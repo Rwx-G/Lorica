@@ -76,9 +76,16 @@ async fn spa_fallback(uri: Uri) -> impl IntoResponse {
 /// an unrecoverable fault, so the request panics into a 500 rather than
 /// serving the dashboard without a valid nonce.
 fn generate_nonce() -> String {
+    use std::fmt::Write;
     let mut bytes = [0u8; 16];
     getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable for the CSP nonce");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    // Hex-encode into a single pre-sized buffer (one allocation) rather
+    // than a per-byte `format!`.
+    let mut nonce = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(nonce, "{b:02x}");
+    }
+    nonce
 }
 
 /// Serve the `index.html` document with a fresh per-request CSP nonce.

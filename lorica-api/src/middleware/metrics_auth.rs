@@ -34,6 +34,51 @@ const SCRAPE_TOKEN_ENV: &str = "LORICA_PROMETHEUS_SCRAPE_TOKEN";
 /// Realm advertised in the `WWW-Authenticate` challenge on a 401.
 const METRICS_REALM: &str = "lorica-metrics";
 
+/// How long a cached auth-settings snapshot is reused before re-reading
+/// the store. Bounds the settings DB read to at most once per this window
+/// regardless of scrape rate (performance: a Prometheus scrape must not
+/// pay a blocking SQLite read every time, especially in the default
+/// `metrics_require_auth = false` configuration). A change to the toggle
+/// or token takes effect within one TTL.
+const AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The two settings the middleware needs, cached to keep `/metrics`
+/// scrapes off the store's connection lock.
+#[derive(Clone)]
+struct AuthSettings {
+    require_auth: bool,
+    scrape_token: Option<String>,
+}
+
+/// Process-wide TTL cache of [`AuthSettings`]. The management API runs in
+/// a single process, so one cache suffices.
+static AUTH_CACHE: std::sync::LazyLock<std::sync::RwLock<Option<(AuthSettings, std::time::Instant)>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+/// Return the auth settings, from the TTL cache when fresh, otherwise
+/// re-read them from the store and refresh the cache. `Err(())` on a
+/// store-read failure so the caller can fail closed.
+async fn cached_auth_settings(state: &AppState) -> Result<AuthSettings, ()> {
+    if let Ok(guard) = AUTH_CACHE.read() {
+        if let Some((cached, at)) = guard.as_ref() {
+            if at.elapsed() < AUTH_CACHE_TTL {
+                return Ok(cached.clone());
+            }
+        }
+    }
+    let settings = crate::db::db_blocking(&state.store, |store| store.get_global_settings())
+        .await
+        .map_err(|_| ())?;
+    let fresh = AuthSettings {
+        require_auth: settings.metrics_require_auth,
+        scrape_token: settings.prometheus_scrape_token,
+    };
+    if let Ok(mut guard) = AUTH_CACHE.write() {
+        *guard = Some((fresh.clone(), std::time::Instant::now()));
+    }
+    Ok(fresh)
+}
+
 /// Axum middleware guarding `/metrics`. See the module docs for the
 /// trust model. Fails closed: if `AppState` is somehow absent from the
 /// request extensions (never in normal wiring) the request is rejected.
@@ -42,15 +87,14 @@ pub async fn metrics_auth(req: Request, next: Next) -> Result<Response, ApiError
         return Ok(unauthorized());
     };
 
-    let settings =
-        match crate::db::db_blocking(&state.store, |store| store.get_global_settings()).await {
-            Ok(s) => s,
-            // A store read failure must not silently open the endpoint
-            // once the operator has asked for auth. Fail closed.
-            Err(_) => return Ok(unauthorized()),
-        };
+    let settings = match cached_auth_settings(&state).await {
+        Ok(s) => s,
+        // A store read failure must not silently open the endpoint
+        // once the operator has asked for auth. Fail closed.
+        Err(()) => return Ok(unauthorized()),
+    };
 
-    if !settings.metrics_require_auth {
+    if !settings.require_auth {
         return Ok(next.run(req).await);
     }
 
@@ -60,7 +104,7 @@ pub async fn metrics_auth(req: Request, next: Next) -> Result<Response, ApiError
     // axum's `Service` bound. The bearer check is fully synchronous;
     // the session check needs only the owned cookie value + a cloned
     // `SessionStore`.
-    if bearer_authorized(&req, settings.prometheus_scrape_token.as_deref()) {
+    if bearer_authorized(&req, settings.scrape_token.as_deref()) {
         return Ok(next.run(req).await);
     }
     let session_store = req.extensions().get::<SessionStore>().cloned();

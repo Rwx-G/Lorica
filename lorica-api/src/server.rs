@@ -1073,6 +1073,7 @@ pub async fn start_server(
             let tls_stream = match acceptor.accept(tcp).await {
                 Ok(s) => s,
                 Err(e) => {
+                    crate::metrics::inc_management_tls_handshake_failed();
                     tracing::debug!(peer = %remote_addr, error = %e, "management TLS handshake failed");
                     return;
                 }

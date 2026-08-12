@@ -94,15 +94,20 @@ async fn test_csp_header_restricts_websocket_to_loopback() {
         "CSP must keep default-src 'self', got: {csp}"
     );
     assert!(
-        csp.contains("ws://localhost:*"),
-        "CSP must allow same-host WebSocket on localhost, got: {csp}"
+        csp.contains("wss://localhost:*"),
+        "CSP must allow same-host secure WebSocket on localhost, got: {csp}"
     );
     assert!(
-        csp.contains("ws://127.0.0.1:*"),
-        "CSP must allow same-host WebSocket on 127.0.0.1, got: {csp}"
+        csp.contains("wss://127.0.0.1:*"),
+        "CSP must allow same-host secure WebSocket on 127.0.0.1, got: {csp}"
     );
-    // Regression pin : the bare `ws:` token must NOT appear (no
-    // host = matches any host).
+    // The management listener is TLS-only, so plaintext `ws://` sources
+    // were dropped (mixed content anyway) - none must remain, and the
+    // bare `ws:` token (no host = any host) must never appear.
+    assert!(
+        !csp.contains("ws://"),
+        "CSP must not carry plaintext `ws://` sources under TLS, got: {csp}"
+    );
     assert!(
         !csp.contains(" ws: ") && !csp.ends_with(" ws:") && !csp.contains(" ws:;"),
         "CSP must not carry a bare `ws:` token (admits any host), got: {csp}"

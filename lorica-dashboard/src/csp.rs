@@ -15,12 +15,15 @@
 //!   `'unsafe-inline'`, the hardened CSP3 posture.
 
 /// The connect-src source list: same-origin document plus same-host
-/// WebSocket schemes scoped to the loopback addresses the management
-/// API binds to. A `:*` port wildcard keeps the policy honest across
-/// operator `management_port` overrides without admitting arbitrary
-/// remote `ws://attacker.example` connections (v1.5.1 audit L-2).
+/// secure WebSocket scoped to the loopback addresses the management API
+/// binds to. The management listener is TLS-only (Story 8.8), so the
+/// dashboard is always served over https and the frontend opens `wss://`
+/// (a plaintext `ws://` would be blocked as mixed content anyway); the
+/// `ws://` loopback sources were dropped as dead policy surface. A `:*`
+/// port wildcard keeps the policy honest across operator
+/// `management_port` overrides without admitting arbitrary remote
+/// `wss://attacker.example` connections (v1.5.1 audit L-2).
 const CONNECT_SRC: &str = "connect-src 'self' \
-ws://localhost:* ws://127.0.0.1:* ws://[::1]:* \
 wss://localhost:* wss://127.0.0.1:* wss://[::1]:*";
 
 /// Build the `Content-Security-Policy` header value.
@@ -95,7 +98,8 @@ mod tests {
         assert!(csp.contains("base-uri 'none'"));
         assert!(csp.contains("object-src 'none'"));
         assert!(csp.contains("img-src 'self' data:"));
-        assert!(csp.contains("ws://127.0.0.1:*"));
+        assert!(csp.contains("wss://127.0.0.1:*"));
+        assert!(!csp.contains("ws://127.0.0.1"));
     }
 
     #[test]

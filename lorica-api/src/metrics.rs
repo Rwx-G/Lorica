@@ -1140,6 +1140,28 @@ pub fn inc_audit_insert_failed() {
     AUDIT_INSERT_FAILED_TOTAL.inc();
 }
 
+/// Counter: management-plane TLS handshakes that failed (client aborted,
+/// spoke plaintext, or trusted the wrong cert). The management listener
+/// is loopback-only, so this mainly surfaces local handshake churn - a
+/// scanner, or an operator whose client pins a stale cert (Story 8.8).
+static MANAGEMENT_TLS_HANDSHAKE_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::with_opts(
+        prometheus::opts!(
+            "management_tls_handshake_failed_total",
+            "Management-plane TLS handshakes that failed"
+        )
+        .namespace("lorica"),
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Bump the management TLS handshake-failure counter (Story 8.8).
+pub fn inc_management_tls_handshake_failed() {
+    MANAGEMENT_TLS_HANDSHAKE_FAILED_TOTAL.inc();
+}
+
 // --- Story 8.5: cert-resolver reliability -------------------------------
 
 /// Counter: cert-resolver reloads by outcome. `result` is `"ok"` (the

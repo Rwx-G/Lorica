@@ -79,7 +79,10 @@ pub(crate) fn run_single_process(cli: Cli) {
                     println!("  Initial admin password written to (mode 0600):");
                     println!("    {}", path.display());
                     println!("  Read it with:  sudo cat {}", path.display());
-                    println!("  Login at http://localhost:{}/", cli.management_port);
+                    println!(
+                        "  Login at https://localhost:{}/ (self-signed cert - accept the browser warning)",
+                        cli.management_port
+                    );
                     println!("  You will be asked to change it on first login,");
                     println!("  after which you can delete that file.");
                     println!("  ===================================================");
@@ -94,7 +97,10 @@ pub(crate) fn run_single_process(cli: Cli) {
                     println!();
                     println!("  ===================================================");
                     println!("  Initial admin password: {password}");
-                    println!("  Login at http://localhost:{}/", cli.management_port);
+                    println!(
+                        "  Login at https://localhost:{}/ (self-signed cert - accept the browser warning)",
+                        cli.management_port
+                    );
                     println!("  You will be asked to change it on first login.");
                     println!("  ===================================================");
                     println!();
