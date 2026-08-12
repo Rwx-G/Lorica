@@ -6,8 +6,9 @@
   import { canWrite, isSuperAdmin } from '../lib/auth';
 
   let events: WafEvent[] = $state([]);
-  let stats: { total_events: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
+  let stats: { total_events: number; total_24h: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
     total_events: 0,
+    total_24h: 0,
     rule_count: 0,
     by_category: [],
   });
@@ -332,6 +333,10 @@
     <div class="stat-card">
       <div class="stat-value">{rulesEnabled}/{stats.rule_count}</div>
       <div class="stat-label">Rules Enabled</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">{stats.total_24h}</div>
+      <div class="stat-label">Events (24h)</div>
     </div>
     <div class="stat-card">
       <div class="stat-value">{stats.total_events}</div>

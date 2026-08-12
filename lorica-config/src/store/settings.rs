@@ -98,6 +98,13 @@ impl ConfigStore {
                         ))
                     })?;
                 }
+                "waf_event_retention" => {
+                    settings.waf_event_retention = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!(
+                            "invalid waf_event_retention {value:?}: {e}"
+                        ))
+                    })?;
+                }
                 "sla_purge_enabled" => {
                     settings.sla_purge_enabled = value == "true" || value == "1";
                 }
@@ -326,6 +333,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('access_log_retention', ?1)",
             params![settings.access_log_retention.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_event_retention', ?1)",
+            params![settings.waf_event_retention.to_string()],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('sla_purge_enabled', ?1)",

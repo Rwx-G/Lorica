@@ -272,11 +272,17 @@ pub(crate) fn spawn_retention_loop(
         let mut last_sla_purge_day: u32 = 0;
         loop {
             interval.tick().await;
-            let (retention, audit_retention_days) = {
+            let (retention, waf_retention, audit_retention_days) = {
                 let s = retention_config_store.lock().await;
                 s.get_global_settings()
-                    .map(|gs| (gs.access_log_retention, gs.audit_log_retention_days))
-                    .unwrap_or((100_000, 90))
+                    .map(|gs| {
+                        (
+                            gs.access_log_retention,
+                            gs.waf_event_retention,
+                            gs.audit_log_retention_days,
+                        )
+                    })
+                    .unwrap_or((100_000, 100_000, 90))
             };
             if retention > 0 {
                 if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
@@ -306,8 +312,10 @@ pub(crate) fn spawn_retention_loop(
                     tracing::warn!(error = %e, "probe result retention cleanup failed");
                 }
             }
-            if let Err(e) = retention_log_store.enforce_waf_retention(100_000) {
-                tracing::warn!(error = %e, "WAF event retention cleanup failed");
+            if waf_retention > 0 {
+                if let Err(e) = retention_log_store.enforce_waf_retention(waf_retention as u64) {
+                    tracing::warn!(error = %e, "WAF event retention cleanup failed");
+                }
             }
             last_sla_purge_day =
                 run_sla_purge(&retention_config_store, last_sla_purge_day).await;

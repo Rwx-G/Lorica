@@ -1369,6 +1369,29 @@ paths:
                 properties:
                   data:
                     type: object
+                    properties:
+                      total_events:
+                        type: integer
+                        format: int64
+                        description: >-
+                          Total persisted WAF events. Plateaus near
+                          waf_event_retention once the cap is reached.
+                      total_24h:
+                        type: integer
+                        format: int64
+                        description: WAF events recorded in the last 24 hours.
+                      rule_count:
+                        type: integer
+                      by_category:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            category:
+                              type: string
+                            count:
+                              type: integer
+                              format: int64
         "401":
           $ref: "#/components/responses/Unauthorized"
 

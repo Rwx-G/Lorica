@@ -45,6 +45,7 @@
     waf_ban_threshold: 5,
     waf_ban_duration_s: 3600,
     access_log_retention: 100000,
+    waf_event_retention: 100000,
     sla_purge_enabled: false,
     sla_purge_retention_days: 90,
     sla_purge_schedule: 'first_of_month',

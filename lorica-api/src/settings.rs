@@ -35,6 +35,7 @@ const HEADER_TIMEOUT_S_MAX: u32 = 3600;
 const WAF_BAN_THRESHOLD_MIN: i32 = 0;
 const WAF_BAN_DURATION_S_MIN: i32 = 0;
 const ACCESS_LOG_RETENTION_MIN: i64 = 0;
+const WAF_EVENT_RETENTION_MIN: i64 = 0;
 const SLA_PURGE_RETENTION_DAYS_MIN: i32 = 1;
 const SLA_PURGE_RETENTION_DAYS_MAX: i32 = 3650;
 const OTLP_SAMPLING_RATIO_MIN: f64 = 0.0;
@@ -134,6 +135,11 @@ pub fn settings_schema() -> serde_json::Value {
             "type": "integer",
             "min": ACCESS_LOG_RETENTION_MIN,
             "default": d.access_log_retention,
+        },
+        "waf_event_retention": {
+            "type": "integer",
+            "min": WAF_EVENT_RETENTION_MIN,
+            "default": d.waf_event_retention,
         },
         "sla_purge_enabled": {
             "type": "boolean",
@@ -268,6 +274,8 @@ pub struct UpdateSettingsRequest {
     pub waf_ban_duration_s: Option<i32>,
     /// Retention cap on the persistent access-log buffer.
     pub access_log_retention: Option<i64>,
+    /// Retention cap on the persistent WAF-event buffer.
+    pub waf_event_retention: Option<i64>,
     /// Toggle the periodic SLA bucket purge.
     pub sla_purge_enabled: Option<bool>,
     /// SLA bucket retention window (days).
@@ -451,6 +459,12 @@ pub async fn update_settings(
             &mut settings.access_log_retention,
             ACCESS_LOG_RETENTION_MIN,
             "access_log_retention",
+        )?;
+        apply_min_i64(
+            body.waf_event_retention,
+            &mut settings.waf_event_retention,
+            WAF_EVENT_RETENTION_MIN,
+            "waf_event_retention",
         )?;
         apply_plain(body.sla_purge_enabled, &mut settings.sla_purge_enabled);
         apply_ranged_i32(

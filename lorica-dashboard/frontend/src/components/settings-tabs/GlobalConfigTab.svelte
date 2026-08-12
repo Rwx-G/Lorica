@@ -14,6 +14,7 @@
     waf_ban_threshold: number;
     waf_ban_duration_s: number;
     access_log_retention: number;
+    waf_event_retention: number;
     sla_purge_enabled: boolean;
     sla_purge_retention_days: number;
     sla_purge_schedule: string;
@@ -73,6 +74,7 @@
     wafBanThreshold: bound('waf_ban_threshold', 0, 1000),
     wafBanDur: bound('waf_ban_duration_s', 0, 604_800),
     logRet: bound('access_log_retention', 0, 100_000_000),
+    wafRet: bound('waf_event_retention', 0, 100_000_000),
     slaPurge: bound('sla_purge_retention_days', 1, 3650),
   });
 
@@ -94,6 +96,7 @@
   let wafBanThresholdErr = $state<string | null>(null);
   let wafBanDurErr = $state<string | null>(null);
   let logRetErr = $state<string | null>(null);
+  let wafRetErr = $state<string | null>(null);
   let slaPurgeErr = $state<string | null>(null);
   function checkHcInterval() { hcIntervalErr = numErr(settingsForm.default_health_check_interval_s, c.hcInterval.min, c.hcInterval.max); }
   function checkHealthProbes() { healthProbesErr = numErr(settingsForm.health_max_concurrent_probes, c.healthProbes.min, c.healthProbes.max); }
@@ -104,6 +107,7 @@
   function checkWafBanThreshold() { wafBanThresholdErr = numErr(settingsForm.waf_ban_threshold, c.wafBanThreshold.min, c.wafBanThreshold.max); }
   function checkWafBanDur() { wafBanDurErr = numErr(settingsForm.waf_ban_duration_s, c.wafBanDur.min, c.wafBanDur.max); }
   function checkLogRet() { logRetErr = numErr(settingsForm.access_log_retention, c.logRet.min, c.logRet.max); }
+  function checkWafRet() { wafRetErr = numErr(settingsForm.waf_event_retention, c.wafRet.min, c.wafRet.max); }
   function checkSlaPurge() { slaPurgeErr = numErr(settingsForm.sla_purge_retention_days, c.slaPurge.min, c.slaPurge.max); }
 </script>
 
@@ -183,6 +187,12 @@
         <input id="s-log-retention" type="number" min={c.logRet.min} max={c.logRet.max} bind:value={settingsForm.access_log_retention} onblur={checkLogRet} oninput={checkLogRet} />
         {#if logRetErr}<span class="field-error" role="alert">{logRetErr}</span>{/if}
         <span class="hint">Maximum entries in persistent log store (0 = unlimited).</span>
+      </div>
+      <div class="settings-form-row">
+        <label for="s-waf-retention">WAF Event Retention (entries)</label>
+        <input id="s-waf-retention" type="number" min={c.wafRet.min} max={c.wafRet.max} bind:value={settingsForm.waf_event_retention} onblur={checkWafRet} oninput={checkWafRet} />
+        {#if wafRetErr}<span class="field-error" role="alert">{wafRetErr}</span>{/if}
+        <span class="hint">Maximum WAF events in persistent store (0 = unlimited).</span>
       </div>
 
       <h3 class="subsection-title">SLA Data Purge</h3>

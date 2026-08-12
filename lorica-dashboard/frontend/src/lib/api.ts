@@ -763,6 +763,7 @@ export interface GlobalSettingsResponse {
   waf_ban_threshold: number;
   waf_ban_duration_s: number;
   access_log_retention: number;
+  waf_event_retention: number;
   sla_purge_enabled: boolean;
   sla_purge_retention_days: number;
   sla_purge_schedule: string;
@@ -809,6 +810,7 @@ export interface UpdateSettingsRequest {
   waf_ban_threshold?: number;
   waf_ban_duration_s?: number;
   access_log_retention?: number;
+  waf_event_retention?: number;
   sla_purge_enabled?: boolean;
   sla_purge_retention_days?: number;
   sla_purge_schedule?: string;
@@ -1619,6 +1621,7 @@ export interface WafCategoryCount {
 
 export interface WafStatsResponse {
   total_events: number;
+  total_24h: number;
   rule_count: number;
   by_category: WafCategoryCount[];
 }

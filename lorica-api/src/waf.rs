@@ -45,6 +45,7 @@ struct WafEventsResponse {
 #[derive(Debug, Serialize)]
 struct WafStatsResponse {
     total_events: u64,
+    total_24h: u64,
     rule_count: usize,
     by_category: Vec<CategoryCount>,
 }
@@ -111,7 +112,7 @@ pub async fn get_waf_stats(
     let rule_count = state.waf_rule_count.unwrap_or(0);
 
     // Read from persistent store if available, fall back to in-memory buffer
-    let (total_events, by_category) = if let Some(ref store) = state.log_store {
+    let (total_events, total_24h, by_category) = if let Some(ref store) = state.log_store {
         // Off the tokio worker. COUNT(*) + GROUP BY can scan the
         // whole waf_events table under retention (up to 100 000
         // rows by default).
@@ -120,20 +121,26 @@ pub async fn get_waf_stats(
         // failure is a hard error, as before.
         let stats = log_db_blocking(store, move |s| Ok(s.waf_event_stats())).await?;
         match stats {
-            Ok((total, cats)) => {
+            Ok((total, total_24h, cats)) => {
                 let by_cat = cats
                     .into_iter()
                     .map(|(category, count)| CategoryCount { category, count })
                     .collect();
-                (total, by_cat)
+                (total, total_24h, by_cat)
             }
-            Err(_) => (0u64, vec![]),
+            Err(_) => (0u64, 0u64, vec![]),
         }
     } else if let Some(ref waf_buffer) = state.waf_event_buffer {
         let buf = waf_buffer.lock();
         let total = buf.len() as u64;
+        let cutoff_24h: String =
+            (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let mut total_24h = 0u64;
         let mut counts = std::collections::HashMap::new();
         for event in buf.iter() {
+            if event.timestamp.as_str() >= cutoff_24h.as_str() {
+                total_24h += 1;
+            }
             *counts
                 .entry(event.category.as_str().to_string())
                 .or_insert(0u64) += 1;
@@ -143,13 +150,14 @@ pub async fn get_waf_stats(
             .map(|(category, count)| CategoryCount { category, count })
             .collect();
         by_cat.sort_by_key(|c| std::cmp::Reverse(c.count));
-        (total, by_cat)
+        (total, total_24h, by_cat)
     } else {
-        (0u64, vec![])
+        (0u64, 0u64, vec![])
     };
 
     Ok(json_data(WafStatsResponse {
         total_events,
+        total_24h,
         rule_count,
         by_category,
     }))

@@ -10,6 +10,11 @@ use rusqlite::{params, Connection};
 
 use crate::logs::{LogEntry, LogsQuery};
 
+/// Aggregated WAF-event statistics returned by
+/// [`LogStore::waf_event_stats`]: `(total, total_24h, by_category)`
+/// where `by_category` is `(category, count)` pairs sorted high-to-low.
+pub type WafEventStats = (u64, u64, Vec<(String, u64)>);
+
 /// Persistent log database wrapper. Cheaply cloneable through `Arc<LogStore>`.
 pub struct LogStore {
     conn: Mutex<Connection>,
@@ -612,18 +617,33 @@ impl LogStore {
         Ok(events)
     }
 
-    /// Summarise WAF events via SQL aggregation : total count and
-    /// per-category counts (sorted high-to-low). Used by
+    /// Summarise WAF events via SQL aggregation : total count, rolling
+    /// 24h count, and per-category counts (sorted high-to-low). Used by
     /// `/api/v1/waf/stats` so the stats are accurate regardless
     /// of table size. The previous implementation loaded up to
     /// 10 000 rows into memory to `.len()` them, which capped
     /// the dashboard counter at 10 000 once the retention window
     /// (100 000 rows) was in use.
-    pub fn waf_event_stats(&self) -> Result<(u64, Vec<(String, u64)>), String> {
+    ///
+    /// Returns `(total, total_24h, by_category)`. Once
+    /// `waf_event_retention` caps the table, `total` plateaus near the
+    /// cap and stops carrying signal ; `total_24h` counts only rows
+    /// with a `timestamp` within the last 24 hours. RFC3339 TEXT
+    /// compares lexicographically, so the `timestamp >= ?` bound rides
+    /// the existing `idx_waf_events_timestamp` index.
+    pub fn waf_event_stats(&self) -> Result<WafEventStats, String> {
         let conn = self.conn.lock();
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM waf_events", [], |row| row.get(0))
             .map_err(|e| format!("failed to count WAF events: {e}"))?;
+        let cutoff_24h: String = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let total_24h: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM waf_events WHERE timestamp >= ?1",
+                params![cutoff_24h],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("failed to count 24h WAF events: {e}"))?;
         let mut stmt = conn
             .prepare(
                 "SELECT category, COUNT(*) FROM waf_events
@@ -639,7 +659,7 @@ impl LogStore {
         for r in rows {
             by_category.push(r.map_err(|e| format!("failed to read WAF stats row: {e}"))?);
         }
-        Ok((total as u64, by_category))
+        Ok((total as u64, total_24h as u64, by_category))
     }
 
     /// Clear all WAF events.
@@ -1117,7 +1137,7 @@ mod waf_stats_tests {
             };
             store.insert_waf_event(&mk_event(i, cat)).expect("insert");
         }
-        let (total, by_cat) = store.waf_event_stats().expect("stats");
+        let (total, _total_24h, by_cat) = store.waf_event_stats().expect("stats");
         assert_eq!(total, n as u64, "total must reflect the full table");
         let sum: u64 = by_cat.iter().map(|(_, c)| c).sum();
         assert_eq!(sum, n as u64, "per-category counts must sum to total");
@@ -1138,7 +1158,7 @@ mod waf_stats_tests {
         store
             .insert_waf_event(&mk_event(2, lorica_waf::RuleCategory::SqlInjection))
             .expect("insert");
-        let (total, by_cat) = store.waf_event_stats().expect("stats");
+        let (total, _total_24h, by_cat) = store.waf_event_stats().expect("stats");
         assert_eq!(total, 4);
         assert_eq!(by_cat.len(), 2);
         // XSS first (3 > 1).
@@ -1149,9 +1169,38 @@ mod waf_stats_tests {
     #[test]
     fn waf_event_stats_on_empty_table() {
         let (store, _dir) = tmp_store();
-        let (total, by_cat) = store.waf_event_stats().expect("stats");
+        let (total, total_24h, by_cat) = store.waf_event_stats().expect("stats");
         assert_eq!(total, 0);
+        assert_eq!(total_24h, 0);
         assert!(by_cat.is_empty());
+    }
+
+    /// Backlog #44 : with `waf_event_retention` capping the table,
+    /// the global total plateaus near the cap and stops carrying
+    /// signal, so `waf_event_stats` also returns a rolling 24h count.
+    /// Insert rows dated well in the past and rows dated now, then
+    /// assert `total_24h` counts only the recent ones while `total`
+    /// still reflects the whole table.
+    #[test]
+    fn waf_event_stats_counts_only_last_24h() {
+        let (store, _dir) = tmp_store();
+        let old_ts: String = (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+        let recent_ts: String = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+
+        for i in 0..4 {
+            let mut ev = mk_event(i, lorica_waf::RuleCategory::Xss);
+            ev.timestamp = old_ts.clone();
+            store.insert_waf_event(&ev).expect("insert old");
+        }
+        for i in 0..3 {
+            let mut ev = mk_event(i, lorica_waf::RuleCategory::SqlInjection);
+            ev.timestamp = recent_ts.clone();
+            store.insert_waf_event(&ev).expect("insert recent");
+        }
+
+        let (total, total_24h, _by_cat) = store.waf_event_stats().expect("stats");
+        assert_eq!(total, 7, "total must reflect the whole table");
+        assert_eq!(total_24h, 3, "total_24h must count only rows within 24h");
     }
 }
 

@@ -164,6 +164,10 @@ pub struct GlobalSettings {
     /// Older entries are purged periodically. 0 = unlimited. Default: 100000.
     #[serde(default = "default_access_log_retention")]
     pub access_log_retention: i64,
+    /// Maximum number of WAF event entries to retain in the persistent store.
+    /// Older entries are purged periodically. 0 = unlimited. Default: 100000.
+    #[serde(default = "default_waf_event_retention")]
+    pub waf_event_retention: i64,
     /// Whether automatic SLA data purge is enabled. Default: true
     /// (bounded disk usage out of the box; operators who need full
     /// history can opt out via the dashboard Settings tab).
@@ -466,6 +470,10 @@ fn default_access_log_retention() -> i64 {
     100_000
 }
 
+fn default_waf_event_retention() -> i64 {
+    100_000
+}
+
 fn default_sla_purge_enabled() -> bool {
     true
 }
@@ -524,6 +532,7 @@ impl Default for GlobalSettings {
             waf_ban_duration_s: default_waf_ban_duration_s(),
             custom_security_presets: Vec::new(),
             access_log_retention: default_access_log_retention(),
+            waf_event_retention: default_waf_event_retention(),
             sla_purge_enabled: default_sla_purge_enabled(),
             sla_purge_retention_days: default_sla_purge_retention_days(),
             sla_purge_schedule: default_sla_purge_schedule(),
