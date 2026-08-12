@@ -171,8 +171,7 @@ fn generate_self_signed(validity_days: i64) -> Result<(String, String), Manageme
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use chrono::Datelike;
-    use rcgen::string::Ia5String;
-    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+    use rcgen::{CertificateParams, DistinguishedName, DnType, Ia5String, KeyPair, SanType};
 
     let mut sans: Vec<SanType> = Vec::with_capacity(4);
     let dns = |name: &str| -> Result<SanType, ManagementTlsError> {
