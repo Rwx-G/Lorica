@@ -2,6 +2,25 @@
 
 Bug fixes, improvements, and maintenance tasks. For new features, see the Roadmap section in [README.md](/README.md).
 
+## Resolved in v1.6.0 (Epic 8)
+
+These items shipped in the v1.6.0 cycle and can be pruned from the Open
+table at the next grooming (kept below for now as historical context):
+**#17** (header_timeout_s + flood_strict_rps, Story 8.10), **#18** +
+**#33** (OCSP background refresh + OCSP_CLIENT + partial-tolerant
+cert-resolver metrics, Story 8.5), **#19** (admin audit log, Story 8.9),
+**#20** (management TLS + `/metrics` auth + `unban` scheme, Story 8.8),
+**#21** (per-source-IP connection cap, Story 8.9), **#22** (BanReason,
+Story 8.11), **#26** (CSP3 style-src nonce, Story 8.8), **#27** (vendor
+`captcha`, Story 8.12), **#29** (dual rate-limit path unification,
+Story 8.10), **#37** (SLA / probe / notification counters +
+`lorica-metrics`, Story 8.11), **#38** (bot-stash caps, Story 8.9),
+**#39** (per-route mirror semaphores, Story 8.9), **#43** + **#45**
+(clippy-1.95 workspace cleanup), **#44** (WAF retention + 24h count),
+**#46** (`settings/schema` endpoint, Story 8.10 AC #7), **#47** (the 8.8
+partial-status pointer, now resolved). See `docs/qa/epic-8-report.md`
+and the `[1.6.0]` section of `CHANGELOG.md`.
+
 ## Open
 
 | # | Item | Type | Notes |

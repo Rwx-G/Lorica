@@ -1,7 +1,7 @@
 # Story 8.8: Management Plane Hardening (TLS + Metrics Auth + CSP3 Nonces)
 
 **Epic:** 8 (v1.6.0)
-**Status:** Review (partial - AC #1, #6, and the AC #3 scheme flip deferred to backlog)
+**Status:** Done
 **Author:** Romain G.
 
 ## Story
@@ -16,16 +16,46 @@ CLI to use the correct URL scheme, AND the dashboard CSP to drop
 
 | AC | Status |
 |----|--------|
-| #1 TLS listener (rcgen self-signed, persist, 30d rotate) | Deferred (backlog) |
-| #2 Operator cert-override settings | Settings landed (inert until #1) |
-| #3 `unban` CLI | Error message improved; https scheme flip deferred (coupled to #1) |
+| #1 TLS listener (rcgen self-signed, persist, 30d rotate) | Done + verified (e2e over https) |
+| #2 Operator cert-override settings | Done + verified |
+| #3 `unban` CLI (https scheme + error message) | Done + verified |
 | #4 `metrics_require_auth` + `prometheus_scrape_token` | Done + verified |
 | #5 Constant-time bearer + 401 challenge | Done + verified |
-| #6 CSP3 per-request style-src nonce | Deferred (backlog) |
+| #6 CSP3 per-request style-src nonce | Done + verified (browser IV4 = operator spot-check) |
 | #7 Dedicated `csp.rs` helper | Done + verified |
-| #8 Docs | `docs/security.md` mgmt-auth section done; TLS/self-signed docs deferred with #1 |
+| #8 Docs (`security.md` + `installation.md`) | Done |
 
-## Deferred work (why, and the mapped follow-up)
+## Completion notes (the initially-deferred parts, all landed in v1.6.0)
+
+The metrics-auth half (AC #4/#5/#7) landed first; the TLS listener
+(AC #1/#2/#3) and the CSP3 nonce (AC #6) were initially deferred for
+verifiability, then completed in the same cycle once e2e / frontend-build
+verification was available. Records of the original deferral rationale
+and the completed approach:
+
+- **AC #1 management TLS listener - DONE.** Implemented with the
+  in-lockfile crates (`tokio-rustls` + `hyper-util`, no `axum-server`):
+  `axum::serve` replaced by a manual TLS accept loop
+  (`lorica-api/src/management_tls.rs` + `server.rs`), rcgen self-signed
+  cert (SANs localhost + hostname + `127.0.0.1` + `::1`, ~1yr, persisted
+  `<data-dir>/management/` dir 0700 / key 0600, 30d auto-rotate). The
+  e2e harness was flipped to https (`docker-compose.yml`,
+  `test-runner/helpers.sh` + `Dockerfile` curlrc, `run.sh` probes) and
+  the `rbac` (37/37) + `audit` (17/17) profiles pass over https - the
+  live-handshake proof the unit gate could not give.
+- **AC #3 scheme flip - DONE.** `unban` / `login` / `upgrade` CLIs now
+  use `https://127.0.0.1` + `danger_accept_invalid_certs` (loopback, no
+  MITM surface).
+- **AC #6 CSP3 nonce - DONE.** The dashboard drops `'unsafe-inline'` from
+  `style-src` in favour of a per-request 128-bit nonce (via the
+  `csp-nonce` meta + backend substitution) and adds
+  `style-src-attr 'unsafe-inline'` for Svelte's runtime `style=`
+  attributes. The production build has zero inline `<style>`/`<script>`
+  (all linked, covered by `'self'`), so nothing legitimate breaks; the
+  only residual is the browser-only IV4 (zero console CSP violations),
+  left as an operator spot-check.
+
+## Original deferral rationale (historical)
 
 - **AC #1 management TLS listener.** Achievable with the in-lockfile
   crates (`tokio-rustls`, `hyper-util`, `rustls`, `rcgen`) - no new
@@ -114,4 +144,5 @@ all green.
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-08-12 | 1.0 | Completed the initially-deferred parts in-cycle (user asked to finish the epic fully). AC #1/#2 management TLS listener (manual tokio-rustls + hyper-util accept loop, rcgen self-signed cert gen/persist/rotate, operator override), AC #3 `unban`/`login`/`upgrade` https scheme flip, AC #6 CSP3 style-src nonce (drop `'unsafe-inline'` + `style-src-attr` fallback), AC #8 docs (`security.md` TLS/CSP sections + `installation.md` self-signed note). Verified: full-workspace clippy `-D warnings` clean, lorica-api 570 (+6 management_tls) + 10 dashboard (+doctest) tests, frontend gates (svelte-check 0 / tsc / lint / vitest 363), e2e rbac 37/37 + audit 17/17 over https. Only residual: browser IV4 CSP-violation spot-check (operator). Status -> Done. | Romain G. |
 | 2026-08-12 | 0.5 | Partial delivery (delegated + orchestrator-verified): opt-in `/metrics` auth with constant-time bearer + 401 challenge (AC #4/#5), dedicated `csp.rs` helper (AC #7), cert-override + auth settings scaffolding (AC #2), `unban` error-message improvement, `docs/security.md` section. AC #1 (mgmt TLS listener), AC #6 (CSP3 nonce) and the AC #3 scheme flip deferred to backlog with mapped follow-ups (verifiability constraints). Gates green. Status -> Review (partial). | Romain G. |

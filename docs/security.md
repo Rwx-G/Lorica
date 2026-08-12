@@ -154,8 +154,22 @@ Story 8.9 hardening knobs, all live-reloadable via settings:
 
 ### Management plane authentication (v1.6.0)
 
-The management API (default port 9443) binds to loopback only. Two
-controls harden it further.
+The management API (default port 9443) binds to loopback only and is
+served over TLS. Three controls harden it.
+
+**TLS listener.** The management API terminates TLS. A self-signed
+certificate is generated on first boot (SANs `localhost`, the machine
+hostname, `127.0.0.1`, `::1`; ~1 year validity), persisted under
+`<data-dir>/management/` (directory `0700`, private key `0600`), and
+regenerated automatically once it is within 30 days of expiry. Serving
+the management plane over TLS lets the `Secure`-flagged session cookie
+round-trip through a fronting reverse proxy instead of being silently
+dropped. Operators who terminate TLS at Lorica with their own
+certificate set `management_cert_pem_path` + `management_key_pem_path`;
+when both point at readable files the self-signed material is ignored.
+Clients reach the API over `https://`; the bundled `lorica` CLI uses
+`https://127.0.0.1` and accepts the self-signed certificate, since the
+target is always loopback (no MITM surface to defend).
 
 **`/metrics` authentication (opt-in).** By default `/metrics` is
 served without authentication so existing Prometheus scrapes keep
@@ -182,14 +196,16 @@ and is never written to the reload diff.
 > Configure `prometheus_scrape_token` and update your scraper's
 > `Authorization` header before upgrading to v1.7.0.
 
-**Dashboard CSP.** The dashboard assets carry a strict CSP3 policy
+**Dashboard CSP.** The dashboard document carries a strict CSP3 policy
 (built in `lorica-dashboard/src/csp.rs`): `default-src 'self'`,
 `script-src 'self'`, `frame-ancestors 'none'`, `form-action 'self'`,
 `base-uri 'none'`, `object-src 'none'`, and a `connect-src` scoped to
-the loopback WebSocket origins. The `style-src` directive retains
-`'unsafe-inline'` for Svelte's runtime-emitted styles; the CSP builder
-already supports a per-request `'nonce-...'` variant for the follow-up
-that patches the runtime style emitter.
+the loopback WebSocket origins. `style-src` drops `'unsafe-inline'` in
+favour of a per-request 128-bit nonce, regenerated on every document
+load and injected into both the `Content-Security-Policy` header and the
+served HTML, so an injected inline `<style>` block is blocked. A
+companion `style-src-attr 'unsafe-inline'` keeps Svelte's runtime inline
+`style=` attributes working, which a `style-src` nonce cannot authorize.
 
 ## Fuzz Testing
 

@@ -22,6 +22,16 @@ The post-install hook enables and starts the service. Lorica listens on
 only). The initial admin password is written to
 `/var/lib/lorica/initial-admin-password` (mode 0600).
 
+The management plane on 9443 is served over TLS. On first boot Lorica
+generates a self-signed certificate (SANs `localhost`, the machine
+hostname, `127.0.0.1`, `::1`) under `/var/lib/lorica/management/` and
+auto-rotates it 30 days before expiry, so browsers show a
+self-signed-certificate warning that you accept once. To present your own
+certificate instead (for example when fronting the dashboard behind a
+reverse proxy that forwards TLS), set `management_cert_pem_path` and
+`management_key_pem_path` in Settings; when both are set the self-signed
+certificate is not used.
+
 Customize ports, worker count, or log level via a drop-in override rather
 than editing the packaged unit (the unit is owned by the package and is
 replaced on upgrade):

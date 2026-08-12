@@ -1,7 +1,7 @@
 # Story 8.10: Settings & Rate-Limit Cleanup
 
 **Epic:** 8 (v1.6.0)
-**Status:** Review
+**Status:** Done
 **Author:** Romain G.
 
 ## Story
@@ -34,7 +34,8 @@ This pass covers the remaining backlog items: wire `header_timeout_s` +
 4. Auto-ban escalation lifts to the unified path.
 5. Path-rule overrides know about the unified path.
 6. `update_settings` dedup - shipped v1.5.10 (helper functions).
-7. `GET /api/v1/settings/schema` - **deferred** (see scope note).
+7. `GET /api/v1/settings/schema` - **done** (single-source bounds consts
+   consumed by both the validator and the schema, anti-drift test).
 8. First-boot operator notice listing routes on the legacy rate-limit
    fields (no DB write).
 
@@ -55,7 +56,8 @@ This pass covers the remaining backlog items: wire `header_timeout_s` +
       a rule overrides `rate_limit_rps`.
 - [x] AC #8: `Once`-guarded first-boot notice in `reload.rs`.
 - [x] AC #6: verified already shipped (v1.5.10).
-- [ ] AC #7: deferred.
+- [x] AC #7: `GET /api/v1/settings/schema` (bounds consts single-sourced
+      with the validator; dashboard GlobalConfigTab consumes it).
 
 ## Dev Notes
 
@@ -117,4 +119,5 @@ lorica-api` 560 + 207; `cargo test -p lorica --lib` 314 passed / 0 failed
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-08-12 | 1.1 | AC #7 completed (user asked to finish the epic fully): `GET /api/v1/settings/schema` exposes field bounds; numeric ranges + enum choices live once as consts consumed by BOTH `update_settings` and `settings_schema()` (plus a boundary anti-drift test), and the dashboard GlobalConfigTab drives its numeric inputs from it. Gates: clippy `-D warnings` clean, lorica-api 572 (+2 schema tests) + doctest, frontend svelte-check 0 / tsc / lint / vitest 363. Status -> Done. | Romain G. |
 | 2026-08-12 | 1.0 | Remaining 8.10 scope (delegated + orchestrator-verified): header_timeout_s + flood_strict_rps wired; dual rate-limit paths unified onto the token-bucket admission path (legacy shim via RateLimit::from_legacy), auto-ban + flood 0.5x + rate-limit headers preserved; first-boot legacy notice. AC #7 deferred, AC #6 already shipped v1.5.10. Gates green incl. lorica lib 314/0. Status -> Review. | Romain G. |
