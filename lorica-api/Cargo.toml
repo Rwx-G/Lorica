@@ -56,7 +56,7 @@ argon2 = "0.5"
 ed25519-dalek = "2"
 rand = "0.9"
 rand_chacha = "0.9"
-rcgen = "0.13"
+rcgen = "0.14"
 regex = "1"
 ring = "0.17"
 # Bumped 0.16 -> 0.18 in v1.5.2 (audit L-15) for the BER/DER
