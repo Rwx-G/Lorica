@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+#[cfg(test)]
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -360,25 +361,6 @@ pub fn match_user_agent(ua: &str) -> Option<&'static AiCrawler> {
         .map(|(_, crawler)| *crawler)
 }
 
-/// Membership test for the bundled vendor IP-list. `vendor_key`
-/// MUST match a `Verification::IpRanges(key)` value of the
-/// crawler entry being evaluated. Returns `false` when the
-/// vendor key is missing from the bundle (treated as "no match
-/// possible" - falls through to the spoofed-fallback flow).
-///
-/// Implementation : linear scan of `Vec<IpNet>` calling
-/// `IpNet::contains`. Acceptable up to ~500 ranges per vendor at
-/// the cost of a few microseconds per matched-UA request. The
-/// caller MUST pass the post-trust-boundary peer IP (e.g.
-/// `RequestCtx.client_ip`) ; reading the raw `X-Forwarded-For`
-/// header here would let a malicious client claim to be in any
-/// vendor's CIDR by spoofing the XFF.
-pub fn ip_in_vendor_ranges(ip: IpAddr, vendor_key: &str) -> bool {
-    match VENDOR_IP_RANGES.get(vendor_key) {
-        Some(ranges) => ranges.iter().any(|net| net.contains(&ip)),
-        None => false,
-    }
-}
 
 /// Build the body of an auto-served `/robots.txt` (Story 8.2
 /// AC #10). Output conforms to RFC 9309 : LF line endings, no
@@ -528,6 +510,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Validate that a vendor bundle loaded into [`VENDOR_IP_RANGES`]
+    /// parses correctly and contains (or excludes) a known IP. Mirrors
+    /// how `ai_bot_merged` pre-resolves ranges into the runtime registry.
+    fn ip_in_vendor_ranges(ip: IpAddr, vendor_key: &str) -> bool {
+        VENDOR_IP_RANGES
+            .get(vendor_key)
+            .is_some_and(|ranges| ranges.iter().any(|net| net.contains(&ip)))
     }
 
     #[test]
