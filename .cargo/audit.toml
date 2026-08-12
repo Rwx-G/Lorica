@@ -25,9 +25,13 @@
 # <- aws-config 1.8.15 <- lorica-api (only when the `route53`
 # feature is enabled).
 #
-# Upstream status (checked 2026-06-10): aws-smithy-http-client
-# 1.1.13 is the current stable and still pins rustls 0.21. There
-# is no published aws-sdk-* release that uses rustls 0.23 yet.
+# Upstream status (rechecked 2026-08-12): aws-smithy-http-client
+# 1.3.0 now exposes an optional rustls-0.23 / hyper-rustls-0.27
+# feature set alongside the legacy rustls-0.21 path, but `aws-config`
+# has not exposed a selector to route to it, so the resolved chain
+# still pins rustls 0.21 / webpki 0.101.7. Revisit trigger unchanged:
+# when `aws-config` lets us select the rustls-0.23 backend, bump the
+# AWS SDK crates and remove all three entries.
 #
 # Runtime exposure:
 # - Lorica uses the AWS SDK exclusively to drive Route 53 Change-

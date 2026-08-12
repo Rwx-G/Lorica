@@ -174,9 +174,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "arc-swap"
@@ -2059,17 +2059,17 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hashlink"
@@ -2599,7 +2599,7 @@ dependencies = [
  "hyper 1.10.1",
  "hyper-rustls 0.27.9",
  "hyper-util",
- "rcgen 0.14.8",
+ "rcgen",
  "ring",
  "rustls 0.23.40",
  "rustls-pki-types",
@@ -2976,7 +2976,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "rand 0.9.4",
- "rcgen 0.13.2",
+ "rcgen",
  "regex",
  "reqwest",
  "rustls 0.23.40",
@@ -3030,7 +3030,7 @@ dependencies = [
  "prometheus",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
- "rcgen 0.13.2",
+ "rcgen",
  "regex",
  "reqwest",
  "ring",
@@ -3490,11 +3490,11 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -4516,29 +4516,16 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
-version = "0.13.2"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
-dependencies = [
- "pem",
- "ring",
- "rustls-pki-types",
- "time",
- "yasna 0.5.2",
-]
-
-[[package]]
-name = "rcgen"
-version = "0.14.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
+checksum = "091e7a8e7d86e6feb87a27ce8e2cba29d49eff9507afeebefab7eeb2ca667fb4"
 dependencies = [
  "pem",
  "ring",
  "rustls-pki-types",
  "time",
  "x509-parser 0.18.1",
- "yasna 0.6.0",
+ "yasna",
 ]
 
 [[package]]
@@ -6879,15 +6866,6 @@ name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
-
-[[package]]
-name = "yasna"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
-dependencies = [
- "time",
-]
 
 [[package]]
 name = "yasna"
