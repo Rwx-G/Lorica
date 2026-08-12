@@ -1348,13 +1348,13 @@ impl LoricaProxy {
     /// `/robots.txt` stays authoritative when the operator has not
     /// opted in). Terminal: 200 with the registry-driven body.
     ///
-    /// Body shape per [`build_robots_txt_from_names`]: header comment
-    /// + one `User-agent / Disallow: /` block per crawler when the
-    /// route's `ai_bot_policy != Off`, or the `User-agent: *\nAllow:
-    /// /\n` fallback when no crawlers are active. Consults the merged
-    /// registry (built-in + enabled custom rows) so an operator's
-    /// Custom Crawler shows up in `/robots.txt` after a hot-reload
-    /// (Story 8.2 AC #8).
+    /// Body shape per [`build_robots_txt_from_names`]: a header comment,
+    /// then one `User-agent` / `Disallow: /` block per crawler when the
+    /// route's `ai_bot_policy` is not `Off`, or a `User-agent: *` with
+    /// `Allow: /` fallback when no crawlers are active. Consults the
+    /// merged registry (built-in and enabled custom rows) so an
+    /// operator's Custom Crawler shows up in `/robots.txt` after a
+    /// hot-reload (Story 8.2 AC #8).
     pub(super) async fn check_robots_txt(
         &self,
         session: &mut Session,
