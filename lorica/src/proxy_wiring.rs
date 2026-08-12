@@ -301,7 +301,7 @@ pub mod ai_bot_merged;
 pub mod filters;
 pub use filters::ip_to_shmem_key;
 #[cfg(test)]
-pub(crate) use filters::{build_redirect_location, ip_matches};
+pub(crate) use filters::build_redirect_location;
 
 pub mod worker_rpc;
 pub use worker_rpc::PendingProxyConfig;

@@ -169,6 +169,13 @@ pub struct RouteEntry {
     /// path does not re-compile patterns on every hit. `None` when
     /// bot-protection is disabled or the UA bypass list is empty.
     pub bot_ua_regex_set: Option<Arc<regex::RegexSet>>,
+    /// Pre-parsed `ip_allowlist` / `ip_denylist` CIDRs (bare IPs become
+    /// host routes). Built once here so `check_ip_allow_deny` does not
+    /// re-parse every pattern per request. Unparseable entries are
+    /// dropped; the emptiness gate still reads `route.ip_allowlist` so an
+    /// all-malformed allowlist stays fail-closed.
+    pub ip_allowlist_nets: Vec<ipnet::IpNet>,
+    pub ip_denylist_nets: Vec<ipnet::IpNet>,
 }
 
 /// Runtime-side view of a route's mTLS policy: the bits we check at
@@ -519,6 +526,8 @@ impl ProxyConfig {
                 response_rewrite_compiled,
                 mtls_enforcer,
                 bot_ua_regex_set,
+                ip_allowlist_nets: super::filters::compile_ip_patterns(&route.ip_allowlist),
+                ip_denylist_nets: super::filters::compile_ip_patterns(&route.ip_denylist),
             });
 
             routes_by_host

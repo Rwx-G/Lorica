@@ -60,6 +60,15 @@ static MIRROR_GLOBAL_SEMAPHORE: Lazy<Arc<tokio::sync::Semaphore>> =
 static MIRROR_ROUTE_SEMAPHORES: Lazy<dashmap::DashMap<String, (u32, Arc<tokio::sync::Semaphore>)>> =
     Lazy::new(dashmap::DashMap::new);
 
+/// Drop per-route mirror semaphores whose route no longer exists, so the
+/// map does not accumulate one stale entry per route ever seen across a
+/// long-running process's config churn. Called on every reload commit
+/// with the live route-id set. Routes still present keep their semaphore
+/// (and its in-flight permits) untouched.
+pub(crate) fn retain_mirror_route_semaphores(live_route_ids: &std::collections::HashSet<String>) {
+    MIRROR_ROUTE_SEMAPHORES.retain(|route_id, _| live_route_ids.contains(route_id));
+}
+
 /// Fetch (or lazily build / resize) the per-route mirror semaphore.
 fn route_mirror_semaphore(route_id: &str, size: u32) -> Arc<tokio::sync::Semaphore> {
     let size = size.max(1);

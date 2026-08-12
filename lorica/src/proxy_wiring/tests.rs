@@ -728,21 +728,31 @@ fn test_from_store_hostname_aliases_indexed() {
 
 // ---- IP Matching ----
 
+/// Mirror the request path: precompile the allow/deny patterns once, then
+/// test containment of a client IP the way `check_ip_allow_deny` does.
+fn ip_in(ip: &str, patterns: &[&str]) -> bool {
+    let owned: Vec<String> = patterns.iter().map(|s| (*s).to_string()).collect();
+    let nets = super::filters::compile_ip_patterns(&owned);
+    ip.parse::<std::net::IpAddr>()
+        .ok()
+        .is_some_and(|a| nets.iter().any(|n| n.contains(&a)))
+}
+
 #[test]
 fn test_ip_matches_exact() {
-    assert!(ip_matches("192.168.1.1", "192.168.1.1"));
-    assert!(!ip_matches("192.168.1.1", "192.168.1.2"));
+    assert!(ip_in("192.168.1.1", &["192.168.1.1"]));
+    assert!(!ip_in("192.168.1.1", &["192.168.1.2"]));
 }
 
 #[test]
 fn test_ip_matches_cidr_prefix() {
-    assert!(ip_matches("192.168.1.100", "192.168.1.0/24"));
-    assert!(ip_matches("192.168.1.1", "192.168.1.0/24"));
-    assert!(!ip_matches("192.168.2.1", "192.168.1.0/24"));
-    assert!(!ip_matches("10.0.0.1", "192.168.1.0/24"));
-    // Regression: old string prefix match would incorrectly match
-    // 10.1.2.3 against "10.1.2.30/24" because "10.1.2.3".starts_with("10.1.2.3")
-    assert!(!ip_matches("10.1.2.3", "10.1.2.30/32"));
+    assert!(ip_in("192.168.1.100", &["192.168.1.0/24"]));
+    assert!(ip_in("192.168.1.1", &["192.168.1.0/24"]));
+    assert!(!ip_in("192.168.2.1", &["192.168.1.0/24"]));
+    assert!(!ip_in("10.0.0.1", &["192.168.1.0/24"]));
+    // Regression: a bare IP compiles to a host route (/32), so it contains
+    // only its exact address - 10.1.2.3 must not match 10.1.2.30/32.
+    assert!(!ip_in("10.1.2.3", &["10.1.2.30/32"]));
 }
 
 // ---- Security Presets in ProxyConfig ----

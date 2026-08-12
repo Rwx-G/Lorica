@@ -260,23 +260,26 @@ struct AiBotStatEvent {
 /// (they are listed in [`PER_WORKER_COUNTERS`]), so `/metrics` is a
 /// true cross-process aggregate. The 5-minute buffer here is only an
 /// in-process convenience for the top-5 endpoint per Story 8.2 AC #7.
+/// Sharded per `route_id` so the bot-match hot path only contends on
+/// the shard for the route being recorded, not a single global lock
+/// (audit hot-path finding). Each value is that route's time-ordered
+/// sliding window.
 static AI_BOT_STATS_BUFFER: Lazy<
-    parking_lot::Mutex<std::collections::HashMap<String, std::collections::VecDeque<AiBotStatEvent>>>,
-> = Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    dashmap::DashMap<String, std::collections::VecDeque<AiBotStatEvent>>,
+> = Lazy::new(dashmap::DashMap::new);
 
 /// Push one AI-bot evaluation into the ring buffer and prune the
 /// route's queue (drop entries older than the window, then enforce
 /// the per-route cap).
 fn push_ai_bot_stat(route_id: &str, crawler: &str, action: &str) {
     let now = std::time::Instant::now();
-    let mut map = AI_BOT_STATS_BUFFER.lock();
-    let buf = map.entry(route_id.to_string()).or_default();
+    let mut buf = AI_BOT_STATS_BUFFER.entry(route_id.to_string()).or_default();
     buf.push_back(AiBotStatEvent {
         at: now,
         crawler: crawler.to_string(),
         action: action.to_string(),
     });
-    prune_ai_bot_buffer(buf, now);
+    prune_ai_bot_buffer(buf.value_mut(), now);
     while buf.len() > AI_BOT_STATS_MAX_PER_ROUTE {
         buf.pop_front();
     }
@@ -305,11 +308,10 @@ fn prune_ai_bot_buffer(
 /// [`AI_BOT_STATS_BUFFER`]).
 pub fn ai_bot_window_events(route_id: &str) -> Vec<(String, String)> {
     let now = std::time::Instant::now();
-    let mut map = AI_BOT_STATS_BUFFER.lock();
-    let Some(buf) = map.get_mut(route_id) else {
+    let Some(mut buf) = AI_BOT_STATS_BUFFER.get_mut(route_id) else {
         return Vec::new();
     };
-    prune_ai_bot_buffer(buf, now);
+    prune_ai_bot_buffer(buf.value_mut(), now);
     buf.iter()
         .map(|e| (e.crawler.clone(), e.action.clone()))
         .collect()
@@ -319,7 +321,7 @@ pub fn ai_bot_window_events(route_id: &str) -> Vec<(String, String)> {
 /// fresh test starts from an empty window.
 #[cfg(test)]
 pub fn reset_ai_bot_stats_for_test() {
-    AI_BOT_STATS_BUFFER.lock().clear();
+    AI_BOT_STATS_BUFFER.clear();
 }
 
 /// Increment the `lorica_ai_bot_rdns_unavailable_total` counter.

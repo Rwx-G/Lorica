@@ -90,7 +90,17 @@ pub fn commit_prepared_reload(
             "mtls CA bundle changed since startup; restart Lorica to apply (rustls ServerConfig is immutable). Toggling mtls.required or editing allowed_organizations takes effect live."
         );
     }
+    // Evict per-route mirror semaphores for routes that no longer exist,
+    // so the map does not grow unbounded across a long-running process's
+    // config churn. Collected before the config is moved into the ArcSwap.
+    let live_route_ids: std::collections::HashSet<String> = prepared
+        .config
+        .routes_by_host
+        .values()
+        .flat_map(|entries| entries.iter().map(|e| e.route.id.clone()))
+        .collect();
     proxy_config.store(Arc::new(prepared.config));
+    crate::proxy_wiring::mirror_rewrite::retain_mirror_route_semaphores(&live_route_ids);
     if let Some(filter) = connection_filter {
         let policy = ConnectionFilterPolicy::from_cidrs(
             &prepared.connection_allow_cidrs,

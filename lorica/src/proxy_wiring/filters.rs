@@ -62,22 +62,25 @@ pub fn ip_to_shmem_key(ip: &str) -> u64 {
     }
 }
 
-/// Check whether an IP address matches a pattern (exact match or CIDR range).
-pub(crate) fn ip_matches(ip: &str, pattern: &str) -> bool {
-    if pattern.contains('/') {
-        // CIDR - parse and use proper network containment check
-        let net: std::net::IpAddr = match ip.parse() {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-        let cidr: ipnet::IpNet = match pattern.parse() {
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        cidr.contains(&net)
-    } else {
-        ip == pattern
-    }
+/// Precompile a list of allow/deny patterns (bare IPs or CIDRs) into
+/// `IpNet` ranges once at config-reload time, so `check_ip_allow_deny`
+/// does not re-parse every entry on each request (audit hot-path finding).
+/// A bare IP becomes a host route (`/32` or `/128`), matching the
+/// exact-equality semantics of `ip_matches` for well-formed client IPs.
+/// Unparseable patterns are dropped; the caller keeps the original list's
+/// emptiness as the allowlist gate, so an all-malformed allowlist still
+/// blocks (fail-closed) rather than degrading to allow-all.
+pub(crate) fn compile_ip_patterns(patterns: &[String]) -> Vec<ipnet::IpNet> {
+    patterns
+        .iter()
+        .filter_map(|p| {
+            if p.contains('/') {
+                p.parse::<ipnet::IpNet>().ok()
+            } else {
+                p.parse::<std::net::IpAddr>().ok().map(ipnet::IpNet::from)
+            }
+        })
+        .collect()
 }
 
 /// Build the `Location` header value for a `redirect_to` rule.
@@ -688,13 +691,23 @@ impl LoricaProxy {
             return Ok(None);
         };
 
-        let scope_key = match rl.scope {
+        // Bucket key = `<route_id>|<scope>`. The engine's `DashMap` is
+        // keyed by `String`, so the key must materialise as one contiguous
+        // buffer; building it in a single pre-sized `String` keeps the
+        // hottest admission check to one allocation (was two: an
+        // intermediate scope String plus the `format!`). Collapsing to a
+        // zero-alloc `(route_id, IpAddr)` tuple key would mean changing the
+        // engine's key type and its prune task, out of scope here.
+        let scope_key: &str = match rl.scope {
             lorica_config::models::RateLimitScope::PerIp => {
-                ctx.client_ip.as_deref().unwrap_or("unknown").to_string()
+                ctx.client_ip.as_deref().unwrap_or("unknown")
             }
-            lorica_config::models::RateLimitScope::PerRoute => "__route__".to_string(),
+            lorica_config::models::RateLimitScope::PerRoute => "__route__",
         };
-        let key = format!("{}|{}", entry.route.id, scope_key);
+        let mut key = String::with_capacity(entry.route.id.len() + 1 + scope_key.len());
+        key.push_str(&entry.route.id);
+        key.push('|');
+        key.push_str(scope_key);
 
         // Story 8.10 AC #2. Adaptive flood defense: while the proxy-wide
         // RPS is above `flood_threshold_rps`, tighten per-IP admission by
@@ -1406,8 +1419,16 @@ impl LoricaProxy {
         entry: &RouteEntry,
         ip: &str,
     ) -> Result<Option<bool>> {
+        // Match against the precompiled `IpNet` ranges (built once at
+        // config-reload time). The allowlist emptiness gate still reads the
+        // original `route.ip_allowlist` so an all-malformed list stays
+        // fail-closed. A client IP that does not parse matches nothing:
+        // fail-closed for the allowlist (blocked), fail-open for the
+        // denylist (not denied).
+        let client_addr: Option<std::net::IpAddr> = ip.parse().ok();
         if !entry.route.ip_allowlist.is_empty()
-            && !entry.route.ip_allowlist.iter().any(|a| ip_matches(ip, a))
+            && !client_addr
+                .is_some_and(|a| entry.ip_allowlist_nets.iter().any(|n| n.contains(&a)))
         {
             ctx.block_reason = Some("IP not in allowlist".to_string());
             return self
@@ -1422,7 +1443,7 @@ impl LoricaProxy {
                 .await
                 .map(Some);
         }
-        if entry.route.ip_denylist.iter().any(|d| ip_matches(ip, d)) {
+        if client_addr.is_some_and(|a| entry.ip_denylist_nets.iter().any(|n| n.contains(&a))) {
             ctx.block_reason = Some("IP in denylist".to_string());
             return self
                 .write_error_response(
