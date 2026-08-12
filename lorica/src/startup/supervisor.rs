@@ -65,7 +65,7 @@ fn decode_ban_report_entry(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn run_supervisor(cli: Cli) {
-    use lorica_command::{Command, CommandChannel, CommandType, Response};
+    use lorica_command::CommandChannel;
     use lorica_worker::manager::{WorkerConfig, WorkerEvent, WorkerManager};
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -612,15 +612,15 @@ pub(crate) fn run_supervisor(cli: Cli) {
             // SAFETY: raw_fd is a valid file descriptor from the socketpair
             // created by WorkerManager::spawn_workers(), passed to this task
             // immediately after fork. The fd is exclusively owned by this task.
-            let mut channel = match unsafe { CommandChannel::from_raw_fd(raw_fd) } {
+            let channel = match unsafe { CommandChannel::from_raw_fd(raw_fd) } {
                 Ok(ch) => ch,
                 Err(e) => {
                     error!(worker_id, error = %e, "failed to create command channel");
                     continue;
                 }
             };
-            let mut reload_rx = reload_bc_tx.subscribe();
-            let mut ban_rx = ban_bc_tx.subscribe();
+            let reload_rx = reload_bc_tx.subscribe();
+            let ban_rx = ban_bc_tx.subscribe();
             let hb_seq = Arc::clone(&sequence);
             let hb_metrics = Arc::clone(&worker_metrics);
             let agg_metrics = Arc::clone(&aggregated_metrics);
@@ -645,220 +645,17 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 Arc::clone(&worker_rpc_endpoints),
             );
 
-            let handle = tokio::spawn(async move {
-                let heartbeat_interval = Duration::from_secs(5);
-                let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
-                heartbeat_timer.tick().await; // skip first immediate tick
-
-
-                loop {
-                    tokio::select! {
-                        // BanIp command from supervisor's global WAF counter
-                        ban_result = ban_rx.recv() => {
-                            match ban_result {
-                                Ok((ip, duration_s)) => {
-                                    let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
-                                    let cmd = Command::ban_ip(
-                                        seq,
-                                        &ip,
-                                        duration_s,
-                                        lorica_api::ban::BanReason::WafCriticalRule.as_i32(),
-                                    );
-                                    if let Err(e) = channel.send(&cmd).await {
-                                        warn!(worker_id, error = %e, "BanIp send failed");
-                                        continue;
-                                    }
-                                    match channel.recv::<Response>().await {
-                                        Ok(resp) => match resp.typed_status() {
-                                            lorica_command::ResponseStatus::Ok => {
-                                                info!(worker_id, ip = %ip, "worker applied BanIp");
-                                            }
-                                            lorica_command::ResponseStatus::Error => {
-                                                error!(worker_id, message = %resp.message, "worker BanIp failed");
-                                            }
-                                            _ => {}
-                                        },
-                                        Err(e) => warn!(worker_id, error = %e, "BanIp response failed"),
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    // Subscriber fell behind the bounded channel.
-                                    // The missed bans are still in SQLite (auto-
-                                    // ban logic persists before broadcasting),
-                                    // and the next ConfigReload rehydrates them.
-                                    warn!(
-                                        worker_id,
-                                        dropped = n,
-                                        "BanIp broadcast lagged; missed bans will be applied via next ConfigReload"
-                                    );
-                                    lorica_api::metrics::inc_ban_broadcast_lagged(
-                                        &worker_id.to_string(),
-                                        n,
-                                    );
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    break;
-                                }
-                            }
-                        }
-                        // Config reload triggered by API.
-                        //
-                        // Use an explicit `match` on `reload_rx.recv()` instead
-                        // of the convenience `Ok(seq) = ...` pattern so that a
-                        // `RecvError::Lagged(n)` is surfaced (counter + warn +
-                        // catch-up reload) instead of silently disabling the
-                        // branch for this select iteration. Without this, a
-                        // burst > the broadcast capacity (16 today) leaves the
-                        // worker on a stale config with zero log, zero metric,
-                        // zero notification (audit C-2 ; mirrors the BanIp
-                        // arm above).
-                        reload_result = reload_rx.recv() => {
-                            let seq = match reload_result {
-                                Ok(s) => s,
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    warn!(
-                                        worker_id,
-                                        dropped = n,
-                                        "ConfigReload broadcast lagged ; issuing catch-up reload to bring worker to latest DB state"
-                                    );
-                                    lorica_api::metrics::inc_reload_broadcast_lagged(
-                                        &worker_id.to_string(),
-                                        n,
-                                    );
-                                    // Synthesize a single catch-up reload with
-                                    // a fresh sequence number from the per-
-                                    // worker counter so the seq stays unique
-                                    // on this command channel.
-                                    hb_seq.fetch_add(1, Ordering::Relaxed)
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    break;
-                                }
-                            };
-                            let cmd = Command::new(CommandType::ConfigReload, seq);
-                            if let Err(e) = channel.send(&cmd).await {
-                                warn!(worker_id, error = %e, "config reload send failed");
-                                continue;
-                            }
-                            match channel.recv::<Response>().await {
-                                Ok(resp) => match resp.typed_status() {
-                                    lorica_command::ResponseStatus::Ok => {
-                                        info!(worker_id, seq, "worker applied config reload");
-                                    }
-                                    lorica_command::ResponseStatus::Error => {
-                                        error!(worker_id, message = %resp.message, "worker config reload failed");
-                                    }
-                                    lorica_command::ResponseStatus::Processing => {
-                                        info!(worker_id, message = %resp.message, "worker processing config reload");
-                                    }
-                                    _ => {}
-                                },
-                                Err(e) => warn!(worker_id, error = %e, "config reload response failed"),
-                            }
-                        }
-                        // Periodic heartbeat
-                        _ = heartbeat_timer.tick() => {
-                            // Skip the probe entirely once the supervisor is
-                            // tearing down: workers are SIGTERM'd in the same
-                            // instant, so any send would race the worker's
-                            // exit and log a spurious "Broken pipe" warning.
-                            if hb_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
-                                continue;
-                            }
-                            let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
-                            let cmd = Command::new(CommandType::Heartbeat, seq);
-                            let start = Instant::now();
-                            if let Err(e) = channel.send(&cmd).await {
-                                warn!(worker_id, error = %e, "heartbeat send failed");
-                                continue;
-                            }
-                            match channel.recv::<Response>().await {
-                                Ok(_) => {
-                                    let latency_ms = start.elapsed().as_millis() as u64;
-                                    hb_metrics.record_heartbeat(worker_id, worker_pid, latency_ms).await;
-
-                                    // Request metrics from this worker
-                                    let m_seq = hb_seq.fetch_add(1, Ordering::Relaxed);
-                                    let m_cmd = Command::new(CommandType::MetricsRequest, m_seq);
-                                    if let Err(e) = channel.send(&m_cmd).await {
-                                        warn!(worker_id, error = %e, "metrics request send failed");
-                                    } else if let Ok(report) = channel.recv::<lorica_command::MetricsReport>().await {
-                                        // Consume the Response::ok that follows the report
-                                        let _ = channel.recv::<Response>().await;
-                                        let ewma: std::collections::HashMap<String, f64> = report
-                                            .ewma_entries
-                                            .iter()
-                                            .map(|e| (e.backend_address.clone(), e.score_us))
-                                            .collect();
-                                        let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
-                                            .ban_entries
-                                            .iter()
-                                            .map(decode_ban_report_entry)
-                                            .collect();
-                                        let backend_conns: std::collections::HashMap<String, u64> = report
-                                            .backend_conn_entries
-                                            .iter()
-                                            .map(|e| (e.backend_address.clone(), e.connections))
-                                            .collect();
-                                        let req_counts: Vec<(String, u32, u64)> = report
-                                            .request_entries
-                                            .iter()
-                                            .map(|e| (e.route_id.clone(), e.status_code, e.count))
-                                            .collect();
-                                        let waf_counts: Vec<(String, String, u64)> = report
-                                            .waf_entries
-                                            .iter()
-                                            .map(|e| (e.category.clone(), e.action.clone(), e.count))
-                                            .collect();
-                                        agg_metrics
-                                            .update_worker(
-                                                worker_id,
-                                                report.cache_hits,
-                                                report.cache_misses,
-                                                report.active_connections,
-                                                bans,
-                                                ewma,
-                                                backend_conns,
-                                                req_counts,
-                                                waf_counts,
-                                            )
-                                            .await;
-                                        // Cross-worker generic-counter
-                                        // aggregation (v1.4.0
-                                        // follow-up).
-                                        // Pair up the flat ["k","v","k","v",...]
-                                        // list back into (String, String) label
-                                        // pairs. Odd trailing entries are
-                                        // silently dropped — safe default
-                                        // since a truncated wire payload
-                                        // just skips the affected metric.
-                                        let gc: Vec<GenericCounterRow> =
-                                            report
-                                                .generic_counters
-                                                .iter()
-                                                .map(|e| {
-                                                    let pairs: Vec<(String, String)> = e
-                                                        .labels
-                                                        .chunks_exact(2)
-                                                        .map(|c| (c[0].clone(), c[1].clone()))
-                                                        .collect();
-                                                    (e.name.clone(), pairs, e.value)
-                                                })
-                                                .collect();
-                                        lorica_api::metrics::apply_worker_generic_counters(
-                                            worker_id,
-                                            &gc,
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(worker_id, error = %e, "heartbeat response failed - worker may be unresponsive");
-                                }
-                            }
-                        }
-                    }
-                }
-            });
+            let handle = spawn_worker_channel_task(
+                worker_id,
+                worker_pid,
+                channel,
+                ban_rx,
+                reload_rx,
+                hb_seq,
+                hb_shutting_down,
+                hb_metrics,
+                agg_metrics,
+            );
             worker_task_handles.lock().insert(worker_id, handle);
         }
 
@@ -1371,130 +1168,23 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             // from WorkerManager::restart_worker(),
                             // exclusively owned here.
                             match unsafe { CommandChannel::from_raw_fd(new_cmd_fd.into_raw_fd()) } {
-                                Ok(mut channel) => {
-                                    let mut rx = monitor_reload_tx.subscribe();
-                                    let mut ban_rx = monitor_ban_tx.subscribe();
+                                Ok(channel) => {
+                                    let rx = monitor_reload_tx.subscribe();
+                                    let ban_rx = monitor_ban_tx.subscribe();
                                     let seq = Arc::clone(&monitor_seq);
                                     let hb_metrics = Arc::clone(&monitor_hb_metrics);
                                     let agg_metrics = Arc::clone(&monitor_agg_metrics);
-                                    let new_handle = tokio::spawn(async move {
-                                        info!(worker_id = id, "restarted worker channel task started");
-                                        let mut timer = tokio::time::interval(Duration::from_secs(5));
-                                        timer.tick().await;
-                                        loop {
-                                            tokio::select! {
-                                                // BanIp command from supervisor
-                                                Ok((ip, duration_s)) = ban_rx.recv() => {
-                                                    let s = seq.fetch_add(1, Ordering::Relaxed);
-                                                    let cmd = Command::ban_ip(
-                                                        s,
-                                                        &ip,
-                                                        duration_s,
-                                                        lorica_api::ban::BanReason::WafCriticalRule
-                                                            .as_i32(),
-                                                    );
-                                                    if channel.send(&cmd).await.is_ok() {
-                                                        let _ = channel.recv::<Response>().await;
-                                                    }
-                                                }
-                                                // Same lagged-aware shape as the
-                                                // initial-spawn branch (audit C-2).
-                                                reload_result = rx.recv() => {
-                                                    let s = match reload_result {
-                                                        Ok(s) => s,
-                                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                                            warn!(
-                                                                worker_id = id,
-                                                                dropped = n,
-                                                                "ConfigReload broadcast lagged on restarted worker ; issuing catch-up reload"
-                                                            );
-                                                            lorica_api::metrics::inc_reload_broadcast_lagged(
-                                                                &id.to_string(),
-                                                                n,
-                                                            );
-                                                            seq.fetch_add(1, Ordering::Relaxed)
-                                                        }
-                                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                                    };
-                                                    let cmd = Command::new(CommandType::ConfigReload, s);
-                                                    if channel.send(&cmd).await.is_ok() {
-                                                        if let Ok(r) = channel.recv::<Response>().await {
-                                                            match r.typed_status() {
-                                                                lorica_command::ResponseStatus::Ok => info!(worker_id = id, "restarted worker applied config reload"),
-                                                                lorica_command::ResponseStatus::Error => error!(worker_id = id, message = %r.message, "restarted worker config reload failed"),
-                                                                _ => {}
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                _ = timer.tick() => {
-                                                    let hb_s = seq.fetch_add(1, Ordering::Relaxed);
-                                                    let cmd = Command::new(CommandType::Heartbeat, hb_s);
-                                                    let start = Instant::now();
-                                                    if let Err(e) = channel.send(&cmd).await {
-                                                        warn!(worker_id = id, error = %e, "restarted worker heartbeat send failed");
-                                                        continue;
-                                                    }
-                                                    match channel.recv::<Response>().await {
-                                                        Ok(_) => {
-                                                            let latency_ms = start.elapsed().as_millis() as u64;
-                                                            hb_metrics.record_heartbeat(id, new_pid, latency_ms).await;
-
-                                                            // Request metrics
-                                                            let m_seq = seq.fetch_add(1, Ordering::Relaxed);
-                                                            let m_cmd = Command::new(CommandType::MetricsRequest, m_seq);
-                                                            if let Err(e) = channel.send(&m_cmd).await {
-                                                                warn!(worker_id = id, error = %e, "metrics request send failed");
-                                                            } else if let Ok(report) = channel.recv::<lorica_command::MetricsReport>().await {
-                                                                let _ = channel.recv::<Response>().await;
-                                                                let ewma: std::collections::HashMap<String, f64> = report
-                                                                    .ewma_entries.iter()
-                                                                    .map(|e| (e.backend_address.clone(), e.score_us))
-                                                                    .collect();
-                                                                let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
-                                                                    .ban_entries.iter()
-                                                                    .map(decode_ban_report_entry)
-                                                                    .collect();
-                                                                let backend_conns: std::collections::HashMap<String, u64> = report
-                                                                    .backend_conn_entries.iter()
-                                                                    .map(|e| (e.backend_address.clone(), e.connections))
-                                                                    .collect();
-                                                                let req_counts: Vec<(String, u32, u64)> = report
-                                                                    .request_entries.iter()
-                                                                    .map(|e| (e.route_id.clone(), e.status_code, e.count))
-                                                                    .collect();
-                                                                let waf_counts: Vec<(String, String, u64)> = report
-                                                                    .waf_entries.iter()
-                                                                    .map(|e| (e.category.clone(), e.action.clone(), e.count))
-                                                                    .collect();
-                                                                agg_metrics
-                                                                    .update_worker(id, report.cache_hits, report.cache_misses, report.active_connections, bans, ewma, backend_conns, req_counts, waf_counts)
-                                                                    .await;
-                                                                let gc: Vec<GenericCounterRow> =
-                                                                    report
-                                                                        .generic_counters
-                                                                        .iter()
-                                                                        .map(|e| {
-                                                                            let pairs: Vec<(String, String)> = e
-                                                                                .labels
-                                                                                .chunks_exact(2)
-                                                                                .map(|c| (c[0].clone(), c[1].clone()))
-                                                                                .collect();
-                                                                            (e.name.clone(), pairs, e.value)
-                                                                        })
-                                                                        .collect();
-                                                                lorica_api::metrics::apply_worker_generic_counters(
-                                                                    id,
-                                                                    &gc,
-                                                                );
-                                                            }
-                                                        }
-                                                        Err(e) => warn!(worker_id = id, error = %e, "restarted worker heartbeat recv failed"),
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    });
+                                    let new_handle = spawn_worker_channel_task(
+                                        id,
+                                        new_pid,
+                                        channel,
+                                        ban_rx,
+                                        rx,
+                                        seq,
+                                        Arc::clone(&monitor_shutting_down),
+                                        hb_metrics,
+                                        agg_metrics,
+                                    );
                                     monitor_task_handles.lock().insert(id, new_handle);
                                 }
                                 Err(e) => error!(worker_id = id, error = %e, "failed to create channel for restarted worker"),
@@ -1804,6 +1494,241 @@ async fn supervisor_restore_waf_state(
             info!(count = custom_rules.len(), "supervisor: WAF custom rules restored");
         }
     }
+}
+
+/// Drive one worker's command channel: BanIp fan-out, ConfigReload,
+/// heartbeat + metrics pull. One source of truth shared by the
+/// initial-spawn and crash-respawn paths so the two cannot drift
+/// (the respawn path previously ran a simplified copy that lacked the
+/// BanIp broadcast-lag handling and the shutdown heartbeat guard).
+#[allow(clippy::too_many_arguments)]
+fn spawn_worker_channel_task(
+    worker_id: u32,
+    worker_pid: i32,
+    mut channel: lorica_command::CommandChannel,
+    mut ban_rx: tokio::sync::broadcast::Receiver<(String, u64)>,
+    mut reload_rx: tokio::sync::broadcast::Receiver<u64>,
+    hb_seq: Arc<std::sync::atomic::AtomicU64>,
+    hb_shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    hb_metrics: Arc<lorica_api::workers::WorkerMetrics>,
+    agg_metrics: Arc<lorica_api::workers::AggregatedMetrics>,
+) -> tokio::task::JoinHandle<()> {
+    use lorica_command::{Command, CommandType, Response};
+    use std::sync::atomic::Ordering;
+    tokio::spawn(async move {
+                let heartbeat_interval = Duration::from_secs(5);
+                let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
+                heartbeat_timer.tick().await; // skip first immediate tick
+
+
+                loop {
+                    tokio::select! {
+                        // BanIp command from supervisor's global WAF counter
+                        ban_result = ban_rx.recv() => {
+                            match ban_result {
+                                Ok((ip, duration_s)) => {
+                                    let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                                    let cmd = Command::ban_ip(
+                                        seq,
+                                        &ip,
+                                        duration_s,
+                                        lorica_api::ban::BanReason::WafCriticalRule.as_i32(),
+                                    );
+                                    if let Err(e) = channel.send(&cmd).await {
+                                        warn!(worker_id, error = %e, "BanIp send failed");
+                                        continue;
+                                    }
+                                    match channel.recv::<Response>().await {
+                                        Ok(resp) => match resp.typed_status() {
+                                            lorica_command::ResponseStatus::Ok => {
+                                                info!(worker_id, ip = %ip, "worker applied BanIp");
+                                            }
+                                            lorica_command::ResponseStatus::Error => {
+                                                error!(worker_id, message = %resp.message, "worker BanIp failed");
+                                            }
+                                            _ => {}
+                                        },
+                                        Err(e) => warn!(worker_id, error = %e, "BanIp response failed"),
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    // Subscriber fell behind the bounded channel.
+                                    // The missed bans are still in SQLite (auto-
+                                    // ban logic persists before broadcasting),
+                                    // and the next ConfigReload rehydrates them.
+                                    warn!(
+                                        worker_id,
+                                        dropped = n,
+                                        "BanIp broadcast lagged; missed bans will be applied via next ConfigReload"
+                                    );
+                                    lorica_api::metrics::inc_ban_broadcast_lagged(
+                                        &worker_id.to_string(),
+                                        n,
+                                    );
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
+                            }
+                        }
+                        // Config reload triggered by API.
+                        //
+                        // Use an explicit `match` on `reload_rx.recv()` instead
+                        // of the convenience `Ok(seq) = ...` pattern so that a
+                        // `RecvError::Lagged(n)` is surfaced (counter + warn +
+                        // catch-up reload) instead of silently disabling the
+                        // branch for this select iteration. Without this, a
+                        // burst > the broadcast capacity (16 today) leaves the
+                        // worker on a stale config with zero log, zero metric,
+                        // zero notification (audit C-2 ; mirrors the BanIp
+                        // arm above).
+                        reload_result = reload_rx.recv() => {
+                            let seq = match reload_result {
+                                Ok(s) => s,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    warn!(
+                                        worker_id,
+                                        dropped = n,
+                                        "ConfigReload broadcast lagged ; issuing catch-up reload to bring worker to latest DB state"
+                                    );
+                                    lorica_api::metrics::inc_reload_broadcast_lagged(
+                                        &worker_id.to_string(),
+                                        n,
+                                    );
+                                    // Synthesize a single catch-up reload with
+                                    // a fresh sequence number from the per-
+                                    // worker counter so the seq stays unique
+                                    // on this command channel.
+                                    hb_seq.fetch_add(1, Ordering::Relaxed)
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
+                            };
+                            let cmd = Command::new(CommandType::ConfigReload, seq);
+                            if let Err(e) = channel.send(&cmd).await {
+                                warn!(worker_id, error = %e, "config reload send failed");
+                                continue;
+                            }
+                            match channel.recv::<Response>().await {
+                                Ok(resp) => match resp.typed_status() {
+                                    lorica_command::ResponseStatus::Ok => {
+                                        info!(worker_id, seq, "worker applied config reload");
+                                    }
+                                    lorica_command::ResponseStatus::Error => {
+                                        error!(worker_id, message = %resp.message, "worker config reload failed");
+                                    }
+                                    lorica_command::ResponseStatus::Processing => {
+                                        info!(worker_id, message = %resp.message, "worker processing config reload");
+                                    }
+                                    _ => {}
+                                },
+                                Err(e) => warn!(worker_id, error = %e, "config reload response failed"),
+                            }
+                        }
+                        // Periodic heartbeat
+                        _ = heartbeat_timer.tick() => {
+                            // Skip the probe entirely once the supervisor is
+                            // tearing down: workers are SIGTERM'd in the same
+                            // instant, so any send would race the worker's
+                            // exit and log a spurious "Broken pipe" warning.
+                            if hb_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                                continue;
+                            }
+                            let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                            let cmd = Command::new(CommandType::Heartbeat, seq);
+                            let start = Instant::now();
+                            if let Err(e) = channel.send(&cmd).await {
+                                warn!(worker_id, error = %e, "heartbeat send failed");
+                                continue;
+                            }
+                            match channel.recv::<Response>().await {
+                                Ok(_) => {
+                                    let latency_ms = start.elapsed().as_millis() as u64;
+                                    hb_metrics.record_heartbeat(worker_id, worker_pid, latency_ms).await;
+
+                                    // Request metrics from this worker
+                                    let m_seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                                    let m_cmd = Command::new(CommandType::MetricsRequest, m_seq);
+                                    if let Err(e) = channel.send(&m_cmd).await {
+                                        warn!(worker_id, error = %e, "metrics request send failed");
+                                    } else if let Ok(report) = channel.recv::<lorica_command::MetricsReport>().await {
+                                        // Consume the Response::ok that follows the report
+                                        let _ = channel.recv::<Response>().await;
+                                        let ewma: std::collections::HashMap<String, f64> = report
+                                            .ewma_entries
+                                            .iter()
+                                            .map(|e| (e.backend_address.clone(), e.score_us))
+                                            .collect();
+                                        let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
+                                            .ban_entries
+                                            .iter()
+                                            .map(decode_ban_report_entry)
+                                            .collect();
+                                        let backend_conns: std::collections::HashMap<String, u64> = report
+                                            .backend_conn_entries
+                                            .iter()
+                                            .map(|e| (e.backend_address.clone(), e.connections))
+                                            .collect();
+                                        let req_counts: Vec<(String, u32, u64)> = report
+                                            .request_entries
+                                            .iter()
+                                            .map(|e| (e.route_id.clone(), e.status_code, e.count))
+                                            .collect();
+                                        let waf_counts: Vec<(String, String, u64)> = report
+                                            .waf_entries
+                                            .iter()
+                                            .map(|e| (e.category.clone(), e.action.clone(), e.count))
+                                            .collect();
+                                        agg_metrics
+                                            .update_worker(
+                                                worker_id,
+                                                report.cache_hits,
+                                                report.cache_misses,
+                                                report.active_connections,
+                                                bans,
+                                                ewma,
+                                                backend_conns,
+                                                req_counts,
+                                                waf_counts,
+                                            )
+                                            .await;
+                                        // Cross-worker generic-counter
+                                        // aggregation (v1.4.0
+                                        // follow-up).
+                                        // Pair up the flat ["k","v","k","v",...]
+                                        // list back into (String, String) label
+                                        // pairs. Odd trailing entries are
+                                        // silently dropped — safe default
+                                        // since a truncated wire payload
+                                        // just skips the affected metric.
+                                        let gc: Vec<GenericCounterRow> =
+                                            report
+                                                .generic_counters
+                                                .iter()
+                                                .map(|e| {
+                                                    let pairs: Vec<(String, String)> = e
+                                                        .labels
+                                                        .chunks_exact(2)
+                                                        .map(|c| (c[0].clone(), c[1].clone()))
+                                                        .collect();
+                                                    (e.name.clone(), pairs, e.value)
+                                                })
+                                                .collect();
+                                        lorica_api::metrics::apply_worker_generic_counters(
+                                            worker_id,
+                                            &gc,
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(worker_id, error = %e, "heartbeat response failed - worker may be unresponsive");
+                                }
+                            }
+                        }
+                    }
+                }
+    })
 }
 
 /// Supervisor-side handler for `CommandType::RateLimitDelta`. Walks the
