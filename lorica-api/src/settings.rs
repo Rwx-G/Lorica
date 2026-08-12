@@ -11,6 +11,183 @@ use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
 
+// ---- Settings field bounds (single source of truth) ----
+//
+// Story 8.10 AC #7. These constants are the ONLY place the numeric
+// ranges and enum choice sets for the operator-tunable global settings
+// are declared. Both `update_settings` (the validator) and
+// `settings_schema` (the `GET /api/v1/settings/schema` payload) read
+// them, so the enforced bound and the advertised bound cannot drift.
+// Defaults are read from `GlobalSettings::default()` for the same
+// reason.
+
+const HEALTH_MAX_CONCURRENT_PROBES_MIN: i32 = 1;
+const HEALTH_MAX_CONCURRENT_PROBES_MAX: i32 = 512;
+const DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN: i32 = 1;
+const CERT_WARNING_DAYS_MIN: i32 = 1;
+const CERT_CRITICAL_DAYS_MIN: i32 = 1;
+const MAX_GLOBAL_CONNECTIONS_MIN: i32 = 0;
+const FLOOD_THRESHOLD_RPS_MIN: i32 = 0;
+const FLOOD_STRICT_RPS_MIN: u32 = 0;
+const FLOOD_STRICT_RPS_MAX: u32 = 10_000_000;
+const HEADER_TIMEOUT_S_MIN: u32 = 0;
+const HEADER_TIMEOUT_S_MAX: u32 = 3600;
+const WAF_BAN_THRESHOLD_MIN: i32 = 0;
+const WAF_BAN_DURATION_S_MIN: i32 = 0;
+const ACCESS_LOG_RETENTION_MIN: i64 = 0;
+const SLA_PURGE_RETENTION_DAYS_MIN: i32 = 1;
+const SLA_PURGE_RETENTION_DAYS_MAX: i32 = 3650;
+const OTLP_SAMPLING_RATIO_MIN: f64 = 0.0;
+const OTLP_SAMPLING_RATIO_MAX: f64 = 1.0;
+const CERT_EXPORT_MODE_MAX: u32 = 0o777;
+const MANAGEMENT_PORT_MAX: u16 = u16::MAX;
+
+const LOG_LEVEL_CHOICES: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+const OTLP_PROTOCOL_CHOICES: [&str; 3] = ["grpc", "http-proto", "http-json"];
+const SPOOFED_FALLBACK_CHOICES: [&str; 3] = ["deny", "log", "allow"];
+
+/// Build the machine-readable settings schema (Story 8.10 AC #7).
+///
+/// Returns a JSON object keyed by field name; each value carries a
+/// `type` (`"integer"` / `"number"` / `"boolean"` / `"string"` /
+/// `"enum"`), optional numeric `min` / `max`, a `default`, and, for
+/// enum fields, the `choices` array. Numeric bounds come from the
+/// shared `*_MIN` / `*_MAX` constants that `update_settings` enforces;
+/// defaults come from [`GlobalSettings::default`]. Fields whose
+/// validator only enforces a lower bound omit `max` (the server sets
+/// no ceiling; the dashboard supplies a UI-only cap).
+///
+/// # Examples
+///
+/// ```
+/// let schema = lorica_api::settings::settings_schema();
+/// assert_eq!(schema["header_timeout_s"]["max"], 3600);
+/// ```
+pub fn settings_schema() -> serde_json::Value {
+    let d: lorica_config::models::GlobalSettings = lorica_config::models::GlobalSettings::default();
+    serde_json::json!({
+        "management_port": {
+            "type": "integer",
+            "min": 0,
+            "max": MANAGEMENT_PORT_MAX,
+            "default": d.management_port,
+        },
+        "log_level": {
+            "type": "enum",
+            "choices": LOG_LEVEL_CHOICES,
+            "default": d.log_level,
+        },
+        "default_health_check_interval_s": {
+            "type": "integer",
+            "min": DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN,
+            "default": d.default_health_check_interval_s,
+        },
+        "health_max_concurrent_probes": {
+            "type": "integer",
+            "min": HEALTH_MAX_CONCURRENT_PROBES_MIN,
+            "max": HEALTH_MAX_CONCURRENT_PROBES_MAX,
+            "default": d.health_max_concurrent_probes,
+        },
+        "cert_warning_days": {
+            "type": "integer",
+            "min": CERT_WARNING_DAYS_MIN,
+            "default": d.cert_warning_days,
+        },
+        "cert_critical_days": {
+            "type": "integer",
+            "min": CERT_CRITICAL_DAYS_MIN,
+            "default": d.cert_critical_days,
+        },
+        "max_global_connections": {
+            "type": "integer",
+            "min": MAX_GLOBAL_CONNECTIONS_MIN,
+            "default": d.max_global_connections,
+        },
+        "flood_threshold_rps": {
+            "type": "integer",
+            "min": FLOOD_THRESHOLD_RPS_MIN,
+            "default": d.flood_threshold_rps,
+        },
+        "flood_strict_rps": {
+            "type": "integer",
+            "min": FLOOD_STRICT_RPS_MIN,
+            "max": FLOOD_STRICT_RPS_MAX,
+            "default": d.flood_strict_rps,
+        },
+        "header_timeout_s": {
+            "type": "integer",
+            "min": HEADER_TIMEOUT_S_MIN,
+            "max": HEADER_TIMEOUT_S_MAX,
+            "default": d.header_timeout_s,
+        },
+        "waf_ban_threshold": {
+            "type": "integer",
+            "min": WAF_BAN_THRESHOLD_MIN,
+            "default": d.waf_ban_threshold,
+        },
+        "waf_ban_duration_s": {
+            "type": "integer",
+            "min": WAF_BAN_DURATION_S_MIN,
+            "default": d.waf_ban_duration_s,
+        },
+        "access_log_retention": {
+            "type": "integer",
+            "min": ACCESS_LOG_RETENTION_MIN,
+            "default": d.access_log_retention,
+        },
+        "sla_purge_enabled": {
+            "type": "boolean",
+            "default": d.sla_purge_enabled,
+        },
+        "sla_purge_retention_days": {
+            "type": "integer",
+            "min": SLA_PURGE_RETENTION_DAYS_MIN,
+            "max": SLA_PURGE_RETENTION_DAYS_MAX,
+            "default": d.sla_purge_retention_days,
+        },
+        "otlp_protocol": {
+            "type": "enum",
+            "choices": OTLP_PROTOCOL_CHOICES,
+            "default": d.otlp_protocol,
+        },
+        "otlp_sampling_ratio": {
+            "type": "number",
+            "min": OTLP_SAMPLING_RATIO_MIN,
+            "max": OTLP_SAMPLING_RATIO_MAX,
+            "default": d.otlp_sampling_ratio,
+        },
+        "cert_export_file_mode": {
+            "type": "integer",
+            "min": 0,
+            "max": CERT_EXPORT_MODE_MAX,
+            "default": d.cert_export_file_mode,
+        },
+        "cert_export_dir_mode": {
+            "type": "integer",
+            "min": 0,
+            "max": CERT_EXPORT_MODE_MAX,
+            "default": d.cert_export_dir_mode,
+        },
+        "ai_bot_treat_spoofed_as": {
+            "type": "enum",
+            "choices": SPOOFED_FALLBACK_CHOICES,
+            "default": d.ai_bot_treat_spoofed_as,
+        },
+    })
+}
+
+/// GET /api/v1/settings/schema - return the operator-tunable global
+/// settings field bounds (Story 8.10 AC #7).
+///
+/// Read-only metadata; no store access. Gated like `GET /settings`
+/// (Viewer+) by the authorize middleware since the path falls under
+/// the GET/HEAD Viewer default before the settings-write SuperAdmin
+/// overlay. The dashboard consumes this to render input constraints
+/// instead of hardcoding them.
+pub async fn get_settings_schema() -> Json<serde_json::Value> {
+    json_data(settings_schema())
+}
+
 // ---- Global Settings ----
 
 /// GET /api/v1/settings - return the global settings document.
@@ -195,7 +372,7 @@ pub async fn update_settings(
         apply_string_choice(
             body.log_level,
             &mut settings.log_level,
-            &["trace", "debug", "info", "warn", "error"],
+            &LOG_LEVEL_CHOICES,
             "log_level",
         )?;
         // NOTE: bound drift - lower bound only, no upper cap unlike
@@ -203,39 +380,41 @@ pub async fn update_settings(
         apply_min_i32(
             body.default_health_check_interval_s,
             &mut settings.default_health_check_interval_s,
-            1,
+            DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN,
             "default_health_check_interval_s",
         )?;
         apply_ranged_i32(
             body.health_max_concurrent_probes,
             &mut settings.health_max_concurrent_probes,
-            1..=512,
-            "health_max_concurrent_probes must be in 1..=512",
+            HEALTH_MAX_CONCURRENT_PROBES_MIN..=HEALTH_MAX_CONCURRENT_PROBES_MAX,
+            &format!(
+                "health_max_concurrent_probes must be in {HEALTH_MAX_CONCURRENT_PROBES_MIN}..={HEALTH_MAX_CONCURRENT_PROBES_MAX}"
+            ),
         )?;
         // NOTE: bound drift - cert thresholds have no upper bound and
         // no warning > critical cross-check.
         apply_min_i32(
             body.cert_warning_days,
             &mut settings.cert_warning_days,
-            1,
+            CERT_WARNING_DAYS_MIN,
             "cert_warning_days",
         )?;
         apply_min_i32(
             body.cert_critical_days,
             &mut settings.cert_critical_days,
-            1,
+            CERT_CRITICAL_DAYS_MIN,
             "cert_critical_days",
         )?;
         apply_min_i32(
             body.max_global_connections,
             &mut settings.max_global_connections,
-            0,
+            MAX_GLOBAL_CONNECTIONS_MIN,
             "max_global_connections",
         )?;
         apply_min_i32(
             body.flood_threshold_rps,
             &mut settings.flood_threshold_rps,
-            0,
+            FLOOD_THRESHOLD_RPS_MIN,
             "flood_threshold_rps",
         )?;
         // Story 8.10 AC #2. `0` is accepted and means "auto"
@@ -243,20 +422,20 @@ pub async fn update_settings(
         apply_ranged_u32(
             body.flood_strict_rps,
             &mut settings.flood_strict_rps,
-            0..=10_000_000,
-            "flood_strict_rps must be in 0..=10000000",
+            FLOOD_STRICT_RPS_MIN..=FLOOD_STRICT_RPS_MAX,
+            &format!("flood_strict_rps must be in {FLOOD_STRICT_RPS_MIN}..={FLOOD_STRICT_RPS_MAX}"),
         )?;
         // Story 8.10 AC #1. `0` disables the global header-phase floor.
         apply_ranged_u32(
             body.header_timeout_s,
             &mut settings.header_timeout_s,
-            0..=3600,
-            "header_timeout_s must be in 0..=3600",
+            HEADER_TIMEOUT_S_MIN..=HEADER_TIMEOUT_S_MAX,
+            &format!("header_timeout_s must be in {HEADER_TIMEOUT_S_MIN}..={HEADER_TIMEOUT_S_MAX}"),
         )?;
         apply_min_i32(
             body.waf_ban_threshold,
             &mut settings.waf_ban_threshold,
-            0,
+            WAF_BAN_THRESHOLD_MIN,
             "waf_ban_threshold",
         )?;
         // NOTE: bound drift - 0 accepted (zero-duration ban), while the
@@ -264,21 +443,23 @@ pub async fn update_settings(
         apply_min_i32(
             body.waf_ban_duration_s,
             &mut settings.waf_ban_duration_s,
-            0,
+            WAF_BAN_DURATION_S_MIN,
             "waf_ban_duration_s",
         )?;
         apply_min_i64(
             body.access_log_retention,
             &mut settings.access_log_retention,
-            0,
+            ACCESS_LOG_RETENTION_MIN,
             "access_log_retention",
         )?;
         apply_plain(body.sla_purge_enabled, &mut settings.sla_purge_enabled);
         apply_ranged_i32(
             body.sla_purge_retention_days,
             &mut settings.sla_purge_retention_days,
-            1..=3650,
-            "sla_purge_retention_days must be in 1..=3650 (10 years)",
+            SLA_PURGE_RETENTION_DAYS_MIN..=SLA_PURGE_RETENTION_DAYS_MAX,
+            &format!(
+                "sla_purge_retention_days must be in {SLA_PURGE_RETENTION_DAYS_MIN}..={SLA_PURGE_RETENTION_DAYS_MAX} (10 years)"
+            ),
         )?;
         apply_sla_purge_schedule(body.sla_purge_schedule, &mut settings.sla_purge_schedule)?;
         apply_plain(
@@ -309,7 +490,7 @@ pub async fn update_settings(
         apply_string_choice(
             body.otlp_protocol,
             &mut settings.otlp_protocol,
-            &["grpc", "http-proto", "http-json"],
+            &OTLP_PROTOCOL_CHOICES,
             "otlp_protocol",
         )?;
         apply_otlp_service_name(body.otlp_service_name, &mut settings.otlp_service_name)?;

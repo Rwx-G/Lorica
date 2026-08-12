@@ -611,6 +611,13 @@ pub fn build_router(
                 .layer(bl(BODY_CAP_SETTINGS))
                 .layer(rl("settings", RL_SETTINGS_UPDATE, RL_WINDOW_S)),
         )
+        // Story 8.10 AC #7. Read-only field bounds; Viewer+ like the
+        // GET /settings read (the GET/HEAD default in the authorize
+        // middleware precedes the settings-write SuperAdmin overlay).
+        .route(
+            "/api/v1/settings/schema",
+            get(crate::settings::get_settings_schema),
+        )
         .route(
             "/api/v1/settings/otel/test",
             post(crate::settings::test_otel_connection),

@@ -5504,3 +5504,113 @@ async fn upgrade_endpoint_missing_signing_key_400s() {
         "an unconfigured signing key must produce the documented 400 message"
     );
 }
+
+// ---- Settings schema endpoint (Story 8.10 AC #7) ----
+
+async fn parse_data(response: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    json["data"].clone()
+}
+
+#[tokio::test]
+async fn test_settings_schema_endpoint_shape() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/settings/schema",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = parse_data(resp).await;
+
+    // Enum field: type + choices + default.
+    assert_eq!(schema["log_level"]["type"], "enum");
+    assert_eq!(schema["log_level"]["default"], "info");
+    assert_eq!(
+        schema["log_level"]["choices"],
+        serde_json::json!(["trace", "debug", "info", "warn", "error"])
+    );
+
+    // Ranged integer field: min + max + default.
+    assert_eq!(schema["header_timeout_s"]["type"], "integer");
+    assert_eq!(schema["header_timeout_s"]["min"], 0);
+    assert_eq!(schema["header_timeout_s"]["max"], 3600);
+    assert_eq!(schema["header_timeout_s"]["default"], 10);
+
+    // Min-only field: no `max` key (server enforces no ceiling).
+    assert_eq!(schema["cert_warning_days"]["min"], 1);
+    assert!(schema["cert_warning_days"].get("max").is_none());
+
+    // Enum sourced from the SpoofedFallback model (lowercase serde).
+    assert_eq!(
+        schema["ai_bot_treat_spoofed_as"]["choices"],
+        serde_json::json!(["deny", "log", "allow"])
+    );
+    assert_eq!(schema["ai_bot_treat_spoofed_as"]["default"], "deny");
+}
+
+#[tokio::test]
+async fn test_settings_schema_bounds_match_validator() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/settings/schema",
+        &admin,
+        None,
+    )
+    .await;
+    let schema = parse_data(resp).await;
+
+    // Anti-drift: the PUT validator must accept the advertised min and
+    // max and reject just past the max for every field carrying both
+    // bounds. If `update_settings` ever diverges from `settings_schema`
+    // the status flips and this fails.
+    for field in [
+        "health_max_concurrent_probes",
+        "header_timeout_s",
+        "flood_strict_rps",
+        "sla_purge_retention_days",
+    ] {
+        let min = schema[field]["min"].as_i64().expect("schema min");
+        let max = schema[field]["max"].as_i64().expect("schema max");
+
+        for (value, expected) in [
+            (min, StatusCode::OK),
+            (max, StatusCode::OK),
+            (max + 1, StatusCode::BAD_REQUEST),
+        ] {
+            let mut map = serde_json::Map::new();
+            map.insert(field.to_string(), serde_json::json!(value));
+            let resp = send(
+                &state,
+                &session_store,
+                &rate_limiter,
+                "PUT",
+                "/api/v1/settings",
+                &admin,
+                Some(serde_json::Value::Object(map)),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                expected,
+                "{field}={value} should map to {expected}"
+            );
+        }
+    }
+}

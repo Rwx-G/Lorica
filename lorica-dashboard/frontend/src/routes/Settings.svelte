@@ -7,6 +7,7 @@
     type UserPreferenceResponse,
     type SecurityHeaderPreset,
     type DnsProviderResponse,
+    type SettingsSchemaResponse,
   } from '../lib/api';
   import { showToast } from '../lib/toast';
   import SettingsDnsProviders from '../components/settings/SettingsDnsProviders.svelte';
@@ -29,6 +30,9 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
+  // Story 8.10 AC #7. Server-authoritative field bounds; empty until
+  // loaded, so the child components fall back to their UI defaults.
+  let settingsSchema = $state<SettingsSchemaResponse>({});
   let settingsForm = $state({
     management_port: 9443,
     log_level: 'info',
@@ -145,13 +149,17 @@
   async function loadAll() {
     loading = true;
     error = '';
-    const [settingsRes, notifRes, prefRes, histRes, dnsRes] = await Promise.all([
+    const [settingsRes, notifRes, prefRes, histRes, dnsRes, schemaRes] = await Promise.all([
       api.getSettings(),
       api.listNotifications(),
       api.listPreferences(),
       api.notificationHistory(),
       api.listDnsProviders(),
+      api.getSettingsSchema(),
     ]);
+    if (schemaRes.data) {
+      settingsSchema = schemaRes.data;
+    }
     if (settingsRes.error) {
       error = settingsRes.error.message;
     } else if (settingsRes.data) {
@@ -374,6 +382,7 @@
 
     <GlobalConfigTab
       bind:settingsForm
+      schema={settingsSchema}
       expanded={expandedSections.global}
       toggleSection={() => toggleSection('global')}
       {settingsSaving}

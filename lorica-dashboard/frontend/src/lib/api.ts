@@ -840,6 +840,26 @@ export interface UpdateSettingsRequest {
   mirror_max_concurrent_global?: number;
 }
 
+/**
+ * Bounds for a single operator-tunable global-settings field
+ * (Story 8.10 AC #7). `min` is present on numeric fields; `max` is
+ * present only when the server enforces an upper bound; `choices` is
+ * present on enum fields. `default` is the server default.
+ */
+export interface SettingsFieldSchema {
+  type: 'integer' | 'number' | 'boolean' | 'string' | 'enum';
+  min?: number;
+  max?: number;
+  default?: number | string | boolean;
+  choices?: string[];
+}
+
+/**
+ * `GET /settings/schema` payload: field name -> bounds. Consumed by the
+ * settings forms to render input constraints from the server.
+ */
+export type SettingsSchemaResponse = Record<string, SettingsFieldSchema>;
+
 export interface CertExportAclResponse {
   id: string;
   hostname_pattern: string;
@@ -1267,6 +1287,12 @@ export const api = {
 
   updateSettings: (body: UpdateSettingsRequest) =>
     request<GlobalSettingsResponse>('PUT', '/settings', body),
+
+  // Story 8.10 AC #7. Server-authoritative field bounds so forms
+  // render input constraints (min/max/choices) from the backend
+  // instead of hardcoding them. Read-only, Viewer+.
+  getSettingsSchema: () =>
+    request<SettingsSchemaResponse>('GET', '/settings/schema'),
 
   // Mint a single canary OTel span via the CURRENTLY persisted
   // `otlp_endpoint` + `otlp_protocol`. Used by the "Test

@@ -454,6 +454,37 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /api/v1/settings/schema:
+    get:
+      tags: [Settings]
+      summary: Get global-settings field bounds
+      description: |
+        Machine-readable constraints for every operator-tunable global
+        settings field (Story 8.10 AC #7). Keyed by field name; each
+        value carries a `type` (`integer`, `number`, `boolean`,
+        `string`, or `enum`), optional `min` / `max`, a `default`, and,
+        for enum fields, the `choices` array. The dashboard renders
+        input constraints from this payload instead of hardcoding them.
+        Numeric bounds are the same values the `PUT /api/v1/settings`
+        validator enforces. Read-only metadata, Viewer+ like
+        `GET /api/v1/settings`.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Settings field schema
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    additionalProperties:
+                      $ref: "#/components/schemas/SettingsFieldSchema"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   # ---------------------------------------------------------------------------
   # Routes
   # ---------------------------------------------------------------------------
@@ -3668,6 +3699,32 @@ components:
           properties:
             message:
               type: string
+
+    SettingsFieldSchema:
+      type: object
+      description: |
+        Constraints for a single operator-tunable global settings field
+        (Story 8.10 AC #7). Numeric fields carry `min` and, when the
+        validator enforces an upper bound, `max`. Enum fields carry
+        `choices`. Every field carries its `default`.
+      properties:
+        type:
+          type: string
+          enum: [integer, number, boolean, string, enum]
+        min:
+          type: number
+          description: Inclusive lower bound (numeric fields only).
+        max:
+          type: number
+          description: Inclusive upper bound; omitted when the server enforces no ceiling.
+        default:
+          description: Default value from GlobalSettings::default.
+        choices:
+          type: array
+          items:
+            type: string
+          description: Allowed values (enum fields only).
+      required: [type]
 
     # v1.5.1 audit L-14 : richer schemas for the
     # Notification + Preference endpoints that previously
