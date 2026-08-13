@@ -5,8 +5,9 @@ services:
     container_name: lorica
     # The management API binds 127.0.0.1 inside the container, so port
     # publishing (-p / ports:) cannot reach the dashboard. Host networking
-    # makes http://127.0.0.1:9443 reachable from the host directly. See the
-    # "Run with Docker" section in README.md.
+    # makes https://127.0.0.1:9443 reachable from the host directly (TLS with
+    # a self-signed cert on first boot). See the "Run with Docker" section in
+    # README.md.
     network_mode: host
     volumes:
       - lorica-data:/var/lib/lorica

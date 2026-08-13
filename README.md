@@ -139,8 +139,9 @@ docker run -d --name lorica --network host \
   -v lorica-data:/var/lib/lorica lorica
 ```
 
-With `--network host` the dashboard is reachable at `http://127.0.0.1:9443`
-(HTTP, not HTTPS) and the proxy listeners bind straight onto the host -
+With `--network host` the dashboard is reachable at `https://127.0.0.1:9443`
+(TLS with a self-signed certificate generated on first boot - accept the
+browser warning) and the proxy listeners bind straight onto the host -
 `:8080` (HTTP) and `:8443` (HTTPS) - so no `-p` flags are needed.
 
 Get the first-run admin password (printed to stdout once and persisted to a
@@ -152,8 +153,9 @@ docker exec lorica cat /var/lib/lorica/initial-admin-password
 docker logs lorica 2>&1 | grep 'Initial admin password:'
 ```
 
-Open `http://127.0.0.1:9443` in your browser and log in with `admin` + the
-password. You will be prompted to change it on first login.
+Open `https://127.0.0.1:9443` in your browser (accept the self-signed
+certificate) and log in with `admin` + the password. You will be prompted
+to change it on first login.
 
 > **Why not `-p 9443:9443`?** The management server binds `127.0.0.1` only
 > (see `lorica-api/src/server.rs`), so port publishing cannot reach it. Use
@@ -174,8 +176,9 @@ On a production host, reach the dashboard through an **SSH tunnel**:
 ssh -L 9443:127.0.0.1:9443 user@host
 ```
 
-Then open `http://127.0.0.1:9443` locally. For TLS-encrypted remote access via
-the proxy itself (not recommended for production), see
+Then open `https://127.0.0.1:9443` locally (accept the self-signed
+certificate). For exposing the dashboard through the proxy itself (not
+recommended for production), see
 [docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md).
 
 ### Run directly
@@ -184,9 +187,10 @@ the proxy itself (not recommended for production), see
 lorica --data-dir /var/lib/lorica
 ```
 
-Open `http://127.0.0.1:9443` in your browser (loopback-only by design - use an
-SSH tunnel on remote hosts; see above). On first run, a random admin password
-is written to `<data-dir>/initial-admin-password` (mode 0600).
+Open `https://127.0.0.1:9443` in your browser (loopback-only by design,
+self-signed certificate - use an SSH tunnel on remote hosts; see above). On
+first run, a random admin password is written to
+`<data-dir>/initial-admin-password` (mode 0600).
 
 ### CLI options
 
@@ -300,13 +304,13 @@ Create a route via the REST API:
 
 ```bash
 # Authenticate
-TOKEN=$(curl -s http://127.0.0.1:9443/api/v1/auth/login \
+TOKEN=$(curl -sk https://127.0.0.1:9443/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"your-admin-password"}' \
   -c - | grep session | awk '{print $NF}')
 
 # Create a backend
-curl -s http://127.0.0.1:9443/api/v1/backends \
+curl -sk https://127.0.0.1:9443/api/v1/backends \
   -b "session=$TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -317,7 +321,7 @@ curl -s http://127.0.0.1:9443/api/v1/backends \
   }'
 
 # Create a route
-curl -s http://127.0.0.1:9443/api/v1/routes \
+curl -sk https://127.0.0.1:9443/api/v1/routes \
   -b "session=$TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -342,7 +346,7 @@ Or just use the dashboard - it covers all the same operations with zero curl.
 
 ## REST API Reference
 
-All endpoints are served on the management port (default `9443`) over HTTP (loopback only). Protected endpoints require a session cookie obtained via `/api/v1/auth/login`.
+All endpoints are served on the management port (default `9443`) over HTTPS (a self-signed certificate generated on first boot; loopback only, so `curl -k` accepts it). Protected endpoints require a session cookie obtained via `/api/v1/auth/login`.
 
 ### Public endpoints
 

@@ -4,7 +4,7 @@
 # Build:
 #   docker build -t lorica .
 #
-# Run (Linux; management API binds 127.0.0.1 — use host networking):
+# Run (Linux; management API binds 127.0.0.1 - use host networking):
 #   docker run -d --name lorica --network host \
 #     -v lorica-data:/var/lib/lorica lorica
 
