@@ -46,16 +46,24 @@ use tokio::net::TcpListener;
 // by the origin so the route's configured TTL / SWR values apply.
 // ---------------------------------------------------------------------------
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct OriginState {
     hits: AtomicU64,
     version: AtomicU64, // body = format!("v{version}")
+    // Deterministic refresh barrier (opt-in; `0` = disabled). Once the
+    // hit count reaches `gate_from_hit`, the origin holds that response
+    // until the test releases a `gate` permit. Lets a test pin a
+    // background refresh in-flight instead of racing its completion.
+    gate_from_hit: AtomicU64,
+    gate: tokio::sync::Semaphore,
 }
 
 async fn spawn_versioned_origin() -> (SocketAddr, Arc<OriginState>) {
     let state = Arc::new(OriginState {
         hits: AtomicU64::new(0),
         version: AtomicU64::new(1),
+        gate_from_hit: AtomicU64::new(0),
+        gate: tokio::sync::Semaphore::new(0),
     });
     let state_c = Arc::clone(&state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -86,6 +94,19 @@ async fn spawn_versioned_origin() -> (SocketAddr, Arc<OriginState>) {
                     }
                 }
                 let hit = state.hits.fetch_add(1, Ordering::SeqCst) + 1;
+                // Deterministic refresh barrier: hold the gated hit's
+                // response until the test releases a permit, keeping a
+                // background refresh in-flight while the test inspects
+                // the stale readers.
+                let gate_from = state.gate_from_hit.load(Ordering::SeqCst);
+                if gate_from != 0 && hit >= gate_from {
+                    state
+                        .gate
+                        .acquire()
+                        .await
+                        .expect("origin gate semaphore closed")
+                        .forget();
+                }
                 let v = state.version.load(Ordering::SeqCst);
                 // version=0 is a test-controlled "failure mode": the
                 // origin emits 503 so stale-if-error and failed-SWR-
@@ -545,6 +566,11 @@ async fn swr_concurrent_requests_spawn_exactly_one_background_refresh() {
     // Populate cache (hit 1).
     let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(r.text().await.unwrap(), "v1-hit1");
+    // Arm the deterministic refresh barrier: the single background
+    // refresh (origin hit #2) blocks until we release it, so the
+    // concurrent readers below observe stale v1 with certainty instead
+    // of racing the refresh completing mid-batch (the old flake).
+    state.gate_from_hit.store(2, Ordering::SeqCst);
     state.version.store(2, Ordering::SeqCst);
 
     tokio::time::sleep(Duration::from_millis(1_300)).await;
@@ -570,6 +596,10 @@ async fn swr_concurrent_requests_spawn_exactly_one_background_refresh() {
             "concurrent SWR readers must all see stale v1"
         );
     }
+
+    // The stale readers are verified; release the held refresh so it
+    // completes and republishes v2.
+    state.gate.add_permits(1);
 
     // Wait for the background refresh to reach the origin, then
     // assert exactly ONE refresh was spawned regardless of how many
