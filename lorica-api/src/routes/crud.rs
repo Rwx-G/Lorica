@@ -6,9 +6,8 @@
 //! `forward_auth`, `mirror`, `response_rewrite`, `mtls`, `path_rules`).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Extension, Path};
+use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
@@ -3295,7 +3294,7 @@ pub async fn list_routes(
 /// Validates type-shape (enum parsing, regex compilability); business
 /// rules (hostname uniqueness) are enforced by the store layer.
 pub async fn create_route(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -3656,7 +3655,7 @@ pub async fn get_route(
 
 /// PUT /api/v1/routes/:id - patch route fields and trigger a proxy reload.
 pub async fn update_route(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -4095,7 +4094,7 @@ pub async fn update_route(
 
 /// DELETE /api/v1/routes/:id - delete a route and notify the proxy.
 pub async fn delete_route(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

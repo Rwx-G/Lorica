@@ -34,12 +34,11 @@
 //! - The total custom-crawler row count MUST stay below
 //!   `CUSTOM_CRAWLER_MAX_COUNT` on insert.
 
-use axum::extract::{ConnectInfo, Extension, Path, Query};
+use axum::extract::{Extension, Path, Query};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use ipnet::IpNet;
-use std::net::SocketAddr;
 use lorica_config::ai_crawler_registry::{
     build_robots_txt_from_names, BASELINE_UAS, BUILTIN_CRAWLER_DESCRIPTORS,
 };
@@ -124,7 +123,7 @@ pub async fn list_custom_crawlers(
 /// Pipeline-validates the regex (compile + baseline-UA smoke), the
 /// verification kind payload, and the count cap.
 pub async fn create_custom_crawler(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -167,7 +166,7 @@ pub async fn create_custom_crawler(
 
 /// `PUT /api/v1/ai-crawlers/custom/:id` - update an existing row.
 pub async fn update_custom_crawler(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -211,7 +210,7 @@ pub async fn update_custom_crawler(
 
 /// `DELETE /api/v1/ai-crawlers/custom/:id` - remove a row.
 pub async fn delete_custom_crawler(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

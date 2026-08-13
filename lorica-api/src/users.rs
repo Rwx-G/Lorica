@@ -6,14 +6,13 @@
 //! last-super-admin invariant. Any role change, disable, or password
 //! reset invalidates every session of the target user immediately.
 
-use axum::extract::{ConnectInfo, Extension, Path};
+use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
 use lorica_config::models::{Role, User};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 use crate::auth::hash_password;
 use crate::db::db_blocking;
@@ -133,7 +132,7 @@ pub async fn get_user(
 
 /// POST /api/v1/users - create an account.
 pub async fn create_user(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -194,7 +193,7 @@ pub async fn create_user(
 
 /// PUT /api/v1/users/{id} - update password / role / disabled flag.
 pub async fn update_user(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
@@ -290,7 +289,7 @@ pub async fn update_user(
 
 /// DELETE /api/v1/users/{id} - delete an account.
 pub async fn delete_user(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,

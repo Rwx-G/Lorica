@@ -1,10 +1,9 @@
 //! Global settings, notification channels, and per-user UI preferences endpoints.
 
-use axum::extract::{ConnectInfo, Extension, Path};
+use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 use crate::db::{db_blocking, log_db_blocking};
 use crate::error::{json_data, json_data_with_status, ApiError};
@@ -358,7 +357,7 @@ pub struct UpdateSettingsRequest {
 /// are kept on purpose (normalising them is a behaviour change) and
 /// flagged with `// NOTE: bound drift` comments for the next audit.
 pub async fn update_settings(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -1052,7 +1051,7 @@ pub struct CreateNotificationRequest {
 
 /// POST /api/v1/notifications - register a new notification channel.
 pub async fn create_notification(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -1098,7 +1097,7 @@ pub async fn create_notification(
 
 /// POST /api/v1/notifications/:id/test - send a real test alert through the configured channel.
 pub async fn test_notification(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -1258,7 +1257,7 @@ fn validate_notification_config(config: &str) -> Result<(), ApiError> {
 
 /// PUT /api/v1/notifications/:id - update channel config; `********` placeholders preserve stored secrets.
 pub async fn update_notification(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -1365,7 +1364,7 @@ pub async fn update_notification(
 
 /// DELETE /api/v1/notifications/:id - remove a notification channel.
 pub async fn delete_notification(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -1413,7 +1412,7 @@ pub struct UpdatePreferenceRequest {
 
 /// PUT /api/v1/preferences/:id - update one user preference value.
 pub async fn update_preference(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -1461,7 +1460,7 @@ pub async fn update_preference(
 
 /// DELETE /api/v1/preferences/:id - remove a user preference.
 pub async fn delete_preference(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

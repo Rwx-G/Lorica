@@ -1,11 +1,10 @@
 //! CRUD endpoints for upstream backends, including graceful drain on delete.
 
-use axum::extract::{ConnectInfo, Extension, Path};
+use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
@@ -187,7 +186,7 @@ pub async fn list_backends(
 
 /// POST /api/v1/backends - register a new upstream backend.
 pub async fn create_backend(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -259,7 +258,7 @@ pub async fn get_backend(
 
 /// PUT /api/v1/backends/:id - patch backend fields and trigger a proxy reload.
 pub async fn update_backend(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -345,7 +344,7 @@ pub async fn update_backend(
 /// that waits for active connections to reach 0 (or a 60s timeout)
 /// before deleting the backend from the database.
 pub async fn delete_backend(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

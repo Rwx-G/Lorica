@@ -14,10 +14,9 @@
 
 //! WAF security events API for the management dashboard.
 
-use axum::extract::{ConnectInfo, Extension, Query};
+use axum::extract::{Extension, Query};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 use crate::db::{db_blocking, log_db_blocking};
 use crate::error::{json_data, ApiError};
@@ -190,7 +189,7 @@ pub struct RuleToggleRequest {
 
 /// PUT /api/v1/waf/rules/:id - enable or disable a specific rule
 pub async fn toggle_waf_rule(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -244,7 +243,7 @@ pub async fn toggle_waf_rule(
 
 /// DELETE /api/v1/waf/events - clear WAF event buffer
 pub async fn clear_waf_events(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -299,7 +298,7 @@ pub struct CreateCustomRuleRequest {
 
 /// POST /api/v1/waf/rules/custom - create a user-defined WAF rule
 pub async fn create_custom_rule(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -388,7 +387,7 @@ pub async fn list_custom_rules(
 
 /// DELETE /api/v1/waf/rules/custom/:id - delete a user-defined WAF rule
 pub async fn delete_custom_rule(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -454,7 +453,7 @@ pub struct BlocklistToggleRequest {
 
 /// PUT /api/v1/waf/blocklist - enable or disable the IP blocklist
 pub async fn toggle_blocklist(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -539,7 +538,7 @@ pub async fn fetch_and_load_blocklist(
 
 /// POST /api/v1/waf/blocklist/reload - reload the IP blocklist from the remote URL
 pub async fn reload_blocklist(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

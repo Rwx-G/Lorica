@@ -14,13 +14,12 @@
 
 //! Read and configure SLA windows, raw buckets, and CSV/JSON exports per route.
 
-use axum::extract::{ConnectInfo, Path};
+use axum::extract::{Path};
 use axum::response::IntoResponse;
 use axum::Extension;
 use axum::Json;
 use chrono::{Duration, Utc};
 use serde::Deserialize;
-use std::net::SocketAddr;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
@@ -126,7 +125,7 @@ pub struct UpdateSlaConfig {
 
 /// PUT /api/v1/sla/routes/:id/config - patch SLA targets and refresh the live collector cache.
 pub async fn update_sla_config(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -308,7 +307,7 @@ pub async fn export_sla_data(
 
 /// DELETE /api/v1/sla/routes/:id/data - delete every persisted SLA bucket and clear the in-memory collector.
 pub async fn clear_route_sla(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

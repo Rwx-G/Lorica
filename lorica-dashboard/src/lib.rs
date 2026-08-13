@@ -37,7 +37,7 @@ const NONCE_PLACEHOLDER: &str = "__LORICA_CSP_NONCE__";
 pub fn router() -> Router {
     Router::new()
         .route("/", get(index_handler))
-        .route("/assets/*path", get(static_handler))
+        .route("/assets/{*path}", get(static_handler))
         .route(
             "/favicon.png",
             get(|| async { serve_embedded_file("favicon.png") }),

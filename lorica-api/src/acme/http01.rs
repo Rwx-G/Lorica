@@ -14,10 +14,9 @@
 
 //! HTTP-01 challenge provisioning: axum endpoints and the internal flow.
 
-use axum::extract::{ConnectInfo, Extension, Path};
+use axum::extract::{Extension, Path};
 use axum::Json;
 use serde::Deserialize;
-use std::net::SocketAddr;
 use tracing::{info, warn};
 
 use crate::db::db_blocking;
@@ -47,7 +46,7 @@ pub struct AcmeProvisionRequest {
 ///
 /// **Requires**: port 80 reachable from the Internet for HTTP-01 challenge.
 pub async fn provision_certificate(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

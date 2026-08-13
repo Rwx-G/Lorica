@@ -14,14 +14,13 @@
 
 //! Active SLA probe configuration endpoints (CRUD plus per-probe history).
 
-use axum::extract::{ConnectInfo, Path, Query};
+use axum::extract::{Path, Query};
 use axum::Extension;
 use axum::Json;
 use chrono::Utc;
 use lorica_config::models::ProbeConfig;
 use lorica_config::store::new_id;
 use serde::Deserialize;
-use std::net::SocketAddr;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
@@ -79,7 +78,7 @@ pub struct CreateProbe {
 
 /// POST /api/v1/probes - create a new active probe attached to a route.
 pub async fn create_probe(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -158,7 +157,7 @@ pub struct UpdateProbe {
 
 /// PUT /api/v1/probes/:id - patch fields on an existing probe configuration.
 pub async fn update_probe(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -226,7 +225,7 @@ pub async fn update_probe(
 /// DELETE /api/v1/probes/:id
 /// Delete a probe configuration.
 pub async fn delete_probe(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

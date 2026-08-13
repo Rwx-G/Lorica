@@ -15,9 +15,8 @@
 //! Background renewal task and manual renewal endpoint.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Extension, Path};
+use axum::extract::{Extension, Path};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use tracing::{error, info, warn};
@@ -360,7 +359,7 @@ pub fn spawn_renewal_task(
 
 /// POST /api/v1/certificates/:id/renew - manually trigger ACME renewal for a certificate
 pub async fn renew_certificate(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

@@ -4,13 +4,12 @@
 //! present and falls back to the in-process [`LogBuffer`] otherwise.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Extension, Query};
+use axum::extract::{Extension, Query};
 use axum::response::IntoResponse;
 use axum::Json;
 use futures_util::{SinkExt, StreamExt};
 use http::header;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 use tokio::sync::broadcast;
 
 use crate::db::log_db_blocking;
@@ -490,7 +489,7 @@ pub async fn export_logs(
 
 /// DELETE /api/v1/logs - empty both the in-memory ring buffer and the persistent store.
 pub async fn clear_logs(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -554,7 +553,7 @@ async fn handle_log_stream(socket: WebSocket, mut rx: broadcast::Receiver<LogEnt
             match rx.recv().await {
                 Ok(entry) => {
                     if let Ok(json) = serde_json::to_string(&entry) {
-                        if sender.send(Message::Text(json)).await.is_err() {
+                        if sender.send(Message::Text(json.into())).await.is_err() {
                             break; // Client disconnected
                         }
                     }

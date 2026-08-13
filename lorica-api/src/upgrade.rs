@@ -24,11 +24,10 @@
 //! [`GlobalSettings::upgrade_signing_pubkey_path`]: lorica_config::models::GlobalSettings::upgrade_signing_pubkey_path
 
 use std::io::Write as _;
-use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use axum::extract::{ConnectInfo, Extension, Multipart};
+use axum::extract::{Extension, Multipart};
 use axum::Json;
 use ed25519_dalek::{Signature, VerifyingKey};
 use thiserror::Error;
@@ -357,7 +356,7 @@ fn stage_binary(data_dir: &Path, binary: &[u8]) -> Result<PathBuf, UpgradeError>
 /// Authorization: mounted behind `require_auth`. Story 8.3 RBAC will
 /// retag this SuperAdmin-only once role tags land.
 pub async fn upgrade_binary(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

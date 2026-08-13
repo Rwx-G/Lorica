@@ -5,13 +5,12 @@
 //! per-pattern ACL list and the "trigger a full re-export now"
 //! convenience endpoint.
 
-use axum::extract::{ConnectInfo, Extension, Path};
+use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use lorica_config::models::CertExportAcl;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 use uuid::Uuid;
 
 use crate::db::db_blocking;
@@ -105,7 +104,7 @@ fn validate_pattern(raw: &str) -> Result<String, ApiError> {
 
 /// POST /api/v1/cert-export/acls - add a new ACL row.
 pub async fn create_acl(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -169,7 +168,7 @@ pub async fn list_acls(
 
 /// DELETE /api/v1/cert-export/acls/:id - remove one ACL. Idempotent.
 pub async fn delete_acl(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -201,7 +200,7 @@ pub async fn delete_acl(
 /// on-disk files realigned without waiting for the next ACME
 /// renewal.
 pub async fn reapply(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -283,7 +282,7 @@ pub async fn list_orphans(
 /// live-cert re-check) before any filesystem write, so a stale or
 /// racy dashboard click cannot blow away a legitimate directory.
 pub async fn delete_orphan(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

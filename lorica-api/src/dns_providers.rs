@@ -1,11 +1,10 @@
 //! CRUD endpoints for stored DNS provider credentials used by ACME DNS-01
 //! challenges (Cloudflare, Route53, OVH).
 
-use axum::extract::{ConnectInfo, Extension, Path};
+use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
@@ -148,7 +147,7 @@ impl DnsProviderConfig {
 
 /// POST /api/v1/dns-providers - register a new DNS provider with provider-specific credentials.
 pub async fn create_dns_provider(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -195,7 +194,7 @@ pub async fn create_dns_provider(
 
 /// PUT /api/v1/dns-providers/:id - replace the credentials and metadata of an existing DNS provider.
 pub async fn update_dns_provider(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -245,7 +244,7 @@ pub async fn update_dns_provider(
 
 /// DELETE /api/v1/dns-providers/:id - delete the provider, refusing if any certificate references it.
 pub async fn delete_dns_provider(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -283,7 +282,7 @@ pub async fn delete_dns_provider(
 
 /// POST /api/v1/dns-providers/:id/test - test DNS provider connectivity
 pub async fn test_dns_provider(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

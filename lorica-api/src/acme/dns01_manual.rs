@@ -14,10 +14,9 @@
 
 //! Two-step manual DNS-01 challenge flow (init, check, confirm).
 
-use std::net::SocketAddr;
 use std::time::Instant;
 
-use axum::extract::{ConnectInfo, Extension};
+use axum::extract::{Extension};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -87,7 +86,7 @@ pub struct AcmeDnsManualConfirmRequest {
 /// the TXT record. Instead it returns the record name and value so the user can
 /// create it manually. The pending challenge is stored in memory.
 pub async fn provision_dns_manual(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -356,7 +355,7 @@ async fn check_txt_record(
 /// to verify the challenge, waits for validation, downloads the certificate, and
 /// stores it in the database.
 pub async fn provision_dns_manual_confirm(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

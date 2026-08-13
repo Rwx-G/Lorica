@@ -1,9 +1,8 @@
 //! Response cache statistics, route purge, and IP ban list management.
 
-use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
-use axum::extract::{ConnectInfo, Path};
+use axum::extract::{Path};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 
@@ -19,7 +18,7 @@ use crate::server::AppState;
 /// clears **all** cached entries as a pragmatic alternative and resets the
 /// hit/miss counters.
 pub async fn purge_route_cache(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -146,7 +145,7 @@ pub async fn list_bans(
 ///
 /// Remove a specific IP from the ban list.
 pub async fn delete_ban(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

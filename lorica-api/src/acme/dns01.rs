@@ -14,10 +14,9 @@
 
 //! Automated DNS-01 challenge provisioning: endpoint and internal flow.
 
-use axum::extract::{ConnectInfo, Extension};
+use axum::extract::{Extension};
 use axum::Json;
 use serde::Deserialize;
-use std::net::SocketAddr;
 use tracing::{info, warn};
 
 use crate::db::db_blocking;
@@ -53,7 +52,7 @@ pub struct AcmeDnsProvisionRequest {
 /// the DNS-01 challenge by creating a TXT record via the configured DNS provider,
 /// and waits for certificate issuance.
 pub async fn provision_certificate_dns(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

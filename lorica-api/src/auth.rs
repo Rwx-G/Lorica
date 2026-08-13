@@ -4,9 +4,8 @@
 //! Sessions are tracked by [`SessionStore`] and exposed via an HTTP-only
 //! `lorica_session` cookie.
 
-use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Extension};
+use axum::extract::{Extension};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -91,14 +90,14 @@ pub struct PasswordChangedResponse {
 /// Rate limited per source IP. On success returns a `Set-Cookie` header
 /// with the new `lorica_session` token and updates `last_login`.
 pub async fn login(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
     Extension(rate_limiter): Extension<RateLimiter>,
     headers: http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let client_ip = connect_info
+    let client_ip = connect_info.0
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     // Legacy fixed 5/60 s login bucket. Retained via
@@ -202,7 +201,7 @@ pub async fn login(
 
 /// POST /api/v1/auth/logout - invalidate the current session and clear the cookie.
 pub async fn logout(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
     headers: http::HeaderMap,
@@ -276,7 +275,7 @@ pub async fn me(Extension(session): Extension<Session>) -> impl IntoResponse {
 /// user stays logged in while any attacker holding the previous
 /// cookie gets a 401 on the next call (v1.5.0 audit LOW-13).
 pub async fn change_password(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,

@@ -1,11 +1,10 @@
 //! Endpoints to export the running configuration as TOML and import a new
 //! one (with optional dry-run diff preview).
 
-use axum::extract::{ConnectInfo, Extension};
+use axum::extract::{Extension};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
-use std::net::SocketAddr;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
@@ -21,7 +20,7 @@ pub struct ImportRequest {
 
 /// POST /api/v1/config/export - serialize the current configuration as a TOML download.
 pub async fn export_config(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -70,7 +69,7 @@ const MAX_IMPORT_SIZE: usize = 1_048_576;
 
 /// POST /api/v1/config/import - replace the entire configuration from a TOML payload (max 1 MB).
 pub async fn import_config(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

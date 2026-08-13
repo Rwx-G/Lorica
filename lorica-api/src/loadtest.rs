@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Path};
+use axum::extract::{Path};
 use axum::response::IntoResponse;
 use axum::Extension;
 use axum::Json;
@@ -28,7 +28,6 @@ use lorica_bench::load_test;
 use lorica_config::models::LoadTestConfig;
 use lorica_config::store::new_id;
 use serde::Deserialize;
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::db::db_blocking;
@@ -170,7 +169,7 @@ fn validate_target_url(
 
 /// POST /api/v1/loadtest/configs - create a new load test configuration. Target must match a configured route.
 pub async fn create_config(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -257,7 +256,7 @@ pub struct UpdateLoadTestConfig {
 
 /// PUT /api/v1/loadtest/configs/:id - patch fields on a saved load test configuration.
 pub async fn update_config(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -337,7 +336,7 @@ pub async fn update_config(
 
 /// DELETE /api/v1/loadtest/configs/:id - delete a saved load test configuration.
 pub async fn delete_config(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -367,7 +366,7 @@ pub async fn delete_config(
 
 /// POST /api/v1/loadtest/start/:config_id - launch a load test, returning a confirmation requirement if it exceeds safe limits.
 pub async fn start_test(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -434,7 +433,7 @@ pub async fn start_test(
 
 /// POST /api/v1/loadtest/start/:config_id/confirm - launch a load test that exceeds safe limits, after explicit user confirmation.
 pub async fn start_test_confirmed(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -502,7 +501,7 @@ pub async fn get_status(
 
 /// POST /api/v1/loadtest/abort - request that the running load test stop.
 pub async fn abort_test(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -599,7 +598,7 @@ async fn handle_loadtest_stream(
                 None => r#"{"active":false}"#.to_string(),
             };
 
-            if sender.send(Message::Text(json)).await.is_err() {
+            if sender.send(Message::Text(json.into())).await.is_err() {
                 break; // Client disconnected
             }
         }
@@ -630,7 +629,7 @@ pub struct CloneConfig {
 
 /// POST /api/v1/loadtest/configs/:id/clone - duplicate a configuration so successive runs are comparable.
 pub async fn clone_config(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,

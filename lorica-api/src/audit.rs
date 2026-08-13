@@ -32,9 +32,11 @@
 //! hashed, never stored: no secret material can land in the audit
 //! table by construction.
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Extension, Query};
+use axum::extract::{ConnectInfo, Extension, FromRequestParts, Query};
+use axum::http::request::Parts;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
@@ -284,6 +286,38 @@ impl AuditContext {
                 .unwrap_or_default()
                 .to_string(),
         }
+    }
+}
+
+/// Optional peer-address extractor for management-plane handlers.
+///
+/// Mirrors the axum 0.7 behavior of `Option<ConnectInfo<SocketAddr>>`:
+/// yields the peer address when the server was started with
+/// `into_make_service_with_connect_info` (production), and `None`
+/// otherwise (unit tests driving the router via Tower `oneshot`, which
+/// do not attach `ConnectInfo`). axum 0.8 dropped the blanket
+/// `Option<T: FromRequestParts>` impl and `ConnectInfo` implements only
+/// the fallible `FromRequestParts`, so this restores the never-rejecting
+/// behavior without changing any call site.
+#[derive(Debug, Clone)]
+pub struct ClientConnectInfo(pub Option<ConnectInfo<SocketAddr>>);
+
+impl ClientConnectInfo {
+    /// Borrow the inner `ConnectInfo`, matching the shape
+    /// [`AuditContext::new`] expects.
+    pub fn as_ref(&self) -> Option<&ConnectInfo<SocketAddr>> {
+        self.0.as_ref()
+    }
+}
+
+impl<S> FromRequestParts<S> for ClientConnectInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(parts.extensions.get::<ConnectInfo<SocketAddr>>().cloned()))
     }
 }
 

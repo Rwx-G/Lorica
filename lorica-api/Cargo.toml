@@ -25,10 +25,10 @@ lorica-bench = { version = "1.6.0", path = "../lorica-bench" }
 # + `rustls-pki-types`) into the `lorica-api` binary, not just the
 # PEM parser.
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
-axum = { version = "0.7", features = ["multipart", "ws"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 futures-util = "0.3"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time"] }
 # Management-plane TLS (Story 8.8 AC #1/#2). The management API moved
 # off plaintext `axum::serve` onto a manual rustls accept loop: axum 0.7
@@ -130,7 +130,7 @@ route53 = ["aws-config", "aws-sdk-route53"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 hyper = { version = "1", features = ["full"] }
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 # HTTP mock server for unit-testing the Cloudflare + OVH DNS
 # challengers without hitting the real providers (v1.5.0 backlog

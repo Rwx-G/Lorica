@@ -345,7 +345,7 @@ pub fn build_router(
             crate::middleware::metrics_auth::metrics_auth,
         ));
     let acme_challenge_routes = Router::new().route(
-        "/.well-known/acme-challenge/:token",
+        "/.well-known/acme-challenge/{token}",
         get(crate::acme::serve_challenge),
     );
 
@@ -374,7 +374,7 @@ pub fn build_router(
                 .layer(rl("users", RL_USERS, RL_WINDOW_S)),
         )
         .route(
-            "/api/v1/users/:id",
+            "/api/v1/users/{id}",
             get(crate::users::get_user)
                 .put(crate::users::update_user)
                 .delete(crate::users::delete_user)
@@ -387,15 +387,15 @@ pub fn build_router(
                 .layer(bl(BODY_CAP_DEFAULT))
                 .layer(rl("routes_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
         )
-        .route("/api/v1/routes/:id", get(crate::routes::get_route))
+        .route("/api/v1/routes/{id}", get(crate::routes::get_route))
         .route(
-            "/api/v1/routes/:id",
+            "/api/v1/routes/{id}",
             put(crate::routes::update_route)
                 .layer(bl(BODY_CAP_DEFAULT))
                 .layer(rl("routes_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
         )
         .route(
-            "/api/v1/routes/:id",
+            "/api/v1/routes/{id}",
             delete(crate::routes::delete_route).layer(rl("routes_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
         )
         .route(
@@ -407,7 +407,7 @@ pub fn build_router(
             post(crate::routes::validate_forward_auth),
         )
         .route(
-            "/api/v1/cache/routes/:id",
+            "/api/v1/cache/routes/{id}",
             delete(crate::cache::purge_route_cache).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -417,7 +417,7 @@ pub fn build_router(
         .route("/api/v1/cache/stats", get(crate::cache::get_cache_stats))
         .route("/api/v1/bans", get(crate::cache::list_bans))
         .route(
-            "/api/v1/bans/:ip",
+            "/api/v1/bans/{ip}",
             delete(crate::cache::delete_ban).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -433,9 +433,9 @@ pub fn build_router(
                 RL_WINDOW_S,
             )),
         )
-        .route("/api/v1/backends/:id", get(crate::backends::get_backend))
+        .route("/api/v1/backends/{id}", get(crate::backends::get_backend))
         .route(
-            "/api/v1/backends/:id",
+            "/api/v1/backends/{id}",
             put(crate::backends::update_backend).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -443,7 +443,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/backends/:id",
+            "/api/v1/backends/{id}",
             delete(crate::backends::delete_backend).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -469,17 +469,17 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/certificates/:id",
+            "/api/v1/certificates/{id}",
             get(crate::certificates::get_certificate),
         )
         .route(
-            "/api/v1/certificates/:id",
+            "/api/v1/certificates/{id}",
             put(crate::certificates::update_certificate)
                 .layer(bl(BODY_CAP_PEM))
                 .layer(rl("cert_create", RL_CERT_CREATE, RL_WINDOW_S)),
         )
         .route(
-            "/api/v1/certificates/:id",
+            "/api/v1/certificates/{id}",
             delete(crate::certificates::delete_certificate).layer(rl(
                 "cert_create",
                 RL_CERT_CREATE,
@@ -487,7 +487,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/certificates/:id/download",
+            "/api/v1/certificates/{id}/download",
             get(crate::certificates::download_certificate),
         )
         .route(
@@ -503,7 +503,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/cert-export/acls/:id",
+            "/api/v1/cert-export/acls/{id}",
             delete(crate::routes::cert_export::delete_acl).layer(rl(
                 "cert_export_acls",
                 RL_CERT_EXPORT_ACLS,
@@ -525,7 +525,7 @@ pub fn build_router(
             get(crate::routes::cert_export::list_orphans),
         )
         .route(
-            "/api/v1/cert-export/orphans/:name",
+            "/api/v1/cert-export/orphans/{name}",
             delete(crate::routes::cert_export::delete_orphan).layer(rl(
                 "cert_export_acls",
                 100,
@@ -579,12 +579,12 @@ pub fn build_router(
                 .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
         )
         .route(
-            "/api/v1/ai-crawlers/custom/:id",
+            "/api/v1/ai-crawlers/custom/{id}",
             put(crate::ai_crawlers::update_custom_crawler)
                 .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
         )
         .route(
-            "/api/v1/ai-crawlers/custom/:id",
+            "/api/v1/ai-crawlers/custom/{id}",
             delete(crate::ai_crawlers::delete_custom_crawler)
                 .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
         )
@@ -635,7 +635,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/dns-providers/:id",
+            "/api/v1/dns-providers/{id}",
             put(crate::dns_providers::update_dns_provider).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -643,7 +643,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/dns-providers/:id",
+            "/api/v1/dns-providers/{id}",
             delete(crate::dns_providers::delete_dns_provider).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -651,7 +651,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/dns-providers/:id/test",
+            "/api/v1/dns-providers/{id}/test",
             post(crate::dns_providers::test_dns_provider).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -671,7 +671,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/notifications/:id",
+            "/api/v1/notifications/{id}",
             put(crate::settings::update_notification).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -679,7 +679,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/notifications/:id",
+            "/api/v1/notifications/{id}",
             delete(crate::settings::delete_notification).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -687,7 +687,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/notifications/:id/test",
+            "/api/v1/notifications/{id}/test",
             post(crate::settings::test_notification).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -703,7 +703,7 @@ pub fn build_router(
             get(crate::settings::list_preferences),
         )
         .route(
-            "/api/v1/preferences/:id",
+            "/api/v1/preferences/{id}",
             put(crate::settings::update_preference).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -711,7 +711,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/preferences/:id",
+            "/api/v1/preferences/{id}",
             delete(crate::settings::delete_preference).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -781,7 +781,7 @@ pub fn build_router(
                 .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
-            "/api/v1/certificates/:id/renew",
+            "/api/v1/certificates/{id}/renew",
             post(crate::acme::renew_certificate)
                 .layer(bl(BODY_CAP_ACME))
                 .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
@@ -796,7 +796,7 @@ pub fn build_router(
             post(crate::waf::create_custom_rule).layer(bl(BODY_CAP_WAF_RULE)),
         )
         .route(
-            "/api/v1/waf/rules/custom/:id",
+            "/api/v1/waf/rules/custom/{id}",
             delete(crate::waf::delete_custom_rule).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -804,7 +804,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/waf/rules/:id",
+            "/api/v1/waf/rules/{id}",
             put(crate::waf::toggle_waf_rule).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -812,17 +812,17 @@ pub fn build_router(
             )),
         )
         .route("/api/v1/sla/overview", get(crate::sla::get_sla_overview))
-        .route("/api/v1/sla/routes/:id", get(crate::sla::get_route_sla))
+        .route("/api/v1/sla/routes/{id}", get(crate::sla::get_route_sla))
         .route(
-            "/api/v1/sla/routes/:id/buckets",
+            "/api/v1/sla/routes/{id}/buckets",
             get(crate::sla::get_route_sla_buckets),
         )
         .route(
-            "/api/v1/sla/routes/:id/config",
+            "/api/v1/sla/routes/{id}/config",
             get(crate::sla::get_sla_config),
         )
         .route(
-            "/api/v1/sla/routes/:id/config",
+            "/api/v1/sla/routes/{id}/config",
             put(crate::sla::update_sla_config).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -830,11 +830,11 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/sla/routes/:id/export",
+            "/api/v1/sla/routes/{id}/export",
             get(crate::sla::export_sla_data),
         )
         .route(
-            "/api/v1/sla/routes/:id/data",
+            "/api/v1/sla/routes/{id}/data",
             delete(crate::sla::clear_route_sla).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -842,7 +842,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/sla/routes/:id/active",
+            "/api/v1/sla/routes/{id}/active",
             get(crate::probes::get_active_sla),
         )
         .route("/api/v1/probes", get(crate::probes::list_probes))
@@ -855,15 +855,15 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/probes/route/:route_id",
+            "/api/v1/probes/route/{route_id}",
             get(crate::probes::list_probes_for_route),
         )
         .route(
-            "/api/v1/probes/:id/history",
+            "/api/v1/probes/{id}/history",
             get(crate::probes::probe_history),
         )
         .route(
-            "/api/v1/probes/:id",
+            "/api/v1/probes/{id}",
             put(crate::probes::update_probe).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -871,7 +871,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/probes/:id",
+            "/api/v1/probes/{id}",
             delete(crate::probes::delete_probe).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -891,7 +891,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/loadtest/configs/:id",
+            "/api/v1/loadtest/configs/{id}",
             put(crate::loadtest::update_config).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -899,7 +899,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/loadtest/configs/:id",
+            "/api/v1/loadtest/configs/{id}",
             delete(crate::loadtest::delete_config).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -907,7 +907,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/loadtest/configs/:id/clone",
+            "/api/v1/loadtest/configs/{id}/clone",
             post(crate::loadtest::clone_config).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -915,22 +915,22 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/loadtest/start/:config_id",
+            "/api/v1/loadtest/start/{config_id}",
             post(crate::loadtest::start_test),
         )
         .route(
-            "/api/v1/loadtest/start/:config_id/confirm",
+            "/api/v1/loadtest/start/{config_id}/confirm",
             post(crate::loadtest::start_test_confirmed),
         )
         .route("/api/v1/loadtest/status", get(crate::loadtest::get_status))
         .route("/api/v1/loadtest/ws", get(crate::loadtest::loadtest_ws))
         .route("/api/v1/loadtest/abort", post(crate::loadtest::abort_test))
         .route(
-            "/api/v1/loadtest/results/:config_id",
+            "/api/v1/loadtest/results/{config_id}",
             get(crate::loadtest::get_results),
         )
         .route(
-            "/api/v1/loadtest/results/:config_id/compare",
+            "/api/v1/loadtest/results/{config_id}/compare",
             get(crate::loadtest::compare_results),
         )
         // Layer order (outermost runs first): require_auth
