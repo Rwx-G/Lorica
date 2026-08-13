@@ -228,6 +228,27 @@ jobs:
           path: lcov.info
           retention-days: 30
 
+  e2e-docker:
+    name: E2E (Docker)
+    needs: lint
+    runs-on: ubuntu-latest
+    # The tests-e2e-docker/ suite drives Lorica against real backend
+    # containers across every profile (base, workers, cert-export, AI-bot,
+    # RBAC, audit, hot-upgrade). It exercises the full network stack
+    # deterministically on Linux, which Docker Desktop on Windows does not -
+    # so it belongs in CI rather than as a Windows-local-only gate. It is
+    # heavy (each profile builds a release image, with Docker layer reuse);
+    # the workflow triggers keep it to PRs against main plus main/tag pushes,
+    # not every feature-branch push. run.sh exits non-zero if any phase fails
+    # and its per-assertion output lands in this job log.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the Docker e2e suite
+        run: |
+          cd tests-e2e-docker
+          ./run.sh --build
+
   build-and-package:
     name: Build & Package
     needs: test
