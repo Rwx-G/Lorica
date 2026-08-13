@@ -176,6 +176,58 @@ jobs:
           cd lorica-dashboard/frontend
           npx vitest run
 
+  coverage:
+    name: Coverage
+    needs: lint
+    runs-on: ubuntu-latest
+    # Reports line coverage for the product crates and uploads an lcov
+    # artifact so gaps stay visible. Intentionally NOT gated on a
+    # `--fail-under` threshold yet: the baseline is not established, and a
+    # blind threshold would flake the pipeline. Add a floor here once a
+    # baseline is agreed (do not silently drop the report if you do).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build frontend (needed by lorica-api dependency)
+        run: |
+          cd lorica-dashboard/frontend
+          npm ci
+          npm run build
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Collect coverage (product crates)
+        run: |
+          cargo llvm-cov --no-report \
+            -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify \
+            -p lorica-bench -p lorica-command -p lorica-metrics -p lorica-acme \
+            -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker
+
+      - name: Report coverage summary
+        run: |
+          echo '### Coverage (product crates)' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --summary-only \
+            --ignore-filename-regex '(tests?\.rs$|/tests/)' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --lcov --output-path lcov.info \
+            --ignore-filename-regex '(tests?\.rs$|/tests/)'
+
+      - name: Upload lcov report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 30
+
   build-and-package:
     name: Build & Package
     needs: test
