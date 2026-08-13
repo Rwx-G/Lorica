@@ -1,6 +1,6 @@
 # Data Models and Schema Changes
 
-> **Status: HISTORICAL (v1.0 schema baseline) — partially out of date
+> **Status: HISTORICAL (v1.0 schema baseline) - partially out of date
 > as of v1.5.2.**
 >
 > This document was written against the v1.0 schema (7 tables, 4
@@ -11,17 +11,17 @@
 >
 > For the **canonical current schema**, the source of truth lives in :
 >
-> - `lorica-config/src/migrations/` — every migration applied since
+> - `lorica-config/src/migrations/` - every migration applied since
 >   v1.0 (001 through 019 as of v1.5.2). Read in numeric order, this
 >   tells you the current shape of every column, index, and table.
-> - `lorica-config/src/store/mod.rs` — the inline `ALTER TABLE` /
+> - `lorica-config/src/store/mod.rs` - the inline `ALTER TABLE` /
 >   `CREATE INDEX IF NOT EXISTS` calls that live alongside the
 >   migrations (some indexes are only added at runtime, e.g. session
 >   indexes per audit L-1 / sessions.rs).
-> - `lorica-config/src/store/{routes,backends,certs,...}.rs` — one
+> - `lorica-config/src/store/{routes,backends,certs,...}.rs` - one
 >   module per table, each holding the SELECT / INSERT / UPDATE
 >   queries against the current column set.
-> - `lorica-config/src/models/` — the Rust struct shape that round-
+> - `lorica-config/src/models/` - the Rust struct shape that round-
 >   trips through serde for the API. Field names match the column
 >   names ; field doc-comments explain when each was added.
 >

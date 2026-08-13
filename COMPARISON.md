@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-04-26 | Lorica v1.5.2
+> Last updated: 2026-08-13 | Lorica v1.6.0
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin/Module (not built-in)
 >
@@ -224,7 +224,7 @@
 | Graceful drain | Y | Y | Y | Paid | Y | Y | Y | Y |
 | Encrypted storage (AES) | Y | N | N | N | N | N | N | N |
 | Retry with backoff | Y | Y | N | N | Y | N | Y | Y |
-| **Hot binary upgrade** | **N** | Y | Y | Y | N | Y | N | Y |
+| Hot binary upgrade | Y | Y | Y | Y | N | Y | N | Y |
 
 ### Lorica Strengths
 
@@ -235,7 +235,7 @@
 ### Gaps for Lorica
 
 - ~~Retry with backoff~~ - Implemented in v1.2.0 (`retry_on_methods`, `retry_attempts`, exponential backoff via the `fail_to_connect` hook).
-- **Hot binary upgrade** - Planned for v1.6.0. Pingora ships the infrastructure (SIGUSR2 fd passing); wiring is ~3-4 days.
+- ~~Hot binary upgrade~~ - Implemented in v1.6.0 (SuperAdmin-only, signature-verified, zero-downtime SIGUSR2 fd passing; see `docs/hot-upgrade.md`).
 
 ---
 
@@ -283,12 +283,10 @@ These features are either unique to Lorica or extremely rare among competitors:
 
 ## Summary: Remaining Gaps
 
-All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.5.2 are shipped (v1.5.1 + v1.5.2 were audit-closure cycles : worker-mode cert hot-reload, SMTP encryption modes, security defense-in-depth pass, reactor-stall + reload pass, deps bumped). Remaining gaps are by design or planned for future versions.
+All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.6.0 are shipped (v1.6.0 added the hot binary upgrade, multi-user RBAC with three roles, and the AI/LLM crawler deny-list; v1.5.1 + v1.5.2 were audit-closure cycles: worker-mode cert hot-reload, SMTP encryption modes, security defense-in-depth pass, reactor-stall + reload pass, deps bumped). Remaining gaps are by design or planned for future versions.
 
 | Gap | Plan |
 |---|---|
-| Hot binary upgrade | Planned for v1.6.0. Pingora ships the infrastructure (SIGUSR2 fd passing); wiring is ~3-4 days |
-| Team settings (users & RBAC) | Planned for v1.6.0. Single-admin model today; multi-user with roles is needed for org-wide adoption |
 | HTTP/3 (QUIC) | Planned for v2.0.0. Blocked on [Pingora PR #524](https://github.com/cloudflare/pingora/pull/524) (tokio-quiche integration) |
 | TCP/L4 proxying | Planned for v2.0.0. Enables database, MQTT, SSH stream proxying |
 | Service discovery (Docker labels, K8s Ingress) | Out of scope by design. Lorica targets standalone edge / bastion, not in-cluster deployment |

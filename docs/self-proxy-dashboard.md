@@ -9,9 +9,13 @@
 
 ## Overview
 
-By default, Lorica's management API listens on `http://127.0.0.1:9443`
-(HTTP, localhost only). This guide shows how to make the dashboard accessible
-remotely by creating a route in Lorica that proxies to its own management API.
+By default, Lorica's management API listens on `https://127.0.0.1:9443`
+(TLS, localhost only). As of v1.6.0 the management plane is served over TLS
+with a self-signed certificate generated on first boot (see
+[docs/installation.md](installation.md)), so the loopback `curl` examples
+below pass `-k` to accept it. This guide shows how to make the dashboard
+accessible remotely by creating a route in Lorica that proxies to its own
+management API.
 
 This is useful when:
 
@@ -55,10 +59,10 @@ setup must be done via the API.
 ### Step 1 - Login
 
 ```bash
-LORICA="http://127.0.0.1:9443"
+LORICA="https://127.0.0.1:9443"
 COOKIE=$(mktemp)
 
-curl -s -c "$COOKIE" "$LORICA/api/v1/auth/login" \
+curl -sk -c "$COOKIE" "$LORICA/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"YOUR_PASSWORD"}'
 ```
@@ -66,27 +70,30 @@ curl -s -c "$COOKIE" "$LORICA/api/v1/auth/login" \
 ### Step 2 - Create the dashboard backend
 
 ```bash
-BACKEND_ID=$(curl -s -b "$COOKIE" "$LORICA/api/v1/backends" \
+BACKEND_ID=$(curl -sk -b "$COOKIE" "$LORICA/api/v1/backends" \
   -H 'Content-Type: application/json' \
   -d '{
     "address": "127.0.0.1:9443",
     "name": "lorica-dashboard",
-    "tls_upstream": false,
+    "tls_upstream": true,
+    "tls_skip_verify": true,
     "health_check_enabled": false
   }' | jq -r '.data.id')
 
 echo "Backend ID: $BACKEND_ID"
 ```
 
-> **Note:** `tls_upstream: false` because the management API listens on
-> plain HTTP. Health checks are disabled to avoid a self-referencing loop.
+> **Note:** `tls_upstream: true` because the management API is served over
+> TLS; `tls_skip_verify: true` because that listener uses a self-signed
+> loopback certificate. Health checks are disabled to avoid a
+> self-referencing loop.
 
 ### Step 3 - Provision a TLS certificate
 
 **Option A - Let's Encrypt (HTTP-01):**
 
 ```bash
-curl -s -b "$COOKIE" "$LORICA/api/v1/acme/provision" \
+curl -sk -b "$COOKIE" "$LORICA/api/v1/acme/provision" \
   -H 'Content-Type: application/json' \
   -d '{
     "domain": "lorica.example.com",
@@ -98,7 +105,7 @@ curl -s -b "$COOKIE" "$LORICA/api/v1/acme/provision" \
 **Option B - Upload manually:**
 
 ```bash
-curl -s -b "$COOKIE" "$LORICA/api/v1/certificates" \
+curl -sk -b "$COOKIE" "$LORICA/api/v1/certificates" \
   -H 'Content-Type: application/json' \
   -d '{
     "domain": "lorica.example.com",
@@ -121,7 +128,7 @@ Replace `ALLOWED_CIDR` with your management network (see table above).
 HOSTNAME="lorica.example.com"
 ALLOWED_CIDR="192.168.0.0/16"
 
-curl -s -b "$COOKIE" "$LORICA/api/v1/routes" \
+curl -sk -b "$COOKIE" "$LORICA/api/v1/routes" \
   -H 'Content-Type: application/json' \
   -d '{
     "hostname": "'"$HOSTNAME"'",
@@ -154,7 +161,7 @@ Save as `setup-dashboard-proxy.sh`:
 set -euo pipefail
 
 # ---- Configuration ----
-LORICA="http://127.0.0.1:9443"
+LORICA="https://127.0.0.1:9443"
 HOSTNAME="${1:?Usage: $0 <hostname> <allowed-cidr> [management-port]}"
 ALLOWED_CIDR="${2:?Usage: $0 <hostname> <allowed-cidr> [management-port]}"
 MGMT_PORT="${3:-9443}"
@@ -174,7 +181,7 @@ echo ""
 
 # Login
 echo "[1/4] Logging in..."
-LOGIN=$(curl -s -c "$COOKIE" "$LORICA/api/v1/auth/login" \
+LOGIN=$(curl -sk -c "$COOKIE" "$LORICA/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
   -d "$(jq -n --arg p "$PASSWORD" '{username:"admin",password:$p}')")
 
@@ -185,12 +192,13 @@ fi
 
 # Create backend
 echo "[2/4] Creating dashboard backend..."
-BACKEND=$(curl -s -b "$COOKIE" "$LORICA/api/v1/backends" \
+BACKEND=$(curl -sk -b "$COOKIE" "$LORICA/api/v1/backends" \
   -H 'Content-Type: application/json' \
   -d "$(jq -n --arg addr "127.0.0.1:$MGMT_PORT" '{
     address: $addr,
     name: "lorica-dashboard",
-    tls_upstream: false,
+    tls_upstream: true,
+    tls_skip_verify: true,
     health_check_enabled: false
   }')")
 
@@ -204,7 +212,7 @@ echo "  Backend ID: $BACKEND_ID"
 
 # Check for existing certificate
 echo "[3/4] Looking for TLS certificate..."
-CERT_ID=$(curl -s -b "$COOKIE" "$LORICA/api/v1/certificates" | \
+CERT_ID=$(curl -sk -b "$COOKIE" "$LORICA/api/v1/certificates" | \
   jq -r --arg h "$HOSTNAME" '.data.certificates[] | select(.domain == $h) | .id' | head -1)
 
 if [ -n "$CERT_ID" ] && [ "$CERT_ID" != "null" ]; then
@@ -213,7 +221,7 @@ else
   echo "  No certificate found for $HOSTNAME."
   echo "  Attempting Let's Encrypt HTTP-01 provisioning..."
   read -p "  Contact email for Let's Encrypt: " ACME_EMAIL
-  ACME=$(curl -s -b "$COOKIE" "$LORICA/api/v1/acme/provision" \
+  ACME=$(curl -sk -b "$COOKIE" "$LORICA/api/v1/acme/provision" \
     -H 'Content-Type: application/json' \
     -d "$(jq -n --arg d "$HOSTNAME" --arg e "$ACME_EMAIL" '{
       domain: $d,
@@ -251,7 +259,7 @@ ROUTE_BODY=$(jq -n \
     access_log_enabled: true
   } + (if $cid != "" then {certificate_id: $cid} else {} end)')
 
-ROUTE=$(curl -s -b "$COOKIE" "$LORICA/api/v1/routes" \
+ROUTE=$(curl -sk -b "$COOKIE" "$LORICA/api/v1/routes" \
   -H 'Content-Type: application/json' \
   -d "$ROUTE_BODY")
 
@@ -285,8 +293,8 @@ If you need to undo this setup:
 
 ```bash
 # Delete the route and backend via the dashboard or API
-curl -s -b "$COOKIE" -X DELETE "$LORICA/api/v1/routes/<route-id>"
-curl -s -b "$COOKIE" -X DELETE "$LORICA/api/v1/backends/<backend-id>"
+curl -sk -b "$COOKIE" -X DELETE "$LORICA/api/v1/routes/<route-id>"
+curl -sk -b "$COOKIE" -X DELETE "$LORICA/api/v1/backends/<backend-id>"
 ```
 
 ## Fallback Access
@@ -295,7 +303,8 @@ If Lorica is down or the self-proxy is misconfigured, use an SSH tunnel:
 
 ```bash
 ssh -L 9443:127.0.0.1:9443 user@your-server
-# Then open http://127.0.0.1:9443 in your browser
+# Then open https://127.0.0.1:9443 in your browser
+# (accept the self-signed management certificate)
 ```
 
 ## Alternatives for Production

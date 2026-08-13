@@ -353,8 +353,9 @@ fn stage_binary(data_dir: &Path, binary: &[u8]) -> Result<PathBuf, UpgradeError>
 /// This chunk STAGES only; the execve / FD-handoff / drain is wired in
 /// Story 8.4 chunk 2 at the [`trigger_handoff`] seam.
 ///
-/// Authorization: mounted behind `require_auth`. Story 8.3 RBAC will
-/// retag this SuperAdmin-only once role tags land.
+/// Authorization: mounted behind `require_auth` and gated `SuperAdmin`
+/// by the `authorize` middleware (Story 8.3), which pairs this endpoint
+/// with the `upgrade_signing_pubkey_path` settings write at the same role.
 pub async fn upgrade_binary(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,

@@ -76,13 +76,14 @@ If `upgrade_signing_pubkey_path` is unset or blank, the endpoint returns
 untouched.
 
 > **Trust boundary (RBAC, Story 8.3).** The upgrade endpoint and the
-> `upgrade_signing_pubkey_path` setting are ONE trust unit and must be
-> gated to the same role. Whoever can point `upgrade_signing_pubkey_path`
-> at a key they control can then upload a binary signed with the matching
-> private key. When multi-user RBAC lands (Story 8.3), both
-> `POST /api/v1/system/upgrade` and the settings write that changes
-> `upgrade_signing_pubkey_path` must be `SuperAdmin`-only; do not gate one
-> without the other, or the weaker gate becomes the effective one.
+> `upgrade_signing_pubkey_path` setting are ONE trust unit and are gated
+> to the same role. Whoever can point `upgrade_signing_pubkey_path` at a
+> key they control can then upload a binary signed with the matching
+> private key. As of v1.6.0 both `POST /api/v1/system/upgrade` and the
+> settings write that changes `upgrade_signing_pubkey_path` are
+> `SuperAdmin`-only (enforced by the `authorize` middleware, which gates
+> `/api/v1/settings*` and the upgrade endpoint alike), so the weaker gate
+> can never become the effective one.
 
 ## Rollback
 
@@ -103,6 +104,9 @@ A drain that overruns its window (stragglers force-killed) records the
 ## Metrics to watch
 
 - `lorica_hot_upgrade_total{outcome="ok"}` - a successful verify + stage.
+- `lorica_hot_upgrade_total{outcome="completed"}` - the new supervisor
+  acked the readiness handshake and took over the systemd MainPID (the
+  terminal success of the handoff started by an `ok` verify + stage).
 - `lorica_hot_upgrade_total{outcome="signature_failed"}` - a rejected
   upload (wrong key, tampered binary, or malformed signature).
 - `lorica_hot_upgrade_total{outcome="exec_failed"}` - the new process did

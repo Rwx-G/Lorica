@@ -46,10 +46,9 @@ architectural moves per release.
 `lorica-lru`, `lorica-ketama`, `lorica-limits`, `lorica-timeout`,
 `lorica-pool`, `lorica-runtime`, `lorica-header-serde`, `tinyufo`
 preserve upstream Pingora structure to stay rebaseable. `lorica-tls`
-additionally carries the native cert resolver + OCSP stapling;
-`lorica-worker`, `lorica-command` are first-party process/IPC crates
-that live at 0.1.0 alongside the forks (see backlog #42d for the
-version-tier cleanup).
+additionally carries the native cert resolver + OCSP stapling.
+`lorica-worker` and `lorica-command` are first-party process/IPC crates
+and follow the product version (1.6.0), not the forked-crate 0.1.0 pin.
 
 ## Tests
 

@@ -58,15 +58,20 @@ These crates do not exist in upstream Pingora:
 | Crate | Purpose |
 |-------|---------|
 | `lorica` | CLI binary, supervisor, worker orchestration |
-| `lorica-api` | axum REST API, auth, session management |
-| `lorica-config` | SQLite store, migrations, TOML export/import |
+| `lorica-api` | axum REST API, auth, session management, RBAC |
+| `lorica-config` | SQLite store, versioned migrations, TOML export/import |
 | `lorica-dashboard` | Svelte 5 frontend embedded via rust-embed |
 | `lorica-waf` | WAF engine, OWASP rules, IP blocklist |
-| `lorica-notify` | Alert dispatch (stdout, SMTP, webhook) |
+| `lorica-notify` | Alert dispatch (stdout, SMTP, webhook, Slack) |
 | `lorica-bench` | SLA monitoring, load testing engine |
 | `lorica-worker` | fork+exec worker isolation, socket passing |
 | `lorica-command` | Protobuf supervisor-worker command channel |
-| `lorica-tls` | SNI resolver, hot-swap, ACME (extends upstream TLS) |
+| `lorica-acme` | Pure ACME core: HTTP-01 / DNS-01 issuance driver, DNS challengers (Cloudflare / Route53 / OVH) |
+| `lorica-metrics` | Shared Prometheus registry + cross-worker counter aggregation |
+| `lorica-challenge` | Bot-protection challenge engine (PoW / captcha / cookie) |
+| `lorica-geoip` | GeoIP / ASN country and network lookups |
+| `lorica-shmem` | Anonymous `memfd` shared region for per-IP WAF flood / auto-ban counters |
+| `lorica-tls` | SNI resolver, hot-swap, encrypted key storage (extends upstream TLS) |
 
 ## Comparing with Upstream
 

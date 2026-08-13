@@ -213,9 +213,10 @@ release. Two paths :
 
 ### Add a new vendor not yet in the built-in registry
 
-Custom Crawler CRUD via `POST /api/v1/ai-crawlers/custom` (admin
-auth in v1.6.0 ; Story 8.3 will retag to Operator + SuperAdmin).
-Pick verification kind based on what the vendor publishes :
+Custom Crawler CRUD via `POST /api/v1/ai-crawlers/custom` (RBAC,
+Story 8.3: the mutating routes require the `Operator` role, reads
+are `Viewer`-accessible). Pick verification kind based on what the
+vendor publishes :
 
 - rDNS suffix -> `kind: rdns` with `suffixes`.
 - IP-list JSON URL -> `kind: ip_ranges` with `cidrs` prefetched.
@@ -253,8 +254,6 @@ view, scrape `/metrics` for `lorica_ai_bot_total` into Prometheus.
 
 - **Vendor IP-list runtime refresh daemon** (proposed Story 8.13,
   v1.7.0+) - v1.6.0 bundles vendor JSONs at compile time.
-- **RBAC tagging** (Story 8.3) - v1.6.0 ships single-admin auth
-  for the custom CRUD endpoints.
 - **Audit-log integration** (Story 8.9) - v1.6.0 does not emit
   `lorica::audit` events on AI-bot decisions.
 - **Per-route bot category aggregation** (HAProxy Enterprise-style

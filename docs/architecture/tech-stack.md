@@ -1,5 +1,13 @@
 # Tech Stack
 
+> **Baseline note.** This table is the v1.0 planning snapshot (the
+> "Upgrade" / "Replace" / "TBD" markers are the choices as they stood
+> then). For the current dependency pins, `Cargo.toml` and the workspace
+> lockfile are authoritative; notable major bumps since the v1.0 baseline
+> (axum 0.8, tower 0.5 / tower-http 0.6, nix 0.31, rusqlite 0.40, rcgen
+> 0.14, sysinfo 0.39, opentelemetry 0.32) are recorded in `CHANGELOG.md`.
+> The frontend was resolved to Svelte 5 + TypeScript + Vite 8.
+
 ## Existing Technology Stack (from Pingora)
 
 | Category | Current Technology | Version | Usage in Enhancement | Notes |

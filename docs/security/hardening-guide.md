@@ -65,7 +65,7 @@ Lorica uses **rustls** exclusively (no OpenSSL). This provides:
 ### Admin Password
 
 - Lorica generates a random password on first run - **change it immediately**
-- Minimum password length: 12 characters
+- Minimum password length: 14 characters, with complexity classes enforced by default (`password_min_length` / `password_require_complexity`)
 - The password is hashed with **Argon2** (memory-hard, resistant to GPU attacks)
 - Failed login attempts are rate-limited (429 after threshold)
 
