@@ -3351,7 +3351,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-notify"
-version = "0.1.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "lettre",
@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-waf"
-version = "0.1.0"
+version = "1.6.0"
 dependencies = [
  "aho-corasick",
  "chrono",

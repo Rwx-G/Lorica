@@ -12,8 +12,8 @@ lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
 lorica-config = { version = "1.6.0", path = "../lorica-config" }
 lorica-dashboard = { version = "1.6.0", path = "../lorica-dashboard" }
 lorica-metrics = { version = "1.6.0", path = "../lorica-metrics" }
-lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
-lorica-notify = { version = "0.1.0", path = "../lorica-notify" }
+lorica-waf = { version = "1.6.0", path = "../lorica-waf" }
+lorica-notify = { version = "1.6.0", path = "../lorica-notify" }
 lorica-bench = { version = "1.6.0", path = "../lorica-bench" }
 # Used in `certificates.rs::validate_certificate_bundle` to gate
 # every cert upload (POST /certificates, PUT /certificates/{id},
