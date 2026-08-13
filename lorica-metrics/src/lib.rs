@@ -543,4 +543,48 @@ mod tests {
         );
         assert_eq!(TEST_SCALAR.get(), before + 10);
     }
+
+    #[test]
+    fn forget_worker_resets_its_delta_baseline() {
+        let _guard = SNAPSHOT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset_generic_counter_snapshot_for_test();
+
+        static TEST_VEC: Lazy<IntCounterVec> = Lazy::new(|| {
+            register_int_counter_vec("metrics_unit_forget_total", "forget unit test", &["route_id"])
+        });
+
+        fn resolve(name: &str) -> Option<(&'static [&'static str], CounterTarget)> {
+            match name {
+                "lorica_metrics_unit_forget_total" => {
+                    Some((&["route_id"], CounterTarget::Vec(&TEST_VEC)))
+                }
+                _ => None,
+            }
+        }
+
+        let entry = |value: u64| {
+            vec![(
+                "lorica_metrics_unit_forget_total".to_string(),
+                vec![("route_id".to_string(), "fgt".to_string())],
+                value,
+            )]
+        };
+
+        let base = TEST_VEC.with_label_values(&["fgt"]).get();
+
+        // Worker 1 reports 5 -> +5 against the base.
+        apply_worker_generic_counters(1, &entry(5), resolve);
+        assert_eq!(TEST_VEC.with_label_values(&["fgt"]).get(), base + 5);
+
+        // A smaller follow-up (3 < 5) from the same worker is swallowed as a
+        // regression, proving the retained baseline is still 5.
+        apply_worker_generic_counters(1, &entry(3), resolve);
+        assert_eq!(TEST_VEC.with_label_values(&["fgt"]).get(), base + 5);
+
+        // Forgetting the (dead) worker drops its snapshot, so the same worker
+        // id reporting 3 again now applies as a fresh delta from zero.
+        forget_worker_generic_counters(1);
+        apply_worker_generic_counters(1, &entry(3), resolve);
+        assert_eq!(TEST_VEC.with_label_values(&["fgt"]).get(), base + 8);
+    }
 }
