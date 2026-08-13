@@ -125,6 +125,58 @@ pub type MetricsRefresher =
 /// is shed rather than queued.
 pub type UpgradeTrigger = tokio::sync::mpsc::Sender<crate::upgrade::StagedBinary>;
 
+/// Deployment mode of the API process, carrying the proxy-side handles
+/// that are valid only for that mode.
+///
+/// Encoding the mode as an enum (rather than a dozen independent
+/// `Option<Arc<...>>` fields on [`AppState`]) makes invalid handle
+/// combinations unrepresentable: a single-process API holds direct
+/// in-process proxy handles, a supervisor API holds handles aggregated
+/// over RPC from workers, and the two sets can no longer coexist or go
+/// half-populated (audit backlog #42b).
+#[derive(Clone)]
+pub enum Mode {
+    /// Single-process: the API shares the proxy's in-process handles directly.
+    SingleProcess {
+        /// Cache hit counter shared with the proxy engine.
+        cache_hits: Arc<AtomicU64>,
+        /// Cache miss counter shared with the proxy engine.
+        cache_misses: Arc<AtomicU64>,
+        /// Ban list shared with the proxy engine: IP -> (ban timestamp,
+        /// ban duration in seconds, ban reason).
+        ban_list: Arc<crate::ban::BanMap>,
+        /// EWMA scores per backend address (microseconds). Shared with
+        /// the proxy engine.
+        ewma_scores: Arc<DashMap<String, f64>>,
+        /// Per-backend active connection counters. Shared with the proxy engine.
+        backend_connections: Arc<crate::connections::BackendConnections>,
+        /// Cache backend for purging cached entries.
+        cache_backend: &'static lorica_cache::MemCache,
+    },
+    /// Supervisor/worker: proxy metrics arrive aggregated over RPC from workers.
+    Supervisor {
+        /// Per-worker heartbeat metrics.
+        worker_metrics: Arc<WorkerMetrics>,
+        /// Aggregated proxy metrics from worker processes.
+        aggregated_metrics: Arc<crate::workers::AggregatedMetrics>,
+        /// Pipelined metrics refresh closure (WPAR-7 pull-on-scrape).
+        /// `Some` once the supervisor has wired the `MetricsPullCoordinator`;
+        /// `None` until it registers the first worker RPC endpoint. Called
+        /// from the `/metrics` handler before reading `aggregated_metrics`
+        /// so Prometheus scrapes see sub-second fresh data. Internally
+        /// dedups: concurrent scrapes within a short window collapse into a
+        /// single supervisor fan-out.
+        metrics_refresher: Option<MetricsRefresher>,
+        /// Channel to the supervisor's hot-upgrade orchestration (Story 8.4).
+        /// The `POST /api/v1/system/upgrade` handler sends the staged binary
+        /// here after a successful verify+stage to start the zero-downtime
+        /// handoff.
+        upgrade_trigger: UpgradeTrigger,
+    },
+    /// Test harness: no proxy-side handles.
+    Test,
+}
+
 /// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]
 pub struct AppState {
@@ -153,8 +205,11 @@ pub struct AppState {
     /// Sender that signals the proxy engine to reload its configuration.
     /// Incremented on each mutation. `None` in tests or when no proxy is running.
     pub config_reload_tx: Option<watch::Sender<u64>>,
-    /// Per-worker heartbeat metrics. `None` in single-process mode.
-    pub worker_metrics: Option<Arc<WorkerMetrics>>,
+    /// Deployment mode plus the proxy-side handles valid only for that
+    /// mode. Encoding it as an enum makes invalid handle combinations
+    /// (single-process direct handles AND supervisor aggregated handles
+    /// at once) unrepresentable (audit backlog #42b).
+    pub mode: Mode,
     /// WAF event ring buffer. `None` if WAF engine not initialized.
     pub waf_event_buffer: Option<Arc<parking_lot::Mutex<VecDeque<lorica_waf::WafEvent>>>>,
     /// WAF engine reference for rule management. `None` if not initialized.
@@ -169,20 +224,6 @@ pub struct AppState {
     pub sla_collector: Option<Arc<lorica_bench::SlaCollector>>,
     /// Load test engine.
     pub load_test_engine: Option<Arc<lorica_bench::LoadTestEngine>>,
-    /// Cache hit counter shared with the proxy engine.
-    pub cache_hits: Option<Arc<AtomicU64>>,
-    /// Cache miss counter shared with the proxy engine.
-    pub cache_misses: Option<Arc<AtomicU64>>,
-    /// Ban list shared with the proxy engine: IP -> (ban timestamp, ban
-    /// duration in seconds, ban reason).
-    pub ban_list: Option<Arc<crate::ban::BanMap>>,
-    /// Cache backend for purging cached entries.
-    pub cache_backend: Option<&'static lorica_cache::MemCache>,
-    /// EWMA scores per backend address (microseconds). Shared with the proxy engine.
-    pub ewma_scores: Option<Arc<DashMap<String, f64>>>,
-    /// Per-backend active connection counters. Shared with the proxy engine.
-    /// `None` in supervisor mode (use aggregated_metrics instead).
-    pub backend_connections: Option<Arc<crate::connections::BackendConnections>>,
     /// Notification event history ring buffer (shared with NotifyDispatcher).
     pub notification_history: Option<Arc<parking_lot::Mutex<VecDeque<lorica_notify::AlertEvent>>>>,
     /// Persistent access log store (SQLite). `None` in tests or worker mode.
@@ -193,17 +234,6 @@ pub struct AppState {
     /// directly). The clear endpoints flush it before wiping so a
     /// forensics wipe cannot be trailed by stale in-flight rows.
     pub log_writer: Option<crate::log_writer::LogWriteHandle>,
-    /// Aggregated proxy metrics from worker processes. `None` in single-process mode.
-    pub aggregated_metrics: Option<Arc<crate::workers::AggregatedMetrics>>,
-    /// Pipelined metrics refresh closure (WPAR-7 pull-on-scrape).
-    /// `Some` in worker mode when the supervisor has wired the
-    /// `MetricsPullCoordinator`; `None` in single-process mode or
-    /// when the supervisor has not yet registered any worker RPC
-    /// endpoint. Called from the `/metrics` handler before reading
-    /// `aggregated_metrics` so Prometheus scrapes see sub-second
-    /// fresh data. Internally dedups: concurrent scrapes within a
-    /// short window collapse into a single supervisor fan-out.
-    pub metrics_refresher: Option<MetricsRefresher>,
     /// Tracker for background tasks that must be drained on graceful
     /// shutdown (ACME polling, session-store writes, WAF refresh,
     /// backend drain watchdog, etc.). The supervisor shutdown path
@@ -211,15 +241,120 @@ pub struct AppState {
     /// in-flight work completes rather than being dropped mid-step.
     /// Cheap to clone (internal `Arc`).
     pub task_tracker: tokio_util::task::TaskTracker,
-    /// Channel to the supervisor's hot-upgrade orchestration (Story 8.4).
-    /// `Some` only in worker/supervisor mode; the `POST
-    /// /api/v1/system/upgrade` handler sends the staged binary path here
-    /// after a successful verify+stage to start the zero-downtime
-    /// handoff. `None` in single-process mode and tests (stage only).
-    pub upgrade_trigger: Option<UpgradeTrigger>,
 }
 
 impl AppState {
+    /// Single-process cache hit counter. `None` outside single-process mode.
+    pub fn cache_hits(&self) -> Option<&Arc<AtomicU64>> {
+        if let Mode::SingleProcess { cache_hits, .. } = &self.mode {
+            Some(cache_hits)
+        } else {
+            None
+        }
+    }
+
+    /// Single-process cache miss counter. `None` outside single-process mode.
+    pub fn cache_misses(&self) -> Option<&Arc<AtomicU64>> {
+        if let Mode::SingleProcess { cache_misses, .. } = &self.mode {
+            Some(cache_misses)
+        } else {
+            None
+        }
+    }
+
+    /// Single-process ban list shared with the proxy engine. `None`
+    /// outside single-process mode.
+    pub fn ban_list(&self) -> Option<&Arc<crate::ban::BanMap>> {
+        if let Mode::SingleProcess { ban_list, .. } = &self.mode {
+            Some(ban_list)
+        } else {
+            None
+        }
+    }
+
+    /// Single-process per-backend EWMA scores. `None` outside
+    /// single-process mode.
+    pub fn ewma_scores(&self) -> Option<&Arc<DashMap<String, f64>>> {
+        if let Mode::SingleProcess { ewma_scores, .. } = &self.mode {
+            Some(ewma_scores)
+        } else {
+            None
+        }
+    }
+
+    /// Single-process per-backend active connection counters. `None`
+    /// outside single-process mode.
+    pub fn backend_connections(&self) -> Option<&Arc<crate::connections::BackendConnections>> {
+        if let Mode::SingleProcess {
+            backend_connections,
+            ..
+        } = &self.mode
+        {
+            Some(backend_connections)
+        } else {
+            None
+        }
+    }
+
+    /// Single-process cache backend for purging. `None` outside
+    /// single-process mode.
+    pub fn cache_backend(&self) -> Option<&'static lorica_cache::MemCache> {
+        if let Mode::SingleProcess { cache_backend, .. } = &self.mode {
+            Some(cache_backend)
+        } else {
+            None
+        }
+    }
+
+    /// Supervisor per-worker heartbeat metrics. `None` outside
+    /// supervisor mode.
+    pub fn worker_metrics(&self) -> Option<&Arc<WorkerMetrics>> {
+        if let Mode::Supervisor { worker_metrics, .. } = &self.mode {
+            Some(worker_metrics)
+        } else {
+            None
+        }
+    }
+
+    /// Supervisor aggregated proxy metrics from workers. `None` outside
+    /// supervisor mode.
+    pub fn aggregated_metrics(&self) -> Option<&Arc<crate::workers::AggregatedMetrics>> {
+        if let Mode::Supervisor {
+            aggregated_metrics, ..
+        } = &self.mode
+        {
+            Some(aggregated_metrics)
+        } else {
+            None
+        }
+    }
+
+    /// Supervisor pull-on-scrape metrics refresher. `None` outside
+    /// supervisor mode, or before the first worker RPC endpoint registers.
+    pub fn metrics_refresher(&self) -> Option<&MetricsRefresher> {
+        if let Mode::Supervisor {
+            metrics_refresher, ..
+        } = &self.mode
+        {
+            metrics_refresher.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Supervisor hot-upgrade handoff channel. `None` outside supervisor
+    /// mode (single-process and tests stage only).
+    pub fn upgrade_trigger(&self) -> Option<&UpgradeTrigger> {
+        if let Mode::Supervisor {
+            upgrade_trigger, ..
+        } = &self.mode
+        {
+            Some(upgrade_trigger)
+        } else {
+            None
+        }
+    }
+
     /// Signal the proxy engine to reload its configuration from the database.
     pub fn notify_config_changed(&self) {
         if let Some(tx) = &self.config_reload_tx {

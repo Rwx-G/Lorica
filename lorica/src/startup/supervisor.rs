@@ -954,7 +954,14 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 http_port: cli.http_port,
                 https_port: cli.https_port,
                 config_reload_tx: Some(config_reload_tx),
-                worker_metrics: Some(api_worker_metrics),
+                // Supervisor: cache/ban are per-worker process, surfaced
+                // to the API as metrics aggregated over the command channel.
+                mode: lorica_api::server::Mode::Supervisor {
+                    worker_metrics: api_worker_metrics,
+                    aggregated_metrics: api_aggregated_metrics,
+                    metrics_refresher: Some(api_metrics_refresher),
+                    upgrade_trigger: upgrade_tx,
+                },
                 waf_event_buffer: Some(waf_event_buffer),
                 waf_engine: Some(waf_engine),
                 waf_rule_count: Some(waf_rule_count),
@@ -962,15 +969,6 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
                 load_test_engine: Some(load_test_engine),
-                // cache/ban are per-worker process; aggregated via command channel
-                cache_hits: None,
-                cache_misses: None,
-                ban_list: None,
-                cache_backend: None,
-                ewma_scores: None,
-                backend_connections: None,
-                aggregated_metrics: Some(api_aggregated_metrics),
-                metrics_refresher: Some(api_metrics_refresher),
                 notification_history: {
                     let d = notify_dispatcher.lock().await;
                     Some(d.history())
@@ -978,7 +976,6 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 log_store: api_log_store,
                 log_writer: None,
                 task_tracker: api_task_tracker,
-                upgrade_trigger: Some(upgrade_tx),
             };
             // Session store + ACME auto-renewal + cert-expiry notifier
             // + server loop, shared with single-process mode (audit

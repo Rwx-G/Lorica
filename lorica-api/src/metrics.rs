@@ -1170,12 +1170,12 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
     // Wall-clock budget = per-worker timeout (500 ms) + generous margin
     // for scheduling overhead. On timeout we keep the cached state so
     // the scrape still returns something useful.
-    if let Some(ref refresher) = state.metrics_refresher {
+    if let Some(refresher) = state.metrics_refresher() {
         let _ = tokio::time::timeout(std::time::Duration::from_millis(1_000), refresher()).await;
     }
 
     // Refresh active connections (aggregated from workers if available)
-    let active_conns = if let Some(ref agg) = state.aggregated_metrics {
+    let active_conns = if let Some(agg) = state.aggregated_metrics() {
         agg.total_active_connections().await as i64
     } else {
         state
@@ -1185,7 +1185,7 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
     set_active_connections(active_conns);
 
     // Refresh aggregated EWMA scores from workers
-    if let Some(ref agg) = state.aggregated_metrics {
+    if let Some(agg) = state.aggregated_metrics() {
         for (addr, score) in agg.merged_ewma_scores().await {
             set_ewma_score(&addr, score);
         }
@@ -1267,7 +1267,7 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
     // In supervisor mode, append aggregated worker request/WAF counters
     // (workers have their own Prometheus registries, so the supervisor's
     // counters are empty for these metrics)
-    if let Some(ref agg) = state.aggregated_metrics {
+    if let Some(agg) = state.aggregated_metrics() {
         let req_counts = agg.merged_request_counts().await;
         if !req_counts.is_empty() {
             buffer.extend_from_slice(

@@ -363,7 +363,18 @@ pub(crate) fn run_single_process(cli: Cli) {
                 http_port: cli.http_port,
                 https_port: cli.https_port,
                 config_reload_tx: Some(config_reload_tx),
-                worker_metrics: None,
+                // Single-process: the API shares the proxy's in-process
+                // handles directly. No supervisor, so the hot-upgrade
+                // endpoint stages only and there is no aggregated/refresher
+                // path.
+                mode: lorica_api::server::Mode::SingleProcess {
+                    cache_hits: proxy_cache_hits,
+                    cache_misses: proxy_cache_misses,
+                    ban_list: proxy_ban_list,
+                    ewma_scores: proxy_ewma_scores,
+                    backend_connections: backend_conns.clone(),
+                    cache_backend: &*lorica::proxy_wiring::CACHE_BACKEND,
+                },
                 waf_event_buffer: Some(waf_event_buffer),
                 waf_engine: Some(waf_engine),
                 waf_rule_count: Some(waf_rule_count),
@@ -371,21 +382,10 @@ pub(crate) fn run_single_process(cli: Cli) {
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
                 load_test_engine: Some(Arc::clone(&load_test_engine)),
-                cache_hits: Some(proxy_cache_hits),
-                cache_misses: Some(proxy_cache_misses),
-                ban_list: Some(proxy_ban_list),
-                cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
-                ewma_scores: Some(proxy_ewma_scores),
-                backend_connections: Some(backend_conns.clone()),
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
                 log_writer: log_writer.clone(),
-                aggregated_metrics: None, // single-process uses direct Arc references
-                metrics_refresher: None,  // pull-on-scrape only meaningful in worker mode
                 task_tracker: api_task_tracker,
-                // Single-process mode has no supervisor to fork a
-                // replacement, so the hot-upgrade endpoint stages only.
-                upgrade_trigger: None,
             };
 
             // Session store + ACME auto-renewal + cert-expiry notifier

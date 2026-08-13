@@ -137,11 +137,11 @@ fn backend_to_response(
 /// Look up active connections for a backend address from shared state.
 async fn get_backend_connections_async(state: &crate::server::AppState, addr: &str) -> i32 {
     // Direct counters (single-process mode)
-    if let Some(ref bc) = state.backend_connections {
+    if let Some(bc) = state.backend_connections() {
         return bc.get(addr) as i32;
     }
     // Aggregated from workers (supervisor mode)
-    if let Some(ref agg) = state.aggregated_metrics {
+    if let Some(agg) = state.aggregated_metrics() {
         if let Some(count) = agg.merged_backend_connections().await.get(addr).copied() {
             return count as i32;
         }
@@ -155,14 +155,13 @@ async fn get_backend_connections_async(state: &crate::server::AppState, addr: &s
 async fn get_ewma_score_async(state: &crate::server::AppState, addr: &str) -> f64 {
     // Direct scores (single-process mode)
     if let Some(score) = state
-        .ewma_scores
-        .as_ref()
+        .ewma_scores()
         .and_then(|scores| scores.get(addr).map(|s| *s))
     {
         return score;
     }
     // Aggregated from workers (supervisor mode)
-    if let Some(ref agg) = state.aggregated_metrics {
+    if let Some(agg) = state.aggregated_metrics() {
         if let Some(score) = agg.merged_ewma_scores().await.get(addr).copied() {
             return score;
         }

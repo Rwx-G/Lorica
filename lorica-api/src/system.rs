@@ -185,7 +185,7 @@ pub async fn get_system(
         .load(std::sync::atomic::Ordering::Relaxed);
     // In supervisor mode, the local counter is 0; read from aggregated workers
     if active_connections == 0 {
-        if let Some(ref agg) = state.aggregated_metrics {
+        if let Some(agg) = state.aggregated_metrics() {
             active_connections = agg.total_active_connections().await;
         }
     }

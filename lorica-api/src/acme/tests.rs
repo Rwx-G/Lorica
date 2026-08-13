@@ -489,7 +489,7 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         http_port: 8080,
         https_port: 8443,
         config_reload_tx: None,
-        worker_metrics: None,
+        mode: crate::server::Mode::Test,
         waf_event_buffer: None,
         waf_engine: None,
         waf_rule_count: None,
@@ -497,19 +497,10 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         pending_dns_challenges: Arc::new(DashMap::new()),
         sla_collector: None,
         load_test_engine: None,
-        cache_hits: None,
-        cache_misses: None,
-        ban_list: None,
-        cache_backend: None,
-        ewma_scores: None,
-        backend_connections: None,
         notification_history: None,
         log_store: None,
         log_writer: None,
-        aggregated_metrics: None,
-        metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
-        upgrade_trigger: None,
     };
 
     let alert_sender = lorica_notify::AlertSender::new(64);

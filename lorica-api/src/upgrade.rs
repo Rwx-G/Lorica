@@ -265,7 +265,7 @@ pub fn verify_staged_digest(path: &Path, expected_sha256_hex: &str) -> Result<()
 /// the three happened so the API response (and thus the CLI / dashboard)
 /// reports honestly instead of always claiming a swap (audit H1).
 pub async fn trigger_handoff(state: &AppState, staged: &StagedBinary) -> HandoffSignal {
-    match &state.upgrade_trigger {
+    match state.upgrade_trigger() {
         Some(trigger) => match trigger.try_send(staged.clone()) {
             Ok(()) => {
                 tracing::info!(

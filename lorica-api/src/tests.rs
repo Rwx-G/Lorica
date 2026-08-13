@@ -10,7 +10,7 @@ use crate::auth::{ensure_admin_user, hash_password};
 use crate::logs::LogBuffer;
 use crate::middleware::auth::SessionStore;
 use crate::middleware::rate_limit::RateLimiter;
-use crate::server::{build_router, AppState};
+use crate::server::{build_router, AppState, Mode};
 use crate::system::SystemCache;
 use crate::workers::WorkerMetrics;
 
@@ -41,7 +41,7 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         http_port: 8080,
         https_port: 8443,
         config_reload_tx: None,
-        worker_metrics: None,
+        mode: Mode::Test,
         waf_event_buffer: None,
         waf_engine: None,
         waf_rule_count: None,
@@ -49,19 +49,10 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
         sla_collector: None,
         load_test_engine: None,
-        cache_hits: None,
-        cache_misses: None,
-        ban_list: None,
-        cache_backend: None,
-        ewma_scores: None,
-        backend_connections: None,
         notification_history: None,
         log_store: None,
         log_writer: None,
-        aggregated_metrics: None,
-        metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
-        upgrade_trigger: None,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -4374,7 +4365,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         http_port: 8080,
         https_port: 8443,
         config_reload_tx: None,
-        worker_metrics: None,
+        mode: Mode::Test,
         waf_event_buffer: Some(event_buffer),
         waf_engine: Some(engine),
         waf_rule_count: Some(rule_count),
@@ -4382,19 +4373,10 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
         sla_collector: None,
         load_test_engine: None,
-        cache_hits: None,
-        cache_misses: None,
-        ban_list: None,
-        cache_backend: None,
-        ewma_scores: None,
-        backend_connections: None,
         notification_history: None,
         log_store: None,
         log_writer: None,
-        aggregated_metrics: None,
-        metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
-        upgrade_trigger: None,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -4414,7 +4396,15 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         http_port: 8080,
         https_port: 8443,
         config_reload_tx: None,
-        worker_metrics: Some(Arc::new(WorkerMetrics::new())),
+        mode: Mode::Supervisor {
+            worker_metrics: Arc::new(WorkerMetrics::new()),
+            aggregated_metrics: Arc::new(crate::workers::AggregatedMetrics::new()),
+            metrics_refresher: None,
+            // No test drives an upgrade through this state; the trigger
+            // exists only to satisfy the Supervisor variant, and its
+            // receiver is dropped at once (nothing sends on it).
+            upgrade_trigger: tokio::sync::mpsc::channel(1).0,
+        },
         waf_event_buffer: None,
         waf_engine: None,
         waf_rule_count: None,
@@ -4422,19 +4412,10 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
         sla_collector: None,
         load_test_engine: None,
-        cache_hits: None,
-        cache_misses: None,
-        ban_list: None,
-        cache_backend: None,
-        ewma_scores: None,
-        backend_connections: None,
         notification_history: None,
         log_store: None,
         log_writer: None,
-        aggregated_metrics: None,
-        metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
-        upgrade_trigger: None,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -4685,7 +4666,7 @@ async fn test_workers_with_metrics() {
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Record a heartbeat for worker 1
-    let metrics = state.worker_metrics.as_ref().expect("test setup");
+    let metrics = state.worker_metrics().expect("test setup");
     metrics.record_heartbeat(1, 12345, 5).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -5298,7 +5279,18 @@ async fn list_bans_includes_reason() {
             reason: crate::ban::BanReason::WafFlood,
         },
     );
-    state.ban_list = Some(bans);
+    // Put the state in single-process mode with the populated ban list.
+    // list_bans reads only the ban list; the other proxy handles are
+    // empty defaults, and the cache backend is leaked to obtain the
+    // `&'static` the variant requires (one-shot test allocation).
+    state.mode = Mode::SingleProcess {
+        cache_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        cache_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ban_list: bans,
+        ewma_scores: Arc::new(dashmap::DashMap::new()),
+        backend_connections: Arc::new(crate::connections::BackendConnections::new()),
+        cache_backend: Box::leak(Box::new(lorica_cache::MemCache::new())),
+    };
 
     let response = crate::cache::list_bans(axum::Extension(state))
         .await

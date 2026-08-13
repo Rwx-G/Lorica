@@ -25,16 +25,15 @@ pub async fn purge_route_cache(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let entries_cleared = state
-        .cache_backend
-        .as_ref()
+        .cache_backend()
         .map(|backend| backend.clear_all())
         .unwrap_or(0);
 
     // Reset hit/miss counters so dashboard stats reflect the purge
-    if let Some(ref hits) = state.cache_hits {
+    if let Some(hits) = state.cache_hits() {
         hits.store(0, Ordering::Relaxed);
     }
-    if let Some(ref misses) = state.cache_misses {
+    if let Some(misses) = state.cache_misses() {
         misses.store(0, Ordering::Relaxed);
     }
 
@@ -64,16 +63,15 @@ pub async fn get_cache_stats(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Single-process: read directly from shared Arc. Multi-worker: read from aggregated metrics.
-    let (hits, misses) = if let Some(ref ch) = state.cache_hits {
+    let (hits, misses) = if let Some(ch) = state.cache_hits() {
         (
             ch.load(Ordering::Relaxed),
             state
-                .cache_misses
-                .as_ref()
+                .cache_misses()
                 .map(|c| c.load(Ordering::Relaxed))
                 .unwrap_or(0),
         )
-    } else if let Some(ref agg) = state.aggregated_metrics {
+    } else if let Some(agg) = state.aggregated_metrics() {
         (agg.total_cache_hits().await, agg.total_cache_misses().await)
     } else {
         (0, 0)
@@ -99,7 +97,7 @@ pub async fn get_cache_stats(
 pub async fn list_bans(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let bans = if let Some(ref bl) = state.ban_list {
+    let bans = if let Some(bl) = state.ban_list() {
         // Single-process: read directly from shared DashMap
         bl.iter()
             .filter_map(|entry| {
@@ -117,7 +115,7 @@ pub async fn list_bans(
                 }
             })
             .collect::<Vec<_>>()
-    } else if let Some(ref agg) = state.aggregated_metrics {
+    } else if let Some(agg) = state.aggregated_metrics() {
         // Multi-worker: read from aggregated metrics
         agg.merged_ban_list()
             .await
@@ -151,7 +149,7 @@ pub async fn delete_ban(
     Extension(session): Extension<Session>,
     Path(ip): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    match &state.ban_list {
+    match state.ban_list() {
         Some(bl) => {
             if bl.remove(&ip).is_some() {
                 let audit_ctx =

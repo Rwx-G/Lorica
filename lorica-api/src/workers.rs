@@ -292,7 +292,7 @@ impl AggregatedMetrics {
 pub async fn get_workers(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workers = if let Some(ref metrics) = state.worker_metrics {
+    let workers = if let Some(metrics) = state.worker_metrics() {
         metrics.snapshot().await
     } else {
         vec![]
