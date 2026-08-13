@@ -167,7 +167,7 @@ impl LogStore {
                 entry.path,
                 entry.host,
                 entry.status,
-                entry.latency_ms,
+                entry.latency_ms as i64,
                 entry.backend,
                 entry.error,
                 entry.client_ip,
@@ -210,7 +210,7 @@ impl LogStore {
                     entry.path,
                     entry.host,
                     entry.status,
-                    entry.latency_ms,
+                    entry.latency_ms as i64,
                     entry.backend,
                     entry.error,
                     entry.client_ip,
@@ -292,8 +292,8 @@ impl LogStore {
         let refs: Vec<&dyn rusqlite::types::ToSql> =
             bind_values.iter().map(|b| b.as_ref()).collect();
         let total: usize = conn
-            .query_row(&count_sql, refs.as_slice(), |row| row.get(0))
-            .map_err(|e| format!("failed to count access logs: {e}"))?;
+            .query_row(&count_sql, refs.as_slice(), |row| row.get::<_, i64>(0))
+            .map_err(|e| format!("failed to count access logs: {e}"))? as usize;
 
         let query_sql = format!(
             "SELECT id, timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff, xff_proxy_ip, source, request_id \

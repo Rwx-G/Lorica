@@ -78,7 +78,7 @@ async fn spa_fallback(uri: Uri) -> impl IntoResponse {
 fn generate_nonce() -> String {
     use std::fmt::Write;
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable for the CSP nonce");
+    getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable for the CSP nonce");
     // Hex-encode into a single pre-sized buffer (one allocation) rather
     // than a per-byte `format!`.
     let mut nonce = String::with_capacity(bytes.len() * 2);

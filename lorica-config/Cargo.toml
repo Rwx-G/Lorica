@@ -8,17 +8,17 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "Configuration state and persistence for Lorica reverse proxy"
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 ring = "0.17"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
-strum = { version = "0.26", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

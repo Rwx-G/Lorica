@@ -11,8 +11,8 @@ repository = "https://github.com/Rwx-G/Lorica"
 # `Cargo.lock` transitively so the workspace stays on one copy of
 # each. Bumping here should be coordinated with a full
 # `cargo update -p hmac -p sha2` pass so no crate pulls two copies.
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 # Constant-time byte comparison for HMAC tag verification. Using
 # `==` on byte slices leaks timing; `ConstantTimeEq::ct_eq`
 # guarantees branch-free equality.
@@ -20,7 +20,7 @@ subtle = "2"
 # Base64url encoding on the cookie wire format, and standard-base64
 # decode of the vendored captcha font glyphs. Matches the rest of
 # the workspace on 0.22.
-base64 = "0.22"
+base64 = "0.23"
 # CSPRNG for the HMAC secret, the PoW challenge nonce, and the
 # captcha solution text. Bumped to 0.9 in v1.5.0 (RUSTSEC-2026-0097
 # unsoundness when a custom logger + `rand::rng()` combine ; fixed
@@ -39,7 +39,7 @@ rand = "0.9"
 #
 # Raster buffer + PNG decode of the embedded font glyphs. `png`
 # feature only (no default codecs) keeps the surface minimal.
-image = { version = "0.24", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 # PNG encoder used to serialise the finished captcha image.
 lodepng = "3"
 # Parses the embedded `font_default.json` glyph table.

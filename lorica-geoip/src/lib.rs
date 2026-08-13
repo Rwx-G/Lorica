@@ -195,7 +195,7 @@ impl GeoIpResolver {
             )));
         }
 
-        let meta = reader.metadata.clone();
+        let meta = reader.metadata().clone();
         let status = GeoIpDbStatus {
             path: path_ref.display().to_string(),
             loaded_at: Utc::now(),
