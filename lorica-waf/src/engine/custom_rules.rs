@@ -93,3 +93,58 @@ impl WafEngine {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_over_length_pattern() {
+        let engine = WafEngine::new();
+        let pattern = "a".repeat(WafEngine::MAX_CUSTOM_PATTERN_LEN + 1);
+        let err = engine
+            .add_custom_rule(
+                1,
+                "too long".to_string(),
+                RuleCategory::ProtocolViolation,
+                &pattern,
+                3,
+            )
+            .expect_err("an over-length pattern must be rejected");
+        assert!(err.contains("exceeds"), "got: {err}");
+        assert!(engine.list_custom_rules().is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_regex() {
+        let engine = WafEngine::new();
+        let err = engine
+            .add_custom_rule(1, "bad regex".to_string(), RuleCategory::Xss, r"(unclosed", 3)
+            .expect_err("an invalid regex must be rejected");
+        assert!(err.contains("invalid regex"), "got: {err}");
+        assert!(engine.list_custom_rules().is_empty());
+    }
+
+    #[test]
+    fn add_list_remove_clear_round_trip() {
+        let engine = WafEngine::new();
+        engine
+            .add_custom_rule(10, "r10".to_string(), RuleCategory::SqlInjection, r"FOO", 3)
+            .expect("valid rule compiles");
+        engine
+            .add_custom_rule(11, "r11".to_string(), RuleCategory::Xss, r"BAR", 2)
+            .expect("valid rule compiles");
+
+        let listed = engine.list_custom_rules();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|r| r.id == 10 && r.enabled));
+
+        // Removing a present rule reports true; an absent id reports false.
+        assert!(engine.remove_custom_rule(10));
+        assert!(!engine.remove_custom_rule(9999));
+        assert_eq!(engine.list_custom_rules().len(), 1);
+
+        engine.clear_custom_rules();
+        assert!(engine.list_custom_rules().is_empty());
+    }
+}
