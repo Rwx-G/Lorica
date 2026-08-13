@@ -35,10 +35,17 @@ axum-route-table drift-gate test (which caught and reconciled three
 undocumented endpoints). Sub-items (f) source-tree and the split of
 `proxy_wiring.rs` / `main.rs` were already resolved in v1.5.10.
 
+**#48** (settings cross-field validation) - `GlobalSettings::validate_cross_fields`
+added in `lorica-config`, called from `lorica-api::settings::update_settings`
+on the merged result before persist. Enforces `cert_warning_days >
+cert_critical_days` and `flood_strict_rps < flood_threshold_rps` (when both
+set; `0` strict = auto). Per-field bounds stay at the API boundary; the
+uid/gid and zero-duration-ban NOTE drifts are documented intentional choices,
+not invariants. Five unit tests in `lorica-config`.
+
 ## Open
 
 | # | Item | Type | Notes |
 |---|------|------|-------|
 | 14 | Upstream-sync `rustls-pemfile` removal in `lorica-tls` | Track | RUSTSEC-2025-0134 (unmaintained) is visible transitively through our Pingora fork `lorica-tls`. Native Lorica code migrated to `rustls-pki-types` in v1.5.0 ; the transitive dep will clear once Pingora upstream migrates. Upstream tracking issue [cloudflare/pingora#772](https://github.com/cloudflare/pingora/issues/772) is still open (re-checked during the v1.6.0 dependency pass). Monitor their tracker ; pull the change into the fork when it lands. |
 | 15 | Upstream-sync `rand 0.8` removal in forked crates | Track | RUSTSEC-2026-0097 (unsound with custom logger) was visible transitively via Pingora forks (`lorica-runtime`, `lorica-limits`), the `tungstenite` / `axum` chain, and the `captcha` crate. Native Lorica code is on `rand 0.9` (v1.5.0) and the advisory itself was cleared in v1.5.8 (bumped `0.8.5 -> 0.8.6`). Removing the `0.8` line entirely still depends on the upstream forks bumping to `rand 0.9`. NOTE (v1.6.0 dep pass): the product-crate `rand 0.9 -> 0.10` bump was deliberately NOT taken - it is pervasive across product AND the pinned-at-0.8 forked crates, so bumping would fragment the workspace into three `rand` majors without removing the old line from the tree. `reqwest 0.12 -> 0.13` deferred for the same reason (forked `lorica-tls` keeps 0.12). Both revisit when the fork moves. |
-| 48 | Settings validation cross-field checks (bound drift) | Track | v1.5.9 audit Low, previously untracked (auditor said "file as backlog"). `lorica-config/src/models/settings.rs` lacks a few cross-field validators: the cert-expiry `warning_days` is not asserted `>` `critical_days`, and some uid/gid/interval fields have no range cross-checks. Self-acknowledged debt, low severity (bad input degrades a warning threshold, not a security boundary). Add validators alongside the next settings-model change. |

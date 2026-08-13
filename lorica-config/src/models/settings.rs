@@ -510,6 +510,44 @@ fn default_ai_bot_inject_headers() -> bool {
     true
 }
 
+impl GlobalSettings {
+    /// Validate the invariants that span more than one field.
+    ///
+    /// Per-field bounds (non-negative, absolute paths, enum tags) are enforced
+    /// field-by-field at the API boundary. The relationships below only make
+    /// sense between two fields, so they are checked on the merged result of a
+    /// settings update (backlog #48). Returns a human-readable message suitable
+    /// for a `400 Bad Request` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with a description of the first violated invariant.
+    pub fn validate_cross_fields(&self) -> Result<(), String> {
+        if self.cert_warning_days <= self.cert_critical_days {
+            return Err(format!(
+                "cert_warning_days ({}) must be greater than cert_critical_days ({}): \
+                 the warning threshold has to fire before the critical one",
+                self.cert_warning_days, self.cert_critical_days
+            ));
+        }
+        // Strict flood mode charges request tokens by the ratio
+        // `flood_threshold_rps / flood_strict_rps`, so strict must be a tighter
+        // cap than the plain threshold. A strict value of `0` means "auto"
+        // (half the threshold) and is exempt from the comparison.
+        if self.flood_threshold_rps > 0
+            && self.flood_strict_rps > 0
+            && i64::from(self.flood_strict_rps) >= i64::from(self.flood_threshold_rps)
+        {
+            return Err(format!(
+                "flood_strict_rps ({}) must be less than flood_threshold_rps ({}) \
+                 when both are set (0 = auto = half the threshold)",
+                self.flood_strict_rps, self.flood_threshold_rps
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
@@ -600,4 +638,53 @@ fn default_audit_log_retention_days() -> u32 {
 
 fn default_password_require_complexity() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GlobalSettings;
+
+    fn settings(
+        cert_warning_days: i32,
+        cert_critical_days: i32,
+        flood_threshold_rps: i32,
+        flood_strict_rps: u32,
+    ) -> GlobalSettings {
+        GlobalSettings {
+            cert_warning_days,
+            cert_critical_days,
+            flood_threshold_rps,
+            flood_strict_rps,
+            ..GlobalSettings::default()
+        }
+    }
+
+    #[test]
+    fn default_settings_pass_cross_field_validation() {
+        assert!(GlobalSettings::default().validate_cross_fields().is_ok());
+    }
+
+    #[test]
+    fn cert_warning_must_exceed_critical() {
+        assert!(settings(7, 7, 0, 0).validate_cross_fields().is_err());
+        assert!(settings(3, 7, 0, 0).validate_cross_fields().is_err());
+        assert!(settings(14, 7, 0, 0).validate_cross_fields().is_ok());
+    }
+
+    #[test]
+    fn flood_strict_must_be_tighter_than_threshold_when_set() {
+        assert!(settings(30, 7, 100, 100).validate_cross_fields().is_err());
+        assert!(settings(30, 7, 100, 150).validate_cross_fields().is_err());
+        assert!(settings(30, 7, 100, 50).validate_cross_fields().is_ok());
+    }
+
+    #[test]
+    fn flood_strict_zero_is_auto_and_exempt() {
+        assert!(settings(30, 7, 100, 0).validate_cross_fields().is_ok());
+    }
+
+    #[test]
+    fn flood_check_skipped_when_threshold_disabled() {
+        assert!(settings(30, 7, 0, 500).validate_cross_fields().is_ok());
+    }
 }

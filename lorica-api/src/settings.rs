@@ -576,6 +576,12 @@ pub async fn update_settings(
             "management_key_pem_path",
         )?;
 
+        // Cross-field invariants (backlog #48). Per-field bounds are applied
+        // above; these reject a partial update that inverts a related pair
+        // (e.g. cert warning <= critical) on the merged result.
+        settings
+            .validate_cross_fields()
+            .map_err(ApiError::BadRequest)?;
         store.update_global_settings(&settings)?;
         Ok::<_, ApiError>(settings)
     })
