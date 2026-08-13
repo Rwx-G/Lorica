@@ -2396,6 +2396,239 @@ async fn test_get_settings_returns_empty_bot_hmac_when_not_initialised() {
 }
 
 #[tokio::test]
+async fn test_get_settings_masks_prometheus_scrape_token() {
+    // Story 8.8 AC #4: a configured Prometheus scrape token grants
+    // unauthenticated /metrics access when `metrics_require_auth` is on,
+    // so GET /api/v1/settings must surface the REDACTED sentinel and
+    // never the raw token.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let token = "s3cr3t-scrape-token-value";
+    {
+        let s = state.store.lock().await;
+        let mut cur = s.get_global_settings().expect("test setup");
+        cur.prometheus_scrape_token = Some(token.to_string());
+        s.update_global_settings(&cur).expect("test setup");
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["prometheus_scrape_token"], "**REDACTED**");
+    assert!(
+        !body.windows(token.len()).any(|w| w == token.as_bytes()),
+        "raw scrape token must not appear anywhere in the response body"
+    );
+}
+
+#[tokio::test]
+async fn test_update_settings_scrape_token_sentinel_round_trip() {
+    // The masked GET returns `**REDACTED**`; a dashboard PUT that echoes
+    // that sentinel must leave the stored token untouched, a fresh value
+    // must overwrite it, and an empty string must clear it.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let original = "original-scrape-token";
+    {
+        let s = state.store.lock().await;
+        let mut cur = s.get_global_settings().expect("test setup");
+        cur.prometheus_scrape_token = Some(original.to_string());
+        s.update_global_settings(&cur).expect("test setup");
+    }
+
+    let put_token = |value: serde_json::Value| {
+        let state = state.clone();
+        let session_store = session_store.clone();
+        let rate_limiter = rate_limiter.clone();
+        let cookie = cookie.clone();
+        async move {
+            let router = app(state, session_store, rate_limiter);
+            let body = serde_json::json!({ "prometheus_scrape_token": value });
+            let req = Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings")
+                .header("Content-Type", "application/json")
+                .header("Cookie", &cookie)
+                .body(Body::from(body.to_string()))
+                .expect("test setup");
+            router.oneshot(req).await.expect("test setup").status()
+        }
+    };
+
+    // Echoing the sentinel leaves the token unchanged.
+    assert_eq!(put_token(serde_json::json!("**REDACTED**")).await, StatusCode::OK);
+    {
+        let s = state.store.lock().await;
+        assert_eq!(
+            s.get_global_settings()
+                .expect("test setup")
+                .prometheus_scrape_token
+                .as_deref(),
+            Some(original)
+        );
+    }
+
+    // A fresh value overwrites.
+    assert_eq!(put_token(serde_json::json!("rotated-token")).await, StatusCode::OK);
+    {
+        let s = state.store.lock().await;
+        assert_eq!(
+            s.get_global_settings()
+                .expect("test setup")
+                .prometheus_scrape_token
+                .as_deref(),
+            Some("rotated-token")
+        );
+    }
+
+    // An empty string clears it.
+    assert_eq!(put_token(serde_json::json!("")).await, StatusCode::OK);
+    {
+        let s = state.store.lock().await;
+        assert_eq!(
+            s.get_global_settings()
+                .expect("test setup")
+                .prometheus_scrape_token,
+            None
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_update_settings_rejects_cert_warning_not_above_critical() {
+    // Backlog #48 cross-field invariant: the warning threshold must fire
+    // before the critical one. Both values are within their per-field
+    // bounds, so the 400 must come from the cross-field check.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "cert_warning_days": 3, "cert_critical_days": 7 });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(body.to_string()))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("cert_warning_days") && text.contains("cert_critical_days"),
+        "the 400 must name the inverted cert-day pair, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_update_settings_rejects_flood_strict_ge_threshold() {
+    // Backlog #48 cross-field invariant: strict flood mode is a tighter
+    // cap than the plain threshold when both are set, but `0` strict is
+    // "auto" and exempt.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // strict == threshold -> rejected.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "flood_threshold_rps": 100, "flood_strict_rps": 100 });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(body.to_string()))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // strict == 0 (auto) with a threshold set -> accepted.
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "flood_threshold_rps": 100, "flood_strict_rps": 0 });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(body.to_string()))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_dns_provider_credentials_never_returned() {
+    // dns_providers promises credentials are never surfaced: a leaked
+    // Cloudflare API token would let anyone edit the zone. Create one,
+    // then assert neither the create response nor the list body carries
+    // the raw token.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let secret = "cloudflare-secret-token-xyz";
+    let create_body = serde_json::json!({
+        "name": "cf-zone",
+        "provider_type": "cloudflare",
+        "config": { "api_token": secret, "zone_id": "zone-123" }
+    });
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/dns-providers")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(create_body.to_string()))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    assert!(
+        !created.windows(secret.len()).any(|w| w == secret.as_bytes()),
+        "create response must not echo the raw credential"
+    );
+
+    // The list must surface provider metadata but never the secret.
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/dns-providers")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["dns_providers"][0]["name"], "cf-zone");
+    assert!(
+        !body.windows(secret.len()).any(|w| w == secret.as_bytes()),
+        "list response must not carry the raw credential"
+    );
+}
+
+#[tokio::test]
 async fn test_update_settings_invalid_log_level() {
     let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
