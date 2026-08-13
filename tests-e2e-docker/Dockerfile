@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y cmake pkg-config libssl-dev && rm -rf /
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY lorica/ lorica/
+COPY lorica-acme/ lorica-acme/
 COPY lorica-api/ lorica-api/
 COPY lorica-cache/ lorica-cache/
 COPY lorica-config/ lorica-config/
