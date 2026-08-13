@@ -37,18 +37,23 @@ done
 
 EXIT_CODE=0
 
-# `docker compose run` never rebuilds an existing image, so a stale
-# test-runner would silently run old assertions. With --build, build
-# every service (runner images included) up front.
-if [ -n "$BUILD_FLAG" ]; then
-    docker compose build
-fi
-
-# Profile-gated services need explicit --profile flags on teardown or
-# `down -v` skips their containers and named volumes; the next run then
-# boots against stale data (e.g. the cert-export smoke rotates the
-# admin password, and a stale volume 401s the next run's login).
+# Profile-gated services need explicit --profile flags: on teardown
+# `down -v` otherwise skips their containers and named volumes (the next
+# run boots against stale data - e.g. the cert-export smoke rotates the
+# admin password, and a stale volume 401s the next login), and on BUILD a
+# plain `docker compose build` (no profile flags) skips them entirely.
 ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade"
+
+# `docker compose run` never rebuilds an existing image, so a stale runner
+# would silently run old assertions. With --build, build every service
+# INCLUDING the profile-gated smoke/lorica images up front. Passing
+# $ALL_PROFILES is load-bearing: a plain `docker compose build` skips the
+# gated images, which once left a pre-HTTPS `ai-bot-smoke` image (built
+# before the management API went TLS) failing every curl with a TLS
+# verification error against the now-self-signed endpoint.
+if [ -n "$BUILD_FLAG" ]; then
+    docker compose $ALL_PROFILES build
+fi
 
 # ---- Phase 1: Single-process tests ----
 echo "=== Lorica E2E Tests (single-process) ==="
