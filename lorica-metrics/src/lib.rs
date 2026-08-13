@@ -54,7 +54,10 @@
 pub use prometheus;
 
 use once_cell::sync::Lazy;
-use prometheus::{HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry};
+use prometheus::{
+    Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Registry,
+};
 
 /// Namespace prepended to every metric registered through the helpers
 /// below. Matches the historical `lorica-api` convention so existing
@@ -156,6 +159,54 @@ pub fn register_histogram_vec(
         .namespace(NAMESPACE)
         .buckets(buckets);
     match HistogramVec::new(opts, label_names) {
+        Ok(histogram) => {
+            REGISTRY.register(Box::new(histogram.clone())).ok();
+            histogram
+        }
+        Err(err) => unreachable_metric_definition(name, &err),
+    }
+}
+
+/// Build a floating-point [`Gauge`] under the `lorica` namespace and
+/// register it against the shared [`REGISTRY`]. Use this for a scalar
+/// gauge whose value is fractional (e.g. a CPU-usage percentage);
+/// [`register_int_gauge`] is the integer-valued counterpart.
+pub fn register_gauge(name: &str, help: &str) -> Gauge {
+    let opts: prometheus::Opts = prometheus::Opts::new(name, help).namespace(NAMESPACE);
+    match Gauge::with_opts(opts) {
+        Ok(gauge) => {
+            REGISTRY.register(Box::new(gauge.clone())).ok();
+            gauge
+        }
+        Err(err) => unreachable_metric_definition(name, &err),
+    }
+}
+
+/// Build a floating-point [`GaugeVec`] under the `lorica` namespace
+/// with the given label names and register it against the shared
+/// [`REGISTRY`]. Use this for a labelled gauge whose value is
+/// fractional (e.g. backend health `1.0 | 0.5 | 0.0`);
+/// [`register_int_gauge_vec`] is the integer-valued counterpart.
+pub fn register_gauge_vec(name: &str, help: &str, label_names: &[&str]) -> GaugeVec {
+    let opts: prometheus::Opts = prometheus::Opts::new(name, help).namespace(NAMESPACE);
+    match GaugeVec::new(opts, label_names) {
+        Ok(gauge) => {
+            REGISTRY.register(Box::new(gauge.clone())).ok();
+            gauge
+        }
+        Err(err) => unreachable_metric_definition(name, &err),
+    }
+}
+
+/// Build a label-less [`Histogram`] under the `lorica` namespace with
+/// the given bucket boundaries and register it against the shared
+/// [`REGISTRY`]. [`register_histogram_vec`] is the labelled
+/// counterpart.
+pub fn register_histogram(name: &str, help: &str, buckets: Vec<f64>) -> Histogram {
+    let opts: HistogramOpts = HistogramOpts::new(name, help)
+        .namespace(NAMESPACE)
+        .buckets(buckets);
+    match Histogram::with_opts(opts) {
         Ok(histogram) => {
             REGISTRY.register(Box::new(histogram.clone())).ok();
             histogram

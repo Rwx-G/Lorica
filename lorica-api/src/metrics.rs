@@ -22,8 +22,8 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use lorica_metrics::REGISTRY;
 use once_cell::sync::Lazy;
-use prometheus::{
-    Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+use lorica_metrics::prometheus::{
+    Encoder, Gauge, GaugeVec, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
     TextEncoder,
 };
 
@@ -31,86 +31,58 @@ use crate::server::AppState;
 
 /// HTTP request counter. Labels: route_id, status_code.
 static HTTP_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!("http_requests_total", "Total HTTP requests proxied").namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "http_requests_total",
+        "Total HTTP requests proxied",
         &["route_id", "status_code"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// HTTP request latency histogram in seconds. Labels: route_id.
 static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
-    let histogram = HistogramVec::new(
-        HistogramOpts::new(
-            "http_request_duration_seconds",
-            "HTTP request latency in seconds",
-        )
-        .namespace("lorica")
-        .buckets(vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
-        ]),
+    lorica_metrics::register_histogram_vec(
+        "http_request_duration_seconds",
+        "HTTP request latency in seconds",
         &["route_id"],
+        vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
+        ],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(histogram.clone())).ok();
-    histogram
 });
 
 /// Active proxy connections gauge.
 static ACTIVE_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
-    let gauge = IntGauge::with_opts(
-        prometheus::Opts::new(
-            "active_connections",
-            "Current number of active proxy connections",
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_gauge(
+        "active_connections",
+        "Current number of active proxy connections",
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(gauge.clone())).ok();
-    gauge
 });
 
 /// Backend health status gauge. Labels: backend_id, address. Value: 1=healthy, 0.5=degraded, 0=down.
 static BACKEND_HEALTH: Lazy<GaugeVec> = Lazy::new(|| {
-    let gauge = GaugeVec::new(
-        prometheus::opts!(
-            "backend_health",
-            "Backend health status (1=healthy, 0.5=degraded, 0=down)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_gauge_vec(
+        "backend_health",
+        "Backend health status (1=healthy, 0.5=degraded, 0=down)",
         &["backend_id", "address"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(gauge.clone())).ok();
-    gauge
 });
 
 /// Certificate days to expiry gauge. Labels: domain.
 static CERT_EXPIRY_DAYS: Lazy<GaugeVec> = Lazy::new(|| {
-    let gauge = GaugeVec::new(
-        prometheus::opts!(
-            "certificate_expiry_days",
-            "Days until certificate expiration"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_gauge_vec(
+        "certificate_expiry_days",
+        "Days until certificate expiration",
         &["domain"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(gauge.clone())).ok();
-    gauge
 });
 
 /// WAF events counter. Labels: category, action (detected/blocked).
 static WAF_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!("waf_events_total", "Total WAF events").namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "waf_events_total",
+        "Total WAF events",
         &["category", "action"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// AI-bot evaluation counter (Story 8.2 AC #4). Labels: crawler,
@@ -130,17 +102,11 @@ static WAF_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// volume rests on the unverifiable UA-only signal. Do not sum the
 /// four actions expecting the request total.
 static AI_BOT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "ai_bot_total",
-            "Total AI / LLM crawler evaluations (deny / log / spoofed / ua_only_match)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "ai_bot_total",
+        "Total AI / LLM crawler evaluations (deny / log / spoofed / ua_only_match)",
         &["crawler", "route_id", "action"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// AI-bot rDNS resolver fail-open counter (Story 8.2 AC #4). No
@@ -154,16 +120,10 @@ static AI_BOT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// Deliberately label-less: the refused IP would be an unbounded
 /// cardinality label.
 static PER_IP_CONNECTION_REFUSED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    let counter = IntCounter::with_opts(
-        prometheus::Opts::new(
-            "per_ip_connection_refused_total",
-            "TCP connections refused by the per-source-IP connection cap",
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter(
+        "per_ip_connection_refused_total",
+        "TCP connections refused by the per-source-IP connection cap",
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Increment the per-IP connection-cap refusal counter. Called from
@@ -174,16 +134,10 @@ pub fn inc_per_ip_connection_refused() {
 }
 
 static AI_BOT_RDNS_UNAVAILABLE_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    let counter = IntCounter::with_opts(
-        prometheus::Opts::new(
-            "ai_bot_rdns_unavailable_total",
-            "AI-bot evaluations that hit the rDNS-resolver-unavailable fail-open path",
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter(
+        "ai_bot_rdns_unavailable_total",
+        "AI-bot evaluations that hit the rDNS-resolver-unavailable fail-open path",
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Counter for custom crawlers skipped on reload (Story 8.2 AC #8
@@ -196,17 +150,11 @@ static AI_BOT_RDNS_UNAVAILABLE_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
 /// so a corrupt SQLite row never silently disappears from the merged
 /// registry.
 static AI_BOT_SKIPPED_CUSTOM_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "ai_bot_skipped_custom_total",
-            "Custom AI crawlers skipped on reload due to malformed regex or verification_data"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "ai_bot_skipped_custom_total",
+        "Custom AI crawlers skipped on reload due to malformed regex or verification_data",
         &["reason"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Increment the `lorica_ai_bot_total{crawler, route_id, action}`
@@ -345,17 +293,11 @@ pub fn record_ai_bot_skipped_custom(reason: &str) {
 
 /// EWMA latency score per backend (microseconds). Labels: backend_address.
 static EWMA_SCORE: Lazy<GaugeVec> = Lazy::new(|| {
-    let gauge = GaugeVec::new(
-        prometheus::opts!(
-            "ewma_score_us",
-            "Peak EWMA latency score per backend in microseconds"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_gauge_vec(
+        "ewma_score_us",
+        "Peak EWMA latency score per backend in microseconds",
         &["backend_address"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(gauge.clone())).ok();
-    gauge
 });
 
 /// Update EWMA score metric for a backend.
@@ -364,25 +306,13 @@ pub fn set_ewma_score(address: &str, score_us: f64) {
 }
 
 /// System CPU usage gauge (0-100).
-static SYSTEM_CPU_PERCENT: Lazy<prometheus::Gauge> = Lazy::new(|| {
-    let gauge = prometheus::Gauge::with_opts(
-        prometheus::Opts::new("system_cpu_percent", "System CPU usage percentage")
-            .namespace("lorica"),
-    )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(gauge.clone())).ok();
-    gauge
+static SYSTEM_CPU_PERCENT: Lazy<Gauge> = Lazy::new(|| {
+    lorica_metrics::register_gauge("system_cpu_percent", "System CPU usage percentage")
 });
 
 /// System memory usage gauge (bytes).
 static SYSTEM_MEMORY_USED_BYTES: Lazy<IntGauge> = Lazy::new(|| {
-    let gauge = IntGauge::with_opts(
-        prometheus::Opts::new("system_memory_used_bytes", "System memory used in bytes")
-            .namespace("lorica"),
-    )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(gauge.clone())).ok();
-    gauge
+    lorica_metrics::register_int_gauge("system_memory_used_bytes", "System memory used in bytes")
 });
 
 /// Record an HTTP request in the metrics.
@@ -444,17 +374,11 @@ pub fn set_system_metrics(cpu_percent: f64, memory_used_bytes: i64) {
 /// response marked the key as uncacheable.
 /// Labels: `route_id` (bounded by the number of configured routes).
 static CACHE_PREDICTOR_BYPASS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "cache_predictor_bypass_total",
-            "Times the cache predictor short-circuited a request as uncacheable"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "cache_predictor_bypass_total",
+        "Times the cache predictor short-circuited a request as uncacheable",
         &["route_id"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record a cache-predictor bypass for a route.
@@ -470,17 +394,11 @@ pub fn inc_cache_predictor_bypass(route_id: &str) {
 /// matched vs. default traffic without a second metric.
 /// Labels: `route_id`, `rule_index` (or `"default"` for fallthrough).
 static HEADER_RULE_MATCH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "header_rule_match_total",
-            "Header-based routing rule matches (rule_index=\"default\" when no rule matched)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "header_rule_match_total",
+        "Header-based routing rule matches (rule_index=\"default\" when no rule matched)",
         &["route_id", "rule_index"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record a header-routing rule match. Pass `"default"` as rule_index
@@ -496,17 +414,11 @@ pub fn inc_header_rule_match(route_id: &str, rule_index: &str) {
 /// the "didn't hit any split" bucket).
 /// Labels: `route_id`, `split_name`.
 static CANARY_SPLIT_SELECTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "canary_split_selected_total",
-            "Canary traffic split selections (split_name=\"default\" when no split matched)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "canary_split_selected_total",
+        "Canary traffic split selections (split_name=\"default\" when no split matched)",
         &["route_id", "split_name"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record a canary-split selection. Pass `"default"` as split_name
@@ -526,17 +438,11 @@ pub fn inc_canary_split_selected(route_id: &str, split_name: &str) {
 ///
 /// Labels: `route_id`, `outcome`.
 static MIRROR_OUTCOME_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "mirror_outcome_total",
-            "Request-mirroring sub-request outcomes per route"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "mirror_outcome_total",
+        "Request-mirroring sub-request outcomes per route",
         &["route_id", "outcome"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record a mirror outcome.
@@ -551,17 +457,11 @@ pub fn inc_mirror_outcome(route_id: &str, outcome: &str) {
 /// `"miss"` means we made the sub-request. Labels: `route_id`,
 /// `outcome` ("hit" | "miss").
 static FORWARD_AUTH_CACHE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "forward_auth_cache_total",
-            "Forward-auth verdict cache lookups (outcome=hit|miss)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "forward_auth_cache_total",
+        "Forward-auth verdict cache lookups (outcome=hit|miss)",
         &["route_id", "outcome"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record a forward-auth verdict cache lookup outcome.
@@ -580,17 +480,11 @@ pub fn inc_forward_auth_cache(route_id: &str, outcome: &str) {
 /// comfort envelope on any sensible deployment. A route with no
 /// GeoIP config never increments this counter.
 static GEOIP_BLOCK_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "geoip_block_total",
-            "GeoIP-filter blocks (country=ISO3166 alpha-2, mode=allowlist|denylist)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "geoip_block_total",
+        "GeoIP-filter blocks (country=ISO3166 alpha-2, mode=allowlist|denylist)",
         &["route_id", "country", "mode"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record a GeoIP filter rejection. Called from the proxy request
@@ -617,17 +511,11 @@ pub fn inc_geoip_block(route_id: &str, country: &str, mode: &str) {
 /// Prometheus comfort on any plausible deployment. Routes without
 /// `bot_protection` configured never touch this counter.
 static BOT_CHALLENGE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "bot_challenge_total",
-            "Bot-protection challenge outcomes (outcome=shown|passed|failed|bypassed)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "bot_challenge_total",
+        "Bot-protection challenge outcomes (outcome=shown|passed|failed|bypassed)",
         &["route_id", "mode", "outcome"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record one bot-protection challenge outcome. Called from the
@@ -809,17 +697,11 @@ pub fn reset_generic_counter_snapshot_for_test() {
 /// channel, labeled by drop reason (`lag` = subscriber fell behind,
 /// `closed` = channel closed). Bounded-cardinality: only two labels.
 static NOTIFIER_EVENTS_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "notifier_events_dropped_total",
-            "Alert events dropped by the notifier broadcast channel (reason=lag|closed)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "notifier_events_dropped_total",
+        "Alert events dropped by the notifier broadcast channel (reason=lag|closed)",
         &["reason"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record one or more dropped notification events.
@@ -834,17 +716,11 @@ pub fn inc_notifier_events_dropped(reason: &str, count: u64) {
 /// writer cannot keep up with sustained request volume; the proxy
 /// keeps serving and sheds forensics rows instead of latency.
 static LOG_WRITE_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "log_write_dropped_total",
-            "Access-log entries and WAF events dropped on log-writer queue overflow (kind=access|waf)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "log_write_dropped_total",
+        "Access-log entries and WAF events dropped on log-writer queue overflow (kind=access|waf)",
         &["kind"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Bump the dropped-log-write counter for `kind` (`"access"` or `"waf"`).
@@ -861,17 +737,11 @@ pub fn inc_log_write_dropped(kind: &str) {
 /// `LOG_WS_CLOSE_ON_DROPS`, protecting Lorica from stuck-client
 /// backpressure amplification.
 static LOGS_WS_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "logs_ws_dropped_total",
-            "Log entries dropped by a WebSocket subscriber (reason=slow_client|closed)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "logs_ws_dropped_total",
+        "Log entries dropped by a WebSocket subscriber (reason=slow_client|closed)",
         &["reason"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record one or more dropped log-stream WebSocket entries.
@@ -896,16 +766,10 @@ pub fn inc_logs_ws_dropped(reason: &str, count: u64) {
 /// in-memory ring buffer + Prometheus categories), but the
 /// persistent forensics trail is broken.
 static WAF_EVENT_PERSIST_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    let counter = IntCounter::with_opts(
-        prometheus::opts!(
-            "waf_event_persist_failed_total",
-            "WAF events the proxy could not persist to the LogStore"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter(
+        "waf_event_persist_failed_total",
+        "WAF events the proxy could not persist to the LogStore",
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Bump the WAF-event-persistence-failed counter by one.
@@ -925,17 +789,11 @@ pub fn inc_waf_event_persist_failed() {
 /// picks up the persisted state, so this is observability, not a
 /// correctness crisis.
 static BAN_BROADCAST_LAGGED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "ban_broadcast_lagged_total",
-            "BanIp commands missed by a worker subscriber due to broadcast channel lag"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "ban_broadcast_lagged_total",
+        "BanIp commands missed by a worker subscriber due to broadcast channel lag",
         &["worker_id"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Counter: pipelined-RPC outcomes on the supervisor-to-worker
@@ -951,17 +809,11 @@ static BAN_BROADCAST_LAGGED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// on `metrics_pull` means a worker is stuck past the 500 ms per-
 /// worker budget.
 static SUPERVISOR_RPC_OUTCOME_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "supervisor_rpc_outcome_total",
-            "Outcome of supervisor -> worker pipelined RPCs, by kind and result"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "supervisor_rpc_outcome_total",
+        "Outcome of supervisor -> worker pipelined RPCs, by kind and result",
         &["kind", "outcome"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record the outcome of a supervisor-initiated RPC. `kind` is the
@@ -993,17 +845,11 @@ pub fn inc_ban_broadcast_lagged(worker_id: &str, count: u64) {
 /// the next iteration so the worker reaches the latest DB state, but
 /// individual `seq` numbers are dropped on the floor (audit C-2).
 static RELOAD_BROADCAST_LAGGED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "reload_broadcast_lagged_total",
-            "ConfigReload broadcast messages missed by a worker subscriber due to channel lag"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "reload_broadcast_lagged_total",
+        "ConfigReload broadcast messages missed by a worker subscriber due to channel lag",
         &["worker_id"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record one or more ConfigReload broadcast messages lagged on a
@@ -1023,17 +869,11 @@ pub fn inc_reload_broadcast_lagged(worker_id: &str, count: u64) {
 /// otherwise freeze the resolver for the lifetime of the process
 /// without any operator-visible signal (audit M-19).
 static RESOLVER_APPLY_FAILED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "resolver_apply_failed_total",
-            "Per-process resolver hook failed to apply settings (store fetch error)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "resolver_apply_failed_total",
+        "Per-process resolver hook failed to apply settings (store fetch error)",
         &["kind"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record one resolver-apply failure. `kind` is one of `geoip`,
@@ -1049,13 +889,10 @@ pub fn inc_resolver_apply_failed(kind: &str) {
 /// flags a stuck supervisor RPC channel and was previously a silent
 /// `let _ = endpoint.request_rpc(...).await` swallow (audit L-14).
 static BOT_VERDICT_PUSH_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    let counter = IntCounter::new(
-        "lorica_bot_verdict_push_failed_total",
+    lorica_metrics::register_int_counter(
+        "bot_verdict_push_failed_total",
         "Bot verdict cross-worker propagation RPCs (worker -> supervisor) that failed",
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record one bot-verdict-push RPC failure.
@@ -1086,17 +923,11 @@ pub fn inc_bot_verdict_push_failed() {
 /// Bounded cardinality : two label values, no operator-controlled
 /// or user-controlled string in the label set.
 static CERTIFICATES_INVALID_BUNDLE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "certificates_invalid_bundle_total",
-            "Certificate bundles rejected as invalid (source=upload|reload)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "certificates_invalid_bundle_total",
+        "Certificate bundles rejected as invalid (source=upload|reload)",
         &["source"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Bump the invalid-bundle counter by one. `source` must be either
@@ -1125,16 +956,10 @@ pub fn inc_certificates_invalid_bundle_by(source: &str, count: u64) {
 /// (Story 8.9) - so this counter surfaces the resulting audit gap for
 /// alerting, since a swallowed insert leaves no chain break to detect.
 static AUDIT_INSERT_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    let counter = IntCounter::with_opts(
-        prometheus::opts!(
-            "audit_insert_failed_total",
-            "Audit-log row inserts that failed (the mutation still succeeded)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter(
+        "audit_insert_failed_total",
+        "Audit-log row inserts that failed (the mutation still succeeded)",
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Bump the audit-insert-failure counter (Story 8.9).
@@ -1147,16 +972,10 @@ pub fn inc_audit_insert_failed() {
 /// is loopback-only, so this mainly surfaces local handshake churn - a
 /// scanner, or an operator whose client pins a stale cert (Story 8.8).
 static MANAGEMENT_TLS_HANDSHAKE_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    let counter = IntCounter::with_opts(
-        prometheus::opts!(
-            "management_tls_handshake_failed_total",
-            "Management-plane TLS handshakes that failed"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter(
+        "management_tls_handshake_failed_total",
+        "Management-plane TLS handshakes that failed",
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Bump the management TLS handshake-failure counter (Story 8.8).
@@ -1173,17 +992,11 @@ pub fn inc_management_tls_handshake_failed() {
 /// [`PER_WORKER_COUNTERS`]; the supervisor sums worker deltas rather
 /// than carrying a `worker_id` label (the established Lorica pattern).
 static CERT_RESOLVER_RELOAD_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "cert_resolver_reload_total",
-            "Cert-resolver reloads by outcome (result=ok|fail)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "cert_resolver_reload_total",
+        "Cert-resolver reloads by outcome (result=ok|fail)",
         &["result"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Bump the cert-resolver reload counter. `result` is `"ok"` | `"fail"`.
@@ -1197,17 +1010,11 @@ pub fn inc_cert_resolver_reload(result: &str) {
 /// is `"ok"` (staple fetched and swapped in) or `"fail"` (a responder
 /// fetch failed for a still-registered cert). Per-worker aggregated.
 static OCSP_REFRESH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        prometheus::opts!(
-            "ocsp_refresh_total",
-            "OCSP staple background-refresh fetches by outcome (result=ok|fail)"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_counter_vec(
+        "ocsp_refresh_total",
+        "OCSP staple background-refresh fetches by outcome (result=ok|fail)",
         &["result"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Bump the OCSP-refresh counter by `count` for `result` (`"ok"`|`"fail"`).
@@ -1227,16 +1034,10 @@ pub fn inc_ocsp_refresh_by(result: &str, count: u64) {
 /// the route-referenced cert domain set in single-process AND worker
 /// modes without depending on the counter-only cross-worker machinery.
 static CERT_RESOLVER_ACTIVE_DOMAINS: Lazy<IntGauge> = Lazy::new(|| {
-    let gauge = IntGauge::with_opts(
-        prometheus::opts!(
-            "cert_resolver_active_domains",
-            "Distinct domains currently served by the TLS cert resolver"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_int_gauge(
+        "cert_resolver_active_domains",
+        "Distinct domains currently served by the TLS cert resolver",
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(gauge.clone())).ok();
-    gauge
 });
 
 /// Set the active-domains gauge (called from the `/metrics` refresh).
@@ -1254,17 +1055,11 @@ pub fn set_cert_resolver_active_domains(count: i64) {
 /// single-process mode. The cross-worker OCSP signal is
 /// `ocsp_refresh_total`, which does aggregate.
 static CERT_RESOLVER_PENDING_OCSP_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
-    let gauge = GaugeVec::new(
-        prometheus::opts!(
-            "cert_resolver_pending_ocsp_seconds",
-            "Seconds since a domain last received a fresh OCSP staple"
-        )
-        .namespace("lorica"),
+    lorica_metrics::register_gauge_vec(
+        "cert_resolver_pending_ocsp_seconds",
+        "Seconds since a domain last received a fresh OCSP staple",
         &["domain"],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(gauge.clone())).ok();
-    gauge
 });
 
 /// Set the pending-OCSP-seconds gauge for `domain`.
@@ -1284,13 +1079,10 @@ pub fn set_cert_resolver_pending_ocsp_seconds(domain: &str, seconds: f64) {
 /// gap that operators need to know about even though the system
 /// self-heals on the next reload.
 static CONFIG_RELOAD_SPLIT_FLEET_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    let counter = IntCounter::new(
-        "lorica_config_reload_split_fleet_total",
+    lorica_metrics::register_int_counter(
+        "config_reload_split_fleet_total",
         "Config reload commits where some workers committed and others failed (transient fleet split)",
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(counter.clone())).ok();
-    counter
 });
 
 /// Record one config-reload split-fleet event.
@@ -1346,17 +1138,11 @@ pub fn record_hot_upgrade(outcome: &str) {
 /// before it exits. Buckets span the configurable drain window (default
 /// 30 s) so an operator can alert on drains creeping toward the timeout.
 static HOT_UPGRADE_DRAIN_SECONDS: Lazy<Histogram> = Lazy::new(|| {
-    let histogram = Histogram::with_opts(
-        HistogramOpts::new(
-            "hot_upgrade_drain_seconds",
-            "Worker connection-drain duration on a successful hot upgrade, in seconds",
-        )
-        .namespace("lorica")
-        .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0]),
+    lorica_metrics::register_histogram(
+        "hot_upgrade_drain_seconds",
+        "Worker connection-drain duration on a successful hot upgrade, in seconds",
+        vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0],
     )
-    .expect("prometheus metric creation");
-    REGISTRY.register(Box::new(histogram.clone())).ok();
-    histogram
 });
 
 /// Observe one successful-upgrade drain duration in seconds. Called by
