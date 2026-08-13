@@ -860,12 +860,26 @@ mod tests {
         let db_path = dir.path().join("legacy.db");
         {
             let conn = rusqlite::Connection::open(&db_path).expect("test setup: raw open");
+            // A real pre-v22 database also has the `routes` and
+            // `sessions` tables (created at v1 / v21); the v22+ tail
+            // adds columns to them. The old runner swallowed the ALTER
+            // errors when they were missing, the tracked runner does
+            // not, so the synthetic fixture must include them.
             conn.execute_batch(
                 "CREATE TABLE schema_migrations (
                     version INTEGER PRIMARY KEY,
                     applied_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
                  INSERT INTO schema_migrations (version) VALUES (21);
+                 CREATE TABLE routes (
+                    id TEXT PRIMARY KEY,
+                    hostname TEXT NOT NULL DEFAULT ''
+                 );
+                 CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                 );
                  CREATE TABLE admin_users (
                     id TEXT PRIMARY KEY,
                     username TEXT NOT NULL UNIQUE,
@@ -1082,11 +1096,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        // 46 is the current head of the tracked MIGRATIONS table (every
+        // schema change now carries a distinct version, including the
+        // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            22
+            46
         );
     }
 
@@ -1104,7 +1121,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                22
+                46
             );
         }
     }
