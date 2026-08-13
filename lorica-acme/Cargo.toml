@@ -1,0 +1,46 @@
+[package]
+name = "lorica-acme"
+version = "1.6.0"
+authors = ["Rwx-G"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "Pure ACME / Let's Encrypt protocol core for Lorica: instant-acme driver, CSR generation, and DNS-01 provider challengers"
+
+[dependencies]
+# instant-acme drives the ACME protocol (account, order,
+# authorizations, challenge readiness, finalize_csr, poll). Default
+# features bring `aws-lc-rs` + `hyper-rustls`; we pin `ring` instead to
+# match the rest of the workspace (`lorica-tls`, `lorica-api`,
+# `lorica/rustls`) so the binary does not carry two crypto providers in
+# parallel. `rcgen` (below) generates the CSR fed into `finalize_csr`.
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
+rcgen = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ring = "0.17"
+base64 = "0.23"
+tracing = "0.1"
+parking_lot = "0.12"
+async-trait = { workspace = true }
+thiserror = "2"
+tokio = { workspace = true, features = ["time"] }
+# Route53 is opt-in because its dep graph drags `aws-smithy-http-client`
+# which depends on the security-maintenance-only `rustls 0.21` + `hyper 0.14`
+# stack. Deployments that don't use ACME DNS-01 via Route53 (the great
+# majority of today's users) should not pay the compile cost nor ship that
+# older TLS surface. Enable via `lorica-api`'s `route53` feature.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"], optional = true }
+aws-sdk-route53 = { version = "1", optional = true }
+
+[features]
+default = []
+route53 = ["dep:aws-config", "dep:aws-sdk-route53"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# HTTP mock server for unit-testing the Cloudflare + OVH DNS challengers
+# without hitting the real providers (v1.5.0 backlog #9). Scoped to dev so
+# the runtime binary does not pick up the dep.
+wiremock = "0.6"

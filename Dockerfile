@@ -28,6 +28,7 @@ COPY Cargo.toml Cargo.lock ./
 
 # Copy all workspace crates
 COPY lorica/ lorica/
+COPY lorica-acme/ lorica-acme/
 COPY lorica-api/ lorica-api/
 COPY lorica-cache/ lorica-cache/
 COPY lorica-config/ lorica-config/

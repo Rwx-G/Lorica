@@ -8,6 +8,7 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
+lorica-acme = { version = "1.6.0", path = "../lorica-acme" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
 lorica-config = { version = "1.6.0", path = "../lorica-config" }
 lorica-dashboard = { version = "1.6.0", path = "../lorica-dashboard" }
@@ -66,8 +67,6 @@ ring = "0.17"
 # across the bump.
 x509-parser = "0.18"
 pem = "4"
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"], optional = true }
-aws-sdk-route53 = { version = "1", optional = true }
 sysinfo = "0.39"
 # Linux-only. Used for `statvfs` so the System page reports disk
 # usage with the same "used = total - free" semantics as `df -h`
@@ -77,23 +76,6 @@ sysinfo = "0.39"
 # `#![deny(unsafe_code)]` stays intact.
 nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
 thiserror = "2"
-# Bumped 0.7 -> 0.8 in v1.5.2 (audit L-15). Maintainer is djc
-# (Dirkjan Ochtman, well-known crate maintainer ; low takeover
-# risk). 0.8 added ACME-CAA + revoked-account error handling.
-# API breaks migrated in `acme/{http01,dns01,dns01_manual}.rs` :
-# Account creation goes through `AccountBuilder` ; NewOrder uses
-# the `::new(&identifiers)` constructor ; authorizations are a
-# stream-style iterator ; challenge readiness moved from
-# `Order::set_challenge_ready(url)` to
-# `ChallengeHandle::set_ready()` ; `finalize` lost its CSR arg
-# in favour of a separate `finalize_csr(der)` method.
-# Default features bring `aws-lc-rs` + `hyper-rustls` ; we
-# pin `ring` instead to match the rest of the workspace
-# (`lorica-tls`, `lorica/rustls`) so the binary does not
-# carry two crypto providers in parallel. `rcgen` not needed
-# (we generate the CSR with `rcgen` directly and feed it into
-# `finalize_csr`).
-instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 async-trait = { workspace = true }
 base64 = "0.23"
@@ -125,15 +107,10 @@ itoa = "1"
 # building from source, or uncomment the default line for downstream
 # packagers that need it. See ROADMAP.md (audit SC-M-3).
 default = []
-route53 = ["aws-config", "aws-sdk-route53"]
+route53 = ["lorica-acme/route53"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 hyper = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
-# HTTP mock server for unit-testing the Cloudflare + OVH DNS
-# challengers without hitting the real providers (v1.5.0 backlog
-# #9). Scoped to dev so the runtime binary does not pick up the
-# dep.
-wiremock = "0.6"

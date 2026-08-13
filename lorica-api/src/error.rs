@@ -51,6 +51,18 @@ impl From<lorica_config::ConfigError> for ApiError {
     }
 }
 
+/// ACME protocol failures are internal server errors: they surface a
+/// generic "internal error" to the client (audit M-12) while the full
+/// `AcmeError` detail is logged. Input validation for ACME requests
+/// (`DnsChallengeConfig::validate`, `build_dns_challenger`) stays a
+/// `BadRequest` at the individual call sites; only the driver's protocol
+/// errors flow through here.
+impl From<lorica_acme::AcmeError> for ApiError {
+    fn from(err: lorica_acme::AcmeError) -> Self {
+        ApiError::Internal(err.to_string())
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody {
     code: String,

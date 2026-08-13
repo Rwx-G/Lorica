@@ -183,3 +183,18 @@ impl AcmeChallengeStore {
         }
     }
 }
+
+/// The store is the HTTP-01 challenge-solving strategy for the ACME driver:
+/// publishing a token persists it (`set`), retracting it deletes it
+/// (`remove`), so the proxy data plane serves the right key authorization at
+/// `/.well-known/acme-challenge/{token}` while the order is live.
+#[async_trait::async_trait]
+impl lorica_acme::Http01ChallengeSolver for AcmeChallengeStore {
+    async fn present(&self, token: String, key_authorization: String) {
+        self.set(token, key_authorization).await;
+    }
+
+    async fn cleanup(&self, token: &str) {
+        self.remove(token).await;
+    }
+}

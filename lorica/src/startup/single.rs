@@ -373,7 +373,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                     ban_list: proxy_ban_list,
                     ewma_scores: proxy_ewma_scores,
                     backend_connections: backend_conns.clone(),
-                    cache_backend: &*lorica::proxy_wiring::CACHE_BACKEND,
+                    cache_backend: &lorica::proxy_wiring::CACHE_BACKEND,
                 },
                 waf_event_buffer: Some(waf_event_buffer),
                 waf_engine: Some(waf_engine),

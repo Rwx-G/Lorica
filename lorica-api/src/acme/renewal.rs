@@ -168,9 +168,9 @@ pub fn superseded_orphans(
         .collect()
 }
 
-use super::config::AcmeConfig;
+use lorica_acme::{build_dns_challenger, AcmeConfig, DnsChallengeConfig};
+
 use super::dns01::provision_with_acme_dns;
-use super::dns_challengers::{build_dns_challenger, DnsChallengeConfig};
 use super::http01::provision_with_acme;
 
 /// Spawn a background task that checks ACME certificates for renewal.

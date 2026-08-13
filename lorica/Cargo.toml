@@ -160,6 +160,12 @@ connection_filter = [
 any_tls = []
 prometheus = ["lorica-core/prometheus"]
 
+# ACME DNS-01 via AWS Route53. Off by default (matches the supply-chain
+# audit SC-M-3 policy): the Route53 dep graph drags an older TLS stack, so
+# only builds that need it pay the cost. Passes through to
+# `lorica-api/route53`, which enables `lorica-acme/route53`.
+route53 = ["lorica-api/route53"]
+
 # Distributed tracing via OTLP export. Off by default.
 # Enable with `cargo build --release --features otel`. See Cargo.toml
 # section above for the exact crate versions pulled in.

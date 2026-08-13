@@ -2995,13 +2995,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "lorica-acme"
+version = "1.6.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-route53",
+ "base64 0.23.1",
+ "instant-acme",
+ "parking_lot",
+ "rcgen",
+ "reqwest 0.12.28",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "lorica-api"
 version = "1.6.0"
 dependencies = [
  "argon2",
  "async-trait",
- "aws-config",
- "aws-sdk-route53",
  "axum",
  "base64 0.23.1",
  "chrono",
@@ -3011,9 +3030,9 @@ dependencies = [
  "http 1.5.0",
  "hyper 1.11.0",
  "hyper-util",
- "instant-acme",
  "ipnet",
  "itoa",
+ "lorica-acme",
  "lorica-bench",
  "lorica-cache",
  "lorica-config",
@@ -3047,7 +3066,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
- "wiremock",
  "x509-parser 0.18.1",
 ]
 

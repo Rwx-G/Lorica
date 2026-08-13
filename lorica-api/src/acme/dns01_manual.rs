@@ -21,13 +21,13 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use lorica_acme::AcmeConfig;
+
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
 
-use super::config::AcmeConfig;
-use super::dns01::acme_dns_base_domain;
 use super::types::{default_true, AcmeProvisionResponse, PendingDnsChallenge};
 
 /// Maximum age for a pending manual DNS challenge before it is considered expired.
@@ -92,10 +92,6 @@ pub async fn provision_dns_manual(
     Extension(session): Extension<Session>,
     Json(body): Json<AcmeDnsManualRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use instant_acme::{
-        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder,
-    };
-
     // Support multi-domain: "example.com, *.example.com" or "a.com,b.com"
     let domains: Vec<String> = body
         .domain
@@ -119,92 +115,44 @@ pub async fn provision_dns_manual(
         "starting manual DNS-01 challenge (step 1)"
     );
 
-    // Create ACME account
-    let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
-    let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
+    // Drive the pure ACME core: create the account + order and extract the
+    // DNS-01 challenge metadata WITHOUT creating any TXT record. The operator
+    // publishes the returned records, then calls confirm.
+    let manual_order = lorica_acme::begin_manual_dns01(&config, &domains).await?;
 
-    // instant-acme 0.8 (audit L-15) : Account creation goes
-    // through a builder, NewOrder needs the public constructor.
-    let (account, credentials) = Account::builder()
-        .map_err(|e| ApiError::Internal(format!("ACME account builder failed: {e}")))?
-        .create(
-            &NewAccount {
-                contact: &contact_refs,
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            config.directory_url().to_string(),
-            None,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("ACME account creation failed: {e}")))?;
-
-    // Create order with all domains as identifiers
-    let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
-    let mut order = account
-        .new_order(&NewOrder::new(&identifiers))
-        .await
-        .map_err(|e| ApiError::Internal(format!("ACME order creation failed: {e}")))?;
-
-    // instant-acme 0.8 (audit L-15) : authorizations is now a
-    // stream-style iterator of `AuthorizationHandle`. We extract
-    // the challenge metadata (URL + token + key_authorization +
-    // identifier) synchronously here and store it in the
-    // `PendingDnsChallenge` ; the confirm phase rebuilds the
-    // order from credentials and re-walks the iterator to call
-    // `set_ready` on each challenge by URL.
-    let mut challenge_urls: Vec<String> = Vec::new();
-    let mut txt_records_out: Vec<DnsManualTxtRecord> = Vec::new();
-    let mut txt_records_pending: Vec<(String, String, String)> = Vec::new(); // (record_name, txt_value, domain)
-
-    let mut authorizations = order.authorizations();
-    while let Some(result) = authorizations.next().await {
-        let mut authz =
-            result.map_err(|e| ApiError::Internal(format!("failed to get authorization: {e}")))?;
-        if matches!(authz.status, AuthorizationStatus::Valid) {
-            continue;
-        }
-
-        let challenge = authz
-            .challenge(ChallengeType::Dns01)
-            .ok_or_else(|| ApiError::Internal("no DNS-01 challenge available".into()))?;
-
-        let key_authorization = challenge.key_authorization();
-        let txt_value = key_authorization.dns_value();
-
-        let auth_domain = challenge.identifier().to_string();
-        let base_domain = acme_dns_base_domain(&auth_domain);
-        let txt_record_name = format!("_acme-challenge.{base_domain}");
-
-        challenge_urls.push(challenge.url.clone());
-        txt_records_out.push(DnsManualTxtRecord {
-            domain: auth_domain.clone(),
-            name: txt_record_name.clone(),
-            value: txt_value.clone(),
-        });
-        txt_records_pending.push((txt_record_name, txt_value, auth_domain));
-    }
-    // `authorizations` borrows `order` ; let NLL release the borrow
-    // here so subsequent `order` calls can re-borrow mut.
-    let _ = authorizations;
-
-    if txt_records_out.is_empty() {
+    if manual_order.challenges.is_empty() {
         return Err(ApiError::BadRequest(
             "all authorizations already valid - no challenge needed".into(),
         ));
     }
 
-    // Serialize account credentials for later restoration
-    let credentials_json = serde_json::to_string(&credentials)
-        .map_err(|e| ApiError::Internal(format!("failed to serialize credentials: {e}")))?;
+    let txt_records_out: Vec<DnsManualTxtRecord> = manual_order
+        .challenges
+        .iter()
+        .map(|c| DnsManualTxtRecord {
+            domain: c.domain.clone(),
+            name: c.record_name.clone(),
+            value: c.txt_value.clone(),
+        })
+        .collect();
+    let challenge_urls: Vec<String> = manual_order
+        .challenges
+        .iter()
+        .map(|c| c.challenge_url.clone())
+        .collect();
+    let txt_records_pending: Vec<(String, String, String)> = manual_order
+        .challenges
+        .iter()
+        .map(|c| (c.record_name.clone(), c.txt_value.clone(), c.domain.clone()))
+        .collect();
 
     // Store the pending challenge (keyed by primary domain)
     let pending = PendingDnsChallenge {
-        order_url: order.url().to_string(),
+        order_url: manual_order.order_url,
         challenge_urls,
         txt_records: txt_records_pending,
         domains: domains.clone(),
-        account_credentials_json: credentials_json,
+        account_credentials_json: manual_order.account_credentials_json,
         staging: body.staging,
         contact_email: body.contact_email.clone(),
         created_at: Instant::now(),
@@ -361,10 +309,6 @@ pub async fn provision_dns_manual_confirm(
     Extension(session): Extension<Session>,
     Json(body): Json<AcmeDnsManualConfirmRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use instant_acme::{
-        Account, AccountCredentials, AuthorizationStatus, ChallengeType, OrderStatus, RetryPolicy,
-    };
-
     if body.domain.is_empty() {
         return Err(ApiError::BadRequest("domain is required".into()));
     }
@@ -397,121 +341,18 @@ pub async fn provision_dns_manual_confirm(
         "confirming manual DNS-01 challenge (step 2)"
     );
 
-    // Restore ACME account from saved credentials
-    let credentials: AccountCredentials =
-        serde_json::from_str(&pending.account_credentials_json)
-            .map_err(|e| ApiError::Internal(format!("failed to deserialize credentials: {e}")))?;
-
-    // instant-acme 0.8 (audit L-15) : `Account::from_credentials`
-    // moved onto `AccountBuilder`. Same semantics : restore an
-    // account from previously-stored credentials.
-    let account = Account::builder()
-        .map_err(|e| ApiError::Internal(format!("ACME account builder failed: {e}")))?
-        .from_credentials(credentials)
-        .await
-        .map_err(|e| ApiError::Internal(format!("failed to restore ACME account: {e}")))?;
-
-    // Restore the order
-    let mut order = account
-        .order(pending.order_url.clone())
-        .await
-        .map_err(|e| ApiError::Internal(format!("failed to restore ACME order: {e}")))?;
-
-    // instant-acme 0.8 (audit L-15) : `set_challenge_ready` is
-    // gone ; readiness is signalled per-handle via
-    // `ChallengeHandle::set_ready()`. Walk the authorizations
-    // iterator, find the matching challenge by URL, signal.
-    {
-        use std::collections::HashSet;
-        let target_urls: HashSet<&str> =
-            pending.challenge_urls.iter().map(|s| s.as_str()).collect();
-        let mut authorizations = order.authorizations();
-        while let Some(result) = authorizations.next().await {
-            let mut authz = result
-                .map_err(|e| ApiError::Internal(format!("failed to load authorization: {e}")))?;
-            if matches!(authz.status, AuthorizationStatus::Valid) {
-                continue;
-            }
-            let mut challenge = authz
-                .challenge(ChallengeType::Dns01)
-                .ok_or_else(|| ApiError::Internal("no DNS-01 challenge available".into()))?;
-            if !target_urls.contains(challenge.url.as_str()) {
-                continue;
-            }
-            challenge
-                .set_ready()
-                .await
-                .map_err(|e| ApiError::Internal(format!("set_ready failed: {e}")))?;
-        }
-    }
-
-    // Wait for all authorizations to reach Ready (or terminal
-    // failure) via the new `poll_ready` helper.
-    let ready_status = order
-        .poll_ready(&RetryPolicy::default())
-        .await
-        .map_err(|e| ApiError::Internal(format!("poll_ready failed: {e}")))?;
-    if ready_status != OrderStatus::Ready {
-        return Err(ApiError::Internal(format!(
-            "DNS-01 challenge validation did not reach Ready: {ready_status:?} - check your TXT records"
-        )));
-    }
-
-    // Generate CSR with all domains and finalize order
-    let mut params = rcgen::CertificateParams::new(domains.clone())
-        .map_err(|e| ApiError::Internal(format!("CSR params error: {e}")))?;
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    let private_key =
-        rcgen::KeyPair::generate().map_err(|e| ApiError::Internal(format!("keygen error: {e}")))?;
-    let csr = params
-        .serialize_request(&private_key)
-        .map_err(|e| ApiError::Internal(format!("CSR serialize error: {e}")))?;
-
-    // `finalize_csr` is the explicit-CSR variant in 0.8.
-    order
-        .finalize_csr(csr.der())
-        .await
-        .map_err(|e| ApiError::Internal(format!("order finalize failed: {e}")))?;
-
-    // Poll for issuance with exponential backoff (replaces the
-    // legacy manual sleep-and-refresh loop).
-    let cert_pem = order
-        .poll_certificate(&RetryPolicy::default())
-        .await
-        .map_err(|e| ApiError::Internal(format!("certificate poll failed: {e}")))?;
-
-    // Stub the legacy poll loop. `poll_certificate` replaced it.
-    #[allow(unreachable_code, clippy::never_loop)]
-    let _ = loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let order_state = order.state();
-        match order_state.status {
-            OrderStatus::Valid => {
-                let cert = order
-                    .certificate()
-                    .await
-                    .map_err(|e| ApiError::Internal(format!("certificate download failed: {e}")))?;
-                break cert.ok_or_else(|| ApiError::Internal("no certificate returned".into()))?;
-            }
-            OrderStatus::Processing => {
-                let attempts = 0;
-                if attempts > 30 {
-                    return Err(ApiError::Internal("certificate issuance timed out".into()));
-                }
-                order
-                    .refresh()
-                    .await
-                    .map_err(|e| ApiError::Internal(format!("order refresh failed: {e}")))?;
-            }
-            status => {
-                return Err(ApiError::Internal(format!(
-                    "unexpected order status: {status:?}"
-                )));
-            }
-        }
-    };
-
-    let key_pem = private_key.serialize_pem();
+    // Drive the pure ACME core: restore the account + order from the pending
+    // credentials, signal readiness for the operator-published challenges,
+    // and poll to issuance.
+    let issued = lorica_acme::finalize_manual_dns01(
+        &pending.account_credentials_json,
+        &pending.order_url,
+        &pending.challenge_urls,
+        domains,
+    )
+    .await?;
+    let cert_pem = issued.cert_pem;
+    let key_pem = issued.key_pem;
 
     // Store certificate in database
     let now = chrono::Utc::now();

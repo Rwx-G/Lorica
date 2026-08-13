@@ -19,6 +19,7 @@ members = [
     "lorica-lru",
     "tinyufo",
     "lorica-config",
+    "lorica-acme",
     "lorica-api",
     "lorica-metrics",
     "lorica-dashboard",
