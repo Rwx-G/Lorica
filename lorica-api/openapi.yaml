@@ -50,6 +50,8 @@ tags:
     description: DNS provider credentials for ACME DNS-01 challenges
   - name: Validation
     description: Pre-flight validation helpers (mTLS PEM, forward-auth health check)
+  - name: Audit
+    description: Admin audit log (tamper-evident hash chain)
 
 paths:
   # ---------------------------------------------------------------------------
@@ -1309,6 +1311,44 @@ paths:
                         type: array
                         items:
                           type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/system/upgrade:
+    post:
+      tags: [System]
+      summary: Upload, verify, and stage a new lorica binary (Story 8.4)
+      description: |
+        Hot binary-upgrade endpoint. The multipart body carries a full
+        `lorica` executable plus a detached Ed25519 signature; the
+        server verifies the signature against the configured public key
+        and stages the binary for the zero-downtime handoff. Rejected
+        unless the payload is a correctly-signed binary.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [binary, signature]
+              properties:
+                binary:
+                  type: string
+                  format: binary
+                signature:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Binary verified and staged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -3310,6 +3350,58 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           description: Renewal failed (ACME server error, DNS, etc.)
+
+  # ---------------------------------------------------------------------------
+  # Admin audit log (Story 8.9)
+  # ---------------------------------------------------------------------------
+  /api/v1/audit:
+    get:
+      tags: [Audit]
+      summary: List admin audit-log entries
+      description: |
+        Returns the tamper-evident admin audit log (Story 8.9).
+        Operator+ role floor, enforced by the authorize middleware.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Audit log entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/audit/verify:
+    get:
+      tags: [Audit]
+      summary: Verify the audit-log hash chain
+      description: |
+        Recomputes the audit-log hash chain and reports whether the
+        trail is intact (Story 8.9). SuperAdmin-only, enforced by the
+        authorize middleware.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Verification outcome
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
 components:
   securitySchemes:
