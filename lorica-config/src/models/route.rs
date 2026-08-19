@@ -403,6 +403,36 @@ pub struct RateLimit {
     pub scope: RateLimitScope,
 }
 
+impl RateLimit {
+    /// Synthesise a [`RateLimit`] from the legacy `rate_limit_rps` +
+    /// optional `rate_limit_burst` fields (Story 8.10 AC #3). This is the
+    /// single compatibility shim that lets the legacy per-route knobs run
+    /// through the unified token-bucket path instead of the old sliding-
+    /// window limiter.
+    ///
+    /// `capacity` follows the AC formula `burst.unwrap_or(rps)`, with one
+    /// degenerate-input guard: a `Some(0)` burst is treated like an unset
+    /// burst (so it never collapses the bucket to zero tokens, which would
+    /// reject every request). `refill_per_sec` is the steady admission
+    /// rate `rps`, and the scope is always `PerIp` to match the legacy
+    /// per-`(route, ip)` keying.
+    ///
+    /// ```
+    /// use lorica_config::models::{RateLimit, RateLimitScope};
+    /// let rl = RateLimit::from_legacy(10, Some(25));
+    /// assert_eq!(rl.capacity, 25);
+    /// assert_eq!(rl.refill_per_sec, 10);
+    /// assert_eq!(rl.scope, RateLimitScope::PerIp);
+    /// ```
+    pub fn from_legacy(rps: u32, burst: Option<u32>) -> RateLimit {
+        RateLimit {
+            capacity: burst.filter(|&b| b > 0).unwrap_or(rps).max(1),
+            refill_per_sec: rps,
+            scope: RateLimitScope::PerIp,
+        }
+    }
+}
+
 /// How a `RateLimit` partitions traffic across clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -742,6 +772,34 @@ pub struct Route {
     /// `None` = filter disabled for this route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_protection: Option<BotProtectionConfig>,
+    /// Per-route AI / LLM crawler deny-list policy (Story 8.2 AC #2).
+    /// `None` and `Some(AiBotPolicy::Off)` are equivalent at the
+    /// request-filter layer (no behaviour change). When `Some(Deny)`,
+    /// matched AI crawlers receive 403 + `Retry-After: 86400` + the
+    /// route's `error_page_html` (if set, else a hardcoded plain-text
+    /// fallback). When `Some(Log)`, matches are allowed but counter +
+    /// structured-log entries fire so operators can size up bot
+    /// traffic before flipping to `Deny`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_bot_policy: Option<AiBotPolicy>,
+    /// Per-route override for the global `ai_bot_treat_spoofed_as`
+    /// setting (Story 8.2 AC #3). Applies only when the matched
+    /// crawler's verification is `Rdns` or `IpRanges` and the
+    /// verification fails (rDNS suffix mismatch / IP outside vendor
+    /// CIDR list). `UaOnly` crawlers have no spoof signal and skip
+    /// this fallback. `None` defers to the global setting (default
+    /// `Deny`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_bot_spoofed_fallback: Option<SpoofedFallback>,
+    /// Per-route opt-in to Lorica auto-serving `/robots.txt` (Story
+    /// 8.2 AC #10). Default `false` preserves backward compatibility
+    /// (existing deployments keep passthrough to backend). When
+    /// `true`, GET `/robots.txt` is intercepted on this route and
+    /// served from the merged crawler registry (built-in + custom
+    /// enabled-on-this-route, filtered to entries with
+    /// `ai_bot_policy != Off`).
+    #[serde(default)]
+    pub serve_robots_txt: bool,
     /// Free-form classification label so an operator can filter /
     /// group routes in the dashboard (e.g. `prod`, `staging`,
     /// `homelab`, `legacy`). Mirrors the `group_name` convention on
@@ -756,6 +814,53 @@ pub struct Route {
     pub created_at: DateTime<Utc>,
     /// Last-write timestamp (refreshed on every UPDATE).
     pub updated_at: DateTime<Utc>,
+}
+
+/// Per-route AI / LLM crawler deny-list policy (Story 8.2 AC #2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiBotPolicy {
+    /// Disabled : no behaviour change, the AI-bot filter is a
+    /// no-op for this route. Matches the absent-field semantic.
+    #[default]
+    Off,
+    /// Reject matched AI crawlers with HTTP 403 + `Retry-After:
+    /// 86400` + the route's `error_page_html` (if set, else a
+    /// hardcoded plain-text fallback).
+    Deny,
+    /// Allow matched AI crawlers but increment the
+    /// `lorica_ai_bot_total{action="log"}` counter and emit a
+    /// structured log entry. Useful for sizing up bot traffic
+    /// before flipping to `Deny`.
+    Log,
+}
+
+/// Spoofed-bot fallback policy applied when a `Verification::Rdns`
+/// or `Verification::IpRanges` crawler's verification fails (rDNS
+/// suffix mismatch / IP outside vendor CIDR list). `UaOnly`
+/// crawlers have no spoof signal and skip this fallback.
+///
+/// Used by both `GlobalSettings.ai_bot_treat_spoofed_as` (default
+/// `Deny`) and per-route `Route.ai_bot_spoofed_fallback` override
+/// (`None` defers to the global). Story 8.2 AC #3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpoofedFallback {
+    /// Reject the request with the same 403 / `Retry-After`
+    /// shape as the matched-crawler `Deny` path. Default global
+    /// value : the typical operator deploying Story 8.2 wants to
+    /// block spoofers.
+    #[default]
+    Deny,
+    /// Allow the request but increment
+    /// `lorica_ai_bot_total{action="spoofed"}` for visibility.
+    Log,
+    /// Allow the request silently (no Decision, no counter
+    /// increment with `action="spoofed"`). Useful for
+    /// high-noise environments where vendor IP-list staleness
+    /// between Lorica patch releases generates frequent
+    /// false-positives.
+    Allow,
 }
 
 /// Mode for the per-route GeoIP filter.
@@ -958,6 +1063,17 @@ impl Route {
         if let Some(v) = rule.rate_limit_burst {
             r.rate_limit_burst = Some(v);
         }
+        // Story 8.10 AC #5. The unified limiter reads `rate_limit`, so a
+        // path rule that overrides the legacy `rate_limit_rps` must also
+        // re-synthesise the structured limit; otherwise a route carrying a
+        // `rate_limit` struct would keep enforcing the route-level bucket
+        // and silently ignore the per-path override.
+        if rule.rate_limit_rps.is_some() {
+            r.rate_limit = r
+                .rate_limit_rps
+                .filter(|&rps| rps > 0)
+                .map(|rps| RateLimit::from_legacy(rps, r.rate_limit_burst));
+        }
         if rule.redirect_to.is_some() {
             r.redirect_to = rule.redirect_to.clone();
         }
@@ -965,6 +1081,20 @@ impl Route {
             r.return_status = rule.return_status;
         }
         r
+    }
+
+    /// Resolve the effective token-bucket rate limit for this route
+    /// (Story 8.10 AC #3). The structured `rate_limit` struct wins when
+    /// present; otherwise the legacy `rate_limit_rps` / `rate_limit_burst`
+    /// pair is synthesised through [`RateLimit::from_legacy`]. A legacy
+    /// `rate_limit_rps` of `0` (or absent) means "no limit" and yields
+    /// `None`, so both engines now share a single admission path.
+    pub fn effective_rate_limit(&self) -> Option<RateLimit> {
+        self.rate_limit.clone().or_else(|| {
+            self.rate_limit_rps
+                .filter(|&rps| rps > 0)
+                .map(|rps| RateLimit::from_legacy(rps, self.rate_limit_burst))
+        })
     }
 }
 

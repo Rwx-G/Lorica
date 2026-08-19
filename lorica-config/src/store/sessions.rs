@@ -4,12 +4,15 @@
 //! plus the indexes added later on `expires_at` and `user_id` to keep
 //! the GC tick and per-user cleanup queries off a full-table scan.
 
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
 
 use super::row_helpers::parse_datetime;
 use super::ConfigStore;
-use crate::error::Result;
+use crate::error::{ConfigError, Result};
+use crate::models::Role;
 
 impl ConfigStore {
     /// Save a session to the database (insert or replace).
@@ -18,16 +21,18 @@ impl ConfigStore {
         id: &str,
         user_id: &str,
         username: &str,
+        role: Role,
         created_at: &DateTime<Utc>,
         expires_at: &DateTime<Utc>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (id, user_id, username, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO sessions (id, user_id, username, role, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id,
                 user_id,
                 username,
+                role.as_str(),
                 created_at.to_rfc3339(),
                 expires_at.to_rfc3339(),
             ],
@@ -35,16 +40,18 @@ impl ConfigStore {
         Ok(())
     }
 
-    /// Get a session by ID. Returns None if not found.
+    /// Get a session by ID. Returns None if not found. An
+    /// unparseable `role` value is an error, not a default: the
+    /// caller treats it as "no session" and the user re-logs in.
     #[allow(clippy::type_complexity)]
     pub fn get_session(
         &self,
         id: &str,
-    ) -> Result<Option<(String, String, DateTime<Utc>, DateTime<Utc>)>> {
+    ) -> Result<Option<(String, String, Role, DateTime<Utc>, DateTime<Utc>)>> {
         let result = self
             .conn
             .query_row(
-                "SELECT user_id, username, created_at, expires_at FROM sessions WHERE id = ?1",
+                "SELECT user_id, username, role, created_at, expires_at FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok((
@@ -52,16 +59,19 @@ impl ConfigStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
             .optional()?;
 
         match result {
-            Some((user_id, username, created_str, expires_str)) => {
+            Some((user_id, username, role_str, created_str, expires_str)) => {
+                let role = Role::from_str(&role_str)
+                    .map_err(|e| ConfigError::Validation(format!("invalid session role: {e}")))?;
                 let created_at = parse_datetime(&created_str)?;
                 let expires_at = parse_datetime(&expires_str)?;
-                Ok(Some((user_id, username, created_at, expires_at)))
+                Ok(Some((user_id, username, role, created_at, expires_at)))
             }
             None => Ok(None),
         }
@@ -117,14 +127,16 @@ impl ConfigStore {
         Ok(count)
     }
 
-    /// Load all non-expired sessions from the database.
+    /// Load all non-expired sessions from the database. Rows with an
+    /// unparseable `role` are skipped (the user re-logs in) rather
+    /// than failing the whole startup rehydration.
     #[allow(clippy::type_complexity)]
     pub fn load_all_sessions(
         &self,
-    ) -> Result<Vec<(String, String, String, DateTime<Utc>, DateTime<Utc>)>> {
+    ) -> Result<Vec<(String, String, String, Role, DateTime<Utc>, DateTime<Utc>)>> {
         let now = Utc::now().to_rfc3339();
         let mut stmt = self.conn.prepare(
-            "SELECT id, user_id, username, created_at, expires_at FROM sessions WHERE expires_at >= ?1",
+            "SELECT id, user_id, username, role, created_at, expires_at FROM sessions WHERE expires_at >= ?1",
         )?;
         let rows = stmt.query_map(params![now], |row| {
             Ok((
@@ -133,15 +145,20 @@ impl ConfigStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
 
         let mut sessions = Vec::new();
         for row in rows {
-            let (id, user_id, username, created_str, expires_str) = row?;
+            let (id, user_id, username, role_str, created_str, expires_str) = row?;
+            let Ok(role) = Role::from_str(&role_str) else {
+                tracing::warn!(session_id = %id, role = %role_str, "skipping session with invalid role");
+                continue;
+            };
             let created_at = parse_datetime(&created_str)?;
             let expires_at = parse_datetime(&expires_str)?;
-            sessions.push((id, user_id, username, created_at, expires_at));
+            sessions.push((id, user_id, username, role, created_at, expires_at));
         }
         Ok(sessions)
     }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api, type ImportDiffResponse } from '../../lib/api';
+  import { canWrite, isSuperAdmin } from '../../lib/auth';
 
   interface Props {
     expanded: boolean;
@@ -95,7 +96,7 @@
     return (
       e(diff.routes) || e(diff.backends) || e(diff.certificates) ||
       e(diff.route_backends) || e(diff.notification_configs) ||
-      e(diff.user_preferences) || e(diff.admin_users) ||
+      e(diff.user_preferences) || e(diff.users) ||
       diff.global_settings.changes.length > 0
     );
   }
@@ -116,18 +117,20 @@
           {#if exportError}
             <div class="settings-form-error">{exportError}</div>
           {/if}
-          <div class="actions-center">
-            <button class="btn btn-primary" onclick={handleExport} disabled={exporting}>
-              {exporting ? 'Exporting...' : 'Download TOML'}
-            </button>
-          </div>
+          {#if $canWrite}
+            <div class="actions-center">
+              <button class="btn btn-primary" onclick={handleExport} disabled={exporting}>
+                {exporting ? 'Exporting...' : 'Download TOML'}
+              </button>
+            </div>
+          {/if}
         </div>
 
         <!-- Import -->
         <div class="settings-form-card">
           <h3>Import</h3>
           <p class="settings-hint">Upload a TOML file to preview and apply changes.</p>
-          {#if !importDiff}
+          {#if $isSuperAdmin && !importDiff}
             <div class="actions-center">
               <label class="file-input-label">
                 <input type="file" accept=".toml,text/plain" onchange={handleFileSelect} style="display:none" />
@@ -166,7 +169,7 @@
               { label: 'Route-Backend Links', diff: importDiff.route_backends },
               { label: 'Notification Configs', diff: importDiff.notification_configs },
               { label: 'User Preferences', diff: importDiff.user_preferences },
-              { label: 'Admin Users', diff: importDiff.admin_users },
+              { label: 'Users', diff: importDiff.users },
             ]}
             {#each sections as sec (sec.label)}
               {#if sec.diff.added.length > 0 || sec.diff.modified.length > 0 || sec.diff.removed.length > 0}

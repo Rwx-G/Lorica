@@ -27,3 +27,9 @@ This document supplements the Pingora framework architecture by defining how new
 - [Security Integration](./security-integration.md)
 - [Checklist Results Report](./checklist-results-report.md)
 - [Next Steps](./next-steps.md)
+
+### Design deep-dives (added after the v1.0 blueprint)
+
+- [Worker Shared State](./worker-shared-state.md)
+- [Bot Protection](./bot-protection.md)
+- [Certificate Resolver](./cert-resolver.md)

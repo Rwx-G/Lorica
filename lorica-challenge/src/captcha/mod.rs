@@ -8,11 +8,20 @@
 
 //! Image-captcha generation + verification.
 //!
-//! Wraps the pure-Rust [`captcha`](https://docs.rs/captcha) crate
-//! with an opinionated configuration: 6-character codes drawn from
-//! a configurable alphabet that excludes visually-confusable glyphs
-//! by default (0/O, 1/l/I). Distortion filters (Noise + Wave +
-//! Dots) are tuned for "readable on a phone, expensive to OCR".
+//! The PNG rendering engine (font, filters, distortion, lodepng
+//! encode) is vendored from the [`captcha`](https://crates.io/crates/captcha)
+//! crate v1.0.0 by Daniel Etzold, MIT licensed. The vendored source
+//! lives under [`vendored`]; see `src/captcha/LICENSE` for the
+//! original license text and `src/captcha/VENDORING.md` for the exact
+//! deltas vs upstream. Inlining it (Story 8.12 / audit row M-16)
+//! removes a transitive supply-chain-takeover surface: the renderer
+//! is a leaf crate that runs in-process on every captcha challenge.
+//!
+//! This module wraps that engine with an opinionated configuration:
+//! 6-character codes drawn from a configurable alphabet that excludes
+//! visually-confusable glyphs by default (0/O, 1/l/I). Distortion
+//! filters (Noise + Wave + Dots) are tuned for "readable on a phone,
+//! expensive to OCR".
 //!
 //! The generator produces a `(text, png_bytes)` tuple. The caller
 //! stashes `text` on the server side (keyed by a one-shot URL
@@ -24,18 +33,20 @@
 //! comparator so an attacker with timing access cannot enumerate
 //! the expected code one byte at a time.
 
+mod vendored;
+
 use subtle::ConstantTimeEq;
 
 use crate::{ChallengeError, Result};
 
 /// Default alphabet: digits + mixed-case ASCII letters, minus the
 /// visually-confusable glyphs (`0`, `O`, `1`, `l`, `I`) AND the
-/// glyphs the `captcha` 1.0 crate's default font does not render
-/// (`L` uppercase, `o` lowercase — the crate silently drops any
-/// unknown glyph, which would produce short codes if left in).
+/// glyphs the vendored 1.0 font does not render (`L` uppercase, `o`
+/// lowercase — the renderer silently drops any unknown glyph, which
+/// would produce short codes if left in).
 /// Keeping the list hard-coded and visible makes it auditable:
-/// future `captcha` upgrades that change the font character set
-/// must be paired with a review of this string.
+/// future font changes that alter the character set must be paired
+/// with a review of this string.
 pub const DEFAULT_ALPHABET: &str = "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ";
 
 /// Minimum alphabet length. Below 10 characters the brute-force
@@ -49,9 +60,9 @@ pub const MIN_ALPHABET_LEN: usize = 10;
 /// ~55^6 ≈ 2.8 × 10^10 tries.
 pub const DEFAULT_CODE_LEN: u32 = 6;
 
-/// Captcha image dimensions. Matches the `captcha` crate default
-/// and renders legibly on a phone without too much horizontal
-/// wrap.
+/// Captcha image width in pixels. Matches the vendored renderer's
+/// default and renders legibly on a phone without too much
+/// horizontal wrap.
 pub const IMAGE_WIDTH: u32 = 220;
 /// Captcha image height in pixels. See `IMAGE_WIDTH` for rationale.
 pub const IMAGE_HEIGHT: u32 = 120;
@@ -112,16 +123,15 @@ pub fn generate(alphabet: &[char], code_len: u32) -> Result<(String, Vec<u8>)> {
         ));
     }
 
-    use captcha::filters::{Dots, Noise, Wave};
-    use captcha::Captcha;
+    use vendored::filters::{Dots, Noise, Wave};
+    use vendored::Captcha;
 
     // Intersect the operator-supplied alphabet with the glyphs the
-    // crate's default font actually renders. The `captcha` 1.0
-    // crate silently skips an `add_char` call when the randomly-
-    // chosen character has no glyph, which would produce a code
-    // shorter than `code_len`. Filtering upfront guarantees every
-    // `add_char` below lands.
-    let supported = Captcha::new().supported_chars();
+    // vendored default font actually renders. The renderer silently
+    // skips an `add_char` call when the randomly-chosen character has
+    // no glyph, which would produce a code shorter than `code_len`.
+    // Filtering upfront guarantees every `add_char` below lands.
+    let supported: Vec<char> = Captcha::new().supported_chars();
     let effective: Vec<char> = alphabet
         .iter()
         .copied()
@@ -133,7 +143,7 @@ pub fn generate(alphabet: &[char], code_len: u32) -> Result<(String, Vec<u8>)> {
         ));
     }
 
-    let mut c = Captcha::new();
+    let mut c: Captcha = Captcha::new();
     c.set_chars(&effective);
     c.add_chars(code_len);
     c.apply_filter(Noise::new(0.4));
@@ -143,21 +153,20 @@ pub fn generate(alphabet: &[char], code_len: u32) -> Result<(String, Vec<u8>)> {
     c.apply_filter(Dots::new(15));
 
     // Defence-in-depth: the filter above should guarantee the
-    // full `code_len` chars land, but a future crate version or
-    // font swap could still regress. Assert at the end and
-    // surface a typed internal error rather than handing the
-    // caller a short code.
+    // full `code_len` chars land, but a future font swap could
+    // still regress. Assert at the end and surface a typed internal
+    // error rather than handing the caller a short code.
     if c.chars().len() != code_len as usize {
         return Err(ChallengeError::Internal(
-            "captcha crate produced fewer chars than requested",
+            "captcha renderer produced fewer chars than requested",
         ));
     }
 
-    // `as_tuple` returns (text, png_bytes). The crate returns
-    // `Option<...>` because the PNG encoder can technically fail;
-    // in practice it fails only on memory allocation errors, so
-    // a None here is treated as a non-retryable internal fault.
-    let (text, png) = c
+    // `as_tuple` returns (text, png_bytes). It returns `Option`
+    // because the PNG encoder can technically fail; in practice it
+    // fails only on memory allocation errors, so a None here is
+    // treated as a non-retryable internal fault.
+    let (text, png): (String, Vec<u8>) = c
         .as_tuple()
         .ok_or(ChallengeError::Internal("captcha PNG encode failed"))?;
     Ok((text, png))
@@ -197,6 +206,20 @@ pub fn verify(submitted: &str, expected: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read the 32-bit big-endian width/height from a PNG's IHDR
+    /// chunk. The IHDR data begins at byte 16 (8-byte signature +
+    /// 4-byte length + 4-byte type). Returns `(width, height)`.
+    fn png_dimensions(png: &[u8]) -> (u32, u32) {
+        let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+        let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+        (w, h)
+    }
+
+    /// True iff the byte slice contains an `IDAT` chunk-type marker.
+    fn has_idat_chunk(png: &[u8]) -> bool {
+        png.windows(4).any(|w| w == b"IDAT")
+    }
 
     #[test]
     fn default_alphabet_validates() {
@@ -262,6 +285,26 @@ mod tests {
     }
 
     #[test]
+    fn generate_png_is_valid_and_has_idat() {
+        let alphabet = validate_alphabet(DEFAULT_ALPHABET).unwrap();
+        let (_, png) = generate(&alphabet, DEFAULT_CODE_LEN).unwrap();
+
+        // Valid PNG: 8-byte signature.
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
+        // A decodable PNG carries at least one IDAT (image data) chunk.
+        assert!(has_idat_chunk(&png), "PNG has no IDAT chunk");
+    }
+
+    #[test]
+    fn generate_output_dimensions_match_config() {
+        let alphabet = validate_alphabet(DEFAULT_ALPHABET).unwrap();
+        let (_, png) = generate(&alphabet, DEFAULT_CODE_LEN).unwrap();
+        let (w, h) = png_dimensions(&png);
+        assert_eq!(w, IMAGE_WIDTH, "PNG width does not match IMAGE_WIDTH");
+        assert_eq!(h, IMAGE_HEIGHT, "PNG height does not match IMAGE_HEIGHT");
+    }
+
+    #[test]
     fn generate_rejects_bad_code_len() {
         let alphabet = validate_alphabet(DEFAULT_ALPHABET).unwrap();
         assert!(generate(&alphabet, 0).is_err());
@@ -312,14 +355,16 @@ mod tests {
     }
 
     #[test]
-    fn generate_two_calls_yield_different_codes() {
-        // The crate's internal RNG is reseeded on each new Captcha
-        // instance, so two consecutive generates must differ with
-        // extremely high probability. Pinning 2 iterations is
-        // enough to catch a "RNG not seeded" regression.
+    fn generate_two_calls_yield_different_images() {
+        // The renderer's RNG is reseeded on each new Captcha
+        // instance, so two consecutive generates must differ in both
+        // code and rendered bytes with extremely high probability.
+        // Pinning 2 iterations is enough to catch a "RNG not seeded"
+        // regression.
         let alphabet = validate_alphabet(DEFAULT_ALPHABET).unwrap();
-        let (t1, _) = generate(&alphabet, DEFAULT_CODE_LEN).unwrap();
-        let (t2, _) = generate(&alphabet, DEFAULT_CODE_LEN).unwrap();
+        let (t1, png1) = generate(&alphabet, DEFAULT_CODE_LEN).unwrap();
+        let (t2, png2) = generate(&alphabet, DEFAULT_CODE_LEN).unwrap();
         assert_ne!(t1, t2, "two fresh captchas returned the same code");
+        assert_ne!(png1, png2, "two fresh captchas returned identical images");
     }
 }

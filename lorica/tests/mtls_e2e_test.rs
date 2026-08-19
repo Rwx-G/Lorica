@@ -68,7 +68,10 @@ fn init_crypto() {
     });
 }
 
-fn build_ca(cn: &str) -> (rcgen::Certificate, KeyPair, String) {
+// rcgen 0.14 moved CA-signing behind an `Issuer` (params + key bundled),
+// so `build_ca` returns the self-signed cert (for the CA DER/PEM) plus an
+// `Issuer` that `sign_cert` reuses for every leaf under that CA.
+fn build_ca(cn: &str) -> (rcgen::Certificate, rcgen::Issuer<'static, KeyPair>, String) {
     let mut params = CertificateParams::new(vec![cn.to_string()]).unwrap();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let mut dn = DistinguishedName::new();
@@ -77,12 +80,12 @@ fn build_ca(cn: &str) -> (rcgen::Certificate, KeyPair, String) {
     let key = KeyPair::generate().unwrap();
     let cert = params.self_signed(&key).unwrap();
     let pem = cert.pem();
-    (cert, key, pem)
+    let issuer = rcgen::Issuer::new(params, key);
+    (cert, issuer, pem)
 }
 
 fn sign_cert(
-    ca: &rcgen::Certificate,
-    ca_key: &KeyPair,
+    issuer: &rcgen::Issuer<'_, KeyPair>,
     cn: &str,
     org: Option<&str>,
     san: Vec<String>,
@@ -95,33 +98,23 @@ fn sign_cert(
     }
     params.distinguished_name = dn;
     let key = KeyPair::generate().unwrap();
-    let cert = params.signed_by(&key, ca, ca_key).unwrap();
+    let cert = params.signed_by(&key, issuer).unwrap();
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
     (cert_der, key_der)
 }
 
 fn build_pki() -> TestPki {
-    let (ca_cert, ca_key, ca_pem) = build_ca("Lorica Test CA");
+    let (ca_cert, ca_issuer, ca_pem) = build_ca("Lorica Test CA");
     let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
-    let (server_cert_der, server_key_der) = sign_cert(
-        &ca_cert,
-        &ca_key,
-        "localhost",
-        None,
-        vec!["localhost".into()],
-    );
+    let (server_cert_der, server_key_der) =
+        sign_cert(&ca_issuer, "localhost", None, vec!["localhost".into()]);
     let (client_cert_der, client_key_der) =
-        sign_cert(&ca_cert, &ca_key, "client-a", Some("Acme Corp"), vec![]);
+        sign_cert(&ca_issuer, "client-a", Some("Acme Corp"), vec![]);
 
-    let (rogue_ca_cert, rogue_ca_key, rogue_ca_pem) = build_ca("Rogue CA");
-    let (rogue_client_cert_der, rogue_client_key_der) = sign_cert(
-        &rogue_ca_cert,
-        &rogue_ca_key,
-        "rogue-client",
-        Some("Evil Corp"),
-        vec![],
-    );
+    let (_rogue_ca_cert, rogue_ca_issuer, rogue_ca_pem) = build_ca("Rogue CA");
+    let (rogue_client_cert_der, rogue_client_key_der) =
+        sign_cert(&rogue_ca_issuer, "rogue-client", Some("Evil Corp"), vec![]);
 
     TestPki {
         ca_pem,
@@ -256,6 +249,9 @@ fn mtls_route(ca_pem: &str, required: bool, orgs: Vec<&str>) -> Route {
         geoip: None,
         bot_protection: None,
         group_name: String::new(),
+        ai_bot_policy: None,
+        ai_bot_spoofed_fallback: None,
+        serve_robots_txt: false,
         created_at: now,
         updated_at: now,
     }

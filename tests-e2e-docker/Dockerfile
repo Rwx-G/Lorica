@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y cmake pkg-config libssl-dev && rm -rf /
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY lorica/ lorica/
+COPY lorica-acme/ lorica-acme/
 COPY lorica-api/ lorica-api/
 COPY lorica-cache/ lorica-cache/
 COPY lorica-config/ lorica-config/
@@ -30,6 +31,7 @@ COPY lorica-lb/ lorica-lb/
 COPY lorica-limits/ lorica-limits/
 COPY lorica-lru/ lorica-lru/
 COPY lorica-memory-cache/ lorica-memory-cache/
+COPY lorica-metrics/ lorica-metrics/
 COPY lorica-notify/ lorica-notify/
 COPY lorica-pool/ lorica-pool/
 COPY lorica-proxy/ lorica-proxy/
@@ -73,7 +75,8 @@ COPY tests-e2e-docker/entrypoint-geoip.sh /entrypoint-geoip.sh
 COPY tests-e2e-docker/entrypoint-otel.sh /entrypoint-otel.sh
 COPY tests-e2e-docker/entrypoint-otel-workers.sh /entrypoint-otel-workers.sh
 COPY tests-e2e-docker/entrypoint-rdns.sh /entrypoint-rdns.sh
-RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh
+COPY tests-e2e-docker/entrypoint-hot-upgrade.sh /entrypoint-hot-upgrade.sh
+RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh /entrypoint-hot-upgrade.sh
 
 # Pre-create the `/shared` mount point owned by the non-root lorica
 # user so the entrypoint can write `/shared/admin_password` after the

@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Lorica API
   description: REST API for Lorica reverse proxy management
-  version: "1.5.13"
+  version: "1.6.0"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -50,6 +50,8 @@ tags:
     description: DNS provider credentials for ACME DNS-01 challenges
   - name: Validation
     description: Pre-flight validation helpers (mTLS PEM, forward-auth health check)
+  - name: Audit
+    description: Admin audit log (tamper-evident hash chain)
 
 paths:
   # ---------------------------------------------------------------------------
@@ -65,10 +67,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [username, password]
+              required: [password]
               properties:
                 username:
                   type: string
+                  description: >-
+                    Optional backwards-compat shim (pre-1.6.0 clients
+                    sent `{password}` only); defaults to `admin`.
                 password:
                   type: string
       responses:
@@ -87,6 +92,10 @@ paths:
                   data:
                     type: object
                     properties:
+                      username:
+                        type: string
+                      role:
+                        $ref: "#/components/schemas/Role"
                       must_change_password:
                         type: boolean
                       session_expires_at:
@@ -96,6 +105,31 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/RateLimited"
+
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: Identity and role behind the current session
+      responses:
+        "200":
+          description: Session identity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      username:
+                        type: string
+                      role:
+                        $ref: "#/components/schemas/Role"
+                      session_expires_at:
+                        type: string
+                        format: date-time
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /api/v1/auth/logout:
     post:
@@ -168,7 +202,10 @@ paths:
                   type: string
                 new_password:
                   type: string
-                  minLength: 8
+                  description: >-
+                    Validated against the configured policy
+                    (password_min_length, default 14, plus character
+                    classes when password_require_complexity is on).
       responses:
         "200":
           description: Password updated
@@ -180,6 +217,170 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # Users (SuperAdmin only, Story 8.3)
+  # ---------------------------------------------------------------------------
+  /api/v1/users:
+    get:
+      tags: [Users]
+      summary: List user accounts (SuperAdmin)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: All accounts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Users]
+      summary: Create a user account (SuperAdmin)
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, role]
+              properties:
+                username:
+                  type: string
+                  description: 3-32 chars, lowercase alphanumeric plus '._-', starting alphanumeric.
+                password:
+                  type: string
+                  description: Validated against the password policy.
+                role:
+                  $ref: "#/components/schemas/Role"
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Username already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Users]
+      summary: Fetch one user account (SuperAdmin)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The account
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Users]
+      summary: Update password / role / disabled flag (SuperAdmin)
+      description: >-
+        Any role change, disable, or password reset invalidates every
+        session of the target user immediately. Demoting or disabling
+        the last enabled super admin is rejected.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password:
+                  type: string
+                  description: >-
+                    New password (policy-validated); sets
+                    must_change_password on the target.
+                role:
+                  $ref: "#/components/schemas/Role"
+                disabled:
+                  type: boolean
+      responses:
+        "200":
+          description: Updated account
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Users]
+      summary: Delete a user account (SuperAdmin)
+      description: >-
+        Deleting your own account or the last enabled super admin is
+        rejected.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Account deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   # ---------------------------------------------------------------------------
   # Settings
@@ -252,6 +453,37 @@ paths:
                 $ref: "#/components/schemas/MessageResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/settings/schema:
+    get:
+      tags: [Settings]
+      summary: Get global-settings field bounds
+      description: |
+        Machine-readable constraints for every operator-tunable global
+        settings field (Story 8.10 AC #7). Keyed by field name; each
+        value carries a `type` (`integer`, `number`, `boolean`,
+        `string`, or `enum`), optional `min` / `max`, a `default`, and,
+        for enum fields, the `choices` array. The dashboard renders
+        input constraints from this payload instead of hardcoding them.
+        Numeric bounds are the same values the `PUT /api/v1/settings`
+        validator enforces. Read-only metadata, Viewer+ like
+        `GET /api/v1/settings`.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Settings field schema
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    additionalProperties:
+                      $ref: "#/components/schemas/SettingsFieldSchema"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -927,11 +1159,15 @@ paths:
                           properties:
                             ip:
                               type: string
-                            banned_at:
-                              type: string
-                              format: date-time
-                            duration_s:
+                            banned_seconds_ago:
                               type: integer
+                            remaining_seconds:
+                              type: integer
+                            reason:
+                              type: string
+                              enum: [rate_limit, waf_flood, waf_critical_rule, manual]
+                      total:
+                        type: integer
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -1078,6 +1314,44 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /api/v1/system/upgrade:
+    post:
+      tags: [System]
+      summary: Upload, verify, and stage a new lorica binary (Story 8.4)
+      description: |
+        Hot binary-upgrade endpoint. The multipart body carries a full
+        `lorica` executable plus a detached Ed25519 signature; the
+        server verifies the signature against the configured public key
+        and stages the binary for the zero-downtime handoff. Rejected
+        unless the payload is a correctly-signed binary.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [binary, signature]
+              properties:
+                binary:
+                  type: string
+                  format: binary
+                signature:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Binary verified and staged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   # ---------------------------------------------------------------------------
   # WAF
   # ---------------------------------------------------------------------------
@@ -1135,6 +1409,29 @@ paths:
                 properties:
                   data:
                     type: object
+                    properties:
+                      total_events:
+                        type: integer
+                        format: int64
+                        description: >-
+                          Total persisted WAF events. Plateaus near
+                          waf_event_retention once the cap is reached.
+                      total_24h:
+                        type: integer
+                        format: int64
+                        description: WAF events recorded in the last 24 hours.
+                      rule_count:
+                        type: integer
+                      by_category:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            category:
+                              type: string
+                            count:
+                              type: integer
+                              format: int64
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -1483,6 +1780,335 @@ paths:
   # ---------------------------------------------------------------------------
   # Probes
   # ---------------------------------------------------------------------------
+  /api/v1/ai-crawlers/custom:
+    get:
+      tags: [AICrawlers]
+      summary: List custom AI / LLM crawler entries
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Custom crawler list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      entries:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/CustomCrawler"
+                      built_in_count:
+                        type: integer
+                        example: 16
+                      max_count:
+                        type: integer
+                        example: 256
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [AICrawlers]
+      summary: Create a custom AI crawler entry
+      description: >
+        Server-side validation: the regex is compiled with size +
+        DFA caps; a pattern that matches any baseline browser /
+        search-bot UA is rejected (HTTP 400). IpRanges CIDR lists
+        are capped at 64 and validated; Rdns suffixes must be
+        non-empty and dot-prefixed.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CustomCrawlerRequest"
+      responses:
+        "201":
+          description: Crawler created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CustomCrawler"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/ai-crawlers/custom/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Custom crawler row id
+        schema:
+          type: integer
+          format: int64
+    put:
+      tags: [AICrawlers]
+      summary: Update a custom AI crawler entry
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CustomCrawlerRequest"
+      responses:
+        "200":
+          description: Crawler updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CustomCrawler"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [AICrawlers]
+      summary: Delete a custom AI crawler entry
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Crawler deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      deleted:
+                        type: integer
+                        format: int64
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/ai-crawlers/builtin:
+    get:
+      tags: [AICrawlers]
+      summary: List the built-in AI crawler descriptors
+      description: >
+        Returns the 16 built-in crawler descriptors (name, UA
+        pattern, verification kind, vendor source). Mirrors the
+        authoritative registry in the lorica binary crate.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Built-in descriptor list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [entries]
+                    properties:
+                      entries:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/BuiltinCrawler"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/ai-crawlers/test:
+    get:
+      tags: [AICrawlers]
+      summary: Classify a User-Agent against the merged registry
+      description: >
+        Read-only classification of a UA against the merged
+        registry (16 built-ins overlaid with enabled custom rows,
+        custom wins on name conflict; first match returned). Does
+        NOT consult rDNS or vendor IP ranges. would_apply_policy
+        reflects the route's ai_bot_policy (off when the route is
+        not found or has no policy).
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: ua
+          in: query
+          required: true
+          description: URL-encoded User-Agent string to classify
+          schema:
+            type: string
+        - name: route_id
+          in: query
+          required: true
+          description: Route whose ai_bot_policy decides would_apply_policy
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Classification result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [matched_crawler, verification_kind, would_apply_policy, note]
+                    properties:
+                      matched_crawler:
+                        type: string
+                        nullable: true
+                        example: GPTBot
+                      verification_kind:
+                        type: string
+                        nullable: true
+                        enum: [rdns, ip_ranges, ua_only]
+                      would_apply_policy:
+                        type: string
+                        enum: [off, deny, log]
+                      note:
+                        type: string
+                        example: "Matched GPTBot via ip_ranges; route policy Deny"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/ai-crawlers/robots-preview:
+    get:
+      tags: [AICrawlers]
+      summary: Preview the auto-served robots.txt body for a route
+      description: >
+        Returns the body that the proxy's check_robots_txt would
+        emit for the route, regardless of the route's
+        serve_robots_txt flag. When the route policy is Off the
+        allow-all fallback is returned; otherwise one Disallow
+        block per active crawler name (16 built-ins + enabled
+        custom names, deduped).
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: route_id
+          in: query
+          required: true
+          description: Route whose merged registry + policy shapes the body
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: robots.txt preview
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [body, route_id, generated_at]
+                    properties:
+                      body:
+                        type: string
+                      route_id:
+                        type: string
+                      generated_at:
+                        type: string
+                        format: date-time
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/ai-crawlers/stats:
+    get:
+      tags: [AICrawlers]
+      summary: Top-5 AI crawlers in the in-process 5-minute window
+      description: >
+        Top 5 crawlers by hit count for a route within an
+        in-process 5-minute sliding window, with per-action
+        breakdown. WORKERS-MODE LIMITATION: the buffer is
+        per-process; in multi-worker mode the authoritative
+        cross-process source is the Prometheus lorica_ai_bot_total
+        counter via /metrics. Only window=5m is accepted.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: route_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: window
+          in: query
+          required: false
+          description: Only "5m" is accepted; any other value returns HTTP 400
+          schema:
+            type: string
+            enum: ["5m"]
+            default: "5m"
+      responses:
+        "200":
+          description: Top-5 stats
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [window, route_id, top_5]
+                    properties:
+                      window:
+                        type: string
+                        example: "5m"
+                      route_id:
+                        type: string
+                      top_5:
+                        type: array
+                        items:
+                          type: object
+                          required: [crawler, count, action_breakdown]
+                          properties:
+                            crawler:
+                              type: string
+                            count:
+                              type: integer
+                              format: int64
+                            action_breakdown:
+                              type: object
+                              properties:
+                                deny:
+                                  type: integer
+                                  format: int64
+                                log:
+                                  type: integer
+                                  format: int64
+                                spoofed:
+                                  type: integer
+                                  format: int64
+                                ua_only_match:
+                                  type: integer
+                                  format: int64
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /api/v1/probes:
     get:
       tags: [Probes]
@@ -2725,6 +3351,58 @@ paths:
         "500":
           description: Renewal failed (ACME server error, DNS, etc.)
 
+  # ---------------------------------------------------------------------------
+  # Admin audit log (Story 8.9)
+  # ---------------------------------------------------------------------------
+  /api/v1/audit:
+    get:
+      tags: [Audit]
+      summary: List admin audit-log entries
+      description: |
+        Returns the tamper-evident admin audit log (Story 8.9).
+        Operator+ role floor, enforced by the authorize middleware.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Audit log entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/audit/verify:
+    get:
+      tags: [Audit]
+      summary: Verify the audit-log hash chain
+      description: |
+        Recomputes the audit-log hash chain and reports whether the
+        trail is intact (Story 8.9). SuperAdmin-only, enforced by the
+        authorize middleware.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Verification outcome
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
 components:
   securitySchemes:
     sessionCookie:
@@ -2742,6 +3420,111 @@ components:
         format: uuid
 
   schemas:
+    User:
+      type: object
+      description: A dashboard / API user account (password hash never serialized).
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        role:
+          $ref: "#/components/schemas/Role"
+        must_change_password:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        last_login_at:
+          type: string
+          format: date-time
+          nullable: true
+        disabled:
+          type: boolean
+        created_by:
+          type: string
+          nullable: true
+
+    Role:
+      type: string
+      description: >-
+        RBAC role of a user account (Story 8.3). viewer is read-only
+        with secrets scrubbed; operator has full CRUD except settings
+        writes and user management; super_admin has full access.
+      enum: [super_admin, operator, viewer]
+
+    CustomVerification:
+      type: object
+      description: >
+        Tagged union (discriminator "kind"). rdns carries suffixes,
+        ip_ranges carries cidrs, ua_only carries no payload.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [rdns, ip_ranges, ua_only]
+        suffixes:
+          type: array
+          description: Present when kind=rdns; each entry dot-prefixed (e.g. ".crawl.commoncrawl.org")
+          items:
+            type: string
+        cidrs:
+          type: array
+          description: Present when kind=ip_ranges; max 64 CIDR strings
+          items:
+            type: string
+    CustomCrawlerRequest:
+      type: object
+      required: [name, user_agent_pattern, verification]
+      properties:
+        name:
+          type: string
+          maxLength: 64
+        user_agent_pattern:
+          type: string
+          description: Regex source; compiled case-insensitive with size + DFA caps
+        verification:
+          $ref: "#/components/schemas/CustomVerification"
+        enabled:
+          type: boolean
+          default: true
+    CustomCrawler:
+      type: object
+      required: [id, name, user_agent_pattern, verification, enabled, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        user_agent_pattern:
+          type: string
+        verification:
+          $ref: "#/components/schemas/CustomVerification"
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    BuiltinCrawler:
+      type: object
+      required: [name, user_agent_pattern, verification_kind, source]
+      properties:
+        name:
+          type: string
+          example: GPTBot
+        user_agent_pattern:
+          type: string
+          example: "(?i)\\bGPTBot\\b"
+        verification_kind:
+          type: string
+          enum: [rdns, ip_ranges, ua_only]
+        source:
+          type: string
+          example: OpenAI
     Route:
       type: object
       properties:
@@ -3032,6 +3815,32 @@ components:
             message:
               type: string
 
+    SettingsFieldSchema:
+      type: object
+      description: |
+        Constraints for a single operator-tunable global settings field
+        (Story 8.10 AC #7). Numeric fields carry `min` and, when the
+        validator enforces an upper bound, `max`. Enum fields carry
+        `choices`. Every field carries its `default`.
+      properties:
+        type:
+          type: string
+          enum: [integer, number, boolean, string, enum]
+        min:
+          type: number
+          description: Inclusive lower bound (numeric fields only).
+        max:
+          type: number
+          description: Inclusive upper bound; omitted when the server enforces no ceiling.
+        default:
+          description: Default value from GlobalSettings::default.
+        choices:
+          type: array
+          items:
+            type: string
+          description: Allowed values (enum fields only).
+      required: [type]
+
     # v1.5.1 audit L-14 : richer schemas for the
     # Notification + Preference endpoints that previously
     # surfaced as `type: object` (no fields). External
@@ -3163,6 +3972,12 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     Unauthorized:
       description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Forbidden:
+      description: Authenticated but the session role is insufficient
       content:
         application/json:
           schema:

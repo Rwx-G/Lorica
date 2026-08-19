@@ -13,8 +13,11 @@
 //! [`AppState`]: crate::server::AppState
 
 pub mod acme;
+pub mod ai_crawlers;
+pub mod audit;
 pub mod auth;
 pub mod backends;
+pub mod ban;
 pub mod cache;
 pub mod cert_export;
 pub mod certificates;
@@ -25,10 +28,12 @@ pub mod dns_providers;
 pub mod error;
 pub mod loadtest;
 pub mod log_store;
+pub mod management_tls;
 pub mod log_writer;
 pub mod logs;
 pub mod metrics;
 pub mod middleware;
+pub mod password_policy;
 pub mod probes;
 pub mod routes;
 /// Axum router + shared `AppState` construction.
@@ -37,6 +42,9 @@ pub mod settings;
 pub mod sla;
 pub mod status;
 pub mod system;
+/// Hot binary-upgrade verification + staging (Story 8.4).
+pub mod upgrade;
+pub mod users;
 pub mod waf;
 pub mod workers;
 

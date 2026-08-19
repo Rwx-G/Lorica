@@ -245,6 +245,36 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             // migration on a bisect build.
             row.get::<_, String>(65).unwrap_or_default()
         },
+        ai_bot_policy: {
+            // Column index 66 (Story 8.2 migration V39). Stored as
+            // lowercase enum string ("off" / "deny" / "log") or NULL.
+            // `unwrap_or(None)` covers pre-V39 rows on a bisect build.
+            row.get::<_, Option<String>>(66)
+                .unwrap_or(None)
+                .and_then(|s| match s.as_str() {
+                    "off" => Some(AiBotPolicy::Off),
+                    "deny" => Some(AiBotPolicy::Deny),
+                    "log" => Some(AiBotPolicy::Log),
+                    _ => None,
+                })
+        },
+        ai_bot_spoofed_fallback: {
+            // Column index 67 (Story 8.2 migration V39).
+            row.get::<_, Option<String>>(67)
+                .unwrap_or(None)
+                .and_then(|s| match s.as_str() {
+                    "deny" => Some(SpoofedFallback::Deny),
+                    "log" => Some(SpoofedFallback::Log),
+                    "allow" => Some(SpoofedFallback::Allow),
+                    _ => None,
+                })
+        },
+        serve_robots_txt: {
+            // Column index 68 (Story 8.2 migration V41). 0 = false
+            // (default, passthrough to backend), 1 = true (Lorica
+            // intercepts and serves a registry-driven body).
+            row.get::<_, i32>(68).unwrap_or(0) != 0
+        },
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })
@@ -306,14 +336,22 @@ pub(super) fn row_to_user_preference(row: &rusqlite::Row<'_>) -> Result<UserPref
     })
 }
 
-pub(super) fn row_to_admin_user(row: &rusqlite::Row<'_>) -> Result<AdminUser> {
-    Ok(AdminUser {
+/// Column order matches `USER_COLUMNS` in `store/users.rs`:
+/// id, username, password_hash, role, must_change_password,
+/// created_at, last_login_at, disabled_at, created_by.
+pub(super) fn row_to_user(row: &rusqlite::Row<'_>) -> Result<User> {
+    use std::str::FromStr;
+    Ok(User {
         id: row.get(0)?,
         username: row.get(1)?,
         password_hash: row.get(2)?,
-        must_change_password: row.get(3)?,
-        created_at: parse_datetime(&row.get::<_, String>(4)?)?,
-        last_login: parse_optional_datetime(row.get(5)?)?,
+        role: Role::from_str(&row.get::<_, String>(3)?)
+            .map_err(|e| ConfigError::Validation(format!("invalid user role: {e}")))?,
+        must_change_password: row.get(4)?,
+        created_at: parse_datetime(&row.get::<_, String>(5)?)?,
+        last_login_at: parse_optional_datetime(row.get(6)?)?,
+        disabled_at: parse_optional_datetime(row.get(7)?)?,
+        created_by: row.get(8)?,
     })
 }
 

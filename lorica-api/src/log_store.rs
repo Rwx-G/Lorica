@@ -10,6 +10,11 @@ use rusqlite::{params, Connection};
 
 use crate::logs::{LogEntry, LogsQuery};
 
+/// Aggregated WAF-event statistics returned by
+/// [`LogStore::waf_event_stats`]: `(total, total_24h, by_category)`
+/// where `by_category` is `(category, count)` pairs sorted high-to-low.
+pub type WafEventStats = (u64, u64, Vec<(String, u64)>);
+
 /// Persistent log database wrapper. Cheaply cloneable through `Arc<LogStore>`.
 pub struct LogStore {
     conn: Mutex<Connection>,
@@ -114,6 +119,32 @@ impl LogStore {
         .map_err(|e| format!("failed to initialize notification history schema: {e}"))?;
 
         conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                operator_username TEXT NOT NULL,
+                operator_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                before_payload_hash TEXT NOT NULL DEFAULT '',
+                after_payload_hash TEXT NOT NULL DEFAULT '',
+                ip TEXT NOT NULL DEFAULT '',
+                user_agent TEXT NOT NULL DEFAULT '',
+                prev_chain_hash TEXT NOT NULL,
+                chain_hash TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_operator ON audit_log(operator_username);
+            CREATE TABLE IF NOT EXISTS audit_log_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )
+        .map_err(|e| format!("failed to initialize audit log schema: {e}"))?;
+
+        conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
         )
         .map_err(|e| format!("failed to set access log pragmas: {e}"))?;
@@ -136,7 +167,7 @@ impl LogStore {
                 entry.path,
                 entry.host,
                 entry.status,
-                entry.latency_ms,
+                entry.latency_ms as i64,
                 entry.backend,
                 entry.error,
                 entry.client_ip,
@@ -179,7 +210,7 @@ impl LogStore {
                     entry.path,
                     entry.host,
                     entry.status,
-                    entry.latency_ms,
+                    entry.latency_ms as i64,
                     entry.backend,
                     entry.error,
                     entry.client_ip,
@@ -261,8 +292,8 @@ impl LogStore {
         let refs: Vec<&dyn rusqlite::types::ToSql> =
             bind_values.iter().map(|b| b.as_ref()).collect();
         let total: usize = conn
-            .query_row(&count_sql, refs.as_slice(), |row| row.get(0))
-            .map_err(|e| format!("failed to count access logs: {e}"))?;
+            .query_row(&count_sql, refs.as_slice(), |row| row.get::<_, i64>(0))
+            .map_err(|e| format!("failed to count access logs: {e}"))? as usize;
 
         let query_sql = format!(
             "SELECT id, timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff, xff_proxy_ip, source, request_id \
@@ -586,18 +617,33 @@ impl LogStore {
         Ok(events)
     }
 
-    /// Summarise WAF events via SQL aggregation : total count and
-    /// per-category counts (sorted high-to-low). Used by
+    /// Summarise WAF events via SQL aggregation : total count, rolling
+    /// 24h count, and per-category counts (sorted high-to-low). Used by
     /// `/api/v1/waf/stats` so the stats are accurate regardless
     /// of table size. The previous implementation loaded up to
     /// 10 000 rows into memory to `.len()` them, which capped
     /// the dashboard counter at 10 000 once the retention window
     /// (100 000 rows) was in use.
-    pub fn waf_event_stats(&self) -> Result<(u64, Vec<(String, u64)>), String> {
+    ///
+    /// Returns `(total, total_24h, by_category)`. Once
+    /// `waf_event_retention` caps the table, `total` plateaus near the
+    /// cap and stops carrying signal ; `total_24h` counts only rows
+    /// with a `timestamp` within the last 24 hours. RFC3339 TEXT
+    /// compares lexicographically, so the `timestamp >= ?` bound rides
+    /// the existing `idx_waf_events_timestamp` index.
+    pub fn waf_event_stats(&self) -> Result<WafEventStats, String> {
         let conn = self.conn.lock();
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM waf_events", [], |row| row.get(0))
             .map_err(|e| format!("failed to count WAF events: {e}"))?;
+        let cutoff_24h: String = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let total_24h: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM waf_events WHERE timestamp >= ?1",
+                params![cutoff_24h],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("failed to count 24h WAF events: {e}"))?;
         let mut stmt = conn
             .prepare(
                 "SELECT category, COUNT(*) FROM waf_events
@@ -613,7 +659,7 @@ impl LogStore {
         for r in rows {
             by_category.push(r.map_err(|e| format!("failed to read WAF stats row: {e}"))?);
         }
-        Ok((total as u64, by_category))
+        Ok((total as u64, total_24h as u64, by_category))
     }
 
     /// Clear all WAF events.
@@ -758,6 +804,281 @@ impl LogStore {
     }
 }
 
+/// Audit-log storage (Story 8.9). See [`crate::audit`] for the chain
+/// model. Every method here holds the single `Mutex<Connection>` for
+/// its whole critical section, which is what serializes chain writes.
+impl LogStore {
+    const RETENTION_SEAL_KEY: &'static str = "retention_seal";
+
+    fn audit_seal(conn: &Connection) -> Result<Option<String>, String> {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT value FROM audit_log_meta WHERE key = ?1",
+            params![Self::RETENTION_SEAL_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("failed to read audit retention seal: {e}"))
+    }
+
+    /// Append one audit row. `prev_chain_hash` and `chain_hash` are
+    /// computed HERE, inside the connection lock: two concurrent
+    /// mutations cannot fork the chain. The previous hash comes from
+    /// the newest stored row, else the retention seal, else genesis.
+    pub fn insert_audit(&self, entry: &crate::audit::NewAuditEntry) -> Result<(i64, String), String> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock();
+
+        let last: Option<String> = conn
+            .query_row(
+                "SELECT chain_hash FROM audit_log ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("failed to read audit chain head: {e}"))?;
+
+        let prev_chain_hash: String = match last {
+            Some(hash) => hash,
+            None => Self::audit_seal(&conn)?
+                .unwrap_or_else(|| crate::audit::GENESIS_HASH.to_string()),
+        };
+
+        let chain_hash: String = crate::audit::compute_chain_hash(
+            &prev_chain_hash,
+            &crate::audit::ChainInput::from(entry),
+        );
+
+        conn.execute(
+            "INSERT INTO audit_log (timestamp, operator_username, operator_role, action,
+                target_type, target_id, before_payload_hash, after_payload_hash,
+                ip, user_agent, prev_chain_hash, chain_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                entry.timestamp,
+                entry.operator_username,
+                entry.operator_role,
+                entry.action,
+                entry.target_type,
+                entry.target_id,
+                entry.before_payload_hash,
+                entry.after_payload_hash,
+                entry.ip,
+                entry.user_agent,
+                prev_chain_hash,
+                chain_hash,
+            ],
+        )
+        .map_err(|e| format!("failed to insert audit row: {e}"))?;
+
+        Ok((conn.last_insert_rowid(), chain_hash))
+    }
+
+    fn row_to_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::audit::AuditRecord> {
+        Ok(crate::audit::AuditRecord {
+            id: row.get(0)?,
+            timestamp: row.get(1)?,
+            operator_username: row.get(2)?,
+            operator_role: row.get(3)?,
+            action: row.get(4)?,
+            target_type: row.get(5)?,
+            target_id: row.get(6)?,
+            before_payload_hash: row.get(7)?,
+            after_payload_hash: row.get(8)?,
+            ip: row.get(9)?,
+            user_agent: row.get(10)?,
+            prev_chain_hash: row.get(11)?,
+            chain_hash: row.get(12)?,
+        })
+    }
+
+    const AUDIT_COLUMNS: &'static str = "id, timestamp, operator_username, operator_role, \
+        action, target_type, target_id, before_payload_hash, after_payload_hash, \
+        ip, user_agent, prev_chain_hash, chain_hash";
+
+    /// Query audit rows, newest first, with total count under the
+    /// same filters (for pagination). `action_prefix` is a literal
+    /// prefix: `%`/`_`/`\` in user input are escaped.
+    pub fn query_audit(
+        &self,
+        q: &crate::audit::AuditQuery,
+    ) -> Result<(Vec<crate::audit::AuditRecord>, u64), String> {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(operator) = &q.operator {
+            clauses.push("operator_username = ?".into());
+            binds.push(Box::new(operator.clone()));
+        }
+        if let Some(prefix) = &q.action_prefix {
+            let escaped = prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            clauses.push("action LIKE ? ESCAPE '\\'".into());
+            binds.push(Box::new(format!("{escaped}%")));
+        }
+        if let Some(from) = &q.from {
+            clauses.push("timestamp >= ?".into());
+            binds.push(Box::new(from.clone()));
+        }
+        if let Some(to) = &q.to {
+            clauses.push("timestamp <= ?".into());
+            binds.push(Box::new(to.clone()));
+        }
+        if let Some(before_id) = q.before_id {
+            clauses.push("id < ?".into());
+            binds.push(Box::new(before_id));
+        }
+
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+
+        let conn = self.conn.lock();
+
+        let total: i64 = {
+            let sql = format!("SELECT COUNT(*) FROM audit_log{where_sql}");
+            let bind_refs: Vec<&dyn rusqlite::types::ToSql> =
+                binds.iter().map(|b| b.as_ref()).collect();
+            conn.query_row(&sql, bind_refs.as_slice(), |row| row.get(0))
+                .map_err(|e| format!("failed to count audit rows: {e}"))?
+        };
+
+        let sql = format!(
+            "SELECT {} FROM audit_log{where_sql} ORDER BY id DESC LIMIT ?",
+            Self::AUDIT_COLUMNS
+        );
+        binds.push(Box::new(q.limit.max(1) as i64));
+        let bind_refs: Vec<&dyn rusqlite::types::ToSql> =
+            binds.iter().map(|b| b.as_ref()).collect();
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("failed to prepare audit query: {e}"))?;
+        let rows = stmt
+            .query_map(bind_refs.as_slice(), Self::row_to_audit)
+            .map_err(|e| format!("failed to run audit query: {e}"))?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(|e| format!("failed to read audit row: {e}"))?);
+        }
+        Ok((records, total as u64))
+    }
+
+    /// Walk the whole chain from genesis (or the retention seal) and
+    /// recompute every `chain_hash`. Stops at the earliest break.
+    pub fn verify_audit_chain(&self) -> Result<crate::audit::VerifyResult, String> {
+        let conn = self.conn.lock();
+        let mut expected: String = Self::audit_seal(&conn)?
+            .unwrap_or_else(|| crate::audit::GENESIS_HASH.to_string());
+
+        let sql = format!(
+            "SELECT {} FROM audit_log ORDER BY id ASC",
+            Self::AUDIT_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("failed to prepare audit verify: {e}"))?;
+        let rows = stmt
+            .query_map([], Self::row_to_audit)
+            .map_err(|e| format!("failed to run audit verify: {e}"))?;
+
+        let mut total_rows: u64 = 0;
+        for row in rows {
+            let record = row.map_err(|e| format!("failed to read audit row: {e}"))?;
+            total_rows += 1;
+            if record.prev_chain_hash != expected {
+                return Ok(crate::audit::VerifyResult {
+                    verified: false,
+                    total_rows,
+                    first_break_id: Some(record.id),
+                    first_break_reason: Some("prev_hash_mismatch".into()),
+                });
+            }
+            if crate::audit::recompute_chain_hash(&record) != record.chain_hash {
+                return Ok(crate::audit::VerifyResult {
+                    verified: false,
+                    total_rows,
+                    first_break_id: Some(record.id),
+                    first_break_reason: Some("chain_hash_mismatch".into()),
+                });
+            }
+            expected = record.chain_hash;
+        }
+
+        Ok(crate::audit::VerifyResult {
+            verified: true,
+            total_rows,
+            first_break_id: None,
+            first_break_reason: None,
+        })
+    }
+
+    /// Delete audit rows older than `cutoff_timestamp` (RFC 3339),
+    /// preserving chain verifiability: before deleting, the earliest
+    /// SURVIVING row's `prev_chain_hash` (or, when nothing survives,
+    /// the newest deleted row's `chain_hash`) is stored as the
+    /// retention seal, which `verify` and `insert` then treat as the
+    /// new genesis. Returns the number of rows deleted.
+    pub fn enforce_audit_retention(&self, cutoff_timestamp: &str) -> Result<u64, String> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock();
+
+        let doomed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE timestamp < ?1",
+                params![cutoff_timestamp],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("failed to count expired audit rows: {e}"))?;
+        if doomed == 0 {
+            return Ok(0);
+        }
+
+        let survivor_prev: Option<String> = conn
+            .query_row(
+                "SELECT prev_chain_hash FROM audit_log WHERE timestamp >= ?1 ORDER BY id ASC LIMIT 1",
+                params![cutoff_timestamp],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("failed to read earliest surviving audit row: {e}"))?;
+
+        let seal: Option<String> = match survivor_prev {
+            Some(prev) => Some(prev),
+            None => conn
+                .query_row(
+                    "SELECT chain_hash FROM audit_log ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("failed to read audit chain tail: {e}"))?,
+        };
+
+        if let Some(seal) = seal {
+            conn.execute(
+                "INSERT OR REPLACE INTO audit_log_meta (key, value) VALUES (?1, ?2)",
+                params![Self::RETENTION_SEAL_KEY, seal],
+            )
+            .map_err(|e| format!("failed to write audit retention seal: {e}"))?;
+        }
+
+        let deleted = conn
+            .execute(
+                "DELETE FROM audit_log WHERE timestamp < ?1",
+                params![cutoff_timestamp],
+            )
+            .map_err(|e| format!("failed to enforce audit retention: {e}"))?;
+
+        Ok(deleted as u64)
+    }
+}
+
 /// Helper to re-box a ToSql value for a second bind pass.
 /// We only store String and i64 values, so this covers all cases.
 fn copy_to_sql(val: &dyn rusqlite::types::ToSql) -> Box<dyn rusqlite::types::ToSql> {
@@ -816,7 +1137,7 @@ mod waf_stats_tests {
             };
             store.insert_waf_event(&mk_event(i, cat)).expect("insert");
         }
-        let (total, by_cat) = store.waf_event_stats().expect("stats");
+        let (total, _total_24h, by_cat) = store.waf_event_stats().expect("stats");
         assert_eq!(total, n as u64, "total must reflect the full table");
         let sum: u64 = by_cat.iter().map(|(_, c)| c).sum();
         assert_eq!(sum, n as u64, "per-category counts must sum to total");
@@ -837,7 +1158,7 @@ mod waf_stats_tests {
         store
             .insert_waf_event(&mk_event(2, lorica_waf::RuleCategory::SqlInjection))
             .expect("insert");
-        let (total, by_cat) = store.waf_event_stats().expect("stats");
+        let (total, _total_24h, by_cat) = store.waf_event_stats().expect("stats");
         assert_eq!(total, 4);
         assert_eq!(by_cat.len(), 2);
         // XSS first (3 > 1).
@@ -848,9 +1169,38 @@ mod waf_stats_tests {
     #[test]
     fn waf_event_stats_on_empty_table() {
         let (store, _dir) = tmp_store();
-        let (total, by_cat) = store.waf_event_stats().expect("stats");
+        let (total, total_24h, by_cat) = store.waf_event_stats().expect("stats");
         assert_eq!(total, 0);
+        assert_eq!(total_24h, 0);
         assert!(by_cat.is_empty());
+    }
+
+    /// Backlog #44 : with `waf_event_retention` capping the table,
+    /// the global total plateaus near the cap and stops carrying
+    /// signal, so `waf_event_stats` also returns a rolling 24h count.
+    /// Insert rows dated well in the past and rows dated now, then
+    /// assert `total_24h` counts only the recent ones while `total`
+    /// still reflects the whole table.
+    #[test]
+    fn waf_event_stats_counts_only_last_24h() {
+        let (store, _dir) = tmp_store();
+        let old_ts: String = (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+        let recent_ts: String = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+
+        for i in 0..4 {
+            let mut ev = mk_event(i, lorica_waf::RuleCategory::Xss);
+            ev.timestamp = old_ts.clone();
+            store.insert_waf_event(&ev).expect("insert old");
+        }
+        for i in 0..3 {
+            let mut ev = mk_event(i, lorica_waf::RuleCategory::SqlInjection);
+            ev.timestamp = recent_ts.clone();
+            store.insert_waf_event(&ev).expect("insert recent");
+        }
+
+        let (total, total_24h, _by_cat) = store.waf_event_stats().expect("stats");
+        assert_eq!(total, 7, "total must reflect the whole table");
+        assert_eq!(total_24h, 3, "total_24h must count only rows within 24h");
     }
 }
 
@@ -899,5 +1249,191 @@ mod notification_history_tests {
     fn notification_history_count_on_empty_table() {
         let (store, _dir) = tmp_store();
         assert_eq!(store.notification_history_count().expect("count"), 0);
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::audit::{AuditQuery, NewAuditEntry, GENESIS_HASH};
+
+    fn tmp_store() -> (LogStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LogStore::open(dir.path()).expect("open store");
+        (store, dir)
+    }
+
+    fn entry(n: u32, action: &str, operator: &str) -> NewAuditEntry {
+        NewAuditEntry {
+            timestamp: format!("2026-08-{:02}T12:00:00+00:00", n),
+            operator_username: operator.to_string(),
+            operator_role: "super_admin".to_string(),
+            action: action.to_string(),
+            target_type: action.split('.').next().unwrap_or("").to_string(),
+            target_id: n.to_string(),
+            before_payload_hash: String::new(),
+            after_payload_hash: String::new(),
+            ip: "192.0.2.10".to_string(),
+            user_agent: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn chain_inserts_and_verifies() {
+        let (store, _dir) = tmp_store();
+        for n in 1..=5 {
+            store.insert_audit(&entry(n, "route.create", "alice")).expect("insert");
+        }
+        let result = store.verify_audit_chain().expect("verify");
+        assert!(result.verified);
+        assert_eq!(result.total_rows, 5);
+        assert!(result.first_break_id.is_none());
+
+        // Genesis row anchors on the all-zero hash.
+        let (rows, total) = store
+            .query_audit(&AuditQuery { limit: 10, ..Default::default() })
+            .expect("query");
+        assert_eq!(total, 5);
+        assert_eq!(rows.last().expect("rows").prev_chain_hash, GENESIS_HASH);
+        // Newest first.
+        assert_eq!(rows.first().expect("rows").target_id, "5");
+    }
+
+    #[test]
+    fn tampering_breaks_at_the_modified_row() {
+        let (store, _dir) = tmp_store();
+        for n in 1..=4 {
+            store.insert_audit(&entry(n, "route.update", "alice")).expect("insert");
+        }
+        {
+            let conn = store.conn.lock();
+            conn.execute("UPDATE audit_log SET target_id = '999' WHERE id = 2", [])
+                .expect("tamper");
+        }
+        let result = store.verify_audit_chain().expect("verify");
+        assert!(!result.verified);
+        assert_eq!(result.first_break_id, Some(2));
+        assert_eq!(result.first_break_reason.as_deref(), Some("chain_hash_mismatch"));
+    }
+
+    #[test]
+    fn deleting_a_middle_row_breaks_the_successor() {
+        let (store, _dir) = tmp_store();
+        for n in 1..=4 {
+            store.insert_audit(&entry(n, "backend.delete", "bob")).expect("insert");
+        }
+        {
+            let conn = store.conn.lock();
+            conn.execute("DELETE FROM audit_log WHERE id = 2", []).expect("delete");
+        }
+        let result = store.verify_audit_chain().expect("verify");
+        assert!(!result.verified);
+        assert_eq!(result.first_break_id, Some(3));
+        assert_eq!(result.first_break_reason.as_deref(), Some("prev_hash_mismatch"));
+    }
+
+    #[test]
+    fn retention_seal_keeps_chain_verifiable() {
+        let (store, _dir) = tmp_store();
+        for n in 1..=10 {
+            store.insert_audit(&entry(n, "cert.renew", "alice")).expect("insert");
+        }
+        // Truncate the first 5 rows (timestamps 2026-08-01..05).
+        let deleted = store
+            .enforce_audit_retention("2026-08-06T00:00:00+00:00")
+            .expect("retention");
+        assert_eq!(deleted, 5);
+
+        let result = store.verify_audit_chain().expect("verify");
+        assert!(result.verified, "seal must anchor the surviving suffix");
+        assert_eq!(result.total_rows, 5);
+
+        // New inserts keep chaining onto the surviving tail.
+        store.insert_audit(&entry(11, "cert.renew", "alice")).expect("insert");
+        let result = store.verify_audit_chain().expect("verify");
+        assert!(result.verified);
+        assert_eq!(result.total_rows, 6);
+    }
+
+    #[test]
+    fn retention_that_empties_the_table_seals_the_tail() {
+        let (store, _dir) = tmp_store();
+        for n in 1..=3 {
+            store.insert_audit(&entry(n, "waf.toggle", "alice")).expect("insert");
+        }
+        let deleted = store
+            .enforce_audit_retention("2026-09-01T00:00:00+00:00")
+            .expect("retention");
+        assert_eq!(deleted, 3);
+        let result = store.verify_audit_chain().expect("verify");
+        assert!(result.verified);
+        assert_eq!(result.total_rows, 0);
+
+        // The next insert anchors on the seal, not genesis.
+        store.insert_audit(&entry(4, "waf.toggle", "alice")).expect("insert");
+        let (rows, _) = store
+            .query_audit(&AuditQuery { limit: 1, ..Default::default() })
+            .expect("query");
+        assert_ne!(rows[0].prev_chain_hash, GENESIS_HASH);
+        assert!(store.verify_audit_chain().expect("verify").verified);
+    }
+
+    #[test]
+    fn query_filters_operator_action_prefix_and_cursor() {
+        let (store, _dir) = tmp_store();
+        store.insert_audit(&entry(1, "route.create", "alice")).expect("insert");
+        store.insert_audit(&entry(2, "route.delete", "bob")).expect("insert");
+        store.insert_audit(&entry(3, "backend.create", "alice")).expect("insert");
+
+        let (rows, total) = store
+            .query_audit(&AuditQuery {
+                operator: Some("alice".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("query");
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
+
+        let (rows, total) = store
+            .query_audit(&AuditQuery {
+                action_prefix: Some("route.".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("query");
+        assert_eq!(total, 2);
+        assert!(rows.iter().all(|r| r.action.starts_with("route.")));
+
+        // LIKE wildcards in user input are escaped, not interpreted.
+        let (_, total) = store
+            .query_audit(&AuditQuery {
+                action_prefix: Some("%".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("query");
+        assert_eq!(total, 0);
+
+        let (rows, total) = store
+            .query_audit(&AuditQuery {
+                before_id: Some(3),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("query");
+        assert_eq!(total, 2);
+        assert!(rows.iter().all(|r| r.id < 3));
+
+        let (rows, _) = store
+            .query_audit(&AuditQuery {
+                from: Some("2026-08-02T00:00:00+00:00".into()),
+                to: Some("2026-08-02T23:59:59+00:00".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].operator_username, "bob");
     }
 }

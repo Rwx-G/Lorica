@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// JSON view of a backend enriched with live EWMA score and active connection count.
@@ -136,11 +137,11 @@ fn backend_to_response(
 /// Look up active connections for a backend address from shared state.
 async fn get_backend_connections_async(state: &crate::server::AppState, addr: &str) -> i32 {
     // Direct counters (single-process mode)
-    if let Some(ref bc) = state.backend_connections {
+    if let Some(bc) = state.backend_connections() {
         return bc.get(addr) as i32;
     }
     // Aggregated from workers (supervisor mode)
-    if let Some(ref agg) = state.aggregated_metrics {
+    if let Some(agg) = state.aggregated_metrics() {
         if let Some(count) = agg.merged_backend_connections().await.get(addr).copied() {
             return count as i32;
         }
@@ -154,14 +155,13 @@ async fn get_backend_connections_async(state: &crate::server::AppState, addr: &s
 async fn get_ewma_score_async(state: &crate::server::AppState, addr: &str) -> f64 {
     // Direct scores (single-process mode)
     if let Some(score) = state
-        .ewma_scores
-        .as_ref()
+        .ewma_scores()
         .and_then(|scores| scores.get(addr).map(|s| *s))
     {
         return score;
     }
     // Aggregated from workers (supervisor mode)
-    if let Some(ref agg) = state.aggregated_metrics {
+    if let Some(agg) = state.aggregated_metrics() {
         if let Some(score) = agg.merged_ewma_scores().await.get(addr).copied() {
             return score;
         }
@@ -185,7 +185,10 @@ pub async fn list_backends(
 
 /// POST /api/v1/backends - register a new upstream backend.
 pub async fn create_backend(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateBackendRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     if body.address.is_empty() {
@@ -220,10 +223,20 @@ pub async fn create_backend(
     .await?;
     state.notify_config_changed();
 
-    Ok(json_data_with_status(
-        StatusCode::CREATED,
-        backend_to_response(&backend, 0.0, 0),
-    ))
+    let response = backend_to_response(&backend, 0.0, 0);
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "backend.create",
+        ("backend", &backend.id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data_with_status(StatusCode::CREATED, response))
 }
 
 /// GET /api/v1/backends/:id - fetch a single backend by id.
@@ -244,14 +257,18 @@ pub async fn get_backend(
 
 /// PUT /api/v1/backends/:id - patch backend fields and trigger a proxy reload.
 pub async fn update_backend(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdateBackendRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let backend = db_blocking(&state.store, move |store| {
+    let (before_backend, backend) = db_blocking(&state.store, move |store| {
         let mut backend = store
             .get_backend(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        let before_backend = backend.clone();
 
         if let Some(address) = body.address {
             backend.address = address;
@@ -296,12 +313,26 @@ pub async fn update_backend(
         backend.updated_at = Utc::now();
 
         store.update_backend(&backend)?;
-        Ok::<_, ApiError>(backend)
+        Ok::<_, ApiError>((before_backend, backend))
     })
     .await?;
     state.notify_config_changed();
     let score = get_ewma_score_async(&state, &backend.address).await;
     let conns = get_backend_connections_async(&state, &backend.address).await;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(&before_backend).ok();
+    let after = serde_json::to_value(&backend).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "backend.update",
+        ("backend", &backend.id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
+
     Ok(json_data(backend_to_response(&backend, score, conns)))
 }
 
@@ -312,7 +343,10 @@ pub async fn update_backend(
 /// that waits for active connections to reach 0 (or a 60s timeout)
 /// before deleting the backend from the database.
 pub async fn delete_backend(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id_db = id.clone();
@@ -335,6 +369,18 @@ pub async fn delete_backend(
     })
     .await?;
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(&backend).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "backend.delete",
+        ("backend", &backend.id),
+        before.as_ref(),
+        None,
+    )
+    .await;
 
     if force_deleted {
         return Ok(json_data(serde_json::json!({"message": "backend deleted"})));

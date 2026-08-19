@@ -1,0 +1,12 @@
+source_url: https://bgp.he.net/AS32934
+fetched: 2026-05-03
+upstream_creation_time: not_published_in_payload
+notes:
+  Meta does not publish a stable JSON IP-list URL; ranges are scraped from
+  the public BGP table for AS32934 (bgp.he.net mirrors RIR + global routing
+  table). Overlapping subranges deduplicated against their supernets to
+  shrink the linear scan: e.g. 31.13.96.0/19 is inside 31.13.64.0/18 so
+  only the /18 is kept; 57.144.x/23 + 57.145.x/23 are all inside
+  57.144.0.0/14; 129.134.x/24 are all inside 129.134.0.0/17; etc.
+  Refresh cadence: alongside each Lorica patch release. Operators wanting
+  faster refresh override via Custom Crawler with the latest CIDRs.

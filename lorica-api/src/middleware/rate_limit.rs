@@ -26,10 +26,9 @@
 //! a `Retry-After` header alongside the 429 response (RFC 6585).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, Extension, Request};
+use axum::extract::{Extension, Request};
 use axum::middleware::Next;
 use axum::response::Response;
 use chrono::{DateTime, Duration, Utc};
@@ -190,12 +189,12 @@ pub struct RateLimitConfig {
 /// deterministic bucketing.
 pub async fn rate_limit_middleware(
     Extension(limiter): Extension<RateLimiter>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    connect_info: crate::audit::ClientConnectInfo,
     axum::extract::State(config): axum::extract::State<RateLimitConfig>,
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let client_ip = connect_info
+    let client_ip = connect_info.0
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     match limiter

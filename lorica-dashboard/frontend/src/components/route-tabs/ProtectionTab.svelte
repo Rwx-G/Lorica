@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { RouteFormState } from '../../lib/route-form';
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
+  import { api, type AiCrawlerTestResponse, type AiCrawlerStatEntry, type AiCrawlerVerificationKind } from '../../lib/api';
+  import { verificationKindLabel } from '../../lib/ai-crawlers';
   import CountryPicker from '../CountryPicker.svelte';
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import FieldHelpButton from '../FieldHelpButton.svelte';
@@ -11,9 +13,86 @@
   interface Props {
     form: RouteFormState;
     importedFields?: Set<string>;
+    /**
+     * The persisted route id, or `null` for an unsaved (new) route.
+     * Required by the AI-crawler test / stats / robots-preview calls,
+     * which evaluate against the stored route config. When absent the
+     * widgets show a "save the route first" hint instead.
+     */
+    routeId?: string | null;
   }
 
-  let { form = $bindable(), importedFields }: Props = $props();
+  let { form = $bindable(), importedFields, routeId = null }: Props = $props();
+
+  function aiPolicyLabel(policy: 'off' | 'deny' | 'log'): string {
+    return policy === 'off' ? 'Off' : policy === 'deny' ? 'Deny' : 'Log';
+  }
+
+  // AI crawler "Test classification" widget state.
+  let aiTestUa = $state('');
+  let aiTestResult = $state<AiCrawlerTestResponse | null>(null);
+  let aiTestError = $state<string | null>(null);
+  let aiTestLoading = $state(false);
+  async function runAiTest(): Promise<void> {
+    const ua = aiTestUa.trim();
+    if (ua === '') {
+      aiTestError = 'Enter a User-Agent string to test.';
+      aiTestResult = null;
+      return;
+    }
+    aiTestLoading = true;
+    aiTestError = null;
+    const res = await api.testAiCrawler(ua, routeId);
+    if (res.error) {
+      aiTestError = res.error.message;
+      aiTestResult = null;
+    } else {
+      aiTestResult = res.data ?? null;
+    }
+    aiTestLoading = false;
+  }
+
+  // "Detected crawlers" widget state (5-minute window, loaded on demand).
+  let aiStats = $state<AiCrawlerStatEntry[] | null>(null);
+  let aiStatsError = $state<string | null>(null);
+  let aiStatsLoading = $state(false);
+  async function loadAiStats(): Promise<void> {
+    if (!routeId) return;
+    aiStatsLoading = true;
+    aiStatsError = null;
+    const res = await api.getAiCrawlerStats(routeId);
+    if (res.error) {
+      aiStatsError = res.error.message;
+      aiStats = null;
+    } else {
+      aiStats = res.data?.top_5 ?? [];
+    }
+    aiStatsLoading = false;
+  }
+
+  // robots.txt preview modal state.
+  let showRobotsPreview = $state(false);
+  let robotsPreviewBody = $state<string | null>(null);
+  let robotsPreviewError = $state<string | null>(null);
+  let robotsPreviewLoading = $state(false);
+  async function openRobotsPreview(): Promise<void> {
+    if (!routeId) return;
+    showRobotsPreview = true;
+    robotsPreviewLoading = true;
+    robotsPreviewError = null;
+    robotsPreviewBody = null;
+    const res = await api.getAiCrawlerRobotsPreview(routeId);
+    if (res.error) {
+      robotsPreviewError = res.error.message;
+    } else {
+      robotsPreviewBody = res.data?.body ?? '';
+    }
+    robotsPreviewLoading = false;
+  }
+
+  function aiVerificationLabel(kind: AiCrawlerVerificationKind | null): string {
+    return kind === null ? 'none' : verificationKindLabel(kind);
+  }
 
   // Multi-line placeholder: HTML attributes render `\n` as two chars,
   // so the newline has to come from a JS string at interpolation time.
@@ -29,6 +108,7 @@
     | 'section:auto_ban'
     | 'section:geoip'
     | 'section:bot'
+    | 'section:ai_crawler'
   >(null);
 
   function isModified(field: keyof RouteFormState): boolean {
@@ -396,6 +476,123 @@
       {/if}
     </div>
   </section>
+
+  <!-- ============ AI crawler policy ============ -->
+  <section id="prot-ai-crawler" class="subsection">
+    <SubsectionHeader
+      title="AI crawler policy"
+      description="Identify verified AI crawlers (GPTBot, ClaudeBot, ...) and deny or log them. Spoofed bots (UA matches but verification fails) get a separate fallback action."
+      accent="teal"
+      onhelp={() => { activeHelp = 'section:ai_crawler'; }}
+    />
+    <div class="subsection-body">
+      <div class="form-row">
+        <div class="form-group" class:modified={isModified('ai_bot_policy')}>
+          <label for="ai-bot-policy">Policy</label>
+          {#if isImported('ai_bot_policy')}<span class="imported-badge">imported</span>{/if}
+          <select id="ai-bot-policy" bind:value={form.ai_bot_policy}>
+            <option value="off">Off (no AI crawler handling)</option>
+            <option value="deny">Deny (block verified AI crawlers)</option>
+            <option value="log">Log (record only, do not block)</option>
+          </select>
+          <span class="hint">Applies to crawlers whose identity is verified (rDNS / IP range).</span>
+        </div>
+        <div class="form-group" class:modified={isModified('ai_bot_spoofed_fallback')}>
+          <label for="ai-bot-spoofed">Spoofed fallback</label>
+          {#if isImported('ai_bot_spoofed_fallback')}<span class="imported-badge">imported</span>{/if}
+          <select id="ai-bot-spoofed" bind:value={form.ai_bot_spoofed_fallback}>
+            <option value="">Inherit global default</option>
+            <option value="deny">Deny</option>
+            <option value="log">Log</option>
+            <option value="allow">Allow</option>
+          </select>
+          <span class="hint">Action when a UA claims to be an AI bot but verification fails. Inherit defers to the global setting.</span>
+        </div>
+      </div>
+
+      <div class="form-group" class:modified={isModified('serve_robots_txt')}>
+        <label class="checkbox-item">
+          <input type="checkbox" bind:checked={form.serve_robots_txt} />
+          <span>Auto-serve /robots.txt</span>
+        </label>
+        {#if isImported('serve_robots_txt')}<span class="imported-badge">imported</span>{/if}
+        <span class="hint">
+          ON = Lorica serves a registry-driven <code>robots.txt</code> for this route. OFF (default) = passes <code>/robots.txt</code> through to the backend.
+        </span>
+        <div class="ai-actions">
+          <button type="button" class="ai-btn" onclick={openRobotsPreview} disabled={!routeId || robotsPreviewLoading}>
+            {robotsPreviewLoading ? 'Loading...' : 'Preview robots.txt'}
+          </button>
+          {#if !routeId}<span class="hint inline-hint">Save the route first to preview.</span>{/if}
+        </div>
+      </div>
+
+      <!-- Test classification -->
+      <div class="form-group">
+        <label for="ai-test-ua">Test classification</label>
+        <div class="ai-inline-row">
+          <input
+            id="ai-test-ua"
+            type="text"
+            bind:value={aiTestUa}
+            placeholder="Paste a User-Agent string"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button type="button" class="ai-btn" onclick={runAiTest} disabled={aiTestLoading}>
+            {aiTestLoading ? 'Testing...' : 'Test'}
+          </button>
+        </div>
+        {#if aiTestError}<span class="field-error" role="alert">{aiTestError}</span>{/if}
+        {#if aiTestResult}
+          {#if aiTestResult.matched_crawler}
+            <div class="ai-result">
+              <strong>Matched:</strong> {aiTestResult.matched_crawler}
+              <span class="ai-sep">;</span>
+              <strong>Verification:</strong> {aiVerificationLabel(aiTestResult.verification_kind)}
+              <span class="ai-sep">;</span>
+              <strong>Would apply:</strong> {aiPolicyLabel(aiTestResult.would_apply_policy)}
+            </div>
+            {#if aiTestResult.note}<span class="hint">{aiTestResult.note}</span>{/if}
+          {:else}
+            <div class="ai-result ai-result-empty">No AI bot match{aiTestResult.note ? ` - ${aiTestResult.note}` : ''}</div>
+          {/if}
+        {/if}
+        <span class="hint">Checks the UA against built-in and custom crawler patterns{routeId ? ' for this route' : ''}.</span>
+      </div>
+
+      <!-- Detected crawlers -->
+      <div class="form-group">
+        <label for="ai-stats-refresh">Detected crawlers (last 5 min)</label>
+        <div class="ai-actions">
+          <button id="ai-stats-refresh" type="button" class="ai-btn" onclick={loadAiStats} disabled={!routeId || aiStatsLoading}>
+            {aiStatsLoading ? 'Loading...' : 'Refresh'}
+          </button>
+          {#if !routeId}<span class="hint inline-hint">Save the route first to see detected crawlers.</span>{/if}
+        </div>
+        {#if aiStatsError}<span class="field-error" role="alert">{aiStatsError}</span>{/if}
+        {#if aiStats !== null}
+          {#if aiStats.length === 0}
+            <div class="ai-result ai-result-empty">No AI crawlers detected in the last 5 minutes.</div>
+          {:else}
+            <table class="ai-stats-table">
+              <thead>
+                <tr><th>Crawler</th><th>Hits</th></tr>
+              </thead>
+              <tbody>
+                {#each aiStats as entry (entry.crawler)}
+                  <tr>
+                    <td>{entry.crawler}</td>
+                    <td class="ai-count">{entry.count}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {/if}
+        {/if}
+      </div>
+    </div>
+  </section>
 </div>
 
 {#if activeHelp === 'section:rate_limit'}
@@ -552,6 +749,55 @@
       (threat model, wire format, captcha alphabet defaults).
     </p>
   </HelpModal>
+{:else if activeHelp === 'section:ai_crawler'}
+  <HelpModal title="AI crawler policy" onclose={() => { activeHelp = null; }}>
+    <p>
+      Detects AI / LLM crawlers (GPTBot, ClaudeBot, Google-Extended,
+      PerplexityBot, ...) from a built-in registry plus your custom
+      entries (Settings &rarr; AI Crawlers), then applies a per-route
+      action.
+    </p>
+    <p><strong>Policy</strong> - applied to crawlers whose identity is
+    confirmed by their verification method (forward-confirmed rDNS or a
+    published IP range):</p>
+    <ul>
+      <li><em>Off</em> - no AI-crawler handling for this route.</li>
+      <li><em>Deny</em> - block the request (403).</li>
+      <li><em>Log</em> - record the hit but let the request through.</li>
+    </ul>
+    <p>
+      <strong>Spoofed fallback</strong> - a request whose User-Agent
+      claims to be an AI bot but fails verification is treated
+      separately, because anyone can copy a UA string. <em>Inherit</em>
+      defers to the global default; <em>Deny</em> / <em>Log</em> /
+      <em>Allow</em> pin a per-route action.
+    </p>
+    <p>
+      <strong>Auto-serve /robots.txt</strong> - when ON, Lorica answers
+      <code>/robots.txt</code> for this route with a registry-driven
+      policy file instead of forwarding to the backend. OFF (default)
+      passes the path through unchanged.
+    </p>
+    <p>
+      Use <strong>Test classification</strong> to see how a given
+      User-Agent would be classified, and <strong>Detected
+      crawlers</strong> for a rolling 5-minute count of what hit this
+      route.
+    </p>
+  </HelpModal>
+{/if}
+
+{#if showRobotsPreview}
+  <HelpModal title="robots.txt preview" onclose={() => { showRobotsPreview = false; }}>
+    {#if robotsPreviewLoading}
+      <p>Loading...</p>
+    {:else if robotsPreviewError}
+      <p class="preview-error">{robotsPreviewError}</p>
+    {:else}
+      <p>Registry-driven <code>robots.txt</code> Lorica would serve for this route:</p>
+      <pre>{robotsPreviewBody}</pre>
+    {/if}
+  </HelpModal>
 {/if}
 
 <style>
@@ -666,4 +912,70 @@
     margin-left: 0.375rem;
     vertical-align: middle;
   }
+
+  .ai-inline-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+  }
+  .ai-inline-row input[type="text"] { flex: 1; }
+
+  .ai-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+  }
+  .inline-hint { margin-top: 0; }
+
+  .ai-btn {
+    flex-shrink: 0;
+    padding: 0.5rem 0.875rem;
+    border: 1px solid var(--color-border);
+    border-radius: 0.375rem;
+    background: var(--color-bg-input);
+    color: var(--color-text);
+    font-size: 0.8125rem;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .ai-btn:hover:not(:disabled) { border-color: var(--color-primary); color: var(--color-primary); }
+  .ai-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+  .ai-result {
+    margin-top: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.375rem;
+    background: var(--color-bg-input);
+    border: 1px solid var(--color-border);
+    font-size: 0.8125rem;
+    line-height: 1.5;
+  }
+  .ai-result strong { color: var(--color-text-heading); }
+  .ai-result-empty { color: var(--color-text-muted); }
+  .ai-sep { color: var(--color-text-muted); margin: 0 0.25rem; }
+
+  .ai-stats-table {
+    width: 100%;
+    margin-top: 0.5rem;
+    border-collapse: collapse;
+    font-size: 0.8125rem;
+  }
+  .ai-stats-table th {
+    text-align: left;
+    padding: 0.375rem 0.5rem;
+    border-bottom: 1px solid var(--color-border);
+    color: var(--color-text-muted);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: 0.6875rem;
+    letter-spacing: 0.05em;
+  }
+  .ai-stats-table td {
+    padding: 0.375rem 0.5rem;
+    border-bottom: 1px solid var(--color-border);
+  }
+  .ai-count { text-align: right; font-variant-numeric: tabular-nums; }
+
+  .preview-error { color: var(--color-red); }
 </style>

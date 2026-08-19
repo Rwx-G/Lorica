@@ -14,6 +14,7 @@ use tokio::sync::broadcast;
 
 use crate::db::log_db_blocking;
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// A single access log entry.
@@ -488,7 +489,10 @@ pub async fn export_logs(
 
 /// DELETE /api/v1/logs - empty both the in-memory ring buffer and the persistent store.
 pub async fn clear_logs(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.log_buffer.clear();
     if let Some(ref store) = state.log_store {
@@ -503,6 +507,10 @@ pub async fn clear_logs(
         // few seconds on a busy DB - off the tokio worker.
         log_db_blocking(store, |s| s.clear()).await?;
     }
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(&state, &audit_ctx, "logs.clear", ("logs", ""), None, None).await;
+
     Ok(json_data(serde_json::json!({ "message": "logs cleared" })))
 }
 
@@ -545,7 +553,7 @@ async fn handle_log_stream(socket: WebSocket, mut rx: broadcast::Receiver<LogEnt
             match rx.recv().await {
                 Ok(entry) => {
                     if let Ok(json) = serde_json::to_string(&entry) {
-                        if sender.send(Message::Text(json)).await.is_err() {
+                        if sender.send(Message::Text(json.into())).await.is_err() {
                             break; // Client disconnected
                         }
                     }

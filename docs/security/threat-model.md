@@ -53,7 +53,7 @@ Internet  -->  [ Lorica Proxy (8080/8443) ]  -->  Backend Services
 | Brute force login | Rate limiter on /auth/login endpoint | Implemented |
 | Session hijacking | Localhost-only binding (127.0.0.1), no remote access | Implemented |
 | CSRF | Same-origin cookie policy, JSON-only API | Implemented |
-| Weak passwords | 12-character minimum, forced change on first login | Implemented |
+| Weak passwords | 14-character minimum + complexity classes, forced change on first login | Implemented |
 | API abuse | All mutations require authenticated session | Implemented |
 
 ### T4: Data at Rest

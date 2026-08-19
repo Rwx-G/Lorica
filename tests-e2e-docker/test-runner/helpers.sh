@@ -10,16 +10,18 @@ log()   { echo -e "\033[1;34m[TEST]\033[0m $*"; }
 ok()    { PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); echo -e "\033[1;32m  PASS\033[0m $*"; }
 fail()  { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo -e "\033[1;31m  FAIL\033[0m $*"; }
 
-api_get()  { curl -s -b "$SESSION" "$API$1" 2>/dev/null || true; }
-api_post() { curl -s -b "$SESSION" -X POST -H "Content-Type: application/json" -d "$2" "$API$1" 2>/dev/null || true; }
-api_put()  { curl -s -b "$SESSION" -X PUT -H "Content-Type: application/json" -d "$2" "$API$1" 2>/dev/null || true; }
-api_del()  { curl -s -b "$SESSION" -X DELETE "$API$1" 2>/dev/null || true; }
+# `-k` accepts the management API's self-signed TLS cert (Story 8.8);
+# the image also ships a global `insecure` curlrc, this is belt-and-braces.
+api_get()  { curl -sk -b "$SESSION" "$API$1" 2>/dev/null || true; }
+api_post() { curl -sk -b "$SESSION" -X POST -H "Content-Type: application/json" -d "$2" "$API$1" 2>/dev/null || true; }
+api_put()  { curl -sk -b "$SESSION" -X PUT -H "Content-Type: application/json" -d "$2" "$API$1" 2>/dev/null || true; }
+api_del()  { curl -sk -b "$SESSION" -X DELETE "$API$1" 2>/dev/null || true; }
 
 assert_status() {
     local method="$1" url="$2" expected="$3" label="$4"
     shift 4
     local status
-    status=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" -X "$method" "$@" "$url" 2>/dev/null || true)
+    status=$(curl -sk -o /dev/null -w '%{http_code}' -b "$SESSION" -X "$method" "$@" "$url" 2>/dev/null || true)
     if [ "$status" = "$expected" ]; then
         ok "$label (HTTP $status)"
     else
@@ -115,7 +117,7 @@ wait_for_backend() {
 wait_for_api() {
     local max_wait="${1:-120}"
     for i in $(seq 1 "$max_wait"); do
-        if curl -sf "$API/api/v1/status" >/dev/null 2>&1; then
+        if curl -skf "$API/api/v1/status" >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
@@ -126,7 +128,7 @@ wait_for_api() {
 login() {
     local password="$1"
     SESSION=$(mktemp)
-    curl -sf -c "$SESSION" -X POST -H "Content-Type: application/json" \
+    curl -skf -c "$SESSION" -X POST -H "Content-Type: application/json" \
         -d "{\"username\":\"admin\",\"password\":\"$password\"}" \
         "$API/api/v1/auth/login" >/dev/null 2>&1
 }

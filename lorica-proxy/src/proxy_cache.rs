@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// clippy 1.95 promoted `collapsible_match` on the `if let` guards inside
+// the range `match` arms below (e.g. `if cache.hit_handler().can_seek()
+// { ... }`). This file is vendored from upstream Pingora; keeping the
+// upstream shape rather than collapsing the guards into the match arms
+// keeps the next upstream re-sync a clean diff. Backlog #43.
+#![allow(clippy::collapsible_match)]
+
 use super::*;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{Method, StatusCode};

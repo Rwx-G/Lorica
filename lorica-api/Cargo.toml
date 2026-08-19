@@ -1,6 +1,6 @@
 [package]
 name = "lorica-api"
-version = "1.5.13"
+version = "1.6.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -8,12 +8,14 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
+lorica-acme = { version = "1.6.0", path = "../lorica-acme" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-config = { version = "1.5.13", path = "../lorica-config" }
-lorica-dashboard = { version = "1.5.13", path = "../lorica-dashboard" }
-lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
-lorica-notify = { version = "0.1.0", path = "../lorica-notify" }
-lorica-bench = { version = "1.5.13", path = "../lorica-bench" }
+lorica-config = { version = "1.6.0", path = "../lorica-config" }
+lorica-dashboard = { version = "1.6.0", path = "../lorica-dashboard" }
+lorica-metrics = { version = "1.6.0", path = "../lorica-metrics" }
+lorica-waf = { version = "1.6.0", path = "../lorica-waf" }
+lorica-notify = { version = "1.6.0", path = "../lorica-notify" }
+lorica-bench = { version = "1.6.0", path = "../lorica-bench" }
 # Used in `certificates.rs::validate_certificate_bundle` to gate
 # every cert upload (POST /certificates, PUT /certificates/{id},
 # POST /config/import) with the exact loader the worker uses :
@@ -24,19 +26,38 @@ lorica-bench = { version = "1.5.13", path = "../lorica-bench" }
 # + `rustls-pki-types`) into the `lorica-api` binary, not just the
 # PEM parser.
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
-axum = { version = "0.7", features = ["multipart", "ws"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 futures-util = "0.3"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time"] }
+# Management-plane TLS (Story 8.8 AC #1/#2). The management API moved
+# off plaintext `axum::serve` onto a manual rustls accept loop: axum 0.7
+# `Router` -> `hyper-util` auto (h1/h2) connection server over a
+# `tokio-rustls` acceptor. Both crates are already in the workspace
+# lockfile (transitive via the rustls / hyper stack); promoted to direct
+# deps here. `tokio-rustls` pins the `ring` provider (no aws-lc-rs) to
+# match the rest of the workspace, which installs the ring default
+# provider at process start. `hyper-util` needs `server-auto` (protocol
+# auto-detect), `service` (`TowerToHyperService` bridge), and `tokio`
+# (the `TokioIo` / `TokioExecutor` adapters).
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 argon2 = "0.5"
+# Native Ed25519 verification for the Story 8.4 hot binary-upgrade
+# endpoint (`POST /api/v1/system/upgrade`). Default features only:
+# the `verify_strict` path needs no RNG, and tests build a
+# `SigningKey` from fixed bytes (`SigningKey::from_bytes`) rather than
+# `generate`, so the optional `rand_core` feature stays off and no
+# extra RNG dep is pulled.
+ed25519-dalek = "3"
 rand = "0.9"
 rand_chacha = "0.9"
-rcgen = "0.13"
+rcgen = "0.14"
 regex = "1"
 ring = "0.17"
 # Bumped 0.16 -> 0.18 in v1.5.2 (audit L-15) for the BER/DER
@@ -45,47 +66,32 @@ ring = "0.17"
 # prelude::GeneralName::DNSName, prelude::ASN1Time) is stable
 # across the bump.
 x509-parser = "0.18"
-pem = "3"
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"], optional = true }
-aws-sdk-route53 = { version = "1", optional = true }
-sysinfo = "0.33"
+pem = "4"
+sysinfo = "0.39"
 # Linux-only. Used for `statvfs` so the System page reports disk
 # usage with the same "used = total - free" semantics as `df -h`
 # (sysinfo's available_space excludes reserved root blocks, which
 # inflates computed "used" by ~5 % of total). `nix` is preferred
 # over raw `libc` so the call stays in safe Rust - the crate-wide
 # `#![deny(unsafe_code)]` stays intact.
-nix = { version = "0.29", default-features = false, features = ["fs"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
 thiserror = "2"
-# Bumped 0.7 -> 0.8 in v1.5.2 (audit L-15). Maintainer is djc
-# (Dirkjan Ochtman, well-known crate maintainer ; low takeover
-# risk). 0.8 added ACME-CAA + revoked-account error handling.
-# API breaks migrated in `acme/{http01,dns01,dns01_manual}.rs` :
-# Account creation goes through `AccountBuilder` ; NewOrder uses
-# the `::new(&identifiers)` constructor ; authorizations are a
-# stream-style iterator ; challenge readiness moved from
-# `Order::set_challenge_ready(url)` to
-# `ChallengeHandle::set_ready()` ; `finalize` lost its CSR arg
-# in favour of a separate `finalize_csr(der)` method.
-# Default features bring `aws-lc-rs` + `hyper-rustls` ; we
-# pin `ring` instead to match the rest of the workspace
-# (`lorica-tls`, `lorica/rustls`) so the binary does not
-# carry two crypto providers in parallel. `rcgen` not needed
-# (we generate the CSR with `rcgen` directly and feed it into
-# `finalize_csr`).
-instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 async-trait = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 dashmap = "6"
 tracing = "0.1"
-prometheus = "0.14"
 once_cell = { workspace = true }
 http = { workspace = true }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 parking_lot = "0.12"
 ipnet = "2"
-strum = "0.26"
+strum = "0.28"
+# Constant-time byte comparison for the `/metrics` bearer-token check
+# (Story 8.8 AC #5) so token verification does not leak how many
+# leading bytes matched. Already in the workspace lockfile via the
+# rustls / dalek stack; promoted to a direct dep here.
+subtle = "2"
 tokio-util = { version = "0.7", features = ["rt"] }
 # Allocation-free integer formatter used on per-request hot paths
 # (e.g. `metrics::record_request` for the `status_code` Prometheus
@@ -101,15 +107,10 @@ itoa = "1"
 # building from source, or uncomment the default line for downstream
 # packagers that need it. See ROADMAP.md (audit SC-M-3).
 default = []
-route53 = ["aws-config", "aws-sdk-route53"]
+route53 = ["lorica-acme/route53"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 hyper = { version = "1", features = ["full"] }
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
-# HTTP mock server for unit-testing the Cloudflare + OVH DNS
-# challengers without hitting the real providers (v1.5.0 backlog
-# #9). Scoped to dev so the runtime binary does not pick up the
-# dep.
-wiremock = "0.6"

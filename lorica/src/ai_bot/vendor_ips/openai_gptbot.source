@@ -1,0 +1,9 @@
+source_url: https://openai.com/gptbot.json
+fetched: 2026-05-03
+upstream_creation_time: 2025-10-30T11:00:00.000000
+notes:
+  Normalized from upstream {"prefixes": [{"ipv4Prefix": "X"}, ...]} shape into a
+  flat array of CIDR strings to match `serde_json::from_str::<Vec<String>>`
+  consumer in lorica/src/ai_bot.rs::VENDOR_IP_RANGES Lazy.
+  Refresh cadence: alongside each Lorica patch release. Mid-cycle override
+  available via Custom Crawler CRUD (AC #6).

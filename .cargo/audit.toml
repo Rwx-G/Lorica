@@ -25,9 +25,13 @@
 # <- aws-config 1.8.15 <- lorica-api (only when the `route53`
 # feature is enabled).
 #
-# Upstream status (checked 2026-06-10): aws-smithy-http-client
-# 1.1.13 is the current stable and still pins rustls 0.21. There
-# is no published aws-sdk-* release that uses rustls 0.23 yet.
+# Upstream status (rechecked 2026-08-12): aws-smithy-http-client
+# 1.3.0 now exposes an optional rustls-0.23 / hyper-rustls-0.27
+# feature set alongside the legacy rustls-0.21 path, but `aws-config`
+# has not exposed a selector to route to it, so the resolved chain
+# still pins rustls 0.21 / webpki 0.101.7. Revisit trigger unchanged:
+# when `aws-config` lets us select the rustls-0.23 backend, bump the
+# AWS SDK crates and remove all three entries.
 #
 # Runtime exposure:
 # - Lorica uses the AWS SDK exclusively to drive Route 53 Change-
@@ -47,8 +51,36 @@
 # Revisit on every `cargo update` touching the AWS SDK : when
 # aws-smithy-http-client switches to rustls 0.23 (tracked upstream
 # in awslabs/smithy-rs), remove all three entries.
+# RUSTSEC-2026-0258 "h2 unbounded empty DATA frames" (DoS: a peer can
+# stream unbounded empty DATA frames). Fixed in h2 >= 0.4.16.
+#
+# The SHIPPED HTTP/2 data path is patched, not ignored: `lorica-core`
+# and `lorica-proxy` take h2 as a normal dependency and now resolve to
+# 0.4.17, and the workspace manifest floors the constraint at
+# `h2 = ">=0.4.16"`. That floor is what makes this ignore safe - the
+# entry cannot silently mask a data-path regression back onto a
+# vulnerable version, because such a version can no longer resolve.
+#
+# What still matches, and why it is out of reach:
+# - h2 0.3.27 <- hyper 0.14.32. Every first-party edge into hyper 0.14
+#   is a DEV-dependency of `lorica-proxy` (`hyper = "0.14"`, plus
+#   `hyperlocal = "0.8"` under cfg(unix)), i.e. test-only code that is
+#   never linked into the shipped binary.
+# - h2 0.3.27 <- hyper 0.14.32 <- aws-smithy-http-client 1.3.0 <-
+#   aws-sdk-route53 / aws-sdk-sts <- aws-config <- lorica-api, and only
+#   when the OPTIONAL `route53` feature is enabled. That client speaks
+#   HTTP/2 exclusively to `route53.amazonaws.com` for ACME DNS-01
+#   solving, so the peer that would have to flood empty DATA frames is
+#   AWS itself, not a user-controlled host.
+#
+# No listener that terminates untrusted HTTP/2 traffic runs on the 0.3
+# line. Revisit trigger: same as the three entries above (when
+# aws-config lets us select the newer hyper/rustls backend), plus
+# whenever the lorica-proxy dev-dependency on hyper 0.14 is dropped -
+# either removes the 0.3 line from the tree and this entry with it.
 ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0258",
 ]

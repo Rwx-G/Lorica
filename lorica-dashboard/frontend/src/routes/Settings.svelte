@@ -7,6 +7,7 @@
     type UserPreferenceResponse,
     type SecurityHeaderPreset,
     type DnsProviderResponse,
+    type SettingsSchemaResponse,
   } from '../lib/api';
   import { showToast } from '../lib/toast';
   import SettingsDnsProviders from '../components/settings/SettingsDnsProviders.svelte';
@@ -17,14 +18,21 @@
   import ObservabilityTab from '../components/settings-tabs/ObservabilityTab.svelte';
   import SecurityPresetsTab from '../components/settings-tabs/SecurityPresetsTab.svelte';
   import BanRulesTab from '../components/settings-tabs/BanRulesTab.svelte';
+  import AiCrawlersTab from '../components/settings-tabs/AiCrawlersTab.svelte';
   import NotificationHistoryTab from '../components/settings-tabs/NotificationHistoryTab.svelte';
   import PreferencesTab from '../components/settings-tabs/PreferencesTab.svelte';
   import ExportImportTab from '../components/settings-tabs/ExportImportTab.svelte';
   import CertExportTab from '../components/settings-tabs/CertExportTab.svelte';
+  import BinaryUpgradeTab from '../components/settings-tabs/BinaryUpgradeTab.svelte';
+  import UsersAccessTab from '../components/settings-tabs/UsersAccessTab.svelte';
+  import { isSuperAdmin } from '../lib/auth';
   import { parseOctalMode } from '../lib/validators';
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
+  // Story 8.10 AC #7. Server-authoritative field bounds; empty until
+  // loaded, so the child components fall back to their UI defaults.
+  let settingsSchema = $state<SettingsSchemaResponse>({});
   let settingsForm = $state({
     management_port: 9443,
     log_level: 'info',
@@ -37,6 +45,7 @@
     waf_ban_threshold: 5,
     waf_ban_duration_s: 3600,
     access_log_retention: 100000,
+    waf_event_retention: 100000,
     sla_purge_enabled: false,
     sla_purge_retention_days: 90,
     sla_purge_schedule: 'first_of_month',
@@ -53,6 +62,16 @@
     geoip_auto_update_enabled: false,
     asn_db_path: '',
     asn_auto_update_enabled: false,
+    // Defense-in-depth data-plane bounds (Story 8.9).
+    // connection_limits_per_ip is held as a string so an empty
+    // input maps to "no cap" (null), same pattern as the cert
+    // export uid / gid below.
+    audit_log_retention_days: 90,
+    connection_limits_per_ip: '',
+    bot_stash_max_entries: 10000,
+    bot_stash_per_prefix_max: 100,
+    mirror_max_concurrent_per_route: 32,
+    mirror_max_concurrent_global: 4096,
     // Cert export (v1.4.1). Modes are held as user-facing octal
     // strings so the input shows "640" rather than decimal 416.
     cert_export_enabled: false,
@@ -106,7 +125,10 @@
     preferences: true,
     export: true,
     ban_rules: true,
+    ai_crawlers: true,
     cert_export: true,
+    binary_upgrade: true,
+    users_access: true,
   };
   let expandedSections = $state<Record<string, boolean>>((() => {
     try {
@@ -128,13 +150,17 @@
   async function loadAll() {
     loading = true;
     error = '';
-    const [settingsRes, notifRes, prefRes, histRes, dnsRes] = await Promise.all([
+    const [settingsRes, notifRes, prefRes, histRes, dnsRes, schemaRes] = await Promise.all([
       api.getSettings(),
       api.listNotifications(),
       api.listPreferences(),
       api.notificationHistory(),
       api.listDnsProviders(),
+      api.getSettingsSchema(),
     ]);
+    if (schemaRes.data) {
+      settingsSchema = schemaRes.data;
+    }
     if (settingsRes.error) {
       error = settingsRes.error.message;
     } else if (settingsRes.data) {
@@ -155,6 +181,10 @@
         asn_db_path: settingsRes.data.asn_db_path ?? '',
         asn_auto_update_enabled:
           settingsRes.data.asn_auto_update_enabled ?? false,
+        connection_limits_per_ip:
+          settingsRes.data.connection_limits_per_ip != null
+            ? String(settingsRes.data.connection_limits_per_ip)
+            : '',
         cert_export_enabled: settingsRes.data.cert_export_enabled ?? false,
         cert_export_dir: settingsRes.data.cert_export_dir ?? '',
         cert_export_owner_uid:
@@ -229,6 +259,7 @@
       cert_export_group_gid,
       cert_export_file_mode,
       cert_export_dir_mode,
+      connection_limits_per_ip,
       ...formRest
     } = settingsForm;
     // Convert textarea fields (newline-separated) to string arrays
@@ -259,6 +290,11 @@
       otlp_endpoint: settingsForm.otlp_endpoint.trim(),
       geoip_db_path: settingsForm.geoip_db_path.trim(),
       asn_db_path: settingsForm.asn_db_path.trim(),
+      // Per-IP connection cap: empty input or 0 means "no cap" (null).
+      connection_limits_per_ip:
+        connection_limits_per_ip.trim() === '' || Number(connection_limits_per_ip.trim()) === 0
+          ? null
+          : Number(connection_limits_per_ip.trim()),
       // Cert export: the enable flag + directory always ride, and
       // uid / gid / modes are only sent when the operator supplied
       // a valid value (empty input => leave backend unchanged).
@@ -297,6 +333,10 @@
         geoip_auto_update_enabled: res.data.geoip_auto_update_enabled ?? false,
         asn_db_path: res.data.asn_db_path ?? '',
         asn_auto_update_enabled: res.data.asn_auto_update_enabled ?? false,
+        connection_limits_per_ip:
+          res.data.connection_limits_per_ip != null
+            ? String(res.data.connection_limits_per_ip)
+            : '',
         cert_export_enabled: res.data.cert_export_enabled ?? false,
         cert_export_dir: res.data.cert_export_dir ?? '',
         cert_export_owner_uid:
@@ -343,6 +383,7 @@
 
     <GlobalConfigTab
       bind:settingsForm
+      schema={settingsSchema}
       expanded={expandedSections.global}
       toggleSection={() => toggleSection('global')}
       {settingsSaving}
@@ -392,6 +433,11 @@
       toggleSection={() => toggleSection('ban_rules')}
     />
 
+    <AiCrawlersTab
+      expanded={expandedSections.ai_crawlers}
+      toggleSection={() => toggleSection('ai_crawlers')}
+    />
+
     <SettingsDnsProviders bind:dnsProviders {expandedSections} {toggleSection} onReload={loadAll} />
 
     <SettingsNotifications bind:notifications {expandedSections} {toggleSection} onReload={loadAll} />
@@ -414,6 +460,18 @@
       toggleSection={() => toggleSection('export')}
       onReload={loadAll}
     />
+
+    <BinaryUpgradeTab
+      expanded={expandedSections.binary_upgrade}
+      toggleSection={() => toggleSection('binary_upgrade')}
+    />
+
+    {#if $isSuperAdmin}
+      <UsersAccessTab
+        expanded={expandedSections.users_access}
+        toggleSection={() => toggleSection('users_access')}
+      />
+    {/if}
   {/if}
 </div>
 

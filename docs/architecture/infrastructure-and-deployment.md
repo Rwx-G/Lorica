@@ -10,8 +10,8 @@
 
 **Deployment Approach:**
 1. Primary: `.deb` package via apt repository
-2. Secondary: Static binary download from GitHub releases
-3. Future: Docker image, RPM package
+2. Secondary: `.rpm` package (Fedora/RHEL) and static binary download from GitHub releases
+3. Also shipped: Docker image (`Dockerfile`)
 
 **Infrastructure Changes:**
 - systemd service file (`lorica.service`) with security hardening directives

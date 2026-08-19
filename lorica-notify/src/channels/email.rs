@@ -46,7 +46,42 @@ fn default_port_for(enc: SmtpEncryption) -> u16 {
 /// `smtp_username` and `smtp_password` are provided. Returns
 /// [`NotifyError::Email`] on address parse failures, transport setup
 /// errors, or SMTP send failures.
+///
+/// Records exactly one `lorica_notification_dispatch_total{channel="email"}`
+/// sample per call via [`email_outcome`].
 pub async fn send(config: &EmailConfig, event: &AlertEvent) -> Result<(), NotifyError> {
+    let result = send_message(config, event).await;
+    crate::metrics::record_notification_dispatch("email", email_outcome(&result));
+    result
+}
+
+/// Map an SMTP send result to a `lorica_notification_dispatch_total`
+/// outcome label.
+///
+/// SMTP carries no HTTP status, so the `http_4xx` / `http_5xx` buckets
+/// never apply here. `Ok` -> `ok`. For an error the message is the only
+/// signal: lettre renders connection / IO timeouts with "timed out", so
+/// a case-insensitive `timed out` / `timeout` match buckets the failure
+/// as `timeout`; every other failure (address parse, TLS / relay setup,
+/// auth rejection, connection refused) -> `connect_failed`.
+fn email_outcome(result: &Result<(), NotifyError>) -> &'static str {
+    match result {
+        Ok(()) => "ok",
+        Err(e) => {
+            let message = e.to_string().to_ascii_lowercase();
+            if message.contains("timed out") || message.contains("timeout") {
+                "timeout"
+            } else {
+                "connect_failed"
+            }
+        }
+    }
+}
+
+/// Build and deliver the SMTP message. Split out from [`send`] so the
+/// dispatch-outcome metric is recorded exactly once regardless of which
+/// `?` early-return fires.
+async fn send_message(config: &EmailConfig, event: &AlertEvent) -> Result<(), NotifyError> {
     let subject = format!(
         "[Lorica Alert] {} - {}",
         event.alert_type.as_str(),
@@ -229,6 +264,21 @@ mod tests {
         let event = AlertEvent::new(AlertType::BackendDown, "test");
         let result = send(&config, &event).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_email_outcome_mapping() {
+        assert_eq!(email_outcome(&Ok(())), "ok");
+        assert_eq!(
+            email_outcome(&Err(NotifyError::Email(
+                "SMTP send failed: connection timed out".into()
+            ))),
+            "timeout"
+        );
+        assert_eq!(
+            email_outcome(&Err(NotifyError::Email("invalid from_address: bad".into()))),
+            "connect_failed"
+        );
     }
 
     #[test]

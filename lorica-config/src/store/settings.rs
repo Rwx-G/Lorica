@@ -65,6 +65,12 @@ impl ConfigStore {
                         ))
                     })?;
                 }
+                "flood_strict_rps" => {
+                    settings.flood_strict_rps = value.parse().unwrap_or(0);
+                }
+                "header_timeout_s" => {
+                    settings.header_timeout_s = value.parse().unwrap_or(10);
+                }
                 "waf_ban_threshold" => {
                     settings.waf_ban_threshold = value.parse().map_err(|e| {
                         ConfigError::Validation(format!("invalid waf_ban_threshold {value:?}: {e}"))
@@ -89,6 +95,13 @@ impl ConfigStore {
                     settings.access_log_retention = value.parse().map_err(|e| {
                         ConfigError::Validation(format!(
                             "invalid access_log_retention {value:?}: {e}"
+                        ))
+                    })?;
+                }
+                "waf_event_retention" => {
+                    settings.waf_event_retention = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!(
+                            "invalid waf_event_retention {value:?}: {e}"
                         ))
                     })?;
                 }
@@ -184,6 +197,71 @@ impl ConfigStore {
                 "health_max_concurrent_probes" => {
                     settings.health_max_concurrent_probes = value.parse().unwrap_or(32);
                 }
+                "ai_bot_treat_spoofed_as" => {
+                    // Story 8.2 AC #3. Lowercase serde tag matching
+                    // SpoofedFallback's `rename_all = "lowercase"`.
+                    // Unrecognised value silently degrades to the
+                    // default (Deny) - the API boundary already
+                    // validates via serde-derive parsing on
+                    // update_settings, so a foreign value at this
+                    // point indicates a hand-edited DB row.
+                    settings.ai_bot_treat_spoofed_as = match value.as_str() {
+                        "deny" => SpoofedFallback::Deny,
+                        "log" => SpoofedFallback::Log,
+                        "allow" => SpoofedFallback::Allow,
+                        _ => SpoofedFallback::default(),
+                    };
+                }
+                "ai_bot_inject_headers" => {
+                    settings.ai_bot_inject_headers = value == "true" || value == "1";
+                }
+                "upgrade_signing_pubkey_path" => {
+                    settings.upgrade_signing_pubkey_path =
+                        if value.is_empty() { None } else { Some(value) };
+                }
+                "password_min_length" => {
+                    settings.password_min_length = value.parse().unwrap_or(14);
+                }
+                "password_require_complexity" => {
+                    settings.password_require_complexity = value == "true" || value == "1";
+                }
+                "audit_log_retention_days" => {
+                    settings.audit_log_retention_days = value.parse().unwrap_or(90);
+                }
+                "connection_limits_per_ip" => {
+                    settings.connection_limits_per_ip = if value.is_empty() {
+                        None
+                    } else {
+                        value.parse().ok().filter(|v| *v > 0)
+                    };
+                }
+                "bot_stash_max_entries" => {
+                    settings.bot_stash_max_entries = value.parse().unwrap_or(10_000);
+                }
+                "bot_stash_per_prefix_max" => {
+                    settings.bot_stash_per_prefix_max = value.parse().unwrap_or(100);
+                }
+                "mirror_max_concurrent_per_route" => {
+                    settings.mirror_max_concurrent_per_route = value.parse().unwrap_or(32);
+                }
+                "mirror_max_concurrent_global" => {
+                    settings.mirror_max_concurrent_global = value.parse().unwrap_or(4096);
+                }
+                "metrics_require_auth" => {
+                    settings.metrics_require_auth = value == "true" || value == "1";
+                }
+                "prometheus_scrape_token" => {
+                    settings.prometheus_scrape_token =
+                        if value.is_empty() { None } else { Some(value) };
+                }
+                "management_cert_pem_path" => {
+                    settings.management_cert_pem_path =
+                        if value.is_empty() { None } else { Some(value) };
+                }
+                "management_key_pem_path" => {
+                    settings.management_key_pem_path =
+                        if value.is_empty() { None } else { Some(value) };
+                }
                 _ => {}
             }
         }
@@ -229,6 +307,14 @@ impl ConfigStore {
             params![settings.flood_threshold_rps.to_string()],
         )?;
         self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('flood_strict_rps', ?1)",
+            params![settings.flood_strict_rps.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('header_timeout_s', ?1)",
+            params![settings.header_timeout_s.to_string()],
+        )?;
+        self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_ban_threshold', ?1)",
             params![settings.waf_ban_threshold.to_string()],
         )?;
@@ -247,6 +333,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('access_log_retention', ?1)",
             params![settings.access_log_retention.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_event_retention', ?1)",
+            params![settings.waf_event_retention.to_string()],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('sla_purge_enabled', ?1)",
@@ -368,6 +458,80 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_export_dir_mode', ?1)",
             params![settings.cert_export_dir_mode.to_string()],
+        )?;
+        // Story 8.2 AC #3 + AC #11. Lowercase enum tag matches the
+        // serde `rename_all = "lowercase"` shape, so the round-trip
+        // through `get_global_settings` re-installs the same value.
+        let spoofed_str: &'static str = match settings.ai_bot_treat_spoofed_as {
+            SpoofedFallback::Deny => "deny",
+            SpoofedFallback::Log => "log",
+            SpoofedFallback::Allow => "allow",
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('ai_bot_treat_spoofed_as', ?1)",
+            params![spoofed_str],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('ai_bot_inject_headers', ?1)",
+            params![settings.ai_bot_inject_headers.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('upgrade_signing_pubkey_path', ?1)",
+            params![settings
+                .upgrade_signing_pubkey_path
+                .as_deref()
+                .unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('password_min_length', ?1)",
+            params![settings.password_min_length.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('password_require_complexity', ?1)",
+            params![settings.password_require_complexity.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('audit_log_retention_days', ?1)",
+            params![settings.audit_log_retention_days.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('connection_limits_per_ip', ?1)",
+            params![settings
+                .connection_limits_per_ip
+                .map(|v| v.to_string())
+                .unwrap_or_default()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('bot_stash_max_entries', ?1)",
+            params![settings.bot_stash_max_entries.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('bot_stash_per_prefix_max', ?1)",
+            params![settings.bot_stash_per_prefix_max.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('mirror_max_concurrent_per_route', ?1)",
+            params![settings.mirror_max_concurrent_per_route.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('mirror_max_concurrent_global', ?1)",
+            params![settings.mirror_max_concurrent_global.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('metrics_require_auth', ?1)",
+            params![settings.metrics_require_auth.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('prometheus_scrape_token', ?1)",
+            params![settings.prometheus_scrape_token.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('management_cert_pem_path', ?1)",
+            params![settings.management_cert_pem_path.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('management_key_pem_path', ?1)",
+            params![settings.management_key_pem_path.as_deref().unwrap_or("")],
         )?;
         Ok(())
     }

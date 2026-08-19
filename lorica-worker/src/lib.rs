@@ -22,7 +22,13 @@
 #![cfg(unix)]
 
 pub mod fd_passing;
+pub mod hot_upgrade;
 pub mod manager;
+
+/// Re-export the process identifier type so callers (e.g. the `lorica`
+/// binary's hot-upgrade orchestration) can hold a child PID returned by
+/// [`hot_upgrade::fork_exec`] without taking a direct `nix` dependency.
+pub use nix::unistd::Pid;
 
 /// Errors from the worker isolation subsystem.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +62,12 @@ pub enum WorkerError {
 
     #[error("execv failed: {0}")]
     Exec(nix::Error),
+
+    #[error("failed to duplicate file descriptor: {0}")]
+    DupFd(nix::Error),
+
+    #[error("exec argument contained an interior NUL byte")]
+    InvalidExecArg,
 
     #[error("failed to get current executable path: {0}")]
     CurrentExe(std::io::Error),

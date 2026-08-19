@@ -21,6 +21,11 @@ mkdir -p "$PKG_DIR/usr/bin"
 mkdir -p "$PKG_DIR/lib/systemd/system"
 mkdir -p "$PKG_DIR/usr/share/doc/lorica"
 mkdir -p "$PKG_DIR/var/lib/lorica"
+# The hot-upgrade staging zone /var/lib/lorica/upgrade (Story 8.4) is
+# created 0700 at runtime by the upgrade endpoint - do NOT pre-create it
+# here. No signing key is bundled either: the Ed25519 public key is
+# operator-managed (the operator sets `upgrade_signing_pubkey_path`, e.g.
+# to /etc/lorica/upgrade-signing.pub). See docs/hot-upgrade.md.
 
 # Copy binary
 cp "$BINARY" "$PKG_DIR/usr/bin/lorica"
@@ -113,8 +118,9 @@ echo ""
 echo "  ================================================"
 echo "  Lorica installed successfully!"
 echo "  "
-echo "  Dashboard: http://127.0.0.1:9443"
-echo "    (listens on localhost only - not reachable"
+echo "  Dashboard: https://127.0.0.1:9443"
+echo "    (TLS with a self-signed cert - accept the browser"
+echo "     warning; listens on localhost only, not reachable"
 echo "     from other machines)"
 echo "  "
 echo "  The initial admin password is written to a 0600 file:"

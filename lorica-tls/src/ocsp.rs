@@ -13,7 +13,31 @@
 //! This avoids clients having to contact the CA themselves, reducing latency
 //! and improving privacy.
 
+use std::sync::LazyLock;
+use std::time::Duration;
+
 use log::warn;
+
+/// Per-fetch timeout applied to every OCSP responder request.
+const OCSP_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shared HTTP client for OCSP fetches.
+///
+/// Hoisted to a process-wide `LazyLock` (Story 8.5 AC #1) so the
+/// background refresh loop and the reload path reuse one connection
+/// pool instead of building a fresh `reqwest::Client` on every staple
+/// fetch - mirrors the `HEALTH_HTTP_CLIENT` precedent in
+/// `lorica/src/health.rs`. Redirect following stays disabled: the
+/// responder URL comes from the certificate AIA extension, which an
+/// attacker-issued chain controls, so a 3xx must not steer the fetch
+/// into an internal service (`http://169.254.169.254/`). Audit L-7.
+static OCSP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(OCSP_FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build OCSP reqwest client (static config is infallible)")
+});
 
 /// Extract the OCSP responder URL from a PEM-encoded certificate chain.
 ///
@@ -85,17 +109,10 @@ pub async fn fetch_ocsp_response(cert_pem: &str, responder_url: &str) -> Result<
     let cert_id = build_cert_id(issuer_name_hash.as_ref(), issuer_key_hash.as_ref(), serial);
     let ocsp_request = build_ocsp_request(&cert_id);
 
-    // POST to OCSP responder. The responder URL comes from the cert
-    // AIA extension, which an attacker-issued chain controls. Disable
-    // redirect following so we don't get steered into an internal
-    // service (`http://169.254.169.254/`). Audit L-7.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("HTTP client: {e}"))?;
-
-    let resp = client
+    // POST to OCSP responder using the shared `OCSP_CLIENT` (timeout +
+    // redirect policy baked into the static builder - see the client
+    // doc comment for the AIA-controlled-URL / audit L-7 rationale).
+    let resp = OCSP_CLIENT
         .post(responder_url)
         .header("Content-Type", "application/ocsp-request")
         .body(ocsp_request)

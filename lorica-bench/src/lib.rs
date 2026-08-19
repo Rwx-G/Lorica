@@ -3,6 +3,7 @@
 
 pub mod active_probes;
 pub mod load_test;
+pub mod metrics;
 pub mod passive_sla;
 pub mod results;
 pub mod scheduler;

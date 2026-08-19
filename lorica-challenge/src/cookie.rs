@@ -49,6 +49,7 @@
 //!   with a drifting clock does not lose its cookie mid-session.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -225,7 +226,7 @@ fn hmac_tag(secret: &[u8; 32], bytes: &[u8]) -> [u8; TAG_LEN] {
     // `Hmac::new_from_slice` only errors on key length issues,
     // which is impossible here since the key type is fixed-size.
     let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
+        <Hmac<Sha256> as KeyInit>::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
     mac.update(bytes);
     let full = mac.finalize().into_bytes();
     let mut out = [0u8; TAG_LEN];

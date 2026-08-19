@@ -179,6 +179,17 @@ if [ -n "$SESSION" ]; then
     assert_json "$FLOOD" ".data.flood_threshold_rps" "5000" "Flood threshold updated to 5000"
     api_put "/api/v1/settings" '{"flood_threshold_rps":0}' >/dev/null
 
+    # Cross-field validation (backlog #48): the merged settings reject an
+    # inverted cert-day pair and a strict flood cap that is not tighter than
+    # the threshold, while still accepting the "auto" strict value (0).
+    assert_status PUT "$API/api/v1/settings" 400 "cert_warning <= cert_critical rejected" \
+        -H "Content-Type: application/json" -d '{"cert_warning_days":3,"cert_critical_days":7}'
+    assert_status PUT "$API/api/v1/settings" 400 "flood_strict >= flood_threshold rejected" \
+        -H "Content-Type: application/json" -d '{"flood_threshold_rps":100,"flood_strict_rps":100}'
+    assert_status PUT "$API/api/v1/settings" 200 "flood_strict=0 (auto) accepted" \
+        -H "Content-Type: application/json" -d '{"flood_threshold_rps":100,"flood_strict_rps":0}'
+    api_put "/api/v1/settings" '{"flood_threshold_rps":0,"flood_strict_rps":0}' >/dev/null
+
 # =============================================================================
 # 4. API - BACKENDS CRUD
 # =============================================================================
@@ -616,20 +627,31 @@ if [ -n "$SESSION" ]; then
 # =============================================================================
     log "=== 14. Health Checks ==="
 
-    # Wait for health check cycle
-    sleep 12
+    # A flip to "healthy" needs several consecutive successful probes at the
+    # default interval, so the wait runs into tens of seconds and shifts with
+    # machine speed. The old fixed `sleep 12` raced the probe cadence and
+    # flaked on CI ("got unknown"); poll instead, breaking out as soon as the
+    # status lands.
+    wait_backend_health() {
+        local id="$1" want="$2" out="unknown" i
+        for i in $(seq 1 30); do
+            out=$(api_get "/api/v1/backends/$id" | jq -r '.data.health_status' 2>/dev/null || echo "unknown")
+            if [ "$out" = "$want" ]; then
+                break
+            fi
+            sleep 3
+        done
+        echo "$out"
+    }
 
-    # Check backend health status
-    B1_STATUS=$(api_get "/api/v1/backends/$B1_ID")
-    B1_HEALTH=$(echo "$B1_STATUS" | jq -r '.data.health_status' 2>/dev/null || echo "unknown")
+    B1_HEALTH=$(wait_backend_health "$B1_ID" healthy)
     if [ "$B1_HEALTH" = "healthy" ]; then
         ok "Backend 1 is healthy"
     else
         fail "Backend 1 should be healthy (got $B1_HEALTH)"
     fi
 
-    B2_STATUS=$(api_get "/api/v1/backends/$B2_ID")
-    B2_HEALTH=$(echo "$B2_STATUS" | jq -r '.data.health_status' 2>/dev/null || echo "unknown")
+    B2_HEALTH=$(wait_backend_health "$B2_ID" healthy)
     if [ "$B2_HEALTH" = "healthy" ]; then
         ok "Backend 2 is healthy"
     else
@@ -766,13 +788,15 @@ if [ -n "$SESSION" ]; then
     FO_ROUTE_ID=$(echo "$FO_ROUTE" | jq -r '.data.id')
     ok "Failover route created with 1 dead + 1 healthy backend"
 
-    # Wait for the health check to mark the dead backend down. Since
-    # v1.5.8 a status flip needs HEALTH_FLIP_THRESHOLD (3) consecutive
-    # probes at the default 10s interval, so detection takes up to
-    # ~30s depending on probe phase; poll instead of a fixed sleep.
+    # Wait for the health check to mark the dead backend down. A status
+    # flip needs HEALTH_FLIP_THRESHOLD (3) consecutive failed probes, and
+    # each probe to the non-routable TEST-NET address must exhaust its
+    # connect timeout, so the total can run past a minute depending on the
+    # probe phase. Poll generously (up to 90s) instead of a fixed sleep;
+    # the early break keeps a fast flip from wasting time.
     log "    Waiting for health check to detect dead backend..."
     DEAD_HEALTH="unknown"
-    for i in $(seq 1 15); do
+    for i in $(seq 1 30); do
         DEAD_STATUS=$(api_get "/api/v1/backends/$DEAD_B_ID")
         DEAD_HEALTH=$(echo "$DEAD_STATUS" | jq -r '.data.health_status' 2>/dev/null || echo "unknown")
         if [ "$DEAD_HEALTH" = "down" ]; then
@@ -910,6 +934,26 @@ if [ -n "$SESSION" ]; then
     else
         fail "Metrics should have labeled request counters"
     fi
+
+    # Story 8.8: /metrics auth gating. With metrics_require_auth on, an
+    # unauthenticated scrape is 401 and only a correct bearer token (or a
+    # dashboard session) is 200. Reset to the default (open) afterwards so
+    # the rest of the suite keeps scraping without auth. The middleware
+    # caches the auth settings for 5s (AUTH_CACHE_TTL), so both the enable
+    # and the reset need a >5s settle before the new state is observable.
+    api_put "/api/v1/settings" '{"metrics_require_auth":true,"prometheus_scrape_token":"e2e-scrape-token"}' >/dev/null
+    sleep 6
+    GATED_NOAUTH=$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics" 2>/dev/null || true)
+    [ "$GATED_NOAUTH" = "401" ] && ok "gated /metrics rejects an unauthenticated scrape (401)" \
+        || fail "gated /metrics should be 401 without auth (got $GATED_NOAUTH)"
+    GATED_BADTOK=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer wrong-token" "$API/metrics" 2>/dev/null || true)
+    [ "$GATED_BADTOK" = "401" ] && ok "gated /metrics rejects a wrong bearer token (401)" \
+        || fail "gated /metrics should be 401 with a wrong token (got $GATED_BADTOK)"
+    GATED_OK=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer e2e-scrape-token" "$API/metrics" 2>/dev/null || true)
+    [ "$GATED_OK" = "200" ] && ok "gated /metrics accepts the correct bearer token (200)" \
+        || fail "gated /metrics should be 200 with the correct token (got $GATED_OK)"
+    api_put "/api/v1/settings" '{"metrics_require_auth":false,"prometheus_scrape_token":""}' >/dev/null
+    sleep 6
 
 # =============================================================================
 # 20. PEAK EWMA LOAD BALANCING (Epic 4)

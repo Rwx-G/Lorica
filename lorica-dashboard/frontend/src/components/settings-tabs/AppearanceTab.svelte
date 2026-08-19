@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { canWrite } from '../../lib/auth';
+
   interface Props {
     theme: 'dark' | 'light';
     expanded: boolean;
@@ -17,11 +19,13 @@
   {#if expanded}
     <div class="settings-section-body">
       <p class="settings-hint">Current theme: {theme}.</p>
-      <div class="settings-dialog-actions">
-        <button class="btn btn-secondary" onclick={onToggleTheme}>
-          {theme === 'dark' ? 'Switch to Light' : 'Switch to Dark'}
-        </button>
-      </div>
+      {#if $canWrite}
+        <div class="settings-dialog-actions">
+          <button class="btn btn-secondary" onclick={onToggleTheme}>
+            {theme === 'dark' ? 'Switch to Light' : 'Switch to Dark'}
+          </button>
+        </div>
+      {/if}
     </div>
   {/if}
 </section>

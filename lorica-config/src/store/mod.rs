@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::crypto::EncryptionKey;
 use crate::error::{ConfigError, Result};
 
+mod ai_crawlers;
 mod backends;
 pub mod bot_stash;
 mod cert_export_acls;
@@ -80,6 +81,424 @@ const MIGRATION_V15: &str = include_str!("../migrations/015_probe_results.sql");
 const MIGRATION_V16: &str = include_str!("../migrations/016_backend_tls_skip_verify.sql");
 const MIGRATION_V17: &str = include_str!("../migrations/017_acme_method.sql");
 const MIGRATION_V19: &str = include_str!("../migrations/019_sessions.sql");
+
+/// A single tracked schema migration: its version and the function
+/// that applies it. Entries live in [`MIGRATIONS`], ascending.
+type Migration = (i64, fn(&Connection) -> rusqlite::Result<()>);
+
+/// Every schema migration, in ascending version order.
+/// [`ConfigStore::run_migrations`] applies each entry whose version is
+/// greater than the highest recorded in `schema_migrations`, then
+/// records that version.
+///
+/// Versions 1-22 map to the historical gates: the numbered `.sql`
+/// batches, a few inline column additions, and the RBAC backfill at
+/// 22. Versions 23+ were previously *unconditional* idempotent
+/// `ALTER TABLE ... ADD COLUMN` statements re-run on every open. They
+/// now each carry a distinct version and an idempotent body.
+///
+/// This split matters for databases already deployed in the field. An
+/// installation that ran the old code sits at recorded version 22 yet
+/// already has every post-22 column, because those unconditional
+/// ALTERs added them on every startup regardless of the recorded
+/// version. Re-issuing a bare `ALTER TABLE ADD COLUMN` for such a
+/// column raises "duplicate column name" and aborts the upgrade;
+/// [`add_column_if_absent`] makes each body skip the column it already
+/// finds and merely advance the version. The `.sql` batch migrations
+/// (1-16, 19, 21) keep their exact original version gating: the
+/// columns they add were only ever created by that gated path, so a
+/// database below their version never has the column and the bare DDL
+/// inside them stays safe.
+const MIGRATIONS: &[Migration] = &[
+    (1, migrate_initial),
+    (2, migrate_health_check_path),
+    (3, migrate_sla_metrics),
+    (4, migrate_probe_configs),
+    (5, migrate_load_tests),
+    (6, migrate_sla_bucket_snapshot),
+    (7, migrate_route_config),
+    (8, migrate_backend_name_group),
+    (9, migrate_cache_and_protection),
+    (10, migrate_sla_default_range),
+    (11, migrate_backend_h2_upstream),
+    (12, migrate_route_regex_rewrite),
+    (13, migrate_waf_persistence),
+    (14, migrate_backend_tls_sni),
+    (15, migrate_probe_results),
+    (16, migrate_backend_tls_skip_verify),
+    (17, migrate_route_redirect_to),
+    (18, migrate_route_path_rules),
+    (19, migrate_acme_method),
+    (20, migrate_dns_providers),
+    (21, migrate_sessions),
+    (22, migrate_users_rbac),
+    (23, migrate_route_sticky_session),
+    (24, migrate_route_basic_auth),
+    (25, migrate_route_stale_cache),
+    (26, migrate_route_retry_on_methods),
+    (27, migrate_route_maintenance),
+    (28, migrate_route_cache_vary_headers),
+    (29, migrate_route_header_rules),
+    (30, migrate_route_traffic_splits),
+    (31, migrate_route_forward_auth),
+    (32, migrate_route_mirror),
+    (33, migrate_route_response_rewrite),
+    (34, migrate_route_mtls),
+    (35, migrate_session_indexes),
+    (36, migrate_route_rate_limit),
+    (37, migrate_route_geoip),
+    (38, migrate_route_bot_protection),
+    (39, migrate_bot_pending_challenges),
+    (40, migrate_route_group_name),
+    (41, migrate_cert_export_acls),
+    (42, migrate_route_ai_bot_policy),
+    (43, migrate_ai_crawlers_custom),
+    (44, migrate_route_serve_robots_txt),
+    (45, migrate_bot_pending_prefix_index),
+    (46, migrate_session_role),
+];
+
+/// Whether `column` already exists on `table`, via `pragma_table_info`.
+/// Returns `false` when the table itself is absent (the pragma yields
+/// no rows), matching the pre-refactor behaviour of the inline guards.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Add `column` to `table` with the given column definition, but only
+/// when it is absent. Field databases upgraded from the pre-tracked
+/// runner already carry these columns (the old code added them
+/// unconditionally on every open), so a bare `ALTER TABLE ADD COLUMN`
+/// would fail with "duplicate column name". Guarding on
+/// `pragma_table_info` keeps each migration idempotent. `table` and
+/// `column` are compile-time constants from this module, never
+/// caller-supplied, so interpolating them into the DDL is safe.
+fn add_column_if_absent(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    coldef_ddl: &str,
+) -> rusqlite::Result<()> {
+    if !column_exists(conn, table, column)? {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {coldef_ddl}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_initial(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V1)
+}
+
+fn migrate_health_check_path(conn: &Connection) -> rusqlite::Result<()> {
+    if !column_exists(conn, "backends", "health_check_path")? {
+        conn.execute_batch(MIGRATION_V2)?;
+    }
+    Ok(())
+}
+
+fn migrate_sla_metrics(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V3)
+}
+
+fn migrate_probe_configs(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V4)
+}
+
+fn migrate_load_tests(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V5)
+}
+
+fn migrate_sla_bucket_snapshot(conn: &Connection) -> rusqlite::Result<()> {
+    if !column_exists(conn, "sla_buckets", "cfg_max_latency_ms")? {
+        conn.execute_batch(MIGRATION_V6)?;
+    }
+    Ok(())
+}
+
+fn migrate_route_config(conn: &Connection) -> rusqlite::Result<()> {
+    if !column_exists(conn, "routes", "force_https")? {
+        conn.execute_batch(MIGRATION_V7)?;
+    }
+    Ok(())
+}
+
+fn migrate_backend_name_group(conn: &Connection) -> rusqlite::Result<()> {
+    if !column_exists(conn, "backends", "name")? {
+        conn.execute_batch(MIGRATION_V8)?;
+    }
+    Ok(())
+}
+
+fn migrate_cache_and_protection(conn: &Connection) -> rusqlite::Result<()> {
+    if !column_exists(conn, "routes", "cache_enabled")? {
+        conn.execute_batch(MIGRATION_V9)?;
+    }
+    Ok(())
+}
+
+fn migrate_sla_default_range(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V10)
+}
+
+fn migrate_backend_h2_upstream(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V11)
+}
+
+fn migrate_route_regex_rewrite(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V12)
+}
+
+fn migrate_waf_persistence(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V13)
+}
+
+fn migrate_backend_tls_sni(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V14)
+}
+
+fn migrate_probe_results(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V15)
+}
+
+fn migrate_backend_tls_skip_verify(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V16)
+}
+
+fn migrate_route_redirect_to(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "redirect_to", "TEXT DEFAULT NULL")
+}
+
+/// Version 18: the `path_rules` / `return_status` columns were
+/// historically added inline (no `.sql` file numbered 018 exists);
+/// they are slotted here as a tracked, idempotent entry so the version
+/// sequence has no gap.
+fn migrate_route_path_rules(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "path_rules", "TEXT DEFAULT '[]'")?;
+    add_column_if_absent(conn, "routes", "return_status", "INTEGER DEFAULT NULL")
+}
+
+fn migrate_acme_method(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V17)
+}
+
+fn migrate_dns_providers(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dns_providers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            provider_type TEXT NOT NULL,
+            config TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )?;
+    add_column_if_absent(
+        conn,
+        "certificates",
+        "acme_dns_provider_id",
+        "TEXT DEFAULT NULL",
+    )
+}
+
+fn migrate_sessions(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(MIGRATION_V19)
+}
+
+/// Version 22: the `users` table replaces `admin_users` (Story 8.3
+/// RBAC). This carries a one-time data backfill (the single pre-RBAC
+/// admin row migrates as role `super_admin`), which is why it cannot
+/// be an idempotent ALTER: the backfill must run exactly once. The
+/// backfill and drop only run while `admin_users` still exists, so a
+/// process that loses the concurrent-open race skips them cleanly.
+fn migrate_users_rbac(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'super_admin',
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_login_at TEXT,
+            disabled_at TEXT,
+            created_by TEXT
+        );",
+    )?;
+    let has_admin_users: bool = conn
+        .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='admin_users'")?
+        .query_row([], |row| row.get::<_, i64>(0))
+        .map(|c| c > 0)?;
+    if has_admin_users {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO users
+                (id, username, password_hash, role, must_change_password,
+                 created_at, last_login_at)
+             SELECT id, username, password_hash, 'super_admin',
+                    must_change_password, created_at, last_login
+             FROM admin_users;
+             DROP TABLE admin_users;",
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_route_sticky_session(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "sticky_session", "INTEGER NOT NULL DEFAULT 0")
+}
+
+fn migrate_route_basic_auth(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "basic_auth_username", "TEXT DEFAULT NULL")?;
+    add_column_if_absent(
+        conn,
+        "routes",
+        "basic_auth_password_hash",
+        "TEXT DEFAULT NULL",
+    )
+}
+
+fn migrate_route_stale_cache(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "routes",
+        "stale_while_revalidate_s",
+        "INTEGER NOT NULL DEFAULT 10",
+    )?;
+    add_column_if_absent(conn, "routes", "stale_if_error_s", "INTEGER NOT NULL DEFAULT 60")
+}
+
+fn migrate_route_retry_on_methods(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "retry_on_methods", "TEXT NOT NULL DEFAULT '[]'")
+}
+
+fn migrate_route_maintenance(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "maintenance_mode", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_absent(conn, "routes", "error_page_html", "TEXT DEFAULT NULL")
+}
+
+fn migrate_route_cache_vary_headers(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "cache_vary_headers", "TEXT NOT NULL DEFAULT '[]'")
+}
+
+fn migrate_route_header_rules(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "header_rules", "TEXT NOT NULL DEFAULT '[]'")
+}
+
+fn migrate_route_traffic_splits(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "traffic_splits", "TEXT NOT NULL DEFAULT '[]'")
+}
+
+fn migrate_route_forward_auth(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "forward_auth", "TEXT DEFAULT NULL")
+}
+
+fn migrate_route_mirror(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "mirror", "TEXT DEFAULT NULL")
+}
+
+fn migrate_route_response_rewrite(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "response_rewrite", "TEXT DEFAULT NULL")
+}
+
+fn migrate_route_mtls(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "mtls", "TEXT DEFAULT NULL")
+}
+
+fn migrate_session_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+         CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);",
+    )
+}
+
+fn migrate_route_rate_limit(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "rate_limit", "TEXT DEFAULT NULL")
+}
+
+fn migrate_route_geoip(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "geoip", "TEXT DEFAULT NULL")
+}
+
+fn migrate_route_bot_protection(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "bot_protection", "TEXT DEFAULT NULL")
+}
+
+fn migrate_bot_pending_challenges(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS bot_pending_challenges (
+            nonce TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            mode INTEGER NOT NULL,
+            route_id TEXT NOT NULL,
+            ip_prefix_disc INTEGER NOT NULL,
+            ip_prefix_bytes BLOB NOT NULL,
+            return_url TEXT NOT NULL,
+            cookie_ttl_s INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            png_bytes BLOB
+        );
+         CREATE INDEX IF NOT EXISTS idx_bot_pending_expires_at
+            ON bot_pending_challenges(expires_at);",
+    )
+}
+
+fn migrate_route_group_name(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "group_name", "TEXT NOT NULL DEFAULT ''")
+}
+
+fn migrate_cert_export_acls(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cert_export_acls (
+            id TEXT PRIMARY KEY,
+            hostname_pattern TEXT NOT NULL,
+            allowed_uid INTEGER,
+            allowed_gid INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )
+}
+
+fn migrate_route_ai_bot_policy(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "ai_bot_policy", "TEXT DEFAULT NULL")?;
+    add_column_if_absent(conn, "routes", "ai_bot_spoofed_fallback", "TEXT DEFAULT NULL")
+}
+
+fn migrate_ai_crawlers_custom(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ai_crawlers_custom (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            user_agent_pattern TEXT NOT NULL,
+            verification_kind TEXT NOT NULL,
+            verification_data TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+    )
+}
+
+fn migrate_route_serve_robots_txt(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "serve_robots_txt", "INTEGER NOT NULL DEFAULT 0")
+}
+
+fn migrate_bot_pending_prefix_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_bot_pending_prefix
+         ON bot_pending_challenges(ip_prefix_disc, ip_prefix_bytes);",
+    )
+}
+
+fn migrate_session_role(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "sessions", "role", "TEXT NOT NULL DEFAULT 'super_admin'")
+}
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -181,7 +600,7 @@ impl ConfigStore {
     }
 
     fn run_migrations(&self) -> Result<()> {
-        // Ensure schema_migrations table exists before querying it
+        // Ensure schema_migrations table exists before querying it.
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
@@ -195,469 +614,16 @@ impl ConfigStore {
             |row| row.get(0),
         )?;
 
-        if current_version < 1 {
-            tracing::info!("applying migration 001_initial");
-            self.conn.execute_batch(MIGRATION_V1)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![1],
-            )?;
-        }
-
-        if current_version < 2 {
-            // Check if column already exists (another process may have added it)
-            let has_column: bool = self
-                .conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('backends') WHERE name='health_check_path'")?
-                .query_row([], |row| row.get::<_, i64>(0))
-                .map(|c| c > 0)?;
-
-            if !has_column {
-                tracing::info!("applying migration 002_add_health_check_path");
-                self.conn.execute_batch(MIGRATION_V2)?;
+        for &(version, migrate) in MIGRATIONS {
+            if version > current_version {
+                tracing::info!("applying schema migration v{version}");
+                migrate(&self.conn)?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                    params![version],
+                )?;
             }
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![2],
-            )?;
         }
-
-        if current_version < 3 {
-            tracing::info!("applying migration 003_sla_metrics");
-            self.conn.execute_batch(MIGRATION_V3)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![3],
-            )?;
-        }
-
-        if current_version < 4 {
-            tracing::info!("applying migration 004_probe_configs");
-            self.conn.execute_batch(MIGRATION_V4)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![4],
-            )?;
-        }
-
-        if current_version < 5 {
-            tracing::info!("applying migration 005_load_tests");
-            self.conn.execute_batch(MIGRATION_V5)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![5],
-            )?;
-        }
-
-        if current_version < 6 {
-            let has_column: bool = self
-                .conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('sla_buckets') WHERE name='cfg_max_latency_ms'")?
-                .query_row([], |row| row.get::<_, i64>(0))
-                .map(|c| c > 0)?;
-
-            if !has_column {
-                tracing::info!("applying migration 006_sla_bucket_config_snapshot");
-                self.conn.execute_batch(MIGRATION_V6)?;
-            }
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![6],
-            )?;
-        }
-
-        if current_version < 7 {
-            let has_column: bool = self
-                .conn
-                .prepare(
-                    "SELECT COUNT(*) FROM pragma_table_info('routes') WHERE name='force_https'",
-                )?
-                .query_row([], |row| row.get::<_, i64>(0))
-                .map(|c| c > 0)?;
-
-            if !has_column {
-                tracing::info!("applying migration 007_route_config");
-                self.conn.execute_batch(MIGRATION_V7)?;
-            }
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![7],
-            )?;
-        }
-
-        if current_version < 8 {
-            let has_column: bool = self
-                .conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('backends') WHERE name='name'")?
-                .query_row([], |row| row.get::<_, i64>(0))
-                .map(|c| c > 0)?;
-
-            if !has_column {
-                tracing::info!("applying migration 008_backend_name_group");
-                self.conn.execute_batch(MIGRATION_V8)?;
-            }
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![8],
-            )?;
-        }
-
-        if current_version < 9 {
-            let has_column: bool = self
-                .conn
-                .prepare(
-                    "SELECT COUNT(*) FROM pragma_table_info('routes') WHERE name='cache_enabled'",
-                )?
-                .query_row([], |row| row.get::<_, i64>(0))
-                .map(|c| c > 0)?;
-
-            if !has_column {
-                tracing::info!("applying migration 009_cache_and_protection");
-                self.conn.execute_batch(MIGRATION_V9)?;
-            }
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![9],
-            )?;
-        }
-
-        if current_version < 10 {
-            tracing::info!("applying migration 010_sla_default_range");
-            self.conn.execute_batch(MIGRATION_V10)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![10],
-            )?;
-        }
-
-        if current_version < 11 {
-            tracing::info!("applying migration 011_backend_h2_upstream");
-            self.conn.execute_batch(MIGRATION_V11)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![11],
-            )?;
-        }
-
-        if current_version < 12 {
-            tracing::info!("applying migration 012_route_regex_rewrite");
-            self.conn.execute_batch(MIGRATION_V12)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![12],
-            )?;
-        }
-
-        if current_version < 13 {
-            tracing::info!("applying migration 013_waf_persistence");
-            self.conn.execute_batch(MIGRATION_V13)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![13],
-            )?;
-        }
-
-        if current_version < 14 {
-            tracing::info!("applying migration 014_backend_tls_sni");
-            self.conn.execute_batch(MIGRATION_V14)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![14],
-            )?;
-        }
-
-        if current_version < 15 {
-            tracing::info!("applying migration 015_probe_results");
-            self.conn.execute_batch(MIGRATION_V15)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![15],
-            )?;
-        }
-
-        if current_version < 16 {
-            tracing::info!("applying migration 016_backend_tls_skip_verify");
-            self.conn.execute_batch(MIGRATION_V16)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![16],
-            )?;
-        }
-
-        if current_version < 17 {
-            if let Err(e) = self.conn.execute(
-                "ALTER TABLE routes ADD COLUMN redirect_to TEXT DEFAULT NULL",
-                [],
-            ) {
-                tracing::debug!("redirect_to column may already exist: {e}");
-            }
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![17],
-            )?;
-        }
-
-        if current_version < 18 {
-            let _ = self.conn.execute(
-                "ALTER TABLE routes ADD COLUMN path_rules TEXT DEFAULT '[]'",
-                [],
-            );
-            let _ = self.conn.execute(
-                "ALTER TABLE routes ADD COLUMN return_status INTEGER DEFAULT NULL",
-                [],
-            );
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![18],
-            )?;
-        }
-
-        // Unconditional column additions (idempotent, let _ = ignores "already exists")
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN sticky_session INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-
-        if current_version < 19 {
-            tracing::info!("applying migration 017_acme_method");
-            self.conn.execute_batch(MIGRATION_V17)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![19],
-            )?;
-        }
-
-        if current_version < 20 {
-            tracing::info!("applying migration 018_dns_providers");
-            // Table creation is idempotent; ALTER TABLE may fail if column already exists.
-            self.conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS dns_providers (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
-                    provider_type TEXT NOT NULL,
-                    config TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-                );",
-            )?;
-            if let Err(e) = self.conn.execute(
-                "ALTER TABLE certificates ADD COLUMN acme_dns_provider_id TEXT DEFAULT NULL",
-                [],
-            ) {
-                tracing::debug!("acme_dns_provider_id column may already exist: {e}");
-            }
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![20],
-            )?;
-        }
-
-        if current_version < 21 {
-            tracing::info!("applying migration 019_sessions");
-            self.conn.execute_batch(MIGRATION_V19)?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                params![21],
-            )?;
-        }
-
-        // V22: basic auth per route
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN basic_auth_username TEXT DEFAULT NULL",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN basic_auth_password_hash TEXT DEFAULT NULL",
-            [],
-        );
-
-        // V23: stale cache config per route
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN stale_while_revalidate_s INTEGER NOT NULL DEFAULT 10",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN stale_if_error_s INTEGER NOT NULL DEFAULT 60",
-            [],
-        );
-
-        // V24: retry_on_methods
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN retry_on_methods TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-
-        // V24: maintenance mode + custom error pages
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN maintenance_mode INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN error_page_html TEXT DEFAULT NULL",
-            [],
-        );
-
-        // V25: per-route cache variance headers
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN cache_vary_headers TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-
-        // V26: header-based routing rules (A/B testing, multi-tenant)
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN header_rules TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-
-        // V27: canary traffic splits (percent-based backend diversion)
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN traffic_splits TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-
-        // V28: forward-auth per route (Authelia / Authentik / Keycloak).
-        // Stored as a JSON blob or NULL (feature off by default).
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN forward_auth TEXT DEFAULT NULL",
-            [],
-        );
-
-        // V29: request mirroring (shadow testing). JSON blob or NULL.
-        let _ = self
-            .conn
-            .execute("ALTER TABLE routes ADD COLUMN mirror TEXT DEFAULT NULL", []);
-
-        // V30: response body rewriting (Nginx sub_filter equivalent).
-        // JSON blob or NULL (feature off by default).
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN response_rewrite TEXT DEFAULT NULL",
-            [],
-        );
-
-        // V31: mTLS client verification (per-route CA + required flag +
-        // org allowlist). JSON blob or NULL.
-        let _ = self
-            .conn
-            .execute("ALTER TABLE routes ADD COLUMN mtls TEXT DEFAULT NULL", []);
-
-        // V32: indexes on sessions(expires_at) and sessions(user_id).
-        // The session GC scans expired rows on every tick and the
-        // password-change flow deletes sessions for one user; both
-        // queries were full-table scans before this index. CREATE
-        // INDEX IF NOT EXISTS is idempotent so the migration is safe
-        // to re-run.
-        let _ = self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)",
-            [],
-        );
-        let _ = self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
-            [],
-        );
-
-        // V33: per-route token-bucket rate limit (WPAR-1 / Phase 3d).
-        // JSON blob or NULL (feature off by default). Schema:
-        //   { "capacity": u32, "refill_per_sec": u32,
-        //     "scope": "per_ip" | "per_route" }
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN rate_limit TEXT DEFAULT NULL",
-            [],
-        );
-
-        // V34: per-route GeoIP country filter (v1.4.0 Epic 2 story 2.2).
-        // JSON blob or NULL (feature off by default). Schema:
-        //   { "mode": "allowlist" | "denylist",
-        //     "countries": ["FR", "DE", ...] }
-        // The supervisor's shared-memory `.mmdb` reader (loaded from
-        // `GlobalSettings.geoip_db_path`) is the lookup source; a NULL
-        // column skips the GeoIP check entirely for that route.
-        let _ = self
-            .conn
-            .execute("ALTER TABLE routes ADD COLUMN geoip TEXT DEFAULT NULL", []);
-
-        // V35: per-route bot-protection challenge (v1.4.0 Epic 3
-        // story 3.3). JSON blob or NULL (feature off by default).
-        // Schema: serde-serialised `BotProtectionConfig` with mode,
-        // cookie_ttl_s, pow_difficulty, captcha_alphabet, bypass
-        // (ip_cidrs / asns / countries / user_agents / rdns), and
-        // only_country. NULL column = request_filter skips the
-        // bot-protection stage for this route.
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN bot_protection TEXT DEFAULT NULL",
-            [],
-        );
-
-        // V36: cross-worker bot-protection pending-challenge stash
-        // (v1.4.0 Epic 3 follow-up closing the per-worker-stash
-        // deferred item). Each row = one pending PoW or captcha
-        // challenge waiting for the client to solve. SQLite-backed
-        // so a client solving on worker A can submit on worker B;
-        // the DELETE RETURNING on take() gives atomic "first solver
-        // wins" semantics across workers without any RPC.
-        //   - nonce (hex): primary key, 32 chars for PoW / 32 for
-        //     captcha. Generated with `OsRng`, unpredictable.
-        //   - kind: "pow" or "captcha" — deserialise dispatch key.
-        //   - payload: JSON blob of the mode-specific fields.
-        //     PoW: { nonce_hex, difficulty }; captcha:
-        //     { expected_text } (PNG bytes are stored in the
-        //     separate `png_bytes` column for binary efficiency).
-        //   - mode: numeric value of `lorica_challenge::Mode`
-        //     (1 = Cookie, 2 = Javascript, 3 = Captcha) so the
-        //     verdict cookie payload can be rebuilt.
-        //   - route_id: the route_id the cookie will be bound to.
-        //   - ip_prefix_disc + ip_prefix_bytes: client IP prefix
-        //     (/24 or /64) so the solve handler rejects a network
-        //     change mid-challenge.
-        //   - return_url: where the client bounces to on success.
-        //   - cookie_ttl_s: u32, copied from the route config at
-        //     stash time so a route edit between stash+solve does
-        //     not re-sign cookies with an unexpected TTL.
-        //   - expires_at: UNIX seconds, stash-time + 5 min.
-        //   - png_bytes: captcha image BLOB. NULL for PoW entries.
-        let _ = self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS bot_pending_challenges (
-                nonce TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                mode INTEGER NOT NULL,
-                route_id TEXT NOT NULL,
-                ip_prefix_disc INTEGER NOT NULL,
-                ip_prefix_bytes BLOB NOT NULL,
-                return_url TEXT NOT NULL,
-                cookie_ttl_s INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                png_bytes BLOB
-            );
-             CREATE INDEX IF NOT EXISTS idx_bot_pending_expires_at
-                ON bot_pending_challenges(expires_at);",
-        );
-
-        // V37: per-route group_name (v1.4.1 dashboard UX). Free-form
-        // classification label mirroring `Backend.group_name` so
-        // operators can filter / group routes in the dashboard
-        // (prod / staging / homelab / legacy, etc.). Pure metadata -
-        // never read on the proxy hot path, never exposed as a
-        // Prometheus label (bounded-cardinality concern). Empty
-        // string = ungrouped.
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN group_name TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-
-        // V38: per-pattern ACL for the certificate export zone
-        // (v1.4.1). One row = one rule. Exporter walks ACLs in
-        // longest-pattern-first order and applies the first match's
-        // uid / gid instead of the global default. `allowed_uid` and
-        // `allowed_gid` are NULLable so an ACL can override only the
-        // group without touching the owner, or vice versa.
-        let _ = self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS cert_export_acls (
-                id TEXT PRIMARY KEY,
-                hostname_pattern TEXT NOT NULL,
-                allowed_uid INTEGER,
-                allowed_gid INTEGER,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
-        );
 
         Ok(())
     }
@@ -773,7 +739,7 @@ impl ConfigStore {
              DELETE FROM notification_configs;
              DELETE FROM dns_providers;
              DELETE FROM user_preferences;
-             DELETE FROM admin_users;
+             DELETE FROM users;
              DELETE FROM global_settings;",
         )?;
         Ok(())
@@ -783,4 +749,170 @@ impl ConfigStore {
 /// Generate a new UUID v4 string.
 pub fn new_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// Late `routes` columns that historically only ever arrived via
+    /// the previously unconditional post-v22 ALTER blocks. Their
+    /// presence proves the tracked runner applied the full tail.
+    const LATE_ROUTE_COLUMNS: &[&str] = &[
+        "sticky_session",
+        "bot_protection",
+        "mtls",
+        "rate_limit",
+        "header_rules",
+        "geoip",
+        "serve_robots_txt",
+        "group_name",
+    ];
+
+    fn max_migration_version() -> i64 {
+        MIGRATIONS
+            .iter()
+            .map(|&(version, _)| version)
+            .max()
+            .expect("MIGRATIONS is non-empty")
+    }
+
+    fn column_count(conn: &Connection, table: &str, column: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |row| row.get(0),
+        )
+        .expect("pragma_table_info query")
+    }
+
+    #[test]
+    fn migration_versions_are_contiguous_and_ascending() {
+        // A gap or a duplicate would let an entry silently never run
+        // (or run twice) on some databases; assert the invariant the
+        // whole runner leans on.
+        for (index, &(version, _)) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(
+                version,
+                index as i64 + 1,
+                "MIGRATIONS[{index}] must have version {}",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_db_reaches_latest_version_with_all_late_columns() {
+        let store = ConfigStore::open_in_memory().expect("fresh in-memory open");
+
+        assert_eq!(
+            store.schema_version().expect("schema_version read"),
+            max_migration_version(),
+            "a fresh DB must land on the highest tracked migration version"
+        );
+
+        for column in LATE_ROUTE_COLUMNS {
+            assert_eq!(
+                column_count(&store.conn, "routes", column),
+                1,
+                "routes.{column} must exist after a fresh migration run"
+            );
+        }
+        // A late non-routes column too (added by the last migration).
+        assert_eq!(
+            column_count(&store.conn, "sessions", "role"),
+            1,
+            "sessions.role must exist after a fresh migration run"
+        );
+    }
+
+    #[test]
+    fn old_field_db_with_preexisting_columns_upgrades_cleanly() {
+        // Reproduce the exact field state the tracked runner must
+        // survive: a database whose recorded version predates the
+        // post-v22 tail, yet which already carries several of those
+        // "late" columns because the historical code added them via
+        // unconditional `ALTER TABLE ADD COLUMN` on every open without
+        // ever advancing the version. A naive `version > current` gate
+        // re-issuing a bare ALTER here would abort on
+        // "duplicate column name".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("field.db");
+        {
+            let conn = Connection::open(&db_path).expect("raw open");
+            // Base schema (001 creates schema_migrations + routes +
+            // admin_users; 019 creates sessions), version pinned at 21
+            // (pre-RBAC).
+            conn.execute_batch(MIGRATION_V1).expect("001 initial");
+            conn.execute_batch(MIGRATION_V19).expect("019 sessions");
+            conn.execute_batch("INSERT INTO schema_migrations (version) VALUES (21);")
+                .expect("pin version 21");
+            // Field drift: several late columns already present with no
+            // corresponding version bump.
+            conn.execute_batch(
+                "ALTER TABLE routes ADD COLUMN sticky_session INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE routes ADD COLUMN mtls TEXT DEFAULT NULL;
+                 ALTER TABLE routes ADD COLUMN rate_limit TEXT DEFAULT NULL;
+                 ALTER TABLE sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'super_admin';",
+            )
+            .expect("simulate unconditional field ALTERs");
+        }
+
+        // The upgrade must not error despite the pre-existing columns.
+        let store = ConfigStore::open(&db_path, None)
+            .expect("migration runner must tolerate pre-existing late columns");
+
+        assert_eq!(
+            store.schema_version().expect("schema_version read"),
+            max_migration_version(),
+            "upgrade must reach the highest tracked version"
+        );
+
+        // Every pre-existing late column is present exactly once: the
+        // idempotent guard skipped the duplicate ALTER instead of
+        // erroring or adding a second column.
+        for column in ["sticky_session", "mtls", "rate_limit"] {
+            assert_eq!(
+                column_count(&store.conn, "routes", column),
+                1,
+                "routes.{column} must exist exactly once after upgrade"
+            );
+        }
+        assert_eq!(
+            column_count(&store.conn, "sessions", "role"),
+            1,
+            "sessions.role must exist exactly once after upgrade"
+        );
+
+        // Columns that were NOT pre-added must now exist too: the tail
+        // ran to completion rather than aborting on the first
+        // duplicate.
+        for column in ["bot_protection", "header_rules", "serve_robots_txt", "group_name"] {
+            assert_eq!(
+                column_count(&store.conn, "routes", column),
+                1,
+                "routes.{column} must be added by the upgrade"
+            );
+        }
+    }
+
+    #[test]
+    fn migrations_are_idempotent_on_second_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("idem.db");
+
+        let first = ConfigStore::open(&db_path, None).expect("first open runs migrations");
+        let version_after_first = first.schema_version().expect("version read");
+        assert_eq!(version_after_first, max_migration_version());
+        drop(first);
+
+        // Re-opening runs run_migrations again; every entry is already
+        // recorded, so the loop body never fires and nothing changes.
+        let second = ConfigStore::open(&db_path, None).expect("second open is a no-op");
+        assert_eq!(
+            second.schema_version().expect("version read"),
+            version_after_first,
+            "a second run must not advance or regress the version"
+        );
+    }
 }

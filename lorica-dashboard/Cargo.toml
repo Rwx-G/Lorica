@@ -1,6 +1,6 @@
 [package]
 name = "lorica-dashboard"
-version = "1.5.13"
+version = "1.6.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -8,12 +8,15 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "Embedded web dashboard for Lorica reverse proxy"
 
 [dependencies]
-axum = "0.7"
+axum = "0.8"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 mime_guess = "2"
 tracing = "0.1"
+# OS CSPRNG for the per-request CSP3 style-src nonce (Story 8.8 AC #6).
+# Already resolved in the workspace lockfile; promoted to a direct dep.
+getrandom = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 hyper = { version = "1", features = ["full"] }
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }

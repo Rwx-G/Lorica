@@ -1,0 +1,9 @@
+source_url: https://developer.amazon.com/amazonbot/ip-addresses
+fetched: 2026-05-03
+upstream_creation_time: not_published_in_payload
+notes:
+  Amazon publishes individual IPv4 addresses (not CIDR ranges) on a static
+  HTML page. Each address normalized to a /32 here so the consumer
+  (lorica/src/ai_bot.rs::VENDOR_IP_RANGES) keeps a uniform Vec<IpNet> shape.
+  No upstream creationTime is published; refreshed alongside each Lorica
+  patch release.

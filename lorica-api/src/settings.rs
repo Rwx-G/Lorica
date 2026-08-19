@@ -3,11 +3,195 @@
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::db::{db_blocking, log_db_blocking};
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
+
+// ---- Settings field bounds (single source of truth) ----
+//
+// Story 8.10 AC #7. These constants are the ONLY place the numeric
+// ranges and enum choice sets for the operator-tunable global settings
+// are declared. Both `update_settings` (the validator) and
+// `settings_schema` (the `GET /api/v1/settings/schema` payload) read
+// them, so the enforced bound and the advertised bound cannot drift.
+// Defaults are read from `GlobalSettings::default()` for the same
+// reason.
+
+const HEALTH_MAX_CONCURRENT_PROBES_MIN: i32 = 1;
+const HEALTH_MAX_CONCURRENT_PROBES_MAX: i32 = 512;
+const DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN: i32 = 1;
+const CERT_WARNING_DAYS_MIN: i32 = 1;
+const CERT_CRITICAL_DAYS_MIN: i32 = 1;
+const MAX_GLOBAL_CONNECTIONS_MIN: i32 = 0;
+const FLOOD_THRESHOLD_RPS_MIN: i32 = 0;
+const FLOOD_STRICT_RPS_MIN: u32 = 0;
+const FLOOD_STRICT_RPS_MAX: u32 = 10_000_000;
+const HEADER_TIMEOUT_S_MIN: u32 = 0;
+const HEADER_TIMEOUT_S_MAX: u32 = 3600;
+const WAF_BAN_THRESHOLD_MIN: i32 = 0;
+const WAF_BAN_DURATION_S_MIN: i32 = 0;
+const ACCESS_LOG_RETENTION_MIN: i64 = 0;
+const WAF_EVENT_RETENTION_MIN: i64 = 0;
+const SLA_PURGE_RETENTION_DAYS_MIN: i32 = 1;
+const SLA_PURGE_RETENTION_DAYS_MAX: i32 = 3650;
+const OTLP_SAMPLING_RATIO_MIN: f64 = 0.0;
+const OTLP_SAMPLING_RATIO_MAX: f64 = 1.0;
+const CERT_EXPORT_MODE_MAX: u32 = 0o777;
+const MANAGEMENT_PORT_MAX: u16 = u16::MAX;
+
+const LOG_LEVEL_CHOICES: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+const OTLP_PROTOCOL_CHOICES: [&str; 3] = ["grpc", "http-proto", "http-json"];
+const SPOOFED_FALLBACK_CHOICES: [&str; 3] = ["deny", "log", "allow"];
+
+/// Build the machine-readable settings schema (Story 8.10 AC #7).
+///
+/// Returns a JSON object keyed by field name; each value carries a
+/// `type` (`"integer"` / `"number"` / `"boolean"` / `"string"` /
+/// `"enum"`), optional numeric `min` / `max`, a `default`, and, for
+/// enum fields, the `choices` array. Numeric bounds come from the
+/// shared `*_MIN` / `*_MAX` constants that `update_settings` enforces;
+/// defaults come from [`GlobalSettings::default`]. Fields whose
+/// validator only enforces a lower bound omit `max` (the server sets
+/// no ceiling; the dashboard supplies a UI-only cap).
+///
+/// # Examples
+///
+/// ```
+/// let schema = lorica_api::settings::settings_schema();
+/// assert_eq!(schema["header_timeout_s"]["max"], 3600);
+/// ```
+pub fn settings_schema() -> serde_json::Value {
+    let d: lorica_config::models::GlobalSettings = lorica_config::models::GlobalSettings::default();
+    serde_json::json!({
+        "management_port": {
+            "type": "integer",
+            "min": 0,
+            "max": MANAGEMENT_PORT_MAX,
+            "default": d.management_port,
+        },
+        "log_level": {
+            "type": "enum",
+            "choices": LOG_LEVEL_CHOICES,
+            "default": d.log_level,
+        },
+        "default_health_check_interval_s": {
+            "type": "integer",
+            "min": DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN,
+            "default": d.default_health_check_interval_s,
+        },
+        "health_max_concurrent_probes": {
+            "type": "integer",
+            "min": HEALTH_MAX_CONCURRENT_PROBES_MIN,
+            "max": HEALTH_MAX_CONCURRENT_PROBES_MAX,
+            "default": d.health_max_concurrent_probes,
+        },
+        "cert_warning_days": {
+            "type": "integer",
+            "min": CERT_WARNING_DAYS_MIN,
+            "default": d.cert_warning_days,
+        },
+        "cert_critical_days": {
+            "type": "integer",
+            "min": CERT_CRITICAL_DAYS_MIN,
+            "default": d.cert_critical_days,
+        },
+        "max_global_connections": {
+            "type": "integer",
+            "min": MAX_GLOBAL_CONNECTIONS_MIN,
+            "default": d.max_global_connections,
+        },
+        "flood_threshold_rps": {
+            "type": "integer",
+            "min": FLOOD_THRESHOLD_RPS_MIN,
+            "default": d.flood_threshold_rps,
+        },
+        "flood_strict_rps": {
+            "type": "integer",
+            "min": FLOOD_STRICT_RPS_MIN,
+            "max": FLOOD_STRICT_RPS_MAX,
+            "default": d.flood_strict_rps,
+        },
+        "header_timeout_s": {
+            "type": "integer",
+            "min": HEADER_TIMEOUT_S_MIN,
+            "max": HEADER_TIMEOUT_S_MAX,
+            "default": d.header_timeout_s,
+        },
+        "waf_ban_threshold": {
+            "type": "integer",
+            "min": WAF_BAN_THRESHOLD_MIN,
+            "default": d.waf_ban_threshold,
+        },
+        "waf_ban_duration_s": {
+            "type": "integer",
+            "min": WAF_BAN_DURATION_S_MIN,
+            "default": d.waf_ban_duration_s,
+        },
+        "access_log_retention": {
+            "type": "integer",
+            "min": ACCESS_LOG_RETENTION_MIN,
+            "default": d.access_log_retention,
+        },
+        "waf_event_retention": {
+            "type": "integer",
+            "min": WAF_EVENT_RETENTION_MIN,
+            "default": d.waf_event_retention,
+        },
+        "sla_purge_enabled": {
+            "type": "boolean",
+            "default": d.sla_purge_enabled,
+        },
+        "sla_purge_retention_days": {
+            "type": "integer",
+            "min": SLA_PURGE_RETENTION_DAYS_MIN,
+            "max": SLA_PURGE_RETENTION_DAYS_MAX,
+            "default": d.sla_purge_retention_days,
+        },
+        "otlp_protocol": {
+            "type": "enum",
+            "choices": OTLP_PROTOCOL_CHOICES,
+            "default": d.otlp_protocol,
+        },
+        "otlp_sampling_ratio": {
+            "type": "number",
+            "min": OTLP_SAMPLING_RATIO_MIN,
+            "max": OTLP_SAMPLING_RATIO_MAX,
+            "default": d.otlp_sampling_ratio,
+        },
+        "cert_export_file_mode": {
+            "type": "integer",
+            "min": 0,
+            "max": CERT_EXPORT_MODE_MAX,
+            "default": d.cert_export_file_mode,
+        },
+        "cert_export_dir_mode": {
+            "type": "integer",
+            "min": 0,
+            "max": CERT_EXPORT_MODE_MAX,
+            "default": d.cert_export_dir_mode,
+        },
+        "ai_bot_treat_spoofed_as": {
+            "type": "enum",
+            "choices": SPOOFED_FALLBACK_CHOICES,
+            "default": d.ai_bot_treat_spoofed_as,
+        },
+    })
+}
+
+/// GET /api/v1/settings/schema - return the operator-tunable global
+/// settings field bounds (Story 8.10 AC #7).
+///
+/// Read-only metadata; no store access. Gated like `GET /settings`
+/// (Viewer+) by the authorize middleware since the path falls under
+/// the GET/HEAD Viewer default before the settings-write SuperAdmin
+/// overlay. The dashboard consumes this to render input constraints
+/// instead of hardcoding them.
+pub async fn get_settings_schema() -> Json<serde_json::Value> {
+    json_data(settings_schema())
+}
 
 // ---- Global Settings ----
 
@@ -40,13 +224,27 @@ pub async fn get_settings(
     } else {
         "**REDACTED**".to_string()
     };
+    // Story 8.8 AC #4: the Prometheus scrape token is a secret (a leaked
+    // value grants unauthenticated `/metrics` access when
+    // `metrics_require_auth` is on). Mask it exactly like the bot HMAC
+    // secret: `None` stays `None`, a configured value becomes the
+    // sentinel. The `PUT` write path treats the sentinel as "leave
+    // unchanged" so the dashboard round-trip never clobbers the token.
+    settings.prometheus_scrape_token = settings
+        .prometheus_scrape_token
+        .as_ref()
+        .map(|_| "**REDACTED**".to_string());
     Ok(json_data(settings))
 }
 
 /// JSON body for `PUT /api/v1/settings`. Only the supplied fields are
 /// mutated ; each field mirrors the matching
 /// [`lorica_config::models::GlobalSettings`] key.
-#[derive(Deserialize)]
+///
+/// `Serialize` exists solely for the audit-log payload hash (Story
+/// 8.9): the request body carries no secret (there is no write path
+/// for `bot_hmac_secret_hex`), unlike the full `GlobalSettings` row.
+#[derive(Deserialize, Serialize)]
 pub struct UpdateSettingsRequest {
     /// Management API TCP port.
     pub management_port: Option<u16>,
@@ -64,12 +262,19 @@ pub struct UpdateSettingsRequest {
     pub max_global_connections: Option<i32>,
     /// Proxy-wide flood threshold (RPS).
     pub flood_threshold_rps: Option<i32>,
+    /// Per-IP admission rate enforced during flood mode (Story 8.10
+    /// AC #2). `0` = auto (`flood_threshold_rps / 2`).
+    pub flood_strict_rps: Option<u32>,
+    /// Global header-phase read timeout in seconds (Story 8.10 AC #1).
+    pub header_timeout_s: Option<u32>,
     /// Number of WAF blocks before auto-ban.
     pub waf_ban_threshold: Option<i32>,
     /// WAF auto-ban duration (s).
     pub waf_ban_duration_s: Option<i32>,
     /// Retention cap on the persistent access-log buffer.
     pub access_log_retention: Option<i64>,
+    /// Retention cap on the persistent WAF-event buffer.
+    pub waf_event_retention: Option<i64>,
     /// Toggle the periodic SLA bucket purge.
     pub sla_purge_enabled: Option<bool>,
     /// SLA bucket retention window (days).
@@ -114,6 +319,34 @@ pub struct UpdateSettingsRequest {
     pub cert_export_file_mode: Option<u32>,
     /// Octal directory mode for the export root + per-hostname dirs.
     pub cert_export_dir_mode: Option<u32>,
+    /// Story 8.2 AC #3. Default applied when an AI-bot crawler's
+    /// verification (Rdns / IpRanges) fails. Per-route override
+    /// available via `Route.ai_bot_spoofed_fallback`.
+    pub ai_bot_treat_spoofed_as: Option<lorica_config::models::SpoofedFallback>,
+    /// Story 8.2 AC #11. Inject `X-Lorica-Verified-Bot` +
+    /// `X-Lorica-Bot-Verification` headers upstream on
+    /// verification-confirmed AI-bot requests.
+    pub ai_bot_inject_headers: Option<bool>,
+    /// Story 8.4. Absolute path to the Ed25519 public key the
+    /// hot-upgrade endpoint verifies uploaded binaries against. An
+    /// empty (after trim) value clears it, disabling hot binary
+    /// upgrade. Without this write path the operator could never
+    /// configure a signing key and every upload returned 400.
+    pub upgrade_signing_pubkey_path: Option<String>,
+    /// Story 8.8 AC #4. Require auth on `/metrics`.
+    pub metrics_require_auth: Option<bool>,
+    /// Story 8.8 AC #4. Static bearer token accepted on `/metrics`.
+    /// An empty (after trim) value clears the token. The masking
+    /// sentinel `**REDACTED**` returned by `GET /settings` is treated
+    /// as "leave unchanged" so a dashboard round-trip never clobbers
+    /// the stored token.
+    pub prometheus_scrape_token: Option<String>,
+    /// Story 8.8 AC #2. Absolute path to the operator management-TLS
+    /// certificate chain (PEM). Empty clears it.
+    pub management_cert_pem_path: Option<String>,
+    /// Story 8.8 AC #2. Absolute path to the operator management-TLS
+    /// private key (PEM). Empty clears it.
+    pub management_key_pem_path: Option<String>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -124,9 +357,17 @@ pub struct UpdateSettingsRequest {
 /// are kept on purpose (normalising them is a behaviour change) and
 /// flagged with `// NOTE: bound drift` comments for the next audit.
 pub async fn update_settings(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<UpdateSettingsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Audit payload = the PATCH body (secret-free by construction),
+    // never the resulting GlobalSettings row (carries
+    // `bot_hmac_secret_hex`). Serialized before the closure consumes
+    // the body; recorded only after the mutation succeeds.
+    let audit_after = serde_json::to_value(&body).ok();
     // The whole get -> validate/assign -> update sequence is sync and
     // runs in one closure on the blocking pool; the store mutex hold
     // window is unchanged.
@@ -138,7 +379,7 @@ pub async fn update_settings(
         apply_string_choice(
             body.log_level,
             &mut settings.log_level,
-            &["trace", "debug", "info", "warn", "error"],
+            &LOG_LEVEL_CHOICES,
             "log_level",
         )?;
         // NOTE: bound drift - lower bound only, no upper cap unlike
@@ -146,45 +387,62 @@ pub async fn update_settings(
         apply_min_i32(
             body.default_health_check_interval_s,
             &mut settings.default_health_check_interval_s,
-            1,
+            DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN,
             "default_health_check_interval_s",
         )?;
         apply_ranged_i32(
             body.health_max_concurrent_probes,
             &mut settings.health_max_concurrent_probes,
-            1..=512,
-            "health_max_concurrent_probes must be in 1..=512",
+            HEALTH_MAX_CONCURRENT_PROBES_MIN..=HEALTH_MAX_CONCURRENT_PROBES_MAX,
+            &format!(
+                "health_max_concurrent_probes must be in {HEALTH_MAX_CONCURRENT_PROBES_MIN}..={HEALTH_MAX_CONCURRENT_PROBES_MAX}"
+            ),
         )?;
         // NOTE: bound drift - cert thresholds have no upper bound and
         // no warning > critical cross-check.
         apply_min_i32(
             body.cert_warning_days,
             &mut settings.cert_warning_days,
-            1,
+            CERT_WARNING_DAYS_MIN,
             "cert_warning_days",
         )?;
         apply_min_i32(
             body.cert_critical_days,
             &mut settings.cert_critical_days,
-            1,
+            CERT_CRITICAL_DAYS_MIN,
             "cert_critical_days",
         )?;
         apply_min_i32(
             body.max_global_connections,
             &mut settings.max_global_connections,
-            0,
+            MAX_GLOBAL_CONNECTIONS_MIN,
             "max_global_connections",
         )?;
         apply_min_i32(
             body.flood_threshold_rps,
             &mut settings.flood_threshold_rps,
-            0,
+            FLOOD_THRESHOLD_RPS_MIN,
             "flood_threshold_rps",
+        )?;
+        // Story 8.10 AC #2. `0` is accepted and means "auto"
+        // (`flood_threshold_rps / 2`), resolved at enforcement time.
+        apply_ranged_u32(
+            body.flood_strict_rps,
+            &mut settings.flood_strict_rps,
+            FLOOD_STRICT_RPS_MIN..=FLOOD_STRICT_RPS_MAX,
+            &format!("flood_strict_rps must be in {FLOOD_STRICT_RPS_MIN}..={FLOOD_STRICT_RPS_MAX}"),
+        )?;
+        // Story 8.10 AC #1. `0` disables the global header-phase floor.
+        apply_ranged_u32(
+            body.header_timeout_s,
+            &mut settings.header_timeout_s,
+            HEADER_TIMEOUT_S_MIN..=HEADER_TIMEOUT_S_MAX,
+            &format!("header_timeout_s must be in {HEADER_TIMEOUT_S_MIN}..={HEADER_TIMEOUT_S_MAX}"),
         )?;
         apply_min_i32(
             body.waf_ban_threshold,
             &mut settings.waf_ban_threshold,
-            0,
+            WAF_BAN_THRESHOLD_MIN,
             "waf_ban_threshold",
         )?;
         // NOTE: bound drift - 0 accepted (zero-duration ban), while the
@@ -192,21 +450,29 @@ pub async fn update_settings(
         apply_min_i32(
             body.waf_ban_duration_s,
             &mut settings.waf_ban_duration_s,
-            0,
+            WAF_BAN_DURATION_S_MIN,
             "waf_ban_duration_s",
         )?;
         apply_min_i64(
             body.access_log_retention,
             &mut settings.access_log_retention,
-            0,
+            ACCESS_LOG_RETENTION_MIN,
             "access_log_retention",
+        )?;
+        apply_min_i64(
+            body.waf_event_retention,
+            &mut settings.waf_event_retention,
+            WAF_EVENT_RETENTION_MIN,
+            "waf_event_retention",
         )?;
         apply_plain(body.sla_purge_enabled, &mut settings.sla_purge_enabled);
         apply_ranged_i32(
             body.sla_purge_retention_days,
             &mut settings.sla_purge_retention_days,
-            1..=3650,
-            "sla_purge_retention_days must be in 1..=3650 (10 years)",
+            SLA_PURGE_RETENTION_DAYS_MIN..=SLA_PURGE_RETENTION_DAYS_MAX,
+            &format!(
+                "sla_purge_retention_days must be in {SLA_PURGE_RETENTION_DAYS_MIN}..={SLA_PURGE_RETENTION_DAYS_MAX} (10 years)"
+            ),
         )?;
         apply_sla_purge_schedule(body.sla_purge_schedule, &mut settings.sla_purge_schedule)?;
         apply_plain(
@@ -237,7 +503,7 @@ pub async fn update_settings(
         apply_string_choice(
             body.otlp_protocol,
             &mut settings.otlp_protocol,
-            &["grpc", "http-proto", "http-json"],
+            &OTLP_PROTOCOL_CHOICES,
             "otlp_protocol",
         )?;
         apply_otlp_service_name(body.otlp_service_name, &mut settings.otlp_service_name)?;
@@ -278,12 +544,61 @@ pub async fn update_settings(
             &mut settings.cert_export_dir_mode,
             "cert_export_dir_mode",
         )?;
+        // Story 8.2 AC #3 + AC #11. Serde-derive parsing on
+        // `body.ai_bot_treat_spoofed_as` already validates the enum
+        // tag ("deny" | "log" | "allow"), so both are passthrough.
+        apply_plain(
+            body.ai_bot_treat_spoofed_as,
+            &mut settings.ai_bot_treat_spoofed_as,
+        );
+        apply_plain(body.ai_bot_inject_headers, &mut settings.ai_bot_inject_headers);
+        // Story 8.4. Mirrors `geoip_db_path` plumbing: absolute-path
+        // validation, empty string clears to None.
+        apply_optional_abs_path(
+            body.upgrade_signing_pubkey_path,
+            &mut settings.upgrade_signing_pubkey_path,
+            "upgrade_signing_pubkey_path",
+        )?;
+        // Story 8.8 AC #4 + AC #2.
+        apply_plain(body.metrics_require_auth, &mut settings.metrics_require_auth);
+        apply_secret_token(
+            body.prometheus_scrape_token,
+            &mut settings.prometheus_scrape_token,
+        );
+        apply_optional_abs_path(
+            body.management_cert_pem_path,
+            &mut settings.management_cert_pem_path,
+            "management_cert_pem_path",
+        )?;
+        apply_optional_abs_path(
+            body.management_key_pem_path,
+            &mut settings.management_key_pem_path,
+            "management_key_pem_path",
+        )?;
 
+        // Cross-field invariants (backlog #48). Per-field bounds are applied
+        // above; these reject a partial update that inverts a related pair
+        // (e.g. cert warning <= critical) on the merged result.
+        settings
+            .validate_cross_fields()
+            .map_err(ApiError::BadRequest)?;
         store.update_global_settings(&settings)?;
         Ok::<_, ApiError>(settings)
     })
     .await?;
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "settings.update",
+        ("settings", ""),
+        None,
+        audit_after.as_ref(),
+    )
+    .await;
+
     Ok(json_data(settings))
 }
 
@@ -356,6 +671,24 @@ fn apply_ranged_i32(
     Ok(())
 }
 
+/// `u32` variant of [`apply_ranged_i32`]. Used by the Story 8.10
+/// settings (`flood_strict_rps`, `header_timeout_s`) which are `u32`
+/// on `GlobalSettings`.
+fn apply_ranged_u32(
+    value: Option<u32>,
+    target: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
+    error_msg: &str,
+) -> Result<(), ApiError> {
+    if let Some(v) = value {
+        if !range.contains(&v) {
+            return Err(ApiError::BadRequest(error_msg.to_string()));
+        }
+        *target = v;
+    }
+    Ok(())
+}
+
 /// Assign a string field when present, rejecting values not in
 /// `valid` with `400 "invalid <label>: <value>. Must be one of:
 /// <valid:?>"`.
@@ -389,6 +722,27 @@ fn apply_cidr_list(
         *target = cidrs;
     }
     Ok(())
+}
+
+/// Assign an optional secret string field (Story 8.8 AC #4 scrape
+/// token). `None` leaves the stored value untouched. An empty (after
+/// trim) value clears the secret to `None`. The masking sentinel the
+/// `GET /settings` handler returns (`**REDACTED**`) is treated as
+/// "leave unchanged" so a dashboard PUT that echoes the masked value
+/// never overwrites the real token. Any other value is stored verbatim.
+fn apply_secret_token(value: Option<String>, target: &mut Option<String>) {
+    let Some(v) = value else {
+        return;
+    };
+    let trimmed = v.trim();
+    if trimmed == "**REDACTED**" {
+        return;
+    }
+    *target = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
 }
 
 /// Assign a Unix permission mode field when present, rejecting values
@@ -703,7 +1057,10 @@ pub struct CreateNotificationRequest {
 
 /// POST /api/v1/notifications - register a new notification channel.
 pub async fn create_notification(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateNotificationRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let channel: lorica_config::models::NotificationChannel = body
@@ -728,14 +1085,31 @@ pub async fn create_notification(
         Ok::<_, ApiError>(masked)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // body carries credentials: not even a hash
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "notification.create",
+        ("notification", &masked.id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data_with_status(StatusCode::CREATED, masked))
 }
 
 /// POST /api/v1/notifications/:id/test - send a real test alert through the configured channel.
 pub async fn test_notification(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let notification_id = id.clone();
     let nc = db_blocking(&state.store, move |store| {
         store
             .get_notification_config(&id)?
@@ -788,6 +1162,17 @@ pub async fn test_notification(
                 .map_err(|e| ApiError::Internal(format!("slack send failed: {e}")))?;
         }
     }
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "notification.test",
+        ("notification", &notification_id),
+        None,
+        None,
+    )
+    .await;
 
     Ok(json_data(serde_json::json!({
         "message": "test notification sent successfully",
@@ -878,7 +1263,10 @@ fn validate_notification_config(config: &str) -> Result<(), ApiError> {
 
 /// PUT /api/v1/notifications/:id - update channel config; `********` placeholders preserve stored secrets.
 pub async fn update_notification(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<CreateNotificationRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -964,18 +1352,47 @@ pub async fn update_notification(
         Ok::<_, ApiError>(masked)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // body carries credentials: not even a hash
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "notification.update",
+        ("notification", &masked.id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(masked))
 }
 
 /// DELETE /api/v1/notifications/:id - remove a notification channel.
 pub async fn delete_notification(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let notification_id = id.clone();
     db_blocking(&state.store, move |store| {
         store.delete_notification_config(&id)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "notification.delete",
+        ("notification", &notification_id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(
         serde_json::json!({"message": "notification config deleted"}),
     ))
@@ -1001,7 +1418,10 @@ pub struct UpdatePreferenceRequest {
 
 /// PUT /api/v1/preferences/:id - update one user preference value.
 pub async fn update_preference(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdatePreferenceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1010,10 +1430,12 @@ pub async fn update_preference(
         .parse()
         .map_err(|e: strum::ParseError| ApiError::BadRequest(e.to_string()))?;
 
-    let updated = db_blocking(&state.store, move |store| {
+    let preference_id = id.clone();
+    let (before_pref, updated) = db_blocking(&state.store, move |store| {
         let existing = store
             .get_user_preference(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("preference {id}")))?;
+        let before_pref = existing.clone();
 
         let updated = lorica_config::models::UserPreference {
             value,
@@ -1022,18 +1444,48 @@ pub async fn update_preference(
         };
 
         store.update_user_preference(&updated)?;
-        Ok::<_, ApiError>(updated)
+        Ok::<_, ApiError>((before_pref, updated))
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(&before_pref).ok();
+    let after = serde_json::to_value(&updated).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "preference.update",
+        ("preference", &preference_id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
+
     Ok(json_data(updated))
 }
 
 /// DELETE /api/v1/preferences/:id - remove a user preference.
 pub async fn delete_preference(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let preference_id = id.clone();
     db_blocking(&state.store, move |store| store.delete_user_preference(&id)).await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "preference.delete",
+        ("preference", &preference_id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(
         serde_json::json!({"message": "preference deleted"}),
     ))

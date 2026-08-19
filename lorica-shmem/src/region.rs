@@ -118,12 +118,12 @@ impl SharedRegion {
     /// spawned. The returned `&'static SharedRegion` has the lifetime
     /// of the process — the supervisor must not unmap it.
     pub fn create_supervisor() -> Result<(&'static SharedRegion, OwnedFd), SharedRegionError> {
-        use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
+        use nix::sys::memfd::{memfd_create, MFdFlags};
 
         // `MFD_CLOEXEC`: the supervisor never exec()s, but this is the
         // defensive default. We explicitly dup / pass the fd to workers
         // via SCM_RIGHTS so CLOEXEC on the supervisor side is harmless.
-        let fd: OwnedFd = memfd_create(c"lorica-shmem", MemFdCreateFlag::MFD_CLOEXEC)
+        let fd: OwnedFd = memfd_create(c"lorica-shmem", MFdFlags::MFD_CLOEXEC)
             .map_err(SharedRegionError::Memfd)?;
 
         // Size the region.
@@ -214,7 +214,7 @@ unsafe fn map_region(fd: &OwnedFd) -> Result<&'static mut SharedRegion, SharedRe
 mod tests {
     use super::*;
     use crate::table::tagged_hash;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, IntoRawFd};
 
     #[test]
     fn create_and_read_header() {
@@ -229,8 +229,10 @@ mod tests {
     fn supervisor_and_worker_see_same_hash_key() {
         let (sup, fd) = SharedRegion::create_supervisor().expect("create");
 
-        // Duplicate the fd so both sides hold their own OwnedFd.
-        let dup_fd = nix::unistd::dup(fd.as_raw_fd()).expect("dup");
+        // Duplicate the fd so both sides hold their own OwnedFd. nix 0.31
+        // `dup` takes an `AsFd` and yields an `OwnedFd`; `open_worker`
+        // adopts a `RawFd`, so release ownership with `into_raw_fd`.
+        let dup_fd = nix::unistd::dup(&fd).expect("dup").into_raw_fd();
         // The test "worker" shares the same process — in production
         // this fd travels via SCM_RIGHTS to a forked child.
         let worker = unsafe { SharedRegion::open_worker(dup_fd) }.expect("worker open");
@@ -260,8 +262,8 @@ mod tests {
 
     #[test]
     fn bad_magic_rejected() {
-        use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
-        let fd = memfd_create(c"lorica-bad", MemFdCreateFlag::MFD_CLOEXEC).expect("memfd");
+        use nix::sys::memfd::{memfd_create, MFdFlags};
+        let fd = memfd_create(c"lorica-bad", MFdFlags::MFD_CLOEXEC).expect("memfd");
         nix::unistd::ftruncate(&fd, REGION_SIZE as i64).expect("ftruncate");
         // Leave magic = 0.
         let raw = fd.as_raw_fd();

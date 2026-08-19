@@ -1,6 +1,6 @@
 [package]
 name = "lorica"
-version = "1.5.13"
+version = "1.6.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -39,21 +39,21 @@ lorica-lb = { version = "0.1.0", path = "../lorica-lb", optional = true, default
 # call site explicit.
 lorica-ketama = { version = "0.1.0", path = "../lorica-ketama" }
 lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, default-features = false }
-lorica-config = { version = "1.5.13", path = "../lorica-config" }
-lorica-api = { version = "1.5.13", path = "../lorica-api" }
+lorica-config = { version = "1.6.0", path = "../lorica-config" }
+lorica-api = { version = "1.6.0", path = "../lorica-api" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
-lorica-worker = { version = "1.5.13", path = "../lorica-worker" }
-lorica-command = { version = "1.5.13", path = "../lorica-command" }
-lorica-shmem = { version = "1.5.13", path = "../lorica-shmem" }
-lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
-lorica-notify = { version = "0.1.0", path = "../lorica-notify" }
+lorica-worker = { version = "1.6.0", path = "../lorica-worker" }
+lorica-command = { version = "1.6.0", path = "../lorica-command" }
+lorica-shmem = { version = "1.6.0", path = "../lorica-shmem" }
+lorica-waf = { version = "1.6.0", path = "../lorica-waf" }
+lorica-notify = { version = "1.6.0", path = "../lorica-notify" }
 lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-geoip = { version = "1.5.13", path = "../lorica-geoip" }
-lorica-challenge = { version = "1.5.13", path = "../lorica-challenge" }
+lorica-geoip = { version = "1.6.0", path = "../lorica-geoip" }
+lorica-challenge = { version = "1.6.0", path = "../lorica-challenge" }
 once_cell = { workspace = true }
-lorica-bench = { version = "1.5.13", path = "../lorica-bench" }
+lorica-bench = { version = "1.6.0", path = "../lorica-bench" }
 regex = "1"
 # HTML sanitization for operator-supplied error_page_html (v1.5.0
 # audit finding HIGH-1). Whitelist-based parser replaces the
@@ -62,7 +62,7 @@ regex = "1"
 # parses through html5ever, so the attack surface collapses onto
 # what the Servo team already hardens.
 ammonia = "4"
-sha2 = "0.10"
+sha2 = "0.11"
 bytes = "1"
 # Async DNS resolver for the bot-protection rDNS bypass
 # (v1.4.0 Epic 3 follow-up). Bumped 0.24 -> 0.26 in v1.5.2
@@ -87,7 +87,7 @@ dashmap = "6"
 rand = "0.9"
 parking_lot = "0.12"
 argon2 = "0.5"
-base64 = "0.22"
+base64 = "0.23"
 async-trait = { workspace = true }
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -99,11 +99,11 @@ ipnet = "2"
 # OpenTelemetry (feature-gated, off by default)
 # Enabled via `--features otel`. Policy matches `route53` since v1.3.0
 # supply-chain audit SC-M-3: non-OTel users do not pay the dep-graph cost.
-opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["trace", "internal-logs"] }
-opentelemetry_sdk = { version = "0.31", optional = true, default-features = false, features = ["trace", "rt-tokio", "internal-logs"] }
-opentelemetry-otlp = { version = "0.31", optional = true, default-features = false, features = ["trace", "http-proto", "grpc-tonic", "reqwest-blocking-client", "tls-ring", "tls-webpki-roots", "internal-logs"] }
-opentelemetry-semantic-conventions = { version = "0.31", optional = true }
-tracing-opentelemetry = { version = "0.32", optional = true, default-features = false }
+opentelemetry = { version = "0.32", optional = true, default-features = false, features = ["trace", "internal-logs"] }
+opentelemetry_sdk = { version = "0.32", optional = true, default-features = false, features = ["trace", "rt-tokio", "internal-logs"] }
+opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["trace", "http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client", "tls-ring", "tls-webpki-roots", "internal-logs"] }
+opentelemetry-semantic-conventions = { version = "0.32", optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true, default-features = false }
 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -120,7 +120,7 @@ log = { workspace = true }
 once_cell = { workspace = true }
 bytes = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
-rcgen = "0.13"
+rcgen = "0.14"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pki-types = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -159,6 +159,12 @@ connection_filter = [
 
 any_tls = []
 prometheus = ["lorica-core/prometheus"]
+
+# ACME DNS-01 via AWS Route53. Off by default (matches the supply-chain
+# audit SC-M-3 policy): the Route53 dep graph drags an older TLS stack, so
+# only builds that need it pay the cost. Passes through to
+# `lorica-api/route53`, which enables `lorica-acme/route53`.
+route53 = ["lorica-api/route53"]
 
 # Distributed tracing via OTLP export. Off by default.
 # Enable with `cargo build --release --features otel`. See Cargo.toml

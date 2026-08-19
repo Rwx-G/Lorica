@@ -1,4 +1,8 @@
-//! Tower / axum middleware: session cookie authentication and per-IP rate limiting.
+//! Tower / axum middleware: session cookie authentication,
+//! role-based authorization, and per-IP rate limiting.
 
 pub mod auth;
+pub mod authorize;
+pub mod metrics_auth;
 pub mod rate_limit;
+pub mod request_span;

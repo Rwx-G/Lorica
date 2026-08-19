@@ -21,21 +21,22 @@
 //! - **DNS-01 (manual)**: Returns the TXT record info for the user to create manually,
 //!   then confirms the challenge in a second step.
 //!
+//! The pure ACME/DNS protocol core (the `instant-acme` driver, CSR
+//! generation, and the DNS-01 provider challengers) lives in the
+//! [`lorica_acme`] crate; this module holds the axum handlers, the
+//! management-plane state, and the persistence that call into it.
+//!
 //! This module is organised into focused submodules:
 //! - [`store`]: the SQLite-backed challenge token store shared across workers.
-//! - [`config`]: the `AcmeConfig` describing the Let's Encrypt directory.
 //! - [`types`]: request/response DTOs and pending challenge state.
 //! - [`http01`]: HTTP-01 provisioning endpoints and internal flow.
 //! - [`renewal`]: background renewal task and manual renewal endpoint.
 //! - [`expiry`]: certificate expiry check task (alerts).
-//! - [`dns_challengers`]: `DnsChallenger` trait and provider implementations.
 //! - [`dns01`]: automated DNS-01 provisioning endpoint and internal flow.
 //! - [`dns01_manual`]: two-step manual DNS-01 flow (init, check, confirm).
 
-mod config;
 mod dns01;
 mod dns01_manual;
-pub mod dns_challengers;
 mod expiry;
 mod http01;
 mod renewal;
@@ -45,17 +46,17 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub use config::AcmeConfig;
+// Pure ACME core re-exported from `lorica-acme` so existing
+// `crate::acme::*` call sites (dns_providers.rs, renewal, handlers) keep
+// their import paths after the extraction.
+#[cfg(feature = "route53")]
+pub use lorica_acme::Route53DnsChallenger;
+pub use lorica_acme::{build_dns_challenger, AcmeConfig, DnsChallengeConfig, DnsChallenger};
+
 pub use dns01::{provision_certificate_dns, AcmeDnsProvisionRequest};
 pub use dns01_manual::{
     check_dns_manual, provision_dns_manual, provision_dns_manual_confirm,
     AcmeDnsManualConfirmRequest, AcmeDnsManualRequest,
-};
-#[cfg(feature = "route53")]
-pub use dns_challengers::Route53DnsChallenger;
-pub use dns_challengers::{
-    build_dns_challenger, CloudflareDnsChallenger, DnsChallengeConfig, DnsChallenger,
-    OvhDnsChallenger,
 };
 pub use expiry::{check_cert_expiry, spawn_cert_expiry_check_task};
 pub use http01::{provision_certificate, serve_challenge, AcmeProvisionRequest};

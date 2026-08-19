@@ -246,8 +246,12 @@ impl NotifyDispatcher {
     ///
     /// [`suppressed_count`]: Self::suppressed_count
     pub async fn dispatch(&self, event: &AlertEvent) {
-        // Always emit to stdout
+        // Always emit to stdout. This channel cannot fail, so its
+        // dispatch outcome is always `ok`. Email / webhook / slack record
+        // their own outcomes inside the respective `send` functions, where
+        // the live transport error / HTTP status is available to classify.
         stdout::emit(event);
+        crate::metrics::record_notification_dispatch("stdout", "ok");
 
         // Store in history
         {

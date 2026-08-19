@@ -24,6 +24,7 @@
 
 pub mod channels;
 pub mod events;
+pub mod metrics;
 
 pub use channels::{NotifyDispatcher, NotifyError, RateLimitConfig};
 pub use events::AlertEvent;
@@ -94,4 +95,44 @@ pub fn spawn_alert_dispatcher(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{AlertEvent, AlertType};
+
+    #[test]
+    fn send_without_subscriber_is_dropped() {
+        // Fire-and-forget: sending with no receivers must never panic.
+        let sender = AlertSender::new(4);
+        sender.send(AlertEvent::new(AlertType::WafAlert, "no subscriber"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_then_receives_event() {
+        let sender = AlertSender::new(8);
+        let mut rx = sender.subscribe();
+        sender.send(AlertEvent::new(AlertType::IpBanned, "1.2.3.4 banned"));
+        let got = rx.recv().await.expect("event should be delivered");
+        assert_eq!(got.alert_type.as_str(), "ip_banned");
+        assert_eq!(got.summary, "1.2.3.4 banned");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_task_drains_then_exits_on_channel_close() {
+        // spawn_alert_dispatcher drains queued events through an (empty)
+        // dispatcher and exits cleanly once the sender is dropped and the
+        // broadcast channel closes.
+        let sender = AlertSender::new(8);
+        let dispatcher = std::sync::Arc::new(tokio::sync::Mutex::new(NotifyDispatcher::new()));
+        let handle = spawn_alert_dispatcher(&sender, dispatcher);
+
+        sender.send(AlertEvent::new(AlertType::BackendDown, "b-1 down"));
+        drop(sender);
+
+        handle
+            .await
+            .expect("dispatcher task must exit cleanly when the channel closes");
+    }
 }

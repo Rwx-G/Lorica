@@ -188,7 +188,8 @@ capped at ≤ cert_ttl, typically 90 days for ACME Let's Encrypt, 1
 year for manual certs). Rotation invalidates all outstanding
 verdict cookies - an acceptable UX cost given the rotation cadence.
 
-Mechanism: the ACME renewal path (`src/acme/*`) and the manual cert
+Mechanism: the ACME renewal path (`lorica-api/src/acme/*`; the pure
+protocol core lives in the `lorica-acme` crate) and the manual cert
 upload path both call `lorica_challenge::rotate_hmac_secret()`
 after the new cert lands. Rotation is atomic (ArcSwap of the
 resolved secret bytes); in-flight requests on the old secret

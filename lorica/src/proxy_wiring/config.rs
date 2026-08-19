@@ -169,6 +169,13 @@ pub struct RouteEntry {
     /// path does not re-compile patterns on every hit. `None` when
     /// bot-protection is disabled or the UA bypass list is empty.
     pub bot_ua_regex_set: Option<Arc<regex::RegexSet>>,
+    /// Pre-parsed `ip_allowlist` / `ip_denylist` CIDRs (bare IPs become
+    /// host routes). Built once here so `check_ip_allow_deny` does not
+    /// re-parse every pattern per request. Unparseable entries are
+    /// dropped; the emptiness gate still reads `route.ip_allowlist` so an
+    /// all-malformed allowlist stays fail-closed.
+    pub ip_allowlist_nets: Vec<ipnet::IpNet>,
+    pub ip_denylist_nets: Vec<ipnet::IpNet>,
 }
 
 /// Runtime-side view of a route's mTLS policy: the bits we check at
@@ -196,8 +203,15 @@ pub struct ProxyConfig {
     /// Max total proxy connections. 503 when exceeded. 0 = unlimited.
     pub max_global_connections: u32,
     /// Global flood detection threshold (RPS). When exceeded, per-IP rate
-    /// limits are halved. 0 = disabled.
+    /// limits are tightened. 0 = disabled.
     pub flood_threshold_rps: u32,
+    /// Story 8.10 AC #2. Per-IP admission rate enforced during flood mode.
+    /// `0` = auto (resolves to `flood_threshold_rps / 2`, the historical
+    /// 0.5x factor). Only consulted when `flood_threshold_rps > 0`.
+    pub flood_strict_rps: u32,
+    /// Story 8.10 AC #1. Global header-phase read timeout (seconds) used
+    /// as a slowloris floor across every route. `0` = disabled.
+    pub header_timeout_s: u32,
     /// WAF auto-ban: ban IP after this many WAF blocks. 0 = disabled.
     pub waf_ban_threshold: u32,
     /// Duration of WAF-triggered bans in seconds.
@@ -208,18 +222,83 @@ pub struct ProxyConfig {
     pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Parsed CIDR ranges of IPs that bypass WAF, rate limiting, and auto-ban.
     pub waf_whitelist: Vec<ipnet::IpNet>,
+    /// Story 8.2 AC #3 - global default applied when an AI-bot
+    /// crawler's verification (Rdns / IpRanges) fails. Per-route
+    /// `Route.ai_bot_spoofed_fallback` overrides this.
+    pub ai_bot_treat_spoofed_as: lorica_config::models::SpoofedFallback,
+    /// Story 8.2 AC #11 - inject `X-Lorica-Verified-Bot` +
+    /// `X-Lorica-Bot-Verification` headers upstream when verification
+    /// confirms.
+    pub ai_bot_inject_headers: bool,
+    /// Story 8.9 AC #6 - global cap on pending bot challenges;
+    /// over-cap issuance answers 503 Retry-After instead of evicting
+    /// legitimate pending entries.
+    pub bot_stash_max_entries: u32,
+    /// Story 8.9 AC #6 - per-IP-prefix (/24 v4, /48 v6) cap on
+    /// pending bot challenges.
+    pub bot_stash_per_prefix_max: u32,
+    /// Story 8.9 AC #7 - per-route cap on concurrent mirror
+    /// sub-requests.
+    pub mirror_max_concurrent_per_route: u32,
+    /// Story 8.9 AC #7 - coarse global safety net across all routes'
+    /// mirror sub-requests.
+    pub mirror_max_concurrent_global: u32,
 }
 
 /// Global settings extracted from the config store for ProxyConfig construction.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ProxyConfigGlobals {
     pub custom_security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
     pub max_global_connections: u32,
     pub flood_threshold_rps: u32,
+    pub flood_strict_rps: u32,
+    pub header_timeout_s: u32,
     pub waf_ban_threshold: u32,
     pub waf_ban_duration_s: u32,
     pub trusted_proxy_cidrs: Vec<String>,
     pub waf_whitelist_cidrs: Vec<String>,
+    /// Story 8.2 AC #3 / #11. Both fields plumbed at config-load
+    /// time and exposed read-only on `ProxyConfig` for filter-chain
+    /// consumption (no hot-path settings lookup).
+    pub ai_bot_treat_spoofed_as: lorica_config::models::SpoofedFallback,
+    pub ai_bot_inject_headers: bool,
+    /// Story 8.9 AC #6 / #7 caps, same plumbing rationale.
+    pub bot_stash_max_entries: u32,
+    pub bot_stash_per_prefix_max: u32,
+    pub mirror_max_concurrent_per_route: u32,
+    pub mirror_max_concurrent_global: u32,
+}
+
+impl Default for ProxyConfigGlobals {
+    /// Hand-written so the two mirror concurrency caps seed to the same
+    /// values the production settings layer uses (`lorica-config`'s
+    /// `default_mirror_max_concurrent_per_route`/`_global`, currently
+    /// 32 / 4096) instead of `0`. A `0` cap is never produced in
+    /// production (the store parses these with `unwrap_or(32/4096)`),
+    /// and it would clamp the per-route mirror semaphore to a single
+    /// permit via `route_mirror_semaphore`'s `.max(1)`, starving every
+    /// shadow backend after the first. Keeping `default()` production-
+    /// faithful stops that footgun from biting config built in tests
+    /// and fallbacks. Every other field keeps its zero/empty default.
+    fn default() -> Self {
+        Self {
+            custom_security_presets: Vec::new(),
+            max_global_connections: 0,
+            flood_threshold_rps: 0,
+            flood_strict_rps: 0,
+            header_timeout_s: 0,
+            waf_ban_threshold: 0,
+            waf_ban_duration_s: 0,
+            trusted_proxy_cidrs: Vec::new(),
+            waf_whitelist_cidrs: Vec::new(),
+            ai_bot_treat_spoofed_as: lorica_config::models::SpoofedFallback::default(),
+            ai_bot_inject_headers: false,
+            bot_stash_max_entries: 0,
+            bot_stash_per_prefix_max: 0,
+            mirror_max_concurrent_per_route: 32,
+            mirror_max_concurrent_global: 4096,
+        }
+    }
 }
 
 impl ProxyConfig {
@@ -239,10 +318,18 @@ impl ProxyConfig {
             custom_security_presets,
             max_global_connections,
             flood_threshold_rps,
+            flood_strict_rps,
+            header_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs,
             waf_whitelist_cidrs,
+            ai_bot_treat_spoofed_as,
+            ai_bot_inject_headers,
+            bot_stash_max_entries,
+            bot_stash_per_prefix_max,
+            mirror_max_concurrent_per_route,
+            mirror_max_concurrent_global,
         } = globals;
         let backend_map: HashMap<String, Backend> = backends
             .into_iter()
@@ -471,6 +558,8 @@ impl ProxyConfig {
                 response_rewrite_compiled,
                 mtls_enforcer,
                 bot_ua_regex_set,
+                ip_allowlist_nets: super::filters::compile_ip_patterns(&route.ip_allowlist),
+                ip_denylist_nets: super::filters::compile_ip_patterns(&route.ip_denylist),
             });
 
             routes_by_host
@@ -564,10 +653,18 @@ impl ProxyConfig {
             security_presets: presets,
             max_global_connections,
             flood_threshold_rps,
+            flood_strict_rps,
+            header_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxies,
             waf_whitelist,
+            ai_bot_treat_spoofed_as,
+            ai_bot_inject_headers,
+            bot_stash_max_entries,
+            bot_stash_per_prefix_max,
+            mirror_max_concurrent_per_route,
+            mirror_max_concurrent_global,
         }
     }
 

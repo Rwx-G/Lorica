@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::Path;
+use axum::extract::{Path};
 use axum::response::IntoResponse;
 use axum::Extension;
 use axum::Json;
@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// GET /api/v1/loadtest/configs - list every saved load test configuration.
@@ -168,7 +169,10 @@ fn validate_target_url(
 
 /// POST /api/v1/loadtest/configs - create a new load test configuration. Target must match a configured route.
 pub async fn create_config(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateLoadTestConfig>,
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
     let target_url = body.target_url.clone();
@@ -205,6 +209,18 @@ pub async fn create_config(
     })
     .await?;
 
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let after = serde_json::to_value(&config).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "loadtest.config_create",
+        ("loadtest_config", &config.id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
     Ok(json_data_with_status(
         axum::http::StatusCode::CREATED,
         config,
@@ -240,13 +256,16 @@ pub struct UpdateLoadTestConfig {
 
 /// PUT /api/v1/loadtest/configs/:id - patch fields on a saved load test configuration.
 pub async fn update_config(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdateLoadTestConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let http_port = state.http_port;
     let https_port = state.https_port;
-    let config = db_blocking(&state.store, move |store| {
+    let (before_config, config) = db_blocking(&state.store, move |store| {
         if let Some(ref url) = body.target_url {
             validate_target_url(url, store, http_port, https_port)?;
         }
@@ -254,6 +273,7 @@ pub async fn update_config(
             .get_load_test_config(&id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::NotFound(format!("load test config {id}")))?;
+        let before_config = config.clone();
 
         if let Some(v) = body.name {
             config.name = v;
@@ -294,16 +314,32 @@ pub async fn update_config(
             .update_load_test_config(&config)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-        Ok::<_, ApiError>(config)
+        Ok::<_, ApiError>((before_config, config))
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(&before_config).ok();
+    let after = serde_json::to_value(&config).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "loadtest.config_update",
+        ("loadtest_config", &config.id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
 
     Ok(json_data(config))
 }
 
 /// DELETE /api/v1/loadtest/configs/:id - delete a saved load test configuration.
 pub async fn delete_config(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = db_blocking(&state.store, move |store| {
@@ -313,12 +349,27 @@ pub async fn delete_config(
         Ok::<_, ApiError>(id)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "loadtest.config_delete",
+        ("loadtest_config", &id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({"deleted": id})))
 }
 
 /// POST /api/v1/loadtest/start/:config_id - launch a load test, returning a confirmation requirement if it exceeds safe limits.
 pub async fn start_test(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(config_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let lookup_id = config_id.clone();
@@ -361,6 +412,19 @@ pub async fn start_test(
         engine.run(&config, &store).await;
     });
 
+    // Recorded only on the actual launch path, not on the
+    // requires_confirmation early return above.
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "loadtest.start",
+        ("loadtest_config", &config_id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({
         "status": "started",
         "config_id": config_id
@@ -369,7 +433,10 @@ pub async fn start_test(
 
 /// POST /api/v1/loadtest/start/:config_id/confirm - launch a load test that exceeds safe limits, after explicit user confirmation.
 pub async fn start_test_confirmed(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(config_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let lookup_id = config_id.clone();
@@ -395,6 +462,17 @@ pub async fn start_test_confirmed(
     state.task_tracker.spawn(async move {
         engine.run(&config, &store).await;
     });
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "loadtest.start",
+        ("loadtest_config", &config_id),
+        None,
+        None,
+    )
+    .await;
 
     Ok(json_data(serde_json::json!({
         "status": "started",
@@ -423,7 +501,10 @@ pub async fn get_status(
 
 /// POST /api/v1/loadtest/abort - request that the running load test stop.
 pub async fn abort_test(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let engine = state
         .load_test_engine
@@ -431,6 +512,18 @@ pub async fn abort_test(
         .ok_or_else(|| ApiError::Internal("load test engine not available".into()))?;
 
     engine.abort().await;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "loadtest.abort",
+        ("loadtest", ""),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({"status": "abort_requested"})))
 }
 
@@ -505,7 +598,7 @@ async fn handle_loadtest_stream(
                 None => r#"{"active":false}"#.to_string(),
             };
 
-            if sender.send(Message::Text(json)).await.is_err() {
+            if sender.send(Message::Text(json.into())).await.is_err() {
                 break; // Client disconnected
             }
         }
@@ -536,7 +629,10 @@ pub struct CloneConfig {
 
 /// POST /api/v1/loadtest/configs/:id/clone - duplicate a configuration so successive runs are comparable.
 pub async fn clone_config(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<CloneConfig>,
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
@@ -547,6 +643,19 @@ pub async fn clone_config(
             .map_err(|e| ApiError::Internal(e.to_string()))
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let after = serde_json::to_value(&cloned).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "loadtest.clone",
+        ("loadtest_config", &cloned.id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
     Ok(json_data_with_status(
         axum::http::StatusCode::CREATED,
         cloned,

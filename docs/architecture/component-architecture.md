@@ -1,5 +1,15 @@
 # Component Architecture
 
+> **Baseline note.** This is the v1.0 planning decomposition (the
+> "Phase 2 / Phase 3" markers are the original roadmap phasing). The
+> workspace has since grown to 30 crates; components added after this
+> blueprint and not described below include `lorica-acme` (pure ACME
+> core: DNS challengers + instant-acme driver), `lorica-metrics` (shared
+> Prometheus registry + cross-worker counter aggregation), `lorica-geoip`,
+> `lorica-challenge`, `lorica-shmem`, and `lorica-cache`. See
+> [FORK.md](../../FORK.md) and the README architecture table for the
+> current crate roster.
+
 ## New Components
 
 ### lorica (binary)

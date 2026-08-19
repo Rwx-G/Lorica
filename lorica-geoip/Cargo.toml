@@ -1,6 +1,6 @@
 [package]
 name = "lorica-geoip"
-version = "1.5.13"
+version = "1.6.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "GeoIP country-code lookup for Lorica, wrapping maxminddb"
@@ -12,7 +12,7 @@ repository = "https://github.com/Rwx-G/Lorica"
 # DB-IP Lite Country DB (CC-BY 4.0, no account required, monthly
 # refresh) is what Lorica targets out of the box. See the `NOTICE` /
 # docs for the required attribution.
-maxminddb = "0.27"
+maxminddb = "0.30"
 arc-swap = "1"
 thiserror = "2"
 tracing = "0.1"

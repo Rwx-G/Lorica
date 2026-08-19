@@ -383,28 +383,37 @@ impl ListenerEndpoint {
                     .or_err(AcceptError, "Fail to accept()")?;
 
                 // Performance: nested if-let avoids cloning/allocations on each connection accept
-                let should_accept = if let Some(digest) = stream.get_socket_digest() {
+                let verdict = if let Some(digest) = stream.get_socket_digest() {
                     if let Some(peer_addr) = digest.peer_addr() {
                         self.connection_filter
-                            .should_accept(peer_addr.as_inet())
+                            .try_accept(peer_addr.as_inet())
                             .await
                     } else {
                         // No peer address available - accept by default
-                        true
+                        super::AcceptVerdict::Accept(None)
                     }
                 } else {
                     // No socket digest available - accept by default
-                    true
+                    super::AcceptVerdict::Accept(None)
                 };
 
-                if !should_accept {
-                    debug!("Connection rejected by filter");
-                    drop(stream);
-                    continue;
+                match verdict {
+                    super::AcceptVerdict::Reject => {
+                        debug!("Connection rejected by filter");
+                        drop(stream);
+                        continue;
+                    }
+                    super::AcceptVerdict::Accept(permit) => {
+                        // The permit rides on the stream so counting
+                        // filters decrement exactly when the
+                        // connection closes (RAII, Story 8.9 AC #5).
+                        if let Some(permit) = permit {
+                            stream.set_accept_permit(permit);
+                        }
+                        self.apply_stream_settings(&mut stream)?;
+                        return Ok(stream);
+                    }
                 }
-
-                self.apply_stream_settings(&mut stream)?;
-                return Ok(stream);
             }
         }
         #[cfg(not(feature = "connection_filter"))]

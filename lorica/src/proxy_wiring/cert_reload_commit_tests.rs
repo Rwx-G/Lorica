@@ -120,6 +120,9 @@ fn make_route_referencing(route_id: &str, hostname: &str, cert_id: &str) -> lori
         geoip: None,
         bot_protection: None,
         group_name: String::new(),
+        ai_bot_policy: None,
+        ai_bot_spoofed_fallback: None,
+        serve_robots_txt: false,
         created_at: now,
         updated_at: now,
     }
@@ -183,6 +186,7 @@ async fn handle_config_reload_commit_reloads_cert_resolver() {
         ),
         connection_allow_cidrs: vec![],
         connection_deny_cidrs: vec![],
+        connection_limits_per_ip: None,
         mtls_fingerprint_drift: None,
     };
     let pending = Arc::new(parking_lot::Mutex::new(Some(PendingProxyConfig {
@@ -305,6 +309,7 @@ async fn handle_config_reload_commit_unreferenced_cert_stays_unloaded() {
         ),
         connection_allow_cidrs: vec![],
         connection_deny_cidrs: vec![],
+        connection_limits_per_ip: None,
         mtls_fingerprint_drift: None,
     };
     let pending = Arc::new(parking_lot::Mutex::new(Some(PendingProxyConfig {
@@ -402,6 +407,7 @@ async fn handle_config_reload_commit_stale_generation_replies_error_and_skips_re
             ),
             connection_allow_cidrs: vec![],
             connection_deny_cidrs: vec![],
+            connection_limits_per_ip: None,
             mtls_fingerprint_drift: None,
         },
     })));

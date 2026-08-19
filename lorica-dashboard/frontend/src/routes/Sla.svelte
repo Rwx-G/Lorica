@@ -7,6 +7,7 @@
     type SlaConfigResponse,
     type SlaBucket,
   } from '../lib/api';
+  import { canWrite } from '../lib/auth';
 
   let routes: RouteResponse[] = $state([]);
   let overview: SlaSummary[] = $state([]);
@@ -204,10 +205,14 @@
           <div class="detail-header">
             <h2>{getRouteHostname(selectedRouteId)}</h2>
             <div class="detail-actions">
-              <button class="btn btn-small" onclick={openConfigModal}>Configure</button>
+              {#if $canWrite}
+                <button class="btn btn-small" onclick={openConfigModal}>Configure</button>
+              {/if}
               <button class="btn btn-small" onclick={() => handleExport('csv')}>Export CSV</button>
               <button class="btn btn-small" onclick={() => handleExport('json')}>Export JSON</button>
-              <button class="btn btn-small btn-danger" onclick={() => (showClearModal = true)}>Clear SLA</button>
+              {#if $canWrite}
+                <button class="btn btn-small btn-danger" onclick={() => (showClearModal = true)}>Clear SLA</button>
+              {/if}
             </div>
           </div>
 

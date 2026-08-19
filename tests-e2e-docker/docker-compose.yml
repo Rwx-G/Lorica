@@ -97,7 +97,7 @@ services:
     volumes:
       - shared:/shared:ro
     environment:
-      - LORICA_API=http://lorica:9443
+      - LORICA_API=https://lorica:9443
       - LORICA_PROXY=http://lorica:8080
       - LORICA_PROXY_HTTPS=https://lorica:8443
       - BACKEND1_ADDR=backend1:80
@@ -126,7 +126,7 @@ services:
     volumes:
       - shared-workers:/shared:ro
     environment:
-      - LORICA_API=http://lorica-workers:9443
+      - LORICA_API=https://lorica-workers:9443
       - LORICA_PROXY=http://lorica-workers:8080
       - BACKEND1_ADDR=backend1:80
       - BACKEND2_ADDR=backend2:80
@@ -187,7 +187,7 @@ services:
     volumes:
       - shared-otel:/shared:ro
     environment:
-      - LORICA_API=http://lorica-otel:9443
+      - LORICA_API=https://lorica-otel:9443
       - LORICA_PROXY=http://lorica-otel:8080
       - JAEGER_QUERY=http://jaeger:16686
       - BACKEND1_ADDR=backend1:80
@@ -248,7 +248,7 @@ services:
     volumes:
       - shared-otel-workers:/shared:ro
     environment:
-      - LORICA_API=http://lorica-otel-workers:9443
+      - LORICA_API=https://lorica-otel-workers:9443
       - LORICA_PROXY=http://lorica-otel-workers:8080
       - JAEGER_QUERY=http://jaeger-workers:16686
       - OTLP_ENDPOINT=http://jaeger-workers:4318
@@ -295,7 +295,7 @@ services:
     volumes:
       - shared-geoip:/shared:ro
     environment:
-      - LORICA_API=http://lorica-geoip:9443
+      - LORICA_API=https://lorica-geoip:9443
       - LORICA_PROXY=http://lorica-geoip:8080
       - BACKEND1_ADDR=backend1:80
     networks:
@@ -334,7 +334,7 @@ services:
     volumes:
       - shared-bot:/shared:ro
     environment:
-      - LORICA_API=http://lorica-bot:9443
+      - LORICA_API=https://lorica-bot:9443
       - LORICA_PROXY=http://lorica-bot:8080
       - BACKEND1_ADDR=backend1:80
     networks:
@@ -375,7 +375,7 @@ services:
     volumes:
       - shared-bot-workers:/shared:ro
     environment:
-      - LORICA_API=http://lorica-bot-workers:9443
+      - LORICA_API=https://lorica-bot-workers:9443
       - LORICA_PROXY=http://lorica-bot-workers:8080
       - BACKEND1_ADDR=backend1:80
       # Counter aggregation now lands (v1.4.0 follow-up):
@@ -447,7 +447,7 @@ services:
     volumes:
       - shared-rdns:/shared:ro
     environment:
-      - LORICA_API=http://lorica-rdns:9443
+      - LORICA_API=https://lorica-rdns:9443
       - LORICA_PROXY=http://lorica-rdns:8080
       - BACKEND1_ADDR=backend1:80
       - DNSMASQ_ADDR=dnsmasq:53
@@ -509,16 +509,278 @@ services:
       # without a docker exec hop.
       - lorica-cert-export-data:/lorica-data:ro
     environment:
-      - LORICA_API=http://lorica-cert-export:9443
+      - LORICA_API=https://lorica-cert-export:9443
       - LORICA_PROXY=http://lorica-cert-export:8080
       - BACKEND1_ADDR=backend1:80
       - EXPORT_ROOT=/lorica-data/exported-certs
     networks:
       - e2e
 
+  # ---- AI / LLM crawler deny-list E2E (v1.6.0 Story 8.2, IV4) --------
+  # Runs the default Lorica image; the `ai-bot-smoke` runner drives
+  # everything over the management API (global AI-bot settings, route
+  # ai_bot_policy / ai_bot_spoofed_fallback / serve_robots_txt, and
+  # custom-crawler CRUD). No GeoIP fixture needed: the matrix keys on
+  # User-Agent classification + the runner's own e2e IP for the custom
+  # ip_ranges verified path. A built-in GPTBot (IpRanges) from the
+  # runner is always out-of-vendor-range, so it deterministically
+  # exercises the spoofed-fallback chain.
+  #
+  # Run with:
+  #   docker compose --profile ai-bot up --build
+  #   docker compose --profile ai-bot run --rm ai-bot-smoke
+  lorica-ai-bot:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["ai-bot"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-ai-bot-data:/var/lib/lorica
+      - shared-ai-bot:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  ai-bot-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["ai-bot"]
+    entrypoint: ["bash", "run-ai-bot-smoke.sh"]
+    depends_on:
+      - lorica-ai-bot
+    volumes:
+      - shared-ai-bot:/shared:ro
+    environment:
+      - LORICA_API=https://lorica-ai-bot:9443
+      - LORICA_PROXY=http://lorica-ai-bot:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
+  # AI-bot E2E in WORKER MODE. Same smoke, but Lorica runs with
+  # `--workers 2` so the custom-crawler hot-reload (AC #8) is exercised
+  # across the supervisor -> worker RPC propagation path and the
+  # check_ai_bot filter runs in the worker processes. Prometheus +
+  # in-process stats are supervisor-scoped, so the runner sets
+  # AI_BOT_SMOKE_SKIP_METRICS=1; all data-plane assertions still run.
+  lorica-ai-bot-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-workers.sh"]
+    profiles: ["ai-bot-workers"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-ai-bot-workers-data:/var/lib/lorica
+      - shared-ai-bot-workers:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  ai-bot-smoke-workers:
+    build:
+      context: ./test-runner
+    profiles: ["ai-bot-workers"]
+    entrypoint: ["bash", "run-ai-bot-smoke.sh"]
+    depends_on:
+      - lorica-ai-bot-workers
+    volumes:
+      - shared-ai-bot-workers:/shared:ro
+    environment:
+      - LORICA_API=https://lorica-ai-bot-workers:9443
+      - LORICA_PROXY=http://lorica-ai-bot-workers:8080
+      - BACKEND1_ADDR=backend1:80
+      - AI_BOT_SMOKE_SKIP_METRICS=1
+    networks:
+      - e2e
+
+  # ---- RBAC E2E (v1.6.0 Story 8.3, IV3) ------------------------------
+  # Exercises the three roles end-to-end: users CRUD, per-role 403
+  # matrix, session invalidation on role change / disable, the legacy
+  # {password}-only login shim, and the last-super-admin guards.
+  # Dedicated volumes: the smoke creates users and rotates the admin
+  # password, so its state must not leak into other profiles.
+  lorica-rbac:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["rbac"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-rbac-data:/var/lib/lorica
+      - shared-rbac:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  rbac-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["rbac"]
+    entrypoint: ["bash", "run-rbac-smoke.sh"]
+    depends_on:
+      - lorica-rbac
+    volumes:
+      - shared-rbac:/shared:ro
+    environment:
+      - LORICA_API=https://lorica-rbac:9443
+      - LORICA_PROXY=http://lorica-rbac:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
+  # RBAC E2E in WORKER MODE. Sessions, users and role checks are
+  # supervisor-only state; this profile proves the management API
+  # behaves identically when Lorica runs with --workers 2.
+  lorica-rbac-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-workers.sh"]
+    profiles: ["rbac-workers"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-rbac-workers-data:/var/lib/lorica
+      - shared-rbac-workers:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  rbac-smoke-workers:
+    build:
+      context: ./test-runner
+    profiles: ["rbac-workers"]
+    entrypoint: ["bash", "run-rbac-smoke.sh"]
+    depends_on:
+      - lorica-rbac-workers
+    volumes:
+      - shared-rbac-workers:/shared:ro
+    environment:
+      - LORICA_API=https://lorica-rbac-workers:9443
+      - LORICA_PROXY=http://lorica-rbac-workers:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
+  # ---- Audit-log E2E (v1.6.0 Story 8.9, IV1 + IV4) -------------------
+  # The lorica data volume is shared READ-WRITE with the smoke runner
+  # so the tamper step can mutate access-log.db directly with sqlite3
+  # (reproducing on-disk tampering the hash chain must detect).
+  lorica-audit:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["audit"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-audit-data:/var/lib/lorica
+      - shared-audit:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  audit-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["audit"]
+    entrypoint: ["bash", "run-audit-smoke.sh"]
+    # Runs as root so the IV4 tamper step can write access-log.db,
+    # which the lorica container owns as its unprivileged runtime uid.
+    user: "0:0"
+    depends_on:
+      - lorica-audit
+    volumes:
+      - shared-audit:/shared:ro
+      - lorica-audit-data:/lorica-data
+    environment:
+      - LORICA_API=https://lorica-audit:9443
+      - LORICA_PROXY=http://lorica-audit:8080
+      - BACKEND1_ADDR=backend1:80
+      - AUDIT_DB_PATH=/lorica-data/access-log.db
+    networks:
+      - e2e
+
+  # ---- Hot binary-upgrade E2E (v1.6.0 Story 8.4, IV1/IV3) ------------
+  # Boots Lorica in supervisor/workers mode (the zero-downtime handoff
+  # only exists in supervisor mode) and drives a live binary swap over
+  # the management API while sustained traffic flows through the proxy.
+  # The `shared-hot-upgrade` volume is mounted READ-WRITE in both the
+  # lorica service and the smoke runner: the entrypoint publishes the
+  # running binary at /shared/lorica-bin (so the runner can sign + re-
+  # upload the exact same executable) and the runner writes the test
+  # Ed25519 public key at /shared/upgrade-pubkey.hex (the path the smoke
+  # configures via `upgrade_signing_pubkey_path`). The keypair is
+  # generated fresh at test time, so no key material is committed.
+  #
+  # Run with:
+  #   docker compose --profile hot-upgrade up --build
+  #   docker compose --profile hot-upgrade run --rm hot-upgrade-smoke
+  lorica-hot-upgrade:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-hot-upgrade.sh"]
+    profiles: ["hot-upgrade"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Story 8.4 audit: point sd_notify at a datagram socket on the
+      # shared volume so the smoke runner can capture the READY=1 +
+      # MAINPID=<newpid> the NEW supervisor emits after the swap. Docker
+      # has no real systemd, so this exercises Lorica's emit side (payload,
+      # PID, post-handoff timing) - systemd's own MainPID reassignment is
+      # out of scope. At cold boot the socket is not yet bound, so that
+      # send fails harmlessly; the post-swap send lands on the runner's
+      # listener.
+      - NOTIFY_SOCKET=/shared/notify.sock
+    volumes:
+      - lorica-hot-upgrade-data:/var/lib/lorica
+      - shared-hot-upgrade:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  hot-upgrade-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["hot-upgrade"]
+    entrypoint: ["bash", "run-hot-upgrade-smoke.sh"]
+    # Run as root so the runner can WRITE the test public key into the
+    # `/shared` volume (owned by the unprivileged lorica user in the
+    # lorica container) and READ the published binary the entrypoint
+    # copied there. Same rationale as cert-export-smoke.
+    user: "0:0"
+    depends_on:
+      - lorica-hot-upgrade
+    volumes:
+      # Read-write: the runner writes the test public key into the same
+      # volume the lorica container reads it from, and reads the
+      # published binary the entrypoint copied in.
+      - shared-hot-upgrade:/shared
+    environment:
+      - LORICA_API=https://lorica-hot-upgrade:9443
+      - LORICA_PROXY=http://lorica-hot-upgrade:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
+  lorica-hot-upgrade-data:
+  shared-hot-upgrade:
   lorica-otel-data:
   lorica-otel-workers-data:
   lorica-geoip-data:
@@ -526,6 +788,10 @@ volumes:
   lorica-bot-workers-data:
   lorica-rdns-data:
   lorica-cert-export-data:
+  lorica-ai-bot-data:
+  lorica-ai-bot-workers-data:
+  lorica-rbac-data:
+  lorica-rbac-workers-data:
   shared:
   shared-workers:
   shared-bot-workers:
@@ -535,6 +801,12 @@ volumes:
   shared-bot:
   shared-rdns:
   shared-cert-export:
+  shared-ai-bot:
+  shared-ai-bot-workers:
+  shared-rbac:
+  shared-rbac-workers:
+  lorica-audit-data:
+  shared-audit:
 
 networks:
   e2e:

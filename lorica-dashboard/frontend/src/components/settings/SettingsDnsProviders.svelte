@@ -6,6 +6,7 @@
   } from '../../lib/api';
   import ConfirmDialog from '../ConfirmDialog.svelte';
   import { showToast } from '../../lib/toast';
+  import { isSuperAdmin } from '../../lib/auth';
 
   let {
     dnsProviders = $bindable([]),
@@ -167,11 +168,13 @@
                   <td class="settings-capitalize">{dp.provider_type}</td>
                   <td class="mono">{new Date(dp.created_at).toLocaleDateString()}</td>
                   <td class="settings-actions-cell">
-                    <button class="settings-btn-action settings-btn-test" onclick={() => handleTestDnsProvider(dp.id)} disabled={testingDnsProvider === dp.id}>
-                      {testingDnsProvider === dp.id ? 'Testing...' : 'Test'}
-                    </button>
-                    <button class="settings-btn-action settings-btn-edit" onclick={() => openDnsProviderEdit(dp)}>Edit</button>
-                    <button class="settings-btn-action settings-btn-delete" onclick={() => deletingDnsProvider = dp}>Delete</button>
+                    {#if $isSuperAdmin}
+                      <button class="settings-btn-action settings-btn-test" onclick={() => handleTestDnsProvider(dp.id)} disabled={testingDnsProvider === dp.id}>
+                        {testingDnsProvider === dp.id ? 'Testing...' : 'Test'}
+                      </button>
+                      <button class="settings-btn-action settings-btn-edit" onclick={() => openDnsProviderEdit(dp)}>Edit</button>
+                      <button class="settings-btn-action settings-btn-delete" onclick={() => deletingDnsProvider = dp}>Delete</button>
+                    {/if}
                   </td>
                 </tr>
               {/each}
@@ -179,9 +182,11 @@
           </table>
         </div>
       {/if}
-      <div class="settings-dialog-actions">
-        <button class="btn btn-primary" onclick={openDnsProviderCreate}>Add Provider</button>
-      </div>
+      {#if $isSuperAdmin}
+        <div class="settings-dialog-actions">
+          <button class="btn btn-primary" onclick={openDnsProviderCreate}>Add Provider</button>
+        </div>
+      {/if}
     </div>
   {/if}
 </section>

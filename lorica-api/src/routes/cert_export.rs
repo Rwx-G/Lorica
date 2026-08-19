@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// JSON body for `POST /api/v1/cert-export/acls`.
@@ -103,7 +104,10 @@ fn validate_pattern(raw: &str) -> Result<String, ApiError> {
 
 /// POST /api/v1/cert-export/acls - add a new ACL row.
 pub async fn create_acl(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateAclRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let pattern = validate_pattern(&body.hostname_pattern)?;
@@ -119,6 +123,19 @@ pub async fn create_acl(
         Ok::<_, lorica_config::ConfigError>(acl)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let after = serde_json::to_value(&acl).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "cert_export.acl_create",
+        ("cert_export_acl", &acl.id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
     Ok(json_data_with_status(
         StatusCode::CREATED,
         AclResponse {
@@ -151,7 +168,10 @@ pub async fn list_acls(
 
 /// DELETE /api/v1/cert-export/acls/:id - remove one ACL. Idempotent.
 pub async fn delete_acl(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = db_blocking(&state.store, move |store| {
@@ -159,6 +179,18 @@ pub async fn delete_acl(
         Ok::<_, lorica_config::ConfigError>(id)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "cert_export.acl_delete",
+        ("cert_export_acl", &id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({ "deleted": id })))
 }
 
@@ -168,7 +200,10 @@ pub async fn delete_acl(
 /// on-disk files realigned without waiting for the next ACME
 /// renewal.
 pub async fn reapply(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (settings, acls, certs) = db_blocking(&state.store, move |store| {
         let settings = store.get_global_settings()?;
@@ -178,6 +213,18 @@ pub async fn reapply(
     })
     .await?;
     let (ok, err, skipped) = crate::cert_export::reexport_all(&settings, &acls, &certs).await;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "cert_export.reapply",
+        ("cert_export", ""),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({
         "enabled": settings.cert_export_enabled,
         "exported": ok,
@@ -235,7 +282,10 @@ pub async fn list_orphans(
 /// live-cert re-check) before any filesystem write, so a stale or
 /// racy dashboard click cannot blow away a legitimate directory.
 pub async fn delete_orphan(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (settings, certs) = db_blocking(&state.store, move |store| {
@@ -257,6 +307,18 @@ pub async fn delete_orphan(
         removed,
         "cert export: orphan deletion requested"
     );
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "cert_export.orphan_delete",
+        ("cert_export_orphan", &name),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({
         "name": name,
         "removed": removed,

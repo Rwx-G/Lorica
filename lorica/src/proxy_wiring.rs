@@ -143,11 +143,10 @@ pub struct LoricaProxy {
     pub waf_engine: Arc<WafEngine>,
     /// Passive SLA metrics collector.
     pub sla_collector: Arc<SlaCollector>,
-    /// Per-route rate limiter (keyed by "route_id:client_ip").
-    pub rate_limiter: Arc<lorica_limits::rate::Rate>,
-    /// Ban list: maps banned IP addresses to (ban timestamp, ban duration in seconds).
-    /// Bans expire after the route-specific `auto_ban_duration_s`.
-    pub ban_list: Arc<DashMap<String, (Instant, u64)>>,
+    /// Ban list: maps banned IP addresses to (ban timestamp, ban
+    /// duration in seconds, ban reason). Bans expire after the
+    /// route-specific `auto_ban_duration_s`.
+    pub ban_list: Arc<lorica_api::ban::BanMap>,
     /// Rate limit violation counter (per minute) for auto-ban decisions.
     pub rate_violations: Arc<lorica_limits::rate::Rate>,
     /// Cumulative WAF block counter per IP for WAF auto-ban (single-process fallback).
@@ -297,10 +296,12 @@ pub use lb::{BackendConnections, CircuitBreaker, EwmaTracker};
 pub mod context;
 pub use context::RequestCtx;
 
+pub mod ai_bot_merged;
+
 pub mod filters;
 pub use filters::ip_to_shmem_key;
 #[cfg(test)]
-pub(crate) use filters::{build_redirect_location, ip_matches};
+pub(crate) use filters::build_redirect_location;
 
 pub mod worker_rpc;
 pub use worker_rpc::PendingProxyConfig;
@@ -322,7 +323,6 @@ impl LoricaProxy {
             ewma_tracker: Arc::new(EwmaTracker::new()),
             waf_engine: Arc::new(WafEngine::new()),
             sla_collector,
-            rate_limiter: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
             ban_list: Arc::new(DashMap::new()),
             rate_violations: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(60))),
             waf_violations: Arc::new(DashMap::new()),
@@ -617,6 +617,7 @@ impl ProxyHttp for LoricaProxy {
             waf_body_truncated: false,
             sticky_backend_id: None,
             forward_auth_inject: Vec::new(),
+            ai_bot_inject: Vec::new(),
             mirror_pending: None,
             mirror_body_state: None,
             breaker_probe_backend: None,
@@ -833,9 +834,11 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(handled);
             }
 
-            // Per-route token-bucket rate limit (structured config)
+            // Unified per-route rate limit (structured `rate_limit` struct
+            // or a legacy `rate_limit_rps` route synthesised through the
+            // compatibility shim). Story 8.10 AC #3/#4/#5.
             if let Some(handled) = self
-                .check_structured_rate_limit(session, ctx, entry, is_whitelisted)
+                .check_structured_rate_limit(session, ctx, entry, is_whitelisted, &config)
                 .await?
             {
                 return Ok(handled);
@@ -872,11 +875,34 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(handled);
             }
 
+            // Story 8.2 AC #10. Auto-served /robots.txt for routes
+            // that opted in via `Route.serve_robots_txt = true`.
+            // Lands BETWEEN return_status and ip_allow_deny so a
+            // decommissioned route (return_status=410) keeps
+            // returning 410 for /robots.txt too, while ip_allow_deny
+            // stays an access-policy gate that would over-block the
+            // public /robots.txt endpoint per RFC 9309.
+            if let Some(handled) = self.check_robots_txt(session, entry).await? {
+                return Ok(handled);
+            }
+
             // Per-route IP allowlist/denylist
             if let Some(ref ip) = check_ip {
                 if let Some(handled) = self.check_ip_allow_deny(session, ctx, entry, ip).await? {
                     return Ok(handled);
                 }
+            }
+
+            // Story 8.2 AC #1 + #3. AI / LLM crawler deny-list.
+            // Lands AFTER ip_allow_deny so a manually-allowlisted IP
+            // bypasses AI policy too, and BEFORE geoip so deny
+            // verdicts don't pay for the mmdb decode_path lookup
+            // unnecessarily.
+            if let Some(handled) = self
+                .check_ai_bot(session, ctx, entry, check_ip.as_deref(), &config)
+                .await?
+            {
+                return Ok(handled);
             }
 
             // Per-route GeoIP country filter; resolves the country once
@@ -894,9 +920,17 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(handled);
             }
 
-            // Slowloris detection (headers took too long to arrive)
+            // Slowloris detection (headers took too long to arrive). The
+            // global `header_timeout_s` (Story 8.10 AC #1) applies as a
+            // floor across every route on top of `slowloris_threshold_ms`.
             if let Some(handled) = self
-                .check_slowloris(session, ctx, entry, check_ip.as_deref())
+                .check_slowloris(
+                    session,
+                    ctx,
+                    entry,
+                    check_ip.as_deref(),
+                    config.header_timeout_s,
+                )
                 .await?
             {
                 return Ok(handled);
@@ -912,21 +946,6 @@ impl ProxyHttp for LoricaProxy {
 
             // Request body size limit + WAF body-scan cap (advertised CL)
             if let Some(handled) = self.check_body_limits(session, ctx, entry).await? {
-                return Ok(handled);
-            }
-
-            // Per-route legacy rate limiting (skipped for whitelisted IPs)
-            if let Some(handled) = self
-                .check_legacy_rate_limit(
-                    session,
-                    ctx,
-                    entry,
-                    check_ip.as_deref(),
-                    is_whitelisted,
-                    &config,
-                )
-                .await?
-            {
                 return Ok(handled);
             }
 
@@ -1102,6 +1121,13 @@ impl ProxyHttp for LoricaProxy {
             {
                 match body_state {
                     MirrorBodyState::Active(buf) => {
+                        let mirror_caps = {
+                            let cfg = self.config.load();
+                            (
+                                cfg.mirror_max_concurrent_per_route,
+                                cfg.mirror_max_concurrent_global,
+                            )
+                        };
                         spawn_mirrors(
                             &pending.cfg,
                             &pending.backends,
@@ -1111,6 +1137,7 @@ impl ProxyHttp for LoricaProxy {
                             Some(buf),
                             pending.request_id,
                             pending.route_id,
+                            mirror_caps,
                         );
                     }
                     MirrorBodyState::Overflowed => {
@@ -1921,6 +1948,21 @@ impl ProxyHttp for LoricaProxy {
             let _ = upstream_request.insert_header(name.clone(), value);
         }
 
+        // Story 8.2 AC #11 trust-laundering defense. Strip any
+        // client-supplied values for the Lorica-namespaced verified-bot
+        // headers BEFORE injecting our own, on EVERY upstream request.
+        // A non-bot request stages nothing in `ctx.ai_bot_inject`, so
+        // without this unconditional removal a client could forge
+        // `X-Lorica-Verified-Bot: GPTBot` and have it forwarded to the
+        // backend (which trusts the header). The subsequent inject uses
+        // insert_header (overwrite), NOT append_header, so a verified
+        // bot's value also replaces rather than augments any client value.
+        upstream_request.remove_header("X-Lorica-Verified-Bot");
+        upstream_request.remove_header("X-Lorica-Bot-Verification");
+        for (name, value) in &ctx.ai_bot_inject {
+            let _ = upstream_request.insert_header(name.clone(), value);
+        }
+
         Ok(())
     }
 
@@ -2480,3 +2522,6 @@ mod tests;
 
 #[cfg(test)]
 mod cert_reload_commit_tests;
+
+#[cfg(test)]
+mod ai_bot_reload_tests;

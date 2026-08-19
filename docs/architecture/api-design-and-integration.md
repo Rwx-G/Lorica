@@ -1,5 +1,12 @@
 # API Design and Integration
 
+> **Baseline note.** The endpoint list below is the v1.0 planning subset
+> and predates the RBAC, ACME, AI-crawler, audit-log, and hot-upgrade
+> routes. The authoritative, always-current API contract is
+> `lorica-api/openapi.yaml` (enforced against the live axum route table by
+> `lorica-api/tests/openapi_contract.rs`); the README "REST API Reference"
+> is the human-readable summary.
+
 ## API Integration Strategy
 
 **API Integration Strategy:** REST API over HTTPS on the management port. JSON request/response bodies. All state mutations go through the API - the dashboard and any future CLI are pure consumers.

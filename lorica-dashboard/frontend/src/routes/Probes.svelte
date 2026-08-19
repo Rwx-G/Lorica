@@ -10,6 +10,7 @@
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { showToast } from '../lib/toast';
+  import { canWrite } from '../lib/auth';
 
   let probes: ProbeConfigResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
@@ -157,7 +158,9 @@
 <div class="probes-page">
   <div class="page-header">
     <h1>Active Probes</h1>
-    <button class="btn btn-primary" onclick={openCreateForm} disabled={routes.length === 0}>Add Probe</button>
+    {#if $canWrite}
+      <button class="btn btn-primary" onclick={openCreateForm} disabled={routes.length === 0}>Add Probe</button>
+    {/if}
   </div>
 
   {#if error}
@@ -170,9 +173,9 @@
     <div class="empty-state">
       <p>No active probes configured.</p>
       <p class="text-muted small">Probes send synthetic health checks to backends at regular intervals.</p>
-      {#if routes.length > 0}
+      {#if routes.length > 0 && $canWrite}
         <button class="btn btn-primary" onclick={openCreateForm}>Add your first probe</button>
-      {:else}
+      {:else if routes.length === 0}
         <p class="text-muted small">Create a route first to add probes.</p>
       {/if}
     </div>
@@ -212,14 +215,16 @@
                   <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html historyIcon}
                 </button>
-                <button class="btn-icon" onclick={() => openEditForm(p)} title="Edit" aria-label="Edit">
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                  {@html editIcon}
-                </button>
-                <button class="btn-icon btn-icon-danger" onclick={() => (deletingProbe = p)} title="Delete" aria-label="Delete">
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                  {@html trashIcon}
-                </button>
+                {#if $canWrite}
+                  <button class="btn-icon" onclick={() => openEditForm(p)} title="Edit" aria-label="Edit">
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                    {@html editIcon}
+                  </button>
+                  <button class="btn-icon btn-icon-danger" onclick={() => (deletingProbe = p)} title="Delete" aria-label="Delete">
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                    {@html trashIcon}
+                  </button>
+                {/if}
               </td>
             </tr>
           {/each}

@@ -3,6 +3,7 @@
   import ConfirmDialog from '../ConfirmDialog.svelte';
   import { showToast } from '../../lib/toast';
   import { validateHeadersMapText } from '../../lib/validators';
+  import { isSuperAdmin } from '../../lib/auth';
 
   interface Props {
     customPresets: SecurityHeaderPreset[];
@@ -156,17 +157,21 @@
                 <td class="preset-desc">{Object.keys(cp.headers).length} header{Object.keys(cp.headers).length !== 1 ? 's' : ''}</td>
                 <td><span class="badge badge-custom">custom</span></td>
                 <td class="settings-actions-cell">
-                  <button class="settings-btn-action settings-btn-edit" onclick={() => openPresetEdit(idx)}>Edit</button>
-                  <button class="settings-btn-action settings-btn-delete" onclick={() => deletingPresetIdx = idx}>Delete</button>
+                  {#if $isSuperAdmin}
+                    <button class="settings-btn-action settings-btn-edit" onclick={() => openPresetEdit(idx)}>Edit</button>
+                    <button class="settings-btn-action settings-btn-delete" onclick={() => deletingPresetIdx = idx}>Delete</button>
+                  {/if}
                 </td>
               </tr>
             {/each}
           </tbody>
         </table>
       </div>
-      <div class="settings-dialog-actions">
-        <button class="btn btn-primary" onclick={openPresetCreate}>Add Preset</button>
-      </div>
+      {#if $isSuperAdmin}
+        <div class="settings-dialog-actions">
+          <button class="btn btn-primary" onclick={openPresetCreate}>Add Preset</button>
+        </div>
+      {/if}
     </div>
   {/if}
 </section>

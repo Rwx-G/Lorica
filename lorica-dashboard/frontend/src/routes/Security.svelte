@@ -1,12 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry } from '../lib/api';
+  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry, type AuditRecord, type AuditVerifyResult, type AuditQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { showToast } from '../lib/toast';
+  import { canWrite, isSuperAdmin } from '../lib/auth';
 
   let events: WafEvent[] = $state([]);
-  let stats: { total_events: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
+  let stats: { total_events: number; total_24h: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
     total_events: 0,
+    total_24h: 0,
     rule_count: 0,
     by_category: [],
   });
@@ -18,12 +20,25 @@
   let loading = $state(true);
   let error = $state('');
   let filterCategory = $state('');
-  let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' | 'bans' = $state('events');
+  let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' | 'bans' | 'audit' = $state('events');
   let showClearConfirm = $state(false);
   let bans: BanEntry[] = $state([]);
   let bansLoading = $state(false);
   let unbanningIp: string | null = $state(null);
   let bansRefreshTimer: ReturnType<typeof setInterval> | null = $state(null);
+
+  // Audit log (Story 8.9)
+  let auditEntries: AuditRecord[] = $state([]);
+  let auditTotal = $state(0);
+  let auditLoading = $state(false);
+  let auditLoadingMore = $state(false);
+  let auditOperator = $state('');
+  let auditAction = $state('');
+  let auditFrom = $state('');
+  let auditTo = $state('');
+  let auditLimit = $state(250);
+  let auditVerifyResult: AuditVerifyResult | null = $state(null);
+  let auditVerifying = $state(false);
 
   // Custom rule form
   let showCustomForm = $state(false);
@@ -112,6 +127,15 @@
       showToast(res.error.message, 'error');
     }
     unbanningIp = null;
+  }
+
+  function banReasonLabel(reason: BanEntry['reason']): string {
+    switch (reason) {
+      case 'rate_limit': return 'Rate Limit';
+      case 'waf_flood': return 'WAF Flood';
+      case 'waf_critical_rule': return 'WAF Critical Rule';
+      case 'manual': return 'Manual';
+    }
   }
 
   function formatDuration(seconds: number): string {
@@ -240,6 +264,53 @@
       return ts;
     }
   }
+
+  function auditBaseParams(): AuditQuery {
+    const params: AuditQuery = { limit: auditLimit };
+    if (auditOperator.trim()) params.operator = auditOperator.trim();
+    if (auditAction.trim()) params.action = auditAction.trim();
+    if (auditFrom) params.from = new Date(auditFrom).toISOString();
+    if (auditTo) params.to = new Date(auditTo).toISOString();
+    return params;
+  }
+
+  async function loadAudit() {
+    auditLoading = true;
+    const res = await api.listAudit(auditBaseParams());
+    if (res.error) {
+      showToast(res.error.message, 'error');
+    } else if (res.data) {
+      auditEntries = res.data.entries;
+      auditTotal = res.data.total;
+    }
+    auditLoading = false;
+  }
+
+  async function loadAuditOlder() {
+    if (auditEntries.length === 0 || auditLoadingMore) return;
+    auditLoadingMore = true;
+    const params = auditBaseParams();
+    params.before_id = auditEntries[auditEntries.length - 1].id;
+    const res = await api.listAudit(params);
+    if (res.error) {
+      showToast(res.error.message, 'error');
+    } else if (res.data) {
+      auditEntries = [...auditEntries, ...res.data.entries];
+      auditTotal = res.data.total;
+    }
+    auditLoadingMore = false;
+  }
+
+  async function verifyAuditChain() {
+    auditVerifying = true;
+    const res = await api.verifyAudit();
+    if (res.error) {
+      showToast(res.error.message, 'error');
+    } else if (res.data) {
+      auditVerifyResult = res.data;
+    }
+    auditVerifying = false;
+  }
 </script>
 
 <div class="security-page">
@@ -247,7 +318,7 @@
     <h1>Security</h1>
     <div class="header-actions">
       <button class="btn btn-secondary" onclick={loadData}>Refresh</button>
-      {#if activeTab === 'events' && events.length > 0}
+      {#if $canWrite && activeTab === 'events' && events.length > 0}
         <button class="btn btn-secondary" style="color: var(--color-red)" onclick={() => (showClearConfirm = true)}>Clear Events</button>
       {/if}
     </div>
@@ -262,6 +333,10 @@
     <div class="stat-card">
       <div class="stat-value">{rulesEnabled}/{stats.rule_count}</div>
       <div class="stat-label">Rules Enabled</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">{stats.total_24h}</div>
+      <div class="stat-label">Events (24h)</div>
     </div>
     <div class="stat-card">
       <div class="stat-value">{stats.total_events}</div>
@@ -299,6 +374,7 @@
         <span class="tab-badge-on">{bans.length}</span>
       {/if}
     </button>
+    <button class="tab" class:active={activeTab === 'audit'} onclick={() => { stopBansRefresh(); activeTab = 'audit'; loadAudit(); }}>Audit log</button>
   </div>
 
   {#if activeTab === 'events'}
@@ -390,7 +466,7 @@
                 <td>{rule.description}</td>
                 <td>
                   <label class="toggle">
-                    <input type="checkbox" checked={rule.enabled} onchange={() => toggleRule(rule.id, !rule.enabled)} />
+                    <input type="checkbox" checked={rule.enabled} disabled={!$canWrite} onchange={() => toggleRule(rule.id, !rule.enabled)} />
                     <span class="toggle-slider"></span>
                   </label>
                 </td>
@@ -403,13 +479,17 @@
   {:else if activeTab === 'custom'}
     <div class="custom-header">
       <p class="text-muted">User-defined WAF rules with custom regex patterns.</p>
-      <button class="btn btn-primary" onclick={openCustomForm}>+ Add Rule</button>
+      {#if $canWrite}
+        <button class="btn btn-primary" onclick={openCustomForm}>+ Add Rule</button>
+      {/if}
     </div>
 
     {#if customRules.length === 0}
       <div class="empty-state">
         <p>No custom WAF rules defined.</p>
-        <button class="btn btn-primary" onclick={openCustomForm}>Create your first rule</button>
+        {#if $canWrite}
+          <button class="btn btn-primary" onclick={openCustomForm}>Create your first rule</button>
+        {/if}
       </div>
     {:else}
       <div class="table-wrapper">
@@ -433,10 +513,12 @@
                 <td>{rule.description}</td>
                 <td class="mono matched-value" title={rule.pattern}>{rule.pattern}</td>
                 <td>
-                  <button class="btn-icon btn-icon-danger" onclick={() => (deletingCustomRule = rule)} title="Delete" aria-label="Delete">
-                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                    {@html trashIcon}
-                  </button>
+                  {#if $canWrite}
+                    <button class="btn-icon btn-icon-danger" onclick={() => (deletingCustomRule = rule)} title="Delete" aria-label="Delete">
+                      <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                      {@html trashIcon}
+                    </button>
+                  {/if}
                 </td>
               </tr>
             {/each}
@@ -515,7 +597,7 @@
             <p class="text-muted">Blocks known malicious IP addresses from accessing the proxy. Sourced from Data-Shield and refreshed every 6 hours.</p>
           </div>
           <label class="toggle">
-            <input type="checkbox" checked={blocklist.enabled} onchange={toggleBlocklist} />
+            <input type="checkbox" checked={blocklist.enabled} disabled={!$canWrite} onchange={toggleBlocklist} />
             <span class="toggle-slider"></span>
           </label>
         </div>
@@ -536,11 +618,13 @@
           <a href={blocklist.source} target="_blank" rel="noopener noreferrer" class="mono">{blocklist.source}</a>
         </div>
 
-        <div class="blocklist-actions">
-          <button class="btn btn-secondary" onclick={reloadBlocklist} disabled={blocklistLoading || !blocklist.enabled}>
-            {blocklistLoading ? 'Reloading...' : 'Reload Now'}
-          </button>
-        </div>
+        {#if $canWrite}
+          <div class="blocklist-actions">
+            <button class="btn btn-secondary" onclick={reloadBlocklist} disabled={blocklistLoading || !blocklist.enabled}>
+              {blocklistLoading ? 'Reloading...' : 'Reload Now'}
+            </button>
+          </div>
+        {/if}
       </div>
     </div>
   {:else if activeTab === 'bans'}
@@ -563,6 +647,7 @@
             <thead>
               <tr>
                 <th>IP Address</th>
+                <th>Reason</th>
                 <th>Banned</th>
                 <th>Expires In</th>
                 <th></th>
@@ -572,13 +657,24 @@
               {#each bans as ban (ban.ip)}
                 <tr>
                   <td class="mono">{ban.ip}</td>
+                  <td>
+                    <span
+                      class="ban-reason-badge"
+                      class:ban-reason-rate-limit={ban.reason === 'rate_limit'}
+                      class:ban-reason-waf-flood={ban.reason === 'waf_flood'}
+                      class:ban-reason-waf-critical={ban.reason === 'waf_critical_rule'}
+                      class:ban-reason-manual={ban.reason === 'manual'}
+                    >{banReasonLabel(ban.reason)}</span>
+                  </td>
                   <td>{formatDuration(ban.banned_seconds_ago)} ago</td>
                   <td>{formatDuration(ban.remaining_seconds)}</td>
                   <td>
-                    <button
-                      class="btn btn-danger btn-sm"
-                      onclick={() => (unbanningIp = ban.ip)}
-                    >Unban</button>
+                    {#if $canWrite}
+                      <button
+                        class="btn btn-danger btn-sm"
+                        onclick={() => (unbanningIp = ban.ip)}
+                      >Unban</button>
+                    {/if}
                   </td>
                 </tr>
               {/each}
@@ -597,6 +693,109 @@
         oncancel={() => (unbanningIp = null)}
       />
     {/if}
+  {:else if activeTab === 'audit'}
+    <div class="audit-section">
+      <p class="text-muted">
+        Tamper-evident record of every operator mutation. Hash-chained, newest first.
+      </p>
+
+      <div class="audit-filters">
+        <input
+          type="text"
+          class="audit-input"
+          placeholder="Operator..."
+          bind:value={auditOperator}
+          onkeydown={(e) => { if (e.key === 'Enter') loadAudit(); }}
+        />
+        <input
+          type="text"
+          class="audit-input"
+          placeholder="Action prefix..."
+          bind:value={auditAction}
+          onkeydown={(e) => { if (e.key === 'Enter') loadAudit(); }}
+        />
+        <label class="audit-date">
+          From
+          <input type="datetime-local" class="audit-input" bind:value={auditFrom} onchange={loadAudit} />
+        </label>
+        <label class="audit-date">
+          To
+          <input type="datetime-local" class="audit-input" bind:value={auditTo} onchange={loadAudit} />
+        </label>
+        <select class="audit-select" bind:value={auditLimit} onchange={loadAudit}>
+          <option value={100}>100</option>
+          <option value={250}>250</option>
+          <option value={500}>500</option>
+          <option value={1000}>1000</option>
+        </select>
+        <button class="btn btn-secondary" onclick={loadAudit}>Apply</button>
+        {#if $isSuperAdmin}
+          <button class="btn btn-secondary" onclick={verifyAuditChain} disabled={auditVerifying}>
+            {auditVerifying ? 'Verifying...' : 'Verify chain integrity'}
+          </button>
+        {/if}
+      </div>
+
+      {#if auditVerifyResult}
+        {#if auditVerifyResult.verified}
+          <div class="audit-verify audit-verify-ok" role="status">
+            Chain verified - {auditVerifyResult.total_rows} rows
+          </div>
+        {:else}
+          <div class="audit-verify audit-verify-broken" role="alert">
+            Chain BROKEN at row {auditVerifyResult.first_break_id}: {auditVerifyResult.first_break_reason}
+          </div>
+        {/if}
+      {/if}
+
+      {#if auditLoading}
+        <p class="loading">Loading...</p>
+      {:else if auditEntries.length === 0}
+        <div class="empty-state">
+          <p>No audit records match the current filters.</p>
+        </div>
+      {:else}
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Operator</th>
+                <th>Action</th>
+                <th>Target</th>
+                <th>IP</th>
+                <th>Chain</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each auditEntries as record (record.id)}
+                <tr>
+                  <td class="mono">{formatTime(record.timestamp)}</td>
+                  <td>
+                    {record.operator_username}
+                    <span class="role-pill">{record.operator_role}</span>
+                  </td>
+                  <td class="mono">{record.action}</td>
+                  <td class="mono">{record.target_type}:{record.target_id}</td>
+                  <td class="mono">{record.ip || '-'}</td>
+                  <td>
+                    <span class="mono" title={record.chain_hash}>{record.chain_hash.slice(0, 12)}</span>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+        <div class="audit-footer">
+          <span class="text-muted">{auditEntries.length} of {auditTotal} records</span>
+          {#if auditEntries.length < auditTotal}
+            <button class="btn btn-secondary" onclick={loadAuditOlder} disabled={auditLoadingMore}>
+              {auditLoadingMore ? 'Loading...' : 'Load older'}
+            </button>
+          {/if}
+        </div>
+      {/if}
+    </div>
   {/if}
 
   {#if showClearConfirm}
@@ -729,6 +928,19 @@
   }
   .action-blocked { background: var(--color-red-subtle); color: var(--color-red); }
   .action-detected { background: var(--color-orange-subtle); color: var(--color-orange); }
+
+  .ban-reason-badge {
+    display: inline-block;
+    padding: 0.125rem 0.5rem;
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .ban-reason-rate-limit { background: var(--color-orange-subtle); color: var(--color-orange); }
+  .ban-reason-waf-flood { background: var(--color-red-subtle); color: var(--color-red); }
+  .ban-reason-waf-critical { background: rgba(127, 29, 29, 0.18); color: #7f1d1d; }
+  .ban-reason-manual { background: var(--color-bg-muted, rgba(148, 163, 184, 0.18)); color: var(--color-text-muted); }
 
   .severity-critical {
     color: var(--color-red);
@@ -922,5 +1134,84 @@
   .btn-sm {
     padding: 0.25rem 0.625rem;
     font-size: 0.75rem;
+  }
+
+  /* Audit log */
+  .audit-section {
+    padding-top: var(--space-4);
+  }
+
+  .audit-section > .text-muted {
+    margin-bottom: var(--space-4);
+  }
+
+  .audit-filters {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+    margin-bottom: var(--space-4);
+  }
+
+  .audit-input,
+  .audit-select {
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-bg-input);
+    color: var(--color-text);
+    font-size: var(--text-md);
+  }
+
+  .audit-input:focus,
+  .audit-select:focus {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--color-primary-subtle);
+  }
+
+  .audit-date {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+  }
+
+  .role-pill {
+    display: inline-block;
+    padding: 0.0625rem 0.375rem;
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    background: var(--color-primary-subtle);
+    color: var(--color-primary);
+    margin-left: 0.375rem;
+    text-transform: uppercase;
+  }
+
+  .audit-verify {
+    padding: var(--space-3) var(--space-4);
+    border-radius: var(--radius-md);
+    margin-bottom: var(--space-4);
+    font-weight: 600;
+    font-size: var(--text-base);
+  }
+
+  .audit-verify-ok {
+    background: var(--color-green-subtle);
+    color: var(--color-green);
+  }
+
+  .audit-verify-broken {
+    background: var(--color-red-subtle);
+    color: var(--color-red);
+  }
+
+  .audit-footer {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    margin-top: var(--space-4);
   }
 </style>

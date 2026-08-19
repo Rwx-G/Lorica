@@ -10,3 +10,11 @@ Dockerfile* text eol=lf
 # rewrite the working copy to CRLF and silently change the embedded
 # bytes that `include_str!` ships into the test binary.
 *.pem text eol=lf
+# AI-bot vendor IP-list fixtures embedded via `include_bytes!` and
+# verified against a `.sha256` sidecar at startup. Same byte-stability
+# requirement as `*.pem` above : git autocrlf on Windows would rewrite
+# the working copy to CRLF, the embedded bytes ship with CRLF, the
+# SHA-256 in the sidecar (computed under LF) no longer matches, and
+# every vendor degrades to an empty range set (v1.6.0 Story 8.2).
+lorica/src/ai_bot/vendor_ips/*.json text eol=lf
+lorica/src/ai_bot/vendor_ips/*.sha256 text eol=lf

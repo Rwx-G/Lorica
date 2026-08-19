@@ -14,7 +14,7 @@
 
 //! Read and configure SLA windows, raw buckets, and CSV/JSON exports per route.
 
-use axum::extract::Path;
+use axum::extract::{Path};
 use axum::response::IntoResponse;
 use axum::Extension;
 use axum::Json;
@@ -23,6 +23,7 @@ use serde::Deserialize;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// GET /api/v1/sla/routes/:id - return passive SLA summaries for all standard windows (1h, 24h, 7d, 30d).
@@ -124,12 +125,15 @@ pub struct UpdateSlaConfig {
 
 /// PUT /api/v1/sla/routes/:id/config - patch SLA targets and refresh the live collector cache.
 pub async fn update_sla_config(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(route_id): Path<String>,
     Json(body): Json<UpdateSlaConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db_route_id = route_id.clone();
-    let config = db_blocking(&state.store, move |store| {
+    let (before_config, config) = db_blocking(&state.store, move |store| {
         store
             .get_route(&db_route_id)?
             .ok_or_else(|| ApiError::NotFound(format!("route {db_route_id}")))?;
@@ -137,6 +141,7 @@ pub async fn update_sla_config(
         let mut config = store
             .get_sla_config(&db_route_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let before_config = config.clone();
 
         if let Some(target) = body.target_pct {
             if !(0.0..=100.0).contains(&target) {
@@ -166,7 +171,7 @@ pub async fn update_sla_config(
             .upsert_sla_config(&config)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-        Ok(config)
+        Ok((before_config, config))
     })
     .await?;
 
@@ -174,6 +179,19 @@ pub async fn update_sla_config(
     if let Some(ref collector) = state.sla_collector {
         collector.set_sla_config(&route_id, config.clone());
     }
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(&before_config).ok();
+    let after = serde_json::to_value(&config).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "sla.config_update",
+        ("route", &route_id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
 
     Ok(json_data(config))
 }
@@ -289,7 +307,10 @@ pub async fn export_sla_data(
 
 /// DELETE /api/v1/sla/routes/:id/data - delete every persisted SLA bucket and clear the in-memory collector.
 pub async fn clear_route_sla(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(route_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db_route_id = route_id.clone();
@@ -308,6 +329,17 @@ pub async fn clear_route_sla(
     if let Some(ref collector) = state.sla_collector {
         collector.clear_route(&route_id);
     }
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "sla.data_clear",
+        ("route", &route_id),
+        None,
+        None,
+    )
+    .await;
 
     Ok(json_data(serde_json::json!({
         "route_id": route_id,

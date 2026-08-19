@@ -238,7 +238,9 @@ pub async fn serve_challenge(
     return_url: &str,
     content_type_prefers_html: bool,
     now: i64,
+    stash_caps: (u32, u32),
 ) -> lorica_core::Result<bool> {
+    let (stash_max_entries, stash_per_prefix_max) = stash_caps;
     let mode = match cfg.mode {
         BotProtectionMode::Cookie => Mode::Cookie,
         BotProtectionMode::Javascript => Mode::Javascript,
@@ -338,7 +340,7 @@ pub async fn serve_challenge(
             };
             let html = chrender::render_pow_page(&challenge, BOT_SOLVE_PATH, None);
 
-            engine
+            let outcome = engine
                 .insert(
                     nonce_hex.clone(),
                     PendingEntry {
@@ -353,8 +355,15 @@ pub async fn serve_challenge(
                         cookie_ttl_s: cfg.cookie_ttl_s,
                         expires_at: now + PENDING_TTL_S as i64,
                     },
+                    stash_max_entries,
+                    stash_per_prefix_max,
                 )
                 .await;
+            if outcome != lorica_config::BotStashInsertOutcome::Inserted {
+                lorica_api::metrics::inc_bot_challenge(route_id, mode_str, "stash_full");
+                return write_plain_retry_after(session, 503, "challenge capacity exhausted", 30)
+                    .await;
+            }
             html
         }
 
@@ -400,7 +409,7 @@ pub async fn serve_challenge(
             let image_url = format!("{BOT_CAPTCHA_PATH_PREFIX}{nonce}");
             let html = chrender::render_captcha_page(&image_url, BOT_SOLVE_PATH, &nonce, None);
 
-            engine
+            let outcome = engine
                 .insert(
                     nonce,
                     PendingEntry {
@@ -415,8 +424,15 @@ pub async fn serve_challenge(
                         cookie_ttl_s: cfg.cookie_ttl_s,
                         expires_at: now + PENDING_TTL_S as i64,
                     },
+                    stash_max_entries,
+                    stash_per_prefix_max,
                 )
                 .await;
+            if outcome != lorica_config::BotStashInsertOutcome::Inserted {
+                lorica_api::metrics::inc_bot_challenge(route_id, mode_str, "stash_full");
+                return write_plain_retry_after(session, 503, "challenge capacity exhausted", 30)
+                    .await;
+            }
             html
         }
     };
@@ -586,6 +602,29 @@ async fn write_plain(session: &mut Session, status: u16, msg: &str) -> lorica_co
     header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
     header.insert_header("Content-Length", msg.len().to_string())?;
     header.insert_header("Cache-Control", "no-store")?;
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(Bytes::copy_from_slice(msg.as_bytes())), true)
+        .await?;
+    Ok(true)
+}
+
+/// `write_plain` variant carrying a `Retry-After` header, used by the
+/// stash-capacity refusal (Story 8.9 AC #6) so polite clients back
+/// off instead of hammering the challenge endpoint.
+async fn write_plain_retry_after(
+    session: &mut Session,
+    status: u16,
+    msg: &str,
+    retry_after_s: u32,
+) -> lorica_core::Result<bool> {
+    let mut header = ResponseHeader::build(status, None)?;
+    header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+    header.insert_header("Content-Length", msg.len().to_string())?;
+    header.insert_header("Cache-Control", "no-store")?;
+    header.insert_header("Retry-After", retry_after_s.to_string())?;
     session
         .write_response_header(Box::new(header), false)
         .await?;

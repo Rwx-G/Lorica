@@ -5,6 +5,7 @@ When bumping the version, update ALL of these files:
 ## Product crate versions (package version)
 - [ ] `lorica/Cargo.toml` - `version`
 - [ ] `lorica-api/Cargo.toml` - `version`
+- [ ] `lorica-metrics/Cargo.toml` - `version` (follows product since v1.6.0)
 - [ ] `lorica-config/Cargo.toml` - `version`
 - [ ] `lorica-dashboard/Cargo.toml` - `version`
 - [ ] `lorica-bench/Cargo.toml` - `version`
@@ -13,11 +14,14 @@ When bumping the version, update ALL of these files:
 - [ ] `lorica-shmem/Cargo.toml` - `version`
 - [ ] `lorica-geoip/Cargo.toml` - `version` (follows product since v1.4.0)
 - [ ] `lorica-challenge/Cargo.toml` - `version` (follows product since v1.4.0)
+- [ ] `lorica-waf/Cargo.toml` - `version` (first-party; follows product since v1.6.0)
+- [ ] `lorica-notify/Cargo.toml` - `version` (first-party; follows product since v1.6.0)
+- [ ] `lorica-acme/Cargo.toml` - `version` (first-party; follows product since v1.6.0)
 
 ## Internal dependency references (cross-crate deps)
-- [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-bench, lorica-worker, lorica-command, lorica-shmem, lorica-geoip, lorica-challenge versions
-- [ ] `lorica-api/Cargo.toml` - lorica-config, lorica-dashboard, lorica-bench versions
-- [ ] `lorica-bench/Cargo.toml` - lorica-config version
+- [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-bench, lorica-worker, lorica-command, lorica-shmem, lorica-geoip, lorica-challenge, lorica-waf, lorica-notify versions
+- [ ] `lorica-api/Cargo.toml` - lorica-acme, lorica-config, lorica-dashboard, lorica-bench, lorica-metrics, lorica-waf, lorica-notify versions
+- [ ] `lorica-bench/Cargo.toml` - lorica-config, lorica-notify versions
 
 ## Frontend and API spec
 - [ ] `lorica-dashboard/frontend/package.json` - `version`
@@ -34,7 +38,7 @@ When bumping the version, update ALL of these files:
 - lorica-core, lorica-proxy, lorica-http, lorica-error, lorica-pool,
   lorica-timeout, lorica-header-serde, lorica-runtime, lorica-ketama,
   lorica-lb, lorica-cache, lorica-memory-cache, lorica-lru, lorica-limits,
-  lorica-waf, lorica-notify, lorica-tls, tinyufo
+  lorica-tls, tinyufo
 
 ## Drift checks (v1.5.2 audit M-15)
 

@@ -126,8 +126,8 @@ struct WorkerSnapshot {
     cache_hits: u64,
     cache_misses: u64,
     active_connections: u64,
-    /// (ip, remaining_seconds, ban_duration_seconds)
-    ban_entries: Vec<(String, u64, u64)>,
+    /// (ip, remaining_seconds, ban_duration_seconds, reason)
+    ban_entries: Vec<(String, u64, u64, crate::ban::BanReason)>,
     /// backend_address -> score_us
     ewma_scores: HashMap<String, f64>,
     /// backend_address -> active connections
@@ -160,7 +160,7 @@ impl AggregatedMetrics {
         cache_hits: u64,
         cache_misses: u64,
         active_connections: u64,
-        ban_entries: Vec<(String, u64, u64)>,
+        ban_entries: Vec<(String, u64, u64, crate::ban::BanReason)>,
         ewma_scores: HashMap<String, f64>,
         backend_connections: HashMap<String, u64>,
         request_counts: Vec<(String, u32, u64)>,
@@ -212,21 +212,25 @@ impl AggregatedMetrics {
             .sum()
     }
 
-    /// Union of ban lists from all workers. For duplicate IPs, keep the longest remaining ban.
-    pub async fn merged_ban_list(&self) -> Vec<(String, u64, u64)> {
+    /// Union of ban lists from all workers. For duplicate IPs, keep the
+    /// longest remaining ban (and its reason).
+    pub async fn merged_ban_list(&self) -> Vec<(String, u64, u64, crate::ban::BanReason)> {
+        use crate::ban::BanReason;
         let map = self.inner.read().await;
-        let mut merged: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut merged: HashMap<String, (u64, u64, BanReason)> = HashMap::new();
         for w in map.values() {
-            for (ip, remaining, duration) in &w.ban_entries {
-                let entry = merged.entry(ip.clone()).or_insert((0, 0));
+            for (ip, remaining, duration, reason) in &w.ban_entries {
+                let entry = merged
+                    .entry(ip.clone())
+                    .or_insert((0, 0, BanReason::RateLimit));
                 if *remaining > entry.0 {
-                    *entry = (*remaining, *duration);
+                    *entry = (*remaining, *duration, *reason);
                 }
             }
         }
         merged
             .into_iter()
-            .map(|(ip, (remaining, duration))| (ip, remaining, duration))
+            .map(|(ip, (remaining, duration, reason))| (ip, remaining, duration, reason))
             .collect()
     }
 
@@ -288,11 +292,43 @@ impl AggregatedMetrics {
 pub async fn get_workers(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workers = if let Some(ref metrics) = state.worker_metrics {
+    let workers = if let Some(metrics) = state.worker_metrics() {
         metrics.snapshot().await
     } else {
         vec![]
     };
     let total = workers.len();
     Ok(json_data(WorkersResponse { workers, total }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AggregatedMetrics;
+    use crate::ban::BanReason;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn merged_ban_list_carries_reason() {
+        let agg = AggregatedMetrics::new();
+        agg.update_worker(
+            1,
+            0,
+            0,
+            0,
+            vec![("10.0.0.1".to_string(), 120, 600, BanReason::WafFlood)],
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+
+        let merged = agg.merged_ban_list().await;
+        assert_eq!(merged.len(), 1);
+        let (ip, remaining, duration, reason) = &merged[0];
+        assert_eq!(ip, "10.0.0.1");
+        assert_eq!(*remaining, 120);
+        assert_eq!(*duration, 600);
+        assert_eq!(reason.as_str(), "waf_flood");
+    }
 }

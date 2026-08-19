@@ -276,4 +276,18 @@ impl RateLimitEngine {
             }
         }
     }
+
+    /// Current token count for the bucket keyed by `key`, or `None` when
+    /// no bucket exists yet. Read right after `try_consume` to fill the
+    /// `X-RateLimit-Remaining` response header (Story 8.10). `Authoritative`
+    /// applies any pending refill via `snapshot`; `Local` returns the
+    /// cached count.
+    pub fn remaining_tokens(&self, key: &str, now_ns: u64) -> Option<i64> {
+        match self {
+            RateLimitEngine::Authoritative(map) => {
+                map.get(key).map(|b| i64::from(b.value().snapshot(now_ns)))
+            }
+            RateLimitEngine::Local(map) => map.get(key).map(|b| b.value().tokens()),
+        }
+    }
 }

@@ -21,8 +21,21 @@
       return;
     }
 
-    if (newPassword.length < 12) {
-      error = 'Password must be at least 12 characters';
+    // UX mirror of the server-side policy (Story 8.3 AC #8):
+    // min 14 chars + one of each character class. The server stays
+    // authoritative (configurable via settings).
+    if ([...newPassword].length < 14) {
+      error = 'Password must be at least 14 characters';
+      return;
+    }
+    if (
+      !/[A-Z]/.test(newPassword) ||
+      !/[a-z]/.test(newPassword) ||
+      !/[0-9]/.test(newPassword) ||
+      !/[^a-zA-Z0-9]/.test(newPassword)
+    ) {
+      error =
+        'Password must contain an uppercase letter, a lowercase letter, a digit, and a symbol';
       return;
     }
 
@@ -36,7 +49,17 @@
       return;
     }
 
-    auth.set({ status: 'authenticated' });
+    // Restore the identity + role for the RBAC-aware UI.
+    const me = await api.getMe();
+    if (me.data) {
+      auth.set({
+        status: 'authenticated',
+        username: me.data.username,
+        role: me.data.role,
+      });
+    } else {
+      auth.set({ status: 'unauthenticated' });
+    }
     loading = false;
   }
 </script>
@@ -76,7 +99,7 @@
             bind:value={newPassword}
             required
             autocomplete="new-password"
-            minlength="12"
+            minlength="14"
           />
           <button type="button" class="toggle-pw" onclick={() => (showNew = !showNew)} aria-label={showNew ? 'Hide password' : 'Show password'}>
             <!-- eslint-disable-next-line svelte/no-at-html-tags -->

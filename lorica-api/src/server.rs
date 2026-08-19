@@ -53,6 +53,14 @@ pub const BODY_CAP_REAPPLY: usize = 4 * 1024;
 /// Body cap for the TOML config import endpoint.
 pub const BODY_CAP_CONFIG_IMPORT: usize = 2 * 1024 * 1024;
 
+/// Body cap for the hot binary-upgrade endpoint (Story 8.4). The
+/// multipart body carries a full `lorica` executable plus a detached
+/// signature, so the limit is generous (128 MiB) relative to every
+/// other endpoint. The Ed25519 verification gate downstream rejects
+/// any payload that is not a correctly-signed binary, so the large cap
+/// is not a free write primitive.
+pub const BODY_CAP_UPGRADE: usize = 128 * 1024 * 1024;
+
 /// Body cap for ACME provisioning (carries domains + DNS provider
 /// id, modest JSON).
 pub const BODY_CAP_ACME: usize = 16 * 1024;
@@ -89,6 +97,9 @@ pub const RL_DESTRUCTIVE_CUD: u32 = 60;
 /// Forensics-trail wipe (logs clear, WAF events clear). Tight cap
 /// so a stolen session cookie cannot flush the trail in one call.
 pub const RL_LOGS_CLEAR: u32 = 1;
+/// Users CRUD (Story 8.3). Moderate cap : account management is
+/// low-frequency, and create/update run an argon2 hash per call.
+pub const RL_USERS: u32 = 20;
 
 /// Type-erased metrics refresher closure (WPAR-7 pull-on-scrape).
 ///
@@ -100,6 +111,71 @@ pub const RL_LOGS_CLEAR: u32 = 1;
 /// /metrics handler awaits it with a bounded overall timeout.
 pub type MetricsRefresher =
     Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// Channel the `POST /api/v1/system/upgrade` handler uses to signal the
+/// supervisor that a verified binary has been staged and the
+/// zero-downtime handoff (Story 8.4) should begin. The payload is the
+/// staged binary plus the SHA-256 verified at stage time
+/// ([`crate::upgrade::StagedBinary`]), so the supervisor can re-hash the
+/// on-disk binary just before exec (audit M7).
+///
+/// `None` in single-process mode and tests, where there is no supervisor
+/// to fork a replacement; the upload then stages only. Bounded capacity
+/// (1): a concurrent second upgrade attempt while a handoff is in flight
+/// is shed rather than queued.
+pub type UpgradeTrigger = tokio::sync::mpsc::Sender<crate::upgrade::StagedBinary>;
+
+/// Deployment mode of the API process, carrying the proxy-side handles
+/// that are valid only for that mode.
+///
+/// Encoding the mode as an enum (rather than a dozen independent
+/// `Option<Arc<...>>` fields on [`AppState`]) makes invalid handle
+/// combinations unrepresentable: a single-process API holds direct
+/// in-process proxy handles, a supervisor API holds handles aggregated
+/// over RPC from workers, and the two sets can no longer coexist or go
+/// half-populated (audit backlog #42b).
+#[derive(Clone)]
+pub enum Mode {
+    /// Single-process: the API shares the proxy's in-process handles directly.
+    SingleProcess {
+        /// Cache hit counter shared with the proxy engine.
+        cache_hits: Arc<AtomicU64>,
+        /// Cache miss counter shared with the proxy engine.
+        cache_misses: Arc<AtomicU64>,
+        /// Ban list shared with the proxy engine: IP -> (ban timestamp,
+        /// ban duration in seconds, ban reason).
+        ban_list: Arc<crate::ban::BanMap>,
+        /// EWMA scores per backend address (microseconds). Shared with
+        /// the proxy engine.
+        ewma_scores: Arc<DashMap<String, f64>>,
+        /// Per-backend active connection counters. Shared with the proxy engine.
+        backend_connections: Arc<crate::connections::BackendConnections>,
+        /// Cache backend for purging cached entries.
+        cache_backend: &'static lorica_cache::MemCache,
+    },
+    /// Supervisor/worker: proxy metrics arrive aggregated over RPC from workers.
+    Supervisor {
+        /// Per-worker heartbeat metrics.
+        worker_metrics: Arc<WorkerMetrics>,
+        /// Aggregated proxy metrics from worker processes.
+        aggregated_metrics: Arc<crate::workers::AggregatedMetrics>,
+        /// Pipelined metrics refresh closure (WPAR-7 pull-on-scrape).
+        /// `Some` once the supervisor has wired the `MetricsPullCoordinator`;
+        /// `None` until it registers the first worker RPC endpoint. Called
+        /// from the `/metrics` handler before reading `aggregated_metrics`
+        /// so Prometheus scrapes see sub-second fresh data. Internally
+        /// dedups: concurrent scrapes within a short window collapse into a
+        /// single supervisor fan-out.
+        metrics_refresher: Option<MetricsRefresher>,
+        /// Channel to the supervisor's hot-upgrade orchestration (Story 8.4).
+        /// The `POST /api/v1/system/upgrade` handler sends the staged binary
+        /// here after a successful verify+stage to start the zero-downtime
+        /// handoff.
+        upgrade_trigger: UpgradeTrigger,
+    },
+    /// Test harness: no proxy-side handles.
+    Test,
+}
 
 /// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]
@@ -129,8 +205,11 @@ pub struct AppState {
     /// Sender that signals the proxy engine to reload its configuration.
     /// Incremented on each mutation. `None` in tests or when no proxy is running.
     pub config_reload_tx: Option<watch::Sender<u64>>,
-    /// Per-worker heartbeat metrics. `None` in single-process mode.
-    pub worker_metrics: Option<Arc<WorkerMetrics>>,
+    /// Deployment mode plus the proxy-side handles valid only for that
+    /// mode. Encoding it as an enum makes invalid handle combinations
+    /// (single-process direct handles AND supervisor aggregated handles
+    /// at once) unrepresentable (audit backlog #42b).
+    pub mode: Mode,
     /// WAF event ring buffer. `None` if WAF engine not initialized.
     pub waf_event_buffer: Option<Arc<parking_lot::Mutex<VecDeque<lorica_waf::WafEvent>>>>,
     /// WAF engine reference for rule management. `None` if not initialized.
@@ -145,19 +224,6 @@ pub struct AppState {
     pub sla_collector: Option<Arc<lorica_bench::SlaCollector>>,
     /// Load test engine.
     pub load_test_engine: Option<Arc<lorica_bench::LoadTestEngine>>,
-    /// Cache hit counter shared with the proxy engine.
-    pub cache_hits: Option<Arc<AtomicU64>>,
-    /// Cache miss counter shared with the proxy engine.
-    pub cache_misses: Option<Arc<AtomicU64>>,
-    /// Ban list shared with the proxy engine: IP -> (ban timestamp, ban duration in seconds).
-    pub ban_list: Option<Arc<DashMap<String, (std::time::Instant, u64)>>>,
-    /// Cache backend for purging cached entries.
-    pub cache_backend: Option<&'static lorica_cache::MemCache>,
-    /// EWMA scores per backend address (microseconds). Shared with the proxy engine.
-    pub ewma_scores: Option<Arc<DashMap<String, f64>>>,
-    /// Per-backend active connection counters. Shared with the proxy engine.
-    /// `None` in supervisor mode (use aggregated_metrics instead).
-    pub backend_connections: Option<Arc<crate::connections::BackendConnections>>,
     /// Notification event history ring buffer (shared with NotifyDispatcher).
     pub notification_history: Option<Arc<parking_lot::Mutex<VecDeque<lorica_notify::AlertEvent>>>>,
     /// Persistent access log store (SQLite). `None` in tests or worker mode.
@@ -168,17 +234,6 @@ pub struct AppState {
     /// directly). The clear endpoints flush it before wiping so a
     /// forensics wipe cannot be trailed by stale in-flight rows.
     pub log_writer: Option<crate::log_writer::LogWriteHandle>,
-    /// Aggregated proxy metrics from worker processes. `None` in single-process mode.
-    pub aggregated_metrics: Option<Arc<crate::workers::AggregatedMetrics>>,
-    /// Pipelined metrics refresh closure (WPAR-7 pull-on-scrape).
-    /// `Some` in worker mode when the supervisor has wired the
-    /// `MetricsPullCoordinator`; `None` in single-process mode or
-    /// when the supervisor has not yet registered any worker RPC
-    /// endpoint. Called from the `/metrics` handler before reading
-    /// `aggregated_metrics` so Prometheus scrapes see sub-second
-    /// fresh data. Internally dedups: concurrent scrapes within a
-    /// short window collapse into a single supervisor fan-out.
-    pub metrics_refresher: Option<MetricsRefresher>,
     /// Tracker for background tasks that must be drained on graceful
     /// shutdown (ACME polling, session-store writes, WAF refresh,
     /// backend drain watchdog, etc.). The supervisor shutdown path
@@ -189,6 +244,117 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Single-process cache hit counter. `None` outside single-process mode.
+    pub fn cache_hits(&self) -> Option<&Arc<AtomicU64>> {
+        if let Mode::SingleProcess { cache_hits, .. } = &self.mode {
+            Some(cache_hits)
+        } else {
+            None
+        }
+    }
+
+    /// Single-process cache miss counter. `None` outside single-process mode.
+    pub fn cache_misses(&self) -> Option<&Arc<AtomicU64>> {
+        if let Mode::SingleProcess { cache_misses, .. } = &self.mode {
+            Some(cache_misses)
+        } else {
+            None
+        }
+    }
+
+    /// Single-process ban list shared with the proxy engine. `None`
+    /// outside single-process mode.
+    pub fn ban_list(&self) -> Option<&Arc<crate::ban::BanMap>> {
+        if let Mode::SingleProcess { ban_list, .. } = &self.mode {
+            Some(ban_list)
+        } else {
+            None
+        }
+    }
+
+    /// Single-process per-backend EWMA scores. `None` outside
+    /// single-process mode.
+    pub fn ewma_scores(&self) -> Option<&Arc<DashMap<String, f64>>> {
+        if let Mode::SingleProcess { ewma_scores, .. } = &self.mode {
+            Some(ewma_scores)
+        } else {
+            None
+        }
+    }
+
+    /// Single-process per-backend active connection counters. `None`
+    /// outside single-process mode.
+    pub fn backend_connections(&self) -> Option<&Arc<crate::connections::BackendConnections>> {
+        if let Mode::SingleProcess {
+            backend_connections,
+            ..
+        } = &self.mode
+        {
+            Some(backend_connections)
+        } else {
+            None
+        }
+    }
+
+    /// Single-process cache backend for purging. `None` outside
+    /// single-process mode.
+    pub fn cache_backend(&self) -> Option<&'static lorica_cache::MemCache> {
+        if let Mode::SingleProcess { cache_backend, .. } = &self.mode {
+            Some(cache_backend)
+        } else {
+            None
+        }
+    }
+
+    /// Supervisor per-worker heartbeat metrics. `None` outside
+    /// supervisor mode.
+    pub fn worker_metrics(&self) -> Option<&Arc<WorkerMetrics>> {
+        if let Mode::Supervisor { worker_metrics, .. } = &self.mode {
+            Some(worker_metrics)
+        } else {
+            None
+        }
+    }
+
+    /// Supervisor aggregated proxy metrics from workers. `None` outside
+    /// supervisor mode.
+    pub fn aggregated_metrics(&self) -> Option<&Arc<crate::workers::AggregatedMetrics>> {
+        if let Mode::Supervisor {
+            aggregated_metrics, ..
+        } = &self.mode
+        {
+            Some(aggregated_metrics)
+        } else {
+            None
+        }
+    }
+
+    /// Supervisor pull-on-scrape metrics refresher. `None` outside
+    /// supervisor mode, or before the first worker RPC endpoint registers.
+    pub fn metrics_refresher(&self) -> Option<&MetricsRefresher> {
+        if let Mode::Supervisor {
+            metrics_refresher, ..
+        } = &self.mode
+        {
+            metrics_refresher.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Supervisor hot-upgrade handoff channel. `None` outside supervisor
+    /// mode (single-process and tests stage only).
+    pub fn upgrade_trigger(&self) -> Option<&UpgradeTrigger> {
+        if let Mode::Supervisor {
+            upgrade_trigger, ..
+        } = &self.mode
+        {
+            Some(upgrade_trigger)
+        } else {
+            None
+        }
+    }
+
     /// Signal the proxy engine to reload its configuration from the database.
     pub fn notify_config_changed(&self) {
         if let Some(tx) = &self.config_reload_tx {
@@ -302,13 +468,21 @@ pub fn build_router(
         .route("/api/v1/auth/login", post(crate::auth::login))
         .route("/api/v1/auth/logout", post(crate::auth::logout));
 
-    // Metrics and ACME challenge endpoints (no auth)
+    // `/metrics` carries an opt-in auth gate (Story 8.8 AC #4/#5):
+    // pass-through when `metrics_require_auth` is off (the default),
+    // else a session cookie OR the bearer scrape token is required. The
+    // ACME challenge stays fully public (the CA reaches it un
+    // authenticated), so the two endpoints are split into separate
+    // sub-routers and only `/metrics` gets the layer.
     let metrics_routes = Router::new()
         .route("/metrics", get(crate::metrics::get_metrics))
-        .route(
-            "/.well-known/acme-challenge/:token",
-            get(crate::acme::serve_challenge),
-        );
+        .layer(middleware::from_fn(
+            crate::middleware::metrics_auth::metrics_auth,
+        ));
+    let acme_challenge_routes = Router::new().route(
+        "/.well-known/acme-challenge/{token}",
+        get(crate::acme::serve_challenge),
+    );
 
     // Protected routes (auth required)
     let protected_routes = Router::new()
@@ -320,6 +494,27 @@ pub fn build_router(
                 RL_WINDOW_S,
             )),
         )
+        .route("/api/v1/auth/me", get(crate::auth::me))
+        // Admin audit log (Story 8.9). Role floors live in the
+        // authorize middleware: /audit is Operator+, /audit/verify
+        // is SuperAdmin-only.
+        .route("/api/v1/audit", get(crate::audit::list_audit))
+        .route("/api/v1/audit/verify", get(crate::audit::verify_audit))
+        // Users CRUD (Story 8.3 AC #5). SuperAdmin-only for every
+        // method, enforced by the authorize middleware.
+        .route(
+            "/api/v1/users",
+            get(crate::users::list_users)
+                .post(crate::users::create_user)
+                .layer(rl("users", RL_USERS, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/users/{id}",
+            get(crate::users::get_user)
+                .put(crate::users::update_user)
+                .delete(crate::users::delete_user)
+                .layer(rl("users", RL_USERS, RL_WINDOW_S)),
+        )
         .route("/api/v1/routes", get(crate::routes::list_routes))
         .route(
             "/api/v1/routes",
@@ -327,15 +522,15 @@ pub fn build_router(
                 .layer(bl(BODY_CAP_DEFAULT))
                 .layer(rl("routes_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
         )
-        .route("/api/v1/routes/:id", get(crate::routes::get_route))
+        .route("/api/v1/routes/{id}", get(crate::routes::get_route))
         .route(
-            "/api/v1/routes/:id",
+            "/api/v1/routes/{id}",
             put(crate::routes::update_route)
                 .layer(bl(BODY_CAP_DEFAULT))
                 .layer(rl("routes_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
         )
         .route(
-            "/api/v1/routes/:id",
+            "/api/v1/routes/{id}",
             delete(crate::routes::delete_route).layer(rl("routes_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
         )
         .route(
@@ -347,7 +542,7 @@ pub fn build_router(
             post(crate::routes::validate_forward_auth),
         )
         .route(
-            "/api/v1/cache/routes/:id",
+            "/api/v1/cache/routes/{id}",
             delete(crate::cache::purge_route_cache).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -357,7 +552,7 @@ pub fn build_router(
         .route("/api/v1/cache/stats", get(crate::cache::get_cache_stats))
         .route("/api/v1/bans", get(crate::cache::list_bans))
         .route(
-            "/api/v1/bans/:ip",
+            "/api/v1/bans/{ip}",
             delete(crate::cache::delete_ban).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -373,9 +568,9 @@ pub fn build_router(
                 RL_WINDOW_S,
             )),
         )
-        .route("/api/v1/backends/:id", get(crate::backends::get_backend))
+        .route("/api/v1/backends/{id}", get(crate::backends::get_backend))
         .route(
-            "/api/v1/backends/:id",
+            "/api/v1/backends/{id}",
             put(crate::backends::update_backend).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -383,7 +578,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/backends/:id",
+            "/api/v1/backends/{id}",
             delete(crate::backends::delete_backend).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -409,17 +604,17 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/certificates/:id",
+            "/api/v1/certificates/{id}",
             get(crate::certificates::get_certificate),
         )
         .route(
-            "/api/v1/certificates/:id",
+            "/api/v1/certificates/{id}",
             put(crate::certificates::update_certificate)
                 .layer(bl(BODY_CAP_PEM))
                 .layer(rl("cert_create", RL_CERT_CREATE, RL_WINDOW_S)),
         )
         .route(
-            "/api/v1/certificates/:id",
+            "/api/v1/certificates/{id}",
             delete(crate::certificates::delete_certificate).layer(rl(
                 "cert_create",
                 RL_CERT_CREATE,
@@ -427,7 +622,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/certificates/:id/download",
+            "/api/v1/certificates/{id}/download",
             get(crate::certificates::download_certificate),
         )
         .route(
@@ -443,7 +638,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/cert-export/acls/:id",
+            "/api/v1/cert-export/acls/{id}",
             delete(crate::routes::cert_export::delete_acl).layer(rl(
                 "cert_export_acls",
                 RL_CERT_EXPORT_ACLS,
@@ -465,7 +660,7 @@ pub fn build_router(
             get(crate::routes::cert_export::list_orphans),
         )
         .route(
-            "/api/v1/cert-export/orphans/:name",
+            "/api/v1/cert-export/orphans/{name}",
             delete(crate::routes::cert_export::delete_orphan).layer(rl(
                 "cert_export_acls",
                 100,
@@ -484,6 +679,17 @@ pub fn build_router(
         .route("/api/v1/logs/export", get(crate::logs::export_logs))
         .route("/api/v1/logs/ws", get(crate::logs::logs_ws))
         .route("/api/v1/system", get(crate::system::get_system))
+        // Story 8.4 hot binary upgrade: upload + Ed25519-verify + stage
+        // a new `lorica` executable. Generous body cap (carries a full
+        // binary) and the `destructive_cud` bucket since a successful
+        // call stages a replacement executable. Story 8.3 RBAC will
+        // retag this SuperAdmin-only.
+        .route(
+            "/api/v1/system/upgrade",
+            post(crate::upgrade::upgrade_binary)
+                .layer(bl(BODY_CAP_UPGRADE))
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
         .route("/api/v1/workers", get(crate::workers::get_workers))
         .route("/api/v1/config/export", post(crate::config::export_config))
         .route(
@@ -498,12 +704,54 @@ pub fn build_router(
                 .layer(bl(BODY_CAP_CONFIG_IMPORT))
                 .layer(rl("config_import", RL_CONFIG_IMPORT, RL_WINDOW_S)),
         )
+        .route(
+            "/api/v1/ai-crawlers/custom",
+            get(crate::ai_crawlers::list_custom_crawlers),
+        )
+        .route(
+            "/api/v1/ai-crawlers/custom",
+            post(crate::ai_crawlers::create_custom_crawler)
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/ai-crawlers/custom/{id}",
+            put(crate::ai_crawlers::update_custom_crawler)
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/ai-crawlers/custom/{id}",
+            delete(crate::ai_crawlers::delete_custom_crawler)
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/ai-crawlers/builtin",
+            get(crate::ai_crawlers::list_builtin_crawlers),
+        )
+        .route(
+            "/api/v1/ai-crawlers/test",
+            get(crate::ai_crawlers::test_crawler),
+        )
+        .route(
+            "/api/v1/ai-crawlers/robots-preview",
+            get(crate::ai_crawlers::robots_preview),
+        )
+        .route(
+            "/api/v1/ai-crawlers/stats",
+            get(crate::ai_crawlers::ai_crawler_stats),
+        )
         .route("/api/v1/settings", get(crate::settings::get_settings))
         .route(
             "/api/v1/settings",
             put(crate::settings::update_settings)
                 .layer(bl(BODY_CAP_SETTINGS))
                 .layer(rl("settings", RL_SETTINGS_UPDATE, RL_WINDOW_S)),
+        )
+        // Story 8.10 AC #7. Read-only field bounds; Viewer+ like the
+        // GET /settings read (the GET/HEAD default in the authorize
+        // middleware precedes the settings-write SuperAdmin overlay).
+        .route(
+            "/api/v1/settings/schema",
+            get(crate::settings::get_settings_schema),
         )
         .route(
             "/api/v1/settings/otel/test",
@@ -522,7 +770,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/dns-providers/:id",
+            "/api/v1/dns-providers/{id}",
             put(crate::dns_providers::update_dns_provider).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -530,7 +778,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/dns-providers/:id",
+            "/api/v1/dns-providers/{id}",
             delete(crate::dns_providers::delete_dns_provider).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -538,7 +786,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/dns-providers/:id/test",
+            "/api/v1/dns-providers/{id}/test",
             post(crate::dns_providers::test_dns_provider).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -558,7 +806,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/notifications/:id",
+            "/api/v1/notifications/{id}",
             put(crate::settings::update_notification).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -566,7 +814,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/notifications/:id",
+            "/api/v1/notifications/{id}",
             delete(crate::settings::delete_notification).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -574,7 +822,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/notifications/:id/test",
+            "/api/v1/notifications/{id}/test",
             post(crate::settings::test_notification).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -590,7 +838,7 @@ pub fn build_router(
             get(crate::settings::list_preferences),
         )
         .route(
-            "/api/v1/preferences/:id",
+            "/api/v1/preferences/{id}",
             put(crate::settings::update_preference).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -598,7 +846,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/preferences/:id",
+            "/api/v1/preferences/{id}",
             delete(crate::settings::delete_preference).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -668,7 +916,7 @@ pub fn build_router(
                 .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
-            "/api/v1/certificates/:id/renew",
+            "/api/v1/certificates/{id}/renew",
             post(crate::acme::renew_certificate)
                 .layer(bl(BODY_CAP_ACME))
                 .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
@@ -683,7 +931,7 @@ pub fn build_router(
             post(crate::waf::create_custom_rule).layer(bl(BODY_CAP_WAF_RULE)),
         )
         .route(
-            "/api/v1/waf/rules/custom/:id",
+            "/api/v1/waf/rules/custom/{id}",
             delete(crate::waf::delete_custom_rule).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -691,7 +939,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/waf/rules/:id",
+            "/api/v1/waf/rules/{id}",
             put(crate::waf::toggle_waf_rule).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -699,17 +947,17 @@ pub fn build_router(
             )),
         )
         .route("/api/v1/sla/overview", get(crate::sla::get_sla_overview))
-        .route("/api/v1/sla/routes/:id", get(crate::sla::get_route_sla))
+        .route("/api/v1/sla/routes/{id}", get(crate::sla::get_route_sla))
         .route(
-            "/api/v1/sla/routes/:id/buckets",
+            "/api/v1/sla/routes/{id}/buckets",
             get(crate::sla::get_route_sla_buckets),
         )
         .route(
-            "/api/v1/sla/routes/:id/config",
+            "/api/v1/sla/routes/{id}/config",
             get(crate::sla::get_sla_config),
         )
         .route(
-            "/api/v1/sla/routes/:id/config",
+            "/api/v1/sla/routes/{id}/config",
             put(crate::sla::update_sla_config).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -717,11 +965,11 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/sla/routes/:id/export",
+            "/api/v1/sla/routes/{id}/export",
             get(crate::sla::export_sla_data),
         )
         .route(
-            "/api/v1/sla/routes/:id/data",
+            "/api/v1/sla/routes/{id}/data",
             delete(crate::sla::clear_route_sla).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -729,7 +977,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/sla/routes/:id/active",
+            "/api/v1/sla/routes/{id}/active",
             get(crate::probes::get_active_sla),
         )
         .route("/api/v1/probes", get(crate::probes::list_probes))
@@ -742,15 +990,15 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/probes/route/:route_id",
+            "/api/v1/probes/route/{route_id}",
             get(crate::probes::list_probes_for_route),
         )
         .route(
-            "/api/v1/probes/:id/history",
+            "/api/v1/probes/{id}/history",
             get(crate::probes::probe_history),
         )
         .route(
-            "/api/v1/probes/:id",
+            "/api/v1/probes/{id}",
             put(crate::probes::update_probe).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -758,7 +1006,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/probes/:id",
+            "/api/v1/probes/{id}",
             delete(crate::probes::delete_probe).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -778,7 +1026,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/loadtest/configs/:id",
+            "/api/v1/loadtest/configs/{id}",
             put(crate::loadtest::update_config).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -786,7 +1034,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/loadtest/configs/:id",
+            "/api/v1/loadtest/configs/{id}",
             delete(crate::loadtest::delete_config).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -794,7 +1042,7 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/loadtest/configs/:id/clone",
+            "/api/v1/loadtest/configs/{id}/clone",
             post(crate::loadtest::clone_config).layer(rl(
                 "destructive_cud",
                 RL_DESTRUCTIVE_CUD,
@@ -802,24 +1050,28 @@ pub fn build_router(
             )),
         )
         .route(
-            "/api/v1/loadtest/start/:config_id",
+            "/api/v1/loadtest/start/{config_id}",
             post(crate::loadtest::start_test),
         )
         .route(
-            "/api/v1/loadtest/start/:config_id/confirm",
+            "/api/v1/loadtest/start/{config_id}/confirm",
             post(crate::loadtest::start_test_confirmed),
         )
         .route("/api/v1/loadtest/status", get(crate::loadtest::get_status))
         .route("/api/v1/loadtest/ws", get(crate::loadtest::loadtest_ws))
         .route("/api/v1/loadtest/abort", post(crate::loadtest::abort_test))
         .route(
-            "/api/v1/loadtest/results/:config_id",
+            "/api/v1/loadtest/results/{config_id}",
             get(crate::loadtest::get_results),
         )
         .route(
-            "/api/v1/loadtest/results/:config_id/compare",
+            "/api/v1/loadtest/results/{config_id}/compare",
             get(crate::loadtest::compare_results),
         )
+        // Layer order (outermost runs first): require_auth
+        // authenticates and injects the Session extension, then
+        // authorize enforces the role floor (Story 8.3 AC #6).
+        .layer(middleware::from_fn(crate::middleware::authorize::authorize))
         .layer(middleware::from_fn(require_auth));
 
     // Dashboard routes serve embedded frontend assets (SPA with fallback)
@@ -828,6 +1080,7 @@ pub fn build_router(
     Router::new()
         .merge(auth_routes)
         .merge(metrics_routes)
+        .merge(acme_challenge_routes)
         .merge(protected_routes)
         .merge(dashboard_routes)
         // No CORS layer by design. The dashboard SPA is served from the
@@ -849,23 +1102,125 @@ pub fn build_router(
         .layer(axum::Extension(state))
         .layer(axum::Extension(session_store))
         .layer(axum::Extension(rate_limiter))
+        // Outermost: every API request runs inside an `api_request`
+        // tracing span so `lorica::audit` events correlate with the
+        // request in OTel (Story 8.9 AC #4).
+        .layer(middleware::from_fn(
+            crate::middleware::request_span::api_request_span,
+        ))
 }
 
-/// Start the API server on localhost only.
+/// Start the API server on localhost only, over TLS (Story 8.8 AC #1).
+///
+/// The management listener terminates TLS with either the operator's
+/// certificate (`management_cert_pem_path` + `management_key_pem_path`,
+/// AC #2) or the auto-generated self-signed leaf under
+/// `<data_dir>/management/`. Serving is a manual accept loop: axum 0.7
+/// `Router` -> `hyper-util` auto (h1/h2, with upgrades for the dashboard
+/// websockets) over a `tokio-rustls` acceptor, replacing the previous
+/// plaintext `axum::serve`.
+///
+/// When `inherited_listener` is `Some`, the server serves on that
+/// pre-bound socket instead of binding a fresh one. The hot-upgrade
+/// handoff (Story 8.4) uses this so the management port is served on the
+/// SAME kernel listening socket the outgoing supervisor handed over, with
+/// no rebind gap. The listener must already be in non-blocking mode (the
+/// caller sets it before `from_std`). `None` binds `127.0.0.1:port`
+/// fresh, the normal single-process / first-boot path.
 pub async fn start_server(
     port: u16,
     state: AppState,
     session_store: SessionStore,
     rate_limiter: RateLimiter,
+    inherited_listener: Option<std::net::TcpListener>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = build_router(state, session_store, rate_limiter)
-        .into_make_service_with_connect_info::<SocketAddr>();
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as HyperAutoBuilder;
+    use hyper_util::service::TowerToHyperService;
+    use tokio_rustls::TlsAcceptor;
+    use tower::Service;
 
-    info!(port = port, "API server listening on localhost only");
+    // Read the operator TLS override paths and the data dir before the
+    // state is consumed into the router below.
+    let data_dir: PathBuf = state.data_dir.clone();
+    let (cert_override, key_override): (Option<String>, Option<String>) = {
+        let store = state.store.lock().await;
+        match store.get_global_settings() {
+            Ok(gs) => (gs.management_cert_pem_path, gs.management_key_pem_path),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to read global settings for management TLS; using self-signed certificate"
+                );
+                (None, None)
+            }
+        }
+    };
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let server_config = crate::management_tls::build_management_server_config(
+        &data_dir,
+        cert_override.as_deref(),
+        key_override.as_deref(),
+    )?;
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
-    Ok(())
+    // `into_make_service_with_connect_info` yields a maker whose per-call
+    // output is the router with a `ConnectInfo<SocketAddr>` extension
+    // injected; the manual loop calls it once per accepted connection so
+    // handlers keep seeing the peer address (audit logging, rate limits).
+    let mut make_service =
+        build_router(state, session_store, rate_limiter).into_make_service_with_connect_info::<SocketAddr>();
+
+    let listener: tokio::net::TcpListener = match inherited_listener {
+        Some(std_listener) => {
+            info!(
+                port = port,
+                "API server adopting inherited management listener (hot upgrade)"
+            );
+            tokio::net::TcpListener::from_std(std_listener)?
+        }
+        None => {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            info!(port = port, "API server listening on localhost only (TLS)");
+            tokio::net::TcpListener::bind(addr).await?
+        }
+    };
+
+    loop {
+        let (tcp, remote_addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "management listener accept failed");
+                continue;
+            }
+        };
+
+        // Build the per-connection service. `make_service` is always
+        // ready and its error type is `Infallible`, so the `Err` arm is
+        // an empty match on an uninhabited type.
+        let tower_service = match make_service.call(remote_addr).await {
+            Ok(svc) => svc,
+            Err(err) => match err {},
+        };
+        let acceptor = acceptor.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::metrics::inc_management_tls_handshake_failed();
+                    tracing::debug!(peer = %remote_addr, error = %e, "management TLS handshake failed");
+                    return;
+                }
+            };
+            let io = TokioIo::new(tls_stream);
+            let hyper_service = TowerToHyperService::new(tower_service);
+            if let Err(e) = HyperAutoBuilder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(io, hyper_service)
+                .await
+            {
+                tracing::debug!(peer = %remote_addr, error = %e, "management connection ended with error");
+            }
+        });
+    }
 }

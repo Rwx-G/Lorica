@@ -176,6 +176,79 @@ jobs:
           cd lorica-dashboard/frontend
           npx vitest run
 
+  coverage:
+    name: Coverage
+    needs: lint
+    runs-on: ubuntu-latest
+    # Reports line coverage for the product crates and uploads an lcov
+    # artifact so gaps stay visible. Intentionally NOT gated on a
+    # `--fail-under` threshold yet: the baseline is not established, and a
+    # blind threshold would flake the pipeline. Add a floor here once a
+    # baseline is agreed (do not silently drop the report if you do).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build frontend (needed by lorica-api dependency)
+        run: |
+          cd lorica-dashboard/frontend
+          npm ci
+          npm run build
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Collect coverage (product crates)
+        run: |
+          cargo llvm-cov --no-report \
+            -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify \
+            -p lorica-bench -p lorica-command -p lorica-metrics -p lorica-acme \
+            -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker
+
+      - name: Report coverage summary
+        run: |
+          echo '### Coverage (product crates)' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --summary-only \
+            --ignore-filename-regex '(tests?\.rs$|/tests/)' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --lcov --output-path lcov.info \
+            --ignore-filename-regex '(tests?\.rs$|/tests/)'
+
+      - name: Upload lcov report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 30
+
+  e2e-docker:
+    name: E2E (Docker)
+    needs: lint
+    runs-on: ubuntu-latest
+    # The tests-e2e-docker/ suite drives Lorica against real backend
+    # containers across every profile (base, workers, cert-export, AI-bot,
+    # RBAC, audit, hot-upgrade). It exercises the full network stack
+    # deterministically on Linux, which Docker Desktop on Windows does not -
+    # so it belongs in CI rather than as a Windows-local-only gate. It is
+    # heavy (each profile builds a release image, with Docker layer reuse);
+    # the workflow triggers keep it to PRs against main plus main/tag pushes,
+    # not every feature-branch push. run.sh exits non-zero if any phase fails
+    # and its per-assertion output lands in this job log.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the Docker e2e suite
+        run: |
+          cd tests-e2e-docker
+          ./run.sh --build
+
   build-and-package:
     name: Build & Package
     needs: test

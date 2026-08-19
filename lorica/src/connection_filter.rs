@@ -27,12 +27,14 @@
 //! channel.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use dashmap::DashMap;
 use ipnet::IpNet;
-use lorica_core::listeners::ConnectionFilter;
+use lorica_core::listeners::{AcceptPermit, AcceptVerdict, ConnectionFilter};
 use tracing::warn;
 
 /// Parsed CIDR policy used by [`GlobalConnectionFilter`].
@@ -99,15 +101,48 @@ fn parse_cidrs(entries: &[String], field_name: &str) -> Vec<IpNet> {
         .collect()
 }
 
-/// Concrete [`ConnectionFilter`] backed by an [`ArcSwap`] policy.
+/// RAII token decrementing one IP's live-connection count when the
+/// accepted stream drops (Story 8.9 AC #5). The listener attaches it
+/// to the stream, so the decrement happens exactly at connection
+/// close.
+#[derive(Debug)]
+struct PerIpPermit {
+    ip: IpAddr,
+    counter: Arc<AtomicU32>,
+    map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
+}
+
+impl Drop for PerIpPermit {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+        // Best-effort map hygiene: drop the entry once its count is
+        // back to zero so an IP scan cannot grow the map unboundedly.
+        // The remove_if re-check makes a concurrent increment safe.
+        self.map
+            .remove_if(&self.ip, |_, counter| counter.load(Ordering::Acquire) == 0);
+    }
+}
+
+impl AcceptPermit for PerIpPermit {}
+
+/// Concrete [`ConnectionFilter`] backed by an [`ArcSwap`] policy, plus
+/// an optional per-source-IP live-connection cap (Story 8.9 AC #5).
 ///
 /// Cloning the inner `Arc<GlobalConnectionFilter>` hands out handles that
 /// observe every [`reload`](Self::reload); listeners hold one such clone, the
 /// reload task holds another, and both see the same atomic snapshot without
 /// locks.
+///
+/// The per-IP cap is per PROCESS: each worker owns its own filter
+/// instance, so the effective ceiling in multi-worker mode is
+/// `connection_limits_per_ip x workers`. Documented in the setting's
+/// operator docs; a shmem-backed global count is a backlog candidate.
 #[derive(Debug)]
 pub struct GlobalConnectionFilter {
     policy: ArcSwap<ConnectionFilterPolicy>,
+    /// 0 = cap disabled.
+    per_ip_limit: AtomicU32,
+    per_ip_counts: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
 }
 
 impl GlobalConnectionFilter {
@@ -116,6 +151,8 @@ impl GlobalConnectionFilter {
     pub fn new(policy: ConnectionFilterPolicy) -> Self {
         Self {
             policy: ArcSwap::from_pointee(policy),
+            per_ip_limit: AtomicU32::new(0),
+            per_ip_counts: Arc::new(DashMap::new()),
         }
     }
 
@@ -131,9 +168,44 @@ impl GlobalConnectionFilter {
         self.policy.store(Arc::new(policy));
     }
 
+    /// Set the per-source-IP live-connection cap (`None` / `Some(0)`
+    /// disables it). Takes effect on the next accept; connections
+    /// already established keep their permits.
+    pub fn set_per_ip_limit(&self, limit: Option<u32>) {
+        self.per_ip_limit
+            .store(limit.unwrap_or(0), Ordering::Release);
+    }
+
+    /// Current per-IP cap (0 = disabled). For tests and diagnostics.
+    pub fn per_ip_limit(&self) -> u32 {
+        self.per_ip_limit.load(Ordering::Acquire)
+    }
+
     /// Read a snapshot of the current policy. Useful for tests and metrics.
     pub fn snapshot(&self) -> Arc<ConnectionFilterPolicy> {
         self.policy.load_full()
+    }
+
+    /// Atomically reserve one connection slot for `ip`. Returns the
+    /// RAII permit, or `None` when the IP is at its cap.
+    fn try_reserve(&self, ip: IpAddr, limit: u32) -> Option<PerIpPermit> {
+        let counter = self
+            .per_ip_counts
+            .entry(ip)
+            .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+            .clone();
+        // fetch_add-then-check keeps the reserve atomic without a CAS
+        // loop: an over-increment is immediately undone before Reject.
+        let previous = counter.fetch_add(1, Ordering::AcqRel);
+        if previous >= limit {
+            counter.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(PerIpPermit {
+            ip,
+            counter,
+            map: Arc::clone(&self.per_ip_counts),
+        })
     }
 }
 
@@ -148,6 +220,28 @@ impl ConnectionFilter for GlobalConnectionFilter {
             return true;
         }
         policy.accepts(addr.ip())
+    }
+
+    async fn try_accept(&self, addr: Option<&SocketAddr>) -> AcceptVerdict {
+        // CIDR policy first (deny wins, no permit needed to refuse).
+        if !self.should_accept(addr).await {
+            return AcceptVerdict::Reject;
+        }
+        let limit = self.per_ip_limit.load(Ordering::Acquire);
+        if limit == 0 {
+            return AcceptVerdict::Accept(None);
+        }
+        let Some(addr) = addr else {
+            // No peer address (unix sockets): the cap cannot apply.
+            return AcceptVerdict::Accept(None);
+        };
+        match self.try_reserve(addr.ip(), limit) {
+            Some(permit) => AcceptVerdict::Accept(Some(Box::new(permit))),
+            None => {
+                lorica_api::metrics::inc_per_ip_connection_refused();
+                AcceptVerdict::Reject
+            }
+        }
     }
 }
 
@@ -246,6 +340,69 @@ mod tests {
 
         f.reload(ConnectionFilterPolicy::from_cidrs(&[], &[]));
         assert!(f.should_accept(Some(&addr)).await);
+    }
+
+    fn permit_of(verdict: AcceptVerdict) -> Option<Box<dyn AcceptPermit>> {
+        match verdict {
+            AcceptVerdict::Accept(permit) => permit,
+            AcceptVerdict::Reject => panic!("expected Accept"),
+        }
+    }
+
+    #[tokio::test]
+    async fn per_ip_cap_disabled_hands_out_no_permit() {
+        let f = GlobalConnectionFilter::empty();
+        let addr = v4(203, 0, 113, 9);
+        assert!(permit_of(f.try_accept(Some(&addr)).await).is_none());
+    }
+
+    #[tokio::test]
+    async fn per_ip_cap_refuses_over_limit_and_recovers_on_drop() {
+        let f = GlobalConnectionFilter::empty();
+        f.set_per_ip_limit(Some(2));
+        let addr = v4(203, 0, 113, 9);
+
+        let p1 = permit_of(f.try_accept(Some(&addr)).await).expect("permit 1");
+        let p2 = permit_of(f.try_accept(Some(&addr)).await).expect("permit 2");
+        assert!(matches!(
+            f.try_accept(Some(&addr)).await,
+            AcceptVerdict::Reject
+        ));
+
+        // A different IP is unaffected by the saturated one.
+        let other = v4(203, 0, 113, 10);
+        assert!(permit_of(f.try_accept(Some(&other)).await).is_some());
+
+        // Dropping one permit frees one slot for the capped IP.
+        drop(p1);
+        let p3 = permit_of(f.try_accept(Some(&addr)).await).expect("slot freed by drop");
+        drop(p2);
+        drop(p3);
+    }
+
+    #[tokio::test]
+    async fn per_ip_cap_zero_or_none_disables() {
+        let f = GlobalConnectionFilter::empty();
+        f.set_per_ip_limit(Some(1));
+        assert_eq!(f.per_ip_limit(), 1);
+        f.set_per_ip_limit(None);
+        assert_eq!(f.per_ip_limit(), 0);
+        let addr = v4(203, 0, 113, 9);
+        assert!(permit_of(f.try_accept(Some(&addr)).await).is_none());
+    }
+
+    #[tokio::test]
+    async fn per_ip_cap_respects_cidr_deny_first() {
+        let f = GlobalConnectionFilter::new(ConnectionFilterPolicy::from_cidrs(
+            &[],
+            &["203.0.113.0/24".to_string()],
+        ));
+        f.set_per_ip_limit(Some(10));
+        let denied = v4(203, 0, 113, 9);
+        assert!(matches!(
+            f.try_accept(Some(&denied)).await,
+            AcceptVerdict::Reject
+        ));
     }
 
     #[tokio::test]

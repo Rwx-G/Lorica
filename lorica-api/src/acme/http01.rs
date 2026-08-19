@@ -19,12 +19,26 @@ use axum::Json;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use lorica_acme::{AcmeConfig, Http01ChallengeSolver};
+
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
-use super::config::AcmeConfig;
 use super::types::{default_true, AcmeProvisionResponse};
+
+/// No-op HTTP-01 solver used when the process has no challenge store
+/// (`state.acme_challenge_store` is `None`). It publishes nowhere, matching
+/// the pre-extraction behaviour where a missing store simply skipped the
+/// token set/remove calls.
+struct NoopHttp01Solver;
+
+#[async_trait::async_trait]
+impl Http01ChallengeSolver for NoopHttp01Solver {
+    async fn present(&self, _token: String, _key_authorization: String) {}
+    async fn cleanup(&self, _token: &str) {}
+}
 
 /// Request body for ACME certificate provisioning.
 #[derive(Debug, Deserialize)]
@@ -45,7 +59,10 @@ pub struct AcmeProvisionRequest {
 ///
 /// **Requires**: port 80 reachable from the Internet for HTTP-01 challenge.
 pub async fn provision_certificate(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<AcmeProvisionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Support multi-domain: "www.rwx-g.fr, rwx-g.fr" or "www.rwx-g.fr,rwx-g.fr"
@@ -77,7 +94,7 @@ pub async fn provision_certificate(
     match result {
         Ok(cert_id) => {
             info!(domains = ?domains, cert_id = %cert_id, "ACME certificate provisioned");
-            Ok(json_data(AcmeProvisionResponse {
+            let response = AcmeProvisionResponse {
                 status: "provisioned".into(),
                 domain: primary_domain,
                 staging: config.staging,
@@ -85,7 +102,22 @@ pub async fn provision_certificate(
                     "Certificate provisioned for {} domain(s) (id: {cert_id})",
                     domains.len()
                 ),
-            }))
+            };
+
+            let audit_ctx =
+                crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+            let after = serde_json::to_value(&response).ok();
+            crate::audit::record(
+                &state,
+                &audit_ctx,
+                "acme.provision_http01",
+                ("certificate", &cert_id),
+                None,
+                after.as_ref(),
+            )
+            .await;
+
+            Ok(json_data(response))
         }
         Err(e) => {
             warn!(domains = ?domains, error = %e, "ACME provisioning failed");
@@ -113,8 +145,8 @@ pub async fn serve_challenge(
         .ok_or_else(|| ApiError::NotFound(format!("challenge token {token} not found")))
 }
 
-/// Internal ACME provisioning logic using instant-acme.
-/// Supports multi-domain SAN certificates (one order, N challenges).
+/// Internal ACME provisioning: drives issuance via `lorica_acme::issue_http01`
+/// then persists the result. Supports multi-domain SAN certificates.
 ///
 /// When `existing_cert_id` is `Some`, the freshly issued leaf is
 /// persisted in place on that row via `update_certificate` (same id,
@@ -127,109 +159,18 @@ pub(super) async fn provision_with_acme(
     domains: &[String],
     existing_cert_id: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use instant_acme::{
-        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
-        RetryPolicy,
-    };
-
     let primary_domain = &domains[0];
 
-    // Create or load ACME account
-    let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
-    let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
-
-    // instant-acme 0.8 (audit L-15) : Account creation goes
-    // through a builder, NewOrder needs the public constructor.
-    let (account, _) = Account::builder()?
-        .create(
-            &NewAccount {
-                contact: &contact_refs,
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            config.directory_url().to_string(),
-            None,
-        )
-        .await?;
-
-    // Create order with all domains as identifiers
-    let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
-    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
-
-    // instant-acme 0.8 (audit L-15) : authorizations is now a
-    // stream-style iterator yielding `AuthorizationHandle`s ;
-    // we iterate once, store each token + signal readiness on
-    // the same handle, then poll the order for "all auths
-    // valid" via the new `poll_ready` helper. Cleanup of stored
-    // tokens happens in both the success and failure paths so
-    // the proxy never serves a stale challenge after the order
-    // resolves.
-    let mut authorizations = order.authorizations();
-    let mut stored_tokens: Vec<String> = Vec::new();
-    while let Some(result) = authorizations.next().await {
-        let mut authz = result?;
-        if matches!(authz.status, AuthorizationStatus::Valid) {
-            continue;
-        }
-        let mut challenge = authz
-            .challenge(ChallengeType::Http01)
-            .ok_or("no HTTP-01 challenge available")?;
-        let key_authorization = challenge.key_authorization();
-        let token = challenge.token.clone();
-        if let Some(ref store) = state.acme_challenge_store {
-            store
-                .set(token.clone(), key_authorization.as_str().to_string())
-                .await;
-        }
-        stored_tokens.push(token);
-        challenge.set_ready().await?;
-    }
-    // `authorizations` borrows `order` ; let NLL release the borrow
-    // here so the next `order.poll_ready()` call can re-borrow mut.
-    let _ = authorizations;
-
-    // Wait for all authorizations to become valid (or hit a
-    // terminal failure). `poll_ready` exponentially backs off
-    // and returns the final OrderStatus.
-    let ready_status = order.poll_ready(&RetryPolicy::default()).await?;
-
-    // Clean up all challenge tokens regardless of outcome - the
-    // proxy must not serve a stale token after the order
-    // resolves either way.
-    if let Some(ref store) = state.acme_challenge_store {
-        for token in &stored_tokens {
-            store.remove(token).await;
-        }
-    }
-
-    if ready_status != OrderStatus::Ready {
-        return Err(
-            format!("ACME challenge validation did not reach Ready: {ready_status:?}").into(),
-        );
-    }
-
-    // Generate CSR with all domains as SANs and finalize order.
-    // `finalize_csr` is the explicit-CSR variant in 0.8 ; the
-    // sibling `finalize()` would use a fresh rcgen key generated
-    // by the crate (requires the `rcgen` feature, which we do
-    // not enable - see `Cargo.toml`).
-    let mut params = rcgen::CertificateParams::new(domains.to_vec())?;
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    let private_key = rcgen::KeyPair::generate()?;
-    let csr = params.serialize_request(&private_key)?;
-
-    order.finalize_csr(csr.der()).await?;
-
-    // Poll for issuance with exponential backoff. Returns the
-    // PEM-encoded certificate chain on success ; the helper
-    // handles `Processing` -> `Valid` transitions internally
-    // and replaces the v0.7-era manual sleep-and-refresh loop.
-    let cert_pem = order
-        .poll_certificate(&RetryPolicy::default())
-        .await
-        .map_err(|e| format!("certificate poll failed: {e}"))?;
-
-    let key_pem = private_key.serialize_pem();
+    // Drive the pure ACME protocol via `lorica-acme`. The challenge tokens
+    // are published through `AcmeChallengeStore` (the `Http01ChallengeSolver`
+    // impl); a process without a store falls back to a no-op solver, matching
+    // the pre-extraction behaviour.
+    let issued = match &state.acme_challenge_store {
+        Some(store) => lorica_acme::issue_http01(config, domains, store).await?,
+        None => lorica_acme::issue_http01(config, domains, &NoopHttp01Solver).await?,
+    };
+    let cert_pem = issued.cert_pem;
+    let key_pem = issued.key_pem;
 
     // Store certificate in database. On renewal (`existing_cert_id`
     // is `Some`) update the row in place so the id and every route

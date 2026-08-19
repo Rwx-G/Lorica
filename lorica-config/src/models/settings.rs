@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::route::SpoofedFallback;
+
 // --- Security Header Presets ---
 
 /// A named collection of HTTP security headers that can be applied to routes.
@@ -126,9 +128,27 @@ pub struct GlobalSettings {
     pub ip_blocklist_enabled: bool,
     /// Global flood detection threshold (requests per second).
     /// When the proxy-wide RPS exceeds this value, per-IP rate limits are
-    /// halved to provide stricter protection. 0 = disabled (default).
+    /// tightened to provide stricter protection. 0 = disabled (default).
     #[serde(default)]
     pub flood_threshold_rps: i32,
+    /// Per-IP admission rate (requests per second) enforced while the
+    /// proxy is in flood mode (proxy-wide RPS above `flood_threshold_rps`).
+    /// It is the tunable form of the historical hard-coded "halve the
+    /// limit" factor: the effective per-IP token cost is scaled by
+    /// `flood_threshold_rps / flood_strict_rps`, so the default of
+    /// `flood_threshold_rps / 2` reproduces the original 0.5x behaviour.
+    /// `0` means "auto" and resolves to `flood_threshold_rps / 2` at
+    /// enforcement time. Only consulted when `flood_threshold_rps > 0`.
+    #[serde(default)]
+    pub flood_strict_rps: u32,
+    /// Maximum time (seconds) the proxy waits for a client to finish
+    /// sending its request headers before the header phase is treated as
+    /// a slowloris attempt and the request is answered with 408. Applies
+    /// globally across every route as a floor on top of the per-route
+    /// `slowloris_threshold_ms`. Default 10. `0` disables the global
+    /// floor (per-route thresholds still apply).
+    #[serde(default = "default_header_timeout_s")]
+    pub header_timeout_s: u32,
     /// Number of WAF blocks before an IP is auto-banned. 0 = disabled (default 5).
     #[serde(default = "default_waf_ban_threshold")]
     pub waf_ban_threshold: i32,
@@ -144,6 +164,10 @@ pub struct GlobalSettings {
     /// Older entries are purged periodically. 0 = unlimited. Default: 100000.
     #[serde(default = "default_access_log_retention")]
     pub access_log_retention: i64,
+    /// Maximum number of WAF event entries to retain in the persistent store.
+    /// Older entries are purged periodically. 0 = unlimited. Default: 100000.
+    #[serde(default = "default_waf_event_retention")]
+    pub waf_event_retention: i64,
     /// Whether automatic SLA data purge is enabled. Default: true
     /// (bounded disk usage out of the box; operators who need full
     /// history can opt out via the dashboard Settings tab).
@@ -181,6 +205,12 @@ pub struct GlobalSettings {
     /// Examples: `["10.0.0.0/8", "192.168.0.0/16"]`.
     #[serde(default)]
     pub connection_allow_cidrs: Vec<String>,
+    /// Maximum simultaneous TCP connections per source IP, refused at
+    /// accept() before the TLS handshake (Story 8.9 AC #5). `None` =
+    /// no cap. The cap is per worker process: in multi-worker mode
+    /// the effective ceiling is `value x workers`.
+    #[serde(default)]
+    pub connection_limits_per_ip: Option<u32>,
     /// OTLP collector endpoint (e.g. `http://localhost:4317` for gRPC,
     /// `http://localhost:4318` for HTTP). Empty / None = OTel tracing
     /// disabled at runtime, even when the binary was built with
@@ -288,6 +318,116 @@ pub struct GlobalSettings {
     /// startup populates it via `secret::generate` + persist.
     #[serde(default)]
     pub bot_hmac_secret_hex: String,
+
+    /// Global default applied when an AI-bot crawler's verification
+    /// (`Verification::Rdns` or `Verification::IpRanges`) fails on
+    /// a request. Per-route `Route.ai_bot_spoofed_fallback` overrides
+    /// this value when set. Default `Deny` reflects the typical
+    /// operator stance ("a request claiming to be GPTBot from outside
+    /// OpenAI's CIDRs is a malicious spoofer"). Story 8.2 AC #3.
+    #[serde(default)]
+    pub ai_bot_treat_spoofed_as: SpoofedFallback,
+
+    /// Inject `X-Lorica-Verified-Bot` + `X-Lorica-Bot-Verification`
+    /// headers upstream when an AI-bot crawler's verification
+    /// confirms (Cloudflare-style verified-bot signaling).
+    /// Default `true` lets backends consume the verification level
+    /// (rate-limit differential, audit-log enrichment, bot-only
+    /// response cache). Story 8.2 AC #11.
+    #[serde(default = "default_ai_bot_inject_headers")]
+    pub ai_bot_inject_headers: bool,
+
+    /// Minimum length enforced when a user sets or changes a
+    /// password (Story 8.3 AC #8). Applies to the change-password
+    /// flow and user CRUD, never to login verification. The upper
+    /// bound stays a fixed 128 (argon2 DoS guard).
+    #[serde(default = "default_password_min_length")]
+    pub password_min_length: u32,
+
+    /// Days of admin audit-log history kept before chain-safe
+    /// truncation (Story 8.9 AC #9). `0` disables retention (rows
+    /// kept forever). Default 90.
+    #[serde(default = "default_audit_log_retention_days")]
+    pub audit_log_retention_days: u32,
+
+    /// Global cap on pending bot challenges in the stash (Story 8.9
+    /// AC #6). Over-cap issuance answers `503 Retry-After: 30`
+    /// instead of evicting legitimate pending entries. Default 10000.
+    #[serde(default = "default_bot_stash_max_entries")]
+    pub bot_stash_max_entries: u32,
+
+    /// Per-IP-prefix (/24 IPv4, /48 IPv6) cap on pending bot
+    /// challenges (Story 8.9 AC #6). Default 100.
+    #[serde(default = "default_bot_stash_per_prefix_max")]
+    pub bot_stash_per_prefix_max: u32,
+
+    /// Per-route cap on concurrent mirror sub-requests (Story 8.9
+    /// AC #7): one slow shadow target cannot starve other routes'
+    /// mirrors. Default 32.
+    #[serde(default = "default_mirror_max_concurrent_per_route")]
+    pub mirror_max_concurrent_per_route: u32,
+
+    /// Coarse global safety net across all routes' mirror
+    /// sub-requests (Story 8.9 AC #7). Default 4096.
+    #[serde(default = "default_mirror_max_concurrent_global")]
+    pub mirror_max_concurrent_global: u32,
+
+    /// Require at least one of each [upper, lower, digit, symbol]
+    /// class in new passwords (Story 8.3 AC #8). Default `true`.
+    #[serde(default = "default_password_require_complexity")]
+    pub password_require_complexity: bool,
+
+    /// Filesystem path to the Ed25519 public key that
+    /// `POST /api/v1/system/upgrade` verifies uploaded binaries
+    /// against (Story 8.4). The file holds the 32-byte verifying key
+    /// hex-encoded as a single 64-character line (trailing whitespace
+    /// tolerated). `None` = hot binary upgrade disabled: the endpoint
+    /// rejects every upload with 400 rather than trusting an
+    /// unsigned binary. No key is compiled into the binary on purpose
+    /// so a dev key can never be trusted in production; the operator
+    /// manages this key file out of band.
+    #[serde(default)]
+    pub upgrade_signing_pubkey_path: Option<String>,
+
+    /// Require authentication on the `/metrics` endpoint (Story 8.8
+    /// AC #4). Default `false` in v1.6.0 for back-compat: existing
+    /// Prometheus scrapers keep working unauthenticated. When `true`,
+    /// `/metrics` demands either a valid dashboard session cookie OR
+    /// the static bearer token in `prometheus_scrape_token`. Flips to
+    /// `true` in v1.7.0 with a release-note migration paragraph.
+    #[serde(default)]
+    pub metrics_require_auth: bool,
+
+    /// Static bearer token accepted on `/metrics` when
+    /// `metrics_require_auth` is `true` (Story 8.8 AC #4). `None` =
+    /// no token configured (only a session cookie authenticates). The
+    /// environment variable `LORICA_PROMETHEUS_SCRAPE_TOKEN` overrides
+    /// this value at request time so operators can inject the token
+    /// out of band without persisting it in the database. Compared in
+    /// constant time (AC #5). Never serialised back over the API: the
+    /// `GET /api/v1/settings` handler masks it like the bot HMAC
+    /// secret.
+    #[serde(default)]
+    pub prometheus_scrape_token: Option<String>,
+
+    /// Operator-supplied PEM certificate chain for the management-API
+    /// TLS listener (Story 8.8 AC #2). When both this and
+    /// `management_key_pem_path` are set, Lorica serves the management
+    /// port with the operator certificate and ignores the
+    /// auto-generated self-signed cert. `None` = use the self-signed
+    /// cert persisted under `<data_dir>/management/`.
+    #[serde(default)]
+    pub management_cert_pem_path: Option<String>,
+
+    /// Operator-supplied PEM private key paired with
+    /// `management_cert_pem_path` (Story 8.8 AC #2). Both must be set
+    /// for the operator override to take effect.
+    #[serde(default)]
+    pub management_key_pem_path: Option<String>,
+}
+
+fn default_header_timeout_s() -> u32 {
+    10
 }
 
 fn default_waf_ban_threshold() -> i32 {
@@ -330,6 +470,10 @@ fn default_access_log_retention() -> i64 {
     100_000
 }
 
+fn default_waf_event_retention() -> i64 {
+    100_000
+}
+
 fn default_sla_purge_enabled() -> bool {
     true
 }
@@ -362,6 +506,48 @@ fn default_cert_export_dir_mode() -> u32 {
     0o750
 }
 
+fn default_ai_bot_inject_headers() -> bool {
+    true
+}
+
+impl GlobalSettings {
+    /// Validate the invariants that span more than one field.
+    ///
+    /// Per-field bounds (non-negative, absolute paths, enum tags) are enforced
+    /// field-by-field at the API boundary. The relationships below only make
+    /// sense between two fields, so they are checked on the merged result of a
+    /// settings update (backlog #48). Returns a human-readable message suitable
+    /// for a `400 Bad Request` body.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with a description of the first violated invariant.
+    pub fn validate_cross_fields(&self) -> Result<(), String> {
+        if self.cert_warning_days <= self.cert_critical_days {
+            return Err(format!(
+                "cert_warning_days ({}) must be greater than cert_critical_days ({}): \
+                 the warning threshold has to fire before the critical one",
+                self.cert_warning_days, self.cert_critical_days
+            ));
+        }
+        // Strict flood mode charges request tokens by the ratio
+        // `flood_threshold_rps / flood_strict_rps`, so strict must be a tighter
+        // cap than the plain threshold. A strict value of `0` means "auto"
+        // (half the threshold) and is exempt from the comparison.
+        if self.flood_threshold_rps > 0
+            && self.flood_strict_rps > 0
+            && i64::from(self.flood_strict_rps) >= i64::from(self.flood_threshold_rps)
+        {
+            return Err(format!(
+                "flood_strict_rps ({}) must be less than flood_threshold_rps ({}) \
+                 when both are set (0 = auto = half the threshold)",
+                self.flood_strict_rps, self.flood_threshold_rps
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
@@ -378,10 +564,13 @@ impl Default for GlobalSettings {
             ip_blocklist_enabled: false,
             max_global_connections: 0,
             flood_threshold_rps: 0,
+            flood_strict_rps: 0,
+            header_timeout_s: default_header_timeout_s(),
             waf_ban_threshold: default_waf_ban_threshold(),
             waf_ban_duration_s: default_waf_ban_duration_s(),
             custom_security_presets: Vec::new(),
             access_log_retention: default_access_log_retention(),
+            waf_event_retention: default_waf_event_retention(),
             sla_purge_enabled: default_sla_purge_enabled(),
             sla_purge_retention_days: default_sla_purge_retention_days(),
             sla_purge_schedule: default_sla_purge_schedule(),
@@ -389,6 +578,7 @@ impl Default for GlobalSettings {
             waf_whitelist_ips: Vec::new(),
             connection_deny_cidrs: Vec::new(),
             connection_allow_cidrs: Vec::new(),
+            connection_limits_per_ip: None,
             otlp_endpoint: None,
             otlp_protocol: default_otlp_protocol(),
             otlp_service_name: default_otlp_service_name(),
@@ -404,6 +594,97 @@ impl Default for GlobalSettings {
             cert_export_group_gid: None,
             cert_export_file_mode: default_cert_export_file_mode(),
             cert_export_dir_mode: default_cert_export_dir_mode(),
+            ai_bot_treat_spoofed_as: SpoofedFallback::default(),
+            ai_bot_inject_headers: default_ai_bot_inject_headers(),
+            upgrade_signing_pubkey_path: None,
+            metrics_require_auth: false,
+            prometheus_scrape_token: None,
+            management_cert_pem_path: None,
+            management_key_pem_path: None,
+            password_min_length: default_password_min_length(),
+            password_require_complexity: default_password_require_complexity(),
+            audit_log_retention_days: default_audit_log_retention_days(),
+            bot_stash_max_entries: default_bot_stash_max_entries(),
+            bot_stash_per_prefix_max: default_bot_stash_per_prefix_max(),
+            mirror_max_concurrent_per_route: default_mirror_max_concurrent_per_route(),
+            mirror_max_concurrent_global: default_mirror_max_concurrent_global(),
         }
+    }
+}
+
+fn default_bot_stash_max_entries() -> u32 {
+    10_000
+}
+
+fn default_bot_stash_per_prefix_max() -> u32 {
+    100
+}
+
+fn default_mirror_max_concurrent_per_route() -> u32 {
+    32
+}
+
+fn default_mirror_max_concurrent_global() -> u32 {
+    4096
+}
+
+fn default_password_min_length() -> u32 {
+    14
+}
+
+fn default_audit_log_retention_days() -> u32 {
+    90
+}
+
+fn default_password_require_complexity() -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GlobalSettings;
+
+    fn settings(
+        cert_warning_days: i32,
+        cert_critical_days: i32,
+        flood_threshold_rps: i32,
+        flood_strict_rps: u32,
+    ) -> GlobalSettings {
+        GlobalSettings {
+            cert_warning_days,
+            cert_critical_days,
+            flood_threshold_rps,
+            flood_strict_rps,
+            ..GlobalSettings::default()
+        }
+    }
+
+    #[test]
+    fn default_settings_pass_cross_field_validation() {
+        assert!(GlobalSettings::default().validate_cross_fields().is_ok());
+    }
+
+    #[test]
+    fn cert_warning_must_exceed_critical() {
+        assert!(settings(7, 7, 0, 0).validate_cross_fields().is_err());
+        assert!(settings(3, 7, 0, 0).validate_cross_fields().is_err());
+        assert!(settings(14, 7, 0, 0).validate_cross_fields().is_ok());
+    }
+
+    #[test]
+    fn flood_strict_must_be_tighter_than_threshold_when_set() {
+        assert!(settings(30, 7, 100, 100).validate_cross_fields().is_err());
+        assert!(settings(30, 7, 100, 150).validate_cross_fields().is_err());
+        assert!(settings(30, 7, 100, 50).validate_cross_fields().is_ok());
+    }
+
+    #[test]
+    fn flood_strict_zero_is_auto_and_exempt() {
+        assert!(settings(30, 7, 100, 0).validate_cross_fields().is_ok());
+    }
+
+    #[test]
+    fn flood_check_skipped_when_threshold_disabled() {
+        assert!(settings(30, 7, 0, 500).validate_cross_fields().is_ok());
     }
 }

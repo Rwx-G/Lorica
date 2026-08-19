@@ -33,10 +33,12 @@ pub struct ImportData {
     /// All rows of the `user_preferences` table.
     #[serde(default)]
     pub user_preferences: Vec<UserPreference>,
-    /// All rows of the `admin_users` table (password hashes are
-    /// redacted to `**REDACTED**` on export ; import rejects those).
-    #[serde(default)]
-    pub admin_users: Vec<AdminUser>,
+    /// All rows of the `users` table (password hashes are redacted
+    /// to `**REDACTED**` on export ; import rejects those). The
+    /// `admin_users` alias accepts pre-1.6.0 exports; those rows
+    /// deserialize with `role = super_admin` via the model defaults.
+    #[serde(default, alias = "admin_users")]
+    pub users: Vec<User>,
 }
 
 /// Parse a TOML string into import data.
@@ -87,10 +89,10 @@ fn validate(data: &ImportData) -> Result<()> {
     validate_structure(data)?;
 
     // Reject redacted password hashes (from exports)
-    for user in &data.admin_users {
+    for user in &data.users {
         if user.password_hash == "**REDACTED**" {
             return Err(ConfigError::Validation(format!(
-                "admin user '{}' has a redacted password hash (from export); \
+                "user '{}' has a redacted password hash (from export); \
                  set a real password hash or remove the user from the import file",
                 user.username
             )));
@@ -181,8 +183,8 @@ pub fn import_to_store(store: &ConfigStore, data: &ImportData) -> Result<()> {
     for pref in &data.user_preferences {
         store.create_user_preference(pref)?;
     }
-    for user in &data.admin_users {
-        store.create_admin_user(user)?;
+    for user in &data.users {
+        store.create_user(user)?;
     }
 
     Ok(())

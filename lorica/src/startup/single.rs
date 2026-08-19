@@ -79,7 +79,10 @@ pub(crate) fn run_single_process(cli: Cli) {
                     println!("  Initial admin password written to (mode 0600):");
                     println!("    {}", path.display());
                     println!("  Read it with:  sudo cat {}", path.display());
-                    println!("  Login at http://localhost:{}/", cli.management_port);
+                    println!(
+                        "  Login at https://localhost:{}/ (self-signed cert - accept the browser warning)",
+                        cli.management_port
+                    );
                     println!("  You will be asked to change it on first login,");
                     println!("  after which you can delete that file.");
                     println!("  ===================================================");
@@ -94,7 +97,10 @@ pub(crate) fn run_single_process(cli: Cli) {
                     println!();
                     println!("  ===================================================");
                     println!("  Initial admin password: {password}");
-                    println!("  Login at http://localhost:{}/", cli.management_port);
+                    println!(
+                        "  Login at https://localhost:{}/ (self-signed cert - accept the browser warning)",
+                        cli.management_port
+                    );
                     println!("  You will be asked to change it on first login.");
                     println!("  ===================================================");
                     println!();
@@ -131,80 +137,15 @@ pub(crate) fn run_single_process(cli: Cli) {
 
         // Build the CertResolver for SNI-based certificate selection
         let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
-        {
-            let s = store.lock().await;
-            let db_certs = s.list_certificates().unwrap_or_default();
-            if !db_certs.is_empty() {
-                let cert_data: Vec<lorica_tls::cert_resolver::CertData> = db_certs
-                    .iter()
-                    .map(|c| lorica_tls::cert_resolver::CertData {
-                        domain: c.domain.clone(),
-                        san_domains: c.san_domains.clone(),
-                        cert_pem: c.cert_pem.clone(),
-                        key_pem: c.key_pem.clone(),
-                        not_after_epoch: c.not_after.timestamp(),
-                        ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
-                    })
-                    .collect();
-                match cert_resolver.reload(cert_data) {
-                    Ok(stats) => {
-                        if stats.skipped > 0 {
-                            lorica_api::metrics::inc_certificates_invalid_bundle_by(
-                                "reload",
-                                stats.skipped as u64,
-                            );
-                        }
-                        info!(
-                            domains = cert_resolver.domain_count(),
-                            skipped = stats.skipped,
-                            total = stats.total,
-                            "loaded certificates into SNI resolver"
-                        );
-                    }
-                    Err(e) => warn!(error = %e, "failed to load certificates into resolver"),
-                }
-            }
-        }
+        load_certs_into_resolver(&store, &cert_resolver).await;
 
         // Create shared WAF engine
         let waf_engine = Arc::new(lorica_waf::WafEngine::new());
         let waf_event_buffer = waf_engine.event_buffer();
         let waf_rule_count = waf_engine.rule_count();
 
-        // Restore WAF state from persisted settings
-        {
-            let s = store.lock().await;
-            if let Ok(settings) = s.get_global_settings() {
-                if settings.ip_blocklist_enabled {
-                    waf_engine.ip_blocklist().set_enabled(true);
-                    match lorica_api::waf::fetch_and_load_blocklist(waf_engine.ip_blocklist()).await
-                    {
-                        Ok(count) => info!(count, "IP blocklist loaded at startup"),
-                        Err(e) => warn!(error = %e, "IP blocklist initial load failed"),
-                    }
-                }
-            }
-            // Restore disabled WAF rules
-            if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
-                if !disabled_ids.is_empty() {
-                    waf_engine.set_disabled_rules(&disabled_ids);
-                    info!(count = disabled_ids.len(), "WAF disabled rules restored");
-                }
-            }
-            // Restore custom WAF rules
-            if let Ok(custom_rules) = s.load_waf_custom_rules() {
-                for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
-                    let category = cat
-                        .parse()
-                        .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
-                    let _ =
-                        waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
-                }
-                if !custom_rules.is_empty() {
-                    info!(count = custom_rules.len(), "WAF custom rules restored");
-                }
-            }
-        }
+        // Restore WAF state (IP blocklist, disabled + custom rules) from settings
+        restore_waf_state(&store, &waf_engine).await;
 
         // Tracker shared by every background task that must drain on
         // shutdown. The shutdown path below calls `close(); wait().
@@ -422,7 +363,18 @@ pub(crate) fn run_single_process(cli: Cli) {
                 http_port: cli.http_port,
                 https_port: cli.https_port,
                 config_reload_tx: Some(config_reload_tx),
-                worker_metrics: None,
+                // Single-process: the API shares the proxy's in-process
+                // handles directly. No supervisor, so the hot-upgrade
+                // endpoint stages only and there is no aggregated/refresher
+                // path.
+                mode: lorica_api::server::Mode::SingleProcess {
+                    cache_hits: proxy_cache_hits,
+                    cache_misses: proxy_cache_misses,
+                    ban_list: proxy_ban_list,
+                    ewma_scores: proxy_ewma_scores,
+                    backend_connections: backend_conns.clone(),
+                    cache_backend: &lorica::proxy_wiring::CACHE_BACKEND,
+                },
                 waf_event_buffer: Some(waf_event_buffer),
                 waf_engine: Some(waf_engine),
                 waf_rule_count: Some(waf_rule_count),
@@ -430,24 +382,17 @@ pub(crate) fn run_single_process(cli: Cli) {
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
                 load_test_engine: Some(Arc::clone(&load_test_engine)),
-                cache_hits: Some(proxy_cache_hits),
-                cache_misses: Some(proxy_cache_misses),
-                ban_list: Some(proxy_ban_list),
-                cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
-                ewma_scores: Some(proxy_ewma_scores),
-                backend_connections: Some(backend_conns.clone()),
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
                 log_writer: log_writer.clone(),
-                aggregated_metrics: None, // single-process uses direct Arc references
-                metrics_refresher: None,  // pull-on-scrape only meaningful in worker mode
                 task_tracker: api_task_tracker,
             };
 
             // Session store + ACME auto-renewal + cert-expiry notifier
             // + server loop, shared with supervisor mode (audit H-9,
-            // see `startup::run_api_server`).
-            startup::run_api_server(management_port, state, alert_sender).await;
+            // see `startup::run_api_server`). No inherited listener:
+            // single-process binds the management port fresh.
+            startup::run_api_server(management_port, state, alert_sender, None).await;
         });
 
         // Hourly retention loop (access logs, probe results, WAF
@@ -455,6 +400,11 @@ pub(crate) fn run_single_process(cli: Cli) {
         // `startup::spawn_retention_loop`). No-op when the access-log
         // store failed to open.
         startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
+
+        // Background OCSP-staple refresh (Story 8.5). Reload swaps cert
+        // bodies with no staple; this loop attaches OCSP responses out
+        // of band, nudged immediately after each reload.
+        startup::spawn_ocsp_refresh_loop(Arc::clone(&cert_resolver), Arc::clone(&store));
 
         // Background task: reload proxy config, cert resolver, and probe scheduler when API signals a change
         let reload_store = Arc::clone(&store);
@@ -514,6 +464,18 @@ pub(crate) fn run_single_process(cli: Cli) {
             server.run_forever();
         });
 
+        // Tell systemd we are accepting. REQUIRED for `Type=notify` or
+        // systemd times the unit out and marks the start failed. No-op
+        // when `$NOTIFY_SOCKET` is unset (Docker, manual run). MAINPID is
+        // self here (single-process has no handover), a no-op for a cold
+        // start. Mirrors the supervisor cold path.
+        let self_pid = std::process::id() as i32;
+        match crate::startup::hot_upgrade::sd_notify_ready(self_pid) {
+            Ok(true) => info!(pid = self_pid, "sent sd_notify READY + MAINPID"),
+            Ok(false) => info!("NOTIFY_SOCKET unset, skipping sd_notify"),
+            Err(e) => warn!(error = %e, "sd_notify failed"),
+        }
+
         // Wait for shutdown signal
         shutdown_signal().await;
 
@@ -537,4 +499,81 @@ pub(crate) fn run_single_process(cli: Cli) {
         // never configured, so it's always safe to call.
         lorica::otel::shutdown();
     });
+}
+
+/// Load every persisted certificate into the SNI resolver at boot. OCSP
+/// staples are attached out of band by the background refresh loop, so
+/// each `CertData` starts with `ocsp_response: None`. A parse failure on
+/// an individual bundle is counted and skipped, never fatal.
+async fn load_certs_into_resolver(
+    store: &Arc<Mutex<ConfigStore>>,
+    cert_resolver: &Arc<lorica_tls::cert_resolver::CertResolver>,
+) {
+    let s = store.lock().await;
+    let db_certs = s.list_certificates().unwrap_or_default();
+    if db_certs.is_empty() {
+        return;
+    }
+    let cert_data: Vec<lorica_tls::cert_resolver::CertData> = db_certs
+        .iter()
+        .map(|c| lorica_tls::cert_resolver::CertData {
+            domain: c.domain.clone(),
+            san_domains: c.san_domains.clone(),
+            cert_pem: c.cert_pem.clone(),
+            key_pem: c.key_pem.clone(),
+            not_after_epoch: c.not_after.timestamp(),
+            ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
+        })
+        .collect();
+    match cert_resolver.reload(cert_data) {
+        Ok(stats) => {
+            if stats.skipped > 0 {
+                lorica_api::metrics::inc_certificates_invalid_bundle_by(
+                    "reload",
+                    stats.skipped as u64,
+                );
+            }
+            info!(
+                domains = cert_resolver.domain_count(),
+                skipped = stats.skipped,
+                total = stats.total,
+                "loaded certificates into SNI resolver"
+            );
+        }
+        Err(e) => warn!(error = %e, "failed to load certificates into resolver"),
+    }
+}
+
+/// Restore WAF runtime state from persisted settings: the IP blocklist
+/// (enable flag plus an initial Data-Shield fetch when on), the operator
+/// disabled-rule set, and any custom rules. Single-process mode owns the
+/// blocklist fetch (workers inherit the enable flag only).
+async fn restore_waf_state(store: &Arc<Mutex<ConfigStore>>, waf_engine: &Arc<lorica_waf::WafEngine>) {
+    let s = store.lock().await;
+    if let Ok(settings) = s.get_global_settings() {
+        if settings.ip_blocklist_enabled {
+            waf_engine.ip_blocklist().set_enabled(true);
+            match lorica_api::waf::fetch_and_load_blocklist(waf_engine.ip_blocklist()).await {
+                Ok(count) => info!(count, "IP blocklist loaded at startup"),
+                Err(e) => warn!(error = %e, "IP blocklist initial load failed"),
+            }
+        }
+    }
+    if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
+        if !disabled_ids.is_empty() {
+            waf_engine.set_disabled_rules(&disabled_ids);
+            info!(count = disabled_ids.len(), "WAF disabled rules restored");
+        }
+    }
+    if let Ok(custom_rules) = s.load_waf_custom_rules() {
+        for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
+            let category = cat
+                .parse()
+                .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
+            let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
+        }
+        if !custom_rules.is_empty() {
+            info!(count = custom_rules.len(), "WAF custom rules restored");
+        }
+    }
 }

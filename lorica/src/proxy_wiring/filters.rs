@@ -17,12 +17,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use lorica_config::models::WafMode;
+use lorica_config::models::{AiBotPolicy, SpoofedFallback, WafMode};
 use lorica_error::Result;
 use lorica_http::ResponseHeader;
 use lorica_proxy::Session;
 use tracing::{debug, warn};
 
+use crate::ai_bot::build_robots_txt_from_names;
+use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use super::{
     bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest,
     evaluate_mtls, extract_host, mirror_sample_hit, render_error_body, request_has_body,
@@ -60,22 +62,25 @@ pub fn ip_to_shmem_key(ip: &str) -> u64 {
     }
 }
 
-/// Check whether an IP address matches a pattern (exact match or CIDR range).
-pub(crate) fn ip_matches(ip: &str, pattern: &str) -> bool {
-    if pattern.contains('/') {
-        // CIDR - parse and use proper network containment check
-        let net: std::net::IpAddr = match ip.parse() {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-        let cidr: ipnet::IpNet = match pattern.parse() {
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        cidr.contains(&net)
-    } else {
-        ip == pattern
-    }
+/// Precompile a list of allow/deny patterns (bare IPs or CIDRs) into
+/// `IpNet` ranges once at config-reload time, so `check_ip_allow_deny`
+/// does not re-parse every entry on each request (audit hot-path finding).
+/// A bare IP becomes a host route (`/32` or `/128`), matching the
+/// exact-equality semantics of `ip_matches` for well-formed client IPs.
+/// Unparseable patterns are dropped; the caller keeps the original list's
+/// emptiness as the allowlist gate, so an all-malformed allowlist still
+/// blocks (fail-closed) rather than degrading to allow-all.
+pub(crate) fn compile_ip_patterns(patterns: &[String]) -> Vec<ipnet::IpNet> {
+    patterns
+        .iter()
+        .filter_map(|p| {
+            if p.contains('/') {
+                p.parse::<ipnet::IpNet>().ok()
+            } else {
+                p.parse::<std::net::IpAddr>().ok().map(ipnet::IpNet::from)
+            }
+        })
+        .collect()
 }
 
 /// Build the `Location` header value for a `redirect_to` rule.
@@ -222,6 +227,79 @@ impl LoricaProxy {
             .write_response_body(Some(bytes::Bytes::from(body)), true)
             .await?;
         Ok(true)
+    }
+}
+
+/// `Retry-After` advised on an AI-bot 403 (both the verified-Deny
+/// and the spoofed-Deny arms). 24 h - an AI training crawler has no
+/// business retrying the same denied route faster than once a day.
+const AI_BOT_DENY_RETRY_AFTER_SECS: u64 = 86_400;
+
+/// Verdict produced by `check_ai_bot`'s per-Verification dispatch
+/// step, then mapped to a terminal response (or a fall-through)
+/// based on the per-route policy and the spoofed-fallback chain.
+enum AiBotVerdict {
+    /// Apply the per-route `ai_bot_policy`. `verified` distinguishes
+    /// a POSITIVELY verified identity (rDNS cache-hit + suffix match,
+    /// or peer IP inside the vendor CIDR list) from a fail-open
+    /// pass (rDNS cache-miss, resolver absent, no peer IP) or a
+    /// `UaOnly` crawler. Only `verified == true` (non-`UaOnly`) is
+    /// allowed to launder the `X-Lorica-Verified-Bot` trust header
+    /// upstream ; the fail-open paths must stage nothing, otherwise
+    /// an attacker spoofing a verified crawler UA from a rotating IP
+    /// would forge that header (Story 8.2 audit fix).
+    ApplyPolicy { verified: bool },
+    /// Verification failed (rDNS suffix mismatch / IP outside the
+    /// vendor CIDR list) - apply the spoofed-fallback.
+    Spoofed,
+}
+
+/// Stage `X-Lorica-Verified-Bot` + `X-Lorica-Bot-Verification`
+/// headers for the upstream-injection loop (Story 8.2 AC #11).
+/// Gated by the global `ai_bot_inject_headers` setting.
+///
+/// Header staging is gated on ACTUAL verification (Story 8.2 audit
+/// fix), not merely on reaching this stage:
+/// - `UaOnly` crawler: stage ONLY the kind header
+///   (`X-Lorica-Bot-Verification: ua_only`). No verified-bot header
+///   because UA-only identity is forgeable by definition.
+/// - non-`UaOnly`, `verified == true` (rDNS suffix-confirmed or peer
+///   IP inside the vendor CIDR list): stage both the
+///   `X-Lorica-Verified-Bot` name header and the kind header.
+/// - non-`UaOnly`, `verified == false` (rDNS fail-open: cache-miss,
+///   resolver absent, or no peer IP): stage NOTHING. Verification
+///   did not actually happen, so laundering the trust header here
+///   would let an attacker spoofing a verified crawler UA from a
+///   rotating IP forge `X-Lorica-Verified-Bot` upstream.
+fn stage_verified_bot_headers(
+    ctx: &mut RequestCtx,
+    crawler: &MergedCrawler,
+    config: &ProxyConfig,
+    verified: bool,
+) {
+    if !config.ai_bot_inject_headers {
+        return;
+    }
+    ctx.ai_bot_inject
+        .extend(verified_bot_headers(crawler, verified));
+}
+
+/// Pure header-staging decision for [`stage_verified_bot_headers`],
+/// split out so the verification gate is unit-testable without
+/// constructing a full `RequestCtx` / `ProxyConfig`. See
+/// [`stage_verified_bot_headers`] for the per-arm rationale.
+fn verified_bot_headers(crawler: &MergedCrawler, verified: bool) -> Vec<(String, String)> {
+    let kind = crawler.verification.kind_str();
+    match crawler.verification {
+        MergedVerification::UaOnly => {
+            vec![("X-Lorica-Bot-Verification".to_string(), kind.to_string())]
+        }
+        _ if verified => vec![
+            ("X-Lorica-Verified-Bot".to_string(), crawler.name.clone()),
+            ("X-Lorica-Bot-Verification".to_string(), kind.to_string()),
+        ],
+        // Fail-open, unverified non-UaOnly: stage nothing.
+        _ => Vec::new(),
     }
 }
 
@@ -419,8 +497,8 @@ impl LoricaProxy {
         ip: &str,
     ) -> Result<Option<bool>> {
         let banned = if let Some(entry) = self.ban_list.get(ip) {
-            let (banned_at, duration_s) = entry.value();
-            if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
+            let rec = entry.value();
+            if rec.banned_at.elapsed() >= Duration::from_secs(rec.duration_s) {
                 drop(entry);
                 // Ban expired - lazy cleanup
                 self.ban_list.remove(ip);
@@ -600,42 +678,150 @@ impl LoricaProxy {
         ctx: &mut RequestCtx,
         entry: &RouteEntry,
         is_whitelisted: bool,
+        config: &ProxyConfig,
     ) -> Result<Option<bool>> {
-        if let Some(ref rl) = entry.route.rate_limit {
-            if !is_whitelisted {
-                let scope_key = match rl.scope {
-                    lorica_config::models::RateLimitScope::PerIp => {
-                        ctx.client_ip.as_deref().unwrap_or("unknown").to_string()
-                    }
-                    lorica_config::models::RateLimitScope::PerRoute => "__route__".to_string(),
+        if is_whitelisted {
+            return Ok(None);
+        }
+        // Story 8.10 AC #3. Single admission path: the structured
+        // `rate_limit` struct wins, and a legacy `rate_limit_rps` route is
+        // synthesised into an equivalent token bucket by
+        // `Route::effective_rate_limit`.
+        let Some(rl) = entry.route.effective_rate_limit() else {
+            return Ok(None);
+        };
+
+        // Bucket key = `<route_id>|<scope>`. The engine's `DashMap` is
+        // keyed by `String`, so the key must materialise as one contiguous
+        // buffer; building it in a single pre-sized `String` keeps the
+        // hottest admission check to one allocation (was two: an
+        // intermediate scope String plus the `format!`). Collapsing to a
+        // zero-alloc `(route_id, IpAddr)` tuple key would mean changing the
+        // engine's key type and its prune task, out of scope here.
+        let scope_key: &str = match rl.scope {
+            lorica_config::models::RateLimitScope::PerIp => {
+                ctx.client_ip.as_deref().unwrap_or("unknown")
+            }
+            lorica_config::models::RateLimitScope::PerRoute => "__route__",
+        };
+        let mut key = String::with_capacity(entry.route.id.len() + 1 + scope_key.len());
+        key.push_str(&entry.route.id);
+        key.push('|');
+        key.push_str(scope_key);
+
+        // Story 8.10 AC #2. Adaptive flood defense: while the proxy-wide
+        // RPS is above `flood_threshold_rps`, tighten per-IP admission by
+        // charging extra tokens per request. The cost multiplier is
+        // `flood_threshold_rps / flood_strict_rps`, so the default
+        // `flood_strict_rps = flood_threshold_rps / 2` doubles the cost -
+        // the token-bucket equivalent of the historical 0.5x "halve the
+        // limit" factor. Only PerIp buckets are tightened, matching the
+        // legacy per-IP-only semantics.
+        let mut cost: u32 = 1;
+        if config.flood_threshold_rps > 0
+            && rl.scope == lorica_config::models::RateLimitScope::PerIp
+        {
+            let global_rps = self.global_rate.rate(&"global");
+            if global_rps > config.flood_threshold_rps as f64 {
+                let strict = if config.flood_strict_rps > 0 {
+                    config.flood_strict_rps
+                } else {
+                    config.flood_threshold_rps / 2
                 };
-                let key = format!("{}|{}", entry.route.id, scope_key);
-                let admitted = self
-                    .rate_limit_buckets
-                    .try_consume(&key, rl, 1, lorica_shmem::now_ns());
-                if !admitted {
-                    ctx.block_reason = Some("rate limited".to_string());
-                    // Retry-After in seconds. For any configured refill
-                    // rate >= 1 tok/s, 1 second is the right advice
-                    // (one token refills in <= 1 s). A zero refill means
-                    // a one-shot bucket that never refills - advise a
-                    // generous 60 s backoff instead of a tight loop.
-                    let retry_after: u64 = if rl.refill_per_sec >= 1 { 1 } else { 60 };
-                    return self
-                        .write_error_response(
-                            session,
-                            429,
-                            &ctx.request_id,
-                            entry.route.error_page_html.as_deref(),
-                            "Rate limit exceeded",
-                            &[("Retry-After", retry_after.to_string())],
-                        )
-                        .await
-                        .map(Some);
+                if strict > 0 && config.flood_threshold_rps > strict {
+                    cost = ((config.flood_threshold_rps as f64 / strict as f64).round() as u32)
+                        .max(1);
                 }
             }
         }
-        Ok(None)
+
+        let now_ns = lorica_shmem::now_ns();
+        let admitted = self.rate_limit_buckets.try_consume(&key, &rl, cost, now_ns);
+
+        // Rate-limit response headers (kept even when admitted, matching
+        // the legacy per-route behaviour the e2e suite pins): the reported
+        // limit is the steady refill rate (or the capacity for a one-shot
+        // bucket) and remaining is the live token count.
+        let reported_limit = if rl.refill_per_sec > 0 {
+            rl.refill_per_sec
+        } else {
+            rl.capacity
+        };
+        let remaining = self
+            .rate_limit_buckets
+            .remaining_tokens(&key, now_ns)
+            .unwrap_or(0)
+            .max(0);
+        let used = (reported_limit as f64 - remaining as f64).max(0.0);
+        ctx.rate_limit_info = Some((reported_limit, used));
+
+        if admitted {
+            return Ok(None);
+        }
+
+        ctx.block_reason = Some("rate limited".to_string());
+
+        // Story 8.10 AC #4. Auto-ban escalation now lives on the unified
+        // path, so a route using the structured config (or a legacy config
+        // routed through the shim) still escalates repeat offenders.
+        if let (Some(ban_threshold), Some(ip)) =
+            (entry.route.auto_ban_threshold, ctx.client_ip.as_deref())
+        {
+            let violation_key = format!("violation:{ip}");
+            self.rate_violations.observe(&violation_key, 1);
+            let violations = self.rate_violations.rate(&violation_key);
+            if violations > ban_threshold as f64 {
+                let ban_duration = entry.route.auto_ban_duration_s;
+                self.ban_list.insert(
+                    ip.to_string(),
+                    lorica_api::ban::BanRecord {
+                        banned_at: Instant::now(),
+                        duration_s: ban_duration as u64,
+                        reason: lorica_api::ban::BanReason::RateLimit,
+                    },
+                );
+                warn!(
+                    ip = %ip,
+                    violations = %violations,
+                    ban_duration_s = %ban_duration,
+                    "IP auto-banned for rate limit abuse"
+                );
+                if let Some(ref sender) = self.alert_sender {
+                    sender.send(
+                        lorica_notify::AlertEvent::new(
+                            lorica_notify::events::AlertType::IpBanned,
+                            format!("IP {ip} auto-banned for rate limit abuse"),
+                        )
+                        .with_detail("ip", ip.to_string())
+                        .with_detail("violations", violations.to_string())
+                        .with_detail("ban_duration_s", ban_duration.to_string()),
+                    );
+                }
+            }
+        }
+
+        // Retry-After in seconds. A refill rate >= 1 tok/s refills one
+        // token in <= 1 s; a zero refill is a one-shot bucket, so advise a
+        // generous 60 s backoff instead of a tight retry loop.
+        let retry_after: u64 = if rl.refill_per_sec >= 1 { 1 } else { 60 };
+        let reset_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + 1;
+        self.write_error_response(
+            session,
+            429,
+            &ctx.request_id,
+            entry.route.error_page_html.as_deref(),
+            "Rate limit exceeded",
+            &[
+                ("Retry-After", retry_after.to_string()),
+                ("X-RateLimit-Reset", reset_ts.to_string()),
+            ],
+        )
+        .await
+        .map(Some)
     }
 
     /// Stage: mTLS client verification. Runs before forward_auth so a
@@ -931,6 +1117,13 @@ impl LoricaProxy {
                 } else {
                     // No body to buffer (or operator opted into
                     // headers-only via max_body_bytes = 0): fire now.
+                    let mirror_caps = {
+                        let cfg = self.config.load();
+                        (
+                            cfg.mirror_max_concurrent_per_route,
+                            cfg.mirror_max_concurrent_global,
+                        )
+                    };
                     spawn_mirrors(
                         mirror_cfg,
                         &entry.mirror_backends,
@@ -940,6 +1133,7 @@ impl LoricaProxy {
                         None,
                         ctx.request_id.clone(),
                         entry.route.id.clone(),
+                        mirror_caps,
                     );
                 }
             }
@@ -1160,6 +1354,60 @@ impl LoricaProxy {
         Ok(None)
     }
 
+    /// Stage: auto-served `/robots.txt` for routes that opted in via
+    /// `Route.serve_robots_txt = true` (Story 8.2 AC #10). Triggers
+    /// on GET `/robots.txt` only; everything else falls through to
+    /// the backend (RFC 9309 advisory layer; the backend's own
+    /// `/robots.txt` stays authoritative when the operator has not
+    /// opted in). Terminal: 200 with the registry-driven body.
+    ///
+    /// Body shape per [`build_robots_txt_from_names`]: a header comment,
+    /// then one `User-agent` / `Disallow: /` block per crawler when the
+    /// route's `ai_bot_policy` is not `Off`, or a `User-agent: *` with
+    /// `Allow: /` fallback when no crawlers are active. Consults the
+    /// merged registry (built-in and enabled custom rows) so an
+    /// operator's Custom Crawler shows up in `/robots.txt` after a
+    /// hot-reload (Story 8.2 AC #8).
+    pub(super) async fn check_robots_txt(
+        &self,
+        session: &mut Session,
+        entry: &RouteEntry,
+    ) -> Result<Option<bool>> {
+        if !entry.route.serve_robots_txt {
+            return Ok(None);
+        }
+        {
+            let req = session.req_header();
+            if req.uri.path() != "/robots.txt" || req.method.as_str() != "GET" {
+                return Ok(None);
+            }
+        }
+        let policy = entry.route.ai_bot_policy.unwrap_or(AiBotPolicy::Off);
+        let body: String = if policy == AiBotPolicy::Off {
+            build_robots_txt_from_names(&[])
+        } else {
+            // `load_full` (a single atomic Arc bump), not `load`, so
+            // no non-`Send` arc-swap guard is alive across the
+            // `.await` response writes below - same pattern, and same
+            // reason, as `check_ai_bot`. The body is fully built here
+            // and the snapshot dropped before the writes.
+            let registry = ai_bot_merged::handle().load_full();
+            let names: Vec<&str> = registry.iter().map(|c| c.name.as_str()).collect();
+            build_robots_txt_from_names(&names)
+        };
+        let mut header = lorica_http::ResponseHeader::build(200, None)?;
+        header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+        header.insert_header("Cache-Control", "public, max-age=3600")?;
+        header.insert_header("Content-Length", body.len().to_string())?;
+        session
+            .write_response_header(Box::new(header), false)
+            .await?;
+        session
+            .write_response_body(Some(bytes::Bytes::from(body)), true)
+            .await?;
+        Ok(Some(true))
+    }
+
     /// Stage: per-route IP allowlist / denylist. Triggers when the
     /// route has a non-empty allowlist that does not match the client
     /// IP, or a denylist entry that does. Terminal: 403 (both
@@ -1171,8 +1419,16 @@ impl LoricaProxy {
         entry: &RouteEntry,
         ip: &str,
     ) -> Result<Option<bool>> {
+        // Match against the precompiled `IpNet` ranges (built once at
+        // config-reload time). The allowlist emptiness gate still reads the
+        // original `route.ip_allowlist` so an all-malformed list stays
+        // fail-closed. A client IP that does not parse matches nothing:
+        // fail-closed for the allowlist (blocked), fail-open for the
+        // denylist (not denied).
+        let client_addr: Option<std::net::IpAddr> = ip.parse().ok();
         if !entry.route.ip_allowlist.is_empty()
-            && !entry.route.ip_allowlist.iter().any(|a| ip_matches(ip, a))
+            && !client_addr
+                .is_some_and(|a| entry.ip_allowlist_nets.iter().any(|n| n.contains(&a)))
         {
             ctx.block_reason = Some("IP not in allowlist".to_string());
             return self
@@ -1187,7 +1443,7 @@ impl LoricaProxy {
                 .await
                 .map(Some);
         }
-        if entry.route.ip_denylist.iter().any(|d| ip_matches(ip, d)) {
+        if client_addr.is_some_and(|a| entry.ip_denylist_nets.iter().any(|n| n.contains(&a))) {
             ctx.block_reason = Some("IP in denylist".to_string());
             return self
                 .write_error_response(
@@ -1202,6 +1458,185 @@ impl LoricaProxy {
                 .map(Some);
         }
         Ok(None)
+    }
+
+    /// Stage: AI / LLM crawler deny-list (Story 8.2 AC #1 + #3).
+    ///
+    /// Flow:
+    /// 1. Per-route policy gate: `Route.ai_bot_policy.unwrap_or(Off)
+    ///    == Off` -> fall through (no decision).
+    /// 2. UA match against the merged registry (built-in + enabled
+    ///    custom rows): no match -> fall through (not an AI bot).
+    /// 3. Dispatch on `crawler.verification`:
+    ///    - `Rdns(suffixes)` -> cache-only forward-confirmed lookup
+    ///      via `bot_rdns::handle()`. Cache hit + suffix match ->
+    ///      `ApplyPolicy`. Cache hit + suffix mismatch -> `Spoofed`.
+    ///      Cache miss -> fire-and-forget resolve, fail-open (the
+    ///      next request from the same IP lands on a hit). Resolver
+    ///      `None` -> `record_ai_bot_rdns_unavailable`, fail-open.
+    ///    - `IpRanges(vendor_key)` -> post-trust-boundary peer IP
+    ///      CIDR scan against the bundled list. In-range ->
+    ///      `ApplyPolicy`, out-of-range -> `Spoofed`.
+    ///    - `UaOnly` -> `ua_only_match` counter, `ApplyPolicy` (no
+    ///      spoof signal possible).
+    /// 4. Map the verdict: `ApplyPolicy + Deny` -> 403 with
+    ///    `Retry-After: 86400` + the route's `error_page_html`;
+    ///    `ApplyPolicy + Log` -> `log` counter, stage AC #11 headers,
+    ///    fall through; `Spoofed` -> per-route
+    ///    `ai_bot_spoofed_fallback` (global
+    ///    `ai_bot_treat_spoofed_as` when unset) with the
+    ///    `action="spoofed"` counter on Deny / Log.
+    ///
+    /// Terminal: 403 (Deny verdicts only).
+    pub(super) async fn check_ai_bot(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        entry: &RouteEntry,
+        check_ip: Option<&str>,
+        config: &ProxyConfig,
+    ) -> Result<Option<bool>> {
+        let policy = entry.route.ai_bot_policy.unwrap_or(AiBotPolicy::Off);
+        if policy == AiBotPolicy::Off {
+            return Ok(None);
+        }
+        // Hold a full Arc clone of the merged registry across the
+        // async response writes below. A bare `load()` guard is not
+        // `Send`-safe to hold past an `.await` ; `load_full` is a
+        // single atomic bump and keeps the matched `&MergedCrawler`
+        // borrow valid for the whole stage.
+        let registry = ai_bot_merged::handle().load_full();
+        let crawler: &MergedCrawler = {
+            let req = session.req_header();
+            let ua = req
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok());
+            match ua.and_then(|ua| MergedCrawler::match_first(&registry, ua)) {
+                Some(c) => c,
+                None => return Ok(None),
+            }
+        };
+        let route_id = entry.route.id.as_str();
+
+        let verdict = match &crawler.verification {
+            MergedVerification::UaOnly => {
+                lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "ua_only_match");
+                // UaOnly is never positively verified.
+                AiBotVerdict::ApplyPolicy { verified: false }
+            }
+            MergedVerification::IpRanges(ranges) => {
+                let parsed_ip = check_ip.and_then(|s| s.parse::<std::net::IpAddr>().ok());
+                match parsed_ip {
+                    Some(ip) if ranges.iter().any(|net| net.contains(&ip)) => {
+                        AiBotVerdict::ApplyPolicy { verified: true }
+                    }
+                    _ => AiBotVerdict::Spoofed,
+                }
+            }
+            MergedVerification::Rdns(suffixes) => self.evaluate_ai_bot_rdns(check_ip, suffixes),
+        };
+
+        match verdict {
+            AiBotVerdict::ApplyPolicy { verified } => match policy {
+                AiBotPolicy::Off => Ok(None),
+                AiBotPolicy::Deny => {
+                    lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "deny");
+                    ctx.block_reason = Some(format!("ai_bot deny {}", crawler.name));
+                    self.write_error_response(
+                        session,
+                        403,
+                        &ctx.request_id,
+                        entry.route.error_page_html.as_deref(),
+                        "AI crawler denied",
+                        &[("Retry-After", AI_BOT_DENY_RETRY_AFTER_SECS.to_string())],
+                    )
+                    .await
+                    .map(Some)
+                }
+                AiBotPolicy::Log => {
+                    lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "log");
+                    stage_verified_bot_headers(ctx, crawler, config, verified);
+                    Ok(None)
+                }
+            },
+            AiBotVerdict::Spoofed => {
+                let fallback = entry
+                    .route
+                    .ai_bot_spoofed_fallback
+                    .unwrap_or(config.ai_bot_treat_spoofed_as);
+                match fallback {
+                    SpoofedFallback::Deny => {
+                        lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "spoofed");
+                        ctx.block_reason = Some(format!("ai_bot spoofed {}", crawler.name));
+                        self.write_error_response(
+                            session,
+                            403,
+                            &ctx.request_id,
+                            entry.route.error_page_html.as_deref(),
+                            "AI crawler denied",
+                            &[("Retry-After", AI_BOT_DENY_RETRY_AFTER_SECS.to_string())],
+                        )
+                        .await
+                        .map(Some)
+                    }
+                    SpoofedFallback::Log => {
+                        lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "spoofed");
+                        Ok(None)
+                    }
+                    SpoofedFallback::Allow => {
+                        // Fail-open Allow still records the spoofed
+                        // signal so operators see spoofed volume in
+                        // /metrics, not just the deny/log arms.
+                        lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "spoofed");
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    /// rDNS verification helper for `check_ai_bot`. Cache-only hot
+    /// path: a miss does not block; we fire-and-forget a resolve so
+    /// the next request from the same IP lands on a hit. Resolver
+    /// `None` (rDNS disabled at startup) increments
+    /// `lorica_ai_bot_rdns_unavailable_total` and falls open.
+    fn evaluate_ai_bot_rdns(&self, check_ip: Option<&str>, suffixes: &[String]) -> AiBotVerdict {
+        let parsed_ip = match check_ip.and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
+            Some(ip) => ip,
+            // Without a peer IP we cannot verify; fail-open (same
+            // semantic as a cache miss) but NOT verified - the trust
+            // header must not be staged on this path.
+            None => return AiBotVerdict::ApplyPolicy { verified: false },
+        };
+        let resolver = match crate::bot_rdns::handle() {
+            Some(r) => r,
+            None => {
+                lorica_api::metrics::record_ai_bot_rdns_unavailable();
+                return AiBotVerdict::ApplyPolicy { verified: false };
+            }
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        match resolver.cache_check(parsed_ip, now) {
+            Some(Some(name)) => {
+                if crate::bot_rdns::suffix_matches(&name, suffixes) {
+                    // Cache hit + suffix match = positively verified.
+                    AiBotVerdict::ApplyPolicy { verified: true }
+                } else {
+                    AiBotVerdict::Spoofed
+                }
+            }
+            Some(None) => AiBotVerdict::Spoofed,
+            None => {
+                // Cache miss: fire-and-forget resolve, fail-open but
+                // unverified (no trust header this request).
+                resolver.try_spawn_resolve(parsed_ip);
+                AiBotVerdict::ApplyPolicy { verified: false }
+            }
+        }
     }
 
     /// Stage: per-route GeoIP country filter (v1.4.0 Epic 2 story 2.4).
@@ -1498,6 +1933,10 @@ impl LoricaProxy {
                                 .get(http::header::ACCEPT)
                                 .and_then(|v| v.to_str().ok()),
                         );
+                        let stash_caps = {
+                            let cfg = self.config.load();
+                            (cfg.bot_stash_max_entries, cfg.bot_stash_per_prefix_max)
+                        };
                         return bot_handlers::serve_challenge(
                             session,
                             &self.bot_engine,
@@ -1507,6 +1946,7 @@ impl LoricaProxy {
                             &path_and_q,
                             accept_html,
                             now_secs,
+                            stash_caps,
                         )
                         .await
                         .map(Some);
@@ -1517,18 +1957,31 @@ impl LoricaProxy {
         Ok(None)
     }
 
-    /// Stage: slowloris detection. Triggers when the route configures
-    /// `slowloris_threshold_ms > 0` and the time from connection start
-    /// to `request_filter` exceeds it (the client is likely sending
-    /// headers very slowly). Terminal: 408.
+    /// Stage: slowloris detection. Triggers when the time from connection
+    /// start to `request_filter` exceeds the effective header-phase
+    /// threshold (the client is likely sending headers very slowly). The
+    /// threshold is the smallest positive of the per-route
+    /// `slowloris_threshold_ms` and the global `header_timeout_s` floor
+    /// (Story 8.10 AC #1), so the global setting protects every route,
+    /// including routes that leave `slowloris_threshold_ms` at 0.
+    /// Terminal: 408.
     pub(super) async fn check_slowloris(
         &self,
         session: &mut Session,
         ctx: &mut RequestCtx,
         entry: &RouteEntry,
         check_ip: Option<&str>,
+        header_timeout_s: u32,
     ) -> Result<Option<bool>> {
-        let slowloris_ms = entry.route.slowloris_threshold_ms;
+        let route_ms = entry.route.slowloris_threshold_ms.max(0);
+        let global_ms = (header_timeout_s as i32).saturating_mul(1000);
+        // Smallest strictly-positive threshold wins; 0 means "disabled"
+        // for that layer.
+        let slowloris_ms = match (route_ms, global_ms) {
+            (0, g) => g,
+            (r, 0) => r,
+            (r, g) => r.min(g),
+        };
         if slowloris_ms > 0 {
             let elapsed_ms = ctx.start_time.elapsed().as_millis() as i32;
             if elapsed_ms > slowloris_ms {
@@ -1676,111 +2129,6 @@ impl LoricaProxy {
         Ok(None)
     }
 
-    /// Stage: legacy per-route rate limiting (`rate_limit_rps` +
-    /// optional burst), with adaptive flood defense (per-IP limits
-    /// halved when global RPS exceeds `flood_threshold_rps`) and
-    /// auto-ban on repeated violations (`auto_ban_threshold`). Skipped
-    /// for whitelisted IPs. Stores `ctx.rate_limit_info` for response
-    /// headers even when not throttled. Terminal: 429 with
-    /// `Retry-After` and `X-RateLimit-Reset`.
-    pub(super) async fn check_legacy_rate_limit(
-        &self,
-        session: &mut Session,
-        ctx: &mut RequestCtx,
-        entry: &RouteEntry,
-        check_ip: Option<&str>,
-        is_whitelisted: bool,
-        config: &ProxyConfig,
-    ) -> Result<Option<bool>> {
-        if !is_whitelisted {
-            if let Some(rps) = entry.route.rate_limit_rps {
-                if let Some(ip) = check_ip {
-                    let key = format!("{}:{}", entry.route.id, ip);
-                    self.rate_limiter.observe(&key, 1);
-                    let current_rate = self.rate_limiter.rate(&key);
-                    let mut effective_limit = match entry.route.rate_limit_burst {
-                        Some(burst) => (rps + burst) as f64,
-                        None => rps as f64,
-                    };
-
-                    // Adaptive flood defense: when global RPS exceeds the
-                    // configured threshold, halve per-IP rate limits.
-                    let threshold = config.flood_threshold_rps;
-                    if threshold > 0 {
-                        let global_rps = self.global_rate.rate(&"global");
-                        if global_rps > threshold as f64 {
-                            effective_limit *= 0.5;
-                        }
-                    }
-                    // Store rate info for response headers (even if not throttled)
-                    ctx.rate_limit_info = Some((rps, current_rate));
-
-                    if current_rate > effective_limit {
-                        warn!(
-                            route_id = %entry.route.id,
-                            client_ip = %ip,
-                            current_rate = %current_rate,
-                            limit_rps = %rps,
-                            "request rate-limited (429)"
-                        );
-
-                        // Track rate limit violations for auto-ban
-                        if let Some(ban_threshold) = entry.route.auto_ban_threshold {
-                            let violation_key = format!("violation:{}", ip);
-                            self.rate_violations.observe(&violation_key, 1);
-                            let violations = self.rate_violations.rate(&violation_key);
-                            if violations > ban_threshold as f64 {
-                                let ban_duration = entry.route.auto_ban_duration_s;
-                                self.ban_list
-                                    .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
-                                warn!(
-                                    ip = %ip,
-                                    violations = %violations,
-                                    ban_duration_s = %ban_duration,
-                                    "IP auto-banned for rate limit abuse"
-                                );
-                                // Dispatch ip_banned notification
-                                if let Some(ref sender) = self.alert_sender {
-                                    sender.send(
-                                        lorica_notify::AlertEvent::new(
-                                            lorica_notify::events::AlertType::IpBanned,
-                                            format!("IP {} auto-banned for rate limit abuse", ip),
-                                        )
-                                        .with_detail("ip", ip.to_string())
-                                        .with_detail("violations", violations.to_string())
-                                        .with_detail("ban_duration_s", ban_duration.to_string()),
-                                    );
-                                }
-                            }
-                        }
-
-                        let reset_ts = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                            + 1;
-                        ctx.block_reason = Some("rate limited".to_string());
-                        return self
-                            .write_error_response(
-                                session,
-                                429,
-                                &ctx.request_id,
-                                entry.route.error_page_html.as_deref(),
-                                "Rate limit exceeded",
-                                &[
-                                    ("Retry-After", "1".to_string()),
-                                    ("X-RateLimit-Reset", reset_ts.to_string()),
-                                ],
-                            )
-                            .await
-                            .map(Some);
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
     /// Stage: WAF evaluation over path, query, and headers (terminal
     /// stage of `request_filter`). Returns `Ok(false)` immediately when
     /// the IP is whitelisted or WAF is disabled on the route (zero
@@ -1900,8 +2248,14 @@ impl LoricaProxy {
                                 + 1;
                             if violations >= threshold as u64 {
                                 let ban_duration = config.waf_ban_duration_s;
-                                self.ban_list
-                                    .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
+                                self.ban_list.insert(
+                                    ip.to_string(),
+                                    lorica_api::ban::BanRecord {
+                                        banned_at: Instant::now(),
+                                        duration_s: ban_duration as u64,
+                                        reason: lorica_api::ban::BanReason::WafCriticalRule,
+                                    },
+                                );
                                 self.waf_violations.remove(ip);
                                 warn!(
                                     ip = %ip,
@@ -1954,5 +2308,80 @@ impl LoricaProxy {
             }
             lorica_waf::WafVerdict::Pass => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipnet::IpNet;
+    use regex::Regex;
+
+    fn crawler(name: &str, verification: MergedVerification) -> MergedCrawler {
+        MergedCrawler {
+            name: name.to_string(),
+            pattern: Regex::new(r"(?i)\btestbot\b").expect("test regex compiles"),
+            verification,
+        }
+    }
+
+    #[test]
+    fn ip_ranges_verified_stages_both_headers() {
+        let net: IpNet = "203.0.113.0/24".parse().unwrap();
+        let c = crawler("GPTBot", MergedVerification::IpRanges(vec![net]));
+        let headers = verified_bot_headers(&c, true);
+        assert_eq!(
+            headers,
+            vec![
+                ("X-Lorica-Verified-Bot".to_string(), "GPTBot".to_string()),
+                ("X-Lorica-Bot-Verification".to_string(), "ip_ranges".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rdns_confirmed_stages_both_headers() {
+        let c = crawler(
+            "CCBot",
+            MergedVerification::Rdns(vec![".crawl.commoncrawl.org".to_string()]),
+        );
+        let headers = verified_bot_headers(&c, true);
+        assert_eq!(
+            headers,
+            vec![
+                ("X-Lorica-Verified-Bot".to_string(), "CCBot".to_string()),
+                ("X-Lorica-Bot-Verification".to_string(), "rdns".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rdns_fail_open_stages_nothing() {
+        // Cache-miss / resolver-absent / no-peer-IP all surface here
+        // as verified=false on a non-UaOnly crawler. The trust header
+        // must NOT be laundered upstream (the security fix).
+        let c = crawler(
+            "CCBot",
+            MergedVerification::Rdns(vec![".crawl.commoncrawl.org".to_string()]),
+        );
+        let headers = verified_bot_headers(&c, false);
+        assert!(headers.is_empty(), "fail-open must stage no headers");
+    }
+
+    #[test]
+    fn ua_only_stages_only_kind_header() {
+        let c = crawler("Bytespider", MergedVerification::UaOnly);
+        // verified flag is irrelevant for UaOnly.
+        let headers = verified_bot_headers(&c, false);
+        assert_eq!(
+            headers,
+            vec![("X-Lorica-Bot-Verification".to_string(), "ua_only".to_string())]
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name == "X-Lorica-Verified-Bot"),
+            "UaOnly must never stage the verified-bot name header"
+        );
     }
 }

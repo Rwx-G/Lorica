@@ -207,6 +207,91 @@ impl CertResolver {
     pub fn domain_count(&self) -> usize {
         self.inner.load().certs.len()
     }
+
+    /// Atomically replace the OCSP staple bytes on already-loaded
+    /// certificates without re-parsing PEM or re-deriving signing keys.
+    ///
+    /// `staples` maps a lowercased domain key (primary or SAN, matching
+    /// the resolver's own key space) to a fresh DER-encoded OCSP response.
+    /// Every registered [`CertEntry`] whose domain is present in the map is
+    /// rebuilt with a new `CertifiedKey` carrying the fresh staple; the
+    /// parsed certificate chain is cloned and the signing key is `Arc`-
+    /// shared, so this path never touches PEM parsing or key derivation.
+    /// Domains absent from the map keep their current key untouched. The
+    /// whole rebuilt table is published with a single `arc-swap`, so
+    /// in-flight TLS handshakes keep serving their already-negotiated
+    /// `CertifiedKey` (Story 8.5 AC #2 / AC #6). This is the OCSP-only
+    /// counterpart to [`Self::reload`]: reload swaps cert bodies, this
+    /// swaps staples, and the two never block each other on the network.
+    pub fn refresh_staples(&self, staples: &HashMap<String, Vec<u8>>) -> RefreshStats {
+        let current = self.inner.load();
+        let mut map: HashMap<String, Vec<CertEntry>> =
+            HashMap::with_capacity(current.certs.len());
+        let mut refreshed: usize = 0;
+        let mut unchanged: usize = 0;
+
+        for (domain, entries) in current.certs.iter() {
+            if let Some(ocsp) = staples.get(domain) {
+                let rebuilt: Vec<CertEntry> = entries
+                    .iter()
+                    .map(|e| {
+                        let mut ck =
+                            CertifiedKey::new(e.key.cert.clone(), Arc::clone(&e.key.key));
+                        ck.ocsp = Some(ocsp.clone());
+                        CertEntry {
+                            key: Arc::new(ck),
+                            not_after_epoch: e.not_after_epoch,
+                        }
+                    })
+                    .collect();
+                map.insert(domain.clone(), rebuilt);
+                refreshed += 1;
+            } else {
+                map.insert(domain.clone(), entries.clone());
+                unchanged += 1;
+            }
+        }
+
+        self.inner.store(Arc::new(CertResolverInner { certs: map }));
+        RefreshStats {
+            refreshed,
+            unchanged,
+        }
+    }
+
+    /// Snapshot of every registered domain key, lowercased, in no
+    /// particular order. The OCSP refresh loop uses it only for logging
+    /// and gauge cardinality; staple fetching is driven from the cert
+    /// store (which retains the PEM), not from this list.
+    pub fn domains(&self) -> Vec<String> {
+        self.inner.load().certs.keys().cloned().collect()
+    }
+
+    /// The OCSP staple currently attached to the first (longest-lived)
+    /// cert registered for `domain`, if any. Test-only accessor used to
+    /// assert that [`Self::refresh_staples`] published the fresh bytes.
+    #[cfg(test)]
+    fn staple_for(&self, domain: &str) -> Option<Vec<u8>> {
+        self.inner
+            .load()
+            .certs
+            .get(domain)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.key.ocsp.clone())
+    }
+}
+
+/// Outcome counts for one [`CertResolver::refresh_staples`] call.
+///
+/// `refreshed` is the number of distinct domain keys whose staple was
+/// replaced; `unchanged` counts registered domains absent from the
+/// staple map (their existing staple, if any, is preserved). The OCSP
+/// refresh loop in `lorica` feeds `refreshed` into the
+/// `lorica_ocsp_refresh_total{result="ok"}` Prometheus counter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshStats {
+    pub refreshed: usize,
+    pub unchanged: usize,
 }
 
 impl ResolvesServerCert for CertResolver {
@@ -308,20 +393,6 @@ fn parse_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Self-signed test certificate for "test.example.com" generated at build time
-    // is not practical, so we test the resolver logic with mock entries.
-
-    #[allow(dead_code)] // Placeholder helper kept for future integration tests.
-    fn make_resolver_with_entries(entries: Vec<(&str, i64)>) -> CertResolver {
-        let resolver = CertResolver::new();
-
-        // We can't easily create real CertifiedKeys in tests without valid certs,
-        // so test the HashMap/wildcard logic via the public API indirectly.
-        // For real cert tests, see integration tests.
-        let _ = entries; // placeholder
-        resolver
-    }
 
     #[test]
     fn test_empty_resolver() {
@@ -659,6 +730,91 @@ mod tests {
                 "second.example.com".to_string(),
             ],
             "both rows' originating domains must be reported"
+        );
+    }
+
+    /// `refresh_staples` must replace the OCSP bytes on a loaded cert
+    /// without changing the served domain set, and report the count of
+    /// refreshed vs untouched domains. This is the background-loop swap
+    /// (Story 8.5) : reload puts the cert body in with no staple, the
+    /// loop attaches the staple later without a PEM re-parse.
+    #[test]
+    fn refresh_staples_replaces_ocsp_bytes_and_counts() {
+        let cert_pem = include_str!("../tests/test-cert.pem");
+        let key_pem = include_str!("../tests/test-key.pem");
+
+        let resolver = CertResolver::new();
+        resolver
+            .reload(vec![CertData {
+                domain: "stapled.example.com".to_string(),
+                san_domains: vec!["alt.example.com".to_string()],
+                cert_pem: cert_pem.to_string(),
+                key_pem: key_pem.to_string(),
+                not_after_epoch: 9999999999,
+                ocsp_response: None,
+            }])
+            .unwrap();
+
+        // No staple after a body-only reload.
+        assert_eq!(resolver.staple_for("stapled.example.com"), None);
+
+        let fresh = vec![0x30, 0x03, 0x0A, 0x01, 0x00];
+        let mut staples = std::collections::HashMap::new();
+        staples.insert("stapled.example.com".to_string(), fresh.clone());
+        staples.insert("alt.example.com".to_string(), fresh.clone());
+
+        let stats = resolver.refresh_staples(&staples);
+
+        assert_eq!(stats.refreshed, 2, "primary + SAN domain keys refreshed");
+        assert_eq!(stats.unchanged, 0);
+        assert_eq!(resolver.domain_count(), 2, "domain set is unchanged");
+        assert_eq!(resolver.staple_for("stapled.example.com"), Some(fresh.clone()));
+        assert_eq!(resolver.staple_for("alt.example.com"), Some(fresh));
+    }
+
+    /// A staple map that misses a registered domain must leave that
+    /// domain's existing key untouched and count it as `unchanged`, so a
+    /// transient OCSP-fetch failure for one vhost never drops the staple
+    /// (or the cert) of the others.
+    #[test]
+    fn refresh_staples_leaves_unlisted_domains_untouched() {
+        let cert_pem = include_str!("../tests/test-cert.pem");
+        let key_pem = include_str!("../tests/test-key.pem");
+
+        let resolver = CertResolver::new();
+        resolver
+            .reload(vec![
+                CertData {
+                    domain: "a.example.com".to_string(),
+                    san_domains: vec![],
+                    cert_pem: cert_pem.to_string(),
+                    key_pem: key_pem.to_string(),
+                    not_after_epoch: 9999999999,
+                    ocsp_response: Some(vec![0xAA]),
+                },
+                CertData {
+                    domain: "b.example.com".to_string(),
+                    san_domains: vec![],
+                    cert_pem: cert_pem.to_string(),
+                    key_pem: key_pem.to_string(),
+                    not_after_epoch: 9999999999,
+                    ocsp_response: Some(vec![0xBB]),
+                },
+            ])
+            .unwrap();
+
+        let mut staples = std::collections::HashMap::new();
+        staples.insert("a.example.com".to_string(), vec![0xCC]);
+
+        let stats = resolver.refresh_staples(&staples);
+
+        assert_eq!(stats.refreshed, 1);
+        assert_eq!(stats.unchanged, 1);
+        assert_eq!(resolver.staple_for("a.example.com"), Some(vec![0xCC]));
+        assert_eq!(
+            resolver.staple_for("b.example.com"),
+            Some(vec![0xBB]),
+            "an unlisted domain keeps its prior staple"
         );
     }
 }

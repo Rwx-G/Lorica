@@ -93,7 +93,7 @@ impl AsnResolver {
             )));
         }
 
-        let meta = reader.metadata.clone();
+        let meta = reader.metadata().clone();
         let status = AsnDbStatus {
             path: path_ref.display().to_string(),
             loaded_at: Utc::now(),

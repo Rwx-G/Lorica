@@ -7,7 +7,7 @@ Thank you for considering contributing to Lorica! This document explains how to 
 ### Prerequisites
 
 - Rust 1.88+ (stable)
-- Node.js 18+ (for dashboard frontend)
+- Node.js 22+ (for dashboard frontend; Vite 8 rejects Node 18)
 - Linux x86_64 (native builds) or Docker (for development on other platforms)
 
 ### Building
@@ -23,13 +23,14 @@ The Svelte frontend is compiled automatically during `cargo build` via `build.rs
 ### Running Tests
 
 ```bash
-# All Rust unit tests (655 tests across 25 crates)
+# All Rust unit tests (~2100 tests across 30 crates; see the
+# test-coverage table in README.md for the per-layer breakdown)
 cargo test
 
-# Product crate tests only (280 tests)
+# Product crate tests only
 cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench
 
-# Frontend tests (52 Vitest tests)
+# Frontend tests (Vitest)
 cd lorica-dashboard/frontend && npx vitest run
 
 # E2E tests (Docker required)
@@ -53,7 +54,7 @@ We use [Conventional Commits](https://www.conventionalcommits.org/):
 
 **Types:** `feat`, `fix`, `docs`, `refactor`, `test`, `ci`, `chore`
 
-**Scopes:** `proxy`, `ui`, `waf`, `api`, `config`, `tls`, `auth`, `health`, `ci`
+**Scopes:** `ui`, `api`, `waf`, `tls`, `proxy`, `worker`, `notify`, `acme`, `config`, `auth`, `health`, `ci`, `security`
 
 ### Code Quality
 
@@ -74,7 +75,7 @@ If your change adds a feature, fixes a bug, or changes behavior, update `CHANGEL
 
 ## Architecture
 
-Lorica is a Rust workspace with 25 crates. See [FORK.md](FORK.md) for the Pingora fork lineage and [README.md](README.md) for the architecture overview.
+Lorica is a Rust workspace with 30 crates. See [FORK.md](FORK.md) for the Pingora fork lineage and [README.md](README.md) for the architecture overview.
 
 ### Key Directories
 

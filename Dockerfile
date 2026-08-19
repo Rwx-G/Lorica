@@ -4,7 +4,7 @@
 # Build:
 #   docker build -t lorica .
 #
-# Run (Linux; management API binds 127.0.0.1 — use host networking):
+# Run (Linux; management API binds 127.0.0.1 - use host networking):
 #   docker run -d --name lorica --network host \
 #     -v lorica-data:/var/lib/lorica lorica
 
@@ -28,6 +28,7 @@ COPY Cargo.toml Cargo.lock ./
 
 # Copy all workspace crates
 COPY lorica/ lorica/
+COPY lorica-acme/ lorica-acme/
 COPY lorica-api/ lorica-api/
 COPY lorica-cache/ lorica-cache/
 COPY lorica-config/ lorica-config/
@@ -41,6 +42,7 @@ COPY lorica-lb/ lorica-lb/
 COPY lorica-limits/ lorica-limits/
 COPY lorica-lru/ lorica-lru/
 COPY lorica-memory-cache/ lorica-memory-cache/
+COPY lorica-metrics/ lorica-metrics/
 COPY lorica-pool/ lorica-pool/
 COPY lorica-proxy/ lorica-proxy/
 COPY lorica-runtime/ lorica-runtime/

@@ -1,5 +1,5 @@
 Name:           lorica
-Version:        1.5.13
+Version:        1.6.0
 Release:        1%{?dist}
 Summary:        Modern reverse proxy with built-in dashboard
 License:        Apache-2.0
@@ -20,6 +20,11 @@ mkdir -p %{buildroot}/usr/share/doc/lorica
 mkdir -p %{buildroot}/usr/share/licenses/lorica
 mkdir -p %{buildroot}/var/lib/lorica
 mkdir -p %{buildroot}/var/lib/lorica/exported-certs
+# The hot-upgrade staging zone /var/lib/lorica/upgrade (Story 8.4) is
+# created 0700 at runtime by the upgrade endpoint - not pre-created here.
+# No signing key is bundled: the Ed25519 public key is operator-managed
+# (`upgrade_signing_pubkey_path`, e.g. /etc/lorica/upgrade-signing.pub).
+# See docs/hot-upgrade.md.
 
 install -m 755 %{_sourcedir}/lorica %{buildroot}/usr/bin/lorica
 install -m 644 %{_sourcedir}/dist/lorica.service %{buildroot}/usr/lib/systemd/system/lorica.service
@@ -49,8 +54,9 @@ echo ""
 echo "  ================================================"
 echo "  Lorica installed successfully!"
 echo "  "
-echo "  Dashboard: http://127.0.0.1:9443"
-echo "    (listens on localhost only - not reachable"
+echo "  Dashboard: https://127.0.0.1:9443"
+echo "    (TLS with a self-signed cert - accept the browser"
+echo "     warning; listens on localhost only, not reachable"
 echo "     from other machines)"
 echo "  "
 echo "  The initial admin password is written to a 0600 file:"

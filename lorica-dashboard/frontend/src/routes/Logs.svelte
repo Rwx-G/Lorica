@@ -3,6 +3,7 @@
   import { SvelteURLSearchParams } from 'svelte/reactivity';
   import { api, type LogEntry, type LogsQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import { canWrite } from '../lib/auth';
 
   let entries: LogEntry[] = $state([]);
   let total = $state(0);
@@ -229,7 +230,9 @@
         class="btn btn-secondary"
         onclick={() => { if (!showExport) initExportDefaults(); showExport = !showExport; }}
       >Export</button>
-      <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
+      {#if $canWrite}
+        <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
+      {/if}
     </div>
   </div>
 

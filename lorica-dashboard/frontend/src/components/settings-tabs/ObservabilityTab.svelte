@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from '../../lib/api';
   import { validateUrl } from '../../lib/validators';
+  import { isSuperAdmin } from '../../lib/auth';
 
   interface ObservabilityFormShape {
     otlp_endpoint: string;
@@ -164,38 +165,42 @@
         </span>
       </div>
 
-      <div class="settings-form-row test-connection-row">
-        <div class="test-connection-inner">
-          <button
-            type="button"
-            class="btn btn-secondary"
-            onclick={testConnection}
-            disabled={testing}
-          >
-            {testing ? 'Testing...' : 'Test connection'}
-          </button>
-          {#if testMsg}
-            <span class="test-msg {testOk ? 'test-ok' : 'test-err'}" role="status">
-              {testMsg}
-            </span>
-          {/if}
+      {#if $isSuperAdmin}
+        <div class="settings-form-row test-connection-row">
+          <div class="test-connection-inner">
+            <button
+              type="button"
+              class="btn btn-secondary"
+              onclick={testConnection}
+              disabled={testing}
+            >
+              {testing ? 'Testing...' : 'Test connection'}
+            </button>
+            {#if testMsg}
+              <span class="test-msg {testOk ? 'test-ok' : 'test-err'}" role="status">
+                {testMsg}
+              </span>
+            {/if}
+          </div>
+          <span class="hint">
+            Probes the CURRENTLY SAVED endpoint (not the form values above).
+            Save first if you changed the endpoint. A 4xx response from the
+            collector still counts as reachable - only connection refused, DNS
+            failure, or timeout mean unreachable.
+          </span>
         </div>
-        <span class="hint">
-          Probes the CURRENTLY SAVED endpoint (not the form values above).
-          Save first if you changed the endpoint. A 4xx response from the
-          collector still counts as reachable - only connection refused, DNS
-          failure, or timeout mean unreachable.
-        </span>
-      </div>
+      {/if}
 
       {#if settingsError}
         <div class="settings-form-error">{settingsError}</div>
       {/if}
-      <div class="settings-dialog-actions">
-        <button class="btn btn-primary" onclick={onSave} disabled={settingsSaving}>
-          {settingsSaving ? 'Saving...' : 'Save Observability Settings'}
-        </button>
-      </div>
+      {#if $isSuperAdmin}
+        <div class="settings-dialog-actions">
+          <button class="btn btn-primary" onclick={onSave} disabled={settingsSaving}>
+            {settingsSaving ? 'Saving...' : 'Save Observability Settings'}
+          </button>
+        </div>
+      {/if}
     </div>
   {/if}
 </section>

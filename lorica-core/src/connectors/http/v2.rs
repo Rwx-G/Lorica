@@ -340,10 +340,18 @@ impl Connector {
         }
         let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
         let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
-        let h2_stream = conn
-            .spawn_stream()
-            .await?
-            .expect("newly created connections should have at least one free stream");
+        // A brand-new connection that yields no stream means the peer refused
+        // the very first stream (e.g. an immediate GOAWAY). Return an error
+        // instead of panicking on the `.expect()` (upstream Pingora 5e0f216).
+        let h2_stream = match conn.spawn_stream().await? {
+            Some(stream) => stream,
+            None => {
+                return Error::e_explain(
+                    H2Error,
+                    "new connection has no free stream, peer likely sent GOAWAY immediately",
+                );
+            }
+        };
         if conn.more_streams_allowed() {
             self.in_use_pool.insert(peer.reuse_hash(), conn);
         }

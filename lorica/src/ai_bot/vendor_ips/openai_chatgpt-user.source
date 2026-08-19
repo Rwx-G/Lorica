@@ -1,0 +1,6 @@
+source_url: https://openai.com/chatgpt-user.json
+fetched: 2026-05-03
+upstream_creation_time: 2026-04-29T21:03:15.207621
+notes:
+  Normalized into flat array of CIDR strings (consumer is
+  serde_json::from_str::<Vec<String>>).

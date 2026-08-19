@@ -79,6 +79,12 @@ async function request<T>(
     return { error: { code: 'unauthorized', message: 'Session expired. Please log in again.' } };
   }
 
+  // Insufficient role (Story 8.3): surface a toast, keep the session.
+  if (res.status === 403) {
+    const { showToast } = await import('./toast');
+    showToast('Your role does not allow this action.', 'error');
+  }
+
   let json: Record<string, unknown>;
   try {
     json = await res.json();
@@ -101,9 +107,42 @@ export interface LoginRequest {
   password: string;
 }
 
+export type Role = 'super_admin' | 'operator' | 'viewer';
+
 export interface LoginResponse {
+  username: string;
+  role: Role;
   must_change_password: boolean;
   session_expires_at: string;
+}
+
+export interface MeResponse {
+  username: string;
+  role: Role;
+  session_expires_at: string;
+}
+
+export interface UserResponse {
+  id: string;
+  username: string;
+  role: Role;
+  must_change_password: boolean;
+  created_at: string;
+  last_login_at: string | null;
+  disabled: boolean;
+  created_by: string | null;
+}
+
+export interface CreateUserRequest {
+  username: string;
+  password: string;
+  role: Role;
+}
+
+export interface UpdateUserRequest {
+  password?: string;
+  role?: Role;
+  disabled?: boolean;
 }
 
 export interface StatusResponse {
@@ -208,12 +247,24 @@ export interface RouteResponse {
   rate_limit?: RateLimitConfig | null;
   geoip?: GeoIpConfig | null;
   bot_protection?: BotProtectionConfig | null;
+  /// AI crawler policy (Story 8.2). `null` / absent = off.
+  ai_bot_policy?: AiBotPolicy | null;
+  /// Action for a spoofed AI bot (UA matches but verification fails).
+  /// `null` = inherit the global default.
+  ai_bot_spoofed_fallback?: AiBotSpoofedFallback | null;
+  /// When true, Lorica auto-serves a registry-driven `/robots.txt` for
+  /// this route instead of passing the path through to the backend.
+  serve_robots_txt?: boolean;
   /// Free-form classification label (prod / staging / homelab / ...).
   /// Empty string = ungrouped. Mirrors `Backend.group_name`.
   group_name?: string;
   created_at: string;
   updated_at: string;
 }
+
+export type AiBotPolicy = 'off' | 'deny' | 'log';
+
+export type AiBotSpoofedFallback = 'deny' | 'log' | 'allow';
 
 export type RateLimitScope = 'per_ip' | 'per_route';
 
@@ -407,6 +458,9 @@ export interface CreateRouteRequest {
   rate_limit?: RateLimitConfig;
   geoip?: GeoIpConfig;
   bot_protection?: BotProtectionConfig;
+  ai_bot_policy?: AiBotPolicy;
+  ai_bot_spoofed_fallback?: AiBotSpoofedFallback | null;
+  serve_robots_txt?: boolean;
   group_name?: string;
 }
 
@@ -480,6 +534,9 @@ export interface UpdateRouteRequest {
   /// `bot_protection` leaves the stored value alone - the
   /// "missing = no-op" contract preserved for every other field.
   bot_protection_disable?: boolean;
+  ai_bot_policy?: AiBotPolicy;
+  ai_bot_spoofed_fallback?: AiBotSpoofedFallback | null;
+  serve_robots_txt?: boolean;
   /// Free-form operator classification (prod / staging / homelab / ...).
   /// Empty string clears the grouping. `undefined` leaves the field
   /// unchanged (follows the same missing-= no-op rule as every other
@@ -582,6 +639,46 @@ export interface LogsQuery {
   after_id?: number;
 }
 
+// --- Audit log (Story 8.9) ---
+
+/// One hash-chained operator-action record. `chain_hash` is the
+/// running chain digest ; `prev_chain_hash` links to the record
+/// before it. Newest first in list responses.
+export interface AuditRecord {
+  id: number;
+  timestamp: string;
+  operator_username: string;
+  operator_role: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  before_payload_hash: string;
+  after_payload_hash: string;
+  ip: string;
+  user_agent: string;
+  prev_chain_hash: string;
+  chain_hash: string;
+}
+
+export interface AuditQuery {
+  operator?: string;
+  action?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+  before_id?: number;
+}
+
+/// Result of the SuperAdmin-only chain integrity check. When
+/// `verified` is false, `first_break_id` / `first_break_reason`
+/// pinpoint the first row whose chain digest does not reconcile.
+export interface AuditVerifyResult {
+  verified: boolean;
+  total_rows: number;
+  first_break_id?: number;
+  first_break_reason?: string;
+}
+
 export interface DiskUsage {
   /// Short role label for the mount: `"root"` or `"data"`. The
   /// absolute path is intentionally not exposed (v1.5.0 hardening).
@@ -615,12 +712,38 @@ export interface ProxyInfo {
   active_connections: number;
   http_port: number;
   https_port: number;
+  /// OS process id of the running proxy. Changes after a hot binary
+  /// upgrade (Story 8.4), letting an operator confirm the swap landed.
+  pid: number;
 }
 
 export interface SystemResponse {
   host: HostMetrics;
   process: ProcessMetrics;
   proxy: ProxyInfo;
+}
+
+/// Whether the upload actually started a live handoff or only staged the
+/// binary (audit H1): `triggered` = the supervisor is performing the
+/// zero-downtime swap; `staged_only` = single-process mode, effective on
+/// the next restart; `trigger_unavailable` = staged but the signal could
+/// not be delivered (a handoff may already be running).
+export type UpgradeHandoff = 'triggered' | 'staged_only' | 'trigger_unavailable';
+
+/// Successful result of `POST /api/v1/system/upgrade` (Story 8.4):
+/// the verified binary has been staged and the handoff signalled.
+export interface UpgradeStageResult {
+  staged_path: string;
+  size: number;
+  sha256: string;
+  handoff: UpgradeHandoff;
+}
+
+/// A detached Ed25519 signature is the 64-byte sig hex-encoded, i.e.
+/// exactly 128 lower/upper-case hex characters. Validate client-side so
+/// the operator gets immediate feedback before the multipart upload.
+export function isValidUpgradeSignatureHex(sig: string): boolean {
+  return /^[0-9a-fA-F]{128}$/.test(sig.trim());
 }
 
 export interface SecurityHeaderPreset {
@@ -640,6 +763,7 @@ export interface GlobalSettingsResponse {
   waf_ban_threshold: number;
   waf_ban_duration_s: number;
   access_log_retention: number;
+  waf_event_retention: number;
   sla_purge_enabled: boolean;
   sla_purge_retention_days: number;
   sla_purge_schedule: string;
@@ -665,6 +789,13 @@ export interface GlobalSettingsResponse {
   cert_export_group_gid?: number | null;
   cert_export_file_mode?: number;
   cert_export_dir_mode?: number;
+  // Defense-in-depth data-plane bounds (Story 8.9).
+  audit_log_retention_days: number;
+  connection_limits_per_ip: number | null;
+  bot_stash_max_entries: number;
+  bot_stash_per_prefix_max: number;
+  mirror_max_concurrent_per_route: number;
+  mirror_max_concurrent_global: number;
 }
 
 export interface UpdateSettingsRequest {
@@ -679,6 +810,7 @@ export interface UpdateSettingsRequest {
   waf_ban_threshold?: number;
   waf_ban_duration_s?: number;
   access_log_retention?: number;
+  waf_event_retention?: number;
   sla_purge_enabled?: boolean;
   sla_purge_retention_days?: number;
   sla_purge_schedule?: string;
@@ -701,7 +833,34 @@ export interface UpdateSettingsRequest {
   cert_export_group_gid?: number | null;
   cert_export_file_mode?: number;
   cert_export_dir_mode?: number;
+  // Defense-in-depth data-plane bounds (Story 8.9).
+  audit_log_retention_days?: number;
+  connection_limits_per_ip?: number | null;
+  bot_stash_max_entries?: number;
+  bot_stash_per_prefix_max?: number;
+  mirror_max_concurrent_per_route?: number;
+  mirror_max_concurrent_global?: number;
 }
+
+/**
+ * Bounds for a single operator-tunable global-settings field
+ * (Story 8.10 AC #7). `min` is present on numeric fields; `max` is
+ * present only when the server enforces an upper bound; `choices` is
+ * present on enum fields. `default` is the server default.
+ */
+export interface SettingsFieldSchema {
+  type: 'integer' | 'number' | 'boolean' | 'string' | 'enum';
+  min?: number;
+  max?: number;
+  default?: number | string | boolean;
+  choices?: string[];
+}
+
+/**
+ * `GET /settings/schema` payload: field name -> bounds. Consumed by the
+ * settings forms to render input constraints from the server.
+ */
+export type SettingsSchemaResponse = Record<string, SettingsFieldSchema>;
 
 export interface CertExportAclResponse {
   id: string;
@@ -824,8 +983,86 @@ export interface ImportDiffResponse {
   route_backends: EntityDiff;
   notification_configs: EntityDiff;
   user_preferences: EntityDiff;
-  admin_users: EntityDiff;
+  users: EntityDiff;
   global_settings: { changes: SettingChange[] };
+}
+
+// --- AI crawler management (Story 8.2) ---
+
+/// Verification strategy attached to a crawler entry. A discriminated
+/// union on `kind`: `rdns` carries DNS suffixes, `ip_ranges` carries
+/// CIDRs, `ua_only` matches on the User-Agent pattern alone.
+export type AiCrawlerVerification =
+  | { kind: 'rdns'; suffixes: string[] }
+  | { kind: 'ip_ranges'; cidrs: string[] }
+  | { kind: 'ua_only' };
+
+export type AiCrawlerVerificationKind = AiCrawlerVerification['kind'];
+
+export interface CustomCrawler {
+  id: number;
+  name: string;
+  user_agent_pattern: string;
+  verification: AiCrawlerVerification;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CustomCrawlerBody {
+  name: string;
+  user_agent_pattern: string;
+  verification: AiCrawlerVerification;
+  enabled: boolean;
+}
+
+export interface AiCrawlersCustomResponse {
+  entries: CustomCrawler[];
+  built_in_count: number;
+  max_count: number;
+}
+
+export interface BuiltinCrawler {
+  name: string;
+  user_agent_pattern: string;
+  verification_kind: AiCrawlerVerificationKind;
+  source: string;
+}
+
+export interface AiCrawlersBuiltinResponse {
+  entries: BuiltinCrawler[];
+}
+
+export interface AiCrawlerTestResponse {
+  matched_crawler: string | null;
+  verification_kind: AiCrawlerVerificationKind | null;
+  would_apply_policy: AiBotPolicy;
+  note: string;
+}
+
+export interface AiCrawlerRobotsPreviewResponse {
+  body: string;
+  route_id: string;
+  generated_at: string;
+}
+
+export interface AiCrawlerStatActionBreakdown {
+  deny: number;
+  log: number;
+  spoofed: number;
+  ua_only_match: number;
+}
+
+export interface AiCrawlerStatEntry {
+  crawler: string;
+  count: number;
+  action_breakdown: AiCrawlerStatActionBreakdown;
+}
+
+export interface AiCrawlerStatsResponse {
+  window: '5m';
+  route_id: string;
+  top_5: AiCrawlerStatEntry[];
 }
 
 export const api = {
@@ -839,6 +1076,19 @@ export const api = {
       current_password,
       new_password,
     }),
+
+  getMe: () => request<MeResponse>('GET', '/auth/me'),
+
+  listUsers: () => request<UserResponse[]>('GET', '/users'),
+
+  createUser: (body: CreateUserRequest) =>
+    request<UserResponse>('POST', '/users', body),
+
+  updateUser: (id: string, body: UpdateUserRequest) =>
+    request<UserResponse>('PUT', `/users/${id}`, body),
+
+  deleteUser: (id: string) =>
+    request<{ message: string }>('DELETE', `/users/${id}`),
 
   getStatus: () => request<StatusResponse>('GET', '/status'),
 
@@ -960,8 +1210,78 @@ export const api = {
   clearLogs: () =>
     request<{ message: string }>('DELETE', '/logs'),
 
+  // Audit log (Story 8.9)
+  listAudit: (params: AuditQuery) => {
+    const query = new URLSearchParams();
+    if (params.operator) query.set('operator', params.operator);
+    if (params.action) query.set('action', params.action);
+    if (params.from) query.set('from', params.from);
+    if (params.to) query.set('to', params.to);
+    if (params.limit !== undefined) query.set('limit', String(params.limit));
+    if (params.before_id !== undefined) query.set('before_id', String(params.before_id));
+    const qs = query.toString();
+    return request<{ entries: AuditRecord[]; total: number }>('GET', `/audit${qs ? `?${qs}` : ''}`);
+  },
+
+  verifyAudit: () =>
+    request<AuditVerifyResult>('GET', '/audit/verify'),
+
   getSystem: () =>
     request<SystemResponse>('GET', '/system'),
+
+  /**
+   * Upload + verify + stage a new `lorica` binary (Story 8.4).
+   *
+   * Posts a `multipart/form-data` body with two parts the backend
+   * expects by name: `binary` (the raw executable) and `signature`
+   * (the detached Ed25519 signature as 128 hex chars, supplied either
+   * as a `.sig` File or a pasted hex string). The shared `request<T>`
+   * wrapper forces a JSON body, so this writes its own credentialed
+   * fetch and mirrors the same error-envelope handling: a 4xx
+   * `{error:{code,message}}` surfaces verbatim so the panel can show
+   * "no upgrade signing key configured" or a signature-mismatch
+   * message inline.
+   */
+  uploadUpgradeBinary: async (
+    binary: File,
+    signature: File | string,
+  ): Promise<ApiResponse<UpgradeStageResult>> => {
+    const form = new FormData();
+    form.append('binary', binary);
+    form.append('signature', signature);
+
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}/system/upgrade`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        body: form,
+      });
+    } catch {
+      return { error: { code: 'network_error', message: 'Unable to reach the server. Is Lorica running?' } };
+    }
+
+    if (res.status === 401) {
+      const { auth } = await import('./auth');
+      auth.set({ status: 'unauthenticated' });
+      return { error: { code: 'unauthorized', message: 'Session expired. Please log in again.' } };
+    }
+
+    let json: Record<string, unknown>;
+    try {
+      json = await res.json();
+    } catch {
+      return { error: { code: 'parse_error', message: `Server returned invalid response (${res.status})` } };
+    }
+
+    if (!res.ok) {
+      const err = json.error && typeof json.error === 'object' && 'code' in json.error
+        ? (json.error as ApiError)
+        : { code: 'unknown', message: res.statusText };
+      return { error: err };
+    }
+    return { data: json.data as UpgradeStageResult };
+  },
 
   // Settings
   getSettings: () =>
@@ -969,6 +1289,12 @@ export const api = {
 
   updateSettings: (body: UpdateSettingsRequest) =>
     request<GlobalSettingsResponse>('PUT', '/settings', body),
+
+  // Story 8.10 AC #7. Server-authoritative field bounds so forms
+  // render input constraints (min/max/choices) from the backend
+  // instead of hardcoding them. Read-only, Viewer+.
+  getSettingsSchema: () =>
+    request<SettingsSchemaResponse>('GET', '/settings/schema'),
 
   // Mint a single canary OTel span via the CURRENTLY persisted
   // `otlp_endpoint` + `otlp_protocol`. Used by the "Test
@@ -1235,6 +1561,38 @@ export const api = {
 
   deleteBan: (ip: string) =>
     request<{ unbanned: boolean; ip: string }>('DELETE', `/bans/${encodeURIComponent(ip)}`),
+
+  // AI crawler management (Story 8.2)
+  getAiCrawlersCustom: () =>
+    request<AiCrawlersCustomResponse>('GET', '/ai-crawlers/custom'),
+
+  createAiCrawlerCustom: (body: CustomCrawlerBody) =>
+    request<CustomCrawler>('POST', '/ai-crawlers/custom', body),
+
+  updateAiCrawlerCustom: (id: number, body: CustomCrawlerBody) =>
+    request<CustomCrawler>('PUT', `/ai-crawlers/custom/${id}`, body),
+
+  deleteAiCrawlerCustom: (id: number) =>
+    request<{ deleted: number }>('DELETE', `/ai-crawlers/custom/${id}`),
+
+  getAiCrawlersBuiltin: () =>
+    request<AiCrawlersBuiltinResponse>('GET', '/ai-crawlers/builtin'),
+
+  testAiCrawler: (ua: string, routeId?: string | null) => {
+    const qs = new URLSearchParams({ ua });
+    if (routeId) qs.set('route_id', routeId);
+    return request<AiCrawlerTestResponse>('GET', `/ai-crawlers/test?${qs.toString()}`);
+  },
+
+  getAiCrawlerRobotsPreview: (routeId: string) => {
+    const qs = new URLSearchParams({ route_id: routeId });
+    return request<AiCrawlerRobotsPreviewResponse>('GET', `/ai-crawlers/robots-preview?${qs.toString()}`);
+  },
+
+  getAiCrawlerStats: (routeId: string) => {
+    const qs = new URLSearchParams({ route_id: routeId, window: '5m' });
+    return request<AiCrawlerStatsResponse>('GET', `/ai-crawlers/stats?${qs.toString()}`);
+  },
 };
 
 export interface WafEvent {
@@ -1263,6 +1621,7 @@ export interface WafCategoryCount {
 
 export interface WafStatsResponse {
   total_events: number;
+  total_24h: number;
   rule_count: number;
   by_category: WafCategoryCount[];
 }
@@ -1592,10 +1951,13 @@ export interface CacheStatsResponse {
   hit_rate: number;
 }
 
+export type BanReason = 'rate_limit' | 'waf_flood' | 'waf_critical_rule' | 'manual';
+
 export interface BanEntry {
   ip: string;
   banned_seconds_ago: number;
   remaining_seconds: number;
+  reason: BanReason;
 }
 
 export interface BanListResponse {

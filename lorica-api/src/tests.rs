@@ -10,7 +10,7 @@ use crate::auth::{ensure_admin_user, hash_password};
 use crate::logs::LogBuffer;
 use crate::middleware::auth::SessionStore;
 use crate::middleware::rate_limit::RateLimiter;
-use crate::server::{build_router, AppState};
+use crate::server::{build_router, AppState, Mode};
 use crate::system::SystemCache;
 use crate::workers::WorkerMetrics;
 
@@ -41,7 +41,7 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         http_port: 8080,
         https_port: 8443,
         config_reload_tx: None,
-        worker_metrics: None,
+        mode: Mode::Test,
         waf_event_buffer: None,
         waf_engine: None,
         waf_rule_count: None,
@@ -49,17 +49,9 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
         sla_collector: None,
         load_test_engine: None,
-        cache_hits: None,
-        cache_misses: None,
-        ban_list: None,
-        cache_backend: None,
-        ewma_scores: None,
-        backend_connections: None,
         notification_history: None,
         log_store: None,
         log_writer: None,
-        aggregated_metrics: None,
-        metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
     };
     let session_store = SessionStore::new(store).await;
@@ -225,11 +217,11 @@ async fn test_change_password() {
     {
         let store = state.store.lock().await;
         let mut user = store
-            .get_admin_user_by_username("admin")
+            .get_user_by_username("admin")
             .expect("test setup")
             .expect("test setup");
         user.password_hash = hash_password(known_password).expect("test setup");
-        store.update_admin_user(&user).expect("test setup");
+        store.update_user(&user).expect("test setup");
     }
 
     // Login again with known password
@@ -256,7 +248,7 @@ async fn test_change_password() {
     let router3 = app(state, session_store, rate_limiter);
     let body = serde_json::json!({
         "current_password": known_password,
-        "new_password": "new_secure_password_456"
+        "new_password": "New_secure_password_456"
     });
 
     let req = Request::builder()
@@ -287,11 +279,11 @@ async fn test_change_password_rotates_session_cookie() {
     {
         let store = state.store.lock().await;
         let mut user = store
-            .get_admin_user_by_username("admin")
+            .get_user_by_username("admin")
             .expect("test setup")
             .expect("test setup");
         user.password_hash = hash_password(known_password).expect("test setup");
-        store.update_admin_user(&user).expect("test setup");
+        store.update_user(&user).expect("test setup");
     }
 
     // Login, capture cookie_A.
@@ -317,7 +309,7 @@ async fn test_change_password_rotates_session_cookie() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({
         "current_password": known_password,
-        "new_password": "new_secure_password_456",
+        "new_password": "New_secure_password_456",
     });
     let req = Request::builder()
         .method("PUT")
@@ -398,6 +390,536 @@ async fn test_rate_limiting() {
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         }
     }
+}
+
+#[tokio::test]
+async fn test_login_legacy_body_without_username_routes_to_admin() {
+    // Pre-RBAC clients send `{password}` only; the shim routes the
+    // login to the migrated `admin` account (Story 8.3 AC #3).
+    let (state, session_store, rate_limiter) = test_state().await;
+    let password = {
+        let store = state.store.lock().await;
+        ensure_admin_user(&store)
+            .expect("test setup")
+            .expect("test setup")
+    };
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "password": password });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["username"], "admin");
+    assert_eq!(json["data"]["role"], "super_admin");
+}
+
+#[tokio::test]
+async fn test_login_disabled_account_returns_401() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let password = {
+        let store = state.store.lock().await;
+        let password = ensure_admin_user(&store)
+            .expect("test setup")
+            .expect("test setup");
+        let mut user = store
+            .get_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup");
+        user.disabled_at = Some(chrono::Utc::now());
+        store.update_user(&user).expect("test setup");
+        password
+    };
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "username": "admin", "password": password });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Same generic message as a wrong password: no account-state
+    // enumeration.
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["error"]["message"], "unauthorized: invalid credentials");
+}
+
+#[tokio::test]
+async fn test_auth_me_returns_identity_and_role() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/auth/me")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["username"], "admin");
+    assert_eq!(json["data"]["role"], "super_admin");
+    assert!(json["data"]["session_expires_at"].is_string());
+}
+
+#[tokio::test]
+async fn test_auth_me_unauthenticated_returns_401() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/auth/me")
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_change_password_missing_complexity_returns_400() {
+    // Long enough (>= 14) but single character class: rejected by
+    // the complexity rule (Story 8.3 AC #8).
+    let (state, session_store, rate_limiter) = test_state().await;
+    let known_password = "test_password_123";
+    {
+        let store = state.store.lock().await;
+        ensure_admin_user(&store).expect("test setup");
+        let mut user = store
+            .get_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup");
+        user.password_hash = hash_password(known_password).expect("test setup");
+        store.update_user(&user).expect("test setup");
+    }
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let login_body = serde_json::json!({ "username": "admin", "password": known_password });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&login_body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    let cookie = format!(
+        "lorica_session={}",
+        extract_session_cookie(&response).expect("test setup")
+    );
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "current_password": known_password,
+        "new_password": "aaaaaaaaaaaaaaaaaa"
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/auth/password")
+        .header("Content-Type", "application/json")
+        .header("Cookie", cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---- RBAC authorization tests (Story 8.3) ----
+
+/// Create a user with the given role directly in the store, then
+/// log in through the endpoint and return the session cookie.
+async fn create_user_and_login(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    username: &str,
+    role: lorica_config::models::Role,
+) -> String {
+    let password = "Rbac-test-pass-42!";
+    {
+        let store = state.store.lock().await;
+        let user = lorica_config::models::User {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: username.to_string(),
+            password_hash: hash_password(password).expect("test setup"),
+            role,
+            must_change_password: false,
+            created_at: chrono::Utc::now(),
+            last_login_at: None,
+            disabled_at: None,
+            created_by: None,
+        };
+        store.create_user(&user).expect("test setup");
+    }
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "username": username, "password": password });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    format!(
+        "lorica_session={}",
+        extract_session_cookie(&response).expect("test setup")
+    )
+}
+
+async fn send(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    method: &str,
+    uri: &str,
+    cookie: &str,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Cookie", cookie);
+    let body = match body {
+        Some(json) => {
+            builder = builder.header("Content-Type", "application/json");
+            Body::from(serde_json::to_string(&json).expect("test setup"))
+        }
+        None => Body::empty(),
+    };
+    router
+        .oneshot(builder.body(body).expect("test setup"))
+        .await
+        .expect("test setup")
+}
+
+#[tokio::test]
+async fn test_viewer_can_read_but_not_mutate() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "viewer1",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/routes",
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &viewer,
+        Some(serde_json::json!({
+            "hostname": "viewer-denied.example.com",
+            "path_prefix": "/",
+            "load_balancing": "round_robin"
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_operator_can_mutate_but_not_touch_settings_or_users() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "operator1",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &operator,
+        Some(serde_json::json!({
+            "hostname": "operator-ok.example.com",
+            "path_prefix": "/",
+            "load_balancing": "round_robin"
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        "/api/v1/settings",
+        &operator,
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Even LISTING users is user management (AC #5).
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/users",
+        &operator,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_users_crud_super_admin_flow() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create an operator through the endpoint.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/users",
+        &admin,
+        Some(serde_json::json!({
+            "username": "ops1",
+            "password": "Ops1-initial-pass!",
+            "role": "operator"
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let created: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let ops_id = created["data"]["id"].as_str().expect("test setup").to_string();
+    assert_eq!(created["data"]["role"], "operator");
+    assert!(created["data"].get("password_hash").is_none());
+
+    // Duplicate username -> 409.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/users",
+        &admin,
+        Some(serde_json::json!({
+            "username": "ops1",
+            "password": "Ops1-initial-pass!",
+            "role": "viewer"
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // The new operator logs in, then gets demoted: their session
+    // must die immediately.
+    let ops_cookie = {
+        let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+        let body = serde_json::json!({ "username": "ops1", "password": "Ops1-initial-pass!" });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test setup"),
+            ))
+            .expect("test setup");
+        let response = router.oneshot(req).await.expect("test setup");
+        assert_eq!(response.status(), StatusCode::OK);
+        format!(
+            "lorica_session={}",
+            extract_session_cookie(&response).expect("test setup")
+        )
+    };
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/users/{ops_id}"),
+        &admin,
+        Some(serde_json::json!({ "role": "viewer" })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/routes",
+        &ops_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "role change must invalidate the target's sessions"
+    );
+
+    // Delete works; the row is gone.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/users/{ops_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/users/{ops_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_users_guards_last_super_admin_and_self_delete() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let admin_id = {
+        let store = state.store.lock().await;
+        store
+            .get_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup")
+            .id
+    };
+
+    // Demoting the only enabled super admin -> 400.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/users/{admin_id}"),
+        &admin,
+        Some(serde_json::json!({ "role": "operator" })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Disabling them -> 400.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/users/{admin_id}"),
+        &admin,
+        Some(serde_json::json!({ "disabled": true })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Deleting yourself -> 400 (also the last-super-admin case).
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/users/{admin_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_viewer_blocked_from_certificate_download() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "viewer2",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    // The id does not need to exist: the 403 must fire before any
+    // lookup, proving the policy gates the whole download surface.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/certificates/some-id/download?format=key",
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // ---- Routes CRUD Tests ----
@@ -824,10 +1346,10 @@ async fn test_config_export_import() {
     .expect("test setup");
     assert!(toml_content.contains("version = 1"));
 
-    // Strip admin_users section (contains redacted password hash from export)
+    // Strip users section (contains redacted password hash from export)
     let toml_content: String = toml_content
         .lines()
-        .take_while(|line| !line.starts_with("[[admin_users]]"))
+        .take_while(|line| !line.starts_with("[[users]]"))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -1725,6 +2247,13 @@ async fn test_system_endpoint() {
     assert!(json["data"]["proxy"]["version"].is_string());
     assert!(json["data"]["proxy"]["uptime_seconds"].as_u64().is_some());
     assert!(json["data"]["process"]["memory_bytes"].as_u64().is_some());
+    // The proxy pid is surfaced so an operator can confirm a hot
+    // binary upgrade took effect (Story 8.4 IV3). In-process tests run
+    // in the same process as the handler, so it equals our own pid.
+    assert_eq!(
+        json["data"]["proxy"]["pid"].as_u64(),
+        Some(u64::from(std::process::id()))
+    );
 }
 
 // ---- Settings Endpoint Tests ----
@@ -1867,6 +2396,239 @@ async fn test_get_settings_returns_empty_bot_hmac_when_not_initialised() {
 }
 
 #[tokio::test]
+async fn test_get_settings_masks_prometheus_scrape_token() {
+    // Story 8.8 AC #4: a configured Prometheus scrape token grants
+    // unauthenticated /metrics access when `metrics_require_auth` is on,
+    // so GET /api/v1/settings must surface the REDACTED sentinel and
+    // never the raw token.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let token = "s3cr3t-scrape-token-value";
+    {
+        let s = state.store.lock().await;
+        let mut cur = s.get_global_settings().expect("test setup");
+        cur.prometheus_scrape_token = Some(token.to_string());
+        s.update_global_settings(&cur).expect("test setup");
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["prometheus_scrape_token"], "**REDACTED**");
+    assert!(
+        !body.windows(token.len()).any(|w| w == token.as_bytes()),
+        "raw scrape token must not appear anywhere in the response body"
+    );
+}
+
+#[tokio::test]
+async fn test_update_settings_scrape_token_sentinel_round_trip() {
+    // The masked GET returns `**REDACTED**`; a dashboard PUT that echoes
+    // that sentinel must leave the stored token untouched, a fresh value
+    // must overwrite it, and an empty string must clear it.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let original = "original-scrape-token";
+    {
+        let s = state.store.lock().await;
+        let mut cur = s.get_global_settings().expect("test setup");
+        cur.prometheus_scrape_token = Some(original.to_string());
+        s.update_global_settings(&cur).expect("test setup");
+    }
+
+    let put_token = |value: serde_json::Value| {
+        let state = state.clone();
+        let session_store = session_store.clone();
+        let rate_limiter = rate_limiter.clone();
+        let cookie = cookie.clone();
+        async move {
+            let router = app(state, session_store, rate_limiter);
+            let body = serde_json::json!({ "prometheus_scrape_token": value });
+            let req = Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings")
+                .header("Content-Type", "application/json")
+                .header("Cookie", &cookie)
+                .body(Body::from(body.to_string()))
+                .expect("test setup");
+            router.oneshot(req).await.expect("test setup").status()
+        }
+    };
+
+    // Echoing the sentinel leaves the token unchanged.
+    assert_eq!(put_token(serde_json::json!("**REDACTED**")).await, StatusCode::OK);
+    {
+        let s = state.store.lock().await;
+        assert_eq!(
+            s.get_global_settings()
+                .expect("test setup")
+                .prometheus_scrape_token
+                .as_deref(),
+            Some(original)
+        );
+    }
+
+    // A fresh value overwrites.
+    assert_eq!(put_token(serde_json::json!("rotated-token")).await, StatusCode::OK);
+    {
+        let s = state.store.lock().await;
+        assert_eq!(
+            s.get_global_settings()
+                .expect("test setup")
+                .prometheus_scrape_token
+                .as_deref(),
+            Some("rotated-token")
+        );
+    }
+
+    // An empty string clears it.
+    assert_eq!(put_token(serde_json::json!("")).await, StatusCode::OK);
+    {
+        let s = state.store.lock().await;
+        assert_eq!(
+            s.get_global_settings()
+                .expect("test setup")
+                .prometheus_scrape_token,
+            None
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_update_settings_rejects_cert_warning_not_above_critical() {
+    // Backlog #48 cross-field invariant: the warning threshold must fire
+    // before the critical one. Both values are within their per-field
+    // bounds, so the 400 must come from the cross-field check.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "cert_warning_days": 3, "cert_critical_days": 7 });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(body.to_string()))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("cert_warning_days") && text.contains("cert_critical_days"),
+        "the 400 must name the inverted cert-day pair, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_update_settings_rejects_flood_strict_ge_threshold() {
+    // Backlog #48 cross-field invariant: strict flood mode is a tighter
+    // cap than the plain threshold when both are set, but `0` strict is
+    // "auto" and exempt.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // strict == threshold -> rejected.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "flood_threshold_rps": 100, "flood_strict_rps": 100 });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(body.to_string()))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // strict == 0 (auto) with a threshold set -> accepted.
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "flood_threshold_rps": 100, "flood_strict_rps": 0 });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(body.to_string()))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_dns_provider_credentials_never_returned() {
+    // dns_providers promises credentials are never surfaced: a leaked
+    // Cloudflare API token would let anyone edit the zone. Create one,
+    // then assert neither the create response nor the list body carries
+    // the raw token.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let secret = "cloudflare-secret-token-xyz";
+    let create_body = serde_json::json!({
+        "name": "cf-zone",
+        "provider_type": "cloudflare",
+        "config": { "api_token": secret, "zone_id": "zone-123" }
+    });
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/dns-providers")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(create_body.to_string()))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    assert!(
+        !created.windows(secret.len()).any(|w| w == secret.as_bytes()),
+        "create response must not echo the raw credential"
+    );
+
+    // The list must surface provider metadata but never the secret.
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/dns-providers")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["dns_providers"][0]["name"], "cf-zone");
+    assert!(
+        !body.windows(secret.len()).any(|w| w == secret.as_bytes()),
+        "list response must not carry the raw credential"
+    );
+}
+
+#[tokio::test]
 async fn test_update_settings_invalid_log_level() {
     let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
@@ -1986,6 +2748,50 @@ async fn test_update_settings_cert_export_roundtrip() {
     assert_eq!(json["data"]["cert_export_group_gid"], 2001);
     assert_eq!(json["data"]["cert_export_file_mode"], 0o640);
     assert_eq!(json["data"]["cert_export_dir_mode"], 0o750);
+}
+
+#[tokio::test]
+async fn test_update_settings_upgrade_signing_pubkey_path_roundtrip() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "upgrade_signing_pubkey_path": "/etc/lorica/upgrade-signing.pub",
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&payload).expect("test setup");
+    // The PUT response echoes the full GlobalSettings doc; assert the
+    // signing-key path round-tripped through the store.
+    assert_eq!(
+        json["data"]["upgrade_signing_pubkey_path"].as_str(),
+        Some("/etc/lorica/upgrade-signing.pub")
+    );
+
+    // Confirm it is actually persisted (not just reflected back).
+    let stored = {
+        let s = state.store.lock().await;
+        s.get_global_settings().expect("test setup")
+    };
+    assert_eq!(
+        stored.upgrade_signing_pubkey_path.as_deref(),
+        Some("/etc/lorica/upgrade-signing.pub")
+    );
 }
 
 #[tokio::test]
@@ -2505,10 +3311,10 @@ async fn test_import_preview_empty_diff() {
     )
     .expect("test setup");
 
-    // Strip admin_users section (contains redacted password hash from export)
+    // Strip users section (contains redacted password hash from export)
     let toml_content: String = toml_content
         .lines()
-        .take_while(|line| !line.starts_with("[[admin_users]]"))
+        .take_while(|line| !line.starts_with("[[users]]"))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -2604,7 +3410,7 @@ async fn test_session_purge_expired() {
     let store = SessionStore::new(Arc::new(Mutex::new(db))).await;
 
     // Create a session
-    let sid = store.create("user1".into(), "admin".into()).await;
+    let sid = store.create("user1".into(), "admin".into(), lorica_config::models::Role::SuperAdmin).await;
 
     // Nothing expired yet
     assert_eq!(store.purge_expired().await, 0);
@@ -2618,6 +3424,7 @@ async fn test_session_purge_expired() {
             Session {
                 user_id: "user2".into(),
                 username: "old".into(),
+                role: lorica_config::models::Role::SuperAdmin,
                 created_at: chrono::Utc::now() - chrono::Duration::hours(2),
                 expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
             },
@@ -2914,11 +3721,11 @@ async fn test_change_password_too_short_returns_400() {
         let store = state.store.lock().await;
         ensure_admin_user(&store).expect("test setup");
         let mut user = store
-            .get_admin_user_by_username("admin")
+            .get_user_by_username("admin")
             .expect("test setup")
             .expect("test setup");
         user.password_hash = hash_password(known_password).expect("test setup");
-        store.update_admin_user(&user).expect("test setup");
+        store.update_user(&user).expect("test setup");
     }
 
     // Login
@@ -2971,11 +3778,11 @@ async fn test_change_password_wrong_current_returns_401() {
         let store = state.store.lock().await;
         ensure_admin_user(&store).expect("test setup");
         let mut user = store
-            .get_admin_user_by_username("admin")
+            .get_user_by_username("admin")
             .expect("test setup")
             .expect("test setup");
         user.password_hash = hash_password(known_password).expect("test setup");
-        store.update_admin_user(&user).expect("test setup");
+        store.update_user(&user).expect("test setup");
     }
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -3000,7 +3807,7 @@ async fn test_change_password_wrong_current_returns_401() {
     let router = app(state, session_store, rate_limiter);
     let body = serde_json::json!({
         "current_password": "wrong_password",
-        "new_password": "new_secure_password_456"
+        "new_password": "New_secure_password_456"
     });
 
     let req = Request::builder()
@@ -3791,7 +4598,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         http_port: 8080,
         https_port: 8443,
         config_reload_tx: None,
-        worker_metrics: None,
+        mode: Mode::Test,
         waf_event_buffer: Some(event_buffer),
         waf_engine: Some(engine),
         waf_rule_count: Some(rule_count),
@@ -3799,17 +4606,9 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
         sla_collector: None,
         load_test_engine: None,
-        cache_hits: None,
-        cache_misses: None,
-        ban_list: None,
-        cache_backend: None,
-        ewma_scores: None,
-        backend_connections: None,
         notification_history: None,
         log_store: None,
         log_writer: None,
-        aggregated_metrics: None,
-        metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
     };
     let session_store = SessionStore::new(store).await;
@@ -3830,7 +4629,15 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         http_port: 8080,
         https_port: 8443,
         config_reload_tx: None,
-        worker_metrics: Some(Arc::new(WorkerMetrics::new())),
+        mode: Mode::Supervisor {
+            worker_metrics: Arc::new(WorkerMetrics::new()),
+            aggregated_metrics: Arc::new(crate::workers::AggregatedMetrics::new()),
+            metrics_refresher: None,
+            // No test drives an upgrade through this state; the trigger
+            // exists only to satisfy the Supervisor variant, and its
+            // receiver is dropped at once (nothing sends on it).
+            upgrade_trigger: tokio::sync::mpsc::channel(1).0,
+        },
         waf_event_buffer: None,
         waf_engine: None,
         waf_rule_count: None,
@@ -3838,17 +4645,9 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
         sla_collector: None,
         load_test_engine: None,
-        cache_hits: None,
-        cache_misses: None,
-        ban_list: None,
-        cache_backend: None,
-        ewma_scores: None,
-        backend_connections: None,
         notification_history: None,
         log_store: None,
         log_writer: None,
-        aggregated_metrics: None,
-        metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
     };
     let session_store = SessionStore::new(store).await;
@@ -4100,7 +4899,7 @@ async fn test_workers_with_metrics() {
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Record a heartbeat for worker 1
-    let metrics = state.worker_metrics.as_ref().expect("test setup");
+    let metrics = state.worker_metrics().expect("test setup");
     metrics.record_heartbeat(1, 12345, 5).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -4699,4 +5498,344 @@ async fn test_update_route_cache_ttl_zero_is_accepted() {
     let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
     assert_eq!(json["data"]["cache_ttl_s"], 0);
     assert_eq!(json["data"]["cache_max_bytes"], 0);
+}
+
+#[tokio::test]
+async fn list_bans_includes_reason() {
+    let (mut state, _session_store, _rate_limiter) = test_state().await;
+    let bans = Arc::new(dashmap::DashMap::new());
+    bans.insert(
+        "10.0.0.7".to_string(),
+        crate::ban::BanRecord {
+            banned_at: Instant::now(),
+            duration_s: 600,
+            reason: crate::ban::BanReason::WafFlood,
+        },
+    );
+    // Put the state in single-process mode with the populated ban list.
+    // list_bans reads only the ban list; the other proxy handles are
+    // empty defaults, and the cache backend is leaked to obtain the
+    // `&'static` the variant requires (one-shot test allocation).
+    state.mode = Mode::SingleProcess {
+        cache_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        cache_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ban_list: bans,
+        ewma_scores: Arc::new(dashmap::DashMap::new()),
+        backend_connections: Arc::new(crate::connections::BackendConnections::new()),
+        cache_backend: Box::leak(Box::new(lorica_cache::MemCache::new())),
+    };
+
+    let response = crate::cache::list_bans(axum::Extension(state))
+        .await
+        .expect("list_bans");
+    let body = response.0;
+    assert_eq!(body["data"]["total"], 1);
+    assert_eq!(body["data"]["bans"][0]["ip"], "10.0.0.7");
+    assert_eq!(body["data"]["bans"][0]["reason"], "waf_flood");
+}
+
+// ---- Hot binary upgrade (Story 8.4) ----
+
+/// Read the live value of `lorica_hot_upgrade_total{outcome=...}` from
+/// the process-global registry so a test can assert the AC #5 counter
+/// ticked. Returns 0 when the label combination has not been touched.
+fn hot_upgrade_counter(outcome: &str) -> u64 {
+    for mf in lorica_metrics::gather() {
+        if mf.name() != "lorica_hot_upgrade_total" {
+            continue;
+        }
+        for m in mf.get_metric() {
+            let hit = m
+                .get_label()
+                .iter()
+                .any(|l| l.name() == "outcome" && l.value() == outcome);
+            if hit {
+                return m.get_counter().value() as u64;
+            }
+        }
+    }
+    0
+}
+
+/// Build a `multipart/form-data` body with a `binary` part (raw bytes)
+/// and a `signature` part (hex). Returns `(content_type, body)`.
+fn build_upgrade_multipart(binary: &[u8], signature_hex: &str) -> (String, Vec<u8>) {
+    let boundary = "lorica84boundary";
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"binary\"; filename=\"lorica\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(binary);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"signature\"\r\n\r\n{signature_hex}\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+#[tokio::test]
+async fn upgrade_endpoint_valid_signature_stages_and_200s() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let signing = SigningKey::from_bytes(&[42u8; 32]);
+    let key_path = data_dir.path().join("upgrade-signing.pub");
+    std::fs::write(&key_path, hex_encode(signing.verifying_key().as_bytes()))
+        .expect("write key file");
+
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    state.data_dir = data_dir.path().to_path_buf();
+    {
+        let store = state.store.lock().await;
+        let mut s = store.get_global_settings().expect("get settings");
+        s.upgrade_signing_pubkey_path = Some(key_path.to_string_lossy().into_owned());
+        store.update_global_settings(&s).expect("set pubkey path");
+    }
+
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let binary = b"fake new lorica binary v9.9.9";
+    let signature_hex = hex_encode(&signing.sign(binary).to_bytes());
+    let (content_type, body) = build_upgrade_multipart(binary, &signature_hex);
+
+    let before = hot_upgrade_counter("ok");
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/system/upgrade")
+        .header("Content-Type", content_type)
+        .header(http::header::COOKIE, &cookie)
+        .body(Body::from(body))
+        .expect("build request");
+    let response = router.oneshot(req).await.expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("json");
+    assert_eq!(json["data"]["size"], binary.len() as u64);
+    assert!(json["data"]["sha256"].as_str().expect("sha256").len() == 64);
+
+    let staged = data_dir.path().join("upgrade").join("lorica.new");
+    assert!(staged.exists(), "verified binary must be staged");
+    assert_eq!(std::fs::read(&staged).expect("read staged"), binary);
+
+    assert!(
+        hot_upgrade_counter("ok") > before,
+        "the ok outcome counter must increment on a successful stage"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_endpoint_bad_signature_400s_and_increments_counter() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let signing = SigningKey::from_bytes(&[7u8; 32]);
+    let key_path = data_dir.path().join("upgrade-signing.pub");
+    std::fs::write(&key_path, hex_encode(signing.verifying_key().as_bytes()))
+        .expect("write key file");
+
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    state.data_dir = data_dir.path().to_path_buf();
+    {
+        let store = state.store.lock().await;
+        let mut s = store.get_global_settings().expect("get settings");
+        s.upgrade_signing_pubkey_path = Some(key_path.to_string_lossy().into_owned());
+        store.update_global_settings(&s).expect("set pubkey path");
+    }
+
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let binary = b"fake new lorica binary";
+    // Sign different bytes so the signature does not match `binary`.
+    let mut signature = signing.sign(b"a different payload").to_bytes();
+    signature[0] ^= 0xff;
+    let signature_hex = hex_encode(&signature);
+    let (content_type, body) = build_upgrade_multipart(binary, &signature_hex);
+
+    let before = hot_upgrade_counter("signature_failed");
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/system/upgrade")
+        .header("Content-Type", content_type)
+        .header(http::header::COOKIE, &cookie)
+        .body(Body::from(body))
+        .expect("build request");
+    let response = router.oneshot(req).await.expect("request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    assert!(
+        hot_upgrade_counter("signature_failed") > before,
+        "the signature_failed outcome counter must increment on a bad signature"
+    );
+
+    // Nothing must be staged on a rejected upload.
+    assert!(!data_dir.path().join("upgrade").join("lorica.new").exists());
+}
+
+#[tokio::test]
+async fn upgrade_endpoint_missing_signing_key_400s() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    state.data_dir = data_dir.path().to_path_buf();
+    // Deliberately leave `upgrade_signing_pubkey_path` unset (None).
+
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let signing = SigningKey::from_bytes(&[3u8; 32]);
+    let binary = b"some binary";
+    let signature_hex = hex_encode(&signing.sign(binary).to_bytes());
+    let (content_type, body) = build_upgrade_multipart(binary, &signature_hex);
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/system/upgrade")
+        .header("Content-Type", content_type)
+        .header(http::header::COOKIE, &cookie)
+        .body(Body::from(body))
+        .expect("build request");
+    let response = router.oneshot(req).await.expect("request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("json");
+    assert_eq!(
+        json["error"]["message"], "bad request: no upgrade signing key configured",
+        "an unconfigured signing key must produce the documented 400 message"
+    );
+}
+
+// ---- Settings schema endpoint (Story 8.10 AC #7) ----
+
+async fn parse_data(response: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    json["data"].clone()
+}
+
+#[tokio::test]
+async fn test_settings_schema_endpoint_shape() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/settings/schema",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = parse_data(resp).await;
+
+    // Enum field: type + choices + default.
+    assert_eq!(schema["log_level"]["type"], "enum");
+    assert_eq!(schema["log_level"]["default"], "info");
+    assert_eq!(
+        schema["log_level"]["choices"],
+        serde_json::json!(["trace", "debug", "info", "warn", "error"])
+    );
+
+    // Ranged integer field: min + max + default.
+    assert_eq!(schema["header_timeout_s"]["type"], "integer");
+    assert_eq!(schema["header_timeout_s"]["min"], 0);
+    assert_eq!(schema["header_timeout_s"]["max"], 3600);
+    assert_eq!(schema["header_timeout_s"]["default"], 10);
+
+    // Min-only field: no `max` key (server enforces no ceiling).
+    assert_eq!(schema["cert_warning_days"]["min"], 1);
+    assert!(schema["cert_warning_days"].get("max").is_none());
+
+    // Enum sourced from the SpoofedFallback model (lowercase serde).
+    assert_eq!(
+        schema["ai_bot_treat_spoofed_as"]["choices"],
+        serde_json::json!(["deny", "log", "allow"])
+    );
+    assert_eq!(schema["ai_bot_treat_spoofed_as"]["default"], "deny");
+}
+
+#[tokio::test]
+async fn test_settings_schema_bounds_match_validator() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/settings/schema",
+        &admin,
+        None,
+    )
+    .await;
+    let schema = parse_data(resp).await;
+
+    // Anti-drift: the PUT validator must accept the advertised min and
+    // max and reject just past the max for every field carrying both
+    // bounds. If `update_settings` ever diverges from `settings_schema`
+    // the status flips and this fails.
+    for field in [
+        "health_max_concurrent_probes",
+        "header_timeout_s",
+        "flood_strict_rps",
+        "sla_purge_retention_days",
+    ] {
+        let min = schema[field]["min"].as_i64().expect("schema min");
+        let max = schema[field]["max"].as_i64().expect("schema max");
+
+        for (value, expected) in [
+            (min, StatusCode::OK),
+            (max, StatusCode::OK),
+            (max + 1, StatusCode::BAD_REQUEST),
+        ] {
+            let mut map = serde_json::Map::new();
+            map.insert(field.to_string(), serde_json::json!(value));
+            let resp = send(
+                &state,
+                &session_store,
+                &rate_limiter,
+                "PUT",
+                "/api/v1/settings",
+                &admin,
+                Some(serde_json::Value::Object(map)),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                expected,
+                "{field}={value} should map to {expected}"
+            );
+        }
+    }
 }

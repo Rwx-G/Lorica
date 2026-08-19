@@ -12,6 +12,7 @@
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { showToast } from '../lib/toast';
+  import { canWrite } from '../lib/auth';
 
   let configs: LoadTestConfigResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
@@ -335,7 +336,9 @@
 <div class="loadtest-page">
   <div class="page-header">
     <h1>Load Testing</h1>
-    <button class="btn btn-primary" onclick={openCreateForm}>New Test Config</button>
+    {#if $canWrite}
+      <button class="btn btn-primary" onclick={openCreateForm}>New Test Config</button>
+    {/if}
   </div>
 
   {#if error}
@@ -348,7 +351,9 @@
       <div class="live-header">
         <span class="live-dot"></span>
         <span class="live-title">Test Running</span>
-        <button class="btn btn-danger-small" onclick={handleAbort}>Abort</button>
+        {#if $canWrite}
+          <button class="btn btn-danger-small" onclick={handleAbort}>Abort</button>
+        {/if}
       </div>
       <div class="live-stats">
         <div class="live-stat">
@@ -385,7 +390,9 @@
   {:else if configs.length === 0}
     <div class="empty-state">
       <p>No load test configurations yet.</p>
-      <button class="btn btn-primary" onclick={openCreateForm}>Create your first test</button>
+      {#if $canWrite}
+        <button class="btn btn-primary" onclick={openCreateForm}>Create your first test</button>
+      {/if}
     </div>
   {:else}
     <div class="table-wrapper">
@@ -413,21 +420,23 @@
               <td>{c.duration_s}s</td>
               <td class="mono small">{c.schedule_cron ?? 'Manual'}</td>
               <td class="actions">
-                <button class="btn btn-small btn-run" onclick={() => handleStart(c.id)} disabled={!!progress?.active} title={progress?.active ? 'Another test is already running' : 'Run this test'}>
-                  Run
-                </button>
-                <button class="btn-icon" onclick={() => openEditForm(c)} title="Edit" aria-label="Edit">
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                  {@html editIcon}
-                </button>
-                <button class="btn-icon" onclick={() => handleClone(c.id, c.name)} title="Clone" aria-label="Clone">
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                  {@html cloneIcon}
-                </button>
-                <button class="btn-icon btn-icon-danger" onclick={() => (deletingConfig = c)} title="Delete" aria-label="Delete">
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                  {@html trashIcon}
-                </button>
+                {#if $canWrite}
+                  <button class="btn btn-small btn-run" onclick={() => handleStart(c.id)} disabled={!!progress?.active} title={progress?.active ? 'Another test is already running' : 'Run this test'}>
+                    Run
+                  </button>
+                  <button class="btn-icon" onclick={() => openEditForm(c)} title="Edit" aria-label="Edit">
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                    {@html editIcon}
+                  </button>
+                  <button class="btn-icon" onclick={() => handleClone(c.id, c.name)} title="Clone" aria-label="Clone">
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                    {@html cloneIcon}
+                  </button>
+                  <button class="btn-icon btn-icon-danger" onclick={() => (deletingConfig = c)} title="Delete" aria-label="Delete">
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                    {@html trashIcon}
+                  </button>
+                {/if}
               </td>
             </tr>
           {/each}

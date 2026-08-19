@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{db_blocking, log_db_blocking};
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 use lorica_waf::WafEvent;
 
@@ -43,6 +44,7 @@ struct WafEventsResponse {
 #[derive(Debug, Serialize)]
 struct WafStatsResponse {
     total_events: u64,
+    total_24h: u64,
     rule_count: usize,
     by_category: Vec<CategoryCount>,
 }
@@ -109,7 +111,7 @@ pub async fn get_waf_stats(
     let rule_count = state.waf_rule_count.unwrap_or(0);
 
     // Read from persistent store if available, fall back to in-memory buffer
-    let (total_events, by_category) = if let Some(ref store) = state.log_store {
+    let (total_events, total_24h, by_category) = if let Some(ref store) = state.log_store {
         // Off the tokio worker. COUNT(*) + GROUP BY can scan the
         // whole waf_events table under retention (up to 100 000
         // rows by default).
@@ -118,20 +120,26 @@ pub async fn get_waf_stats(
         // failure is a hard error, as before.
         let stats = log_db_blocking(store, move |s| Ok(s.waf_event_stats())).await?;
         match stats {
-            Ok((total, cats)) => {
+            Ok((total, total_24h, cats)) => {
                 let by_cat = cats
                     .into_iter()
                     .map(|(category, count)| CategoryCount { category, count })
                     .collect();
-                (total, by_cat)
+                (total, total_24h, by_cat)
             }
-            Err(_) => (0u64, vec![]),
+            Err(_) => (0u64, 0u64, vec![]),
         }
     } else if let Some(ref waf_buffer) = state.waf_event_buffer {
         let buf = waf_buffer.lock();
         let total = buf.len() as u64;
+        let cutoff_24h: String =
+            (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let mut total_24h = 0u64;
         let mut counts = std::collections::HashMap::new();
         for event in buf.iter() {
+            if event.timestamp.as_str() >= cutoff_24h.as_str() {
+                total_24h += 1;
+            }
             *counts
                 .entry(event.category.as_str().to_string())
                 .or_insert(0u64) += 1;
@@ -141,13 +149,14 @@ pub async fn get_waf_stats(
             .map(|(category, count)| CategoryCount { category, count })
             .collect();
         by_cat.sort_by_key(|c| std::cmp::Reverse(c.count));
-        (total, by_cat)
+        (total, total_24h, by_cat)
     } else {
-        (0u64, vec![])
+        (0u64, 0u64, vec![])
     };
 
     Ok(json_data(WafStatsResponse {
         total_events,
+        total_24h,
         rule_count,
         by_category,
     }))
@@ -180,7 +189,10 @@ pub struct RuleToggleRequest {
 
 /// PUT /api/v1/waf/rules/:id - enable or disable a specific rule
 pub async fn toggle_waf_rule(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     axum::extract::Path(rule_id): axum::extract::Path<u32>,
     Json(body): Json<RuleToggleRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -210,15 +222,31 @@ pub async fn toggle_waf_rule(
     }
 
     state.notify_config_changed();
-    Ok(json_data(serde_json::json!({
+
+    let payload = serde_json::json!({
         "rule_id": rule_id,
         "enabled": body.enabled,
-    })))
+    });
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "waf.rule_toggle",
+        ("waf_rule", &rule_id.to_string()),
+        None,
+        Some(&payload),
+    )
+    .await;
+
+    Ok(json_data(payload))
 }
 
 /// DELETE /api/v1/waf/events - clear WAF event buffer
 pub async fn clear_waf_events(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if let Some(ref waf_buffer) = state.waf_event_buffer {
         let mut buf = waf_buffer.lock();
@@ -236,6 +264,18 @@ pub async fn clear_waf_events(
         })
         .await?;
     }
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "waf.events_clear",
+        ("waf_events", ""),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({"cleared": true})))
 }
 
@@ -258,7 +298,10 @@ pub struct CreateCustomRuleRequest {
 
 /// POST /api/v1/waf/rules/custom - create a user-defined WAF rule
 pub async fn create_custom_rule(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateCustomRuleRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let engine = state
@@ -270,6 +313,15 @@ pub async fn create_custom_rule(
         .category
         .parse::<lorica_waf::RuleCategory>()
         .map_err(|e| ApiError::BadRequest(format!("invalid category: {e}")))?;
+
+    // Captured before `body` moves into the persistence closure.
+    let audit_after = serde_json::json!({
+        "id": body.id,
+        "description": body.description.clone(),
+        "category": body.category.clone(),
+        "pattern": body.pattern.clone(),
+        "severity": body.severity.unwrap_or(3),
+    });
 
     engine
         .add_custom_rule(
@@ -298,6 +350,18 @@ pub async fn create_custom_rule(
     .await;
 
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "waf.custom_rule_create",
+        ("waf_rule", &rule_id.to_string()),
+        None,
+        Some(&audit_after),
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({
         "id": rule_id,
         "description": description,
@@ -323,7 +387,10 @@ pub async fn list_custom_rules(
 
 /// DELETE /api/v1/waf/rules/custom/:id - delete a user-defined WAF rule
 pub async fn delete_custom_rule(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     axum::extract::Path(rule_id): axum::extract::Path<u32>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let engine = state
@@ -338,6 +405,18 @@ pub async fn delete_custom_rule(
         })
         .await;
         state.notify_config_changed();
+
+        let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            "waf.custom_rule_delete",
+            ("waf_rule", &rule_id.to_string()),
+            None,
+            None,
+        )
+        .await;
+
         Ok(json_data(
             serde_json::json!({"deleted": true, "id": rule_id}),
         ))
@@ -374,7 +453,10 @@ pub struct BlocklistToggleRequest {
 
 /// PUT /api/v1/waf/blocklist - enable or disable the IP blocklist
 pub async fn toggle_blocklist(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<BlocklistToggleRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let engine = state
@@ -400,10 +482,22 @@ pub async fn toggle_blocklist(
     // Notify workers so they apply the new blocklist state
     state.notify_config_changed();
 
-    Ok(json_data(serde_json::json!({
+    let payload = serde_json::json!({
         "enabled": body.enabled,
         "ip_count": count,
-    })))
+    });
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "waf.blocklist_toggle",
+        ("waf_blocklist", ""),
+        None,
+        Some(&payload),
+    )
+    .await;
+
+    Ok(json_data(payload))
 }
 
 /// Fetch and load the blocklist from the remote URL.
@@ -444,7 +538,10 @@ pub async fn fetch_and_load_blocklist(
 
 /// POST /api/v1/waf/blocklist/reload - reload the IP blocklist from the remote URL
 pub async fn reload_blocklist(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let engine = state
         .waf_engine
@@ -454,6 +551,17 @@ pub async fn reload_blocklist(
     let count = fetch_and_load_blocklist(engine.ip_blocklist())
         .await
         .map_err(ApiError::Internal)?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "waf.blocklist_reload",
+        ("waf_blocklist", ""),
+        None,
+        None,
+    )
+    .await;
 
     Ok(json_data(serde_json::json!({
         "reloaded": true,

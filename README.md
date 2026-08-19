@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.5.13-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.6.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Lorica%20Tests-1306%2B-brightgreen.svg" alt="Lorica Tests">
@@ -54,7 +54,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Security headers** - presets (strict/moderate/none) with HSTS, CSP, X-Frame-Options, X-Content-Type-Options
 - **HTTP Basic Auth** - per-route username/password authentication (Argon2id-hashed) with cached verification
 - **IP allowlist/denylist** and **CORS configuration** per route
-- **Certificate export** (v1.5.0, disabled by default) - mirror issued certificates as PEM files under `/var/lib/lorica/exported-certs/<hostname>/{cert,chain,fullchain,privkey}.pem` every time a cert is issued or renewed. Lets Ansible / HAProxy sidecar / backup jobs read the live bundle straight off disk without hitting the HTTP API. Atomic writes (`.tmp` stage + `fsync` + `rename`, cross-mount `EXDEV` fallback), per-file `chmod` + `chown` with configurable owner UID / group GID / octal modes (defaults 0o640 files / 0o750 dirs), fail-soft (export error never blocks the ACME renewal). Per-pattern ACL table narrows which hostnames are exported and with which UID / GID (exact match, leading `*.` wildcard, or bare `*`). Audit-logged + rate-limited `GET /api/v1/certificates/:id/download` complements on-disk export for one-off downloads. Threat model: `docs/security/cert-export-threat-model.md`
+- **Certificate export** (v1.5.0, disabled by default) - mirror issued certificates as PEM files under `/var/lib/lorica/exported-certs/<hostname>/{cert,chain,fullchain,privkey}.pem` every time a cert is issued or renewed. Lets Ansible / HAProxy sidecar / backup jobs read the live bundle straight off disk without hitting the HTTP API. Atomic writes (`.tmp` stage + `fsync` + `rename`, cross-mount `EXDEV` fallback), per-file `chmod` + `chown` with configurable owner UID / group GID / octal modes (defaults 0o640 files / 0o750 dirs), fail-soft (export error never blocks the ACME renewal). Per-pattern ACL table narrows which hostnames are exported and with which UID / GID (exact match, leading `*.` wildcard, or bare `*`). Audit-logged + rate-limited `GET /api/v1/certificates/{id}/download` complements on-disk export for one-off downloads. Threat model: `docs/security/cert-export-threat-model.md`
 
 ### :bar_chart: Monitoring & Observability
 
@@ -139,9 +139,10 @@ docker run -d --name lorica --network host \
   -v lorica-data:/var/lib/lorica lorica
 ```
 
-With `--network host` the dashboard is reachable at `http://127.0.0.1:9443`
-(HTTP, not HTTPS) and the proxy listeners bind straight onto the host —
-`:8080` (HTTP) and `:8443` (HTTPS) — so no `-p` flags are needed.
+With `--network host` the dashboard is reachable at `https://127.0.0.1:9443`
+(TLS with a self-signed certificate generated on first boot - accept the
+browser warning) and the proxy listeners bind straight onto the host -
+`:8080` (HTTP) and `:8443` (HTTPS) - so no `-p` flags are needed.
 
 Get the first-run admin password (printed to stdout once and persisted to a
 0600 file inside the container):
@@ -152,21 +153,22 @@ docker exec lorica cat /var/lib/lorica/initial-admin-password
 docker logs lorica 2>&1 | grep 'Initial admin password:'
 ```
 
-Open `http://127.0.0.1:9443` in your browser and log in with `admin` + the
-password. You will be prompted to change it on first login.
+Open `https://127.0.0.1:9443` in your browser (accept the self-signed
+certificate) and log in with `admin` + the password. You will be prompted
+to change it on first login.
 
 > **Why not `-p 9443:9443`?** The management server binds `127.0.0.1` only
 > (see `lorica-api/src/server.rs`), so port publishing cannot reach it. Use
 > `--network host` for local dev. For a remote server where host networking
 > is not an option, expose the dashboard via an SSH tunnel or Lorica's own
-> self-proxy — see [docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md).
+> self-proxy - see [docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md).
 
 #### Why the management API is loopback-only
 
 The dashboard and REST API bind to **`127.0.0.1` by design**, not by accident.
 That keeps the management plane off the network so it cannot be exposed to the
 web, even through misconfiguration. Binding to `0.0.0.0` is explicitly out of
-scope — it would weaken this security boundary.
+scope - it would weaken this security boundary.
 
 On a production host, reach the dashboard through an **SSH tunnel**:
 
@@ -174,8 +176,9 @@ On a production host, reach the dashboard through an **SSH tunnel**:
 ssh -L 9443:127.0.0.1:9443 user@host
 ```
 
-Then open `http://127.0.0.1:9443` locally. For TLS-encrypted remote access via
-the proxy itself (not recommended for production), see
+Then open `https://127.0.0.1:9443` locally (accept the self-signed
+certificate). For exposing the dashboard through the proxy itself (not
+recommended for production), see
 [docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md).
 
 ### Run directly
@@ -184,9 +187,10 @@ the proxy itself (not recommended for production), see
 lorica --data-dir /var/lib/lorica
 ```
 
-Open `http://127.0.0.1:9443` in your browser (loopback-only by design — use an
-SSH tunnel on remote hosts; see above). On first run, a random admin password
-is written to `<data-dir>/initial-admin-password` (mode 0600).
+Open `https://127.0.0.1:9443` in your browser (loopback-only by design,
+self-signed certificate - use an SSH tunnel on remote hosts; see above). On
+first run, a random admin password is written to
+`<data-dir>/initial-admin-password` (mode 0600).
 
 ### CLI options
 
@@ -256,19 +260,21 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 ## Architecture
 
-Lorica is a Rust workspace with 28 crates: 16 forked from Cloudflare Pingora and 12 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
+Lorica is a Rust workspace with 30 crates: 16 forked from Cloudflare Pingora and 14 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
 
 | Crate | Purpose |
 |-------|---------|
 | `lorica` | CLI binary, supervisor, worker orchestration |
 | `lorica-proxy` | HTTP/HTTPS proxy engine (Pingora fork) |
-| `lorica-tls` | SNI certificate resolver, hot-swap, ACME |
-| `lorica-config` | SQLite store, migrations, TOML export/import |
-| `lorica-api` | axum REST API, auth, session management |
+| `lorica-tls` | SNI certificate resolver, hot-swap, encrypted key storage |
+| `lorica-acme` | Pure ACME core: HTTP-01 / DNS-01 issuance driver, DNS challengers (Cloudflare / Route53 / OVH) |
+| `lorica-config` | SQLite store, versioned migrations, TOML export/import |
+| `lorica-api` | axum REST API, auth, session management, RBAC |
 | `lorica-dashboard` | Svelte 5 frontend embedded via rust-embed |
 | `lorica-waf` | WAF engine, OWASP rules, IP blocklist |
-| `lorica-notify` | Alert dispatch (stdout, SMTP, webhook) |
+| `lorica-notify` | Alert dispatch (stdout, SMTP, webhook, Slack) |
 | `lorica-bench` | SLA monitoring, load testing engine |
+| `lorica-metrics` | Shared Prometheus registry + cross-worker counter aggregation |
 | `lorica-worker` | fork+exec worker isolation, typed FD passing (Listener / Shmem / Rpc) |
 | `lorica-command` | Protobuf supervisor-worker command channel + pipelined RpcEndpoint (Envelope framing, in-flight demux, bounded backpressure), `Coalescer`, `GenerationGate` |
 | `lorica-shmem` | Anonymous `memfd` region shared across all workers; `AtomicHashTable` for per-IP WAF flood / auto-ban counters; SipHash-1-3 anti-HashDoS; 5-min eviction walker |
@@ -298,13 +304,13 @@ Create a route via the REST API:
 
 ```bash
 # Authenticate
-TOKEN=$(curl -s http://127.0.0.1:9443/api/v1/auth/login \
+TOKEN=$(curl -sk https://127.0.0.1:9443/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"your-admin-password"}' \
   -c - | grep session | awk '{print $NF}')
 
 # Create a backend
-curl -s http://127.0.0.1:9443/api/v1/backends \
+curl -sk https://127.0.0.1:9443/api/v1/backends \
   -b "session=$TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -315,7 +321,7 @@ curl -s http://127.0.0.1:9443/api/v1/backends \
   }'
 
 # Create a route
-curl -s http://127.0.0.1:9443/api/v1/routes \
+curl -sk https://127.0.0.1:9443/api/v1/routes \
   -b "session=$TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -340,7 +346,7 @@ Or just use the dashboard - it covers all the same operations with zero curl.
 
 ## REST API Reference
 
-All endpoints are served on the management port (default `9443`) over HTTP (loopback only). Protected endpoints require a session cookie obtained via `/api/v1/auth/login`.
+All endpoints are served on the management port (default `9443`) over HTTPS (a self-signed certificate generated on first boot; loopback only, so `curl -k` accepts it). Protected endpoints require a session cookie obtained via `/api/v1/auth/login`.
 
 ### Public endpoints
 
@@ -348,8 +354,19 @@ All endpoints are served on the management port (default `9443`) over HTTP (loop
 |--------|------|-------------|
 | `POST` | `/api/v1/auth/login` | Authenticate (returns session cookie) |
 | `POST` | `/api/v1/auth/logout` | Invalidate session |
-| `GET` | `/metrics` | Prometheus metrics (no auth) |
-| `GET` | `/.well-known/acme-challenge/:token` | ACME HTTP-01 challenge response |
+| `GET` | `/metrics` | Prometheus metrics (public by default; requires a session cookie or bearer token when `metrics_require_auth` is enabled) |
+| `GET` | `/.well-known/acme-challenge/{token}` | ACME HTTP-01 challenge response |
+
+### Auth & Users (RBAC)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/auth/me` | Current session user and role |
+| `PUT` | `/api/v1/auth/password` | Change own password |
+| `GET` | `/api/v1/users` | List users |
+| `POST` | `/api/v1/users` | Create user (role-scoped) |
+| `PUT` | `/api/v1/users/{id}` | Update user (role, password reset) |
+| `DELETE` | `/api/v1/users/{id}` | Delete user |
 
 ### Routes
 
@@ -357,9 +374,9 @@ All endpoints are served on the management port (default `9443`) over HTTP (loop
 |--------|------|-------------|
 | `GET` | `/api/v1/routes` | List all routes |
 | `POST` | `/api/v1/routes` | Create route |
-| `GET` | `/api/v1/routes/:id` | Get route |
-| `PUT` | `/api/v1/routes/:id` | Update route |
-| `DELETE` | `/api/v1/routes/:id` | Delete route |
+| `GET` | `/api/v1/routes/{id}` | Get route |
+| `PUT` | `/api/v1/routes/{id}` | Update route |
+| `DELETE` | `/api/v1/routes/{id}` | Delete route |
 | `POST` | `/api/v1/validate/mtls-pem` | Parse a candidate client-CA PEM and return per-cert subjects |
 | `POST` | `/api/v1/validate/forward-auth` | Probe a candidate forward-auth URL (one GET, status + elapsed) |
 
@@ -369,9 +386,9 @@ All endpoints are served on the management port (default `9443`) over HTTP (loop
 |--------|------|-------------|
 | `GET` | `/api/v1/backends` | List all backends |
 | `POST` | `/api/v1/backends` | Create backend |
-| `GET` | `/api/v1/backends/:id` | Get backend |
-| `PUT` | `/api/v1/backends/:id` | Update backend |
-| `DELETE` | `/api/v1/backends/:id` | Delete backend |
+| `GET` | `/api/v1/backends/{id}` | Get backend |
+| `PUT` | `/api/v1/backends/{id}` | Update backend |
+| `DELETE` | `/api/v1/backends/{id}` | Delete backend |
 
 ### Certificates
 
@@ -380,25 +397,45 @@ All endpoints are served on the management port (default `9443`) over HTTP (loop
 | `GET` | `/api/v1/certificates` | List certificates |
 | `POST` | `/api/v1/certificates` | Upload PEM certificate |
 | `POST` | `/api/v1/certificates/self-signed` | Generate self-signed certificate |
-| `GET` | `/api/v1/certificates/:id` | Get certificate |
-| `GET` | `/api/v1/certificates/:id/download?part={cert\|key\|chain\|bundle}` | Download PEM material (rate-limited, audit-logged) |
-| `PUT` | `/api/v1/certificates/:id` | Update certificate |
-| `DELETE` | `/api/v1/certificates/:id` | Delete certificate |
+| `GET` | `/api/v1/certificates/{id}` | Get certificate |
+| `GET` | `/api/v1/certificates/{id}/download?part={cert\|key\|chain\|bundle}` | Download PEM material (rate-limited, audit-logged) |
+| `POST` | `/api/v1/certificates/{id}/renew` | Force ACME renewal of a certificate |
+| `PUT` | `/api/v1/certificates/{id}` | Update certificate |
+| `DELETE` | `/api/v1/certificates/{id}` | Delete certificate |
 | `GET` | `/api/v1/cert-export/acls` | List per-pattern cert-export ACLs |
 | `POST` | `/api/v1/cert-export/acls` | Create a cert-export ACL rule |
-| `DELETE` | `/api/v1/cert-export/acls/:id` | Delete a cert-export ACL rule |
+| `DELETE` | `/api/v1/cert-export/acls/{id}` | Delete a cert-export ACL rule |
 | `POST` | `/api/v1/cert-export/reapply` | Re-export every certificate to disk |
 | `GET` | `/api/v1/cert-export/orphans` | List per-hostname subdirectories with no matching live cert |
-| `DELETE` | `/api/v1/cert-export/orphans/:name` | Remove one orphan subdirectory (sanitised + live-cert guard) |
+| `DELETE` | `/api/v1/cert-export/orphans/{name}` | Remove one orphan subdirectory (sanitised + live-cert guard) |
 
-### ACME
+### ACME & DNS Providers
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/api/v1/acme/provision` | Provision via HTTP-01 |
 | `POST` | `/api/v1/acme/provision-dns` | Provision via DNS-01 |
 | `POST` | `/api/v1/acme/provision-dns-manual` | Start manual DNS-01 flow |
+| `POST` | `/api/v1/acme/provision-dns-manual/check` | Poll DNS propagation for the manual flow |
 | `POST` | `/api/v1/acme/provision-dns-manual/confirm` | Confirm manual DNS-01 |
+| `GET` | `/api/v1/dns-providers` | List DNS provider credentials |
+| `POST` | `/api/v1/dns-providers` | Create a DNS provider credential |
+| `PUT` | `/api/v1/dns-providers/{id}` | Update a DNS provider credential |
+| `DELETE` | `/api/v1/dns-providers/{id}` | Delete a DNS provider credential |
+| `POST` | `/api/v1/dns-providers/{id}/test` | Test a DNS provider credential |
+
+### AI Crawlers
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/ai-crawlers/builtin` | List built-in known-bot signatures |
+| `GET` | `/api/v1/ai-crawlers/custom` | List custom crawler rules |
+| `POST` | `/api/v1/ai-crawlers/custom` | Create a custom crawler rule |
+| `PUT` | `/api/v1/ai-crawlers/custom/{id}` | Update a custom crawler rule |
+| `DELETE` | `/api/v1/ai-crawlers/custom/{id}` | Delete a custom crawler rule |
+| `GET` | `/api/v1/ai-crawlers/robots-preview` | Preview the generated `robots.txt` |
+| `GET` | `/api/v1/ai-crawlers/test` | Test a User-Agent against the matcher |
+| `GET` | `/api/v1/ai-crawlers/stats` | AI-crawler match counters |
 
 ### WAF
 
@@ -408,10 +445,10 @@ All endpoints are served on the management port (default `9443`) over HTTP (loop
 | `DELETE` | `/api/v1/waf/events` | Clear WAF events |
 | `GET` | `/api/v1/waf/stats` | WAF statistics |
 | `GET` | `/api/v1/waf/rules` | List WAF rules |
-| `PUT` | `/api/v1/waf/rules/:id` | Enable/disable rule |
+| `PUT` | `/api/v1/waf/rules/{id}` | Enable/disable rule |
 | `GET` | `/api/v1/waf/rules/custom` | List custom rules |
 | `POST` | `/api/v1/waf/rules/custom` | Create custom rule |
-| `DELETE` | `/api/v1/waf/rules/custom/:id` | Delete custom rule |
+| `DELETE` | `/api/v1/waf/rules/custom/{id}` | Delete custom rule |
 | `GET` | `/api/v1/waf/blocklist` | Blocklist status |
 | `PUT` | `/api/v1/waf/blocklist` | Enable/disable blocklist |
 | `POST` | `/api/v1/waf/blocklist/reload` | Reload blocklist |
@@ -421,17 +458,19 @@ All endpoints are served on the management port (default `9443`) over HTTP (loop
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/v1/sla/overview` | SLA overview for all routes |
-| `GET` | `/api/v1/sla/routes/:id` | SLA metrics for route |
-| `GET` | `/api/v1/sla/routes/:id/buckets` | Time-bucketed SLA data |
-| `GET` | `/api/v1/sla/routes/:id/config` | SLA config |
-| `PUT` | `/api/v1/sla/routes/:id/config` | Update SLA config |
-| `GET` | `/api/v1/sla/routes/:id/export` | Export SLA data (CSV/JSON) |
-| `GET` | `/api/v1/sla/routes/:id/active` | Active probe results |
+| `GET` | `/api/v1/sla/routes/{id}` | SLA metrics for route |
+| `GET` | `/api/v1/sla/routes/{id}/buckets` | Time-bucketed SLA data |
+| `GET` | `/api/v1/sla/routes/{id}/config` | SLA config |
+| `PUT` | `/api/v1/sla/routes/{id}/config` | Update SLA config |
+| `GET` | `/api/v1/sla/routes/{id}/export` | Export SLA data (CSV/JSON) |
+| `GET` | `/api/v1/sla/routes/{id}/active` | Active probe results |
+| `DELETE` | `/api/v1/sla/routes/{id}/data` | Clear stored SLA data for a route |
 | `GET` | `/api/v1/probes` | List probes |
 | `POST` | `/api/v1/probes` | Create probe |
-| `GET` | `/api/v1/probes/route/:route_id` | Probes for route |
-| `PUT` | `/api/v1/probes/:id` | Update probe |
-| `DELETE` | `/api/v1/probes/:id` | Delete probe |
+| `GET` | `/api/v1/probes/route/{route_id}` | Probes for route |
+| `GET` | `/api/v1/probes/{id}/history` | Probe result history |
+| `PUT` | `/api/v1/probes/{id}` | Update probe |
+| `DELETE` | `/api/v1/probes/{id}` | Delete probe |
 
 ### Load Testing
 
@@ -439,50 +478,61 @@ All endpoints are served on the management port (default `9443`) over HTTP (loop
 |--------|------|-------------|
 | `GET` | `/api/v1/loadtest/configs` | List configs |
 | `POST` | `/api/v1/loadtest/configs` | Create config |
-| `PUT` | `/api/v1/loadtest/configs/:id` | Update config |
-| `DELETE` | `/api/v1/loadtest/configs/:id` | Delete config |
-| `POST` | `/api/v1/loadtest/configs/:id/clone` | Clone config |
-| `POST` | `/api/v1/loadtest/start/:config_id` | Start test (requires confirm) |
-| `POST` | `/api/v1/loadtest/start/:config_id/confirm` | Confirm and execute |
+| `PUT` | `/api/v1/loadtest/configs/{id}` | Update config |
+| `DELETE` | `/api/v1/loadtest/configs/{id}` | Delete config |
+| `POST` | `/api/v1/loadtest/configs/{id}/clone` | Clone config |
+| `POST` | `/api/v1/loadtest/start/{config_id}` | Start test (requires confirm) |
+| `POST` | `/api/v1/loadtest/start/{config_id}/confirm` | Confirm and execute |
 | `GET` | `/api/v1/loadtest/status` | Current test status |
 | `GET` | `/api/v1/loadtest/ws` | WebSocket real-time progress |
 | `POST` | `/api/v1/loadtest/abort` | Abort running test |
-| `GET` | `/api/v1/loadtest/results/:config_id` | Test results |
-| `GET` | `/api/v1/loadtest/results/:config_id/compare` | Compare runs |
+| `GET` | `/api/v1/loadtest/results/{config_id}` | Test results |
+| `GET` | `/api/v1/loadtest/results/{config_id}/compare` | Compare runs |
 
 ### Cache & Bans
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `DELETE` | `/api/v1/cache/routes/:id` | Purge route cache |
+| `DELETE` | `/api/v1/cache/routes/{id}` | Purge route cache |
 | `GET` | `/api/v1/cache/stats` | Cache hit/miss stats |
 | `GET` | `/api/v1/bans` | List banned IPs |
-| `DELETE` | `/api/v1/bans/:ip` | Unban IP |
+| `DELETE` | `/api/v1/bans/{ip}` | Unban IP |
+
+### Audit Log
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/audit` | List admin audit-log entries |
+| `GET` | `/api/v1/audit/verify` | Verify the audit-log hash chain |
 
 ### System & Configuration
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `PUT` | `/api/v1/auth/password` | Change password |
 | `GET` | `/api/v1/settings` | Global settings |
-| `PUT` | `/api/v1/settings` | Update settings |
+| `PUT` | `/api/v1/settings` | Update settings (rejects cross-field-inconsistent values with 400) |
+| `GET` | `/api/v1/settings/schema` | Settings field schema (bounds, defaults) |
+| `POST` | `/api/v1/settings/otel/test` | Test the OpenTelemetry exporter connection |
 | `GET` | `/api/v1/status` | System status summary |
 | `GET` | `/api/v1/system` | CPU, memory, disk usage |
+| `POST` | `/api/v1/system/upgrade` | Hot binary upgrade (signature-verified, zero-downtime) |
 | `GET` | `/api/v1/workers` | Worker heartbeat metrics |
 | `GET` | `/api/v1/logs` | Access logs |
 | `DELETE` | `/api/v1/logs` | Clear logs |
+| `GET` | `/api/v1/logs/export` | Export access logs (CSV/JSON) |
 | `GET` | `/api/v1/logs/ws` | WebSocket log stream |
 | `POST` | `/api/v1/config/export` | Export config as TOML |
 | `POST` | `/api/v1/config/import` | Import TOML config |
 | `POST` | `/api/v1/config/import/preview` | Preview import diff |
 | `GET` | `/api/v1/notifications` | List notification configs |
 | `POST` | `/api/v1/notifications` | Create notification config |
-| `PUT` | `/api/v1/notifications/:id` | Update notification config |
-| `DELETE` | `/api/v1/notifications/:id` | Delete notification config |
-| `POST` | `/api/v1/notifications/:id/test` | Test notification channel |
+| `PUT` | `/api/v1/notifications/{id}` | Update notification config |
+| `DELETE` | `/api/v1/notifications/{id}` | Delete notification config |
+| `POST` | `/api/v1/notifications/{id}/test` | Test notification channel |
+| `GET` | `/api/v1/notifications/history` | Notification dispatch history |
 | `GET` | `/api/v1/preferences` | List user preferences |
-| `PUT` | `/api/v1/preferences/:id` | Update preference |
-| `DELETE` | `/api/v1/preferences/:id` | Delete preference |
+| `PUT` | `/api/v1/preferences/{id}` | Update preference |
+| `DELETE` | `/api/v1/preferences/{id}` | Delete preference |
 
 ## Building from Source
 
@@ -503,7 +553,7 @@ cargo build --release
 ### Running tests
 
 ```bash
-# All Rust unit tests (~2091 tests across 28 crates)
+# All Rust unit tests (~2100 tests across 30 crates)
 cargo test --workspace
 
 # Product crate tests only (~1306 tests - lorica-native, include
@@ -513,7 +563,8 @@ cargo test --workspace
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-limits -p lorica-shmem \
-           -p lorica-challenge -p lorica-geoip
+           -p lorica-challenge -p lorica-geoip -p lorica-acme \
+           -p lorica-metrics
 
 # Pingora-forked crate tests (~690 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
@@ -635,7 +686,7 @@ gpg --verify lorica.deb.asc lorica.deb
 | v1.4.0 | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Shipped |
 | v1.5.0 | Operator-input guard-rails on every field with blur + input inline errors; Route `group_name` + filter + colored pill; Certificate download API + dashboard split-menu with private-key confirm; Filesystem certificate export zone with per-pattern ACL, Settings tab, operator re-export endpoint, orphan sweep + per-row delete; Path-rule redirect fix ; Security hardening wave: `ammonia` HTML sanitiser, per-endpoint rate limits on management plane, per-route body-size limits with 1 MiB global default, session cookie rotation on password change, `/system` response filter, `rustls-pemfile → rustls-pki-types` migration, `rand 0.9` bump, source-error preservation on `.map_err` chains, WebSocket log-stream backpressure with close-on-slow-client ; Doc coverage pass + `#![warn(missing_docs)]` on every Lorica-native crate ; ACME unit tests (`wiremock` on Cloudflare + OVH challengers, `is_valid_dns_server` shell-filter, pure `should_auto_renew` predicate) ; `verdict_cache` test-parallelism race fixed via `serial_test` | Shipped |
 | **v1.5.1 + v1.5.2 (audit-closure cycles)** | Worker-mode cert hot-reload (cert install / renew now serves new cert across all workers without restart) ; SMTP encryption modes (`starttls` / `tls` / `none`) for the Email notification channel ; security defense-in-depth pass : webhook URL + Slack URL + auth_header scrubbed on JSON GET (matched the v1.5.1 TOML scrub asymmetry), CSV formula injection guard on access-log export, CSP3 directives (`frame-ancestors`, `form-action`, `base-uri`, `object-src`), per-endpoint rate limits broadened to ~16 mutating endpoints, redirect-policy=none on webhook / OCSP / blocklist clients ; reactor-stall pass : `LogStore` + `enforce_notification_retention` off-loaded to `spawn_blocking` ; reload pass : two-phase + legacy converged through one `apply_per_process_resolver_hooks` helper, cert-resolver reload serialised, OTel / GeoIP / ASN apply-error counter ; perf : Cow URL decode + `itoa` status formatting + chrono deferred until WAF match + `dashmap` fast-path on bot stash + `parking_lot::Mutex` on hot path + `RuleSet::matches` prefilter shortcut ; deps : `rustls-webpki 0.103.13` (RUSTSEC-2026-0104 + 0099), `postcss 8.5.10` (CVE-2026-41305), `aws-lc-rs` dropped from the `lorica-tls` crypto stack in favor of `ring` (the broader binary still pulls `aws-lc-rs` transitively via the rustls 0.23 default stack in `lorica-api`), `x509-parser 0.18` aligned across `lorica-tls` / `lorica-api` ; chore : `~50` magic-number `bl()` / `rl()` calls in `server.rs` lifted to `pub const`, 3 `formatBytes` dashboard implementations consolidated into `lib/format.ts`, 3 `docs/security.md` drift items fixed (49 WAF rules + ~80k IP blocklist) | Shipped |
-| v1.6.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) ; `proxy_wiring.rs` + `main.rs` module split | Planned |
+| v1.6.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC), TLS management plane, cert-resolver reliability + background OCSP, rate-limit unification, vendored captcha | Shipped |
 | v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
 
 ### Backlog (tracking only, blocked on upstream)

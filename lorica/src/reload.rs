@@ -45,6 +45,10 @@ pub struct PreparedReload {
     pub config: ProxyConfig,
     pub connection_allow_cidrs: Vec<String>,
     pub connection_deny_cidrs: Vec<String>,
+    /// Per-source-IP live-connection cap (Story 8.9 AC #5); `None`
+    /// disables it. Applied on the connection filter at commit time,
+    /// beside the CIDR policy.
+    pub connection_limits_per_ip: Option<u32>,
     pub mtls_fingerprint_drift: Option<(Option<String>, Option<String>)>,
 }
 
@@ -86,7 +90,17 @@ pub fn commit_prepared_reload(
             "mtls CA bundle changed since startup; restart Lorica to apply (rustls ServerConfig is immutable). Toggling mtls.required or editing allowed_organizations takes effect live."
         );
     }
+    // Evict per-route mirror semaphores for routes that no longer exist,
+    // so the map does not grow unbounded across a long-running process's
+    // config churn. Collected before the config is moved into the ArcSwap.
+    let live_route_ids: std::collections::HashSet<String> = prepared
+        .config
+        .routes_by_host
+        .values()
+        .flat_map(|entries| entries.iter().map(|e| e.route.id.clone()))
+        .collect();
     proxy_config.store(Arc::new(prepared.config));
+    crate::proxy_wiring::mirror_rewrite::retain_mirror_route_semaphores(&live_route_ids);
     if let Some(filter) = connection_filter {
         let policy = ConnectionFilterPolicy::from_cidrs(
             &prepared.connection_allow_cidrs,
@@ -95,9 +109,11 @@ pub fn commit_prepared_reload(
         let allow_count = policy.allow.len();
         let deny_count = policy.deny.len();
         filter.reload(policy);
+        filter.set_per_ip_limit(prepared.connection_limits_per_ip);
         info!(
             allow_cidrs = allow_count,
             deny_cidrs = deny_count,
+            per_ip_limit = prepared.connection_limits_per_ip.unwrap_or(0),
             "connection filter reloaded"
         );
     }
@@ -117,41 +133,61 @@ pub async fn reload_proxy_config_with_mtls(
     let prepared =
         build_proxy_config_inner(store, proxy_config, installed_mtls_fingerprint).await?;
     commit_prepared_reload(proxy_config, connection_filter, prepared);
-    apply_otel_settings_from_store(store).await;
-    apply_geoip_settings_from_store(store).await;
-    apply_asn_settings_from_store(store).await;
-    apply_bot_secret_from_store(store).await;
+    apply_per_process_reload_state(store).await;
     Ok(())
 }
 
-/// Re-apply the four per-process resolver hooks (OTel exporter,
-/// GeoIP / ASN updater task lifecycle, bot HMAC secret) from the
-/// current store state. Idempotent ; each `apply_*` helper dedups
-/// internally so calling this on every reload is cheap when the
-/// settings haven't changed.
+/// Rebuild the process-wide merged AI-crawler registry (built-in +
+/// enabled custom rows) from the current store and atomically swap it
+/// in (Story 8.2 AC #8). Called from every config-application path -
+/// worker / single-process startup and every reload commit - so a
+/// dashboard Custom Crawler edit takes effect on the next request
+/// without a process restart. Lenient by construction : a single
+/// unreadable or malformed custom row is dropped (logged + counted)
+/// while the rest of the registry stays live. Placed next to the
+/// per-process resolver hooks so the call site reads uniformly with
+/// the GeoIP / ASN / OTel / bot-secret re-application.
+pub async fn rebuild_merged_crawlers(store: &Arc<Mutex<ConfigStore>>) {
+    let guard = store.lock().await;
+    crate::proxy_wiring::ai_bot_merged::rebuild_from_store(&guard);
+}
+
+/// Re-apply the full per-process reload state from the current store:
+/// the four resolver hooks (OTel exporter, GeoIP / ASN updater task
+/// lifecycle, bot HMAC secret) AND the merged AI-crawler registry
+/// rebuild. Idempotent ; each step dedups internally so calling this
+/// on every reload is cheap when nothing changed.
+///
+/// This is THE single bundle every reload path must invoke. The
+/// AI-crawler registry rebuild used to be wired separately from the
+/// resolver hooks, so any reload path that called only the hooks
+/// (notably the legacy `CommandType::ConfigReload` worker fallback)
+/// refreshed resolvers but silently skipped the registry - the exact
+/// missed-rebuild asymmetry Story 8.1 killed for resolver spawns.
+/// Folding the rebuild in here makes that class of bug unrepresentable.
 ///
 /// Used by both the supervisor's `config_reload_tx` listener (the
 /// supervisor never calls `reload_proxy_config` itself - only workers
 /// do, via the two-phase RPC coordinator) AND by every worker reload
 /// path. The two-phase RPC `ConfigReloadCommit` handler at
-/// `proxy_wiring.rs::handle_config_reload_commit` calls it ; the
-/// legacy `CommandType::ConfigReload` worker handler at `main.rs`
-/// calls it too (audit M-18 - was previously skipping this sequence,
-/// so a fallback-from-two-phase reload left GeoIP / OTel / ASN /
-/// bot-secret state frozen even though the proxy config swap
-/// completed).
-pub async fn apply_per_process_resolver_hooks(store: &Arc<Mutex<ConfigStore>>) {
+/// `proxy_wiring/worker_rpc.rs::handle_config_reload_commit` calls it ;
+/// the legacy `CommandType::ConfigReload` worker handler calls it too
+/// (audit M-18 - was previously skipping this sequence, so a
+/// fallback-from-two-phase reload left GeoIP / OTel / ASN / bot-secret
+/// state frozen even though the proxy config swap completed).
+pub async fn apply_per_process_reload_state(store: &Arc<Mutex<ConfigStore>>) {
     apply_otel_settings_from_store(store).await;
     apply_geoip_settings_from_store(store).await;
     apply_asn_settings_from_store(store).await;
     apply_bot_secret_from_store(store).await;
+    rebuild_merged_crawlers(store).await;
 }
 
-/// Supervisor-only alias for [`apply_per_process_resolver_hooks`].
-/// Kept as the public symbol used by `main.rs` boot + reload listener
-/// for backwards naming clarity ; the body delegates.
+/// Supervisor-only alias for [`apply_per_process_reload_state`].
+/// Kept as the public symbol used by the supervisor boot + reload
+/// listener for backwards naming clarity ; the body delegates.
 pub async fn apply_supervisor_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
-    apply_per_process_resolver_hooks(store).await;
+    apply_per_process_reload_state(store).await;
 }
 
 /// Supervisor-side reload trigger registered at boot. The
@@ -639,6 +675,34 @@ struct OtelSnapshot {
     sampling_ratio: f64,
 }
 
+/// Story 8.10 AC #8. Emit a single operator-facing notice, once per
+/// process, listing routes that still carry the legacy `rate_limit_rps`
+/// fields without a structured `rate_limit` block. The unified limiter
+/// keeps enforcing these via a compatibility shim, so this is advisory
+/// only: no database row is written and operators are encouraged (not
+/// forced) to migrate to the richer `rate_limit` struct. The
+/// `std::sync::Once` guard keeps it to the first config build of the
+/// process (`build_proxy_config_inner` also runs on every hot reload).
+fn log_legacy_rate_limit_migration_notice(routes: &[lorica_config::models::Route]) {
+    static NOTICE: std::sync::Once = std::sync::Once::new();
+    NOTICE.call_once(|| {
+        let legacy: Vec<&str> = routes
+            .iter()
+            .filter(|r| r.rate_limit_rps.is_some() && r.rate_limit.is_none())
+            .map(|r| r.hostname.as_str())
+            .collect();
+        if !legacy.is_empty() {
+            tracing::warn!(
+                count = legacy.len(),
+                routes = %legacy.join(", "),
+                "routes still use the legacy rate_limit_rps field; they keep working via the \
+                 compatibility shim, but migrating them to the structured rate_limit block is \
+                 recommended (Story 8.10)"
+            );
+        }
+    });
+}
+
 async fn build_proxy_config_inner(
     store: &Arc<Mutex<ConfigStore>>,
     proxy_config: &Arc<ArcSwap<ProxyConfig>>,
@@ -647,6 +711,7 @@ async fn build_proxy_config_inner(
     let store = store.lock().await;
 
     let routes = store.list_routes()?;
+    log_legacy_rate_limit_migration_notice(&routes);
     let backends = store.list_backends()?;
     let certificates = store.list_certificates()?;
     let route_backends = store.list_route_backends()?;
@@ -663,6 +728,8 @@ async fn build_proxy_config_inner(
         .as_ref()
         .map(|s| s.flood_threshold_rps.max(0) as u32)
         .unwrap_or(0);
+    let flood_strict_rps = settings.as_ref().map(|s| s.flood_strict_rps).unwrap_or(0);
+    let header_timeout_s = settings.as_ref().map(|s| s.header_timeout_s).unwrap_or(10);
     let waf_ban_threshold = settings
         .as_ref()
         .map(|s| s.waf_ban_threshold.max(0) as u32)
@@ -687,6 +754,21 @@ async fn build_proxy_config_inner(
         .as_ref()
         .map(|s| s.connection_deny_cidrs.clone())
         .unwrap_or_default();
+    let connection_limits_per_ip = settings
+        .as_ref()
+        .and_then(|s| s.connection_limits_per_ip)
+        .filter(|v| *v > 0);
+    // Story 8.2 AC #3 / #11. Plumbed at config-load time so the
+    // filter-chain helpers read a stable snapshot, no SettingsStore
+    // lookup on the hot path.
+    let ai_bot_treat_spoofed_as = settings
+        .as_ref()
+        .map(|s| s.ai_bot_treat_spoofed_as)
+        .unwrap_or_default();
+    let ai_bot_inject_headers = settings
+        .as_ref()
+        .map(|s| s.ai_bot_inject_headers)
+        .unwrap_or(true);
 
     let links: Vec<(String, String)> = route_backends
         .into_iter()
@@ -702,10 +784,30 @@ async fn build_proxy_config_inner(
             custom_security_presets: custom_presets,
             max_global_connections,
             flood_threshold_rps,
+            flood_strict_rps,
+            header_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs: trusted_proxies,
             waf_whitelist_cidrs: waf_whitelist_ips,
+            ai_bot_treat_spoofed_as,
+            ai_bot_inject_headers,
+            bot_stash_max_entries: settings
+                .as_ref()
+                .map(|s| s.bot_stash_max_entries)
+                .unwrap_or(10_000),
+            bot_stash_per_prefix_max: settings
+                .as_ref()
+                .map(|s| s.bot_stash_per_prefix_max)
+                .unwrap_or(100),
+            mirror_max_concurrent_per_route: settings
+                .as_ref()
+                .map(|s| s.mirror_max_concurrent_per_route)
+                .unwrap_or(32),
+            mirror_max_concurrent_global: settings
+                .as_ref()
+                .map(|s| s.mirror_max_concurrent_global)
+                .unwrap_or(4096),
         },
     );
 
@@ -772,6 +874,7 @@ async fn build_proxy_config_inner(
         config: new_config,
         connection_allow_cidrs,
         connection_deny_cidrs,
+        connection_limits_per_ip,
         mtls_fingerprint_drift,
     })
 }
@@ -787,6 +890,19 @@ async fn build_proxy_config_inner(
 /// OCSP fetches happened to finish second. Audit L-16 ; serialising
 /// at the per-process level is the simplest correct fix.
 static CERT_RESOLVER_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Process-wide nudge from [`reload_cert_resolver`] to the background
+/// `ocsp_refresh_loop` (Story 8.5). Reload now swaps cert bodies with no
+/// OCSP staple; firing this after the swap lets the loop staple the
+/// fresh certs within a few seconds instead of waiting for its next
+/// periodic tick.
+static OCSP_REFRESH_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Handle to the OCSP-refresh nudge. The background loop awaits
+/// [`tokio::sync::Notify::notified`] on it alongside its periodic timer.
+pub fn ocsp_refresh_notify() -> &'static tokio::sync::Notify {
+    &OCSP_REFRESH_NOTIFY
+}
 
 /// Reload the TLS certificate resolver from the database.
 /// Only loads certificates that are actively referenced by at least one route.
@@ -807,6 +923,7 @@ pub async fn reload_cert_resolver(
     let db_certs = match s.list_certificates() {
         Ok(c) => c,
         Err(e) => {
+            lorica_api::metrics::inc_cert_resolver_reload("fail");
             warn!(error = %e, "failed to list certificates for resolver reload");
             return;
         }
@@ -819,13 +936,20 @@ pub async fn reload_cert_resolver(
             .filter_map(|r| r.certificate_id.clone())
             .collect(),
         Err(e) => {
+            lorica_api::metrics::inc_cert_resolver_reload("fail");
             warn!(error = %e, "failed to list routes for resolver reload");
             return;
         }
     };
 
-    // Build CertData with OCSP staple responses fetched in parallel.
-    // Drop the store lock before doing network I/O.
+    // Build cert bodies only - no OCSP fetch on the reload critical
+    // path (Story 8.5 AC #3). Stapling used to run a 10 s-per-responder
+    // parallel fetch here, so a slow OCSP responder delayed the TLS
+    // listener from serving a freshly installed cert by up to 10 s. The
+    // staples are now attached by the background `ocsp_refresh_loop`,
+    // nudged via `OCSP_REFRESH_NOTIFY` right after this swap (typically
+    // stapled within a few seconds). Drop the store lock before the
+    // (now purely CPU) key parsing in `reload`.
     let active_certs: Vec<_> = db_certs
         .iter()
         .filter(|c| active_cert_ids.contains(&c.id))
@@ -833,27 +957,21 @@ pub async fn reload_cert_resolver(
         .collect();
     drop(s);
 
-    let ocsp_futures: Vec<_> = active_certs
-        .iter()
-        .map(|c| lorica_tls::ocsp::try_fetch_ocsp(&c.cert_pem))
-        .collect();
-    let ocsp_responses = futures_util::future::join_all(ocsp_futures).await;
-
     let cert_data: Vec<CertData> = active_certs
         .iter()
-        .zip(ocsp_responses)
-        .map(|(c, ocsp)| CertData {
+        .map(|c| CertData {
             domain: c.domain.clone(),
             san_domains: c.san_domains.clone(),
             cert_pem: c.cert_pem.clone(),
             key_pem: c.key_pem.clone(),
             not_after_epoch: c.not_after.timestamp(),
-            ocsp_response: ocsp,
+            ocsp_response: None,
         })
         .collect();
 
     match cert_resolver.reload(cert_data) {
         Ok(stats) => {
+            lorica_api::metrics::inc_cert_resolver_reload("ok");
             if stats.skipped > 0 {
                 lorica_api::metrics::inc_certificates_invalid_bundle_by(
                     "reload",
@@ -864,10 +982,16 @@ pub async fn reload_cert_resolver(
                 domains = cert_resolver.domain_count(),
                 skipped = stats.skipped,
                 total = stats.total,
-                "TLS certificate resolver reloaded"
+                "TLS certificate resolver reloaded (OCSP staples deferred to background refresh)"
             );
+            // Nudge the background OCSP loop so the fresh certs get
+            // stapled promptly instead of at the next periodic tick.
+            OCSP_REFRESH_NOTIFY.notify_one();
         }
-        Err(e) => warn!(error = %e, "failed to reload TLS certificate resolver"),
+        Err(e) => {
+            lorica_api::metrics::inc_cert_resolver_reload("fail");
+            warn!(error = %e, "failed to reload TLS certificate resolver");
+        }
     }
 }
 

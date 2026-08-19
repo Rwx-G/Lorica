@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 use super::forward_auth::{build_forward_auth, ForwardAuthConfigRequest};
@@ -2741,6 +2742,17 @@ pub struct RouteResponse {
     /// Empty string = ungrouped. Mirrors `Backend.group_name`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group_name: String,
+    /// Per-route AI / LLM crawler deny-list policy (Story 8.2 AC #2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_bot_policy: Option<lorica_config::models::AiBotPolicy>,
+    /// Per-route override for the global `ai_bot_treat_spoofed_as`
+    /// (Story 8.2 AC #3). `None` = inherit from global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_bot_spoofed_fallback: Option<lorica_config::models::SpoofedFallback>,
+    /// Auto-serve a registry-driven `/robots.txt` for this route
+    /// (Story 8.2 AC #10). Default `false` = passthrough to backend.
+    #[serde(default)]
+    pub serve_robots_txt: bool,
     /// RFC 3339 insert timestamp.
     pub created_at: String,
     /// RFC 3339 last-write timestamp.
@@ -2883,6 +2895,14 @@ pub struct CreateRouteRequest {
     /// Omit or send empty string for ungrouped. Validated against a
     /// lowercase ASCII + digits + `-` + `_` alphabet, 1..=64 chars.
     pub group_name: Option<String>,
+    /// Per-route AI / LLM crawler deny-list policy (Story 8.2 AC #2).
+    pub ai_bot_policy: Option<lorica_config::models::AiBotPolicy>,
+    /// Per-route override for the global `ai_bot_treat_spoofed_as`
+    /// setting (Story 8.2 AC #3). `None` defers to the global.
+    pub ai_bot_spoofed_fallback: Option<lorica_config::models::SpoofedFallback>,
+    /// Auto-serve a Lorica-generated `/robots.txt` for this route
+    /// (Story 8.2 AC #10). Default `false` = passthrough to backend.
+    pub serve_robots_txt: Option<bool>,
 }
 
 /// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are
@@ -3045,6 +3065,24 @@ pub struct UpdateRouteRequest {
     /// Free-form operator classification (prod / staging / homelab / ...).
     /// Empty string clears the grouping. `None` leaves the field unchanged.
     pub group_name: Option<String>,
+    /// Per-route AI / LLM crawler deny-list policy (Story 8.2 AC #2).
+    /// `None` leaves alone ; `Some(Off)` is equivalent to clearing.
+    pub ai_bot_policy: Option<lorica_config::models::AiBotPolicy>,
+    /// Per-route override for the global `ai_bot_treat_spoofed_as`
+    /// (Story 8.2 AC #3). `None` leaves alone ; explicit value
+    /// installs the override. Pair with `ai_bot_spoofed_fallback_inherit`
+    /// to revert the override (back to "inherit from global").
+    pub ai_bot_spoofed_fallback: Option<lorica_config::models::SpoofedFallback>,
+    /// Explicit "inherit-from-global" flag for `ai_bot_spoofed_fallback`.
+    /// When `Some(true)`, drops the per-route override and lets the
+    /// global default apply. Mirrors `bot_protection_disable` pattern :
+    /// the boolean lets the API layer distinguish "absent" from
+    /// "explicitly inherit" without resorting to `Option<Option<T>>`.
+    #[serde(default)]
+    pub ai_bot_spoofed_fallback_inherit: Option<bool>,
+    /// Auto-serve a Lorica-generated `/robots.txt` for this route
+    /// (Story 8.2 AC #10). `None` leaves alone.
+    pub serve_robots_txt: Option<bool>,
 }
 
 fn route_to_response(
@@ -3196,6 +3234,9 @@ fn route_to_response(
         geoip: route.geoip.clone(),
         bot_protection: route.bot_protection.clone(),
         group_name: route.group_name.clone(),
+        ai_bot_policy: route.ai_bot_policy,
+        ai_bot_spoofed_fallback: route.ai_bot_spoofed_fallback,
+        serve_robots_txt: route.serve_robots_txt,
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -3253,7 +3294,10 @@ pub async fn list_routes(
 /// Validates type-shape (enum parsing, regex compilability); business
 /// rules (hostname uniqueness) are enforced by the store layer.
 pub async fn create_route(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     if body.hostname.is_empty() {
@@ -3549,6 +3593,13 @@ pub async fn create_route(
             Some(g) => validate_group_name(g)?,
             None => String::new(),
         },
+        // Story 8.2 AC #2 / #3 / #10. None at the route level is the
+        // backward-compat default ; serde-derive parsing of the enum
+        // values has already validated the strings, so there is no
+        // server-side check beyond passthrough.
+        ai_bot_policy: body.ai_bot_policy,
+        ai_bot_spoofed_fallback: body.ai_bot_spoofed_fallback,
+        serve_robots_txt: body.serve_robots_txt.unwrap_or(false),
         created_at: now,
         updated_at: now,
     };
@@ -3568,6 +3619,21 @@ pub async fn create_route(
 
     let response = route_to_response(&route, backend_ids);
     state.notify_config_changed();
+
+    // `after` uses the response view (no `basic_auth_password_hash`),
+    // never the stored model.
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "route.create",
+        ("route", &route.id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
     Ok(json_data_with_status(StatusCode::CREATED, response))
 }
 
@@ -3589,14 +3655,18 @@ pub async fn get_route(
 
 /// PUT /api/v1/routes/:id - patch route fields and trigger a proxy reload.
 pub async fn update_route(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (route, backend_ids) = db_blocking(&state.store, move |store| {
+    let (before_route, route, backend_ids) = db_blocking(&state.store, move |store| {
         let mut route = store
             .get_route(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
+        let before_route = route.clone();
 
         validate_route_numeric_bounds(
             body.connect_timeout_s,
@@ -3963,6 +4033,23 @@ pub async fn update_route(
         if let Some(ref raw) = body.group_name {
             route.group_name = validate_group_name(raw)?;
         }
+        // Story 8.2 AC #2 / #3 / #10. None on the patch leaves alone ;
+        // explicit Some(_) installs. The serde-derived enum guards the
+        // string set, so server-side validation is just passthrough.
+        if let Some(p) = body.ai_bot_policy {
+            // Some(Off) is functionally equivalent to None at the request
+            // filter ; we still store it explicitly so the round-trip
+            // matches the API contract (set Off -> read Off).
+            route.ai_bot_policy = Some(p);
+        }
+        if matches!(body.ai_bot_spoofed_fallback_inherit, Some(true)) {
+            route.ai_bot_spoofed_fallback = None;
+        } else if let Some(f) = body.ai_bot_spoofed_fallback {
+            route.ai_bot_spoofed_fallback = Some(f);
+        }
+        if let Some(b) = body.serve_robots_txt {
+            route.serve_robots_txt = b;
+        }
         route.updated_at = Utc::now();
 
         store.update_route(&route)?;
@@ -3979,19 +4066,54 @@ pub async fn update_route(
         }
 
         let backend_ids = store.list_backends_for_route(&id)?;
-        Ok::<_, ApiError>((route, backend_ids))
+        Ok::<_, ApiError>((before_route, route, backend_ids))
     })
     .await?;
     state.notify_config_changed();
-    Ok(json_data(route_to_response(&route, backend_ids)))
+
+    let response = route_to_response(&route, backend_ids);
+    // Both payloads use the response view (no
+    // `basic_auth_password_hash`). The `before` snapshot omits backend
+    // links (empty list) - capturing them would need an extra DB read
+    // before the mutation.
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(route_to_response(&before_route, Vec::new())).ok();
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "route.update",
+        ("route", &route.id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data(response))
 }
 
 /// DELETE /api/v1/routes/:id - delete a route and notify the proxy.
 pub async fn delete_route(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let route_id = id.clone();
     db_blocking(&state.store, move |store| store.delete_route(&id)).await?;
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "route.delete",
+        ("route", &route_id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({"message": "route deleted"})))
 }

@@ -1,0 +1,17 @@
+[package]
+name = "lorica-metrics"
+version = "1.6.0"
+authors = ["Rwx-G"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "Shared Prometheus registry, registration helpers, and cross-worker counter aggregation for Lorica"
+
+[dependencies]
+# Pinned to the same 0.14 line lorica-api uses so the re-exported
+# `prometheus` types unify to a single version across the workspace
+# (consumers depend on `lorica_metrics::prometheus`, never on
+# `prometheus` directly, which is what keeps the version skew-free).
+prometheus = "0.14"
+once_cell = { workspace = true }
+parking_lot = "0.12"

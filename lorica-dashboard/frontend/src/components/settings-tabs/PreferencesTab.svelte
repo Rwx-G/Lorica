@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api, type UserPreferenceResponse } from '../../lib/api';
   import ConfirmDialog from '../ConfirmDialog.svelte';
+  import { canWrite } from '../../lib/auth';
 
   interface Props {
     preferences: UserPreferenceResponse[];
@@ -103,6 +104,7 @@
                   <td>
                     <select
                       value={pref.value}
+                      disabled={!$canWrite}
                       onchange={(e) => changePrefValue(pref, (e.target as HTMLSelectElement).value)}
                     >
                       <option value="never">never</option>
@@ -111,7 +113,9 @@
                     </select>
                   </td>
                   <td class="settings-actions-cell">
-                    <button class="btn-link danger" onclick={() => deletingPref = pref}>Delete</button>
+                    {#if $canWrite}
+                      <button class="btn-link danger" onclick={() => deletingPref = pref}>Delete</button>
+                    {/if}
                   </td>
                 </tr>
               {/each}

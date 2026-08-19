@@ -161,6 +161,11 @@ pub struct Command {
     /// Ban duration in seconds (only used with BanIp command type).
     #[prost(uint64, tag = "5")]
     pub ban_duration_s: u64,
+    /// Ban reason (only used with BanIp command type). Encodes
+    /// `lorica_api::ban::BanReason` as an i32; defaults to 0 for legacy
+    /// encoders, which the worker maps back to its forward-compat reason.
+    #[prost(int32, tag = "6")]
+    pub ban_reason: i32,
     /// Typed payload for RPC framework variants (CommandType 6+).
     /// None for legacy variants.
     #[prost(
@@ -209,18 +214,22 @@ impl Command {
             timestamp_ms: now_ms(),
             ban_ip: String::new(),
             ban_duration_s: 0,
+            ban_reason: 0,
             payload: None,
         }
     }
 
-    /// Create a BanIp command with the specified IP and duration.
-    pub fn ban_ip(sequence: u64, ip: impl Into<String>, duration_s: u64) -> Self {
+    /// Create a BanIp command with the specified IP, duration, and
+    /// reason. `ban_reason` encodes `lorica_api::ban::BanReason` as an
+    /// i32 (`BanReason::as_i32`); the worker decodes it on apply.
+    pub fn ban_ip(sequence: u64, ip: impl Into<String>, duration_s: u64, ban_reason: i32) -> Self {
         Self {
             command_type: CommandType::BanIp as i32,
             sequence,
             timestamp_ms: now_ms(),
             ban_ip: ip.into(),
             ban_duration_s: duration_s,
+            ban_reason,
             payload: None,
         }
     }
@@ -234,6 +243,7 @@ impl Command {
             timestamp_ms: now_ms(),
             ban_ip: String::new(),
             ban_duration_s: 0,
+            ban_reason: 0,
             payload: Some(payload),
         }
     }
@@ -353,6 +363,10 @@ pub struct BanReportEntry {
     /// Total ban duration in seconds.
     #[prost(uint64, tag = "3")]
     pub ban_duration_seconds: u64,
+    /// Why the IP was banned. Encodes `lorica_api::ban::BanReason` as an
+    /// i32 (`BanReason::as_i32`); 0 from a legacy worker.
+    #[prost(int32, tag = "4")]
+    pub reason: i32,
 }
 
 /// Per-route/status HTTP request count entry.
@@ -795,11 +809,12 @@ mod tests {
     fn test_ban_ip_command() {
         use prost::Message;
 
-        let cmd = Command::ban_ip(42, "192.168.1.100", 3600);
+        let cmd = Command::ban_ip(42, "192.168.1.100", 3600, 3);
         assert_eq!(cmd.typed_command(), CommandType::BanIp);
         assert_eq!(cmd.sequence, 42);
         assert_eq!(cmd.ban_ip, "192.168.1.100");
         assert_eq!(cmd.ban_duration_s, 3600);
+        assert_eq!(cmd.ban_reason, 3);
         assert!(cmd.timestamp_ms > 0);
 
         // Verify protobuf roundtrip
@@ -823,6 +838,7 @@ mod tests {
                 ip: "192.168.1.100".into(),
                 remaining_seconds: 300,
                 ban_duration_seconds: 600,
+                reason: 1,
             }],
             ewma_entries: vec![
                 EwmaReportEntry {
@@ -1111,6 +1127,7 @@ mod tests {
             timestamp_ms: 123,
             ban_ip: String::new(),
             ban_duration_s: 0,
+            ban_reason: 0,
             payload: None,
         };
         let bytes = legacy.encode_to_vec();

@@ -23,6 +23,7 @@ use tracing::{error, info, warn};
 
 use crate::db::db_blocking;
 use crate::error::ApiError;
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// Pure predicate : does this certificate qualify for automated ACME
@@ -167,9 +168,9 @@ pub fn superseded_orphans(
         .collect()
 }
 
-use super::config::AcmeConfig;
+use lorica_acme::{build_dns_challenger, AcmeConfig, DnsChallengeConfig};
+
 use super::dns01::provision_with_acme_dns;
-use super::dns_challengers::{build_dns_challenger, DnsChallengeConfig};
 use super::http01::provision_with_acme;
 
 /// Spawn a background task that checks ACME certificates for renewal.
@@ -358,7 +359,10 @@ pub fn spawn_renewal_task(
 
 /// POST /api/v1/certificates/:id/renew - manually trigger ACME renewal for a certificate
 pub async fn renew_certificate(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let cert = db_blocking(&state.store, move |store| {
@@ -401,15 +405,27 @@ pub async fn renew_certificate(
         "certificate manually renewed"
     );
 
-    // In-place renewal keeps the id, so `old_cert_id == new_cert_id`.
-    // Both fields are retained for response-shape compatibility with
-    // existing API clients (the dashboard types this exact shape).
-    Ok(crate::error::json_data(serde_json::json!({
+    let payload = serde_json::json!({
         "renewed": true,
         "old_cert_id": cert.id,
         "new_cert_id": cert.id,
         "domain": cert.domain,
-    })))
+    });
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "certificate.renew",
+        ("certificate", &cert.id),
+        None,
+        Some(&payload),
+    )
+    .await;
+
+    // In-place renewal keeps the id, so `old_cert_id == new_cert_id`.
+    // Both fields are retained for response-shape compatibility with
+    // existing API clients (the dashboard types this exact shape).
+    Ok(crate::error::json_data(payload))
 }
 
 /// Renew a certificate using the appropriate method based on `acme_method`.

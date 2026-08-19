@@ -57,16 +57,33 @@ pub struct BotStashEntry {
 /// bug or a crafted payload trying to inflate the DB on disk.
 const MAX_PNG_BYTES: usize = 512 * 1024;
 
-/// Maximum pending challenges in the stash. Bounds disk + memory
-/// usage under sustained bot traffic. When the cap is reached, the
-/// oldest rows are evicted before the new insert.
-const MAX_STASH_ROWS: usize = 10_000;
+/// Outcome of a capacity-checked stash insert (Story 8.9 AC #6).
+/// Refusal replaced the previous oldest-first eviction: with
+/// eviction, a challenge flooder always won a slot by evicting
+/// legitimate pending entries; with refusal the flooder gets
+/// `503 Retry-After` and pending legitimate challenges survive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotStashInsertOutcome {
+    /// The challenge was stored.
+    Inserted,
+    /// The global stash cap (`bot_stash_max_entries`) is reached.
+    GlobalCapExceeded,
+    /// The client's IP prefix is at its cap
+    /// (`bot_stash_per_prefix_max`).
+    PrefixCapExceeded,
+}
 
 impl ConfigStore {
-    /// Insert a pending challenge. Enforces a PNG size cap and a
-    /// global row limit with oldest-first eviction to prevent
-    /// disk/memory exhaustion from sustained bot traffic.
-    pub fn bot_stash_insert(&self, entry: &BotStashEntry) -> Result<()> {
+    /// Insert a pending challenge, enforcing the PNG size cap plus
+    /// the global and per-IP-prefix capacity caps (Story 8.9 AC #6).
+    /// `max_entries` / `per_prefix_max` of 0 disable the respective
+    /// cap. Over-cap inserts are REFUSED, not evicted.
+    pub fn bot_stash_insert(
+        &self,
+        entry: &BotStashEntry,
+        max_entries: u32,
+        per_prefix_max: u32,
+    ) -> Result<BotStashInsertOutcome> {
         if let Some(ref png) = entry.png_bytes {
             if png.len() > MAX_PNG_BYTES {
                 return Err(crate::error::ConfigError::Validation(format!(
@@ -76,21 +93,26 @@ impl ConfigStore {
                 )));
             }
         }
-        // Evict oldest rows when the stash is at capacity.
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM bot_pending_challenges", [], |row| {
-                    row.get(0)
-                })?;
-        if count as usize >= MAX_STASH_ROWS {
-            let to_evict = (count as usize - MAX_STASH_ROWS + 1) as i64;
-            self.conn.execute(
-                "DELETE FROM bot_pending_challenges WHERE rowid IN (
-                     SELECT rowid FROM bot_pending_challenges
-                     ORDER BY expires_at ASC LIMIT ?1
-                 )",
-                params![to_evict],
+        if max_entries > 0 {
+            let count: i64 =
+                self.conn
+                    .query_row("SELECT COUNT(*) FROM bot_pending_challenges", [], |row| {
+                        row.get(0)
+                    })?;
+            if count >= i64::from(max_entries) {
+                return Ok(BotStashInsertOutcome::GlobalCapExceeded);
+            }
+        }
+        if per_prefix_max > 0 {
+            let prefix_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM bot_pending_challenges
+                 WHERE ip_prefix_disc = ?1 AND ip_prefix_bytes = ?2",
+                params![entry.ip_prefix_disc as i64, entry.ip_prefix_bytes],
+                |row| row.get(0),
             )?;
+            if prefix_count >= i64::from(per_prefix_max) {
+                return Ok(BotStashInsertOutcome::PrefixCapExceeded);
+            }
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO bot_pending_challenges
@@ -112,7 +134,7 @@ impl ConfigStore {
                 entry.png_bytes,
             ],
         )?;
-        Ok(())
+        Ok(BotStashInsertOutcome::Inserted)
     }
 
     /// Atomically remove + return a pending challenge. The
@@ -218,7 +240,7 @@ mod tests {
     fn insert_then_take_roundtrip() {
         let store = ConfigStore::open_in_memory().unwrap();
         let e = entry("abc", "pow", 2_000_000_000);
-        store.bot_stash_insert(&e).unwrap();
+        store.bot_stash_insert(&e, 10_000, 100).unwrap();
         let taken = store
             .bot_stash_take("abc", 1_900_000_000)
             .unwrap()
@@ -237,7 +259,7 @@ mod tests {
     fn take_atomic_consumes_single_row() {
         let store = ConfigStore::open_in_memory().unwrap();
         let e = entry("once", "pow", 2_000_000_000);
-        store.bot_stash_insert(&e).unwrap();
+        store.bot_stash_insert(&e, 10_000, 100).unwrap();
         assert!(store
             .bot_stash_take("once", 1_900_000_000)
             .unwrap()
@@ -253,7 +275,7 @@ mod tests {
     fn captcha_image_is_read_only() {
         let store = ConfigStore::open_in_memory().unwrap();
         let e = entry("cap1", "captcha", 2_000_000_000);
-        store.bot_stash_insert(&e).unwrap();
+        store.bot_stash_insert(&e, 10_000, 100).unwrap();
         assert_eq!(
             store.bot_stash_captcha_image("cap1").unwrap(),
             Some(vec![1, 2, 3, 4])
@@ -271,7 +293,7 @@ mod tests {
     fn captcha_image_none_for_pow_entries() {
         let store = ConfigStore::open_in_memory().unwrap();
         let e = entry("pow1", "pow", 2_000_000_000);
-        store.bot_stash_insert(&e).unwrap();
+        store.bot_stash_insert(&e, 10_000, 100).unwrap();
         assert!(store.bot_stash_captcha_image("pow1").unwrap().is_none());
     }
 
@@ -279,13 +301,13 @@ mod tests {
     fn prune_removes_expired_rows() {
         let store = ConfigStore::open_in_memory().unwrap();
         store
-            .bot_stash_insert(&entry("keep", "pow", 2_000_000_000))
+            .bot_stash_insert(&entry("keep", "pow", 2_000_000_000), 10_000, 100)
             .unwrap();
         store
-            .bot_stash_insert(&entry("drop1", "pow", 1_000_000_000))
+            .bot_stash_insert(&entry("drop1", "pow", 1_000_000_000), 10_000, 100)
             .unwrap();
         store
-            .bot_stash_insert(&entry("drop2", "captcha", 1_500_000_000))
+            .bot_stash_insert(&entry("drop2", "captcha", 1_500_000_000), 10_000, 100)
             .unwrap();
         let pruned = store.bot_stash_prune_expired(1_800_000_000).unwrap();
         assert_eq!(pruned, 2);
@@ -297,15 +319,80 @@ mod tests {
     }
 
     #[test]
+    fn global_cap_refuses_instead_of_evicting() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        assert_eq!(
+            store
+                .bot_stash_insert(&entry("a", "pow", 2_000_000_000), 2, 0)
+                .unwrap(),
+            BotStashInsertOutcome::Inserted
+        );
+        assert_eq!(
+            store
+                .bot_stash_insert(&entry("b", "pow", 2_000_000_001), 2, 0)
+                .unwrap(),
+            BotStashInsertOutcome::Inserted
+        );
+        assert_eq!(
+            store
+                .bot_stash_insert(&entry("c", "pow", 2_000_000_002), 2, 0)
+                .unwrap(),
+            BotStashInsertOutcome::GlobalCapExceeded
+        );
+        // The earlier entries survived (no eviction).
+        assert_eq!(store.bot_stash_len().unwrap(), 2);
+        assert!(store.bot_stash_take("a", 1_900_000_000).unwrap().is_some());
+    }
+
+    #[test]
+    fn per_prefix_cap_refuses_only_the_saturated_prefix() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        assert_eq!(
+            store
+                .bot_stash_insert(&entry("p1", "pow", 2_000_000_000), 0, 1)
+                .unwrap(),
+            BotStashInsertOutcome::Inserted
+        );
+        // Same /24 prefix (the `entry` helper uses 192.0.2.x): refused.
+        assert_eq!(
+            store
+                .bot_stash_insert(&entry("p2", "pow", 2_000_000_001), 0, 1)
+                .unwrap(),
+            BotStashInsertOutcome::PrefixCapExceeded
+        );
+        // Different prefix: accepted.
+        let mut other = entry("p3", "pow", 2_000_000_002);
+        other.ip_prefix_bytes = vec![198, 51, 100];
+        assert_eq!(
+            store.bot_stash_insert(&other, 0, 1).unwrap(),
+            BotStashInsertOutcome::Inserted
+        );
+    }
+
+    #[test]
+    fn zero_caps_disable_enforcement() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        for n in 0..5 {
+            assert_eq!(
+                store
+                    .bot_stash_insert(&entry(&format!("n{n}"), "pow", 2_000_000_000), 0, 0)
+                    .unwrap(),
+                BotStashInsertOutcome::Inserted
+            );
+        }
+        assert_eq!(store.bot_stash_len().unwrap(), 5);
+    }
+
+    #[test]
     fn replace_on_nonce_collision() {
         let store = ConfigStore::open_in_memory().unwrap();
         store
-            .bot_stash_insert(&entry("dup", "pow", 2_000_000_000))
+            .bot_stash_insert(&entry("dup", "pow", 2_000_000_000), 10_000, 100)
             .unwrap();
         // Same nonce, different mode → replaces.
         let mut e2 = entry("dup", "captcha", 2_000_000_100);
         e2.mode = 3;
-        store.bot_stash_insert(&e2).unwrap();
+        store.bot_stash_insert(&e2, 10_000, 100).unwrap();
         let taken = store.bot_stash_take("dup", 1_900_000_000).unwrap().unwrap();
         assert_eq!(taken.kind, "captcha");
         assert_eq!(taken.mode, 3);

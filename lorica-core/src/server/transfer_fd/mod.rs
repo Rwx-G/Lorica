@@ -134,11 +134,15 @@ where
     };
     socket::bind(listen_raw_fd, &unix_addr).unwrap();
 
-    /* sock is created before we change user, need to give permission */
+    /* Owner-only: in Lorica both the outgoing and incoming supervisors run
+     * as the same service user, so the FD-transfer socket never needs to be
+     * world-accessible. 0600 (was the upstream pingora 0666) keeps a live
+     * listening-socket handoff off-limits to any other local user (Lorica
+     * audit L1). */
     stat::fchmodat(
         None,
         path,
-        stat::Mode::from_bits_truncate(0o666),
+        stat::Mode::from_bits_truncate(0o600),
         stat::FchmodatFlags::FollowSymlink,
     )
     .unwrap();

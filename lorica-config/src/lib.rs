@@ -9,6 +9,9 @@
 //! typed [`ConfigError`], and the crypto primitives used to protect
 //! sensitive fields at rest.
 
+/// Cross-crate single source of truth for the AI / LLM crawler
+/// built-in registry data and baseline-UA corpus (Story 8.2).
+pub mod ai_crawler_registry;
 /// AES-GCM encryption primitives for sensitive fields at rest.
 pub mod crypto;
 /// Typed diff between two configuration snapshots.
@@ -29,5 +32,5 @@ mod tests;
 
 pub use crypto::EncryptionKey;
 pub use error::{ConfigError, Result};
-pub use store::bot_stash::BotStashEntry;
+pub use store::bot_stash::{BotStashEntry, BotStashInsertOutcome};
 pub use store::ConfigStore;

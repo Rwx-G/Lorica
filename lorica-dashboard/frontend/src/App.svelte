@@ -39,11 +39,17 @@
   }
 
   onMount(async () => {
-    // Check if we already have a valid session cookie (survives F5)
+    // Check if we already have a valid session cookie (survives F5).
+    // /auth/me also restores the username + role the RBAC-aware UI
+    // needs (Story 8.3).
     try {
-      const res = await api.getStatus();
+      const res = await api.getMe();
       if (res.data) {
-        auth.set({ status: 'authenticated' });
+        auth.set({
+          status: 'authenticated',
+          username: res.data.username,
+          role: res.data.role,
+        });
         await loadTheme();
       }
     } catch {

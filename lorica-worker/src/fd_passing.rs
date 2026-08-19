@@ -254,6 +254,23 @@ pub fn clear_cloexec(fd: RawFd) -> Result<(), WorkerError> {
     Ok(())
 }
 
+/// Duplicate `fd` into a fresh CLOEXEC descriptor owned by the returned
+/// [`OwnedFd`].
+///
+/// Used by the hot-upgrade handoff (Story 8.4) to keep a long-lived copy
+/// of each proxy listening socket alive in the supervisor after the
+/// originals are closed post-fork. The dup refers to the SAME open file
+/// description (shared accept queue), so it can later be re-passed to a
+/// new supervisor via SCM_RIGHTS. CLOEXEC is set because the dup is never
+/// meant to leak across an `execv`; the SCM_RIGHTS transfer dups it again
+/// in the receiver regardless of this flag.
+pub fn dup_cloexec(fd: RawFd) -> Result<OwnedFd, WorkerError> {
+    let raw: RawFd = fcntl(fd, FcntlArg::F_DUPFD_CLOEXEC(0)).map_err(WorkerError::DupFd)?;
+    // SAFETY: `F_DUPFD_CLOEXEC` returns a fresh, exclusively-owned FD;
+    // wrapping it in `OwnedFd` is the canonical close-on-drop idiom.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
 /// Create a TCP listening socket bound to the given address.
 ///
 /// The socket has `SO_REUSEADDR` set and a backlog of 65535.

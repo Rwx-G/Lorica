@@ -47,6 +47,40 @@ impl LoadBalancing {
     }
 }
 
+/// RBAC role of a dashboard / API user account (Story 8.3).
+///
+/// Stored as snake_case TEXT in the `users.role` column and on the
+/// wire (`super_admin` / `operator` / `viewer`). Ordering of the
+/// variants is meaningful: `Viewer < Operator < SuperAdmin`, so an
+/// authorization floor can be expressed as `session.role >= min_role`
+/// via the derived `PartialOrd`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, EnumString,
+    IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum Role {
+    /// Read-only on everything; secrets (cert private keys, SMTP
+    /// password, webhook URLs, DNS tokens) are scrubbed or blocked.
+    Viewer,
+    /// Full CRUD on routes / backends / certs / WAF / SLA /
+    /// load-tests / probes / cache / bans; read-only on settings;
+    /// no user management, no encryption-key rotation.
+    Operator,
+    /// Full access, including user management, settings, and
+    /// encryption-key rotation.
+    SuperAdmin,
+}
+
+impl Role {
+    /// Snake_case wire representation of the variant (matches the
+    /// `serde` and `FromStr` form).
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
+}
+
 /// WAF enforcement mode for a route. `Detection` logs hits but lets the
 /// request through; `Blocking` denies the request with a 403.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]

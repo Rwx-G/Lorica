@@ -26,7 +26,7 @@ lorica-lru = { version = "0.1.0", path = "../lorica-lru" }
 lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }
 bstr = { workspace = true }
 http = { workspace = true }
-indexmap = "1"
+indexmap = "2"
 once_cell = { workspace = true }
 regex = "1"
 blake2 = "0.10"
@@ -43,7 +43,7 @@ lru = { workspace = true }
 ahash = { workspace = true }
 hex = "0.4"
 httparse = { workspace = true }
-strum = { version = "0.26", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 rand = "0.8"
 
 [dev-dependencies]

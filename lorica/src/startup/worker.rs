@@ -136,6 +136,23 @@ pub(crate) fn run_worker(
             error!(error = %e, "worker failed to load proxy configuration");
             std::process::exit(1);
         }
+        // Story 8.2 AC #8 / Epic-8.1 mode parity. A freshly forked,
+        // respawned, or hot-upgraded worker lazy-inits the process-wide
+        // merged AI-crawler registry with the BUILT-INS ONLY, and
+        // `reload_proxy_config` above does not touch that registry. Without
+        // this rebuild, operator-defined custom AI-crawler deny rows are
+        // silently unenforced on this worker until the next config
+        // mutation reaches it. Rebuild once here from the store so the
+        // worker enforces existing custom rows from its first request -
+        // single-process boot already gets the same rebuild via
+        // `apply_supervisor_settings_from_store`. Idempotent and lenient:
+        // a malformed custom row is dropped, logged, and counted, never
+        // blanking the live registry. Scoped to the registry (rather than
+        // the full `apply_per_process_reload_state` bundle) because worker
+        // boot already applies OTel above and GeoIP/ASN below through
+        // mode-specific code; routing the whole bundle here would re-init
+        // OTel and race the not-yet-registered resolver handles.
+        lorica::reload::rebuild_merged_crawlers(&store).await;
     });
 
     // Initialise the OTel exporter in this worker's runtime. Must run
@@ -148,47 +165,12 @@ pub(crate) fn run_worker(
 
     // Build CertResolver for TLS termination in worker
     let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
-    rt.block_on(async {
-        let db_certs = store.lock().await;
-        let certs = db_certs.list_certificates().unwrap_or_default();
-        if !certs.is_empty() {
-            let cert_data: Vec<lorica_tls::cert_resolver::CertData> = certs
-                .iter()
-                .map(|c| lorica_tls::cert_resolver::CertData {
-                    domain: c.domain.clone(),
-                    san_domains: c.san_domains.clone(),
-                    cert_pem: c.cert_pem.clone(),
-                    key_pem: c.key_pem.clone(),
-                    not_after_epoch: c.not_after.timestamp(),
-                    ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
-                })
-                .collect();
-            match cert_resolver.reload(cert_data) {
-                Ok(stats) => {
-                    if stats.skipped > 0 {
-                        lorica_api::metrics::inc_certificates_invalid_bundle_by(
-                            "reload",
-                            stats.skipped as u64,
-                        );
-                    }
-                    info!(
-                        worker_id = id,
-                        domains = cert_resolver.domain_count(),
-                        skipped = stats.skipped,
-                        total = stats.total,
-                        "worker loaded TLS certificates"
-                    );
-                }
-                Err(e) => warn!(error = %e, "worker failed to load certificates into resolver"),
-            }
-        }
-    });
+    rt.block_on(worker_load_certs_into_resolver(&store, &cert_resolver, id));
 
     // Pre-create metric Arcs so the command thread can read them
     let worker_cache_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let worker_cache_misses = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let worker_ban_list: Arc<dashmap::DashMap<String, (std::time::Instant, u64)>> =
-        Arc::new(dashmap::DashMap::new());
+    let worker_ban_list: Arc<lorica_api::ban::BanMap> = Arc::new(dashmap::DashMap::new());
     let worker_ewma = Arc::new(lorica::proxy_wiring::EwmaTracker::new());
     let worker_backend_conns = Arc::new(lorica::proxy_wiring::BackendConnections::new());
     let worker_request_counts: Arc<dashmap::DashMap<(String, u16), std::sync::atomic::AtomicU64>> =
@@ -198,38 +180,7 @@ pub(crate) fn run_worker(
 
     // Create shared WAF engine for worker (must be before command channel setup)
     let waf_engine = Arc::new(lorica_waf::WafEngine::new());
-    {
-        let s = store.blocking_lock();
-        if let Ok(settings) = s.get_global_settings() {
-            if settings.ip_blocklist_enabled {
-                waf_engine.ip_blocklist().set_enabled(true);
-                info!("worker: IP blocklist restored as enabled");
-            }
-        }
-        if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
-            if !disabled_ids.is_empty() {
-                waf_engine.set_disabled_rules(&disabled_ids);
-                info!(
-                    count = disabled_ids.len(),
-                    "worker: WAF disabled rules restored"
-                );
-            }
-        }
-        if let Ok(custom_rules) = s.load_waf_custom_rules() {
-            for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
-                let category = cat
-                    .parse()
-                    .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
-                let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
-            }
-            if !custom_rules.is_empty() {
-                info!(
-                    count = custom_rules.len(),
-                    "worker: WAF custom rules restored"
-                );
-            }
-        }
-    }
+    worker_restore_waf_state(&store, &waf_engine);
 
     // Start the command channel listener in a background thread
     // (the proxy server's run_forever blocks the main thread)
@@ -328,19 +279,20 @@ pub(crate) fn run_worker(
                                     &cmd_cert_resolver,
                                 )
                                 .await;
-                                // Re-apply the per-process resolver
-                                // hooks (OTel exporter, GeoIP / ASN
+                                // Re-apply the full per-process reload
+                                // state (OTel exporter, GeoIP / ASN
                                 // updater task lifecycle, bot HMAC
-                                // secret) so the legacy fallback path
-                                // converges with the two-phase RPC
-                                // commit handler. Audit M-18 closure :
-                                // before this, falling back to the
-                                // legacy ConfigReload (e.g. when
-                                // two-phase Prepare timed out) left
-                                // GeoIP / OTel / ASN / bot-secret
-                                // state frozen even though the proxy
-                                // config swap completed.
-                                lorica::reload::apply_per_process_resolver_hooks(
+                                // secret, AND the merged AI-crawler
+                                // registry rebuild) so the legacy
+                                // fallback path converges with the
+                                // two-phase RPC commit handler. Audit
+                                // M-18 closure : before this, falling
+                                // back to the legacy ConfigReload (e.g.
+                                // when two-phase Prepare timed out) left
+                                // GeoIP / OTel / ASN / bot-secret AND
+                                // the AI-crawler registry frozen even
+                                // though the proxy config swap completed.
+                                lorica::reload::apply_per_process_reload_state(
                                     &cmd_store,
                                 )
                                 .await;
@@ -375,76 +327,29 @@ pub(crate) fn run_worker(
                         std::process::exit(0);
                     }
                     CommandType::MetricsRequest => {
-                        use lorica_command::{BanReportEntry, EwmaReportEntry, MetricsReport};
-
-                        // Collect ban list entries (skip expired)
-                        let ban_entries: Vec<BanReportEntry> = cmd_ban_list
-                            .iter()
-                            .filter_map(|entry| {
-                                let (ip, (banned_at, duration_s)) = (entry.key(), entry.value());
-                                let elapsed = banned_at.elapsed().as_secs();
-                                if elapsed >= *duration_s {
-                                    return None; // expired
-                                }
-                                Some(BanReportEntry {
-                                    ip: ip.clone(),
-                                    remaining_seconds: duration_s - elapsed,
-                                    ban_duration_seconds: *duration_s,
-                                })
-                            })
-                            .collect();
-
-                        // Collect EWMA scores
-                        let ewma_entries: Vec<EwmaReportEntry> = cmd_ewma
-                            .iter()
-                            .map(|entry| EwmaReportEntry {
-                                backend_address: entry.key().clone(),
-                                score_us: *entry.value(),
-                            })
-                            .collect();
-
-                        let mut report = MetricsReport::new(
-                            id,
-                            0, // total_requests not tracked yet
-                            cmd_active_conns.load(std::sync::atomic::Ordering::Relaxed),
-                        );
-                        report.cache_hits =
-                            cmd_cache_hits.load(std::sync::atomic::Ordering::Relaxed);
-                        report.cache_misses =
-                            cmd_cache_misses.load(std::sync::atomic::Ordering::Relaxed);
-                        report.ban_entries = ban_entries;
-                        report.ewma_entries = ewma_entries;
-                        report.backend_conn_entries = cmd_backend_conns
-                            .snapshot()
-                            .into_iter()
-                            .map(|(addr, conns)| lorica_command::BackendConnEntry {
-                                backend_address: addr,
-                                connections: conns,
-                            })
-                            .collect();
-                        report.request_entries = cmd_request_counts
-                            .iter()
-                            .map(|entry| {
-                                let ((route_id, status_code), counter) =
-                                    (entry.key(), entry.value());
-                                lorica_command::RequestCountEntry {
-                                    route_id: route_id.clone(),
-                                    status_code: *status_code as u32,
-                                    count: counter.load(std::sync::atomic::Ordering::Relaxed),
-                                }
-                            })
-                            .collect();
-                        report.waf_entries = cmd_waf_counts
-                            .iter()
-                            .map(|entry| {
-                                let ((category, action), counter) = (entry.key(), entry.value());
-                                lorica_command::WafCountEntry {
-                                    category: category.clone(),
-                                    action: action.clone(),
-                                    count: counter.load(std::sync::atomic::Ordering::Relaxed),
-                                }
-                            })
-                            .collect();
+                        // Build the snapshot through the SAME shared builder
+                        // the pipelined-RPC handler uses, so this legacy
+                        // channel report also carries `generic_counters`
+                        // (bot_challenge, geoip_block, ai_bot,
+                        // cert_resolver_reload, ocsp_refresh, ...). This arm
+                        // used to build its own report and omit them, which
+                        // silently zeroed every per-worker generic counter
+                        // whenever the supervisor pulled metrics over the
+                        // legacy channel (which it still does, as the
+                        // periodic-pull populator behind the RPC pull-on-
+                        // scrape path).
+                        let metrics_ctx =
+                            lorica::proxy_wiring::worker_rpc::WorkerMetricsCtx::new(
+                                Arc::clone(&cmd_ban_list),
+                                Arc::clone(&cmd_ewma),
+                                Arc::clone(&cmd_backend_conns),
+                                Arc::clone(&cmd_request_counts),
+                                Arc::clone(&cmd_waf_counts),
+                                Arc::clone(&cmd_cache_hits),
+                                Arc::clone(&cmd_cache_misses),
+                                Arc::clone(&cmd_active_conns),
+                            );
+                        let report = metrics_ctx.build_report(id);
 
                         if let Err(e) = channel.send(&report).await {
                             warn!(error = %e, "failed to send metrics report");
@@ -457,8 +362,21 @@ pub(crate) fn run_worker(
                     CommandType::BanIp => {
                         let ip = cmd.ban_ip.clone();
                         let duration_s = cmd.ban_duration_s;
+                        // The supervisor only broadcasts WAF critical-rule
+                        // auto-bans today; an unrecognized wire value
+                        // (e.g. a future reason from a newer supervisor)
+                        // falls back to that rather than mislabeling.
+                        let reason = lorica_api::ban::BanReason::from_i32(cmd.ban_reason)
+                            .unwrap_or(lorica_api::ban::BanReason::WafCriticalRule);
                         if !ip.is_empty() {
-                            cmd_ban_list.insert(ip.clone(), (Instant::now(), duration_s));
+                            cmd_ban_list.insert(
+                                ip.clone(),
+                                lorica_api::ban::BanRecord {
+                                    banned_at: Instant::now(),
+                                    duration_s,
+                                    reason,
+                                },
+                            );
                             info!(
                                 worker_id = id,
                                 ip = %ip,
@@ -718,6 +636,11 @@ pub(crate) fn run_worker(
         Duration::from_secs(5 * 60),
     );
     let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&worker_auth_prune_tracker);
+    // Background OCSP-staple refresh (Story 8.5). Each worker owns its
+    // own resolver, so each runs its own loop; the fetches are
+    // idempotent. Reload swaps cert bodies with no staple; this loop
+    // attaches OCSP responses out of band, nudged after each reload.
+    crate::startup::spawn_ocsp_refresh_loop(Arc::clone(&cert_resolver), Arc::clone(&store));
     // Spawn the cross-worker sync task when the supervisor provided
     // an RPC socketpair (production worker mode). The task drains
     // `LocalBucket::take_delta` every 100 ms, pushes the batch via
@@ -882,4 +805,86 @@ pub(crate) fn run_worker(
     info!(worker_id = id, "proxy engine drained; flushing OTel spans");
     lorica::otel::shutdown();
     std::process::exit(0);
+}
+
+/// Load persisted certificates into the worker's SNI resolver at boot.
+/// Mirrors single-process cert loading; OCSP staples are attached later
+/// by the reload path, so each `CertData` starts with `ocsp_response: None`.
+async fn worker_load_certs_into_resolver(
+    store: &Arc<Mutex<ConfigStore>>,
+    cert_resolver: &Arc<lorica_tls::cert_resolver::CertResolver>,
+    id: u32,
+) {
+    let db_certs = store.lock().await;
+    let certs = db_certs.list_certificates().unwrap_or_default();
+    if certs.is_empty() {
+        return;
+    }
+    let cert_data: Vec<lorica_tls::cert_resolver::CertData> = certs
+        .iter()
+        .map(|c| lorica_tls::cert_resolver::CertData {
+            domain: c.domain.clone(),
+            san_domains: c.san_domains.clone(),
+            cert_pem: c.cert_pem.clone(),
+            key_pem: c.key_pem.clone(),
+            not_after_epoch: c.not_after.timestamp(),
+            ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
+        })
+        .collect();
+    match cert_resolver.reload(cert_data) {
+        Ok(stats) => {
+            if stats.skipped > 0 {
+                lorica_api::metrics::inc_certificates_invalid_bundle_by(
+                    "reload",
+                    stats.skipped as u64,
+                );
+            }
+            info!(
+                worker_id = id,
+                domains = cert_resolver.domain_count(),
+                skipped = stats.skipped,
+                total = stats.total,
+                "worker loaded TLS certificates"
+            );
+        }
+        Err(e) => warn!(error = %e, "worker failed to load certificates into resolver"),
+    }
+}
+
+/// Restore WAF runtime state for a worker from persisted settings: the IP
+/// blocklist enable flag (workers inherit the flag only; single-process /
+/// supervisor owns the Data-Shield fetch), the disabled-rule set, and any
+/// custom rules. Synchronous - called outside a runtime, so it takes the
+/// store's blocking lock.
+fn worker_restore_waf_state(store: &Arc<Mutex<ConfigStore>>, waf_engine: &Arc<lorica_waf::WafEngine>) {
+    let s = store.blocking_lock();
+    if let Ok(settings) = s.get_global_settings() {
+        if settings.ip_blocklist_enabled {
+            waf_engine.ip_blocklist().set_enabled(true);
+            info!("worker: IP blocklist restored as enabled");
+        }
+    }
+    if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
+        if !disabled_ids.is_empty() {
+            waf_engine.set_disabled_rules(&disabled_ids);
+            info!(
+                count = disabled_ids.len(),
+                "worker: WAF disabled rules restored"
+            );
+        }
+    }
+    if let Ok(custom_rules) = s.load_waf_custom_rules() {
+        for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
+            let category = cat
+                .parse()
+                .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
+            let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
+        }
+        if !custom_rules.is_empty() {
+            info!(
+                count = custom_rules.len(),
+                "worker: WAF custom rules restored"
+            );
+        }
+    }
 }
