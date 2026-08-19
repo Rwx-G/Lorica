@@ -627,20 +627,31 @@ if [ -n "$SESSION" ]; then
 # =============================================================================
     log "=== 14. Health Checks ==="
 
-    # Wait for health check cycle
-    sleep 12
+    # A flip to "healthy" needs several consecutive successful probes at the
+    # default interval, so the wait runs into tens of seconds and shifts with
+    # machine speed. The old fixed `sleep 12` raced the probe cadence and
+    # flaked on CI ("got unknown"); poll instead, breaking out as soon as the
+    # status lands.
+    wait_backend_health() {
+        local id="$1" want="$2" out="unknown" i
+        for i in $(seq 1 30); do
+            out=$(api_get "/api/v1/backends/$id" | jq -r '.data.health_status' 2>/dev/null || echo "unknown")
+            if [ "$out" = "$want" ]; then
+                break
+            fi
+            sleep 3
+        done
+        echo "$out"
+    }
 
-    # Check backend health status
-    B1_STATUS=$(api_get "/api/v1/backends/$B1_ID")
-    B1_HEALTH=$(echo "$B1_STATUS" | jq -r '.data.health_status' 2>/dev/null || echo "unknown")
+    B1_HEALTH=$(wait_backend_health "$B1_ID" healthy)
     if [ "$B1_HEALTH" = "healthy" ]; then
         ok "Backend 1 is healthy"
     else
         fail "Backend 1 should be healthy (got $B1_HEALTH)"
     fi
 
-    B2_STATUS=$(api_get "/api/v1/backends/$B2_ID")
-    B2_HEALTH=$(echo "$B2_STATUS" | jq -r '.data.health_status' 2>/dev/null || echo "unknown")
+    B2_HEALTH=$(wait_backend_health "$B2_ID" healthy)
     if [ "$B2_HEALTH" = "healthy" ]; then
         ok "Backend 2 is healthy"
     else
