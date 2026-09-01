@@ -383,9 +383,13 @@ mod imp {
     /// the supervisor drain hook before the 10 s worker drain so
     /// in-flight spans reach the collector. Idempotent: calling
     /// `shutdown()` on an already-shut-down provider is a no-op.
-    /// Also tears down the logs provider (Story 9.8) so both signals
-    /// flush on the same exit hook.
+    /// Also drains the log-export sink hub and tears down the logs
+    /// provider (Story 9.8) so both signals flush on the same exit
+    /// hook - without the drain, a restart or hot binary upgrade
+    /// silently discarded up to a queue's worth of exported events
+    /// (QA finding).
     pub fn shutdown() {
+        lorica_api::log_sinks::shutdown_and_drain(std::time::Duration::from_secs(3));
         shutdown_logs();
         // Poisoned mutex during shutdown is non-fatal; we're tearing
         // down anyway and the OS will reclaim everything on exit.
@@ -411,6 +415,11 @@ mod imp {
 
     /// Handle to the installed logs provider, mirroring [`PROVIDER`].
     static LOGS_PROVIDER: Lazy<Mutex<Option<SdkLoggerProvider>>> = Lazy::new(|| Mutex::new(None));
+
+    /// Latest OTLP logs consumer thread, joined by [`shutdown_logs`]
+    /// so queued events reach the provider before its final flush.
+    static LOGS_CONSUMER: Lazy<Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Lazy::new(|| Mutex::new(None));
 
     /// Install the OTLP logs exporter and spawn the consumer that
     /// drains the sink hub's otlp lane (Story 9.8). The consumer is a
@@ -506,11 +515,19 @@ mod imp {
                     emit_sink_event(&logger, &event);
                 }
             });
-        if let Err(e) = spawned {
-            let _ = provider.shutdown();
-            return Err(format!("failed to spawn OTLP logs consumer thread: {e}"));
-        }
+        let handle = match spawned {
+            Ok(handle) => handle,
+            Err(e) => {
+                let _ = provider.shutdown();
+                return Err(format!("failed to spawn OTLP logs consumer thread: {e}"));
+            }
+        };
 
+        if let Ok(mut consumer) = LOGS_CONSUMER.lock() {
+            // The previous consumer exits on its own once its lane's
+            // sender is dropped by the hub reinstall; detach it.
+            *consumer = Some(handle);
+        }
         let mut slot = LOGS_PROVIDER
             .lock()
             .map_err(|e| format!("otel logs mutex poisoned: {e}"))?;
@@ -521,9 +538,24 @@ mod imp {
         Ok(())
     }
 
-    /// Flush and drop the logs provider. Idempotent; called on the
-    /// settings-disable transition and from [`shutdown`].
+    /// Join the consumer (bounded) so queued events are emitted, then
+    /// flush and drop the logs provider. Idempotent; called on the
+    /// settings-disable transition and from [`shutdown`]. The caller
+    /// (reload or the exit hook) has already replaced or torn down the
+    /// hub, so the consumer's lane sender is gone and it exits after
+    /// draining.
     pub fn shutdown_logs() {
+        if let Ok(mut consumer) = LOGS_CONSUMER.lock() {
+            if let Some(handle) = consumer.take() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while !handle.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                if handle.is_finished() {
+                    let _ = handle.join();
+                }
+            }
+        }
         let Ok(mut slot) = LOGS_PROVIDER.lock() else {
             return;
         };
@@ -549,8 +581,9 @@ mod imp {
             record.set_timestamp(std::time::SystemTime::from(ts));
         }
         record.set_observed_timestamp(std::time::SystemTime::now());
-        let body = serde_json::to_string(&event.payload).unwrap_or_else(|_| "{}".to_string());
-        record.set_body(AnyValue::from(body));
+        // Shared versioned body (`v` + `kind` keys) so the OTLP and
+        // syslog wire formats cannot drift.
+        record.set_body(AnyValue::from(lorica_api::log_sinks::body_json(event)));
         record.add_attribute("lorica.kind", kind.as_str());
         if let (Some(trace_id), Some(span_id)) = (&event.trace_id, &event.span_id) {
             if let (Ok(tid), Ok(sid)) = (
@@ -574,7 +607,11 @@ mod imp {
         Ok(())
     }
 
-    pub fn shutdown() {}
+    /// Even without the `otel` feature, the exit hook must drain the
+    /// log-export sink hub (the syslog sink is feature-independent).
+    pub fn shutdown() {
+        lorica_api::log_sinks::shutdown_and_drain(std::time::Duration::from_secs(3));
+    }
 
     /// No-op stub. The reload path never requests an OTLP logs lane
     /// when the `otel` feature is off (`LogSinksConfig::from_settings`

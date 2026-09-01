@@ -105,6 +105,13 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
   Both sinks hot-reload on save (no restart) and each has a per-sink test
   button reporting success, failure reason and round-trip time.
+
+  Capacity note: sinks are per-process by design (mode-independent, no
+  cross-process queue). Under `--workers auto` an N-core node holds N
+  worker connections plus one supervisor connection to the same
+  collector, each with its own bounded queue - size collector
+  connection limits for `cores`, not `1`, per node. Ordering across
+  processes is the collector's concern.
   </details>
 
 ### :globe_with_meridians: Management

@@ -18,7 +18,7 @@
 use std::path::Path;
 
 use base64::Engine;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::crypto::EncryptionKey;
@@ -689,6 +689,32 @@ impl ConfigStore {
                 params![re_encoded, id],
             )?;
             count += 1;
+        }
+
+        // Re-encrypt the encrypted global-settings values (Story 9.8:
+        // the syslog mTLS client key and the OTLP logs Authorization
+        // header get the same at-rest treatment as their notification
+        // and certificate peers). Story 9.1 converts this hardcoded
+        // enumeration into a table-driven one with a coverage test so
+        // a future encrypted column cannot be silently skipped.
+        for key in ["syslog_tls_client_key_pem", "otlp_logs_auth_header"] {
+            let stored: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM global_settings WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(stored) = stored.filter(|s| !s.is_empty()) {
+                let plaintext = self.decrypt_config(&stored)?;
+                let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
+                let re_encoded = base64::engine::general_purpose::STANDARD.encode(&re_encrypted);
+                tx.execute(
+                    "UPDATE global_settings SET value = ?1 WHERE key = ?2",
+                    params![re_encoded, key],
+                )?;
+                count += 1;
+            }
         }
 
         tx.commit()

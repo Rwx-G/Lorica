@@ -753,13 +753,16 @@ pub fn build_router(
             "/api/v1/settings/schema",
             get(crate::settings::get_settings_schema),
         )
+        // Rate-limited since Story 9.8 QA flagged the asymmetry with
+        // the sink test endpoints below: all three probes open an
+        // outbound connection to an operator-configured target.
         .route(
             "/api/v1/settings/otel/test",
-            post(crate::settings::test_otel_connection),
+            post(crate::settings::test_otel_connection)
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
         )
-        // Story 9.8 AC #6. Rate-limited (unlike the otel probe) because
-        // the syslog test emits a real message towards an
-        // operator-configured network target.
+        // Story 9.8 AC #6. The syslog test emits a real message
+        // towards an operator-configured network target.
         .route(
             "/api/v1/settings/syslog/test",
             post(crate::settings::test_syslog_connection)

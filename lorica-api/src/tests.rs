@@ -2363,6 +2363,66 @@ async fn test_get_settings_scrubs_bot_hmac_secret_hex_when_set() {
 }
 
 #[tokio::test]
+async fn test_put_settings_response_masks_every_secret() {
+    // Story 9.8 QA (CWE-200): the PUT /api/v1/settings response used
+    // to return the merged row unmasked, handing back the raw bot
+    // HMAC secret, scrape token, syslog mTLS client key and OTLP auth
+    // header on every save. The response must mask all four exactly
+    // like GET does, and none of the raw bytes may appear anywhere in
+    // the body.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let secret_hex = "b".repeat(64);
+    let scrape_token = "scrape-token-secret-42".to_string();
+    let syslog_key = "-----BEGIN PRIVATE KEY-----\nsyslogsinkkey".to_string();
+    let otlp_auth = "Bearer otlp-sink-token-42".to_string();
+    {
+        let s = state.store.lock().await;
+        let mut cur = s.get_global_settings().expect("test setup");
+        cur.bot_hmac_secret_hex = secret_hex.clone();
+        cur.prometheus_scrape_token = Some(scrape_token.clone());
+        cur.syslog_tls_client_key_pem = Some(syslog_key.clone());
+        cur.otlp_logs_auth_header = Some(otlp_auth.clone());
+        s.update_global_settings(&cur).expect("test setup");
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    // A minimal no-op PATCH: every field absent, so nothing changes
+    // and the handler returns the (masked) merged row.
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Cookie", &cookie)
+        .header("Content-Type", "application/json")
+        .body(Body::from("{}"))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["bot_hmac_secret_hex"], "**REDACTED**");
+    assert_eq!(json["data"]["prometheus_scrape_token"], "**REDACTED**");
+    assert_eq!(json["data"]["syslog_tls_client_key_pem"], "**REDACTED**");
+    assert_eq!(json["data"]["otlp_logs_auth_header"], "**REDACTED**");
+    for raw in [
+        secret_hex.as_bytes(),
+        scrape_token.as_bytes(),
+        b"syslogsinkkey".as_slice(),
+        otlp_auth.as_bytes(),
+    ] {
+        assert!(
+            !body.windows(raw.len()).any(|w| w == raw),
+            "raw secret bytes must not appear anywhere in the PUT response body"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_get_settings_returns_empty_bot_hmac_when_not_initialised() {
     // v1.5.1 audit H-1 followup : when the bot HMAC secret has
     // never been generated (fresh store, or import of an export

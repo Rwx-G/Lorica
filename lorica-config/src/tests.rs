@@ -2648,6 +2648,33 @@ cert_critical_days = 3
     }
 
     #[test]
+    fn test_log_sink_secrets_participate_in_key_rotation() {
+        // Story 9.8 QA: the syslog mTLS client key and the OTLP logs
+        // auth header are encrypted at rest and must be re-encrypted
+        // by a key rotation like their notification / certificate
+        // peers. The count doubles as coverage proof: with only the
+        // two sink secrets set, rotation must touch exactly two rows.
+        use crate::crypto::EncryptionKey;
+
+        let key1 = EncryptionKey::generate().expect("test setup: key generates");
+        let key2 = EncryptionKey::generate().expect("test setup: key generates");
+        let store = ConfigStore::open_in_memory_with_key(key1)
+            .expect("test setup: in-memory store opens with key");
+
+        let mut s = store.get_global_settings().expect("test setup");
+        s.syslog_tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----\nsink".to_string());
+        s.otlp_logs_auth_header = Some("Bearer sink-token".to_string());
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let count = store
+            .rotate_encryption_key(&key2)
+            .expect("test setup: rotation succeeds");
+        assert_eq!(count, 2, "both sink secrets must be re-encrypted");
+    }
+
+    #[test]
     fn test_sticky_session_persistence() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();

@@ -295,8 +295,17 @@ impl ConfigStore {
                         if value.is_empty() { None } else { Some(value) };
                 }
                 "syslog_tls_client_key_pem" => {
-                    settings.syslog_tls_client_key_pem =
-                        if value.is_empty() { None } else { Some(value) };
+                    // Stored encrypted (Story 9.8 QA: a TLS client
+                    // private key is the same class of material as a
+                    // certificate key_pem and gets the same at-rest
+                    // treatment). A decrypt failure falls back to the
+                    // raw value: rows written before the encryption
+                    // landed (same release cycle) are plaintext.
+                    settings.syslog_tls_client_key_pem = if value.is_empty() {
+                        None
+                    } else {
+                        Some(self.decrypt_config(&value).unwrap_or(value))
+                    };
                 }
                 "syslog_extra_sd" => {
                     settings.syslog_extra_sd = if value.is_empty() { None } else { Some(value) };
@@ -305,8 +314,12 @@ impl ConfigStore {
                     settings.otlp_logs_enabled = value == "true" || value == "1";
                 }
                 "otlp_logs_auth_header" => {
-                    settings.otlp_logs_auth_header =
-                        if value.is_empty() { None } else { Some(value) };
+                    // Encrypted at rest like the syslog client key.
+                    settings.otlp_logs_auth_header = if value.is_empty() {
+                        None
+                    } else {
+                        Some(self.decrypt_config(&value).unwrap_or(value))
+                    };
                 }
                 _ => {}
             }
@@ -623,9 +636,16 @@ impl ConfigStore {
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_tls_client_cert_pem', ?1)",
             params![settings.syslog_tls_client_cert_pem.as_deref().unwrap_or("")],
         )?;
+        // The two sink secrets are encrypted at rest (Story 9.8 QA),
+        // matching the treatment of notification configs and
+        // certificate keys; every other settings value stays plain.
+        let syslog_key_stored = match settings.syslog_tls_client_key_pem.as_deref() {
+            Some(v) => self.encrypt_config(v)?,
+            None => String::new(),
+        };
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_tls_client_key_pem', ?1)",
-            params![settings.syslog_tls_client_key_pem.as_deref().unwrap_or("")],
+            params![syslog_key_stored],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_extra_sd', ?1)",
@@ -635,9 +655,13 @@ impl ConfigStore {
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_enabled', ?1)",
             params![settings.otlp_logs_enabled.to_string()],
         )?;
+        let otlp_auth_stored = match settings.otlp_logs_auth_header.as_deref() {
+            Some(v) => self.encrypt_config(v)?,
+            None => String::new(),
+        };
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_auth_header', ?1)",
-            params![settings.otlp_logs_auth_header.as_deref().unwrap_or("")],
+            params![otlp_auth_stored],
         )?;
         Ok(())
     }

@@ -583,6 +583,14 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     // aggregation the supervisor's /metrics never sees them.
     "lorica_cert_resolver_reload_total",
     "lorica_ocsp_refresh_total",
+    // Log-export sink counters (Story 9.8). Access-log and WAF events
+    // publish from the worker processes, so without aggregation the
+    // supervisor's /metrics would read ~0 for drops/sends in the
+    // default packaged deployment (--workers auto) - exactly the
+    // blind spot AC #4's drop counter exists to close.
+    "lorica_log_sink_dropped_total",
+    "lorica_log_sink_sent_total",
+    "lorica_log_sink_truncated_total",
 ];
 
 /// Re-export of the worker -> supervisor wire tuple. The lorica
@@ -652,6 +660,16 @@ fn resolve_per_worker_counter(
         )),
         "lorica_ocsp_refresh_total" => {
             Some((&["result"], CounterTarget::Vec(&OCSP_REFRESH_TOTAL)))
+        }
+        "lorica_log_sink_dropped_total" => Some((
+            &["sink", "kind"],
+            CounterTarget::Vec(&LOG_SINK_DROPPED_TOTAL),
+        )),
+        "lorica_log_sink_sent_total" => {
+            Some((&["sink", "kind"], CounterTarget::Vec(&LOG_SINK_SENT_TOTAL)))
+        }
+        "lorica_log_sink_truncated_total" => {
+            Some((&["sink"], CounterTarget::Vec(&LOG_SINK_TRUNCATED_TOTAL)))
         }
         _ => None,
     }
@@ -745,6 +763,41 @@ static LOG_SINK_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// `"otlp"`) and `kind` (`"access"` / `"waf"` / `"audit"`).
 pub fn inc_log_sink_dropped(sink: &str, kind: &str) {
     LOG_SINK_DROPPED_TOTAL.with_label_values(&[sink, kind]).inc();
+}
+
+/// Counter: events successfully handed to a log-export sink's
+/// transport (written to the socket for syslog, emitted into the
+/// batch exporter for OTLP). Paired with the drop counter so an
+/// operator can tell "sink healthy, low traffic" apart from "sink
+/// dead" (QA finding, Story 9.8).
+static LOG_SINK_SENT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "log_sink_sent_total",
+        "Events successfully handed to a log-export sink's transport (sink=syslog|otlp, kind=access|waf|audit)",
+        &["sink", "kind"],
+    )
+});
+
+/// Bump the sent-sink-event counter.
+pub fn inc_log_sink_sent(sink: &str, kind: &str) {
+    LOG_SINK_SENT_TOTAL.with_label_values(&[sink, kind]).inc();
+}
+
+/// Counter: syslog messages whose JSON body was truncated to the
+/// per-transport size ceiling before sending (QA finding, Story 9.8:
+/// an unbounded message lets a client evict its own records via UDP
+/// EMSGSIZE or desync a size-capped collector).
+static LOG_SINK_TRUNCATED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "log_sink_truncated_total",
+        "Log-export sink messages truncated to the transport size ceiling (sink=syslog)",
+        &["sink"],
+    )
+});
+
+/// Bump the truncated-sink-message counter.
+pub fn inc_log_sink_truncated(sink: &str) {
+    LOG_SINK_TRUNCATED_TOTAL.with_label_values(&[sink]).inc();
 }
 
 /// Counter: log-stream WebSocket entries dropped because a

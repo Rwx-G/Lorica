@@ -46,6 +46,19 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// a documentation-reserved number avoids squatting a real vendor id.
 const SD_ID: &str = "lorica@32473";
 
+/// JSON body ceiling for UDP messages. RFC 5426 recommends staying
+/// within the path MTU; a 1536-byte body plus header/SD stays well
+/// under a 2 KB datagram and can never hit EMSGSIZE (QA finding: an
+/// unbounded body let a client evict its own WAF records from the
+/// SIEM lane by padding the matched region until the datagram failed).
+const BODY_MAX_UDP: usize = 1536;
+
+/// JSON body ceiling for stream transports. Collectors commonly cap
+/// at 8 KB (rsyslog `maxMessageSize` default); staying under it keeps
+/// a size-capped collector from splitting the overflow into a bogus
+/// second record.
+const BODY_MAX_STREAM: usize = 7168;
+
 /// Split a `host:port` endpoint, accepting `[v6]:port` bracket
 /// notation. Returns `None` when the port is missing or not a u16.
 pub fn split_host_port(endpoint: &str) -> Option<(String, u16)> {
@@ -65,13 +78,18 @@ pub fn split_host_port(endpoint: &str) -> Option<(String, u16)> {
 /// Spawn the syslog consumer: a plain OS thread owning a
 /// current-thread tokio runtime (Story 9.8 AC #5). The thread exits
 /// when the producer side of `rx` is dropped (hub replaced or process
-/// teardown) and the queue is drained.
+/// teardown) and the queue is drained. Returns `None` when the thread
+/// could not be spawned - the caller then installs no lane, so events
+/// are never offered to a sink with no consumer behind it. A terminal
+/// failure inside the thread (runtime build, invalid TLS material)
+/// removes lane `id` from the hub for the same reason.
 pub(super) fn spawn_syslog_sink(
+    id: u64,
     rx: Receiver<SinkEvent>,
     config: SyslogSinkConfig,
     node_id: String,
     node_name: String,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     let spawned = std::thread::Builder::new()
         .name("lorica-syslog-sink".into())
         .spawn(move || {
@@ -79,17 +97,21 @@ pub(super) fn spawn_syslog_sink(
                 .enable_all()
                 .build();
             match runtime {
-                Ok(rt) => rt.block_on(consumer_loop(rx, config, node_id, node_name)),
+                Ok(rt) => rt.block_on(consumer_loop(id, rx, config, node_id, node_name)),
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to build syslog sink runtime; sink disabled");
+                    super::remove_syslog_lane(id);
                 }
             }
         });
-    if let Err(e) = spawned {
-        // Same policy as spawn_log_writer: thread creation only fails
-        // on resource exhaustion; every enqueue then counts as a drop
-        // once the queue fills.
-        tracing::warn!(error = %e, "failed to spawn syslog sink thread; sink disabled");
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            // Thread creation only fails on resource exhaustion. No
+            // lane is installed in this case.
+            tracing::warn!(error = %e, "failed to spawn syslog sink thread; sink disabled");
+            None
+        }
     }
 }
 
@@ -101,6 +123,7 @@ enum Conn {
 }
 
 async fn consumer_loop(
+    id: u64,
     mut rx: Receiver<SinkEvent>,
     config: SyslogSinkConfig,
     node_id: String,
@@ -114,7 +137,10 @@ async fn consumer_loop(
     let tls = match build_tls_connector(&config) {
         Ok(tls) => tls,
         Err(e) => {
+            // Terminal: the lane must not survive its consumer, or
+            // every event becomes a counted drop forever.
             tracing::warn!(error = %e, "invalid syslog TLS configuration; sink disabled");
+            super::remove_syslog_lane(id);
             return;
         }
     };
@@ -124,8 +150,10 @@ async fn consumer_loop(
 
     while let Some(event) = rx.recv().await {
         let kind = event.kind();
-        let message = encode_rfc5424(&event, &config, &hostname, &node_id, &node_name);
 
+        // Backoff / connect decisions come BEFORE encoding, so a dead
+        // collector does not burn CPU serialising events that are
+        // about to be dropped anyway (QA finding).
         if conn.is_none() {
             if Instant::now() < next_attempt {
                 crate::metrics::inc_log_sink_dropped("syslog", kind.as_str());
@@ -150,6 +178,7 @@ async fn consumer_loop(
             }
         }
 
+        let message = encode_rfc5424(&event, &config, &hostname, &node_id, &node_name);
         let send_failed = match conn.as_mut() {
             Some(c) => send_message(c, &message).await.is_err(),
             None => true,
@@ -163,6 +192,8 @@ async fn consumer_loop(
                 next_attempt = Instant::now() + backoff;
                 backoff = (backoff * 2).min(BACKOFF_MAX);
             }
+        } else {
+            crate::metrics::inc_log_sink_sent("syslog", kind.as_str());
         }
     }
 }
@@ -258,7 +289,12 @@ fn build_tls_connector(config: &SyslogSinkConfig) -> Result<Option<TlsConnector>
         Some(ca_pem) => {
             let mut added = 0usize;
             for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
-                let cert = cert.map_err(|e| format!("invalid CA PEM: {e:?}"))?;
+                // PEM parse errors are mapped to fixed strings: some
+                // rustls-pki-types error variants embed the offending
+                // input, which for the key path would put private-key
+                // bytes into an HTTP body and the journal (QA finding).
+                let cert =
+                    cert.map_err(|_| "invalid CA PEM (unparseable certificate)".to_string())?;
                 roots
                     .add(cert)
                     .map_err(|e| format!("CA certificate rejected: {e}"))?;
@@ -279,9 +315,11 @@ fn build_tls_connector(config: &SyslogSinkConfig) -> Result<Option<TlsConnector>
             let certs: Vec<CertificateDer<'static>> =
                 CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                     .collect::<Result<_, _>>()
-                    .map_err(|e| format!("invalid client certificate PEM: {e:?}"))?;
+                    .map_err(|_| {
+                        "invalid client certificate PEM (unparseable certificate)".to_string()
+                    })?;
             let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
-                .map_err(|e| format!("invalid client key PEM: {e:?}"))?;
+                .map_err(|_| "invalid client key PEM (unparseable private key)".to_string())?;
             builder
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| format!("client certificate rejected: {e}"))?
@@ -296,7 +334,18 @@ fn build_tls_connector(config: &SyslogSinkConfig) -> Result<Option<TlsConnector>
     Ok(Some(TlsConnector::from(Arc::new(client_config))))
 }
 
-/// Encode one event as an RFC 5424 message (no framing).
+/// Validate the TLS material of a syslog configuration by building
+/// the exact connector the sink will use, so a bad PEM is a 400 at
+/// `PUT /settings` instead of a permanently dead sink discovered one
+/// warn-line later (QA finding). A no-TLS transport always validates.
+pub(crate) fn validate_tls_config(config: &SyslogSinkConfig) -> Result<(), String> {
+    build_tls_connector(config).map(|_| ())
+}
+
+/// Encode one event as an RFC 5424 message (no framing). The JSON
+/// body is capped per transport (see [`BODY_MAX_UDP`] /
+/// [`BODY_MAX_STREAM`]); a truncated body carries a `truncated="1"`
+/// SD param and bumps `lorica_log_sink_truncated_total{sink}`.
 fn encode_rfc5424(
     event: &SinkEvent,
     config: &SyslogSinkConfig,
@@ -315,6 +364,16 @@ fn encode_rfc5424(
     let procid = std::process::id();
     let msgid = kind.as_str();
 
+    let body_max = match config.transport {
+        SyslogTransport::Udp => BODY_MAX_UDP,
+        SyslogTransport::Tcp | SyslogTransport::TcpTls => BODY_MAX_STREAM,
+    };
+    let mut body = super::body_json(event);
+    let truncated = truncate_utf8(&mut body, body_max);
+    if truncated {
+        crate::metrics::inc_log_sink_truncated("syslog");
+    }
+
     let mut sd = String::with_capacity(128);
     sd.push('[');
     sd.push_str(SD_ID);
@@ -331,18 +390,39 @@ fn encode_rfc5424(
     if let Some(span_id) = &event.span_id {
         push_sd_param(&mut sd, "span_id", span_id);
     }
+    if truncated {
+        push_sd_param(&mut sd, "truncated", "1");
+    }
     for (key, value) in &config.extra_sd {
         push_sd_param(&mut sd, key, value);
     }
     sd.push(']');
 
-    let body = serde_json::to_string(&event.payload).unwrap_or_else(|_| "{}".to_string());
     format!("<{pri}>1 {timestamp} {hostname} lorica {procid} {msgid} {sd} {body}")
 }
 
+/// Truncate `s` to at most `max` bytes on a char boundary, appending
+/// a marker when anything was cut. Returns whether truncation
+/// happened. The result is intentionally no longer valid JSON - the
+/// marker makes the cut explicit rather than pretending otherwise.
+fn truncate_utf8(s: &mut String, max: usize) -> bool {
+    if s.len() <= max {
+        return false;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s.push_str("...(truncated)");
+    true
+}
+
 /// Push one `key="value"` structured-data parameter, escaping the
-/// value per RFC 5424 §6.3.3 and sanitizing the name (printable
-/// US-ASCII without `= ] "` or spaces).
+/// value per RFC 5424 §6.3.3, replacing control characters with `_`
+/// (QA finding: an LF in a value would split the message on
+/// LF-framed collectors), and sanitizing the name (printable
+/// US-ASCII without `=`, `]`, `"` or spaces).
 fn push_sd_param(sd: &mut String, name: &str, value: &str) {
     sd.push(' ');
     for c in name.chars() {
@@ -356,6 +436,7 @@ fn push_sd_param(sd: &mut String, name: &str, value: &str) {
             '\\' => sd.push_str("\\\\"),
             '"' => sd.push_str("\\\""),
             ']' => sd.push_str("\\]"),
+            other if other.is_control() => sd.push('_'),
             other => sd.push(other),
         }
     }
@@ -534,6 +615,54 @@ mod tests {
         config.extra_sd = vec![("k".to_string(), "a\"b\\c]d".to_string())];
         let msg = encode_rfc5424(&audit_event(), &config, "edge01", "", "");
         assert!(msg.contains(r#"k="a\"b\\c\]d""#));
+    }
+
+    #[test]
+    fn encode_replaces_control_chars_in_sd_values() {
+        // An LF in an SD value would split the message on LF-framed
+        // collectors, forging a second record.
+        let mut config = test_config("host01:514", SyslogTransport::Udp);
+        config.extra_sd = vec![("k".to_string(), "a\nb\rc\u{1}d".to_string())];
+        let msg = encode_rfc5424(&audit_event(), &config, "edge01", "", "");
+        assert!(msg.contains(r#"k="a_b_c_d""#));
+        assert!(!msg.contains('\n'));
+    }
+
+    #[test]
+    fn encode_truncates_oversized_bodies_per_transport() {
+        let mut event = audit_event();
+        if let SinkPayload::Audit(record) = &mut event.payload {
+            record.target_id = "x".repeat(4 * BODY_MAX_UDP);
+        }
+        let config = test_config("host01:514", SyslogTransport::Udp);
+        let msg = encode_rfc5424(&event, &config, "edge01", "", "");
+        assert!(msg.contains(r#"truncated="1""#));
+        assert!(msg.contains("...(truncated)"));
+        // Header + SD stay bounded, so the whole datagram fits well
+        // under the UDP payload limit.
+        assert!(msg.len() < BODY_MAX_UDP + 512, "message len {}", msg.len());
+
+        // The stream ceiling is larger: the same event fits untruncated
+        // under TCP only if below BODY_MAX_STREAM; make it larger to
+        // assert the stream cap too.
+        if let SinkPayload::Audit(record) = &mut event.payload {
+            record.target_id = "x".repeat(4 * BODY_MAX_STREAM);
+        }
+        let config = test_config("host01:514", SyslogTransport::Tcp);
+        let msg = encode_rfc5424(&event, &config, "edge01", "", "");
+        assert!(msg.contains(r#"truncated="1""#));
+        assert!(msg.len() < BODY_MAX_STREAM + 512);
+    }
+
+    #[test]
+    fn truncate_utf8_cuts_on_char_boundaries() {
+        let mut s = "é".repeat(100); // 200 bytes
+        assert!(truncate_utf8(&mut s, 101)); // 101 is mid-char
+        assert!(s.ends_with("...(truncated)"));
+        assert!(s.len() <= 100 + "...(truncated)".len());
+        let mut short = String::from("ok");
+        assert!(!truncate_utf8(&mut short, 100));
+        assert_eq!(short, "ok");
     }
 
     #[test]

@@ -344,14 +344,18 @@ pub async fn record(
     after: Option<&serde_json::Value>,
 ) {
     let (target_type, target_id) = target;
+    // One timestamp shared by the persisted row and the sink copy, so
+    // the SIEM-side and DB-side records agree exactly (QA finding:
+    // timestamp equality is the cheapest out-of-band join key).
+    let timestamp = chrono::Utc::now().to_rfc3339();
 
     let Some(log_store) = state.log_store.clone() else {
-        emit_audit_event(ctx, action, target_type, target_id, "");
+        emit_audit_event(ctx, action, target_type, target_id, "", &timestamp);
         return;
     };
 
     let entry = NewAuditEntry {
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: timestamp.clone(),
         operator_username: ctx.username.clone(),
         operator_role: ctx.role.clone(),
         action: action.to_string(),
@@ -366,17 +370,17 @@ pub async fn record(
     let result = tokio::task::spawn_blocking(move || log_store.insert_audit(&entry)).await;
     match result {
         Ok(Ok((_id, chain_hash))) => {
-            emit_audit_event(ctx, action, target_type, target_id, &chain_hash);
+            emit_audit_event(ctx, action, target_type, target_id, &chain_hash, &timestamp);
         }
         Ok(Err(e)) => {
             crate::metrics::inc_audit_insert_failed();
             tracing::error!(error = %e, "audit log insert failed");
-            emit_audit_event(ctx, action, target_type, target_id, "");
+            emit_audit_event(ctx, action, target_type, target_id, "", &timestamp);
         }
         Err(e) => {
             crate::metrics::inc_audit_insert_failed();
             tracing::error!(error = %e, "audit log insert task failed");
-            emit_audit_event(ctx, action, target_type, target_id, "");
+            emit_audit_event(ctx, action, target_type, target_id, "", &timestamp);
         }
     }
 }
@@ -392,6 +396,7 @@ fn emit_audit_event(
     target_type: &str,
     target_id: &str,
     chain_hash: &str,
+    timestamp: &str,
 ) {
     tracing::info!(
         target: "lorica::audit",
@@ -404,16 +409,21 @@ fn emit_audit_event(
         chain_hash = %chain_hash,
         "audit"
     );
-    crate::log_sinks::publish_audit(crate::log_sinks::AuditSinkRecord {
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        operator_username: ctx.username.clone(),
-        operator_role: ctx.role.clone(),
-        action: action.to_string(),
-        target_type: target_type.to_string(),
-        target_id: target_id.to_string(),
-        ip: ctx.ip.clone(),
-        chain_hash: chain_hash.to_string(),
-    });
+    // Gate before building the record so the seven allocations are
+    // only paid when an audit-interested sink is installed (QA
+    // finding; matches the publish_access / publish_waf pattern).
+    if crate::log_sinks::wants(crate::log_sinks::SinkKind::Audit) {
+        crate::log_sinks::publish_audit(crate::log_sinks::AuditSinkRecord {
+            timestamp: timestamp.to_string(),
+            operator_username: ctx.username.clone(),
+            operator_role: ctx.role.clone(),
+            action: action.to_string(),
+            target_type: target_type.to_string(),
+            target_id: target_id.to_string(),
+            ip: ctx.ip.clone(),
+            chain_hash: chain_hash.to_string(),
+        });
+    }
 }
 
 /// Query-string parameters of `GET /api/v1/audit`.

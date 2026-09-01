@@ -51,78 +51,56 @@
     extraSdError = validateExtraSd(settingsForm.syslog_extra_sd);
   }
 
-  // --- Test connection state (syslog sink) ---
-  let syslogTesting = $state(false);
-  let syslogTestMsg = $state('');
-  let syslogTestOk = $state(false);
+  // --- Test connection state: one state machine per sink, one
+  // shared runner (the two handlers used to be ~30 duplicated lines
+  // each; a third sink would have tripled the pattern).
+  interface SinkTestState {
+    testing: boolean;
+    msg: string;
+    ok: boolean;
+  }
+  let syslogTest = $state<SinkTestState>({ testing: false, msg: '', ok: false });
+  let otlpTest = $state<SinkTestState>({ testing: false, msg: '', ok: false });
 
-  async function testSyslog() {
-    syslogTesting = true;
-    syslogTestMsg = '';
-    syslogTestOk = false;
+  async function runSinkTest(
+    target: SinkTestState,
+    call: () => ReturnType<typeof api.testSyslog>,
+    unreachableMsg: string
+  ): Promise<void> {
+    target.testing = true;
+    target.msg = '';
+    target.ok = false;
     try {
-      const res = await api.testSyslog();
+      const res = await call();
       if (res.error) {
-        syslogTestOk = false;
-        syslogTestMsg = res.error.message || 'Test connection failed (unknown error)';
+        target.ok = false;
+        target.msg = res.error.message || 'Test connection failed (unknown error)';
       } else if (res.data) {
-        syslogTestOk = res.data.ok;
-        if (res.data.ok) {
-          const latency = res.data.latency_ms ?? '?';
-          syslogTestMsg = `Reachable (${latency} ms)`;
-        } else {
-          syslogTestMsg = res.data.message || 'Syslog receiver unreachable';
-        }
+        target.ok = res.data.ok;
+        target.msg = res.data.ok
+          ? `Reachable (${res.data.latency_ms ?? '?'} ms)`
+          : res.data.message || unreachableMsg;
       } else {
-        syslogTestOk = false;
-        syslogTestMsg = 'No response from server';
+        target.ok = false;
+        target.msg = 'No response from server';
       }
     } catch (e) {
-      syslogTestOk = false;
-      syslogTestMsg = `Request failed: ${e instanceof Error ? e.message : String(e)}`;
+      target.ok = false;
+      target.msg = `Request failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
-      syslogTesting = false;
+      target.testing = false;
     }
     setTimeout(() => {
-      syslogTestMsg = '';
+      target.msg = '';
     }, 10000);
   }
 
-  // --- Test connection state (OTLP logs sink) ---
-  let otlpTesting = $state(false);
-  let otlpTestMsg = $state('');
-  let otlpTestOk = $state(false);
+  function testSyslog() {
+    void runSinkTest(syslogTest, () => api.testSyslog(), 'Syslog receiver unreachable');
+  }
 
-  async function testOtlpLogs() {
-    otlpTesting = true;
-    otlpTestMsg = '';
-    otlpTestOk = false;
-    try {
-      const res = await api.testOtlpLogs();
-      if (res.error) {
-        otlpTestOk = false;
-        otlpTestMsg = res.error.message || 'Test connection failed (unknown error)';
-      } else if (res.data) {
-        otlpTestOk = res.data.ok;
-        if (res.data.ok) {
-          const latency = res.data.latency_ms ?? '?';
-          otlpTestMsg = `Reachable (${latency} ms)`;
-        } else {
-          otlpTestMsg = res.data.message || 'OTLP collector unreachable';
-        }
-      } else {
-        otlpTestOk = false;
-        otlpTestMsg = 'No response from server';
-      }
-    } catch (e) {
-      otlpTestOk = false;
-      otlpTestMsg = `Request failed: ${e instanceof Error ? e.message : String(e)}`;
-    } finally {
-      otlpTesting = false;
-    }
-    setTimeout(() => {
-      otlpTestMsg = '';
-    }, 10000);
+  function testOtlpLogs() {
+    void runSinkTest(otlpTest, () => api.testOtlpLogs(), 'OTLP collector unreachable');
   }
 </script>
 
@@ -165,6 +143,14 @@
           <option value="tcp">TCP</option>
           <option value="tcp-tls">TCP + TLS</option>
         </select>
+        {#if settingsForm.syslog_transport !== 'tcp-tls'}
+          <span class="hint">
+            Cleartext transport: exported records carry the audit
+            trail, client IPs and WAF match excerpts, readable and
+            forgeable by anyone on the path to the collector. Prefer
+            TCP + TLS outside a trusted network.
+          </span>
+        {/if}
       </div>
 
       <div class="settings-form-row">
@@ -345,26 +331,26 @@
               type="button"
               class="btn btn-secondary"
               onclick={testSyslog}
-              disabled={syslogTesting}
+              disabled={syslogTest.testing}
             >
-              {syslogTesting ? 'Testing...' : 'Test syslog'}
+              {syslogTest.testing ? 'Testing...' : 'Test syslog'}
             </button>
-            {#if syslogTestMsg}
-              <span class="test-msg {syslogTestOk ? 'test-ok' : 'test-err'}" role="status">
-                {syslogTestMsg}
+            {#if syslogTest.msg}
+              <span class="test-msg {syslogTest.ok ? 'test-ok' : 'test-err'}" role="status">
+                {syslogTest.msg}
               </span>
             {/if}
             <button
               type="button"
               class="btn btn-secondary"
               onclick={testOtlpLogs}
-              disabled={otlpTesting}
+              disabled={otlpTest.testing}
             >
-              {otlpTesting ? 'Testing...' : 'Test OTLP logs'}
+              {otlpTest.testing ? 'Testing...' : 'Test OTLP logs'}
             </button>
-            {#if otlpTestMsg}
-              <span class="test-msg {otlpTestOk ? 'test-ok' : 'test-err'}" role="status">
-                {otlpTestMsg}
+            {#if otlpTest.msg}
+              <span class="test-msg {otlpTest.ok ? 'test-ok' : 'test-err'}" role="status">
+                {otlpTest.msg}
               </span>
             {/if}
           </div>

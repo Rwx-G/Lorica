@@ -251,24 +251,35 @@ pub async fn get_settings(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut settings = db_blocking(&state.store, move |store| store.get_global_settings()).await?;
+    mask_settings_secrets(&mut settings);
+    Ok(json_data(settings))
+}
+
+/// Replace every secret field of a settings row with the
+/// `**REDACTED**` sentinel before serialisation. Applied by BOTH the
+/// GET and the PUT response paths: the PUT handler used to return the
+/// merged row unmasked, handing the raw bot HMAC secret / scrape
+/// token / syslog client key / OTLP auth header back to the caller on
+/// every save (QA finding, CWE-200). The write path treats the
+/// sentinel as "leave unchanged", so a masked value round-trips
+/// safely.
+///
+/// `bot_hmac_secret_hex` keeps its three-state contract (v1.5.1 audit
+/// H-1): empty = never initialised, sentinel = set but withheld.
+fn mask_settings_secrets(settings: &mut lorica_config::models::GlobalSettings) {
     settings.bot_hmac_secret_hex = if settings.bot_hmac_secret_hex.is_empty() {
         String::new()
     } else {
         "**REDACTED**".to_string()
     };
-    // Story 8.8 AC #4: the Prometheus scrape token is a secret (a leaked
-    // value grants unauthenticated `/metrics` access when
-    // `metrics_require_auth` is on). Mask it exactly like the bot HMAC
-    // secret: `None` stays `None`, a configured value becomes the
-    // sentinel. The `PUT` write path treats the sentinel as "leave
-    // unchanged" so the dashboard round-trip never clobbers the token.
+    // Story 8.8 AC #4: a leaked scrape token grants unauthenticated
+    // /metrics access when metrics_require_auth is on. `None` stays
+    // `None`, a configured value becomes the sentinel.
     settings.prometheus_scrape_token = settings
         .prometheus_scrape_token
         .as_ref()
         .map(|_| "**REDACTED**".to_string());
-    // Story 9.8 AC #8: log-sink secrets (syslog mTLS client key, OTLP
-    // logs Authorization header) are masked exactly like the scrape
-    // token; the PUT path treats the sentinel as "leave unchanged".
+    // Story 9.8 AC #8: log-sink secrets get the same treatment.
     settings.syslog_tls_client_key_pem = settings
         .syslog_tls_client_key_pem
         .as_ref()
@@ -277,7 +288,6 @@ pub async fn get_settings(
         .otlp_logs_auth_header
         .as_ref()
         .map(|_| "**REDACTED**".to_string());
-    Ok(json_data(settings))
 }
 
 /// JSON body for `PUT /api/v1/settings`. Only the supplied fields are
@@ -722,11 +732,33 @@ pub async fn update_settings(
         settings
             .validate_cross_fields()
             .map_err(ApiError::BadRequest)?;
+        // Story 9.8 QA: validate syslog TLS material by building the
+        // exact connector the sink will use, so a bad pasted PEM is a
+        // 400 here instead of a permanently dead sink discovered one
+        // warn-line later.
+        let sinks = crate::log_sinks::LogSinksConfig::from_settings(&settings, false);
+        if let Some(syslog_cfg) = &sinks.syslog {
+            crate::log_sinks::syslog::validate_tls_config(syslog_cfg)
+                .map_err(ApiError::BadRequest)?;
+        }
         store.update_global_settings(&settings)?;
         Ok::<_, ApiError>(settings)
     })
     .await?;
     state.notify_config_changed();
+
+    // Story 9.8 QA (CWE-319 advisory): the exported records carry the
+    // audit trail, client IPs and WAF match excerpts; say so loudly
+    // when they ride a cleartext transport. Mirrors the plaintext
+    // `http://` warning on the OTLP endpoint.
+    if settings.syslog_endpoint.is_some() && settings.syslog_transport != "tcp-tls" {
+        tracing::warn!(
+            transport = %settings.syslog_transport,
+            "syslog export configured over a cleartext transport; \
+             exported audit/access/WAF records are readable and \
+             forgeable on-path - prefer tcp-tls"
+        );
+    }
 
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     crate::audit::record(
@@ -739,6 +771,8 @@ pub async fn update_settings(
     )
     .await;
 
+    let mut settings = settings;
+    mask_settings_secrets(&mut settings);
     Ok(json_data(settings))
 }
 
@@ -960,8 +994,13 @@ fn apply_syslog_extra_sd(
         *target = None;
         return Ok(());
     }
+    if trimmed.len() > 512 {
+        return Err(ApiError::BadRequest(
+            "syslog_extra_sd too long (max 512 chars)".to_string(),
+        ));
+    }
     for pair in trimmed.split(',') {
-        let Some((key, _)) = pair.split_once('=') else {
+        let Some((key, val)) = pair.split_once('=') else {
             return Err(ApiError::BadRequest(format!(
                 "syslog_extra_sd entries must be key=value (got {pair:?})"
             )));
@@ -974,6 +1013,14 @@ fn apply_syslog_extra_sd(
         {
             return Err(ApiError::BadRequest(format!(
                 "syslog_extra_sd key {key:?} must be printable ASCII without '=', ']' or '\"'"
+            )));
+        }
+        // Control characters in a value would split the message on
+        // LF-framed collectors (the encoder also sanitizes them, but
+        // rejecting here surfaces the mistake to the operator).
+        if val.chars().any(char::is_control) {
+            return Err(ApiError::BadRequest(format!(
+                "syslog_extra_sd value for key {key:?} must not contain control characters"
             )));
         }
     }
@@ -1159,8 +1206,6 @@ fn apply_otlp_sampling_ratio(value: Option<f64>, target: &mut f64) -> Result<(),
 pub async fn test_otel_connection(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use std::time::{Duration, Instant};
-
     let settings = db_blocking(&state.store, move |store| store.get_global_settings()).await?;
 
     let endpoint = settings
@@ -1175,18 +1220,34 @@ pub async fn test_otel_connection(
         })));
     };
 
-    // Compose the probe URL: for HTTP transports collectors
-    // canonically expose `/v1/traces`. For gRPC we just hit the
-    // base URL — the plain HTTP client will get a protocol error
-    // from the gRPC listener, which still means "TCP is open".
-    let protocol = settings.otlp_protocol.as_str();
+    Ok(json_data(
+        probe_otlp_endpoint(endpoint, &settings.otlp_protocol, "/v1/traces", None).await,
+    ))
+}
+
+/// Shared OTLP reachability probe behind the trace and logs test
+/// endpoints (QA finding: the two handlers were ~80 near-identical
+/// lines). For HTTP transports the collector canonically exposes the
+/// signal under `signal_path`; for gRPC we hit the base URL - the
+/// plain HTTP client gets a protocol error from the gRPC listener,
+/// which still means "TCP is open". A minimal empty POST is the most
+/// representative probe: real traffic is also POST, and a 400 / 415
+/// rejection still proves reachability.
+async fn probe_otlp_endpoint(
+    endpoint: &str,
+    protocol: &str,
+    signal_path: &str,
+    auth_header: Option<&str>,
+) -> serde_json::Value {
+    use std::time::{Duration, Instant};
+
     let probe_url = match protocol {
         "http-proto" | "http-json" => {
             let trimmed = endpoint.trim_end_matches('/');
-            if trimmed.ends_with("/v1/traces") {
+            if trimmed.ends_with(signal_path) {
                 trimmed.to_string()
             } else {
-                format!("{trimmed}/v1/traces")
+                format!("{trimmed}{signal_path}")
             }
         }
         _ => endpoint.to_string(),
@@ -1198,26 +1259,25 @@ pub async fn test_otel_connection(
     {
         Ok(c) => c,
         Err(e) => {
-            return Ok(json_data(serde_json::json!({
+            return serde_json::json!({
                 "ok": false,
                 "message": format!("reqwest client build failed: {e}"),
-            })));
+            });
         }
     };
 
     let start = Instant::now();
-    // A minimal empty POST is the most representative probe: real
-    // traffic is also POST. Collectors reject it with 400 / 415
-    // (wrong content type) which still proves reachability.
-    let result = client
+    let mut request = client
         .post(&probe_url)
         .header("Content-Type", "application/x-protobuf")
-        .body(Vec::<u8>::new())
-        .send()
-        .await;
+        .body(Vec::<u8>::new());
+    if let Some(auth) = auth_header.filter(|a| !a.trim().is_empty()) {
+        request = request.header("Authorization", auth);
+    }
+    let result = request.send().await;
     let latency_ms = start.elapsed().as_millis() as u64;
 
-    let payload = match result {
+    match result {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let detail = if status >= 400 {
@@ -1240,9 +1300,7 @@ pub async fn test_otel_connection(
             "message": format!("unreachable: {e}"),
             "latency_ms": latency_ms,
         }),
-    };
-
-    Ok(json_data(payload))
+    }
 }
 
 /// POST /api/v1/settings/syslog/test - send one synthetic RFC 5424
@@ -1252,7 +1310,10 @@ pub async fn test_otel_connection(
 /// successful send proves resolution and a writable socket, not
 /// collector receipt; the message says so.
 pub async fn test_syslog_connection(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use std::time::Instant;
 
@@ -1270,6 +1331,20 @@ pub async fn test_syslog_connection(
         crate::log_sinks::syslog::send_test_message(&syslog_cfg, &sinks.node_id, &sinks.node_name)
             .await;
     let latency_ms = start.elapsed().as_millis() as u64;
+
+    // The test opens a socket to an operator-configured host and
+    // writes a real frame: an unrecorded network side effect would be
+    // a gap in the tamper-evident trail (QA finding).
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "log_sink.test",
+        ("settings", "syslog"),
+        None,
+        None,
+    )
+    .await;
 
     let payload = match result {
         Ok(()) => {
@@ -1302,10 +1377,11 @@ pub async fn test_syslog_connection(
 /// the `otlp_logs_auth_header` attached when configured, so an
 /// authenticated collector answers 2xx instead of 401.
 pub async fn test_otlp_logs_connection(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use std::time::{Duration, Instant};
-
     let settings = db_blocking(&state.store, move |store| store.get_global_settings()).await?;
 
     let endpoint = settings
@@ -1320,70 +1396,27 @@ pub async fn test_otlp_logs_connection(
         })));
     };
 
-    let probe_url = match settings.otlp_protocol.as_str() {
-        "http-proto" | "http-json" => {
-            let trimmed = endpoint.trim_end_matches('/');
-            if trimmed.ends_with("/v1/logs") {
-                trimmed.to_string()
-            } else {
-                format!("{trimmed}/v1/logs")
-            }
-        }
-        _ => endpoint.to_string(),
-    };
+    let payload = probe_otlp_endpoint(
+        endpoint,
+        &settings.otlp_protocol,
+        "/v1/logs",
+        settings.otlp_logs_auth_header.as_deref(),
+    )
+    .await;
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(json_data(serde_json::json!({
-                "ok": false,
-                "message": format!("reqwest client build failed: {e}"),
-            })));
-        }
-    };
+    // The probe transmits the stored bearer credential to the stored
+    // URL: record who triggered it (QA finding).
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "log_sink.test",
+        ("settings", "otlp_logs"),
+        None,
+        None,
+    )
+    .await;
 
-    let start = Instant::now();
-    let mut request = client
-        .post(&probe_url)
-        .header("Content-Type", "application/x-protobuf")
-        .body(Vec::<u8>::new());
-    if let Some(auth) = settings
-        .otlp_logs_auth_header
-        .as_deref()
-        .filter(|a| !a.trim().is_empty())
-    {
-        request = request.header("Authorization", auth);
-    }
-    let result = request.send().await;
-    let latency_ms = start.elapsed().as_millis() as u64;
-
-    let payload = match result {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let detail = if status >= 400 {
-                format!(
-                    "collector responded (HTTP {status}); \
-                     endpoint is reachable but rejected the probe - \
-                     check authentication or content-type settings"
-                )
-            } else {
-                format!("reachable (HTTP {status})")
-            };
-            serde_json::json!({
-                "ok": true,
-                "message": detail,
-                "latency_ms": latency_ms,
-            })
-        }
-        Err(e) => serde_json::json!({
-            "ok": false,
-            "message": format!("unreachable: {e}"),
-            "latency_ms": latency_ms,
-        }),
-    };
     Ok(json_data(payload))
 }
 

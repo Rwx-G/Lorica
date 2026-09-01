@@ -127,6 +127,29 @@ impl SinkEvent {
     }
 }
 
+/// Version stamped inside every exported JSON body (`"v"` key), so
+/// downstream SIEM parsers can detect a future shape change instead
+/// of silently mis-parsing it (QA finding: an unversioned externally
+/// consumed surface is a breaking change waiting to happen).
+pub const SINK_BODY_VERSION: u32 = 1;
+
+/// Serialize an event's payload as the exported JSON body: the
+/// event's own fields plus `"v"` ([`SINK_BODY_VERSION`]) and
+/// `"kind"` so a record is self-describing without the transport
+/// envelope (syslog MSGID / OTLP attribute). Shared by both sink
+/// consumers so the two wire formats cannot drift.
+pub fn body_json(event: &SinkEvent) -> String {
+    let mut value = serde_json::to_value(&event.payload).unwrap_or_default();
+    if let Some(map) = value.as_object_mut() {
+        map.insert("v".to_string(), serde_json::json!(SINK_BODY_VERSION));
+        map.insert(
+            "kind".to_string(),
+            serde_json::json!(event.kind().as_str()),
+        );
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Syslog transport selector (Story 9.8 AC #1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyslogTransport {
@@ -154,8 +177,10 @@ impl SyslogTransport {
 }
 
 /// Resolved syslog sink configuration, derived from
-/// [`GlobalSettings`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`GlobalSettings`]. `Debug` is hand-implemented so a stray
+/// `debug!(?config)` can never dump the mTLS client key into the
+/// journal (QA finding).
+#[derive(Clone, PartialEq, Eq)]
 pub struct SyslogSinkConfig {
     /// Collector `host:port`.
     pub endpoint: String,
@@ -183,6 +208,32 @@ pub struct SyslogSinkConfig {
     pub tls_client_key_pem: Option<String>,
     /// Static structured-data parameters appended to every message.
     pub extra_sd: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for SyslogSinkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyslogSinkConfig")
+            .field("endpoint", &self.endpoint)
+            .field("transport", &self.transport)
+            .field("facility", &self.facility)
+            .field("severity_access", &self.severity_access)
+            .field("severity_waf", &self.severity_waf)
+            .field("severity_audit", &self.severity_audit)
+            .field("access_enabled", &self.access_enabled)
+            .field("waf_enabled", &self.waf_enabled)
+            .field("audit_enabled", &self.audit_enabled)
+            .field("tls_ca_pem", &self.tls_ca_pem.as_ref().map(|_| "<pem>"))
+            .field(
+                "tls_client_cert_pem",
+                &self.tls_client_cert_pem.as_ref().map(|_| "<pem>"),
+            )
+            .field(
+                "tls_client_key_pem",
+                &self.tls_client_key_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .field("extra_sd", &self.extra_sd)
+            .finish()
+    }
 }
 
 /// Per-process log-sink configuration snapshot. `PartialEq` so the
@@ -255,6 +306,16 @@ impl LogSinksConfig {
     pub fn is_empty(&self) -> bool {
         self.syslog.is_none() && !self.otlp
     }
+
+    /// Stamp the cluster node identity onto this configuration.
+    /// Story 9.6 wires the real values; standalone installs keep the
+    /// empty defaults. Kept as a builder-style seam so 9.6 is a
+    /// one-line call-site change instead of a signature change.
+    pub fn with_node_identity(mut self, node_id: &str, node_name: &str) -> Self {
+        self.node_id = node_id.to_string();
+        self.node_name = node_name.to_string();
+        self
+    }
 }
 
 /// Parse the `key=value,key2=value2` extra structured-data setting.
@@ -275,8 +336,13 @@ fn parse_extra_sd(raw: Option<&str>) -> Vec<(String, String)> {
 }
 
 /// One sink lane: the producer side of a bounded queue plus the kind
-/// filter for that sink.
+/// filter for that sink. `id` is a process-monotonic lane id so a
+/// consumer that dies can tear out exactly its own lane and never a
+/// replacement installed concurrently (QA finding: a live lane with
+/// a dead consumer counted every event as a drop forever).
+#[derive(Clone)]
 struct SinkLane {
+    id: u64,
     tx: tokio::sync::mpsc::Sender<SinkEvent>,
     access: bool,
     waf: bool,
@@ -305,7 +371,7 @@ impl SinkLane {
 }
 
 /// Installed hub state for this process.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct HubState {
     syslog: Option<SinkLane>,
     otlp: Option<SinkLane>,
@@ -316,42 +382,74 @@ impl HubState {
         self.syslog.as_ref().is_some_and(|l| l.wants(kind))
             || self.otlp.as_ref().is_some_and(|l| l.wants(kind))
     }
+
+    fn offer_all(&self, event: &SinkEvent) {
+        if let Some(lane) = &self.syslog {
+            lane.offer(event);
+        }
+        if let Some(lane) = &self.otlp {
+            lane.offer(event);
+        }
+    }
 }
 
 static HUB: OnceLock<parking_lot::RwLock<Arc<HubState>>> = OnceLock::new();
+
+static LANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn hub_slot() -> &'static parking_lot::RwLock<Arc<HubState>> {
     HUB.get_or_init(|| parking_lot::RwLock::new(Arc::new(HubState::default())))
 }
 
+/// Latest syslog consumer thread handle, kept so
+/// [`shutdown_and_drain`] can join it on process teardown. Handles of
+/// lanes replaced by a reinstall are detached (their threads exit on
+/// their own once their senders drop).
+fn syslog_thread_slot() -> &'static parking_lot::Mutex<Option<std::thread::JoinHandle<()>>> {
+    static SLOT: OnceLock<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        OnceLock::new();
+    SLOT.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
 /// Install (or replace) this process's sink hub from a configuration
-/// snapshot. Spawns the syslog consumer thread when a syslog sink is
-/// configured; when `config.otlp` is set, creates the OTLP lane and
-/// returns its receiver, which the caller must hand to the OTLP logs
-/// consumer (`lorica::otel`). Replacing the hub drops the previous
-/// lanes' senders; each old consumer drains its queue and exits.
+/// snapshot. The syslog consumer thread is spawned FIRST and its lane
+/// only installed on a successful spawn, so the hub can never claim a
+/// sink with no consumer behind it. When `config.otlp` is set, the
+/// OTLP lane is created and its receiver returned; the caller must
+/// hand it to the OTLP logs consumer (`lorica::otel`). Replacing the
+/// hub drops the previous lanes' senders; each old consumer drains
+/// its remaining queue and exits.
 pub fn install(config: &LogSinksConfig) -> Option<tokio::sync::mpsc::Receiver<SinkEvent>> {
+    use std::sync::atomic::Ordering;
+
     let mut state = HubState::default();
     if let Some(syslog_cfg) = &config.syslog {
         let (tx, rx) = tokio::sync::mpsc::channel::<SinkEvent>(SINK_QUEUE_CAP);
-        state.syslog = Some(SinkLane {
-            tx,
-            access: syslog_cfg.access_enabled,
-            waf: syslog_cfg.waf_enabled,
-            audit: syslog_cfg.audit_enabled,
-            label: "syslog",
-        });
-        syslog::spawn_syslog_sink(
+        let id = LANE_ID.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(handle) = syslog::spawn_syslog_sink(
+            id,
             rx,
             syslog_cfg.clone(),
             config.node_id.clone(),
             config.node_name.clone(),
-        );
+        ) {
+            state.syslog = Some(SinkLane {
+                id,
+                tx,
+                access: syslog_cfg.access_enabled,
+                waf: syslog_cfg.waf_enabled,
+                audit: syslog_cfg.audit_enabled,
+                label: "syslog",
+            });
+            *syslog_thread_slot().lock() = Some(handle);
+        }
     }
     let mut otlp_rx = None;
     if config.otlp {
         let (tx, rx) = tokio::sync::mpsc::channel::<SinkEvent>(SINK_QUEUE_CAP);
+        let id = LANE_ID.fetch_add(1, Ordering::Relaxed) + 1;
         state.otlp = Some(SinkLane {
+            id,
             tx,
             access: true,
             waf: true,
@@ -364,6 +462,44 @@ pub fn install(config: &LogSinksConfig) -> Option<tokio::sync::mpsc::Receiver<Si
     otlp_rx
 }
 
+/// Tear the syslog lane with `id` out of the hub. Called by the
+/// consumer on a terminal failure (invalid TLS material, runtime
+/// build failure) so the hub never keeps offering events to a lane
+/// whose consumer is gone. The id check makes a racing reinstall win.
+pub(super) fn remove_syslog_lane(id: u64) {
+    let slot = hub_slot();
+    let mut guard = slot.write();
+    if guard.syslog.as_ref().is_some_and(|l| l.id == id) {
+        let mut next = (**guard).clone();
+        next.syslog = None;
+        *guard = Arc::new(next);
+    }
+}
+
+/// Tear the hub down and give the syslog consumer a bounded window to
+/// drain its remaining queue (QA finding: without this, a restart or
+/// hot binary upgrade silently discarded up to a queue's worth of
+/// exported audit/access events). Called from `lorica::otel::shutdown`
+/// on every process exit path, before the OTLP logs provider flush.
+pub fn shutdown_and_drain(timeout: std::time::Duration) {
+    if let Some(slot) = HUB.get() {
+        *slot.write() = Arc::new(HubState::default());
+    }
+    let handle = syslog_thread_slot().lock().take();
+    if let Some(handle) = handle {
+        let deadline = std::time::Instant::now() + timeout;
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+        // Not finished within budget (e.g. mid-write against a stalled
+        // collector): detach. The process is exiting anyway and the
+        // remaining events were already accounted as best-effort.
+    }
+}
+
 /// Cheap hot-path guard: is any sink interested in `kind` right now?
 /// Lets callers skip building the event when nothing is installed.
 pub fn wants(kind: SinkKind) -> bool {
@@ -373,44 +509,43 @@ pub fn wants(kind: SinkKind) -> bool {
     }
 }
 
-/// Publish one event to every interested sink. Never blocks: full
-/// queues drop the event and bump
-/// `lorica_log_sink_dropped_total{sink, kind}`.
-pub fn publish(event: SinkEvent) {
-    let Some(slot) = HUB.get() else {
-        return;
-    };
-    let state = slot.read().clone();
-    if let Some(lane) = &state.syslog {
-        lane.offer(&event);
-    }
-    if let Some(lane) = &state.otlp {
-        lane.offer(&event);
+/// Single-read variant of [`wants`]: returns the hub state when it
+/// wants `kind`, so the caller pays one lock acquisition, not two
+/// (QA finding).
+fn state_if_wants(kind: SinkKind) -> Option<Arc<HubState>> {
+    let state = HUB.get()?.read().clone();
+    if state.wants(kind) {
+        Some(state)
+    } else {
+        None
     }
 }
 
-/// Publish an access-log entry with its request trace context.
+/// Publish an access-log entry with its request trace context. Never
+/// blocks: full queues drop the event and bump
+/// `lorica_log_sink_dropped_total{sink, kind}`.
 pub fn publish_access(entry: &LogEntry, trace_id: Option<&str>, span_id: Option<&str>) {
-    if !wants(SinkKind::Access) {
+    let Some(state) = state_if_wants(SinkKind::Access) else {
         return;
-    }
-    publish(SinkEvent {
+    };
+    state.offer_all(&SinkEvent {
         payload: SinkPayload::Access(entry.clone()),
         trace_id: trace_id.map(str::to_string),
         span_id: span_id.map(str::to_string),
     });
 }
 
-/// Publish a WAF event with its request trace context.
+/// Publish a WAF event with its request trace context. Same
+/// non-blocking contract as [`publish_access`].
 pub fn publish_waf(
     event: &lorica_waf::WafEvent,
     trace_id: Option<&str>,
     span_id: Option<&str>,
 ) {
-    if !wants(SinkKind::Waf) {
+    let Some(state) = state_if_wants(SinkKind::Waf) else {
         return;
-    }
-    publish(SinkEvent {
+    };
+    state.offer_all(&SinkEvent {
         payload: SinkPayload::Waf(event.clone()),
         trace_id: trace_id.map(str::to_string),
         span_id: span_id.map(str::to_string),
@@ -418,12 +553,13 @@ pub fn publish_waf(
 }
 
 /// Publish an audit entry. Management actions carry no request span,
-/// so there is no trace context on this path.
+/// so there is no trace context on this path. Same non-blocking
+/// contract as [`publish_access`].
 pub fn publish_audit(record: AuditSinkRecord) {
-    if !wants(SinkKind::Audit) {
+    let Some(state) = state_if_wants(SinkKind::Audit) else {
         return;
-    }
-    publish(SinkEvent {
+    };
+    state.offer_all(&SinkEvent {
         payload: SinkPayload::Audit(record),
         trace_id: None,
         span_id: None,
@@ -511,6 +647,52 @@ mod tests {
         assert!(LogSinksConfig::from_settings(&s, true).otlp);
         // Feature not compiled in: no lane.
         assert!(!LogSinksConfig::from_settings(&s, false).otlp);
+    }
+
+    #[test]
+    fn body_json_carries_version_and_kind() {
+        let event = SinkEvent {
+            payload: SinkPayload::Audit(AuditSinkRecord {
+                timestamp: "2026-06-10T00:00:00Z".into(),
+                operator_username: "admin".into(),
+                operator_role: "SuperAdmin".into(),
+                action: "route.create".into(),
+                target_type: "route".into(),
+                target_id: "r1".into(),
+                ip: "192.0.2.10".into(),
+                chain_hash: "abc".into(),
+            }),
+            trace_id: None,
+            span_id: None,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&body_json(&event)).expect("body is valid JSON");
+        assert_eq!(value["v"], SINK_BODY_VERSION);
+        assert_eq!(value["kind"], "audit");
+        // Event fields stay flattened at the top level.
+        assert_eq!(value["action"], "route.create");
+    }
+
+    #[test]
+    fn debug_never_prints_the_client_key() {
+        let cfg = SyslogSinkConfig {
+            endpoint: "host01:6514".into(),
+            transport: SyslogTransport::TcpTls,
+            facility: 16,
+            severity_access: 6,
+            severity_waf: 4,
+            severity_audit: 5,
+            access_enabled: true,
+            waf_enabled: true,
+            audit_enabled: true,
+            tls_ca_pem: None,
+            tls_client_cert_pem: None,
+            tls_client_key_pem: Some("-----BEGIN PRIVATE KEY-----\ntopsecret".into()),
+            extra_sd: Vec::new(),
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("topsecret"));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

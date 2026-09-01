@@ -259,7 +259,9 @@ describe('validateExtraSd', () => {
     expect(validateExtraSd('bad]key=1')).toMatch(/printable ASCII/);
     expect(validateExtraSd('bad"key=1')).toMatch(/printable ASCII/);
     expect(validateExtraSd('café=1')).toMatch(/printable ASCII/);
-    expect(validateExtraSd('key=1')).toMatch(/printable ASCII/);
+    // Control char built explicitly: a raw 0x01 byte in the source is
+    // invisible in editors and fooled two review passes.
+    expect(validateExtraSd('k' + String.fromCharCode(1) + 'ey=1')).toMatch(/printable ASCII/);
     expect(validateExtraSd('bad key=1')).toMatch(/printable ASCII/);
   });
 
