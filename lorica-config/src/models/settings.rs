@@ -12,6 +12,7 @@ use super::route::SpoofedFallback;
 /// resolves the name against builtin presets first, then custom presets from
 /// `GlobalSettings`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityHeaderPreset {
     /// Preset identifier (matches `Route.security_headers`).
     pub name: String,

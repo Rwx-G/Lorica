@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// [`Route`]: super::route::Route
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeConfig {
     /// Stable UUID; primary key of the `probes` table.
     pub id: String,

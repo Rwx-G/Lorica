@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 /// behavior - a regex typo would be much harder to debug than a
 /// "does this glob match" check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertExportAcl {
     /// Stable UUID; primary key.
     pub id: String,
