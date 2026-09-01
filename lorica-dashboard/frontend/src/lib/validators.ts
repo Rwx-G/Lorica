@@ -540,3 +540,70 @@ export function validateCertExportPattern(input: string): string | null {
   }
   return null;
 }
+
+/**
+ * Validate a `host:port` endpoint (syslog sink, Story 9.8). Empty
+ * => null ("sink disabled"). Accepts a hostname or IPv4 address
+ * followed by `:port`, or a bracketed IPv6 literal (`[::1]:514`).
+ * Port must be 1-65535. Mirrors the server-side endpoint parser in
+ * `lorica-api::settings`.
+ */
+export function validateHostPort(value: string): string | null {
+  const s = value.trim();
+  if (s === '') return null;
+  let host: string;
+  let portStr: string;
+  if (s.startsWith('[')) {
+    // Bracketed IPv6: [addr]:port
+    const close = s.indexOf(']');
+    if (close === -1) return 'missing closing `]` in IPv6 endpoint';
+    host = s.slice(1, close);
+    const rest = s.slice(close + 1);
+    if (!rest.startsWith(':')) return 'expected `[ipv6]:port`';
+    portStr = rest.slice(1);
+    if (host === '') return 'host must not be empty';
+    const addrNoZone = host.split('%')[0];
+    if (!/^[0-9a-fA-F:]+$/.test(addrNoZone)) return 'not a valid IPv6 address';
+  } else {
+    const idx = s.lastIndexOf(':');
+    if (idx === -1) return 'expected `host:port` (e.g. syslog.example.com:514)';
+    host = s.slice(0, idx);
+    portStr = s.slice(idx + 1);
+    if (host === '') return 'host must not be empty';
+    if (host.includes(':')) return 'IPv6 addresses must be bracketed, e.g. [::1]:514';
+    if (/\s/.test(host)) return 'host must not contain whitespace';
+  }
+  if (portStr === '') return 'port must not be empty';
+  if (!/^\d+$/.test(portStr)) return 'port must be numeric';
+  const port = Number(portStr);
+  if (port < 1 || port > 65535) return 'port must be in 1-65535';
+  return null;
+}
+
+/**
+ * Validate the `syslog_extra_sd` field: comma-separated `key=value`
+ * pairs added as structured data to every syslog message (RFC 5424
+ * SD-PARAM). Empty => null ("no extra structured data"). Keys must
+ * be printable ASCII without `=`, `]`, `"` or spaces; values may
+ * contain anything (the emitter escapes them).
+ */
+export function validateExtraSd(value: string): string | null {
+  const raw = value.trim();
+  if (raw === '') return null;
+  const pairs = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  if (pairs.length === 0) return 'expected `key=value` pairs separated by commas';
+  for (let i = 0; i < pairs.length; i++) {
+    const pair = pairs[i];
+    const idx = pair.indexOf('=');
+    if (idx === -1) return `pair #${i + 1} (${pair}): expected \`key=value\``;
+    if (idx === 0) return `pair #${i + 1}: key must not be empty`;
+    const key = pair.slice(0, idx);
+    for (const c of key) {
+      const code = c.codePointAt(0) ?? 0;
+      if (code <= 0x20 || code > 0x7e || c === '=' || c === ']' || c === '"') {
+        return `pair #${i + 1} (${key}): key must be printable ASCII without \`=\`, \`]\`, \`"\` or spaces`;
+      }
+    }
+  }
+  return null;
+}

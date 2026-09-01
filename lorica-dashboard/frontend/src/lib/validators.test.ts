@@ -3,6 +3,8 @@ import {
   parseOctalMode,
   validateAbsolutePath,
   validateCertExportPattern,
+  validateExtraSd,
+  validateHostPort,
   validateOctalMode,
   validatePosixId,
 } from './validators';
@@ -155,5 +157,113 @@ describe('validateCertExportPattern', () => {
   it('rejects patterns past 253 characters', () => {
     const long = 'a'.repeat(254);
     expect(validateCertExportPattern(long)).toMatch(/253/);
+  });
+});
+
+describe('validateHostPort', () => {
+  it('accepts empty string (sink disabled)', () => {
+    expect(validateHostPort('')).toBeNull();
+    expect(validateHostPort('   ')).toBeNull();
+  });
+
+  it('accepts hostname:port', () => {
+    expect(validateHostPort('syslog.example.com:514')).toBeNull();
+    expect(validateHostPort('localhost:1')).toBeNull();
+    expect(validateHostPort('host01:65535')).toBeNull();
+  });
+
+  it('accepts IPv4:port', () => {
+    expect(validateHostPort('192.0.2.10:514')).toBeNull();
+    expect(validateHostPort('10.0.0.10:6514')).toBeNull();
+  });
+
+  it('accepts bracketed IPv6:port', () => {
+    expect(validateHostPort('[::1]:514')).toBeNull();
+    expect(validateHostPort('[2001:db8::1]:6514')).toBeNull();
+  });
+
+  it('rejects a missing port', () => {
+    expect(validateHostPort('syslog.example.com')).toMatch(/host:port/);
+    expect(validateHostPort('syslog.example.com:')).toMatch(/port/);
+    expect(validateHostPort('[::1]')).toMatch(/port/);
+  });
+
+  it('rejects an empty host', () => {
+    expect(validateHostPort(':514')).toMatch(/host/);
+    expect(validateHostPort('[]:514')).toMatch(/host/);
+  });
+
+  it('rejects an unbracketed IPv6 address', () => {
+    expect(validateHostPort('::1:514')).toMatch(/bracketed/);
+    expect(validateHostPort('2001:db8::1:514')).toMatch(/bracketed/);
+  });
+
+  it('rejects a malformed bracketed IPv6 endpoint', () => {
+    expect(validateHostPort('[::1:514')).toMatch(/closing/);
+    expect(validateHostPort('[::1]514')).toMatch(/\[ipv6\]:port/);
+    expect(validateHostPort('[not-hex]:514')).toMatch(/IPv6/);
+  });
+
+  it('rejects a non-numeric port', () => {
+    expect(validateHostPort('host01:abc')).toMatch(/numeric/);
+    expect(validateHostPort('host01:5 14')).toMatch(/numeric/);
+    expect(validateHostPort('host01:-1')).toMatch(/numeric/);
+  });
+
+  it('rejects a port out of range', () => {
+    expect(validateHostPort('host01:0')).toMatch(/1-65535/);
+    expect(validateHostPort('host01:65536')).toMatch(/1-65535/);
+    expect(validateHostPort('[::1]:70000')).toMatch(/1-65535/);
+  });
+
+  it('rejects whitespace in the host', () => {
+    expect(validateHostPort('bad host:514')).toMatch(/whitespace/);
+  });
+});
+
+describe('validateExtraSd', () => {
+  it('accepts empty string (no extra structured data)', () => {
+    expect(validateExtraSd('')).toBeNull();
+    expect(validateExtraSd('   ')).toBeNull();
+  });
+
+  it('accepts a single key=value pair', () => {
+    expect(validateExtraSd('env=prod')).toBeNull();
+    expect(validateExtraSd('node=web01')).toBeNull();
+  });
+
+  it('accepts multiple comma-separated pairs', () => {
+    expect(validateExtraSd('env=prod,region=eu-west,team=infra')).toBeNull();
+    expect(validateExtraSd(' env=prod , region=eu-west ')).toBeNull();
+  });
+
+  it('accepts values containing = and special characters', () => {
+    expect(validateExtraSd('query=a=b')).toBeNull();
+    expect(validateExtraSd('note=hello world')).toBeNull();
+  });
+
+  it('accepts an empty value', () => {
+    expect(validateExtraSd('flag=')).toBeNull();
+  });
+
+  it('rejects a pair without =', () => {
+    expect(validateExtraSd('justakey')).toMatch(/key=value/);
+    expect(validateExtraSd('env=prod,broken')).toMatch(/key=value/);
+  });
+
+  it('rejects an empty key', () => {
+    expect(validateExtraSd('=value')).toMatch(/key must not be empty/);
+  });
+
+  it('rejects forbidden characters in the key', () => {
+    expect(validateExtraSd('bad]key=1')).toMatch(/printable ASCII/);
+    expect(validateExtraSd('bad"key=1')).toMatch(/printable ASCII/);
+    expect(validateExtraSd('café=1')).toMatch(/printable ASCII/);
+    expect(validateExtraSd('key=1')).toMatch(/printable ASCII/);
+    expect(validateExtraSd('bad key=1')).toMatch(/printable ASCII/);
+  });
+
+  it('rejects only commas and whitespace', () => {
+    expect(validateExtraSd(' , , ')).toMatch(/key=value/);
   });
 });

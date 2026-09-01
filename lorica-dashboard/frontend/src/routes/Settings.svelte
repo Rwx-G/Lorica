@@ -16,6 +16,7 @@
   import GlobalConfigTab from '../components/settings-tabs/GlobalConfigTab.svelte';
   import NetworkTab from '../components/settings-tabs/NetworkTab.svelte';
   import ObservabilityTab from '../components/settings-tabs/ObservabilityTab.svelte';
+  import LogExportTab from '../components/settings-tabs/LogExportTab.svelte';
   import SecurityPresetsTab from '../components/settings-tabs/SecurityPresetsTab.svelte';
   import BanRulesTab from '../components/settings-tabs/BanRulesTab.svelte';
   import AiCrawlersTab from '../components/settings-tabs/AiCrawlersTab.svelte';
@@ -62,6 +63,23 @@
     geoip_auto_update_enabled: false,
     asn_db_path: '',
     asn_auto_update_enabled: false,
+    // Log-export sinks (Story 9.8). Strings are non-nullable in the
+    // form: '' = unset / sink disabled.
+    syslog_endpoint: '',
+    syslog_transport: 'udp',
+    syslog_facility: 16,
+    syslog_severity_access: 6,
+    syslog_severity_waf: 4,
+    syslog_severity_audit: 5,
+    syslog_access_enabled: true,
+    syslog_waf_enabled: true,
+    syslog_audit_enabled: true,
+    syslog_tls_ca_pem: '',
+    syslog_tls_client_cert_pem: '',
+    syslog_tls_client_key_pem: '',
+    syslog_extra_sd: '',
+    otlp_logs_enabled: false,
+    otlp_logs_auth_header: '',
     // Defense-in-depth data-plane bounds (Story 8.9).
     // connection_limits_per_ip is held as a string so an empty
     // input maps to "no cap" (null), same pattern as the cert
@@ -118,6 +136,7 @@
     global: true,
     network: true,
     observability: true,
+    log_export: true,
     dns_providers: true,
     notifications: true,
     presets: true,
@@ -181,6 +200,23 @@
         asn_db_path: settingsRes.data.asn_db_path ?? '',
         asn_auto_update_enabled:
           settingsRes.data.asn_auto_update_enabled ?? false,
+        syslog_endpoint: settingsRes.data.syslog_endpoint ?? '',
+        syslog_transport: settingsRes.data.syslog_transport ?? 'udp',
+        syslog_facility: settingsRes.data.syslog_facility ?? 16,
+        syslog_severity_access: settingsRes.data.syslog_severity_access ?? 6,
+        syslog_severity_waf: settingsRes.data.syslog_severity_waf ?? 4,
+        syslog_severity_audit: settingsRes.data.syslog_severity_audit ?? 5,
+        syslog_access_enabled: settingsRes.data.syslog_access_enabled ?? true,
+        syslog_waf_enabled: settingsRes.data.syslog_waf_enabled ?? true,
+        syslog_audit_enabled: settingsRes.data.syslog_audit_enabled ?? true,
+        syslog_tls_ca_pem: settingsRes.data.syslog_tls_ca_pem ?? '',
+        syslog_tls_client_cert_pem:
+          settingsRes.data.syslog_tls_client_cert_pem ?? '',
+        syslog_tls_client_key_pem:
+          settingsRes.data.syslog_tls_client_key_pem ?? '',
+        syslog_extra_sd: settingsRes.data.syslog_extra_sd ?? '',
+        otlp_logs_enabled: settingsRes.data.otlp_logs_enabled ?? false,
+        otlp_logs_auth_header: settingsRes.data.otlp_logs_auth_header ?? '',
         connection_limits_per_ip:
           settingsRes.data.connection_limits_per_ip != null
             ? String(settingsRes.data.connection_limits_per_ip)
@@ -290,6 +326,15 @@
       otlp_endpoint: settingsForm.otlp_endpoint.trim(),
       geoip_db_path: settingsForm.geoip_db_path.trim(),
       asn_db_path: settingsForm.asn_db_path.trim(),
+      // Log-export sinks (Story 9.8): same convention. Secrets carry
+      // the "**REDACTED**" sentinel round-trip to mean "unchanged";
+      // an empty string clears them.
+      syslog_endpoint: settingsForm.syslog_endpoint.trim(),
+      syslog_tls_ca_pem: settingsForm.syslog_tls_ca_pem.trim(),
+      syslog_tls_client_cert_pem: settingsForm.syslog_tls_client_cert_pem.trim(),
+      syslog_tls_client_key_pem: settingsForm.syslog_tls_client_key_pem.trim(),
+      syslog_extra_sd: settingsForm.syslog_extra_sd.trim(),
+      otlp_logs_auth_header: settingsForm.otlp_logs_auth_header.trim(),
       // Per-IP connection cap: empty input or 0 means "no cap" (null).
       connection_limits_per_ip:
         connection_limits_per_ip.trim() === '' || Number(connection_limits_per_ip.trim()) === 0
@@ -333,6 +378,21 @@
         geoip_auto_update_enabled: res.data.geoip_auto_update_enabled ?? false,
         asn_db_path: res.data.asn_db_path ?? '',
         asn_auto_update_enabled: res.data.asn_auto_update_enabled ?? false,
+        syslog_endpoint: res.data.syslog_endpoint ?? '',
+        syslog_transport: res.data.syslog_transport ?? 'udp',
+        syslog_facility: res.data.syslog_facility ?? 16,
+        syslog_severity_access: res.data.syslog_severity_access ?? 6,
+        syslog_severity_waf: res.data.syslog_severity_waf ?? 4,
+        syslog_severity_audit: res.data.syslog_severity_audit ?? 5,
+        syslog_access_enabled: res.data.syslog_access_enabled ?? true,
+        syslog_waf_enabled: res.data.syslog_waf_enabled ?? true,
+        syslog_audit_enabled: res.data.syslog_audit_enabled ?? true,
+        syslog_tls_ca_pem: res.data.syslog_tls_ca_pem ?? '',
+        syslog_tls_client_cert_pem: res.data.syslog_tls_client_cert_pem ?? '',
+        syslog_tls_client_key_pem: res.data.syslog_tls_client_key_pem ?? '',
+        syslog_extra_sd: res.data.syslog_extra_sd ?? '',
+        otlp_logs_enabled: res.data.otlp_logs_enabled ?? false,
+        otlp_logs_auth_header: res.data.otlp_logs_auth_header ?? '',
         connection_limits_per_ip:
           res.data.connection_limits_per_ip != null
             ? String(res.data.connection_limits_per_ip)
@@ -406,6 +466,16 @@
       bind:settingsForm
       expanded={expandedSections.observability}
       toggleSection={() => toggleSection('observability')}
+      onSave={saveSettings}
+      {settingsSaving}
+      {settingsMsg}
+      {settingsError}
+    />
+
+    <LogExportTab
+      bind:settingsForm
+      expanded={expandedSections.log_export}
+      toggleSection={() => toggleSection('log_export')}
       onSave={saveSettings}
       {settingsSaving}
       {settingsMsg}

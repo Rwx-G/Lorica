@@ -796,6 +796,24 @@ export interface GlobalSettingsResponse {
   bot_stash_per_prefix_max: number;
   mirror_max_concurrent_per_route: number;
   mirror_max_concurrent_global: number;
+  // Log-export sinks (Story 9.8). Empty endpoint = syslog sink off.
+  syslog_endpoint?: string | null;
+  syslog_transport?: string;
+  syslog_facility?: number;
+  syslog_severity_access?: number;
+  syslog_severity_waf?: number;
+  syslog_severity_audit?: number;
+  syslog_access_enabled?: boolean;
+  syslog_waf_enabled?: boolean;
+  syslog_audit_enabled?: boolean;
+  syslog_tls_ca_pem?: string | null;
+  syslog_tls_client_cert_pem?: string | null;
+  // SECRET: GET returns "**REDACTED**" when a key is stored.
+  syslog_tls_client_key_pem?: string | null;
+  syslog_extra_sd?: string | null;
+  otlp_logs_enabled?: boolean;
+  // SECRET: GET returns "**REDACTED**" when a header is stored.
+  otlp_logs_auth_header?: string | null;
 }
 
 export interface UpdateSettingsRequest {
@@ -840,6 +858,23 @@ export interface UpdateSettingsRequest {
   bot_stash_per_prefix_max?: number;
   mirror_max_concurrent_per_route?: number;
   mirror_max_concurrent_global?: number;
+  // Log-export sinks (Story 9.8). Sending "" clears a string field;
+  // sending back the "**REDACTED**" sentinel leaves a secret unchanged.
+  syslog_endpoint?: string | null;
+  syslog_transport?: string;
+  syslog_facility?: number;
+  syslog_severity_access?: number;
+  syslog_severity_waf?: number;
+  syslog_severity_audit?: number;
+  syslog_access_enabled?: boolean;
+  syslog_waf_enabled?: boolean;
+  syslog_audit_enabled?: boolean;
+  syslog_tls_ca_pem?: string | null;
+  syslog_tls_client_cert_pem?: string | null;
+  syslog_tls_client_key_pem?: string | null;
+  syslog_extra_sd?: string | null;
+  otlp_logs_enabled?: boolean;
+  otlp_logs_auth_header?: string | null;
 }
 
 /**
@@ -905,6 +940,15 @@ export interface CertExportOrphansResponse {
 /// currently-configured endpoint + protocol and reports whether
 /// the collector accepted it.
 export interface OtelTestResponse {
+  ok: boolean;
+  message: string;
+  latency_ms?: number;
+}
+
+/// Result of the "Test syslog" / "Test OTLP logs" probes on the
+/// Log Export settings section (Story 9.8). Same contract as
+/// `OtelTestResponse`: always HTTP 200, `ok` carries the verdict.
+export interface LogSinkTestResponse {
   ok: boolean;
   message: string;
   latency_ms?: number;
@@ -1303,6 +1347,16 @@ export const api = {
   // change. Does not mutate state.
   testOtel: () =>
     request<OtelTestResponse>('POST', '/settings/otel/test', {}),
+
+  // Emit a canary syslog message via the CURRENTLY persisted
+  // syslog sink settings (Story 9.8). Does not mutate state.
+  testSyslog: () =>
+    request<LogSinkTestResponse>('POST', '/settings/syslog/test', {}),
+
+  // Emit a canary OTLP log record via the CURRENTLY persisted
+  // OTLP endpoint + protocol (Story 9.8). Does not mutate state.
+  testOtlpLogs: () =>
+    request<LogSinkTestResponse>('POST', '/settings/otlp-logs/test', {}),
 
   // Notifications
   listNotifications: () =>
