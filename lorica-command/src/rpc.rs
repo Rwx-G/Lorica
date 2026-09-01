@@ -34,8 +34,10 @@
 //! `RpcEndpoint::request` is the hot-path entry point. It allocates a
 //! monotonically increasing sequence, installs a oneshot in the in-flight
 //! map, enqueues the request, and awaits the matching response with a
-//! per-request timeout. The in-flight entry is always removed on exit
-//! (Ok, Closed, or Timeout) so dead senders do not linger.
+//! per-request timeout. The in-flight entry is removed on EVERY exit -
+//! Ok, Closed, Timeout, and cancellation of the returned future by an
+//! outer timeout or `select!` (an RAII guard, so dead senders do not
+//! linger no matter how the future ends).
 //!
 //! Transport limits are per-endpoint ([`RpcLimits`], Story 9.1 AC #3):
 //! the historical crate constants were tuned for a same-host UDS and
@@ -221,6 +223,25 @@ impl Frame for Envelope {
 // high-frequency path (per-request RPC fan-out > 100 kHz) the Mutex is
 // still the first structure to revisit.
 type InflightMap<R> = Arc<Mutex<HashMap<u64, oneshot::Sender<R>>>>;
+
+/// Removes its sequence's in-flight entry on drop, making `request`'s
+/// bookkeeping cancel-safe: an OUTER timeout or `select!` dropping the
+/// future at any await point still releases the slot. Removing an
+/// already-removed entry is a no-op; a poisoned lock is skipped
+/// (panicking in Drop is not an option) and the entry is then
+/// reclaimed when the whole endpoint drops.
+struct InflightGuard<R> {
+    map: InflightMap<R>,
+    seq: u64,
+}
+
+impl<R> Drop for InflightGuard<R> {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.map.lock() {
+            map.remove(&self.seq);
+        }
+    }
+}
 
 /// A pipelined, duplex RPC endpoint, generic over the transport
 /// (any `AsyncRead + AsyncWrite` stream) and the [`Frame`] type.
@@ -446,8 +467,9 @@ impl<F: Frame> RpcEndpoint<F> {
     }
 
     /// Send a request and await the matching response with a
-    /// per-request timeout. The in-flight entry is always removed on
-    /// exit (Ok, Closed, or Timeout); the outgoing queue is bounded so
+    /// per-request timeout. The in-flight entry is removed on every
+    /// exit - Ok, Closed, Timeout, and cancellation of the returned
+    /// future itself (RAII guard); the outgoing queue is bounded so
     /// backpressure propagates as the overall timeout firing.
     ///
     /// # Errors
@@ -481,6 +503,16 @@ impl<F: Frame> RpcEndpoint<F> {
             }
             map.insert(seq, resp_tx);
         }
+        // RAII cleanup: the returned future can be dropped at ANY
+        // await point by an OUTER timeout or select! (the metrics
+        // pull does exactly that), not just by our own timeout below.
+        // Without drop-safety every such cancellation would leak one
+        // in-flight slot until a stale response arrives, eventually
+        // pinning the endpoint at InflightFull.
+        let _inflight_guard = InflightGuard {
+            map: self.inner.inflight.clone(),
+            seq,
+        };
 
         let tx_out = self.inner.tx_out.clone();
         let slow_enqueue_warn = self.inner.limits.slow_enqueue_warn;
@@ -493,10 +525,8 @@ impl<F: Frame> RpcEndpoint<F> {
         let backpressured_frame = match tx_out.try_send(frame) {
             Ok(()) => None,
             Err(mpsc::error::TrySendError::Full(frame)) => Some(frame),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.forget(seq);
-                return Err(ChannelError::Closed);
-            }
+            // The guard drops here and releases the in-flight slot.
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(ChannelError::Closed),
         };
 
         // Cover both enqueue and response wait under a single timeout so
@@ -543,17 +573,12 @@ impl<F: Frame> RpcEndpoint<F> {
         };
 
         let result = tokio::time::timeout(timeout, full).await;
-        self.forget(seq);
+        // `_inflight_guard` drops on return (and on any cancellation
+        // above), removing the in-flight entry on every exit path.
         match result {
             Ok(inner) => inner,
             Err(_) => Err(ChannelError::Timeout),
         }
-    }
-
-    /// Remove the in-flight entry for `seq`, if present.
-    fn forget(&self, seq: u64) {
-        let mut map = self.inner.inflight.lock().expect("inflight map poisoned");
-        map.remove(&seq);
     }
 }
 
@@ -1029,6 +1054,38 @@ mod tests {
         let map = a.inner.inflight.lock().unwrap();
         assert!(map.is_empty());
         drop(map);
+        drop(drainer);
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_releases_its_inflight_slot() {
+        // An OUTER timeout or select! dropping the request future
+        // (the metrics-pull pattern wraps a request fan-out in its
+        // own wall-clock timeout) must not leak the in-flight slot:
+        // leaked slots accumulate until InflightFull rejects every
+        // request to that endpoint.
+        let ((a, _a_rx), (b_ep, mut b_rx)) = endpoints();
+        let drainer = tokio::spawn(async move {
+            // Accept and drop forever: the request stays pending.
+            while let Some(inc) = b_rx.recv().await {
+                drop(inc);
+            }
+            b_ep
+        });
+
+        let mut fut = Box::pin(a.request(
+            Command::new(CommandType::Heartbeat, 0),
+            Duration::from_secs(60),
+        ));
+        let outer = tokio::time::timeout(Duration::from_millis(50), fut.as_mut()).await;
+        assert!(outer.is_err(), "request must still be pending");
+        assert_eq!(a.inner.inflight.lock().unwrap().len(), 1);
+
+        drop(fut);
+        assert!(
+            a.inner.inflight.lock().unwrap().is_empty(),
+            "cancelling the request future must release its in-flight slot"
+        );
         drop(drainer);
     }
 
