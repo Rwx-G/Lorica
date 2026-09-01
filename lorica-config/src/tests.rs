@@ -1189,7 +1189,7 @@ created_at = "2026-01-01T00:00:00Z"
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            46
+            48
         );
     }
 
@@ -1207,9 +1207,164 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                46
+                48
             );
         }
+    }
+
+    #[test]
+    fn test_acme_challenges_owned_by_migrations() {
+        // Story 9.1 AC #10: the table is created by migration v47, not
+        // by lorica-api's ad-hoc DDL, so schema changes to it flow
+        // through MIGRATIONS.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='acme_challenges'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("test setup: sqlite_master query");
+        assert_eq!(count, 1, "acme_challenges must exist after migrations");
+    }
+
+    #[test]
+    fn test_cluster_config_generation_persists_and_increments() {
+        // Story 9.1 AC #6: the counter is persisted (survives a store
+        // reopen), unlike the supervisor's in-memory reload
+        // generation.
+        let tmp = NamedTempFile::new().expect("test setup: new() succeeds");
+        let path = tmp.path();
+        {
+            let store = ConfigStore::open(path, None).expect("test setup: store opens");
+            assert_eq!(
+                store
+                    .cluster_config_generation()
+                    .expect("test setup: generation reads"),
+                0
+            );
+            assert_eq!(
+                store
+                    .increment_cluster_config_generation()
+                    .expect("test setup: increment"),
+                1
+            );
+            assert_eq!(
+                store
+                    .increment_cluster_config_generation()
+                    .expect("test setup: increment"),
+                2
+            );
+        }
+        {
+            let store = ConfigStore::open(path, None).expect("test setup: store reopens");
+            assert_eq!(
+                store
+                    .cluster_config_generation()
+                    .expect("test setup: generation reads"),
+                2,
+                "generation must survive a restart"
+            );
+            // Story 9.1 AC #7: the takeover epoch is an independent
+            // persisted counter (the hot-upgrade double-session
+            // interlock primitive).
+            assert_eq!(
+                store
+                    .cluster_takeover_epoch()
+                    .expect("test setup: epoch reads"),
+                0
+            );
+            assert_eq!(
+                store
+                    .increment_cluster_takeover_epoch()
+                    .expect("test setup: epoch increments"),
+                1
+            );
+            assert_eq!(
+                store
+                    .cluster_config_generation()
+                    .expect("test setup: generation reads"),
+                2,
+                "epoch and generation must not share a counter"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rotation_covers_dns_provider_credentials() {
+        // Story 9.1 AC #8's motivating bug, found live: the pre-9.1
+        // hardcoded rotation loop skipped `dns_providers.config`, so a
+        // key rotation left DNS credentials undecryptable while
+        // reporting success. The table-driven registry must include it.
+        use crate::crypto::EncryptionKey;
+
+        let key1 = EncryptionKey::generate().expect("test setup: key generates");
+        let key2 = EncryptionKey::generate().expect("test setup: key generates");
+        let store = ConfigStore::open_in_memory_with_key(key1)
+            .expect("test setup: in-memory store opens with key");
+
+        let provider = make_dns_provider();
+        store
+            .create_dns_provider(&provider)
+            .expect("test setup: dns provider inserts");
+
+        let count = store
+            .rotate_encryption_key(&key2)
+            .expect("test setup: rotation succeeds");
+        assert_eq!(count, 1, "the dns provider credential must rotate");
+
+        // The store still holds key1 in memory, so a read now fails to
+        // decrypt - proof the stored bytes were re-encrypted under
+        // key2 (production rotation restarts with the new key file).
+        assert!(
+            store.get_dns_provider(&provider.id).is_err(),
+            "post-rotation read under the old key must fail to decrypt"
+        );
+    }
+
+    #[test]
+    fn rotation_registry_covers_every_encrypting_store_module() {
+        // Story 9.1 AC #8 drift gate: scan every store module at test
+        // time; a module that encrypts at rest must write into a table
+        // named by ENCRYPTED_COLUMNS. Adding `encrypt_config` /
+        // `encrypt_key_pem` calls to a new module without registering
+        // its table fails here instead of silently bricking secrets at
+        // the next key rotation.
+        use std::collections::HashSet;
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store");
+        let registry: HashSet<&str> = crate::store::rotation_covered_tables().into_iter().collect();
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("test setup: store dir lists") {
+            let path = entry.expect("test setup: dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("test setup: source reads");
+            if !(src.contains("encrypt_config(") || src.contains("encrypt_key_pem")) {
+                continue;
+            }
+            scanned += 1;
+            // Heuristic: the module must mention at least one table
+            // the registry covers (its SQL, or - for mod.rs, which
+            // hosts the registry itself - the registry entries). A new
+            // module encrypting into an unregistered table mentions
+            // only that table's name and fails here.
+            let covered = registry.iter().any(|table| src.contains(*table));
+            assert!(
+                covered,
+                "{} encrypts at rest but mentions no table named in ENCRYPTED_COLUMNS; \
+                 add the column to the rotation registry in store/mod.rs",
+                path.display()
+            );
+        }
+        // Sanity floor so a scan breakage fails loudly instead of
+        // passing on an empty set (same pattern as the openapi gate).
+        assert!(
+            scanned >= 4,
+            "expected at least 4 encrypting store modules, scanned {scanned}"
+        );
     }
 
     // ---- Export/Import round-trip ----

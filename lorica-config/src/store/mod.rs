@@ -156,6 +156,8 @@ const MIGRATIONS: &[Migration] = &[
     (44, migrate_route_serve_robots_txt),
     (45, migrate_bot_pending_prefix_index),
     (46, migrate_session_role),
+    (47, migrate_acme_challenges),
+    (48, migrate_cluster_state),
 ];
 
 /// Whether `column` already exists on `table`, via `pragma_table_info`.
@@ -500,6 +502,119 @@ fn migrate_session_role(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_absent(conn, "sessions", "role", "TEXT NOT NULL DEFAULT 'super_admin'")
 }
 
+fn migrate_acme_challenges(conn: &Connection) -> rusqlite::Result<()> {
+    // Story 9.1 AC #10: schema ownership of `acme_challenges` moves
+    // here from the ad-hoc CREATE in lorica-api's AcmeChallengeStore
+    // (which opened a second connection on the same file and issued
+    // its own DDL). IF NOT EXISTS because every deployed database
+    // already carries the table from that ad-hoc path; from now on
+    // any schema change to it (Story 9.5 adds a network writer)
+    // flows through MIGRATIONS.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS acme_challenges (
+            token TEXT PRIMARY KEY,
+            key_auth TEXT NOT NULL
+        );",
+    )
+}
+
+fn migrate_cluster_state(conn: &Connection) -> rusqlite::Result<()> {
+    // Story 9.1 AC #6: the persisted cluster configuration generation,
+    // distinct from the supervisor's in-memory `reload_generation`
+    // (which resets to 0 on every start). Without persistence a
+    // control-plane restart would put the whole fleet in permanent
+    // false drift and every follower GenerationGate would reject the
+    // first post-restart Prepare.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cluster_state (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO cluster_state (key, value) VALUES ('config_generation', 0);
+        INSERT OR IGNORE INTO cluster_state (key, value) VALUES ('takeover_epoch', 0);",
+    )
+}
+
+/// One encrypted-at-rest storage location the key rotation walks
+/// (Story 9.1 AC #8). Adding at-rest encryption anywhere in the store
+/// REQUIRES a matching entry here; the source-scan test
+/// `rotation_registry_covers_every_encrypting_store_module` fails the
+/// build's test run when a store module encrypts into a table this
+/// registry does not name.
+#[derive(Debug, Clone, Copy)]
+enum EncryptedColumn {
+    /// A BLOB column holding raw AES-256-GCM ciphertext.
+    Blob {
+        table: &'static str,
+        id_col: &'static str,
+        col: &'static str,
+    },
+    /// A TEXT column holding base64-wrapped ciphertext.
+    Text {
+        table: &'static str,
+        id_col: &'static str,
+        col: &'static str,
+    },
+    /// One row of a key-value table (TEXT, base64-wrapped
+    /// ciphertext; the empty string means "absent").
+    KvText {
+        table: &'static str,
+        key_col: &'static str,
+        val_col: &'static str,
+        row_key: &'static str,
+    },
+}
+
+/// Every encrypted-at-rest storage location, the single registry the
+/// rotation iterates.
+const ENCRYPTED_COLUMNS: &[EncryptedColumn] = &[
+    EncryptedColumn::Blob {
+        table: "certificates",
+        id_col: "id",
+        col: "key_pem",
+    },
+    EncryptedColumn::Text {
+        table: "notification_configs",
+        id_col: "id",
+        col: "config",
+    },
+    // Missing from the pre-9.1 hardcoded loop: a key rotation left
+    // every DNS provider credential undecryptable while reporting
+    // success (Story 9.1 AC #8's motivating bug class, found live).
+    EncryptedColumn::Text {
+        table: "dns_providers",
+        id_col: "id",
+        col: "config",
+    },
+    // Log-export sink secrets (Story 9.8).
+    EncryptedColumn::KvText {
+        table: "global_settings",
+        key_col: "key",
+        val_col: "value",
+        row_key: "syslog_tls_client_key_pem",
+    },
+    EncryptedColumn::KvText {
+        table: "global_settings",
+        key_col: "key",
+        val_col: "value",
+        row_key: "otlp_logs_auth_header",
+    },
+];
+
+/// Table names covered by [`ENCRYPTED_COLUMNS`], for the coverage
+/// test in `tests.rs`.
+#[cfg(test)]
+pub(crate) fn rotation_covered_tables() -> Vec<&'static str> {
+    ENCRYPTED_COLUMNS
+        .iter()
+        .map(|c| match c {
+            EncryptedColumn::Blob { table, .. }
+            | EncryptedColumn::Text { table, .. }
+            | EncryptedColumn::KvText { table, .. } => *table,
+        })
+        .collect()
+}
+
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
     pub(crate) conn: Connection,
@@ -640,8 +755,18 @@ impl ConfigStore {
 
     // ---- Key Rotation ----
 
-    /// Re-encrypt all secrets (certificate private keys and notification configs)
-    /// from the current encryption key to a new one. Runs in a single transaction.
+    /// Re-encrypt every encrypted-at-rest value from the current
+    /// encryption key to a new one, in a single transaction, driven
+    /// by [`ENCRYPTED_COLUMNS`] (Story 9.1 AC #8).
+    ///
+    /// The rotation used to be a hardcoded two-table loop, which
+    /// silently skipped `dns_providers.config` - a real bug this
+    /// rework fixes: rotating the key left every DNS provider
+    /// credential encrypted under the retired key, breaking DNS-01
+    /// issuance at the next renewal while rotation reported success.
+    /// A registry entry is now the ONLY way a column takes part, and
+    /// the source-scan test in `tests.rs` fails when a store module
+    /// encrypts into a table the registry does not name.
     pub fn rotate_encryption_key(&self, new_key: &EncryptionKey) -> Result<u32> {
         let tx = self
             .conn
@@ -650,70 +775,73 @@ impl ConfigStore {
 
         let mut count = 0u32;
 
-        // Re-encrypt certificate private keys (key_pem is BLOB)
-        let mut stmt = tx.prepare("SELECT id, key_pem FROM certificates")?;
-        let certs: Vec<(String, Vec<u8>)> = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
-
-        for (id, encrypted_key_pem) in &certs {
-            let plaintext = self.decrypt_key_pem(encrypted_key_pem)?;
-            let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
-            tx.execute(
-                "UPDATE certificates SET key_pem = ?1 WHERE id = ?2",
-                params![re_encrypted, id],
-            )?;
-            count += 1;
-        }
-
-        // Re-encrypt notification configs (config is TEXT, base64-encoded)
-        let mut stmt = tx.prepare("SELECT id, config FROM notification_configs")?;
-        let configs: Vec<(String, String)> = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
-
-        for (id, encrypted_config) in &configs {
-            let plaintext = self.decrypt_config(encrypted_config)?;
-            let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
-            let re_encoded = base64::engine::general_purpose::STANDARD.encode(&re_encrypted);
-            tx.execute(
-                "UPDATE notification_configs SET config = ?1 WHERE id = ?2",
-                params![re_encoded, id],
-            )?;
-            count += 1;
-        }
-
-        // Re-encrypt the encrypted global-settings values (Story 9.8:
-        // the syslog mTLS client key and the OTLP logs Authorization
-        // header get the same at-rest treatment as their notification
-        // and certificate peers). Story 9.1 converts this hardcoded
-        // enumeration into a table-driven one with a coverage test so
-        // a future encrypted column cannot be silently skipped.
-        for key in ["syslog_tls_client_key_pem", "otlp_logs_auth_header"] {
-            let stored: Option<String> = tx
-                .query_row(
-                    "SELECT value FROM global_settings WHERE key = ?1",
-                    params![key],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(stored) = stored.filter(|s| !s.is_empty()) {
-                let plaintext = self.decrypt_config(&stored)?;
-                let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
-                let re_encoded = base64::engine::general_purpose::STANDARD.encode(&re_encrypted);
-                tx.execute(
-                    "UPDATE global_settings SET value = ?1 WHERE key = ?2",
-                    params![re_encoded, key],
-                )?;
-                count += 1;
+        for column in ENCRYPTED_COLUMNS {
+            match column {
+                EncryptedColumn::Blob { table, id_col, col } => {
+                    let mut stmt = tx.prepare(&format!("SELECT {id_col}, {col} FROM {table}"))?;
+                    let rows: Vec<(String, Vec<u8>)> = stmt
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    drop(stmt);
+                    for (id, stored) in &rows {
+                        let plaintext = self.decrypt_key_pem(stored)?;
+                        let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
+                        tx.execute(
+                            &format!("UPDATE {table} SET {col} = ?1 WHERE {id_col} = ?2"),
+                            params![re_encrypted, id],
+                        )?;
+                        count += 1;
+                    }
+                }
+                EncryptedColumn::Text { table, id_col, col } => {
+                    let mut stmt = tx.prepare(&format!("SELECT {id_col}, {col} FROM {table}"))?;
+                    let rows: Vec<(String, String)> = stmt
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    drop(stmt);
+                    for (id, stored) in &rows {
+                        let plaintext = self.decrypt_config(stored)?;
+                        let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
+                        let re_encoded =
+                            base64::engine::general_purpose::STANDARD.encode(&re_encrypted);
+                        tx.execute(
+                            &format!("UPDATE {table} SET {col} = ?1 WHERE {id_col} = ?2"),
+                            params![re_encoded, id],
+                        )?;
+                        count += 1;
+                    }
+                }
+                EncryptedColumn::KvText {
+                    table,
+                    key_col,
+                    val_col,
+                    row_key,
+                } => {
+                    let stored: Option<String> = tx
+                        .query_row(
+                            &format!("SELECT {val_col} FROM {table} WHERE {key_col} = ?1"),
+                            params![row_key],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(stored) = stored.filter(|s| !s.is_empty()) {
+                        let plaintext = self.decrypt_config(&stored)?;
+                        let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
+                        let re_encoded =
+                            base64::engine::general_purpose::STANDARD.encode(&re_encrypted);
+                        tx.execute(
+                            &format!("UPDATE {table} SET {val_col} = ?1 WHERE {key_col} = ?2"),
+                            params![re_encoded, row_key],
+                        )?;
+                        count += 1;
+                    }
+                }
             }
         }
 
@@ -721,6 +849,59 @@ impl ConfigStore {
             .map_err(|e| ConfigError::Validation(format!("failed to commit transaction: {e}")))?;
 
         Ok(count)
+    }
+
+    /// Read the persisted cluster configuration generation (Story 9.1
+    /// AC #6). Returns 0 on a store that has never taken a cluster
+    /// mutation.
+    pub fn cluster_config_generation(&self) -> Result<u64> {
+        let value: i64 = self.conn.query_row(
+            "SELECT value FROM cluster_state WHERE key = 'config_generation'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(value.max(0) as u64)
+    }
+
+    /// Atomically increment and return the persisted cluster
+    /// configuration generation. Every cluster-replicated mutation
+    /// calls this (Story 9.4); the returned value survives restarts,
+    /// unlike the supervisor's in-memory `reload_generation`.
+    pub fn increment_cluster_config_generation(&self) -> Result<u64> {
+        self.conn.execute(
+            "UPDATE cluster_state SET value = value + 1 WHERE key = 'config_generation'",
+            [],
+        )?;
+        self.cluster_config_generation()
+    }
+
+    /// Read the persisted supervisor takeover epoch (Story 9.1 AC #7).
+    pub fn cluster_takeover_epoch(&self) -> Result<u64> {
+        let value: i64 = self.conn.query_row(
+            "SELECT value FROM cluster_state WHERE key = 'takeover_epoch'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(value.max(0) as u64)
+    }
+
+    /// Atomically increment and return the supervisor takeover epoch.
+    ///
+    /// The hot-upgrade double-session interlock (Story 9.1 AC #7): a
+    /// NEW supervisor taking over via `--hot-upgrade` bumps this
+    /// before serving the cluster plane. Cluster sessions (Story 9.2)
+    /// tag themselves with the epoch they were accepted under, and
+    /// the session registry terminates any session from an older
+    /// epoch, so during the old/new supervisor overlap a follower can
+    /// never hold two live sessions for one `node_id` - the old
+    /// supervisor's sessions are fenced the moment the new one takes
+    /// the epoch.
+    pub fn increment_cluster_takeover_epoch(&self) -> Result<u64> {
+        self.conn.execute(
+            "UPDATE cluster_state SET value = value + 1 WHERE key = 'takeover_epoch'",
+            [],
+        )?;
+        self.cluster_takeover_epoch()
     }
 
     /// Clear all importable data before applying a TOML import.
