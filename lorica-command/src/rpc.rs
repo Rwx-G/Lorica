@@ -48,6 +48,13 @@
 //! The legacy bare `Command`/`Response` wire format used by
 //! [`crate::CommandChannel`] is *not* compatible with `RpcEndpoint`; a
 //! given socket pair must use one or the other.
+//!
+//! One endpoint = one FIFO byte stream. There is no frame-level
+//! multiplexing: a large frame head-of-line-blocks everything behind
+//! it for its transfer time. Traffic classes that must not block each
+//! other (Story 9.2 AC #7: a config push versus a heartbeat) need
+//! separate endpoints on separate connections; per-class credit above
+//! a single endpoint cannot deliver that isolation.
 
 use std::collections::HashMap;
 use std::io;
@@ -82,12 +89,24 @@ pub struct RpcLimits {
     /// awaits `tx_out.send(...)`, which the per-request timeout
     /// bounds; a stuck peer cannot blow the queue.
     pub outbound_queue_cap: usize,
+    /// Bounded incoming-request queue capacity, independent of the
+    /// outbound side. The per-connection decoded-frame memory ceiling
+    /// is `(outbound_queue_cap + inbound_queue_cap) * max_message_size`
+    /// worst case; a WAN endpoint raising `max_message_size` sizes the
+    /// two queues separately.
+    pub inbound_queue_cap: usize,
     /// If enqueuing to the outbound channel takes longer than this,
     /// log a warning so operators can spot a stuck peer. Advisory
     /// only - the per-request timeout stays the authoritative bound.
     pub slow_enqueue_warn: Duration,
     /// Default per-request timeout for callers that use it.
     pub default_request_timeout: Duration,
+    /// Maximum time to receive a frame's BODY once its length prefix
+    /// has arrived. Idling between frames is legitimate (the worker
+    /// plane has no heartbeat), but a peer that announces a length
+    /// and then stalls is holding the connection's buffer hostage
+    /// (WAN slowloris); the reader kills the connection instead.
+    pub frame_read_timeout: Duration,
     /// Upper bound on concurrently in-flight requests (Story 9.1
     /// AC #4). A request past the cap fails with
     /// [`ChannelError::InflightFull`] instead of growing the map
@@ -100,8 +119,10 @@ impl Default for RpcLimits {
         Self {
             max_message_size: 1024 * 1024,
             outbound_queue_cap: 256,
+            inbound_queue_cap: 256,
             slow_enqueue_warn: Duration::from_millis(10),
             default_request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            frame_read_timeout: Duration::from_secs(30),
             // Generous versus the documented reload-frequency volume
             // of the worker plane, small enough that a dead peer
             // cannot hold more than ~a few MB of oneshot senders.
@@ -237,7 +258,7 @@ struct Inner<F: Frame> {
 /// A request received from the peer, awaiting a reply.
 ///
 /// The caller must eventually reply (via [`Self::reply_frame`], or the
-/// `Envelope`-specific `reply` / `reply_ok` / `reply_error`) — dropping
+/// `Envelope`-specific `reply` / `reply_ok` / `reply_error`) - dropping
 /// without replying lets the peer's `request` time out naturally.
 pub struct IncomingRequest<F: Frame> {
     req: F::Request,
@@ -370,9 +391,10 @@ impl<F: Frame> RpcEndpoint<F> {
         let (read_half, write_half) = tokio::io::split(stream);
         let inflight: InflightMap<F::Response> = Arc::new(Mutex::new(HashMap::new()));
         let (tx_out, rx_out) = mpsc::channel::<F>(limits.outbound_queue_cap);
-        let (tx_in, rx_in) = mpsc::channel::<IncomingRequest<F>>(limits.outbound_queue_cap);
+        let (tx_in, rx_in) = mpsc::channel::<IncomingRequest<F>>(limits.inbound_queue_cap);
 
         let max = limits.max_message_size;
+        let frame_read_timeout = limits.frame_read_timeout;
         let writer = tokio::spawn(writer_task::<F, _>(write_half, rx_out, max));
         let reader = tokio::spawn(reader_task::<F, _>(
             read_half,
@@ -380,6 +402,7 @@ impl<F: Frame> RpcEndpoint<F> {
             tx_in,
             tx_out.clone(),
             max,
+            frame_read_timeout,
         ));
 
         let endpoint = Self {
@@ -406,6 +429,15 @@ impl<F: Frame> RpcEndpoint<F> {
     /// This endpoint's transport limits.
     pub fn limits(&self) -> &RpcLimits {
         &self.inner.limits
+    }
+
+    /// Whether the endpoint's outbound side is closed (writer task
+    /// gone, or the peer disconnected and the writer exited). Lets a
+    /// reconnecting caller (Story 9.2's dialer) learn the endpoint is
+    /// dead from socket EOF instead of by issuing a request and
+    /// failing.
+    pub fn is_closed(&self) -> bool {
+        self.inner.tx_out.is_closed()
     }
 
     /// Allocate the next outgoing sequence number.
@@ -454,12 +486,25 @@ impl<F: Frame> RpcEndpoint<F> {
         let slow_enqueue_warn = self.inner.limits.slow_enqueue_warn;
         let start = Instant::now();
 
+        // Fast path: with room in the outbound queue (the common case
+        // on the per-request breaker/verdict plane), enqueue without
+        // arming the slow-enqueue warning timer - `try_send` never
+        // registers a timer-wheel entry.
+        let backpressured_frame = match tx_out.try_send(frame) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(frame)) => Some(frame),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.forget(seq);
+                return Err(ChannelError::Closed);
+            }
+        };
+
         // Cover both enqueue and response wait under a single timeout so
         // that a stuck peer surfaces as Timeout, not an indefinite hang.
         //
         // Cancel-safety: if the outer `timeout` fires while `send_fut`
         // is still pending (queue full, peer stuck), dropping `full`
-        // drops `send_fut` before the frame leaves the process — no
+        // drops `send_fut` before the frame leaves the process - no
         // request is enqueued, no spurious response can arrive, and
         // `forget(seq)` below then removes the inflight oneshot. If the
         // timeout fires after enqueue but before `resp_rx` resolves, a
@@ -468,10 +513,10 @@ impl<F: Frame> RpcEndpoint<F> {
         // "response for unknown sequence"), and the oneshot sender is
         // simply discarded. Either way, no leak, no double-send.
         let full = async move {
-            // Enqueue. Emit a warning if the send future is still pending
-            // after `slow_enqueue_warn`; keep awaiting on the same future
-            // so the request is not duplicated.
-            {
+            // Backpressure path only: emit a warning if the send future
+            // is still pending after `slow_enqueue_warn`; keep awaiting
+            // on the same future so the request is not duplicated.
+            if let Some(frame) = backpressured_frame {
                 let send_fut = tx_out.send(frame);
                 tokio::pin!(send_fut);
                 let warn_delay = tokio::time::sleep(slow_enqueue_warn);
@@ -604,12 +649,14 @@ where
             );
             continue;
         }
-        if let Err(e) = write_half.write_all(&len.to_le_bytes()).await {
-            tracing::debug!(error = %e, "rpc: writer failed on length prefix");
-            break;
-        }
-        if let Err(e) = write_half.write_all(&encoded).await {
-            tracing::debug!(error = %e, "rpc: writer failed on body");
+        // One buffer, one write_all: halves the syscall (and, on the
+        // future TLS transport, record-write) count per frame versus
+        // writing the prefix and body separately.
+        let mut wire = Vec::with_capacity(8 + encoded.len());
+        wire.extend_from_slice(&len.to_le_bytes());
+        wire.extend_from_slice(&encoded);
+        if let Err(e) = write_half.write_all(&wire).await {
+            tracing::debug!(error = %e, "rpc: writer failed on frame");
             break;
         }
         if let Err(e) = write_half.flush().await {
@@ -626,10 +673,14 @@ async fn reader_task<F: Frame, R>(
     tx_in: mpsc::Sender<IncomingRequest<F>>,
     tx_out: mpsc::Sender<F>,
     max: u64,
+    frame_read_timeout: Duration,
 ) where
     R: AsyncRead + Unpin + Send,
 {
     loop {
+        // Waiting for the next length prefix is NOT bounded: idling
+        // between frames is legitimate (the worker plane has no
+        // heartbeat). Everything after the prefix is.
         let mut len_buf = [0u8; 8];
         if let Err(e) = read_half.read_exact(&mut len_buf).await {
             if e.kind() != io::ErrorKind::UnexpectedEof {
@@ -642,10 +693,35 @@ async fn reader_task<F: Frame, R>(
             tracing::error!(bytes = len, "rpc: inbound frame exceeds max_message_size");
             break;
         }
-        let mut buf = vec![0u8; len as usize];
-        if let Err(e) = read_half.read_exact(&mut buf).await {
-            tracing::debug!(error = %e, "rpc: reader failed on body");
-            break;
+        // Grow the buffer as bytes arrive (capacity capped at 64 KiB
+        // up front) instead of eagerly committing `len` bytes: a peer
+        // must actually SEND max_message_size to make us hold it, and
+        // a peer that announces a length then stalls is cut off by
+        // `frame_read_timeout` instead of pinning the buffer forever.
+        let mut buf: Vec<u8> = Vec::with_capacity(std::cmp::min(len as usize, 64 * 1024));
+        let body_read = tokio::time::timeout(
+            frame_read_timeout,
+            (&mut read_half).take(len).read_to_end(&mut buf),
+        )
+        .await;
+        match body_read {
+            Ok(Ok(n)) if n as u64 == len => {}
+            Ok(Ok(_)) => {
+                tracing::debug!("rpc: reader hit EOF mid-frame");
+                break;
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "rpc: reader failed on body");
+                break;
+            }
+            Err(_) => {
+                tracing::error!(
+                    bytes = len,
+                    "rpc: frame body not received within frame_read_timeout; \
+                     closing the connection"
+                );
+                break;
+            }
         }
         let frame = match F::decode(&buf[..]) {
             Ok(f) => f,
@@ -698,7 +774,7 @@ async fn reader_task<F: Frame, R>(
     // task is exiting (it would leave dependent tasks and Arc counts in
     // an awkward state). In the impossible-in-practice case where the
     // mutex is already poisoned, pending requesters fall back to their
-    // per-request timeout instead of a prompt Closed — acceptable
+    // per-request timeout instead of a prompt Closed - acceptable
     // degradation for a pathological situation we don't actually expect
     // to hit.
     if let Ok(mut map) = inflight.lock() {
