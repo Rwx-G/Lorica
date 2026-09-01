@@ -212,6 +212,75 @@ and version 18 is an inline entry (`store/mod.rs:280-286`), while
 
 ### Completion Notes
 
+- **QA iteration 1 (2026-09-02)**: five-auditor sweep (quality,
+  security, performance, architecture + AC traceability) returned
+  1 Critical, 5 High (after my aggregation), and a set of cheap
+  Mediums; all fixed in one pass:
+  - Critical: the canonical blob embedded secret MATERIAL while
+    doubling as the future replication payload. Secrets now encode
+    as `sha256:<hex>` digests (drift-visible, nothing to steal);
+    actual key/credential transfer stays on Story 9.5's node-scoped
+    path. Free today (zero production callers), a wire break after
+    9.4.
+  - Rotation: row read failures now abort the transaction instead of
+    silently under-rotating; every re-encrypted value is
+    decrypt-verified under the new key before the UPDATE; the UPDATE
+    is prepared once per column; the drift-gate test now extracts
+    the actual INSERT/UPDATE target tables (recursive scan, mod.rs
+    exempt, reviewed non-encrypted targets listed) instead of a
+    substring match.
+  - Cluster counters: increment via single-statement
+    `UPDATE .. RETURNING` (two concurrent mutators could both read
+    the other's post-increment value and stamp two configs with one
+    generation).
+  - Takeover epoch: the old supervisor re-takes the epoch on the
+    Rollback branch, otherwise a FAILED upgrade would fence the
+    surviving supervisor's sessions under 9.2's fencing rule.
+  - FD handoff: cluster slot widened to role-qualified entries
+    (`cluster:op:<bind>` / `cluster:enroll:<bind>`) because 9.2
+    mandates two listeners and the table is a cross-version wire
+    contract; duplicate/malformed/unknown-role keys now fail the
+    pull (rollback) instead of silently dropping a descriptor.
+  - RpcEndpoint: `try_send` fast path (no timer armed unless
+    backpressured - request() sits on the per-HTTP-request
+    breaker/verdict path); `is_closed()`; `inbound_queue_cap` and
+    `frame_read_timeout` in RpcLimits (body-read bounded, idle wait
+    not - the worker plane has no heartbeat); incremental body
+    buffer (64 KiB initial cap) so a length prefix alone cannot
+    commit max_message_size; single-buffer frame writes; module doc
+    states the one-endpoint-one-FIFO contract for 9.2.
+  - Canonical decode: version peeked tolerantly BEFORE the strict
+    pass (a v2 blob now fails as "version not supported", not on its
+    first unknown field); decode errors carry position only, never
+    field values.
+  - GlobalSettings replication drift gate: exhaustive destructuring
+    test (no `..`) forces every future field through an explicit
+    replicate-or-node-local decision at compile time.
+  - present() carries the authorization's hostname (9.5's fleet
+    solver input; folded into this cycle's one breaking trait
+    change); tokens are recorded before presenting so a partial
+    publish is retracted; NoopHttp01Solver now fails closed;
+    challenge-store cache entry removed when persist fails; DELETE
+    failures logged (token only).
+  - LORICA_ACME_DIRECTORY_URL: https-only (non-https override is
+    ignored with an error log), and use of the override is WARN'd at
+    issuance.
+  - e2e: wait_for_backend/wait_for_api helpers wired into the acme
+    smoke (wait_for_api itself fixed: it curl -f'd an
+    auth-required endpoint, so it could never succeed - why it had
+    zero callers); stale fixture comment refreshed.
+- **QA findings deliberately NOT fixed this story** (logged for
+  backlog / handoffs): RpcObserver event hook (9.2 designs the
+  vocabulary with its consumer; is_closed() landed now),
+  DashMap/sharded inflight map (self-flagged threshold not reached),
+  encoded_len double computation (measure first),
+  canonical_bytes double serialize/sort (cold until 9.4 wires drift
+  checks), rpc.rs file split (9.2), acme_challenges TTL + prune
+  (9.5 adds expires_at), CLI programmatic key-file swap on rotation,
+  transfer_fd bind-then-chmod TOCTOU + SO_PEERCRED (forked crate),
+  challenge-path INFO token logging downgrade, driver account/order
+  bootstrap dedup, TableName newtype for rotation SQL.
+
 - **AC #5 (canonical encoder) - the Dev Notes' determinism premise
   was WRONG**: serde serializes a `HashMap` field in the map's own
   iteration order; the BTreeMap-backed `serde_json::Map` only kicks
