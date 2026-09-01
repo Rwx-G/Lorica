@@ -1,7 +1,7 @@
 # Story 9.8: Syslog Sink and OTLP Logs Signal
 
 **Epic:** 9 (v1.7.0)
-**Status:** Draft
+**Status:** Review
 **Author:** Romain G.
 
 **Depends on:** nothing in this epic. Independent of the cluster and
@@ -46,16 +46,17 @@ logs and WAF events into my pipeline.
 
 ## Tasks / Subtasks
 
-- [ ] AC #1: RFC 5424 encoder + three transports + per-kind toggles.
-- [ ] AC #2: `logs` feature flip, exporter wiring, span-context
+- [x] AC #1: RFC 5424 encoder + three transports + per-kind toggles.
+- [x] AC #2: `logs` feature flip, exporter wiring, span-context
       correlation.
-- [ ] AC #3: node identity fields on both sinks.
-- [ ] AC #4: bounded queue + drop counters.
-- [ ] AC #5: decide the execution model, document it, implement.
-- [ ] AC #6: Settings tab + test endpoints.
-- [ ] AC #7: hot reload through the two-phase path.
-- [ ] AC #8: scrubbing on JSON and TOML paths.
-- [ ] AC #9: docs.
+- [x] AC #3: node identity fields on both sinks.
+- [x] AC #4: bounded queue + drop counters.
+- [x] AC #5: decide the execution model, document it, implement.
+- [x] AC #6: Settings tab + test endpoints.
+- [x] AC #7: hot reload through the two-phase path.
+- [x] AC #8: scrubbing on JSON and TOML paths.
+- [x] AC #9: docs (README done; `docs/cluster.md` section deferred to
+      Story 9.6, which creates that file - see Completion Notes).
 
 ## Dev Notes
 
@@ -116,25 +117,91 @@ release something shippable while the cluster stories are still moving.
 
 ### Debug Log
 
-(empty)
+- 2026-09-01: first Docker `cargo check` failed twice on environment,
+  not code: (1) `lorica-dashboard/build.rs` needs
+  `SKIP_FRONTEND_BUILD=1` in a Node-less container; (2)
+  `rust:1-bookworm` lacks `cmake` + `protobuf-compiler`
+  (`libz-ng-sys`) - both already documented in
+  `.claude/rules/lorica-docker.md`.
+- 2026-09-01: `Result<Option<TlsConnector>, _>::expect_err` does not
+  compile (`TlsConnector: !Debug`); the unit test matches instead.
 
 ### Completion Notes
 
-(empty)
+- **AC #5 decision (execution model)**: each sink consumer is a plain
+  OS thread. The syslog consumer owns a **current-thread tokio
+  runtime** (async sockets for TCP+TLS); the OTLP consumer uses
+  `blocking_recv` and needs no runtime at all (the SDK batch
+  processor does its own I/O on a dedicated thread). This keeps
+  `log_writer.rs`'s mode-independence argument (identical behaviour
+  in supervisor, worker and single-process modes regardless of the
+  ambient runtime) while still using async I/O where a sink needs it.
+- **Placement deviation from the anticipated File List**: the syslog
+  sink lives in `lorica-api/src/log_sinks/` (beside `log_writer.rs`,
+  whose bounded/`try_send`/drop contract it reuses), NOT in
+  `lorica-notify`. lorica-notify is alert-only (10 events / 60 s
+  rate limit) and has neither `tokio/net` nor `tokio-rustls`;
+  putting a per-request-volume sink there would have added deps and
+  fought the dispatcher's rate limiter.
+- **Trace correlation (AC #2/#3)** is captured at publish time on the
+  hot path (`ctx.outgoing_traceparent`) and carried on the event
+  envelope - the consumer thread has no ambient span. WAF events
+  publish without trace context (several emit sites are pre-route
+  with no ctx in scope); the access-log record for the same request
+  carries the correlation.
+- **Process topology**: access logs + WAF events publish from the
+  proxy process (worker / single), audit entries from the management
+  process (supervisor / single) via `emit_audit_event`, the single
+  funnel all audit paths hit. Each process installs its own hub via
+  `apply_per_process_reload_state` (6th line) + boot-time calls in
+  the three startups; snapshot-dedup mirrors the OTel exporter so a
+  route edit never tears down sink connections.
+- **gRPC + auth header**: `otlp_logs_auth_header` is not applied on
+  the `grpc` transport (would pull tonic metadata types in);
+  a warn log points operators at http-proto / http-json. Documented
+  in the code and the API doc comment.
+- **node_id / node_name (AC #3)**: fields exist on the sink config
+  and the wire formats (syslog SD params, OTLP attributes) but stay
+  empty until Story 9.6 wires cluster identity; standalone installs
+  emit without them, as required.
+- **AC #9 partial deferral**: README observability section done
+  (worked rsyslog + OTLP collector examples); `docs/cluster.md` does
+  not exist yet - it is created by Story 9.6, which must add the
+  log-sink section there.
+- Rate limiting: the two new test endpoints are rate-limited
+  (`destructive_cud` bucket) unlike the historical otel probe,
+  because the syslog test emits a real network message.
 
 ## File List
 
-Anticipated:
-
-- `lorica-notify/src/channels/syslog.rs` (new, RFC 5424)
-- `lorica/src/otel.rs` (logs exporter + span correlation)
+- `lorica-config/src/models/settings.rs` (15 new GlobalSettings fields + defaults)
+- `lorica-config/src/store/settings.rs` (KV read arms + write stanzas)
+- `lorica-config/src/export.rs` (scrub syslog client key + OTLP auth header)
+- `lorica-config/src/import.rs` (reject redacted sink secrets)
+- `lorica-config/src/tests.rs` (round-trip + scrub/reject tests)
+- `lorica-api/src/log_sinks/mod.rs` (new: sink hub, config, publish API)
+- `lorica-api/src/log_sinks/syslog.rs` (new: RFC 5424 encoder + UDP/TCP/TLS transports + test message)
+- `lorica-api/src/lib.rs` (module registration)
+- `lorica-api/Cargo.toml` (tokio `net` feature)
+- `lorica-api/src/metrics.rs` (`lorica_log_sink_dropped_total{sink,kind}`)
+- `lorica-api/src/audit.rs` (publish audit entries to sinks)
+- `lorica-api/src/settings.rs` (validation, scrubbing, schema, 2 test endpoints)
+- `lorica-api/src/server.rs` (routes for the test endpoints)
+- `lorica-api/openapi.yaml` (2 new paths)
 - `lorica/Cargo.toml` (`logs` feature on the three otel crates)
-- `lorica-api/src/settings.rs` (sink config + test endpoints)
-- `lorica-dashboard/frontend/src/routes/Settings.svelte` (Log export tab)
-- `tests-e2e-docker/` (`log-sinks` profile)
+- `lorica/src/otel.rs` (`OtelLogsConfig`, `init_logs` / `shutdown_logs`, record mapping)
+- `lorica/src/reload.rs` (`apply_log_sinks_from_store` + bundle wiring)
+- `lorica/src/proxy_wiring.rs` (access-log publish with trace context)
+- `lorica/src/proxy_wiring/filters.rs` (WAF event publish)
+- `lorica/src/startup/single.rs`, `lorica/src/startup/worker.rs` (boot-time sink install)
+- `lorica-dashboard/frontend/` (Log export tab, api client, validators - see frontend commit)
+- `tests-e2e-docker/` (`log-sinks` profile - see e2e commit)
+- `README.md` (observability section + API table)
+- `CHANGELOG.md` (`[Unreleased]` Added entries)
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Syslog hand-rolled rather than added as a dependency; OTLP logs via a feature flip on already-pinned crates; sink execution model promoted to an acceptance criterion. Status Draft. | Romain G. |
+| 2026-09-01 | 0.2 | Implemented: config fields + KV projection + secret scrub/reject; sink hub + RFC 5424 syslog sink in `lorica-api/src/log_sinks/`; OTLP logs exporter behind the existing `otel` feature; reload + boot wiring in all three process modes; hot-path publish with trace context; settings validation, JSON masking, 2 test endpoints + openapi; dashboard "Log export" tab; `log-sinks` e2e profile (phase 8). Rust unit tests (567 in lorica-api) and all four frontend gates green; CI-equivalent clippy + audit pending final run. Status Review. | Romain G. |
