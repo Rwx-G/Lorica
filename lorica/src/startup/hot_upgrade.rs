@@ -94,17 +94,49 @@ fn restrict_socket_perms(path: &Path) {
 /// address (e.g. `0.0.0.0:8080`) so the worker manager can re-tag them.
 const MANAGEMENT_KEY_PREFIX: &str = "management:";
 
-/// `Fds` table key prefix for the cluster-plane listener (Story 9.1
-/// AC #7). The listener itself arrives with Story 9.2's
+/// `Fds` table key prefix for cluster-plane listeners (Story 9.1
+/// AC #7). The listeners themselves arrive with Story 9.2's
 /// `--cluster-listen`; the handoff seam is extended here first so the
 /// FD-transfer wire format is settled before any cluster deployment
-/// exists, and a control-plane node never loses its accept queue
-/// across a hot binary upgrade.
+/// exists, and a control-plane node never loses its accept queues
+/// across a hot binary upgrade. Story 9.2 mandates TWO distinct
+/// listeners (operational mTLS plane and enrollment), and this table
+/// is exchanged between two different binary versions, so the key
+/// carries the role now: widening the format later would be a
+/// hot-upgrade compatibility event, not a refactor.
 const CLUSTER_KEY_PREFIX: &str = "cluster:";
 
-/// `Fds` table key for the cluster listener bound at `bind_addr`.
-pub fn cluster_fds_key(bind_addr: &str) -> String {
-    format!("{CLUSTER_KEY_PREFIX}{bind_addr}")
+/// Role of a cluster-plane listener in the FD-handoff table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterListenerRole {
+    /// The operational mTLS cluster plane (Story 9.2 AC #2).
+    Operational,
+    /// The enrollment listener (Story 9.2 AC #2).
+    Enrollment,
+}
+
+impl ClusterListenerRole {
+    /// Wire token inside the `cluster:<role>:<bind>` key.
+    fn key_part(self) -> &'static str {
+        match self {
+            ClusterListenerRole::Operational => "op",
+            ClusterListenerRole::Enrollment => "enroll",
+        }
+    }
+
+    fn from_key_part(part: &str) -> Option<Self> {
+        match part {
+            "op" => Some(ClusterListenerRole::Operational),
+            "enroll" => Some(ClusterListenerRole::Enrollment),
+            _ => None,
+        }
+    }
+}
+
+/// `Fds` table key for the cluster listener with `role` bound at
+/// `bind_addr`: `cluster:<role>:<bind>`.
+pub fn cluster_fds_key(role: ClusterListenerRole, bind_addr: &str) -> String {
+    format!("{CLUSTER_KEY_PREFIX}{}:{bind_addr}", role.key_part())
 }
 
 /// `<data_dir>/upgrade` - the operator-only staging directory shared with
@@ -209,34 +241,35 @@ pub fn notify_payload(main_pid: i32) -> String {
 }
 
 /// Listener FDs pulled from an outgoing supervisor during a hot upgrade.
+#[derive(Debug)]
 pub struct InheritedListeners {
     /// Proxy listeners keyed by bind address (HTTP, optionally HTTPS).
     pub proxy: Vec<(String, RawFd)>,
     /// The management-API listener FD, if it was handed over.
     pub management: Option<RawFd>,
-    /// The cluster-plane listener (bind address, FD), if the outgoing
-    /// supervisor ran with `--cluster-listen` (Story 9.1 AC #7; the
-    /// listener itself lands in Story 9.2).
-    pub cluster: Option<(String, RawFd)>,
+    /// Cluster-plane listeners (role, bind address, FD), if the
+    /// outgoing supervisor ran with `--cluster-listen` (Story 9.1
+    /// AC #7; the listeners themselves land in Story 9.2).
+    pub cluster: Vec<(ClusterListenerRole, String, RawFd)>,
 }
 
 /// Build the `Fds` table the old supervisor serves: every proxy listener
 /// keyed by its bind address, the management listener under the
-/// [`MANAGEMENT_KEY_PREFIX`] key, and the cluster listener (when
-/// present) under the [`CLUSTER_KEY_PREFIX`] key.
+/// [`MANAGEMENT_KEY_PREFIX`] key, and each cluster listener (when
+/// present) under its role-qualified [`CLUSTER_KEY_PREFIX`] key.
 fn build_fds_table(
     proxy: &[(String, RawFd)],
     management_fd: RawFd,
     management_port: u16,
-    cluster: Option<&(String, RawFd)>,
+    cluster: &[(ClusterListenerRole, String, RawFd)],
 ) -> Fds {
     let mut fds = Fds::new();
     for (addr, fd) in proxy {
         fds.add(addr.clone(), *fd);
     }
     fds.add(management_fds_key(management_port), management_fd);
-    if let Some((bind, fd)) = cluster {
-        fds.add(cluster_fds_key(bind), *fd);
+    for (role, bind, fd) in cluster {
+        fds.add(cluster_fds_key(*role, bind), *fd);
     }
     fds
 }
@@ -251,7 +284,7 @@ pub fn serve_listener_fds_blocking(
     proxy: &[(String, RawFd)],
     management_fd: RawFd,
     management_port: u16,
-    cluster: Option<&(String, RawFd)>,
+    cluster: &[(ClusterListenerRole, String, RawFd)],
 ) -> Result<(), String> {
     let table = build_fds_table(proxy, management_fd, management_port, cluster);
     let sock = transfer_sock_path(data_dir);
@@ -280,39 +313,65 @@ pub fn pull_inherited_listeners(
         .map_err(|e| format!("failed to pull inherited listeners from {sock_str}: {e}"))?;
 
     let (serialized_keys, serialized_fds) = fds.serialize();
-    Ok(partition_inherited_fds(
-        serialized_keys,
-        serialized_fds,
-        management_port,
-    ))
+    partition_inherited_fds(serialized_keys, serialized_fds, management_port)
 }
 
 /// Partition a pulled FD table into proxy / management / cluster
 /// listeners by key prefix. Pure (no socket ops), so the wire-format
 /// partitioning is unit-testable without an SCM_RIGHTS round-trip.
+///
+/// The table's only producer is the outgoing supervisor's own
+/// `build_fds_table`, so a duplicate management/cluster key or an
+/// unknown cluster role means the two binaries disagree about the
+/// wire format - failing the pull (which rolls the upgrade back)
+/// beats silently dropping a descriptor.
 fn partition_inherited_fds(
     keys: Vec<String>,
     fds: Vec<RawFd>,
     management_port: u16,
-) -> InheritedListeners {
+) -> Result<InheritedListeners, String> {
     let management_key = management_fds_key(management_port);
     let mut proxy: Vec<(String, RawFd)> = Vec::new();
     let mut management: Option<RawFd> = None;
-    let mut cluster: Option<(String, RawFd)> = None;
+    let mut cluster: Vec<(ClusterListenerRole, String, RawFd)> = Vec::new();
     for (key, fd) in keys.into_iter().zip(fds) {
-        if key == management_key || key.starts_with(MANAGEMENT_KEY_PREFIX) {
+        if key.starts_with(MANAGEMENT_KEY_PREFIX) {
+            if management.is_some() {
+                return Err(format!(
+                    "inherited FD table carries a duplicate management key `{key}`"
+                ));
+            }
+            if key != management_key {
+                tracing::warn!(
+                    key = %key,
+                    expected = %management_key,
+                    "hot upgrade: inherited management listener does not match \
+                     the configured management port; adopting it anyway"
+                );
+            }
             management = Some(fd);
-        } else if let Some(bind) = key.strip_prefix(CLUSTER_KEY_PREFIX) {
-            cluster = Some((bind.to_string(), fd));
+        } else if let Some(rest) = key.strip_prefix(CLUSTER_KEY_PREFIX) {
+            let (role_part, bind) = rest.split_once(':').ok_or_else(|| {
+                format!("inherited FD table carries a malformed cluster key `{key}`")
+            })?;
+            let role = ClusterListenerRole::from_key_part(role_part).ok_or_else(|| {
+                format!("inherited FD table carries an unknown cluster role in `{key}`")
+            })?;
+            if cluster.iter().any(|(r, b, _)| *r == role && b == bind) {
+                return Err(format!(
+                    "inherited FD table carries a duplicate cluster key `{key}`"
+                ));
+            }
+            cluster.push((role, bind.to_string(), fd));
         } else {
             proxy.push((key, fd));
         }
     }
-    InheritedListeners {
+    Ok(InheritedListeners {
         proxy,
         management,
         cluster,
-    }
+    })
 }
 
 /// NEW-side readiness handshake: repeatedly announce readiness to the old
@@ -466,10 +525,10 @@ pub struct HandoffArgs {
     pub management_fd: RawFd,
     /// Management port (used to key the management FD in the table).
     pub management_port: u16,
-    /// Cluster-plane listener (bind address, FD) to hand over, when
-    /// the node runs with `--cluster-listen` (Story 9.1 AC #7; wired
-    /// by Story 9.2, always `None` until then).
-    pub cluster_fd: Option<(String, RawFd)>,
+    /// Cluster-plane listeners (role, bind address, FD) to hand over,
+    /// when the node runs with `--cluster-listen` (Story 9.1 AC #7;
+    /// wired by Story 9.2, always empty until then).
+    pub cluster_fds: Vec<(ClusterListenerRole, String, RawFd)>,
     /// Full argv for the new binary, `argv[0]` first.
     pub child_argv: Vec<String>,
 }
@@ -524,14 +583,14 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
     let serve_proxy = args.proxy_fds.clone();
     let serve_mgmt = args.management_fd;
     let serve_port = args.management_port;
-    let serve_cluster = args.cluster_fd.clone();
+    let serve_cluster = args.cluster_fds.clone();
     let serve_task = tokio::task::spawn_blocking(move || {
         serve_listener_fds_blocking(
             &serve_data_dir,
             &serve_proxy,
             serve_mgmt,
             serve_port,
-            serve_cluster.as_ref(),
+            &serve_cluster,
         )
     });
 
@@ -568,21 +627,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn partition_routes_cluster_listener_by_prefix() {
-        // Story 9.1 AC #7: the FD-transfer wire format carries an
-        // optional cluster listener alongside proxy + management, and
-        // the new supervisor partitions it back out by key prefix.
+    fn partition_routes_cluster_listeners_by_role_key() {
+        // Story 9.1 AC #7: the FD-transfer wire format carries the
+        // role-qualified cluster listeners alongside proxy +
+        // management, and the new supervisor partitions them back out
+        // by key prefix. Two roles because Story 9.2 mandates distinct
+        // operational and enrollment listeners.
         let keys = vec![
             "0.0.0.0:8080".to_string(),
             "0.0.0.0:8443".to_string(),
             management_fds_key(9443),
-            cluster_fds_key("10.0.0.10:7443"),
+            cluster_fds_key(ClusterListenerRole::Operational, "10.0.0.10:7443"),
+            cluster_fds_key(ClusterListenerRole::Enrollment, "10.0.0.10:7444"),
         ];
-        let fds: Vec<RawFd> = vec![10, 11, 12, 13];
-        let inherited = partition_inherited_fds(keys, fds, 9443);
+        let fds: Vec<RawFd> = vec![10, 11, 12, 13, 14];
+        let inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
         assert_eq!(inherited.proxy.len(), 2);
         assert_eq!(inherited.management, Some(12));
-        assert_eq!(inherited.cluster, Some(("10.0.0.10:7443".to_string(), 13)));
+        assert_eq!(
+            inherited.cluster,
+            vec![
+                (
+                    ClusterListenerRole::Operational,
+                    "10.0.0.10:7443".to_string(),
+                    13
+                ),
+                (
+                    ClusterListenerRole::Enrollment,
+                    "10.0.0.10:7444".to_string(),
+                    14
+                ),
+            ]
+        );
 
         // Without a cluster key the slot stays empty (every pre-9.2
         // deployment).
@@ -590,9 +666,42 @@ mod tests {
             vec!["0.0.0.0:8080".to_string(), management_fds_key(9443)],
             vec![20, 21],
             9443,
-        );
-        assert!(inherited.cluster.is_none());
+        )
+        .expect("partition succeeds");
+        assert!(inherited.cluster.is_empty());
         assert_eq!(inherited.management, Some(21));
+    }
+
+    #[test]
+    fn partition_rejects_duplicate_and_malformed_keys() {
+        // A duplicate management key would silently leak the earlier
+        // descriptor; the wire format's only producer is our own
+        // build_fds_table, so this means version disagreement - fail
+        // the pull and let the upgrade roll back.
+        let err = partition_inherited_fds(
+            vec![management_fds_key(9443), management_fds_key(9443)],
+            vec![30, 31],
+            9443,
+        )
+        .expect_err("duplicate management key must fail");
+        assert!(err.contains("duplicate management key"), "{err}");
+
+        let key = cluster_fds_key(ClusterListenerRole::Operational, "10.0.0.10:7443");
+        let err = partition_inherited_fds(vec![key.clone(), key], vec![32, 33], 9443)
+            .expect_err("duplicate cluster key must fail");
+        assert!(err.contains("duplicate cluster key"), "{err}");
+
+        let err = partition_inherited_fds(
+            vec!["cluster:mesh:10.0.0.10:7443".to_string()],
+            vec![34],
+            9443,
+        )
+        .expect_err("unknown cluster role must fail");
+        assert!(err.contains("unknown cluster role"), "{err}");
+
+        let err = partition_inherited_fds(vec!["cluster:oops".to_string()], vec![35], 9443)
+            .expect_err("role-less cluster key must fail");
+        assert!(err.contains("malformed cluster key"), "{err}");
     }
 
     #[test]

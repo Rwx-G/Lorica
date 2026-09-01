@@ -88,10 +88,10 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 info!(
                     proxy_listeners = i.proxy.len(),
                     has_management = i.management.is_some(),
-                    // Cluster slot always empty until Story 9.2 wires
+                    // Cluster slots always empty until Story 9.2 wires
                     // --cluster-listen; logged so an upgraded
                     // control-plane node can verify the handoff.
-                    has_cluster = i.cluster.is_some(),
+                    cluster_listeners = i.cluster.len(),
                     "hot upgrade: pulled inherited listeners from outgoing supervisor"
                 );
                 Some(i)
@@ -1372,7 +1372,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                         management_port,
                         // Story 9.1 AC #7 seam: populated by Story 9.2
                         // once --cluster-listen exists.
-                        cluster_fd: None,
+                        cluster_fds: Vec::new(),
                         child_argv,
                     })
                     .await;
@@ -1469,6 +1469,25 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             let _ = std::fs::remove_file(hot_upgrade::transfer_sock_path(&data_dir_path));
                             let _ = std::fs::remove_file(hot_upgrade::ready_sock_path(&data_dir_path));
                             let _ = std::fs::remove_file(hot_upgrade::ack_sock_path(&data_dir_path));
+                            // The failed NEW supervisor already bumped the
+                            // persisted takeover epoch during its boot, so
+                            // under Story 9.2's "fence sessions from older
+                            // epochs" rule the SURVIVING supervisor's
+                            // sessions would be the ones fenced - the
+                            // interlock inverting on exactly the path it
+                            // exists to protect. Re-take the epoch so the
+                            // survivor is newest again ("newest writer
+                            // wins" is preserved: we still own the DB).
+                            match store.lock().await.increment_cluster_takeover_epoch() {
+                                Ok(epoch) => info!(
+                                    epoch,
+                                    "hot upgrade: re-took cluster takeover epoch after rollback"
+                                ),
+                                Err(e) => warn!(
+                                    error = %e,
+                                    "hot upgrade: failed to re-take cluster takeover epoch after rollback"
+                                ),
+                            }
                             lorica_api::metrics::record_hot_upgrade(reason.metric_outcome());
                             error!(
                                 reason = reason.metric_outcome(),
