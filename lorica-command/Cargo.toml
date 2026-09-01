@@ -9,7 +9,7 @@ description = "Command channel for Lorica worker process communication"
 
 [dependencies]
 prost = "0.13"
-tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros"] }
 tracing = "0.1"
 thiserror = "2"
 
