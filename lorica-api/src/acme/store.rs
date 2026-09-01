@@ -84,11 +84,13 @@ impl AcmeChallengeStore {
                      PRAGMA busy_timeout=5000; \
                      PRAGMA synchronous=NORMAL;",
                 );
-                let _ = c.execute(
-                    "CREATE TABLE IF NOT EXISTS acme_challenges \
-                     (token TEXT PRIMARY KEY, key_auth TEXT NOT NULL)",
-                    [],
-                );
+                // Schema ownership note (Story 9.1 AC #10): the
+                // `acme_challenges` table is created by lorica-config
+                // migration v47, which every process runs on
+                // `ConfigStore::open` before this store attaches to
+                // the same file. No DDL is issued here so future
+                // schema changes (Story 9.5 adds a network writer)
+                // have exactly one owner.
                 Some(Arc::new(parking_lot::Mutex::new(c)))
             }
             Err(e) => {
@@ -107,29 +109,53 @@ impl AcmeChallengeStore {
         }
     }
 
-    /// Persist a challenge `token -> key_authorization` to SQLite and the in-memory cache.
-    pub async fn set(&self, token: String, key_authorization: String) {
+    /// Persist a challenge `token -> key_authorization` to SQLite and
+    /// the in-memory cache.
+    ///
+    /// Fallible since Story 9.1 AC #9: in worker mode the workers
+    /// serve the challenge from SQLite, so a failed INSERT means the
+    /// data plane would 404 the CA's validation request - that must
+    /// abort the order before readiness, not race it. A store running
+    /// memory-only (SQLite unavailable at construction, single-process
+    /// degraded mode) still returns `Ok`: the in-memory copy is what
+    /// that topology serves from.
+    pub async fn set(&self, token: String, key_authorization: String) -> Result<(), String> {
         self.challenges
             .write()
             .await
             .insert(token.clone(), key_authorization.clone());
-        if let Some(ref conn) = self.conn {
-            let conn = Arc::clone(conn);
-            let token_log = token.clone();
-            let db_log = self.db_path.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let guard = conn.lock();
-                match guard.execute(
+        let Some(ref conn) = self.conn else {
+            return Ok(());
+        };
+        let conn = Arc::clone(conn);
+        let token_log = token.clone();
+        let db_log = self.db_path.clone();
+        let persist = tokio::task::spawn_blocking(move || {
+            let guard = conn.lock();
+            guard
+                .execute(
                     "INSERT OR REPLACE INTO acme_challenges (token, key_auth) VALUES (?1, ?2)",
                     rusqlite::params![token, key_authorization],
-                ) {
-                    Ok(_) => tracing::info!(token = %token_log, db = %db_log.display(),
-                        "ACME challenge persisted to SQLite"),
-                    Err(e) => tracing::warn!(token = %token_log, error = %e,
-                        "failed to persist ACME challenge to SQLite"),
-                }
-            })
-            .await;
+                )
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        match persist {
+            Ok(Ok(_)) => {
+                tracing::info!(token = %token_log, db = %db_log.display(),
+                    "ACME challenge persisted to SQLite");
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(token = %token_log, error = %e,
+                    "failed to persist ACME challenge to SQLite");
+                Err(format!("challenge persist failed: {e}"))
+            }
+            Err(e) => {
+                tracing::warn!(token = %token_log, error = %e,
+                    "ACME challenge persist task failed");
+                Err(format!("challenge persist task failed: {e}"))
+            }
         }
     }
 
@@ -190,8 +216,14 @@ impl AcmeChallengeStore {
 /// `/.well-known/acme-challenge/{token}` while the order is live.
 #[async_trait::async_trait]
 impl lorica_acme::Http01ChallengeSolver for AcmeChallengeStore {
-    async fn present(&self, token: String, key_authorization: String) {
-        self.set(token, key_authorization).await;
+    async fn present(
+        &self,
+        token: String,
+        key_authorization: String,
+    ) -> Result<(), lorica_acme::AcmeError> {
+        self.set(token, key_authorization)
+            .await
+            .map_err(lorica_acme::AcmeError::Solver)
     }
 
     async fn cleanup(&self, token: &str) {

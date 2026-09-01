@@ -52,7 +52,13 @@ pub struct IssuedCertificate {
 #[async_trait::async_trait]
 pub trait Http01ChallengeSolver: Send + Sync {
     /// Publish `key_authorization` so it is served for `token`.
-    async fn present(&self, token: String, key_authorization: String);
+    ///
+    /// Fallible since Story 9.1 AC #9 (breaking change, budgeted
+    /// there): a partial distribution - the fleet case in Story 9.5,
+    /// or a local persist failure that would 404 the challenge on a
+    /// worker - must abort the order BEFORE `set_ready()` tells the
+    /// CA to validate, instead of racing an opaque validation failure.
+    async fn present(&self, token: String, key_authorization: String) -> Result<(), AcmeError>;
     /// Retract a previously-published `token`.
     async fn cleanup(&self, token: &str);
 }
@@ -131,28 +137,54 @@ pub async fn issue_http01(
     // never serves a stale challenge after the order resolves.
     let mut authorizations = order.authorizations();
     let mut stored_tokens: Vec<String> = Vec::new();
-    while let Some(result) = authorizations.next().await {
-        let mut authz = result.map_err(|e| AcmeError::Order(e.to_string()))?;
-        if matches!(authz.status, AuthorizationStatus::Valid) {
-            continue;
+    // Collected instead of `?`-returned so the failure path below can
+    // retract every token already presented. Story 9.1 AC #9: a
+    // failed `present` aborts here, BEFORE `set_ready()` tells the CA
+    // to validate (previously `present` was infallible and readiness
+    // fired on the next line even when some serving node had no
+    // token). The same restructure closes a pre-existing leak where
+    // an in-loop `?` on a challenge error returned without cleaning
+    // up already-presented tokens.
+    let setup_result: Result<(), AcmeError> = 'setup: {
+        while let Some(result) = authorizations.next().await {
+            let mut authz = match result {
+                Ok(a) => a,
+                Err(e) => break 'setup Err(AcmeError::Order(e.to_string())),
+            };
+            if matches!(authz.status, AuthorizationStatus::Valid) {
+                continue;
+            }
+            let mut challenge = match authz.challenge(ChallengeType::Http01) {
+                Some(c) => c,
+                None => break 'setup Err(AcmeError::NoChallenge("HTTP-01")),
+            };
+            let key_authorization = challenge.key_authorization();
+            let token = challenge.token.clone();
+            if let Err(e) = solver
+                .present(token.clone(), key_authorization.as_str().to_string())
+                .await
+            {
+                break 'setup Err(e);
+            }
+            stored_tokens.push(token);
+            if let Err(e) = challenge.set_ready().await {
+                break 'setup Err(AcmeError::Order(e.to_string()));
+            }
         }
-        let mut challenge = authz
-            .challenge(ChallengeType::Http01)
-            .ok_or(AcmeError::NoChallenge("HTTP-01"))?;
-        let key_authorization = challenge.key_authorization();
-        let token = challenge.token.clone();
-        solver
-            .present(token.clone(), key_authorization.as_str().to_string())
-            .await;
-        stored_tokens.push(token);
-        challenge
-            .set_ready()
-            .await
-            .map_err(|e| AcmeError::Order(e.to_string()))?;
-    }
+        Ok(())
+    };
     // `authorizations` borrows `order` ; let NLL release the borrow here so
     // the next `order.poll_ready()` call can re-borrow mut.
     let _ = authorizations;
+
+    if let Err(e) = setup_result {
+        // Retract everything already published so no node keeps
+        // serving a challenge for an order that will never validate.
+        for token in &stored_tokens {
+            solver.cleanup(token).await;
+        }
+        return Err(e);
+    }
 
     // Wait for all authorizations to become valid (or hit a terminal
     // failure). `poll_ready` exponentially backs off and returns the final

@@ -58,4 +58,11 @@ pub enum AcmeError {
     /// Serialization or deserialization of ACME account credentials failed.
     #[error("credentials error: {0}")]
     Credentials(String),
+
+    /// The HTTP-01 challenge solver failed to publish a token
+    /// (Story 9.1 AC #9). Raised BEFORE the driver signals readiness,
+    /// so a partial distribution aborts the order instead of racing
+    /// an opaque CA validation failure.
+    #[error("HTTP-01 challenge solver failed: {0}")]
+    Solver(String),
 }

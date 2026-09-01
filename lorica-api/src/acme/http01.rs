@@ -36,7 +36,13 @@ struct NoopHttp01Solver;
 
 #[async_trait::async_trait]
 impl Http01ChallengeSolver for NoopHttp01Solver {
-    async fn present(&self, _token: String, _key_authorization: String) {}
+    async fn present(
+        &self,
+        _token: String,
+        _key_authorization: String,
+    ) -> Result<(), lorica_acme::AcmeError> {
+        Ok(())
+    }
     async fn cleanup(&self, _token: &str) {}
 }
 

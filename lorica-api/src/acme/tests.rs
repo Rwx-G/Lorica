@@ -30,13 +30,21 @@ use super::types::{PendingDnsChallenge, PendingDnsChallenges};
 fn temp_challenge_store() -> AcmeChallengeStore {
     let dir = tempfile::tempdir().expect("tempdir available for test");
     let db_path = dir.keep().join("test-acme.db");
+    // Since Story 9.1 AC #10 the `acme_challenges` table is owned by
+    // lorica-config migration v47; mirror production, where
+    // ConfigStore::open runs migrations on the shared file before the
+    // challenge store attaches to it.
+    drop(lorica_config::ConfigStore::open(&db_path, None).expect("config store migrates the db"));
     AcmeChallengeStore::with_db_path(db_path)
 }
 
 #[tokio::test]
 async fn test_challenge_store_set_get_remove() {
     let store = temp_challenge_store();
-    store.set("token1".into(), "auth1".into()).await;
+    store
+        .set("token1".into(), "auth1".into())
+        .await
+        .expect("challenge persists");
     assert_eq!(store.get("token1").await, Some("auth1".to_string()));
     store.remove("token1").await;
     assert_eq!(store.get("token1").await, None);
