@@ -776,6 +776,89 @@ services:
     networks:
       - e2e
 
+  # ---- Log-sinks E2E (v1.7.0 Story 9.8, IV1/IV2/IV3) -----------------
+  # One Lorica node (built with `--features otel` so the OTLP logs
+  # signal is compiled in) plus two collectors: a socat-based syslog
+  # TCP listener appending raw RFC 6587 frames to /shared/syslog.log,
+  # and an OpenTelemetry Collector with a logs-only pipeline writing
+  # received records to /shared/otlp-logs.json. The smoke configures
+  # both sinks over the management API, drives traffic, and asserts
+  # delivery plus zero request-path impact with dead collectors.
+  #
+  # Run with:
+  #   docker compose --profile log-sinks up --build
+  #   docker compose --profile log-sinks run --rm log-sinks-smoke
+  lorica-log-sinks:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+      args:
+        LORICA_FEATURES: "otel"
+    entrypoint: ["/entrypoint-log-sinks.sh"]
+    profiles: ["log-sinks"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-log-sinks-data:/var/lib/lorica
+      - shared-log-sinks:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  # Minimal RFC 6587 octet-counting TCP collector: socat appends every
+  # received byte to /shared/syslog.log. Reuses the test-runner image
+  # (which ships socat) rather than adding a syslog daemon image.
+  # Runs as root because the shared volume is initialised owned by the
+  # unprivileged lorica user (same rationale as audit-smoke).
+  syslog-collector:
+    build:
+      context: ./test-runner
+    profiles: ["log-sinks"]
+    user: "0:0"
+    entrypoint:
+      - "sh"
+      - "-c"
+      - "mkdir -p /shared && : > /shared/syslog.log && exec socat -u TCP-LISTEN:6601,fork,reuseaddr OPEN:/shared/syslog.log,creat,append"
+    volumes:
+      - shared-log-sinks:/shared
+    networks:
+      - e2e
+
+  # Logs-only OTel collector with a file exporter (config in
+  # ./fixtures/otelcol-logs.yaml). Runs as root for the same shared-
+  # volume ownership reason as syslog-collector.
+  otelcol-logs:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    profiles: ["log-sinks"]
+    user: "0:0"
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./fixtures/otelcol-logs.yaml:/etc/otelcol/config.yaml:ro
+      - shared-log-sinks:/shared
+    networks:
+      - e2e
+
+  log-sinks-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["log-sinks"]
+    entrypoint: ["bash", "run-log-sinks-smoke.sh"]
+    depends_on:
+      - lorica-log-sinks
+      - syslog-collector
+      - otelcol-logs
+    volumes:
+      - shared-log-sinks:/shared:ro
+    environment:
+      - LORICA_API=https://lorica-log-sinks:9443
+      - LORICA_PROXY=http://lorica-log-sinks:8080
+      - BACKEND1_ADDR=backend1:80
+      - SYSLOG_LOG=/shared/syslog.log
+      - OTLP_LOG=/shared/otlp-logs.json
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
@@ -807,6 +890,8 @@ volumes:
   shared-rbac-workers:
   lorica-audit-data:
   shared-audit:
+  lorica-log-sinks-data:
+  shared-log-sinks:
 
 networks:
   e2e:
