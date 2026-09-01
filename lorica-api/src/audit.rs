@@ -381,9 +381,11 @@ pub async fn record(
     }
 }
 
-/// Emit the `lorica::audit` tracing event for one mutation. `chain_hash`
-/// is the committed chain head (the out-of-band anchor), or `""` when
-/// nothing was persisted (worker mode or an insert failure).
+/// Emit the `lorica::audit` tracing event for one mutation, and offer
+/// the entry to the log-export sinks (Story 9.8). `chain_hash` is the
+/// committed chain head (the out-of-band anchor), or `""` when
+/// nothing was persisted (worker mode or an insert failure) - the
+/// sink copy is best-effort either way.
 fn emit_audit_event(
     ctx: &AuditContext,
     action: &str,
@@ -402,6 +404,16 @@ fn emit_audit_event(
         chain_hash = %chain_hash,
         "audit"
     );
+    crate::log_sinks::publish_audit(crate::log_sinks::AuditSinkRecord {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        operator_username: ctx.username.clone(),
+        operator_role: ctx.role.clone(),
+        action: action.to_string(),
+        target_type: target_type.to_string(),
+        target_id: target_id.to_string(),
+        ip: ctx.ip.clone(),
+        chain_hash: chain_hash.to_string(),
+    });
 }
 
 /// Query-string parameters of `GET /api/v1/audit`.

@@ -728,6 +728,25 @@ pub fn inc_log_write_dropped(kind: &str) {
     LOG_WRITE_DROPPED_TOTAL.with_label_values(&[kind]).inc();
 }
 
+/// Counter: events dropped by a log-export sink (Story 9.8 AC #4),
+/// either on queue overflow or because the collector is unreachable
+/// and the message was shed during backoff. Same policy as the log
+/// writer: the proxy keeps serving and sheds export rows, never
+/// latency.
+static LOG_SINK_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "log_sink_dropped_total",
+        "Events dropped by a log-export sink (sink=syslog|otlp, kind=access|waf|audit)",
+        &["sink", "kind"],
+    )
+});
+
+/// Bump the dropped-sink-event counter for `sink` (`"syslog"` /
+/// `"otlp"`) and `kind` (`"access"` / `"waf"` / `"audit"`).
+pub fn inc_log_sink_dropped(sink: &str, kind: &str) {
+    LOG_SINK_DROPPED_TOTAL.with_label_values(&[sink, kind]).inc();
+}
+
 /// Counter: log-stream WebSocket entries dropped because a
 /// subscriber lagged the bounded broadcast channel (v1.5.0 audit
 /// LOW-12 backpressure). Non-zero values signal a slow client (or

@@ -757,6 +757,19 @@ pub fn build_router(
             "/api/v1/settings/otel/test",
             post(crate::settings::test_otel_connection),
         )
+        // Story 9.8 AC #6. Rate-limited (unlike the otel probe) because
+        // the syslog test emits a real message towards an
+        // operator-configured network target.
+        .route(
+            "/api/v1/settings/syslog/test",
+            post(crate::settings::test_syslog_connection)
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/settings/otlp-logs/test",
+            post(crate::settings::test_otlp_logs_connection)
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
         .route(
             "/api/v1/dns-providers",
             get(crate::dns_providers::list_dns_providers),

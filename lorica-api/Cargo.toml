@@ -30,7 +30,9 @@ axum = { version = "0.8", features = ["multipart", "ws"] }
 futures-util = "0.3"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time"] }
+# `net` was added for the Story 9.8 log-export sinks (UDP / TCP /
+# TCP+TLS syslog client sockets); no new crate, tokio already ships it.
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time", "net"] }
 # Management-plane TLS (Story 8.8 AC #1/#2). The management API moved
 # off plaintext `axum::serve` onto a manual rustls accept loop: axum 0.7
 # `Router` -> `hyper-util` auto (h1/h2) connection server over a

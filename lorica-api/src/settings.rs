@@ -45,6 +45,9 @@ const MANAGEMENT_PORT_MAX: u16 = u16::MAX;
 const LOG_LEVEL_CHOICES: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 const OTLP_PROTOCOL_CHOICES: [&str; 3] = ["grpc", "http-proto", "http-json"];
 const SPOOFED_FALLBACK_CHOICES: [&str; 3] = ["deny", "log", "allow"];
+const SYSLOG_TRANSPORT_CHOICES: [&str; 3] = ["udp", "tcp", "tcp-tls"];
+const SYSLOG_FACILITY_MAX: u32 = 23;
+const SYSLOG_SEVERITY_MAX: u32 = 7;
 
 /// Build the machine-readable settings schema (Story 8.10 AC #7).
 ///
@@ -178,6 +181,35 @@ pub fn settings_schema() -> serde_json::Value {
             "choices": SPOOFED_FALLBACK_CHOICES,
             "default": d.ai_bot_treat_spoofed_as,
         },
+        "syslog_transport": {
+            "type": "enum",
+            "choices": SYSLOG_TRANSPORT_CHOICES,
+            "default": d.syslog_transport,
+        },
+        "syslog_facility": {
+            "type": "integer",
+            "min": 0,
+            "max": SYSLOG_FACILITY_MAX,
+            "default": d.syslog_facility,
+        },
+        "syslog_severity_access": {
+            "type": "integer",
+            "min": 0,
+            "max": SYSLOG_SEVERITY_MAX,
+            "default": d.syslog_severity_access,
+        },
+        "syslog_severity_waf": {
+            "type": "integer",
+            "min": 0,
+            "max": SYSLOG_SEVERITY_MAX,
+            "default": d.syslog_severity_waf,
+        },
+        "syslog_severity_audit": {
+            "type": "integer",
+            "min": 0,
+            "max": SYSLOG_SEVERITY_MAX,
+            "default": d.syslog_severity_audit,
+        },
     })
 }
 
@@ -232,6 +264,17 @@ pub async fn get_settings(
     // unchanged" so the dashboard round-trip never clobbers the token.
     settings.prometheus_scrape_token = settings
         .prometheus_scrape_token
+        .as_ref()
+        .map(|_| "**REDACTED**".to_string());
+    // Story 9.8 AC #8: log-sink secrets (syslog mTLS client key, OTLP
+    // logs Authorization header) are masked exactly like the scrape
+    // token; the PUT path treats the sentinel as "leave unchanged".
+    settings.syslog_tls_client_key_pem = settings
+        .syslog_tls_client_key_pem
+        .as_ref()
+        .map(|_| "**REDACTED**".to_string());
+    settings.otlp_logs_auth_header = settings
+        .otlp_logs_auth_header
         .as_ref()
         .map(|_| "**REDACTED**".to_string());
     Ok(json_data(settings))
@@ -347,6 +390,46 @@ pub struct UpdateSettingsRequest {
     /// Story 8.8 AC #2. Absolute path to the operator management-TLS
     /// private key (PEM). Empty clears it.
     pub management_key_pem_path: Option<String>,
+    /// Story 9.8 AC #1. Syslog collector `host:port`. Empty clears it
+    /// (sink disabled).
+    pub syslog_endpoint: Option<String>,
+    /// Story 9.8 AC #1. Syslog transport (`udp` / `tcp` / `tcp-tls`).
+    pub syslog_transport: Option<String>,
+    /// Story 9.8 AC #1. RFC 5424 facility code (0-23).
+    pub syslog_facility: Option<u32>,
+    /// Story 9.8 AC #1. Severity for access-log messages (0-7).
+    pub syslog_severity_access: Option<u32>,
+    /// Story 9.8 AC #1. Severity for WAF-event messages (0-7).
+    pub syslog_severity_waf: Option<u32>,
+    /// Story 9.8 AC #1. Severity for audit messages (0-7).
+    pub syslog_severity_audit: Option<u32>,
+    /// Story 9.8 AC #1. Ship access logs to syslog.
+    pub syslog_access_enabled: Option<bool>,
+    /// Story 9.8 AC #1. Ship WAF events to syslog.
+    pub syslog_waf_enabled: Option<bool>,
+    /// Story 9.8 AC #1. Ship audit entries to syslog.
+    pub syslog_audit_enabled: Option<bool>,
+    /// Story 9.8 AC #1. PEM CA bundle trusted for `tcp-tls`. Empty
+    /// clears it (platform trust store).
+    pub syslog_tls_ca_pem: Option<String>,
+    /// Story 9.8 AC #1. PEM client certificate chain for collector
+    /// mTLS. Empty clears it.
+    pub syslog_tls_client_cert_pem: Option<String>,
+    /// Story 9.8 AC #8. PEM client key paired with the client
+    /// certificate. Secret: empty clears, the `**REDACTED**` sentinel
+    /// leaves the stored value unchanged.
+    pub syslog_tls_client_key_pem: Option<String>,
+    /// Story 9.8 AC #1. Extra static structured-data parameters as
+    /// comma-separated `key=value` pairs. Empty clears.
+    pub syslog_extra_sd: Option<String>,
+    /// Story 9.8 AC #2. Export logs as OTLP log records to the
+    /// `otlp_endpoint` collector (needs a binary built with
+    /// `--features otel`).
+    pub otlp_logs_enabled: Option<bool>,
+    /// Story 9.8 AC #8. `Authorization` header for the OTLP logs
+    /// exporter. Secret: empty clears, `**REDACTED**` leaves
+    /// unchanged.
+    pub otlp_logs_auth_header: Option<String>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -575,6 +658,63 @@ pub async fn update_settings(
             &mut settings.management_key_pem_path,
             "management_key_pem_path",
         )?;
+        // Story 9.8: log-export sinks.
+        apply_syslog_endpoint(body.syslog_endpoint, &mut settings.syslog_endpoint)?;
+        apply_string_choice(
+            body.syslog_transport,
+            &mut settings.syslog_transport,
+            &SYSLOG_TRANSPORT_CHOICES,
+            "syslog_transport",
+        )?;
+        apply_ranged_u32(
+            body.syslog_facility,
+            &mut settings.syslog_facility,
+            0..=SYSLOG_FACILITY_MAX,
+            &format!("syslog_facility must be in 0..={SYSLOG_FACILITY_MAX}"),
+        )?;
+        apply_ranged_u32(
+            body.syslog_severity_access,
+            &mut settings.syslog_severity_access,
+            0..=SYSLOG_SEVERITY_MAX,
+            &format!("syslog_severity_access must be in 0..={SYSLOG_SEVERITY_MAX}"),
+        )?;
+        apply_ranged_u32(
+            body.syslog_severity_waf,
+            &mut settings.syslog_severity_waf,
+            0..=SYSLOG_SEVERITY_MAX,
+            &format!("syslog_severity_waf must be in 0..={SYSLOG_SEVERITY_MAX}"),
+        )?;
+        apply_ranged_u32(
+            body.syslog_severity_audit,
+            &mut settings.syslog_severity_audit,
+            0..=SYSLOG_SEVERITY_MAX,
+            &format!("syslog_severity_audit must be in 0..={SYSLOG_SEVERITY_MAX}"),
+        )?;
+        apply_plain(body.syslog_access_enabled, &mut settings.syslog_access_enabled);
+        apply_plain(body.syslog_waf_enabled, &mut settings.syslog_waf_enabled);
+        apply_plain(body.syslog_audit_enabled, &mut settings.syslog_audit_enabled);
+        apply_optional_pem(
+            body.syslog_tls_ca_pem,
+            &mut settings.syslog_tls_ca_pem,
+            "CERTIFICATE",
+            "syslog_tls_ca_pem",
+        )?;
+        apply_optional_pem(
+            body.syslog_tls_client_cert_pem,
+            &mut settings.syslog_tls_client_cert_pem,
+            "CERTIFICATE",
+            "syslog_tls_client_cert_pem",
+        )?;
+        // Secret semantics (empty clears, sentinel leaves unchanged);
+        // PEM shape is checked by the sink when it builds the TLS
+        // connector, mirroring how the scrape token skips validation.
+        apply_secret_token(
+            body.syslog_tls_client_key_pem,
+            &mut settings.syslog_tls_client_key_pem,
+        );
+        apply_syslog_extra_sd(body.syslog_extra_sd, &mut settings.syslog_extra_sd)?;
+        apply_plain(body.otlp_logs_enabled, &mut settings.otlp_logs_enabled);
+        apply_secret_token(body.otlp_logs_auth_header, &mut settings.otlp_logs_auth_header);
 
         // Cross-field invariants (backlog #48). Per-field bounds are applied
         // above; these reject a partial update that inverts a related pair
@@ -743,6 +883,102 @@ fn apply_secret_token(value: Option<String>, target: &mut Option<String>) {
     } else {
         Some(trimmed.to_string())
     };
+}
+
+/// Assign the syslog collector endpoint (Story 9.8 AC #1). `None`
+/// leaves the stored value untouched; empty (after trim) clears the
+/// endpoint, disabling the sink. A non-empty value must be
+/// `host:port` (bracketed IPv6 accepted).
+fn apply_syslog_endpoint(
+    value: Option<String>,
+    target: &mut Option<String>,
+) -> Result<(), ApiError> {
+    let Some(v) = value else {
+        return Ok(());
+    };
+    let trimmed = v.trim();
+    if trimmed.is_empty() {
+        *target = None;
+        return Ok(());
+    }
+    if crate::log_sinks::syslog::split_host_port(trimmed).is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "syslog_endpoint must be host:port (got {trimmed:?})"
+        )));
+    }
+    if trimmed.len() > 512 {
+        return Err(ApiError::BadRequest(
+            "syslog_endpoint too long (max 512 chars)".to_string(),
+        ));
+    }
+    *target = Some(trimmed.to_string());
+    Ok(())
+}
+
+/// Assign an optional PEM field (Story 9.8 syslog TLS material).
+/// `None` leaves the stored value untouched; empty (after trim)
+/// clears it. A non-empty value must contain at least one
+/// `-----BEGIN <block>-----` marker; deep parsing is left to the sink
+/// when it builds the TLS connector (same loader the connection will
+/// actually use, so no parser drift).
+fn apply_optional_pem(
+    value: Option<String>,
+    target: &mut Option<String>,
+    block: &str,
+    label: &str,
+) -> Result<(), ApiError> {
+    let Some(v) = value else {
+        return Ok(());
+    };
+    let trimmed = v.trim();
+    if trimmed.is_empty() {
+        *target = None;
+        return Ok(());
+    }
+    if !trimmed.contains(&format!("-----BEGIN {block}")) {
+        return Err(ApiError::BadRequest(format!(
+            "{label} must be PEM ({block} block)"
+        )));
+    }
+    *target = Some(trimmed.to_string());
+    Ok(())
+}
+
+/// Assign the syslog extra structured-data field (Story 9.8 AC #1).
+/// `None` leaves untouched; empty clears. A non-empty value must be
+/// comma-separated `key=value` pairs whose keys are printable
+/// US-ASCII without `=`, `]`, `"` or spaces (RFC 5424 SD-NAME).
+fn apply_syslog_extra_sd(
+    value: Option<String>,
+    target: &mut Option<String>,
+) -> Result<(), ApiError> {
+    let Some(v) = value else {
+        return Ok(());
+    };
+    let trimmed = v.trim();
+    if trimmed.is_empty() {
+        *target = None;
+        return Ok(());
+    }
+    for pair in trimmed.split(',') {
+        let Some((key, _)) = pair.split_once('=') else {
+            return Err(ApiError::BadRequest(format!(
+                "syslog_extra_sd entries must be key=value (got {pair:?})"
+            )));
+        };
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_graphic() && c != '=' && c != ']' && c != '"')
+        {
+            return Err(ApiError::BadRequest(format!(
+                "syslog_extra_sd key {key:?} must be printable ASCII without '=', ']' or '\"'"
+            )));
+        }
+    }
+    *target = Some(trimmed.to_string());
+    Ok(())
 }
 
 /// Assign a Unix permission mode field when present, rejecting values
@@ -1006,6 +1242,148 @@ pub async fn test_otel_connection(
         }),
     };
 
+    Ok(json_data(payload))
+}
+
+/// POST /api/v1/settings/syslog/test - send one synthetic RFC 5424
+/// test message over the currently-persisted syslog configuration
+/// (Story 9.8 AC #6). Same contract as the OTel test: always 200,
+/// outcome in the body (`ok` / `message` / `latency_ms`). For UDP a
+/// successful send proves resolution and a writable socket, not
+/// collector receipt; the message says so.
+pub async fn test_syslog_connection(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use std::time::Instant;
+
+    let settings = db_blocking(&state.store, move |store| store.get_global_settings()).await?;
+    let sinks = crate::log_sinks::LogSinksConfig::from_settings(&settings, false);
+    let Some(syslog_cfg) = sinks.syslog else {
+        return Ok(json_data(serde_json::json!({
+            "ok": false,
+            "message": "syslog_endpoint is not set; save a collector address first.",
+        })));
+    };
+
+    let start = Instant::now();
+    let result =
+        crate::log_sinks::syslog::send_test_message(&syslog_cfg, &sinks.node_id, &sinks.node_name)
+            .await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    let payload = match result {
+        Ok(()) => {
+            let caveat = if syslog_cfg.transport == crate::log_sinks::SyslogTransport::Udp {
+                " (UDP is fire-and-forget; delivery is not confirmed)"
+            } else {
+                ""
+            };
+            serde_json::json!({
+                "ok": true,
+                "message": format!(
+                    "test message sent over {}{caveat}",
+                    settings.syslog_transport
+                ),
+                "latency_ms": latency_ms,
+            })
+        }
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "message": e,
+            "latency_ms": latency_ms,
+        }),
+    };
+    Ok(json_data(payload))
+}
+
+/// POST /api/v1/settings/otlp-logs/test - probe the persisted OTLP
+/// endpoint's `/v1/logs` path for reachability (Story 9.8 AC #6).
+/// Mirrors [`test_otel_connection`], with the logs signal path and
+/// the `otlp_logs_auth_header` attached when configured, so an
+/// authenticated collector answers 2xx instead of 401.
+pub async fn test_otlp_logs_connection(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use std::time::{Duration, Instant};
+
+    let settings = db_blocking(&state.store, move |store| store.get_global_settings()).await?;
+
+    let endpoint = settings
+        .otlp_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(endpoint) = endpoint else {
+        return Ok(json_data(serde_json::json!({
+            "ok": false,
+            "message": "otlp_endpoint is not set; save a collector URL first.",
+        })));
+    };
+
+    let probe_url = match settings.otlp_protocol.as_str() {
+        "http-proto" | "http-json" => {
+            let trimmed = endpoint.trim_end_matches('/');
+            if trimmed.ends_with("/v1/logs") {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/v1/logs")
+            }
+        }
+        _ => endpoint.to_string(),
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(json_data(serde_json::json!({
+                "ok": false,
+                "message": format!("reqwest client build failed: {e}"),
+            })));
+        }
+    };
+
+    let start = Instant::now();
+    let mut request = client
+        .post(&probe_url)
+        .header("Content-Type", "application/x-protobuf")
+        .body(Vec::<u8>::new());
+    if let Some(auth) = settings
+        .otlp_logs_auth_header
+        .as_deref()
+        .filter(|a| !a.trim().is_empty())
+    {
+        request = request.header("Authorization", auth);
+    }
+    let result = request.send().await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    let payload = match result {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let detail = if status >= 400 {
+                format!(
+                    "collector responded (HTTP {status}); \
+                     endpoint is reachable but rejected the probe - \
+                     check authentication or content-type settings"
+                )
+            } else {
+                format!("reachable (HTTP {status})")
+            };
+            serde_json::json!({
+                "ok": true,
+                "message": detail,
+                "latency_ms": latency_ms,
+            })
+        }
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "message": format!("unreachable: {e}"),
+            "latency_ms": latency_ms,
+        }),
+    };
     Ok(json_data(payload))
 }
 

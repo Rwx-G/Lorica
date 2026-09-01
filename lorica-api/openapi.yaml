@@ -3247,6 +3247,53 @@ paths:
           $ref: "#/components/responses/Unauthorized"
 
   # ---------------------------------------------------------------------------
+  # Log-export sink tests (Story 9.8)
+  # ---------------------------------------------------------------------------
+  /api/v1/settings/syslog/test:
+    post:
+      tags: [Settings]
+      summary: Send a test message over the configured syslog sink
+      description: |
+        Sends one synthetic RFC 5424 message to the operator-configured
+        syslog collector over the persisted transport (`udp` / `tcp` /
+        `tcp-tls`) and reports success, failure reason and round-trip
+        time. UDP is fire-and-forget: a successful send proves
+        resolution and a writable socket, not collector receipt.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Test outcome (ok / message / latency_ms)
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/settings/otlp-logs/test:
+    post:
+      tags: [Settings]
+      summary: Probe the configured OTLP endpoint's logs signal path
+      description: |
+        Probes `/v1/logs` on the operator-configured OTLP collector
+        (attaching `otlp_logs_auth_header` when set) and reports
+        reachability, failure reason and round-trip time. Any HTTP
+        status counts as reachable; connection refused, DNS failure
+        or timeout count as unreachable.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Test outcome (ok / message / latency_ms)
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
   # Logs export
   # ---------------------------------------------------------------------------
   /api/v1/logs/export:
