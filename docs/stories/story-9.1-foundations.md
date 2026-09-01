@@ -1,7 +1,7 @@
 # Story 9.1: Foundations
 
 **Epic:** 9 (v1.7.0)
-**Status:** Draft
+**Status:** Review
 **Author:** Romain G.
 
 ## Story
@@ -59,29 +59,32 @@ before this lands.
 
 ## Tasks / Subtasks
 
-- [ ] AC #1: generic `new()`, swap `UnixStream::into_split` for
+- [x] AC #1: generic `new()`, swap `UnixStream::into_split` for
       `tokio::io::split`, add bounds; keep `from_raw_fd` concrete.
-- [ ] AC #2: define `Frame` trait, parameterise the reader/writer tasks
+- [x] AC #2: define `Frame` trait, parameterise the reader/writer tasks
       and the demux over it; keep `Envelope` as the worker-plane impl.
-- [ ] AC #3: move the four constants into a per-endpoint config struct
+- [x] AC #3: move the four constants into a per-endpoint config struct
       with the current values as defaults.
-- [ ] AC #4: replace the `continue` at the oversize branch with a typed
+- [x] AC #4: replace the `continue` at the oversize branch with a typed
       error path; bound the in-flight map and define the over-limit
       behaviour.
-- [ ] AC #5: canonical encoder + sorted-view serialisation for every
+- [x] AC #5: canonical encoder + sorted-view serialisation for every
       `HashMap` field; unit tests across differing `RandomState` seeds.
-- [ ] AC #6: migration for the persisted counter; wire it distinctly
+- [x] AC #6: migration for the persisted counter; wire it distinctly
       from `reload_generation`.
-- [ ] AC #7: extend the hot-upgrade FD set; add the double-session
-      interlock and a test for the overlap window.
-- [ ] AC #8: table-driven rotation + coverage test.
-- [ ] AC #9: `present -> Result`, update the driver call site so a
+- [x] AC #7: extend the hot-upgrade FD set; add the double-session
+      interlock and a test for the overlap window. (Seam-only in 9.1;
+      see Completion Notes.)
+- [x] AC #8: table-driven rotation + coverage test.
+- [x] AC #9: `present -> Result`, update the driver call site so a
       failure aborts before `set_ready()`.
-- [ ] AC #10: move `acme_challenges` DDL into `MIGRATIONS`.
-- [ ] AC #11: expose `schema_version()`.
-- [ ] AC #12: `deny_unknown_fields` on replica decode types.
-- [ ] AC #13: Pebble compose service, CA trust injection, mock DNS
-      provider, wiring into the `cluster` profile.
+- [x] AC #10: move `acme_challenges` DDL into `MIGRATIONS`.
+- [x] AC #11: expose `schema_version()`. (Already `pub`; see
+      Completion Notes.)
+- [x] AC #12: `deny_unknown_fields` on replica decode types.
+- [x] AC #13: Pebble compose service, CA trust injection, mock DNS
+      provider, wiring into the `cluster` profile. (Shipped as its
+      own `acme` profile, run.sh Phase 9; 15/15 asserts green.)
 
 ## Dev Notes
 
@@ -182,30 +185,138 @@ and version 18 is an inline entry (`store/mod.rs:280-286`), while
 
 ### Debug Log
 
-(empty)
+- 2026-09-01: `lorica-command` tests green after the transport+frame
+  generalisation on the first full run; the bare-`RpcEndpoint` call
+  sites in `lorica` inferred unchanged thanks to the default type
+  parameter (`RpcEndpoint<F: Frame = Envelope>`) plus keeping
+  `new`/`from_raw_fd`/`request_rpc` on the `Envelope` impl.
+- 2026-09-01: the AC #8 source-scan gate initially keyed on literal
+  `INTO <table>` / `UPDATE <table>` strings and broke itself: the
+  table-driven rotation builds its SQL with `format!`. Relaxed to
+  "module must mention a registry table name".
+- 2026-09-01: standalone `cargo clippy -p lorica-command` failed on
+  `tokio::select!` while `cargo test` passed: the `macros` feature
+  was dev-deps-only and test builds unify features. Added `macros`
+  to the lib dependency.
+- 2026-09-01: first acme e2e run failed at provisioning: Lorica hit
+  the aliased Pebble at `/directory` (Let's Encrypt convention) but
+  Pebble serves `/dir`. Resolved with the `LORICA_ACME_DIRECTORY_URL`
+  override (also useful for private CAs); the TLS trust chain via
+  `SSL_CERT_FILE` was proven working by that very failure (Pebble's
+  404 body was received over a verified handshake).
+- 2026-09-01: smoke script assumed `GET /api/v1/certificates`
+  returns `{data: [...]}`; the API wraps as
+  `{data: {certificates: [...]}}`. Fixed the jq paths. Final run:
+  15/15 asserts, both HTTP-01 and manual DNS-01 certificates issued
+  by Pebble.
 
 ### Completion Notes
 
-(empty)
+- **AC #5 (canonical encoder) - the Dev Notes' determinism premise
+  was WRONG**: serde serializes a `HashMap` field in the map's own
+  iteration order; the BTreeMap-backed `serde_json::Map` only kicks
+  in when encoding via `serde_json::Value`. A direct
+  `serde_json::to_vec(&struct)` is therefore NOT deterministic
+  across processes (per-instance SipHash seeds). Caught by the
+  cross-insertion-order test. Fix: `canonical_bytes()` encodes
+  through `Value` plus a recursive key-sort rewrite, deterministic
+  even if `preserve_order` gets enabled somewhere later. Top-level
+  entity Vecs are sorted by their canonical JSON string (total
+  order, immune to SQL tie-ordering); inner rule arrays keep their
+  semantic first-match-wins order. Hash = `ring` SHA-256 (existing
+  dep), `CANONICAL_FORMAT_VERSION = 1`.
+- **AC #12**: `deny_unknown_fields` on 23 model structs.
+  `GlobalSettings` deliberately NOT strict (tolerant KV projection
+  used by the settings table); the strict fleet-policy replica is
+  `CanonicalGlobalSettings` (34 fields, node-local fields excluded
+  by construction: cert_export_*, management, geoip paths, secrets
+  for local sinks, all syslog_*/otlp_* - Story 9.4 revisits the
+  sink split). `CustomVerification` (internally-tagged enum) cannot
+  take the attribute per serde limitation; documented in code.
+- **AC #7 scope decision**: the cluster listener only exists from
+  Story 9.2 (`--cluster-listen`), so 9.1 lands the SEAM: the FD
+  transfer gains an optional `cluster:<bind>` slot (serve, pull,
+  partition all handle it; `HandoffArgs.cluster_fd` is `None` until
+  9.2 wires it), and the double-session interlock primitive is a
+  persisted `takeover_epoch` in `cluster_state` that a `--hot-upgrade`
+  NEW supervisor bumps before serving anything. Story 9.2's session
+  registry tags sessions with their accept epoch and fences older
+  epochs.
+- **AC #8 found its motivating bug live**: the pre-9.1 hardcoded
+  rotation loop skipped `dns_providers.config`, so a key rotation
+  left every DNS provider credential undecryptable while reporting
+  success. The table-driven `ENCRYPTED_COLUMNS` registry now covers
+  certificates, notification_configs, dns_providers and the two
+  Story 9.8 sink secrets; the drift gate is a runtime source scan of
+  `src/store/` asserting every encrypting module mentions a
+  registered table.
+- **AC #9** also closes a pre-existing leak: an in-loop `?` on a
+  challenge/authz error used to return without retracting
+  already-presented tokens; the restructured setup loop cleans up on
+  every failure path before returning. `AcmeChallengeStore::set` is
+  now fallible (SQLite persist failure = the workers would 404 the
+  CA's validation request); memory-only degraded mode still succeeds
+  (single-process serves from memory).
+- **AC #10**: schema ownership moved to migration v47; the ad-hoc
+  DDL in `AcmeChallengeStore` is deleted (production order is safe:
+  every process opens `ConfigStore` - which migrates - before the
+  challenge store attaches; the store's own tests now mirror that).
+- **AC #11 was already satisfied**: `ConfigStore::schema_version()`
+  has been `pub` since the migration-table rework; the story's
+  "referenced only from tests" observation predates it. No change
+  needed beyond this note.
+- **AC #6**: `cluster_state` table (migration v48) with
+  `config_generation` and `takeover_epoch` rows;
+  `increment_cluster_config_generation()` /
+  `increment_cluster_takeover_epoch()` are atomic single-statement
+  UPDATEs; persistence proven across a reopen in tests.
+- **AC #3/#4**: `RpcLimits` per endpoint (defaults = the historical
+  constants); oversize outbound frames fail with the existing typed
+  `ChannelError::MessageTooLarge` at enqueue (size measured via
+  `encoded_len()` before any state is installed); new
+  `ChannelError::InflightFull` bounds the in-flight map (default
+  1024).
 
 ## File List
 
-Anticipated:
-
-- `lorica-command/src/rpc.rs` (transport + frame generalisation, limits,
-  oversize error path, bounded in-flight map)
-- `lorica-command/src/lib.rs` (Frame trait export)
-- `lorica-config/src/canonical.rs` (new)
-- `lorica-config/src/store/mod.rs` (rotation table, schema_version
-  exposure, cluster generation migration)
-- `lorica-config/src/migrations/` (new migration)
-- `lorica/src/hot_upgrade.rs` (cluster FD handoff + interlock)
-- `lorica-acme/src/driver.rs` (fallible present)
-- `lorica-api/src/acme/store.rs` (DDL moved to MIGRATIONS)
-- `tests-e2e-docker/docker-compose.yml`, `Dockerfile`, Pebble fixture
+- `lorica-command/src/rpc.rs` (Frame trait, RpcLimits, generic
+  transport via `tokio::io::split`, typed oversize error, bounded
+  in-flight map, tests)
+- `lorica-command/src/lib.rs` (Frame/FrameKind/IncomingRequest(s)/
+  RpcLimits exports, `ChannelError::InflightFull`)
+- `lorica-command/Cargo.toml` (tokio `macros` feature: lib code now
+  uses `select!`/`pin!`; previously dev-only)
+- `lorica-config/src/canonical.rs` (new: canonical encoder, hash,
+  strict decode, tests)
+- `lorica-config/src/lib.rs` (canonical module + re-exports)
+- `lorica-config/src/models/*.rs` (`deny_unknown_fields` on 23
+  structs: route, backend, certificate, notification,
+  cert_export_acl, ai_crawler, probes, sla, settings)
+- `lorica-config/src/store/mod.rs` (migrations 47+48,
+  ENCRYPTED_COLUMNS registry, table-driven rotation, cluster
+  generation/takeover-epoch accessors)
+- `lorica-config/src/tests.rs` (schema head 48, migration ownership,
+  cluster counters, rotation coverage incl. registry drift gate)
+- `lorica-acme/src/error.rs` (`AcmeError::Solver`)
+- `lorica-acme/src/config.rs` (`LORICA_ACME_DIRECTORY_URL` override,
+  `directory_url()` returns `String`)
+- `lorica-acme/src/driver.rs` (fallible `present`, setup loop aborts
+  before `set_ready()` and retracts presented tokens on failure)
+- `lorica-api/src/acme/store.rs` (ad-hoc DDL removed, fallible
+  `set`)
+- `lorica-api/src/acme/http01.rs` + `tests.rs` (call-site updates)
+- `lorica/src/startup/hot_upgrade.rs` (cluster FD slot, pure
+  `partition_inherited_fds` + test)
+- `lorica/src/startup/supervisor.rs` (cluster_fd handoff arg,
+  takeover-epoch bump under `--hot-upgrade`)
+- `tests-e2e-docker/` (acme profile: Pebble + challtestsrv services,
+  CA init, `run-acme-smoke.sh`, run.sh Phase 9, Dockerfile entries)
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD, after a five-pass verification of the first draft's reuse assumptions. Status Draft. | Romain G. |
+| 2026-09-01 | 0.2 | Slices A-E implemented: RpcEndpoint generalisation (Frame + RpcLimits + typed oversize/inflight errors), canonical encoder + deny_unknown_fields, migrations 47/48 + table-driven key rotation (fixes pre-existing dns_providers rotation gap), fallible present with pre-set_ready abort, cluster FD seam + takeover-epoch interlock. Status InProgress. | Romain G. |
+| 2026-09-01 | 0.3 | Pebble ACME e2e profile authored (tests-e2e-docker acme profile, Phase 9). | Romain G. |
+| 2026-09-01 | 0.4 | acme e2e proven 15/15 (HTTP-01 + manual DNS-01 issued by Pebble) after LORICA_ACME_DIRECTORY_URL override and smoke jq fixes. All ACs implemented; full test/clippy/audit chain green. Status Review. | Romain G. |
