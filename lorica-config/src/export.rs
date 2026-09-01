@@ -115,6 +115,18 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
         global_settings.bot_hmac_secret_hex = REDACTED.into();
     }
 
+    // Log-sink secrets (Story 9.8 AC #8): the syslog mTLS client key
+    // and the OTLP logs Authorization header are credentials for the
+    // operator's log pipeline. Same treatment as the bot HMAC secret;
+    // import rejects the placeholder so a round-trip cannot clear a
+    // live credential silently.
+    if global_settings.syslog_tls_client_key_pem.is_some() {
+        global_settings.syslog_tls_client_key_pem = Some(REDACTED.into());
+    }
+    if global_settings.otlp_logs_auth_header.is_some() {
+        global_settings.otlp_logs_auth_header = Some(REDACTED.into());
+    }
+
     let data = ExportData {
         version: EXPORT_FORMAT_VERSION,
         global_settings,

@@ -262,6 +262,52 @@ impl ConfigStore {
                     settings.management_key_pem_path =
                         if value.is_empty() { None } else { Some(value) };
                 }
+                "syslog_endpoint" => {
+                    settings.syslog_endpoint = if value.is_empty() { None } else { Some(value) };
+                }
+                "syslog_transport" => settings.syslog_transport = value,
+                "syslog_facility" => {
+                    settings.syslog_facility = value.parse().unwrap_or(16);
+                }
+                "syslog_severity_access" => {
+                    settings.syslog_severity_access = value.parse().unwrap_or(6);
+                }
+                "syslog_severity_waf" => {
+                    settings.syslog_severity_waf = value.parse().unwrap_or(4);
+                }
+                "syslog_severity_audit" => {
+                    settings.syslog_severity_audit = value.parse().unwrap_or(5);
+                }
+                "syslog_access_enabled" => {
+                    settings.syslog_access_enabled = value == "true" || value == "1";
+                }
+                "syslog_waf_enabled" => {
+                    settings.syslog_waf_enabled = value == "true" || value == "1";
+                }
+                "syslog_audit_enabled" => {
+                    settings.syslog_audit_enabled = value == "true" || value == "1";
+                }
+                "syslog_tls_ca_pem" => {
+                    settings.syslog_tls_ca_pem = if value.is_empty() { None } else { Some(value) };
+                }
+                "syslog_tls_client_cert_pem" => {
+                    settings.syslog_tls_client_cert_pem =
+                        if value.is_empty() { None } else { Some(value) };
+                }
+                "syslog_tls_client_key_pem" => {
+                    settings.syslog_tls_client_key_pem =
+                        if value.is_empty() { None } else { Some(value) };
+                }
+                "syslog_extra_sd" => {
+                    settings.syslog_extra_sd = if value.is_empty() { None } else { Some(value) };
+                }
+                "otlp_logs_enabled" => {
+                    settings.otlp_logs_enabled = value == "true" || value == "1";
+                }
+                "otlp_logs_auth_header" => {
+                    settings.otlp_logs_auth_header =
+                        if value.is_empty() { None } else { Some(value) };
+                }
                 _ => {}
             }
         }
@@ -532,6 +578,66 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('management_key_pem_path', ?1)",
             params![settings.management_key_pem_path.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_endpoint', ?1)",
+            params![settings.syslog_endpoint.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_transport', ?1)",
+            params![settings.syslog_transport],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_facility', ?1)",
+            params![settings.syslog_facility.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_severity_access', ?1)",
+            params![settings.syslog_severity_access.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_severity_waf', ?1)",
+            params![settings.syslog_severity_waf.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_severity_audit', ?1)",
+            params![settings.syslog_severity_audit.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_access_enabled', ?1)",
+            params![settings.syslog_access_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_waf_enabled', ?1)",
+            params![settings.syslog_waf_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_audit_enabled', ?1)",
+            params![settings.syslog_audit_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_tls_ca_pem', ?1)",
+            params![settings.syslog_tls_ca_pem.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_tls_client_cert_pem', ?1)",
+            params![settings.syslog_tls_client_cert_pem.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_tls_client_key_pem', ?1)",
+            params![settings.syslog_tls_client_key_pem.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_extra_sd', ?1)",
+            params![settings.syslog_extra_sd.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_enabled', ?1)",
+            params![settings.otlp_logs_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_auth_header', ?1)",
+            params![settings.otlp_logs_auth_header.as_deref().unwrap_or("")],
         )?;
         Ok(())
     }

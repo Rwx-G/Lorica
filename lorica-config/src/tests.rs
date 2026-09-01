@@ -1091,6 +1091,92 @@ created_at = "2026-01-01T00:00:00Z"
         assert!(fetched.otlp_endpoint.is_none());
     }
 
+    #[test]
+    fn test_global_settings_log_sinks_round_trip() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+
+        // Defaults: syslog disabled (no endpoint), udp transport,
+        // local0 facility, per-kind severities info/warning/notice,
+        // all three kinds enabled, OTLP logs off.
+        let settings = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert!(settings.syslog_endpoint.is_none());
+        assert_eq!(settings.syslog_transport, "udp");
+        assert_eq!(settings.syslog_facility, 16);
+        assert_eq!(settings.syslog_severity_access, 6);
+        assert_eq!(settings.syslog_severity_waf, 4);
+        assert_eq!(settings.syslog_severity_audit, 5);
+        assert!(settings.syslog_access_enabled);
+        assert!(settings.syslog_waf_enabled);
+        assert!(settings.syslog_audit_enabled);
+        assert!(settings.syslog_tls_ca_pem.is_none());
+        assert!(settings.syslog_extra_sd.is_none());
+        assert!(!settings.otlp_logs_enabled);
+        assert!(settings.otlp_logs_auth_header.is_none());
+
+        // Round-trip non-default values.
+        let mut updated = settings;
+        updated.syslog_endpoint = Some("siem.internal.example.org:6514".to_string());
+        updated.syslog_transport = "tcp-tls".to_string();
+        updated.syslog_facility = 17;
+        updated.syslog_severity_access = 7;
+        updated.syslog_severity_waf = 3;
+        updated.syslog_severity_audit = 2;
+        updated.syslog_access_enabled = false;
+        updated.syslog_waf_enabled = true;
+        updated.syslog_audit_enabled = false;
+        updated.syslog_tls_ca_pem = Some("-----BEGIN CERTIFICATE-----".to_string());
+        updated.syslog_tls_client_cert_pem = Some("-----BEGIN CERTIFICATE-----".to_string());
+        updated.syslog_tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----".to_string());
+        updated.syslog_extra_sd = Some("env=prod,dc=eu-west".to_string());
+        updated.otlp_logs_enabled = true;
+        updated.otlp_logs_auth_header = Some("Bearer token123".to_string());
+        store
+            .update_global_settings(&updated)
+            .expect("test setup: global settings update");
+
+        let fetched = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert_eq!(
+            fetched.syslog_endpoint.as_deref(),
+            Some("siem.internal.example.org:6514")
+        );
+        assert_eq!(fetched.syslog_transport, "tcp-tls");
+        assert_eq!(fetched.syslog_facility, 17);
+        assert_eq!(fetched.syslog_severity_access, 7);
+        assert_eq!(fetched.syslog_severity_waf, 3);
+        assert_eq!(fetched.syslog_severity_audit, 2);
+        assert!(!fetched.syslog_access_enabled);
+        assert!(fetched.syslog_waf_enabled);
+        assert!(!fetched.syslog_audit_enabled);
+        assert_eq!(
+            fetched.syslog_tls_client_key_pem.as_deref(),
+            Some("-----BEGIN PRIVATE KEY-----")
+        );
+        assert_eq!(fetched.syslog_extra_sd.as_deref(), Some("env=prod,dc=eu-west"));
+        assert!(fetched.otlp_logs_enabled);
+        assert_eq!(
+            fetched.otlp_logs_auth_header.as_deref(),
+            Some("Bearer token123")
+        );
+
+        // Clearing an optional field (empty string in the KV table)
+        // deserialises back to None.
+        let mut cleared = fetched;
+        cleared.syslog_endpoint = None;
+        cleared.otlp_logs_auth_header = None;
+        store
+            .update_global_settings(&cleared)
+            .expect("test setup: global settings update");
+        let fetched = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert!(fetched.syslog_endpoint.is_none());
+        assert!(fetched.otlp_logs_auth_header.is_none());
+    }
+
     // ---- Migration ----
 
     #[test]
@@ -2099,6 +2185,70 @@ cert_critical_days = 3
         assert!(
             msg.contains("redacted"),
             "error message must mention the redacted state, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_export_redacts_log_sink_secrets() {
+        // Story 9.8 AC #8: the syslog mTLS client key and the OTLP
+        // logs Authorization header are credentials for the operator's
+        // log pipeline and must never leave the node in a TOML export.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut s = store.get_global_settings().expect("test setup");
+        s.syslog_tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----\nsecret".to_string());
+        s.otlp_logs_auth_header = Some("Bearer sink-token-42".to_string());
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+
+        assert!(
+            toml_str.contains("syslog_tls_client_key_pem = \"**REDACTED**\""),
+            "client key must be replaced with the REDACTED placeholder"
+        );
+        assert!(
+            toml_str.contains("otlp_logs_auth_header = \"**REDACTED**\""),
+            "auth header must be replaced with the REDACTED placeholder"
+        );
+        assert!(
+            !toml_str.contains("sink-token-42") && !toml_str.contains("BEGIN PRIVATE KEY"),
+            "raw secret material must not appear anywhere in the export"
+        );
+    }
+
+    #[test]
+    fn test_import_rejects_redacted_log_sink_secrets() {
+        // Story 9.8 AC #8: a round-trip of an export holding redacted
+        // sink secrets must fail loudly instead of silently clearing
+        // live credentials.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut s = store.get_global_settings().expect("test setup");
+        s.syslog_tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----\nsecret".to_string());
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        let err = parse_toml(&toml_str).expect_err("parse must reject the REDACTED placeholder");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("syslog_tls_client_key_pem"),
+            "error message must name the field, got: {msg}"
+        );
+
+        // Same for the OTLP logs auth header on its own.
+        let store2 = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut s2 = store2.get_global_settings().expect("test setup");
+        s2.otlp_logs_auth_header = Some("Bearer sink-token-42".to_string());
+        store2
+            .update_global_settings(&s2)
+            .expect("test setup: settings update");
+        let toml_str2 = export_to_toml(&store2).expect("test setup: toml export succeeds");
+        let err2 = parse_toml(&toml_str2).expect_err("parse must reject the REDACTED placeholder");
+        assert!(
+            err2.to_string().contains("otlp_logs_auth_header"),
+            "error message must name the field, got: {err2}"
         );
     }
 

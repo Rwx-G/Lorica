@@ -144,6 +144,23 @@ fn validate(data: &ImportData) -> Result<()> {
         ));
     }
 
+    // Reject redacted log-sink secrets (Story 9.8 AC #8): same
+    // rationale as the bot HMAC secret above.
+    if data.global_settings.syslog_tls_client_key_pem.as_deref() == Some("**REDACTED**") {
+        return Err(ConfigError::Validation(
+            "global_settings.syslog_tls_client_key_pem is redacted (from export); \
+             set the real PEM key or clear the field"
+                .into(),
+        ));
+    }
+    if data.global_settings.otlp_logs_auth_header.as_deref() == Some("**REDACTED**") {
+        return Err(ConfigError::Validation(
+            "global_settings.otlp_logs_auth_header is redacted (from export); \
+             set the real header value or clear the field"
+                .into(),
+        ));
+    }
+
     // Validate certificate references in routes
     for route in &data.routes {
         if let Some(cert_id) = &route.certificate_id {
