@@ -1,7 +1,7 @@
 # Story 9.8: Syslog Sink and OTLP Logs Signal
 
 **Epic:** 9 (v1.7.0)
-**Status:** Review
+**Status:** Done
 **Author:** Romain G.
 
 **Depends on:** nothing in this epic. Independent of the cluster and
@@ -168,9 +168,77 @@ release something shippable while the cluster stories are still moving.
   (worked rsyslog + OTLP collector examples); `docs/cluster.md` does
   not exist yet - it is created by Story 9.6, which must add the
   log-sink section there.
-- Rate limiting: the two new test endpoints are rate-limited
-  (`destructive_cud` bucket) unlike the historical otel probe,
-  because the syslog test emits a real network message.
+- Rate limiting: all three settings test probes (otel, syslog,
+  otlp-logs) are rate-limited (`destructive_cud` bucket); the
+  historical otel probe gained the limiter during QA for consistency.
+
+### QA iteration 1 (2026-09-01, five parallel auditors)
+
+Findings fixed in-loop (Critical=0, High=5, all resolved):
+
+- **PUT /settings returned every secret unmasked** (security, High,
+  pre-existing structural asymmetry with GET): masking extracted into
+  `mask_settings_secrets` applied by both handlers; regression test
+  asserts no raw secret bytes in the PUT body.
+- **Worker-side sink counters invisible on /metrics** (architecture,
+  High): `lorica_log_sink_{dropped,sent,truncated}_total` added to
+  `PER_WORKER_COUNTERS` + resolve arms.
+- **No sink drain on shutdown / hot upgrade** (architecture, High):
+  `log_sinks::shutdown_and_drain(3s)` called from `otel::shutdown`
+  (both feature variants) before the OTLP consumer join + provider
+  flush; every exit path already calls `otel::shutdown`.
+- **Dead consumer left a live lane; PEM unvalidated at PUT**
+  (architecture, High): lanes carry ids and self-remove on terminal
+  consumer failure; install spawns the consumer before installing the
+  lane; `PUT /settings` builds the exact TLS connector and 400s on
+  bad material.
+- **validators.test.ts "broken assertion"** (quality, High):
+  FALSE POSITIVE - the fixture contained a raw 0x01 byte invisible in
+  terminal rendering (Vitest was green all along). The raw byte was
+  the real defect: replaced with an explicit `String.fromCharCode(1)`.
+
+Medium/Low fixed: per-transport message ceilings (1536 B UDP / 7168 B
+stream bodies) with UTF-8-safe truncation + `truncated="1"` SD param +
+counter (closes the UDP EMSGSIZE self-eviction and collector-desync
+vectors); sink secrets encrypted at rest via `encrypt_config` +
+covered by `rotate_encryption_key` (rotation test); cleartext
+transport warn (API log + UI hint); audit records on both sink test
+endpoints; control chars stripped from SD values and rejected in
+`syslog_extra_sd` values (+512-char cap); PEM parse errors mapped to
+fixed strings (no key material in error bodies); sink export decoupled
+from the local `access_log_enabled` toggle; `lorica_log_sink_sent_total`;
+versioned self-describing JSON body (`v`, `kind`) shared by both
+consumers; probe helper dedup (otel + otlp-logs handlers); frontend
+test-runner dedup; encode-after-backoff reorder; single-lock publish;
+audit sink record reuses the persisted row's timestamp and is gated on
+`wants()`; `with_node_identity` seam for Story 9.6; manual `Debug`
+redacting the client key; per-process fan-out documented in README.
+
+Findings rejected with rationale: store numeric `unwrap_or` fallbacks
+(consistent with the recent sibling fields, e.g.
+`cert_export_file_mode`); ArcSwap migration for the hub (new dep edge
+for a nanosecond-scale win; the double-lock was fixed instead);
+`tcp-tls` as default transport (UDP is the standard syslog operator
+expectation; loud warnings instead). Deferred items recorded as
+backlog #49-#55.
+
+Verification after fixes: 573 Rust tests green, CI-equivalent clippy
+clean, cargo audit clean (pre-existing warnings only), all four
+frontend gates green (383 Vitest tests), log-sinks e2e smoke re-built
+and re-run after the fixes: 23/23.
+
+### Handoff notes for later stories
+
+- **Story 9.1** (`rotate_encryption_key` table-driven rework): the
+  rotation loop now also covers the `global_settings` keys
+  `syslog_tls_client_key_pem` and `otlp_logs_auth_header` - fold them
+  into the table-driven enumeration and its coverage test.
+- **Story 9.2**: reuse the sink-lane seam deliberately - see backlog
+  #51 (registration inversion) and #52 (lorica-obs boundary).
+- **Story 9.6**: wire node identity via
+  `LogSinksConfig::with_node_identity` in
+  `lorica/src/reload.rs::apply_log_sinks_from_store`, and add the
+  log-sink section to the new `docs/cluster.md` (AC #9 deferral).
 
 ## File List
 
@@ -205,3 +273,4 @@ release something shippable while the cluster stories are still moving.
 |------|---------|-------------|--------|
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Syslog hand-rolled rather than added as a dependency; OTLP logs via a feature flip on already-pinned crates; sink execution model promoted to an acceptance criterion. Status Draft. | Romain G. |
 | 2026-09-01 | 0.2 | Implemented: config fields + KV projection + secret scrub/reject; sink hub + RFC 5424 syslog sink in `lorica-api/src/log_sinks/`; OTLP logs exporter behind the existing `otel` feature; reload + boot wiring in all three process modes; hot-path publish with trace context; settings validation, JSON masking, 2 test endpoints + openapi; dashboard "Log export" tab; `log-sinks` e2e profile (phase 8). Rust unit tests (567 in lorica-api) and all four frontend gates green; CI-equivalent clippy + audit pending final run. Status Review. | Romain G. |
+| 2026-09-01 | 1.0 | QA iteration 1 (5 parallel auditors): 5 High fixed (PUT secret masking, worker counter aggregation, shutdown drain, lane lifecycle + PUT-time TLS validation, test-fixture raw control byte), plus the Medium/Low batch (message ceilings + truncation, at-rest encryption of sink secrets, cleartext warnings, test-endpoint audit records, SD hardening, dedups). Deferred items -> backlog #49-#55. All gates green incl. e2e 23/23 after rebuild. Status Done. | Romain G. |
