@@ -9,10 +9,10 @@
 #     native roots through openssl-probe, which honours that env var).
 #   - pebble-dir.pem / pebble-dir.key : the leaf Pebble presents on its
 #     ACME directory listener. Its SANs cover the Let's Encrypt staging
-#     and production hostnames because `lorica-acme` hardcodes those
-#     directory URLs (AcmeConfig::directory_url); the compose network
-#     aliases the pebble service to the staging hostname so no Rust
-#     change is needed to point the client at the fixture.
+#     and production hostnames: the compose network aliases the pebble
+#     service to the staging hostname so the fixture's TLS identity is
+#     realistic, and LORICA_ACME_DIRECTORY_URL points issuance at its
+#     /dir path (Pebble does not serve /directory).
 #
 # Generated at runtime (never committed): the Pebble 2.8.0 image is
 # distroless with no bundled test certificates to extract, and

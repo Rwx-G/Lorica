@@ -46,11 +46,12 @@ HTTP01_DOMAIN="acme-e2e.test"
 DNS01_DOMAIN="dns-e2e.test"
 
 log "=== ACME smoke: preflight ==="
-for i in $(seq 1 30); do
-    curl -sf "http://$BACKEND1/healthz" >/dev/null 2>&1 && break
-    sleep 1
-done
-log "backend1 ready"
+if wait_for_backend "$BACKEND1" 30; then
+    log "backend1 ready"
+else
+    fail "backend1 never came up at $BACKEND1"
+    exit 1
+fi
 
 PEBBLE_OK=false
 for i in $(seq 1 60); do
@@ -83,12 +84,12 @@ else
     exit 1
 fi
 
-for i in $(seq 1 120); do
-    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/" 2>/dev/null || true)
-    [ "$HTTP_CODE" != "000" ] && [ -n "$HTTP_CODE" ] && break
-    sleep 2
-done
-log "Lorica API ready"
+if wait_for_api 120; then
+    log "Lorica API ready"
+else
+    fail "Lorica API never came up at $API"
+    exit 1
+fi
 
 # --- Login (with first-run password change handling) ---
 ADMIN_PW=""
