@@ -94,6 +94,19 @@ fn restrict_socket_perms(path: &Path) {
 /// address (e.g. `0.0.0.0:8080`) so the worker manager can re-tag them.
 const MANAGEMENT_KEY_PREFIX: &str = "management:";
 
+/// `Fds` table key prefix for the cluster-plane listener (Story 9.1
+/// AC #7). The listener itself arrives with Story 9.2's
+/// `--cluster-listen`; the handoff seam is extended here first so the
+/// FD-transfer wire format is settled before any cluster deployment
+/// exists, and a control-plane node never loses its accept queue
+/// across a hot binary upgrade.
+const CLUSTER_KEY_PREFIX: &str = "cluster:";
+
+/// `Fds` table key for the cluster listener bound at `bind_addr`.
+pub fn cluster_fds_key(bind_addr: &str) -> String {
+    format!("{CLUSTER_KEY_PREFIX}{bind_addr}")
+}
+
 /// `<data_dir>/upgrade` - the operator-only staging directory shared with
 /// the verify+stage path in `lorica_api::upgrade`.
 pub fn upgrade_dir(data_dir: &Path) -> PathBuf {
@@ -201,17 +214,30 @@ pub struct InheritedListeners {
     pub proxy: Vec<(String, RawFd)>,
     /// The management-API listener FD, if it was handed over.
     pub management: Option<RawFd>,
+    /// The cluster-plane listener (bind address, FD), if the outgoing
+    /// supervisor ran with `--cluster-listen` (Story 9.1 AC #7; the
+    /// listener itself lands in Story 9.2).
+    pub cluster: Option<(String, RawFd)>,
 }
 
 /// Build the `Fds` table the old supervisor serves: every proxy listener
-/// keyed by its bind address, plus the management listener under the
-/// [`MANAGEMENT_KEY_PREFIX`] key.
-fn build_fds_table(proxy: &[(String, RawFd)], management_fd: RawFd, management_port: u16) -> Fds {
+/// keyed by its bind address, the management listener under the
+/// [`MANAGEMENT_KEY_PREFIX`] key, and the cluster listener (when
+/// present) under the [`CLUSTER_KEY_PREFIX`] key.
+fn build_fds_table(
+    proxy: &[(String, RawFd)],
+    management_fd: RawFd,
+    management_port: u16,
+    cluster: Option<&(String, RawFd)>,
+) -> Fds {
     let mut fds = Fds::new();
     for (addr, fd) in proxy {
         fds.add(addr.clone(), *fd);
     }
     fds.add(management_fds_key(management_port), management_fd);
+    if let Some((bind, fd)) = cluster {
+        fds.add(cluster_fds_key(bind), *fd);
+    }
     fds
 }
 
@@ -225,8 +251,9 @@ pub fn serve_listener_fds_blocking(
     proxy: &[(String, RawFd)],
     management_fd: RawFd,
     management_port: u16,
+    cluster: Option<&(String, RawFd)>,
 ) -> Result<(), String> {
-    let table = build_fds_table(proxy, management_fd, management_port);
+    let table = build_fds_table(proxy, management_fd, management_port, cluster);
     let sock = transfer_sock_path(data_dir);
     let sock_str = sock.to_string_lossy().into_owned();
     table
@@ -239,7 +266,8 @@ pub fn serve_listener_fds_blocking(
 ///
 /// Called by the NEW supervisor before it starts its tokio runtime,
 /// mirroring the bind-then-fork ordering of a fresh start. Partitions the
-/// pulled FD set into proxy listeners and the management listener.
+/// pulled FD set into proxy listeners, the management listener, and the
+/// cluster listener.
 pub fn pull_inherited_listeners(
     data_dir: &Path,
     management_port: u16,
@@ -251,18 +279,40 @@ pub fn pull_inherited_listeners(
     fds.get_from_sock(sock_str.as_str())
         .map_err(|e| format!("failed to pull inherited listeners from {sock_str}: {e}"))?;
 
-    let management_key = management_fds_key(management_port);
     let (serialized_keys, serialized_fds) = fds.serialize();
+    Ok(partition_inherited_fds(
+        serialized_keys,
+        serialized_fds,
+        management_port,
+    ))
+}
+
+/// Partition a pulled FD table into proxy / management / cluster
+/// listeners by key prefix. Pure (no socket ops), so the wire-format
+/// partitioning is unit-testable without an SCM_RIGHTS round-trip.
+fn partition_inherited_fds(
+    keys: Vec<String>,
+    fds: Vec<RawFd>,
+    management_port: u16,
+) -> InheritedListeners {
+    let management_key = management_fds_key(management_port);
     let mut proxy: Vec<(String, RawFd)> = Vec::new();
     let mut management: Option<RawFd> = None;
-    for (key, fd) in serialized_keys.into_iter().zip(serialized_fds) {
+    let mut cluster: Option<(String, RawFd)> = None;
+    for (key, fd) in keys.into_iter().zip(fds) {
         if key == management_key || key.starts_with(MANAGEMENT_KEY_PREFIX) {
             management = Some(fd);
+        } else if let Some(bind) = key.strip_prefix(CLUSTER_KEY_PREFIX) {
+            cluster = Some((bind.to_string(), fd));
         } else {
             proxy.push((key, fd));
         }
     }
-    Ok(InheritedListeners { proxy, management })
+    InheritedListeners {
+        proxy,
+        management,
+        cluster,
+    }
 }
 
 /// NEW-side readiness handshake: repeatedly announce readiness to the old
@@ -416,6 +466,10 @@ pub struct HandoffArgs {
     pub management_fd: RawFd,
     /// Management port (used to key the management FD in the table).
     pub management_port: u16,
+    /// Cluster-plane listener (bind address, FD) to hand over, when
+    /// the node runs with `--cluster-listen` (Story 9.1 AC #7; wired
+    /// by Story 9.2, always `None` until then).
+    pub cluster_fd: Option<(String, RawFd)>,
     /// Full argv for the new binary, `argv[0]` first.
     pub child_argv: Vec<String>,
 }
@@ -470,8 +524,15 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
     let serve_proxy = args.proxy_fds.clone();
     let serve_mgmt = args.management_fd;
     let serve_port = args.management_port;
+    let serve_cluster = args.cluster_fd.clone();
     let serve_task = tokio::task::spawn_blocking(move || {
-        serve_listener_fds_blocking(&serve_data_dir, &serve_proxy, serve_mgmt, serve_port)
+        serve_listener_fds_blocking(
+            &serve_data_dir,
+            &serve_proxy,
+            serve_mgmt,
+            serve_port,
+            serve_cluster.as_ref(),
+        )
     });
 
     // Fork + exec the staged binary.
@@ -505,6 +566,34 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_routes_cluster_listener_by_prefix() {
+        // Story 9.1 AC #7: the FD-transfer wire format carries an
+        // optional cluster listener alongside proxy + management, and
+        // the new supervisor partitions it back out by key prefix.
+        let keys = vec![
+            "0.0.0.0:8080".to_string(),
+            "0.0.0.0:8443".to_string(),
+            management_fds_key(9443),
+            cluster_fds_key("10.0.0.10:7443"),
+        ];
+        let fds: Vec<RawFd> = vec![10, 11, 12, 13];
+        let inherited = partition_inherited_fds(keys, fds, 9443);
+        assert_eq!(inherited.proxy.len(), 2);
+        assert_eq!(inherited.management, Some(12));
+        assert_eq!(inherited.cluster, Some(("10.0.0.10:7443".to_string(), 13)));
+
+        // Without a cluster key the slot stays empty (every pre-9.2
+        // deployment).
+        let inherited = partition_inherited_fds(
+            vec!["0.0.0.0:8080".to_string(), management_fds_key(9443)],
+            vec![20, 21],
+            9443,
+        );
+        assert!(inherited.cluster.is_none());
+        assert_eq!(inherited.management, Some(21));
+    }
 
     #[test]
     fn notify_payload_is_well_formed() {

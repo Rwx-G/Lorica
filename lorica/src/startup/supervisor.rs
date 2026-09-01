@@ -88,6 +88,10 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 info!(
                     proxy_listeners = i.proxy.len(),
                     has_management = i.management.is_some(),
+                    // Cluster slot always empty until Story 9.2 wires
+                    // --cluster-listen; logged so an upgraded
+                    // control-plane node can verify the handoff.
+                    has_cluster = i.cluster.is_some(),
                     "hot upgrade: pulled inherited listeners from outgoing supervisor"
                 );
                 Some(i)
@@ -135,9 +139,29 @@ pub(crate) fn run_supervisor(cli: Cli) {
             }
         };
         let db_path = data_dir.join("lorica.db");
-        if let Err(e) = ConfigStore::open(&db_path, encryption_key) {
-            error!(error = %e, "failed to run database migrations before forking workers");
-            std::process::exit(1);
+        match ConfigStore::open(&db_path, encryption_key) {
+            Ok(store) => {
+                // Story 9.1 AC #7 interlock: a NEW supervisor taking
+                // over via --hot-upgrade bumps the takeover epoch
+                // BEFORE it serves anything. Cluster sessions (Story
+                // 9.2) tag themselves with the epoch they were
+                // accepted under and the registry fences older
+                // epochs, so a follower never holds two live sessions
+                // for one node_id during the old/new overlap.
+                if cli.hot_upgrade {
+                    match store.increment_cluster_takeover_epoch() {
+                        Ok(epoch) => info!(epoch, "hot upgrade: took cluster takeover epoch"),
+                        Err(e) => {
+                            error!(error = %e, "hot upgrade: failed to take cluster takeover epoch");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "failed to run database migrations before forking workers");
+                std::process::exit(1);
+            }
         }
         info!("database migrations completed, forking workers");
     }
@@ -1346,6 +1370,9 @@ pub(crate) fn run_supervisor(cli: Cli) {
                         proxy_fds: handoff_proxy_fds.clone(),
                         management_fd: mgmt_handoff_fd,
                         management_port,
+                        // Story 9.1 AC #7 seam: populated by Story 9.2
+                        // once --cluster-listen exists.
+                        cluster_fd: None,
                         child_argv,
                     })
                     .await;
