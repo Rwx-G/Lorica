@@ -1,7 +1,7 @@
 # Story 9.1: Foundations
 
 **Epic:** 9 (v1.7.0)
-**Status:** Review
+**Status:** Done
 **Author:** Romain G.
 
 ## Story
@@ -389,3 +389,5 @@ and version 18 is an inline entry (`store/mod.rs:280-286`), while
 | 2026-09-01 | 0.2 | Slices A-E implemented: RpcEndpoint generalisation (Frame + RpcLimits + typed oversize/inflight errors), canonical encoder + deny_unknown_fields, migrations 47/48 + table-driven key rotation (fixes pre-existing dns_providers rotation gap), fallible present with pre-set_ready abort, cluster FD seam + takeover-epoch interlock. Status InProgress. | Romain G. |
 | 2026-09-01 | 0.3 | Pebble ACME e2e profile authored (tests-e2e-docker acme profile, Phase 9). | Romain G. |
 | 2026-09-01 | 0.4 | acme e2e proven 15/15 (HTTP-01 + manual DNS-01 issued by Pebble) after LORICA_ACME_DIRECTORY_URL override and smoke jq fixes. All ACs implemented; full test/clippy/audit chain green. Status Review. | Romain G. |
+| 2026-09-02 | 0.5 | QA iteration 1: five-auditor sweep; 1 Critical (canonical blob secret material -> digests) + 5 High + cheap Mediums fixed; e2e re-proven 15/15. | Romain G. |
+| 2026-09-02 | 0.6 | QA iteration 2 (incremental re-audit): request() in-flight bookkeeping made cancel-safe (RAII guard + regression test), rotation gate narrowed to KV row_key granularity, scanner hardened. All green. Status Done. | Romain G. |
