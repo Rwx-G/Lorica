@@ -102,7 +102,7 @@ async fn build_account(config: &AcmeConfig) -> Result<Account, AcmeError> {
                 terms_of_service_agreed: true,
                 only_return_existing: false,
             },
-            config.directory_url().to_string(),
+            config.directory_url(),
             None,
         )
         .await
@@ -366,7 +366,7 @@ pub async fn begin_manual_dns01(
                 terms_of_service_agreed: true,
                 only_return_existing: false,
             },
-            config.directory_url().to_string(),
+            config.directory_url(),
             None,
         )
         .await
