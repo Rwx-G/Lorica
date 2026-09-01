@@ -77,7 +77,8 @@ COPY tests-e2e-docker/entrypoint-otel-workers.sh /entrypoint-otel-workers.sh
 COPY tests-e2e-docker/entrypoint-rdns.sh /entrypoint-rdns.sh
 COPY tests-e2e-docker/entrypoint-hot-upgrade.sh /entrypoint-hot-upgrade.sh
 COPY tests-e2e-docker/entrypoint-log-sinks.sh /entrypoint-log-sinks.sh
-RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh /entrypoint-hot-upgrade.sh /entrypoint-log-sinks.sh
+COPY tests-e2e-docker/entrypoint-acme.sh /entrypoint-acme.sh
+RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh /entrypoint-hot-upgrade.sh /entrypoint-log-sinks.sh /entrypoint-acme.sh
 
 # Pre-create the `/shared` mount point owned by the non-root lorica
 # user so the entrypoint can write `/shared/admin_password` after the

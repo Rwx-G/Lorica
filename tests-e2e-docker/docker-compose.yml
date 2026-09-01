@@ -859,6 +859,113 @@ services:
     networks:
       - e2e
 
+  # ---------------------------------------------------------------------
+  # ACME profile (Story 9.1 AC #13): Pebble fixture with a mock DNS
+  # provider, the repo's first end-to-end ACME coverage (audit M-22).
+  #
+  # `lorica-acme` hardcodes the Let's Encrypt staging/production
+  # directory URLs, so the pebble service carries a network alias for
+  # the staging hostname and serves its directory on 443 with a leaf
+  # covering those SANs, signed by a fixture CA that `acme-ca-init`
+  # generates into the shared volume at boot. The Lorica node trusts
+  # that CA via SSL_CERT_FILE (instant-acme's platform verifier loads
+  # native roots through openssl-probe, which honours the env var).
+  # Pebble's VA resolves via challtestsrv (-dnsserver) and dials
+  # HTTP-01 on 8080 - the Lorica proxy port.
+  #
+  # Run with:
+  #   docker compose --profile acme up --build
+  #   docker compose --profile acme run --rm acme-smoke
+  acme-ca-init:
+    build:
+      context: ./test-runner
+    profiles: ["acme"]
+    user: "0:0"
+    entrypoint: ["sh", "/fixtures/gen-pebble-certs.sh"]
+    volumes:
+      - ./fixtures/gen-pebble-certs.sh:/fixtures/gen-pebble-certs.sh:ro
+      - shared-acme:/shared
+    networks:
+      - e2e
+
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:2.8.0
+    profiles: ["acme"]
+    command: ["-config", "/test/pebble-config.json", "-dnsserver", "challtestsrv:8053", "-strict"]
+    environment:
+      # No artificial validation sleeps: the smoke polls with tight
+      # budgets and pebble's default 0-15s random sleep only adds flake.
+      - PEBBLE_VA_NOSLEEP=1
+    volumes:
+      - ./fixtures/pebble-config.json:/test/pebble-config.json:ro
+      - shared-acme:/shared:ro
+    depends_on:
+      acme-ca-init:
+        condition: service_completed_successfully
+      challtestsrv:
+        condition: service_started
+    networks:
+      e2e:
+        aliases:
+          - acme-staging-v02.api.letsencrypt.org
+          - acme-v02.api.letsencrypt.org
+
+  # Mock DNS provider: answers pebble's DNS queries on 8053 and takes
+  # A / TXT records over its management API on 8055 (the smoke uses
+  # /add-a for HTTP-01 host resolution and /set-txt for the manual
+  # DNS-01 flow). Empty defaults so only explicitly registered names
+  # resolve.
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:2.8.0
+    profiles: ["acme"]
+    command: ["-defaultIPv4", "", "-defaultIPv6", ""]
+    networks:
+      - e2e
+
+  lorica-acme:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-acme.sh"]
+    profiles: ["acme"]
+    environment:
+      # Trust the fixture CA for outbound TLS from the ACME client.
+      # reqwest-based clients (webhooks, OTLP) compile in webpki roots
+      # and are unaffected.
+      - SSL_CERT_FILE=/shared/pebble-ca.pem
+      # Pebble serves its directory at /dir, not the Let's Encrypt
+      # /directory path; keep the staging alias for the TLS SAN.
+      - LORICA_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/dir
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-acme-data:/var/lib/lorica
+      - shared-acme:/shared
+    depends_on:
+      - backend1
+      - pebble
+    networks:
+      - e2e
+
+  acme-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["acme"]
+    entrypoint: ["bash", "run-acme-smoke.sh"]
+    depends_on:
+      - lorica-acme
+      - pebble
+      - challtestsrv
+    volumes:
+      - shared-acme:/shared:ro
+    environment:
+      - LORICA_API=https://lorica-acme:9443
+      - LORICA_PROXY=http://lorica-acme:8080
+      - BACKEND1_ADDR=backend1:80
+      - CHALLTESTSRV=http://challtestsrv:8055
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
@@ -892,6 +999,8 @@ volumes:
   shared-audit:
   lorica-log-sinks-data:
   shared-log-sinks:
+  lorica-acme-data:
+  shared-acme:
 
 networks:
   e2e:

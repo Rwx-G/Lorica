@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the Lorica E2E test suite with Docker Compose.
-# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-rbac] [--skip-hot-upgrade] [--skip-log-sinks]
+# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-rbac] [--skip-hot-upgrade] [--skip-log-sinks] [--skip-acme]
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
@@ -10,6 +10,7 @@
 #   --skip-audit        Skip the v1.6.0 Story 8.9 audit-log profile (faster)
 #   --skip-hot-upgrade  Skip the v1.6.0 Story 8.4 hot binary-upgrade profile (faster)
 #   --skip-log-sinks    Skip the v1.7.0 Story 9.8 log-sinks profile (faster)
+#   --skip-acme         Skip the v1.7.0 Story 9.1 Pebble ACME profile (faster)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -23,6 +24,7 @@ SKIP_RBAC=false
 SKIP_AUDIT=false
 SKIP_HOT_UPGRADE=false
 SKIP_LOG_SINKS=false
+SKIP_ACME=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -35,6 +37,7 @@ for arg in "$@"; do
         --skip-audit)        SKIP_AUDIT=true ;;
         --skip-hot-upgrade)  SKIP_HOT_UPGRADE=true ;;
         --skip-log-sinks)    SKIP_LOG_SINKS=true ;;
+        --skip-acme)         SKIP_ACME=true ;;
     esac
 done
 
@@ -45,7 +48,7 @@ EXIT_CODE=0
 # run boots against stale data - e.g. the cert-export smoke rotates the
 # admin password, and a stale volume 401s the next login), and on BUILD a
 # plain `docker compose build` (no profile flags) skips them entirely.
-ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks"
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks --profile acme"
 
 # `docker compose run` never rebuilds an existing image, so a stale runner
 # would silently run old assertions. With --build, build every service
@@ -319,6 +322,35 @@ if [ "$SKIP_LOG_SINKS" = false ] && [ "$EXIT_CODE" = "0" ]; then
     done
 
     docker compose --profile log-sinks run --rm log-sinks-smoke || EXIT_CODE=$?
+fi
+
+# ---- Phase 9: ACME / Pebble profile (Story 9.1 AC #13) --------------
+# First end-to-end ACME coverage (audit M-22): HTTP-01 issuance
+# against Pebble routed through the proxy, and DNS-01 via the manual
+# flow with TXT records published on the challtestsrv mock DNS
+# provider. Opt-out via --skip-acme (default ON).
+if [ "$SKIP_ACME" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (acme profile) ==="
+    echo ""
+
+    docker compose --profile acme up $BUILD_FLAG -d backend1 challtestsrv pebble lorica-acme
+
+    echo "Waiting for Lorica (acme) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica-acme curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (acme) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (acme) did not start within 120s"
+            docker compose logs lorica-acme | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    docker compose --profile acme run --rm acme-smoke || EXIT_CODE=$?
 fi
 
 # Cleanup unless --keep
