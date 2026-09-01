@@ -65,6 +65,47 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Real-time access logs** - WebSocket streaming to the dashboard with filtering
 - **Load testing** - built-in load test engine with SSE streaming, cron scheduling, CPU circuit breaker, and result comparison
 - **SLA breach alerts** - automatic notifications when SLA drops below target
+- **Syslog export** (v1.7.0) - ship access logs, WAF events and audit entries to an existing SIEM as RFC 5424 messages over UDP, TCP (RFC 6587 octet-counting framing) or TCP+TLS (optional mutual TLS towards the collector). Configurable facility, per-event-kind severity mapping, per-kind toggles, and static structured-data parameters (`env=prod,dc=eu-west`). Fire-and-forget with a bounded queue: an unreachable collector sheds export rows (`lorica_log_sink_dropped_total`) and never affects request serving
+- **OTLP logs export** (v1.7.0, needs a build with `--features otel`) - the same three event kinds as OTLP log records to the OpenTelemetry collector already configured for tracing, with `trace_id` / `span_id` attached from the request's span context so a log record joins its trace in Grafana / Tempo / Loki-style backends. Optional `Authorization` header for authenticated collectors (HTTP transports)
+
+  <details>
+  <summary>Worked examples: SIEM (syslog) and OTLP collector</summary>
+
+  Syslog towards an rsyslog / SIEM ingest listening in TCP on 6514 with TLS:
+  set **Settings → Log export** to endpoint `siem.example.com:6514`, transport
+  `tcp-tls`, facility 16 (`local0`), keep the default severities
+  (access=info, waf=warning, audit=notice), paste the collector CA if it is
+  private. Matching rsyslog receiver:
+
+  ```conf
+  module(load="imtcp" StreamDriver.Name="gtls" StreamDriver.Mode="1")
+  input(type="imtcp" port="6514")
+  template(name="lorica" type="string" string="/var/log/lorica/%APP-NAME%-%$YEAR%%$MONTH%%$DAY%.log")
+  if $app-name == "lorica" then action(type="omfile" dynaFile="lorica")
+  ```
+
+  OTLP logs towards an OpenTelemetry collector: enable **OTLP logs** in the
+  same tab (the collector endpoint and protocol come from the Observability
+  tab). Minimal collector pipeline:
+
+  ```yaml
+  receivers:
+    otlp:
+      protocols:
+        http:
+  exporters:
+    file:
+      path: /var/log/otel/lorica-logs.json
+  service:
+    pipelines:
+      logs:
+        receivers: [otlp]
+        exporters: [file]
+  ```
+
+  Both sinks hot-reload on save (no restart) and each has a per-sink test
+  button reporting success, failure reason and round-trip time.
+  </details>
 
 ### :globe_with_meridians: Management
 
@@ -513,6 +554,8 @@ All endpoints are served on the management port (default `9443`) over HTTPS (a s
 | `PUT` | `/api/v1/settings` | Update settings (rejects cross-field-inconsistent values with 400) |
 | `GET` | `/api/v1/settings/schema` | Settings field schema (bounds, defaults) |
 | `POST` | `/api/v1/settings/otel/test` | Test the OpenTelemetry exporter connection |
+| `POST` | `/api/v1/settings/syslog/test` | Send a test message over the syslog export sink |
+| `POST` | `/api/v1/settings/otlp-logs/test` | Probe the OTLP collector's logs signal path |
 | `GET` | `/api/v1/status` | System status summary |
 | `GET` | `/api/v1/system` | CPU, memory, disk usage |
 | `POST` | `/api/v1/system/upgrade` | Hot binary upgrade (signature-verified, zero-downtime) |

@@ -9,6 +9,11 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Added
+
+- Syslog export sink (Epic 9 Story 9.8): access logs, WAF events and audit entries can be shipped to an operator SIEM as RFC 5424 messages, implemented in-tree (no new dependency) over UDP, TCP (RFC 6587 octet-counting framing) and TCP+TLS with optional mutual TLS towards the collector (PEM CA / client cert / client key settings; the client key is secret-masked on `GET /settings` and redacted from TOML export, with import rejecting the placeholder). Configurable facility (default `local0`), per-event-kind severity mapping (access=info, waf=warning, audit=notice), independent per-kind toggles, and static structured-data parameters (`syslog_extra_sd`, e.g. `env=prod,dc=eu-west`) carried in a `[lorica@32473 ...]` SD element alongside the event kind and the request `trace_id` / `span_id`. Delivery is fire-and-forget through a bounded queue drained by a dedicated OS thread owning its own tokio runtime (identical behaviour in supervisor, worker and single-process modes): an unreachable collector backs off exponentially (1 s to 30 s) and sheds messages into `lorica_log_sink_dropped_total{sink,kind}` instead of ever touching the request path. `POST /api/v1/settings/syslog/test` sends a synthetic test message and reports success, failure reason and round-trip time.
+- OTLP logs signal (Epic 9 Story 9.8, builds with `--features otel`): the same three event kinds are exported as OTLP log records to the collector already configured for tracing (`otlp_endpoint` / `otlp_protocol` / `otlp_service_name`), by enabling the `logs` feature on the already-pinned opentelemetry 0.32 crates - no new crate, no version bump. Each record carries the JSON event as its body, a `lorica.kind` attribute, and the `trace_id` / `span_id` captured from the request's span context at emission time, so a log record joins its trace in the backend. An optional `otlp_logs_auth_header` (secret, masked and export-redacted like the scrape token) is sent as `Authorization` on the HTTP transports. `POST /api/v1/settings/otlp-logs/test` probes the collector's `/v1/logs` path. Both sinks hot-reload through the existing per-process reload bundle with no restart, and the dashboard Settings gains a "Log export" tab with per-sink test buttons.
+
 ## [1.6.0] - 2026-08-12
 
 ### Added
