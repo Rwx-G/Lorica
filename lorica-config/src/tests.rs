@@ -1365,21 +1365,87 @@ created_at = "2026-01-01T00:00:00Z"
             ("certs.rs", "routes"),
         ];
 
+        // Normalise before scanning so the gate does not depend on
+        // the author's SQL formatting habits: collapse all whitespace
+        // (multi-line statements) and match keywords
+        // ASCII-case-insensitively (per-char uppercase, so byte
+        // offsets stay aligned with the normalised source).
         fn extract_write_tables(src: &str) -> HashSet<String> {
+            let normalized: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+            let upper: String = normalized.chars().map(|c| c.to_ascii_uppercase()).collect();
             let mut tables = HashSet::new();
-            for marker in ["INSERT INTO ", "INSERT OR REPLACE INTO ", "UPDATE "] {
-                for (idx, _) in src.match_indices(marker) {
-                    let rest = &src[idx + marker.len()..];
+            for (marker, is_update) in [
+                ("INSERT INTO ", false),
+                ("INSERT OR REPLACE INTO ", false),
+                ("UPDATE ", true),
+            ] {
+                for (idx, _) in upper.match_indices(marker) {
+                    let rest = &normalized[idx + marker.len()..];
                     let table: String = rest
                         .chars()
                         .take_while(|c| c.is_ascii_lowercase() || *c == '_')
                         .collect();
-                    if !table.is_empty() {
+                    if table.is_empty() {
+                        continue;
+                    }
+                    // Only count actual SQL statements: the keyword
+                    // also appears in prose ("Update an existing
+                    // certificate"), so require the table to be
+                    // followed by the statement's next clause.
+                    let after = rest[table.len()..].trim_start();
+                    let after_upper: String =
+                        after.chars().take(8).map(|c| c.to_ascii_uppercase()).collect();
+                    let is_sql = if is_update {
+                        after_upper.starts_with("SET ")
+                    } else {
+                        after.starts_with('(') || after_upper.starts_with("VALUES")
+                    };
+                    if is_sql {
                         tables.insert(table);
                     }
                 }
             }
             tables
+        }
+
+        // Table-level coverage is too coarse for the key/value
+        // `global_settings` table: dozens of plaintext settings and a
+        // few encrypted secrets share the same INSERT, so a new
+        // encrypted row could hide behind the already-registered
+        // table. For every `encrypt_config(` call whose following
+        // INSERT targets `global_settings`, extract the literal row
+        // key and require a matching `EncryptedColumn::KvText` entry.
+        fn extract_encrypted_kv_row_keys(src: &str, path: &std::path::Path) -> HashSet<String> {
+            let normalized: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut keys = HashSet::new();
+            for (idx, _) in normalized.match_indices("encrypt_config(") {
+                let mut window_end = std::cmp::min(idx + 800, normalized.len());
+                while !normalized.is_char_boundary(window_end) {
+                    window_end -= 1;
+                }
+                let window = &normalized[idx..window_end];
+                let Some(into_at) = window.find("INTO global_settings") else {
+                    continue;
+                };
+                let after_into = &window[into_at..];
+                let key = after_into
+                    .find("VALUES ('")
+                    .map(|v| &after_into[v + "VALUES ('".len()..])
+                    .and_then(|rest| rest.split('\'').next())
+                    .filter(|k| !k.is_empty());
+                match key {
+                    Some(k) => {
+                        keys.insert(k.to_string());
+                    }
+                    None => panic!(
+                        "{}: encrypt_config() write into global_settings without an \
+                         extractable literal row key; the KV coverage gate needs updating \
+                         for the new write shape",
+                        path.display()
+                    ),
+                }
+            }
+            keys
         }
 
         fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -1395,9 +1461,13 @@ created_at = "2026-01-01T00:00:00Z"
 
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store");
         let registry: HashSet<&str> = crate::store::rotation_covered_tables().into_iter().collect();
+        let kv_registry: HashSet<&str> = crate::store::rotation_covered_kv_row_keys()
+            .into_iter()
+            .collect();
         let mut files = Vec::new();
         rs_files(&dir, &mut files);
         let mut scanned = 0usize;
+        let mut kv_keys_seen = 0usize;
         for path in files {
             let file_name = path
                 .file_name()
@@ -1431,7 +1501,23 @@ created_at = "2026-01-01T00:00:00Z"
                     path.display()
                 );
             }
+            for row_key in extract_encrypted_kv_row_keys(&src, &path) {
+                kv_keys_seen += 1;
+                assert!(
+                    kv_registry.contains(row_key.as_str()),
+                    "{} encrypts the global_settings row `{row_key}` but no \
+                     EncryptedColumn::KvText entry covers it; a key rotation would \
+                     silently skip this secret - register it in store/mod.rs",
+                    path.display()
+                );
+            }
         }
+        // Same floor logic as `scanned`: the KV extraction must keep
+        // finding the two Story 9.8 sink secrets or it has gone blind.
+        assert!(
+            kv_keys_seen >= 2,
+            "expected at least 2 encrypted global_settings row keys, found {kv_keys_seen}"
+        );
         // Sanity floor so a scan breakage fails loudly instead of
         // passing on an empty set (same pattern as the openapi gate).
         assert!(

@@ -615,6 +615,21 @@ pub(crate) fn rotation_covered_tables() -> Vec<&'static str> {
         .collect()
 }
 
+/// Row keys of the [`EncryptedColumn::KvText`] entries, for the
+/// coverage test in `tests.rs`: table-level coverage is too coarse
+/// for a key/value table where dozens of plaintext settings and a
+/// few encrypted secrets share the same INSERT.
+#[cfg(test)]
+pub(crate) fn rotation_covered_kv_row_keys() -> Vec<&'static str> {
+    ENCRYPTED_COLUMNS
+        .iter()
+        .filter_map(|c| match c {
+            EncryptedColumn::KvText { row_key, .. } => Some(*row_key),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
     pub(crate) conn: Connection,
