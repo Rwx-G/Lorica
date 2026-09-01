@@ -1227,6 +1227,28 @@ created_at = "2026-01-01T00:00:00Z"
             )
             .expect("test setup: sqlite_master query");
         assert_eq!(count, 1, "acme_challenges must exist after migrations");
+
+        // Shape, not just existence: `IF NOT EXISTS` makes migration
+        // v47 a no-op on databases where the retired ad-hoc DDL
+        // already created the table, so the columns the Story 9.5
+        // network writer will bind must be asserted explicitly.
+        let mut stmt = store
+            .conn
+            .prepare("SELECT name, type FROM pragma_table_info('acme_challenges') ORDER BY name")
+            .expect("test setup: pragma prepares");
+        let columns: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("test setup: pragma queries")
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()
+            .expect("test setup: pragma rows read");
+        assert_eq!(
+            columns,
+            vec![
+                ("key_auth".to_string(), "TEXT".to_string()),
+                ("token".to_string(), "TEXT".to_string()),
+            ],
+            "acme_challenges columns must match the migration-owned shape"
+        );
     }
 
     #[test]
@@ -1325,20 +1347,64 @@ created_at = "2026-01-01T00:00:00Z"
 
     #[test]
     fn rotation_registry_covers_every_encrypting_store_module() {
-        // Story 9.1 AC #8 drift gate: scan every store module at test
-        // time; a module that encrypts at rest must write into a table
-        // named by ENCRYPTED_COLUMNS. Adding `encrypt_config` /
-        // `encrypt_key_pem` calls to a new module without registering
-        // its table fails here instead of silently bricking secrets at
-        // the next key rotation.
+        // Story 9.1 AC #8 drift gate: recursively scan every store
+        // module at test time. A module that encrypts at rest may only
+        // write into tables that ENCRYPTED_COLUMNS names (or tables
+        // explicitly listed below as non-encrypted write targets), so
+        // a new module encrypting into an unregistered table fails
+        // here instead of silently bricking that secret at the next
+        // key rotation. `mod.rs` is exempt: it hosts the registry and
+        // the table-driven rotation itself, whose SQL is format!-built
+        // from the registry.
         use std::collections::HashSet;
+
+        // Tables an encrypting module writes WITHOUT encrypted
+        // content. Every entry is a reviewed decision.
+        const NON_ENCRYPTED_WRITE_TARGETS: &[(&str, &str)] = &[
+            // delete_certificate clears routes.certificate_id.
+            ("certs.rs", "routes"),
+        ];
+
+        fn extract_write_tables(src: &str) -> HashSet<String> {
+            let mut tables = HashSet::new();
+            for marker in ["INSERT INTO ", "INSERT OR REPLACE INTO ", "UPDATE "] {
+                for (idx, _) in src.match_indices(marker) {
+                    let rest = &src[idx + marker.len()..];
+                    let table: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || *c == '_')
+                        .collect();
+                    if !table.is_empty() {
+                        tables.insert(table);
+                    }
+                }
+            }
+            tables
+        }
+
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("test setup: store dir lists") {
+                let path = entry.expect("test setup: dir entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
 
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store");
         let registry: HashSet<&str> = crate::store::rotation_covered_tables().into_iter().collect();
+        let mut files = Vec::new();
+        rs_files(&dir, &mut files);
         let mut scanned = 0usize;
-        for entry in std::fs::read_dir(&dir).expect("test setup: store dir lists") {
-            let path = entry.expect("test setup: dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+        for path in files {
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("test setup: file name")
+                .to_string();
+            if file_name == "mod.rs" {
                 continue;
             }
             let src = std::fs::read_to_string(&path).expect("test setup: source reads");
@@ -1346,18 +1412,25 @@ created_at = "2026-01-01T00:00:00Z"
                 continue;
             }
             scanned += 1;
-            // Heuristic: the module must mention at least one table
-            // the registry covers (its SQL, or - for mod.rs, which
-            // hosts the registry itself - the registry entries). A new
-            // module encrypting into an unregistered table mentions
-            // only that table's name and fails here.
-            let covered = registry.iter().any(|table| src.contains(*table));
+            let tables = extract_write_tables(&src);
             assert!(
-                covered,
-                "{} encrypts at rest but mentions no table named in ENCRYPTED_COLUMNS; \
-                 add the column to the rotation registry in store/mod.rs",
+                !tables.is_empty(),
+                "{} encrypts at rest but the scan found no INSERT/UPDATE target; \
+                 the gate's SQL extraction needs updating",
                 path.display()
             );
+            for table in &tables {
+                let exempt = NON_ENCRYPTED_WRITE_TARGETS
+                    .iter()
+                    .any(|(file, t)| *file == file_name && t == table);
+                assert!(
+                    registry.contains(table.as_str()) || exempt,
+                    "{} encrypts at rest and writes into `{table}`, which is neither in \
+                     ENCRYPTED_COLUMNS nor listed as a reviewed non-encrypted write target; \
+                     register the column in store/mod.rs (or record the exemption here)",
+                    path.display()
+                );
+            }
         }
         // Sanity floor so a scan breakage fails loudly instead of
         // passing on an empty set (same pattern as the openapi gate).

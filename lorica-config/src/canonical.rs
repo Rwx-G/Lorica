@@ -39,14 +39,28 @@
 //!
 //! # Secrets and node-local fields
 //!
-//! Secrets ARE included (certificate `key_pem`, notification / DNS
-//! provider credentials - the store listings decrypt transparently):
-//! the blob travels only over the cluster plane's mutual TLS and is
-//! what a follower needs to actually serve. Node-local machine facts
-//! are excluded BY CONSTRUCTION: [`CanonicalGlobalSettings`] simply
-//! has no field for them, so a control-plane compromise cannot turn
-//! replication into an arbitrary-path file-write primitive on the
-//! fleet (Story 9.4 AC #1).
+//! Secret MATERIAL is never embedded. The blob has two jobs with
+//! opposite requirements - fleet drift-hash input (must cover every
+//! secret so a changed credential is detectable) and Story 9.4's
+//! replication payload (must be need-to-know) - so secret-bearing
+//! fields carry a `sha256:<hex>` digest of the secret instead of the
+//! secret itself. The digest is byte-stable and moves when the secret
+//! changes, which is all drift detection needs, and a compromised
+//! follower holding the blob learns no private key or DNS-zone
+//! credential. Actual key/credential transfer is the node-scoped
+//! distribution path Story 9.5 AC #7 mandates, never this blob.
+//! Digested fields: `Certificate::key_pem`,
+//! `NotificationConfig::config`, `DnsProvider::config` (the latter
+//! two are opaque secret-bearing JSON payloads and are digested
+//! whole).
+//!
+//! Node-local machine facts are excluded BY CONSTRUCTION:
+//! [`CanonicalGlobalSettings`] simply has no field for them, so a
+//! control-plane compromise cannot turn replication into an
+//! arbitrary-path file-write primitive on the fleet (Story 9.4
+//! AC #1). The `every_global_setting_is_explicitly_routed` test
+//! forces every future `GlobalSettings` field through an explicit
+//! replicate-or-node-local decision at compile time.
 
 use serde::{Deserialize, Serialize};
 
@@ -227,11 +241,14 @@ pub struct CanonicalConfig {
     pub backends: Vec<Backend>,
     /// Route-to-backend links, sorted canonically.
     pub route_backends: Vec<RouteBackend>,
-    /// Certificates INCLUDING private keys (see module doc).
+    /// Certificates; `key_pem` carries the private key's
+    /// `sha256:<hex>` digest, never the key (see module doc).
     pub certificates: Vec<Certificate>,
-    /// Notification channels INCLUDING their secrets.
+    /// Notification channels; `config` carries the payload's
+    /// `sha256:<hex>` digest, never the secret-bearing JSON.
     pub notification_configs: Vec<NotificationConfig>,
-    /// DNS providers INCLUDING their credentials.
+    /// DNS providers; `config` carries the payload's `sha256:<hex>`
+    /// digest, never the zone-credential JSON.
     pub dns_providers: Vec<DnsProvider>,
     /// Operator WAF custom rules.
     pub waf_custom_rules: Vec<CanonicalWafRule>,
@@ -269,6 +286,22 @@ fn sort_object_keys(value: serde_json::Value) -> serde_json::Value {
         }
         other => other,
     }
+}
+
+/// Lowercase-hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
+
+/// `sha256:<hex>` stand-in for a secret in the canonical blob:
+/// byte-stable, moves when the secret changes, discloses nothing.
+fn secret_digest(secret: &str) -> String {
+    format!("sha256:{}", sha256_hex(secret.as_bytes()))
 }
 
 /// Sort a collection by the canonical (key-sorted) JSON form of each
@@ -325,6 +358,18 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
         sla_configs: store.list_sla_configs()?,
     };
 
+    // Replace secret material with digests BEFORE sorting so the
+    // sort keys are computed on the bytes actually encoded.
+    for cert in &mut cfg.certificates {
+        cert.key_pem = secret_digest(&cert.key_pem);
+    }
+    for notification in &mut cfg.notification_configs {
+        notification.config = secret_digest(&notification.config);
+    }
+    for provider in &mut cfg.dns_providers {
+        provider.config = secret_digest(&provider.config);
+    }
+
     sort_by_canonical_repr(&mut cfg.routes);
     sort_by_canonical_repr(&mut cfg.backends);
     sort_by_canonical_repr(&mut cfg.route_backends);
@@ -354,21 +399,51 @@ pub fn canonical_bytes(store: &ConfigStore) -> Result<Vec<u8>> {
 /// for drift detection across the fleet.
 pub fn canonical_hash(store: &ConfigStore) -> Result<String> {
     let bytes = canonical_bytes(store)?;
-    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
-    Ok(digest
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>())
+    Ok(sha256_hex(&bytes))
+}
+
+/// Tolerant single-field peek so a version mismatch is reported AS a
+/// version mismatch, not as whichever unknown field the strict
+/// decoder trips on first.
+#[derive(Deserialize)]
+struct VersionPeek {
+    #[serde(default)]
+    version: u32,
 }
 
 /// Strict decode of a replicated blob (Story 9.1 AC #12). A follower
 /// on schema N-1 receiving a blob from schema N fails loudly here
 /// instead of silently discarding unknown fields and reporting
 /// "applied ok" - including for a new security-relevant setting.
+///
+/// The version is checked FIRST via a tolerant peek: under
+/// `deny_unknown_fields` a newer blob would otherwise fail on its
+/// first unknown field and the version stamp could never act as the
+/// gate it exists to be. Decode errors report position only (line /
+/// column), never the offending value: serde's `invalid type`
+/// rendering embeds the raw value, and mis-typed fields in this blob
+/// can neighbour secret digests and PEM bodies.
 pub fn decode_canonical(bytes: &[u8]) -> Result<CanonicalConfig> {
-    serde_json::from_slice(bytes)
-        .map_err(|e| ConfigError::Validation(format!("canonical decode failed: {e}")))
+    let peek: VersionPeek = serde_json::from_slice(bytes).map_err(|e| {
+        ConfigError::Validation(format!(
+            "canonical decode failed: not a JSON object (line {} column {})",
+            e.line(),
+            e.column()
+        ))
+    })?;
+    if peek.version != CANONICAL_FORMAT_VERSION {
+        return Err(ConfigError::Validation(format!(
+            "canonical format version {} is not supported (this node supports {})",
+            peek.version, CANONICAL_FORMAT_VERSION
+        )));
+    }
+    serde_json::from_slice(bytes).map_err(|e| {
+        ConfigError::Validation(format!(
+            "canonical decode failed at line {} column {}",
+            e.line(),
+            e.column()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -624,13 +699,148 @@ mod tests {
     }
 
     #[test]
-    fn secrets_are_included_in_canonical_bytes() {
+    fn secret_material_is_digested_not_embedded() {
         let store = ConfigStore::open_in_memory().expect("test setup: store opens");
         populate(&store, false);
 
         let text = String::from_utf8(canonical_bytes(&store).expect("encode")).expect("utf8");
-        assert!(text.contains("canonical-secret-key-material"));
-        assert!(text.contains("canonical-smtp-secret"));
+        // The material itself never appears...
+        assert!(!text.contains("canonical-secret-key-material"));
+        assert!(!text.contains("canonical-smtp-secret"));
+        // ...but its digest does, so drift detection still covers it.
+        assert!(text.contains("sha256:"));
+
+        let baseline = canonical_hash(&store).expect("hash");
+        let mut certs = store.list_certificates().expect("certs");
+        certs.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut rotated = certs[0].clone();
+        rotated.key_pem =
+            "-----BEGIN PRIVATE KEY-----\nrotated-material\n-----END PRIVATE KEY-----".into();
+        store
+            .update_certificate(&rotated)
+            .expect("cert key rotation");
+        assert_ne!(
+            baseline,
+            canonical_hash(&store).expect("hash"),
+            "a changed secret must move the fleet hash even though only its digest is encoded"
+        );
+    }
+
+    #[test]
+    fn decode_reports_version_mismatch_before_unknown_fields() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        populate(&store, false);
+        let bytes = canonical_bytes(&store).expect("encode");
+
+        // A "v2" blob: bumped version AND an unknown field. The error
+        // must name the version, not the unknown field.
+        let mut root: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        root["version"] = serde_json::json!(CANONICAL_FORMAT_VERSION + 1);
+        root.as_object_mut()
+            .expect("object")
+            .insert("added_in_v2".into(), serde_json::Value::Bool(true));
+        let newer = serde_json::to_vec(&root).expect("re-encode");
+        let err = decode_canonical(&newer).expect_err("newer version must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("version"), "unexpected error: {msg}");
+
+        // Malformed field on a matching version: the error carries a
+        // position, never the offending value.
+        let mut root: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        root["global"]["waf_ban_threshold"] = serde_json::json!("not-a-number-sentinel");
+        let malformed = serde_json::to_vec(&root).expect("re-encode");
+        let err = decode_canonical(&malformed).expect_err("type mismatch must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("line"), "unexpected error: {msg}");
+        assert!(
+            !msg.contains("not-a-number-sentinel"),
+            "decode errors must not embed field values: {msg}"
+        );
+    }
+
+    /// Compile-time drift gate (Story 9.1 QA): every `GlobalSettings`
+    /// field must be explicitly routed - either replicated through
+    /// [`CanonicalGlobalSettings`] or deliberately node-local. Adding
+    /// a field to `GlobalSettings` fails this destructuring (no `..`)
+    /// until the author decides which side it belongs to.
+    #[test]
+    fn every_global_setting_is_explicitly_routed() {
+        let GlobalSettings {
+            // Replicated fleet policy (mirrored in CanonicalGlobalSettings).
+            default_health_check_interval_s: _,
+            cert_warning_days: _,
+            cert_critical_days: _,
+            max_active_probes: _,
+            health_max_concurrent_probes: _,
+            loadtest_max_concurrency: _,
+            loadtest_max_duration_s: _,
+            loadtest_max_rps: _,
+            max_global_connections: _,
+            ip_blocklist_enabled: _,
+            flood_threshold_rps: _,
+            flood_strict_rps: _,
+            header_timeout_s: _,
+            waf_ban_threshold: _,
+            waf_ban_duration_s: _,
+            custom_security_presets: _,
+            access_log_retention: _,
+            waf_event_retention: _,
+            sla_purge_enabled: _,
+            sla_purge_retention_days: _,
+            sla_purge_schedule: _,
+            waf_whitelist_ips: _,
+            connection_deny_cidrs: _,
+            connection_allow_cidrs: _,
+            connection_limits_per_ip: _,
+            ai_bot_treat_spoofed_as: _,
+            ai_bot_inject_headers: _,
+            password_min_length: _,
+            password_require_complexity: _,
+            audit_log_retention_days: _,
+            bot_stash_max_entries: _,
+            bot_stash_per_prefix_max: _,
+            mirror_max_concurrent_per_route: _,
+            mirror_max_concurrent_global: _,
+            // Node-local by decision (module doc lists the rationale).
+            management_port: _,
+            log_level: _,
+            trusted_proxies: _,
+            otlp_endpoint: _,
+            otlp_protocol: _,
+            otlp_service_name: _,
+            otlp_sampling_ratio: _,
+            geoip_db_path: _,
+            geoip_auto_update_enabled: _,
+            asn_db_path: _,
+            asn_auto_update_enabled: _,
+            cert_export_enabled: _,
+            cert_export_dir: _,
+            cert_export_owner_uid: _,
+            cert_export_group_gid: _,
+            cert_export_file_mode: _,
+            cert_export_dir_mode: _,
+            bot_hmac_secret_hex: _,
+            upgrade_signing_pubkey_path: _,
+            metrics_require_auth: _,
+            prometheus_scrape_token: _,
+            management_cert_pem_path: _,
+            management_key_pem_path: _,
+            syslog_endpoint: _,
+            syslog_transport: _,
+            syslog_facility: _,
+            syslog_severity_access: _,
+            syslog_severity_waf: _,
+            syslog_severity_audit: _,
+            syslog_access_enabled: _,
+            syslog_waf_enabled: _,
+            syslog_audit_enabled: _,
+            syslog_tls_ca_pem: _,
+            syslog_tls_client_cert_pem: _,
+            syslog_tls_client_key_pem: _,
+            syslog_extra_sd: _,
+            otlp_logs_enabled: _,
+            otlp_logs_auth_header: _,
+        } = GlobalSettings::default();
     }
 
     #[test]

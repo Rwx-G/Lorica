@@ -779,20 +779,25 @@ impl ConfigStore {
             match column {
                 EncryptedColumn::Blob { table, id_col, col } => {
                     let mut stmt = tx.prepare(&format!("SELECT {id_col}, {col} FROM {table}"))?;
+                    // A row that fails to read aborts the whole
+                    // rotation: silently skipping it would leave that
+                    // secret under the retired key while the rotation
+                    // reports success - the exact failure AC #8 exists
+                    // to eliminate.
                     let rows: Vec<(String, Vec<u8>)> = stmt
                         .query_map([], |row| {
                             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
                         })?
-                        .filter_map(|r| r.ok())
-                        .collect();
+                        .collect::<rusqlite::Result<Vec<(String, Vec<u8>)>>>()?;
                     drop(stmt);
+                    let mut update = tx.prepare(&format!(
+                        "UPDATE {table} SET {col} = ?1 WHERE {id_col} = ?2"
+                    ))?;
                     for (id, stored) in &rows {
                         let plaintext = self.decrypt_key_pem(stored)?;
-                        let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
-                        tx.execute(
-                            &format!("UPDATE {table} SET {col} = ?1 WHERE {id_col} = ?2"),
-                            params![re_encrypted, id],
-                        )?;
+                        let re_encrypted =
+                            Self::reencrypt_verified(new_key, plaintext.as_bytes())?;
+                        update.execute(params![re_encrypted, id])?;
                         count += 1;
                     }
                 }
@@ -802,18 +807,18 @@ impl ConfigStore {
                         .query_map([], |row| {
                             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                         })?
-                        .filter_map(|r| r.ok())
-                        .collect();
+                        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
                     drop(stmt);
+                    let mut update = tx.prepare(&format!(
+                        "UPDATE {table} SET {col} = ?1 WHERE {id_col} = ?2"
+                    ))?;
                     for (id, stored) in &rows {
                         let plaintext = self.decrypt_config(stored)?;
-                        let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
+                        let re_encrypted =
+                            Self::reencrypt_verified(new_key, plaintext.as_bytes())?;
                         let re_encoded =
                             base64::engine::general_purpose::STANDARD.encode(&re_encrypted);
-                        tx.execute(
-                            &format!("UPDATE {table} SET {col} = ?1 WHERE {id_col} = ?2"),
-                            params![re_encoded, id],
-                        )?;
+                        update.execute(params![re_encoded, id])?;
                         count += 1;
                     }
                 }
@@ -832,7 +837,8 @@ impl ConfigStore {
                         .optional()?;
                     if let Some(stored) = stored.filter(|s| !s.is_empty()) {
                         let plaintext = self.decrypt_config(&stored)?;
-                        let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
+                        let re_encrypted =
+                            Self::reencrypt_verified(new_key, plaintext.as_bytes())?;
                         let re_encoded =
                             base64::engine::general_purpose::STANDARD.encode(&re_encrypted);
                         tx.execute(
@@ -849,6 +855,23 @@ impl ConfigStore {
             .map_err(|e| ConfigError::Validation(format!("failed to commit transaction: {e}")))?;
 
         Ok(count)
+    }
+
+    /// Encrypt `plaintext` under `new_key` and prove the ciphertext
+    /// decrypts back to the same bytes before it is written. Rotation
+    /// is a one-way door - the old ciphertext is overwritten inside
+    /// the transaction and the plaintext exists nowhere else - so an
+    /// unreadable re-encryption must abort, not commit.
+    fn reencrypt_verified(new_key: &EncryptionKey, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let re_encrypted = new_key.encrypt(plaintext)?;
+        let check = new_key.decrypt(&re_encrypted)?;
+        if check != plaintext {
+            return Err(ConfigError::Validation(
+                "post-rotation verification failed: re-encrypted value does not decrypt back"
+                    .to_string(),
+            ));
+        }
+        Ok(re_encrypted)
     }
 
     /// Read the persisted cluster configuration generation (Story 9.1
@@ -868,11 +891,17 @@ impl ConfigStore {
     /// calls this (Story 9.4); the returned value survives restarts,
     /// unlike the supervisor's in-memory `reload_generation`.
     pub fn increment_cluster_config_generation(&self) -> Result<u64> {
-        self.conn.execute(
-            "UPDATE cluster_state SET value = value + 1 WHERE key = 'config_generation'",
+        // Single-statement RETURNING (as bot_stash.rs already does):
+        // an UPDATE followed by a separate SELECT would let two
+        // concurrent mutators read the same post-increment value and
+        // stamp two distinct configs with one generation.
+        let value: i64 = self.conn.query_row(
+            "UPDATE cluster_state SET value = value + 1 WHERE key = 'config_generation' \
+             RETURNING value",
             [],
+            |row| row.get(0),
         )?;
-        self.cluster_config_generation()
+        Ok(value.max(0) as u64)
     }
 
     /// Read the persisted supervisor takeover epoch (Story 9.1 AC #7).
@@ -897,11 +926,13 @@ impl ConfigStore {
     /// supervisor's sessions are fenced the moment the new one takes
     /// the epoch.
     pub fn increment_cluster_takeover_epoch(&self) -> Result<u64> {
-        self.conn.execute(
-            "UPDATE cluster_state SET value = value + 1 WHERE key = 'takeover_epoch'",
+        let value: i64 = self.conn.query_row(
+            "UPDATE cluster_state SET value = value + 1 WHERE key = 'takeover_epoch' \
+             RETURNING value",
             [],
+            |row| row.get(0),
         )?;
-        self.cluster_takeover_epoch()
+        Ok(value.max(0) as u64)
     }
 
     /// Clear all importable data before applying a TOML import.
