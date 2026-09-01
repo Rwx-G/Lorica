@@ -2470,6 +2470,18 @@ impl ProxyHttp for LoricaProxy {
             if let Some(ref writer) = self.log_writer {
                 writer.enqueue_access(entry.clone());
             }
+            // Story 9.8: offer the entry to the log-export sinks with
+            // the request trace context captured here - the sink
+            // consumer thread has no ambient span to read it from.
+            lorica_api::log_sinks::publish_access(
+                &entry,
+                ctx.outgoing_traceparent
+                    .as_ref()
+                    .map(|t| t.trace_id.as_str()),
+                ctx.outgoing_traceparent
+                    .as_ref()
+                    .map(|t| t.parent_id.as_str()),
+            );
             self.log_buffer.push(entry);
         }
 

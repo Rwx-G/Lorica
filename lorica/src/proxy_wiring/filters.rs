@@ -126,6 +126,12 @@ impl LoricaProxy {
         if let Some(ref writer) = self.log_writer {
             writer.enqueue_waf(ev.clone());
         }
+        // Story 9.8: offer the event to the log-export sinks. WAF
+        // events are emitted from several stages, some pre-route with
+        // no request ctx in scope, so no trace context is attached;
+        // the access-log record for the same request carries the
+        // trace correlation.
+        lorica_api::log_sinks::publish_waf(ev, None, None);
     }
 
     /// Record that a request body crossed `WAF_BODY_SCAN_MAX` while

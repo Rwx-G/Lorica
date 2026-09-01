@@ -163,6 +163,13 @@ pub(crate) fn run_worker(
     // supervisor has its own init (for API / health spans).
     rt.block_on(try_init_otel_from_settings(&store, "worker"));
 
+    // Story 9.8: install this worker's log-export sinks at boot
+    // (access logs and WAF events are produced in the worker
+    // process). Reloads refresh them via
+    // apply_per_process_reload_state in the two-phase commit handler
+    // and the legacy fallback.
+    rt.block_on(lorica::reload::apply_log_sinks_from_store(&store));
+
     // Build CertResolver for TLS termination in worker
     let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
     rt.block_on(worker_load_certs_into_resolver(&store, &cert_resolver, id));

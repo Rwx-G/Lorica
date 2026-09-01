@@ -222,6 +222,23 @@ pub struct OtelConfig {
     pub sampling_ratio: f64,
 }
 
+/// Runtime configuration for the OTLP **logs** exporter (Story 9.8
+/// AC #2). Shares the collector endpoint / protocol / service name
+/// with the trace exporter; `auth_header` is the optional
+/// `Authorization` value from `otlp_logs_auth_header`.
+#[derive(Debug, Clone)]
+pub struct OtelLogsConfig {
+    /// Collector base URL (the `/v1/logs` path is appended for HTTP
+    /// transports).
+    pub endpoint: String,
+    /// Wire protocol, shared with the trace exporter.
+    pub protocol: OtlpProtocol,
+    /// `service.name` resource attribute.
+    pub service_name: String,
+    /// Optional `Authorization` header value.
+    pub auth_header: Option<String>,
+}
+
 /// Hook installed by `init_logging` when the `otel` feature is built
 /// in. Called from `otel::init` once the global tracer provider is
 /// live so the `tracing_opentelemetry` bridge layer's embedded tracer
@@ -366,7 +383,10 @@ mod imp {
     /// the supervisor drain hook before the 10 s worker drain so
     /// in-flight spans reach the collector. Idempotent: calling
     /// `shutdown()` on an already-shut-down provider is a no-op.
+    /// Also tears down the logs provider (Story 9.8) so both signals
+    /// flush on the same exit hook.
     pub fn shutdown() {
+        shutdown_logs();
         // Poisoned mutex during shutdown is non-fatal; we're tearing
         // down anyway and the OS will reclaim everything on exit.
         let Ok(mut slot) = PROVIDER.lock() else {
@@ -378,22 +398,199 @@ mod imp {
             let _ = provider.shutdown();
         }
     }
+
+    // ---- OTLP logs signal (Story 9.8 AC #2) ----
+
+    use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
+    use opentelemetry::trace::{SpanId, TraceFlags, TraceId};
+    use opentelemetry_otlp::{LogExporter, WithHttpConfig};
+    use opentelemetry_sdk::logs::SdkLoggerProvider;
+
+    use super::OtelLogsConfig;
+    use lorica_api::log_sinks::{SinkEvent, SinkPayload};
+
+    /// Handle to the installed logs provider, mirroring [`PROVIDER`].
+    static LOGS_PROVIDER: Lazy<Mutex<Option<SdkLoggerProvider>>> = Lazy::new(|| Mutex::new(None));
+
+    /// Install the OTLP logs exporter and spawn the consumer that
+    /// drains the sink hub's otlp lane (Story 9.8). The consumer is a
+    /// plain OS thread using `blocking_recv` - it never needs a tokio
+    /// runtime, so it behaves identically in supervisor, worker and
+    /// single-process modes; the SDK batch processor does its own I/O
+    /// on a dedicated thread. The thread exits when the lane's sender
+    /// side is dropped (hub replaced or process teardown).
+    ///
+    /// Safe to call repeatedly: a previous provider is flushed and
+    /// replaced, and the previous consumer thread exits with its
+    /// closed lane.
+    pub fn init_logs(
+        cfg: &OtelLogsConfig,
+        mut rx: tokio::sync::mpsc::Receiver<SinkEvent>,
+    ) -> Result<(), String> {
+        if cfg.endpoint.trim().is_empty() {
+            return Ok(());
+        }
+
+        let http_endpoint = || -> String {
+            let trimmed = cfg.endpoint.trim_end_matches('/');
+            if trimmed.ends_with("/v1/logs") {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/v1/logs")
+            }
+        };
+        let headers = || -> std::collections::HashMap<String, String> {
+            cfg.auth_header
+                .as_ref()
+                .map(|auth| {
+                    std::collections::HashMap::from([(
+                        "authorization".to_string(),
+                        auth.clone(),
+                    )])
+                })
+                .unwrap_or_default()
+        };
+
+        let exporter = match cfg.protocol {
+            OtlpProtocol::HttpProto => LogExporter::builder()
+                .with_http()
+                .with_endpoint(http_endpoint())
+                .with_protocol(Protocol::HttpBinary)
+                .with_headers(headers())
+                .build()
+                .map_err(|e| format!("OTLP HTTP/protobuf logs exporter build failed: {e}"))?,
+            OtlpProtocol::HttpJson => LogExporter::builder()
+                .with_http()
+                .with_endpoint(http_endpoint())
+                .with_protocol(Protocol::HttpJson)
+                .with_headers(headers())
+                .build()
+                .map_err(|e| format!("OTLP HTTP/JSON logs exporter build failed: {e}"))?,
+            OtlpProtocol::Grpc => {
+                // The tonic transport takes metadata, not headers; the
+                // settings validator steers authenticated setups to the
+                // HTTP transports, so gRPC ships without the header
+                // rather than pulling tonic types in here.
+                if cfg.auth_header.is_some() {
+                    tracing::warn!(
+                        "otlp_logs_auth_header is not applied over grpc; \
+                         use http-proto or http-json for an authenticated collector"
+                    );
+                }
+                LogExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(&cfg.endpoint)
+                    .build()
+                    .map_err(|e| format!("OTLP gRPC logs exporter build failed: {e}"))?
+            }
+        };
+
+        let resource = Resource::builder()
+            .with_attribute(KeyValue::new("service.name", cfg.service_name.clone()))
+            .with_attribute(KeyValue::new(
+                "service.version",
+                env!("CARGO_PKG_VERSION").to_string(),
+            ))
+            .build();
+
+        let provider = SdkLoggerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(resource)
+            .build();
+
+        let logger = provider.logger("lorica");
+        let spawned = std::thread::Builder::new()
+            .name("lorica-otlp-logs-sink".into())
+            .spawn(move || {
+                while let Some(event) = rx.blocking_recv() {
+                    emit_sink_event(&logger, &event);
+                }
+            });
+        if let Err(e) = spawned {
+            let _ = provider.shutdown();
+            return Err(format!("failed to spawn OTLP logs consumer thread: {e}"));
+        }
+
+        let mut slot = LOGS_PROVIDER
+            .lock()
+            .map_err(|e| format!("otel logs mutex poisoned: {e}"))?;
+        if let Some(old) = slot.take() {
+            let _ = old.shutdown();
+        }
+        *slot = Some(provider);
+        Ok(())
+    }
+
+    /// Flush and drop the logs provider. Idempotent; called on the
+    /// settings-disable transition and from [`shutdown`].
+    pub fn shutdown_logs() {
+        let Ok(mut slot) = LOGS_PROVIDER.lock() else {
+            return;
+        };
+        if let Some(provider) = slot.take() {
+            let _ = provider.shutdown();
+        }
+    }
+
+    /// Convert one sink event into an OTel log record. The trace
+    /// context captured at publish time on the hot path becomes the
+    /// record's trace correlation (Story 9.8 AC #2).
+    fn emit_sink_event(logger: &opentelemetry_sdk::logs::SdkLogger, event: &SinkEvent) {
+        let kind = event.kind();
+        let (severity, severity_text, raw_ts) = match &event.payload {
+            SinkPayload::Access(entry) => (Severity::Info, "INFO", entry.timestamp.as_str()),
+            SinkPayload::Waf(waf) => (Severity::Warn, "WARN", waf.timestamp.as_str()),
+            SinkPayload::Audit(audit) => (Severity::Info, "INFO", audit.timestamp.as_str()),
+        };
+        let mut record = logger.create_log_record();
+        record.set_severity_number(severity);
+        record.set_severity_text(severity_text);
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw_ts) {
+            record.set_timestamp(std::time::SystemTime::from(ts));
+        }
+        record.set_observed_timestamp(std::time::SystemTime::now());
+        let body = serde_json::to_string(&event.payload).unwrap_or_else(|_| "{}".to_string());
+        record.set_body(AnyValue::from(body));
+        record.add_attribute("lorica.kind", kind.as_str());
+        if let (Some(trace_id), Some(span_id)) = (&event.trace_id, &event.span_id) {
+            if let (Ok(tid), Ok(sid)) = (
+                TraceId::from_hex(trace_id),
+                SpanId::from_hex(span_id),
+            ) {
+                record.set_trace_context(tid, sid, Some(TraceFlags::SAMPLED));
+            }
+        }
+        logger.emit(record);
+    }
 }
 
 #[cfg(not(feature = "otel"))]
 mod imp {
     //! No-op stubs; compiled when `otel` is disabled.
 
-    use super::OtelConfig;
+    use super::{OtelConfig, OtelLogsConfig};
 
     pub fn init(_cfg: &OtelConfig) -> Result<(), String> {
         Ok(())
     }
 
     pub fn shutdown() {}
+
+    /// No-op stub. The reload path never requests an OTLP logs lane
+    /// when the `otel` feature is off (`LogSinksConfig::from_settings`
+    /// is called with `otlp_available = false`), so this only exists
+    /// so call sites compile; the receiver is dropped unread.
+    pub fn init_logs(
+        _cfg: &OtelLogsConfig,
+        _rx: tokio::sync::mpsc::Receiver<lorica_api::log_sinks::SinkEvent>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn shutdown_logs() {}
 }
 
-pub use imp::{init, shutdown};
+pub use imp::{init, init_logs, shutdown, shutdown_logs};
 
 #[cfg(all(test, feature = "otel"))]
 mod shutdown_tests {

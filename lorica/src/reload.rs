@@ -181,6 +181,7 @@ pub async fn apply_per_process_reload_state(store: &Arc<Mutex<ConfigStore>>) {
     apply_asn_settings_from_store(store).await;
     apply_bot_secret_from_store(store).await;
     rebuild_merged_crawlers(store).await;
+    apply_log_sinks_from_store(store).await;
 }
 
 /// Supervisor-only alias for [`apply_per_process_reload_state`].
@@ -673,6 +674,104 @@ struct OtelSnapshot {
     protocol: String,
     service_name: String,
     sampling_ratio: f64,
+}
+
+/// Story 9.8: (re)install this process's log-export sinks (syslog +
+/// OTLP logs) from settings, with the same snapshot-dedup strategy as
+/// the OTel exporter: replacing the hub tears down the sink
+/// connections, so it only happens when a sink-relevant field
+/// actually changed. Runs on every reload via
+/// [`apply_per_process_reload_state`] and at boot from each startup
+/// path.
+pub async fn apply_log_sinks_from_store(store: &Arc<Mutex<ConfigStore>>) {
+    use std::sync::OnceLock;
+
+    static LAST_APPLIED: OnceLock<parking_lot::Mutex<Option<LogSinksSnapshot>>> = OnceLock::new();
+    let slot = LAST_APPLIED.get_or_init(|| parking_lot::Mutex::new(None));
+
+    let s = store.lock().await;
+    let settings = match s.get_global_settings() {
+        Ok(settings) => settings,
+        Err(e) => {
+            warn!(error = %e, "apply_log_sinks_from_store: store fetch failed, sinks pinned at last applied state");
+            lorica_api::metrics::inc_resolver_apply_failed("log_sinks");
+            return;
+        }
+    };
+    drop(s);
+
+    // The OTLP exporter fields feed the logs exporter, so they are
+    // part of the change detection alongside the sink fields carried
+    // by `LogSinksConfig` itself.
+    let next = LogSinksSnapshot {
+        sinks: lorica_api::log_sinks::LogSinksConfig::from_settings(
+            &settings,
+            cfg!(feature = "otel"),
+        ),
+        otlp_endpoint: settings
+            .otlp_endpoint
+            .as_ref()
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty()),
+        otlp_protocol: settings.otlp_protocol.clone(),
+        otlp_service_name: settings.otlp_service_name.clone(),
+        otlp_auth_header: settings.otlp_logs_auth_header.clone(),
+    };
+
+    let mut last = slot.lock();
+    if last.as_ref() == Some(&next) {
+        return;
+    }
+    // Skip the initial no-op: nothing installed yet and nothing to
+    // install (the common standalone boot with sinks off).
+    if last.is_none() && next.sinks.is_empty() {
+        *last = Some(next);
+        return;
+    }
+
+    let otlp_rx = lorica_api::log_sinks::install(&next.sinks);
+    match otlp_rx {
+        Some(rx) => {
+            let cfg = crate::otel::OtelLogsConfig {
+                endpoint: next.otlp_endpoint.clone().unwrap_or_default(),
+                protocol: crate::otel::OtlpProtocol::from_settings(&next.otlp_protocol),
+                service_name: next.otlp_service_name.clone(),
+                auth_header: next.otlp_auth_header.clone(),
+            };
+            match crate::otel::init_logs(&cfg, rx) {
+                Ok(()) => info!(
+                    endpoint = %cfg.endpoint,
+                    protocol = cfg.protocol.as_str(),
+                    "OTLP logs sink (re)installed from settings"
+                ),
+                Err(e) => {
+                    warn!(error = %e, "OTLP logs sink init failed; events on the otlp lane will be dropped")
+                }
+            }
+        }
+        None => crate::otel::shutdown_logs(),
+    }
+    if let Some(syslog) = &next.sinks.syslog {
+        info!(
+            endpoint = %syslog.endpoint,
+            transport = ?syslog.transport,
+            "syslog sink (re)installed from settings"
+        );
+    }
+    if next.sinks.is_empty() && last.as_ref().is_some_and(|l| !l.sinks.is_empty()) {
+        info!("log-export sinks disabled by settings change");
+    }
+
+    *last = Some(next);
+}
+
+#[derive(Clone, PartialEq)]
+struct LogSinksSnapshot {
+    sinks: lorica_api::log_sinks::LogSinksConfig,
+    otlp_endpoint: Option<String>,
+    otlp_protocol: String,
+    otlp_service_name: String,
+    otlp_auth_header: Option<String>,
 }
 
 /// Story 8.10 AC #8. Emit a single operator-facing notice, once per

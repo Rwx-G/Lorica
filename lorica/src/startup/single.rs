@@ -135,6 +135,12 @@ pub(crate) fn run_single_process(cli: Cli) {
 
         try_init_otel_from_settings(&store, "single-process").await;
 
+        // Story 9.8: install the log-export sinks (syslog / OTLP
+        // logs) from persisted settings. Reloads go through
+        // apply_per_process_reload_state; this is the boot-time
+        // equivalent, mirroring the OTel init above.
+        lorica::reload::apply_log_sinks_from_store(&store).await;
+
         // Build the CertResolver for SNI-based certificate selection
         let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
         load_certs_into_resolver(&store, &cert_resolver).await;
