@@ -140,7 +140,7 @@ impl AcmeChallengeStore {
                 .map_err(|e| e.to_string())
         })
         .await;
-        match persist {
+        let outcome = match persist {
             Ok(Ok(_)) => {
                 tracing::info!(token = %token_log, db = %db_log.display(),
                     "ACME challenge persisted to SQLite");
@@ -156,7 +156,13 @@ impl AcmeChallengeStore {
                     "ACME challenge persist task failed");
                 Err(format!("challenge persist task failed: {e}"))
             }
+        };
+        if outcome.is_err() {
+            // The order aborts on this Err; do not leave the
+            // supervisor's cache serving a key authorization for it.
+            self.challenges.write().await.remove(&token_log);
         }
+        outcome
     }
 
     /// Look up the key authorization for `token`, falling back to SQLite if not in the local cache.
@@ -200,10 +206,17 @@ impl AcmeChallengeStore {
             let token = token.to_string();
             let _ = tokio::task::spawn_blocking(move || {
                 let guard = conn.lock();
-                let _ = guard.execute(
+                // Cleanup stays infallible for the driver, but a
+                // failed DELETE means workers keep serving this token
+                // from SQLite across restarts (no expiry exists yet) -
+                // that deserves a journal line, never key_auth.
+                if let Err(e) = guard.execute(
                     "DELETE FROM acme_challenges WHERE token = ?1",
                     rusqlite::params![token],
-                );
+                ) {
+                    tracing::warn!(token = %token, error = %e,
+                        "failed to delete ACME challenge from SQLite; stale token stays served");
+                }
             })
             .await;
         }
@@ -218,9 +231,12 @@ impl AcmeChallengeStore {
 impl lorica_acme::Http01ChallengeSolver for AcmeChallengeStore {
     async fn present(
         &self,
+        _identifier: &str,
         token: String,
         key_authorization: String,
     ) -> Result<(), lorica_acme::AcmeError> {
+        // The local store serves every token regardless of hostname;
+        // `identifier` is for Story 9.5's fleet distribution.
         self.set(token, key_authorization)
             .await
             .map_err(lorica_acme::AcmeError::Solver)

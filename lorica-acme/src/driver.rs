@@ -53,12 +53,23 @@ pub struct IssuedCertificate {
 pub trait Http01ChallengeSolver: Send + Sync {
     /// Publish `key_authorization` so it is served for `token`.
     ///
+    /// `identifier` is the hostname the authorization covers. The
+    /// local solver ignores it; Story 9.5's fleet solver uses it to
+    /// distribute the token to the followers plausibly serving that
+    /// hostname (passing it now folds that need into this cycle's one
+    /// breaking change to the trait).
+    ///
     /// Fallible since Story 9.1 AC #9 (breaking change, budgeted
     /// there): a partial distribution - the fleet case in Story 9.5,
     /// or a local persist failure that would 404 the challenge on a
     /// worker - must abort the order BEFORE `set_ready()` tells the
     /// CA to validate, instead of racing an opaque validation failure.
-    async fn present(&self, token: String, key_authorization: String) -> Result<(), AcmeError>;
+    async fn present(
+        &self,
+        identifier: &str,
+        token: String,
+        key_authorization: String,
+    ) -> Result<(), AcmeError>;
     /// Retract a previously-published `token`.
     async fn cleanup(&self, token: &str);
 }
@@ -160,13 +171,21 @@ pub async fn issue_http01(
             };
             let key_authorization = challenge.key_authorization();
             let token = challenge.token.clone();
+            let identifier = challenge.identifier().to_string();
+            // Record the token BEFORE presenting: a `present` that
+            // fails after partially publishing (the fleet case) must
+            // still be retracted by the failure path below.
+            stored_tokens.push(token.clone());
             if let Err(e) = solver
-                .present(token.clone(), key_authorization.as_str().to_string())
+                .present(
+                    &identifier,
+                    token,
+                    key_authorization.as_str().to_string(),
+                )
                 .await
             {
                 break 'setup Err(e);
             }
-            stored_tokens.push(token);
             if let Err(e) = challenge.set_ready().await {
                 break 'setup Err(AcmeError::Order(e.to_string()));
             }

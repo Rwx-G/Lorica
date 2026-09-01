@@ -44,7 +44,22 @@ impl AcmeConfig {
         if let Ok(url) = std::env::var("LORICA_ACME_DIRECTORY_URL") {
             let url = url.trim();
             if !url.is_empty() {
-                return url.to_string();
+                if url.starts_with("https://") {
+                    // WARN, not info: redirecting issuance to another
+                    // CA is a trust decision that must be unmistakable
+                    // in the journal, not silent success.
+                    tracing::warn!(
+                        directory = %url,
+                        "ACME directory overridden by LORICA_ACME_DIRECTORY_URL"
+                    );
+                    return url.to_string();
+                }
+                // Fail closed toward the trusted default: a cleartext
+                // or malformed directory must not weaken issuance.
+                tracing::error!(
+                    directory = %url,
+                    "ignoring LORICA_ACME_DIRECTORY_URL: only https:// directories are accepted"
+                );
             }
         }
         if self.staging {

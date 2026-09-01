@@ -28,20 +28,25 @@ use crate::server::AppState;
 
 use super::types::{default_true, AcmeProvisionResponse};
 
-/// No-op HTTP-01 solver used when the process has no challenge store
-/// (`state.acme_challenge_store` is `None`). It publishes nowhere, matching
-/// the pre-extraction behaviour where a missing store simply skipped the
-/// token set/remove calls.
+/// Solver used when the process has no challenge store
+/// (`state.acme_challenge_store` is `None` - test states only; all
+/// three real startup modes construct one). It fails `present` so the
+/// order aborts with a clear error instead of telling the CA to
+/// validate against a node serving no token (the fail-closed contract
+/// Story 9.1 AC #9 introduced).
 struct NoopHttp01Solver;
 
 #[async_trait::async_trait]
 impl Http01ChallengeSolver for NoopHttp01Solver {
     async fn present(
         &self,
+        _identifier: &str,
         _token: String,
         _key_authorization: String,
     ) -> Result<(), lorica_acme::AcmeError> {
-        Ok(())
+        Err(lorica_acme::AcmeError::Solver(
+            "no HTTP-01 challenge store configured in this process".to_string(),
+        ))
     }
     async fn cleanup(&self, _token: &str) {}
 }
