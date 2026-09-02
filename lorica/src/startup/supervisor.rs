@@ -1016,6 +1016,33 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // store failed to open.
         startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
 
+        // Cluster plane (Story 9.2): control-plane listeners, opt-in
+        // via --cluster-listen. A bad bind or a missing CA is fatal -
+        // the operator asked for the plane, running without it is
+        // the wrong failure mode. Handles stay alive for the process
+        // lifetime; the stats feed the Prometheus bridge.
+        let mut cluster_plane = match startup::cluster_plane::spawn_cluster_plane(
+            hu_cli.cluster_listen.as_deref(),
+            hu_cli.cluster_listen_any,
+            management_port,
+            &store,
+        )
+        .await
+        {
+            Ok(Some(plane)) => {
+                lorica_api::metrics::install_cluster_plane_stats(
+                    Arc::clone(&plane.operational_stats),
+                    Arc::clone(&plane.enrollment_stats),
+                );
+                Some(plane)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                error!(error = %e, "cluster plane failed to start");
+                std::process::exit(1);
+            }
+        };
+
         // Worker monitoring loop (crash detection and restart with backoff)
         let manager = Arc::new(std::sync::Mutex::new(manager));
         let monitor_mgr = Arc::clone(&manager);
@@ -1288,6 +1315,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
             tokio::select! {
                 _ = shutdown_signal() => {
                     info!("supervisor shutting down");
+                    // Stop accepting cluster sessions and tear down the
+                    // established ones before the workers drain.
+                    if let Some(plane) = cluster_plane.take() {
+                        plane.shutdown();
+                    }
                     // CRITICAL ordering: stop the worker monitor BEFORE
                     // telling workers to drain. The monitor respawns
                     // crashed workers; during shutdown the SIGKILL we

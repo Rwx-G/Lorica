@@ -45,6 +45,7 @@ lorica-error = { version = "0.1.0", path = "../lorica-error" }
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 lorica-worker = { version = "1.6.0", path = "../lorica-worker" }
 lorica-command = { version = "1.6.0", path = "../lorica-command" }
+lorica-cluster = { version = "1.6.0", path = "../lorica-cluster" }
 lorica-shmem = { version = "1.6.0", path = "../lorica-shmem" }
 lorica-waf = { version = "1.6.0", path = "../lorica-waf" }
 lorica-notify = { version = "1.6.0", path = "../lorica-notify" }

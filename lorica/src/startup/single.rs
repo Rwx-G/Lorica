@@ -353,6 +353,8 @@ pub(crate) fn run_single_process(cli: Cli) {
         let api_active_connections = Arc::clone(&active_connections);
         let api_log_store = log_store.clone();
         let management_port = cli.management_port;
+        let cluster_listen = cli.cluster_listen.clone();
+        let cluster_listen_any = cli.cluster_listen_any;
         // `single_task_tracker` is already defined above (before the
         // WAF blocklist refresh spawn). Clone it for AppState and the
         // shutdown drain path.
@@ -406,6 +408,33 @@ pub(crate) fn run_single_process(cli: Cli) {
         // `startup::spawn_retention_loop`). No-op when the access-log
         // store failed to open.
         startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
+
+        // Cluster plane (Story 9.2): control-plane listeners, opt-in
+        // via --cluster-listen. A bad bind or a missing CA is fatal -
+        // the operator asked for the plane, running without it is
+        // the wrong failure mode. Handles stay alive for the process
+        // lifetime; the stats feed the Prometheus bridge.
+        let mut cluster_plane = match startup::cluster_plane::spawn_cluster_plane(
+            cluster_listen.as_deref(),
+            cluster_listen_any,
+            management_port,
+            &store,
+        )
+        .await
+        {
+            Ok(Some(plane)) => {
+                lorica_api::metrics::install_cluster_plane_stats(
+                    Arc::clone(&plane.operational_stats),
+                    Arc::clone(&plane.enrollment_stats),
+                );
+                Some(plane)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                error!(error = %e, "cluster plane failed to start");
+                std::process::exit(1);
+            }
+        };
 
         // Background OCSP-staple refresh (Story 8.5). Reload swaps cert
         // bodies with no staple; this loop attaches OCSP responses out
@@ -486,6 +515,12 @@ pub(crate) fn run_single_process(cli: Cli) {
         shutdown_signal().await;
 
         info!("Lorica shutting down gracefully");
+
+        // Stop accepting cluster sessions and tear down the established
+        // ones before the rest of the process winds down.
+        if let Some(plane) = cluster_plane.take() {
+            plane.shutdown();
+        }
 
         // Drain tracked background tasks before tearing down the API
         // server. Bounded at 10 s so a hung task does not delay exit.

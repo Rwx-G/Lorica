@@ -19,7 +19,8 @@ mod startup;
 use clap::Parser;
 
 use crate::cli::{
-    init_logging, run_rotate_key, run_unban, run_upgrade, startup_banner, Cli, Commands,
+    init_logging, run_cluster_init, run_rotate_key, run_unban, run_upgrade, startup_banner, Cli,
+    ClusterAction, Commands,
 };
 
 fn main() {
@@ -64,6 +65,11 @@ fn main() {
         }) => {
             run_upgrade(cli.management_port, binary, signature, user, password);
         }
+        Some(Commands::Cluster { action }) => match action {
+            ClusterAction::Init { common_name } => {
+                run_cluster_init(&cli.data_dir, &common_name);
+            }
+        },
         None => {
             init_logging(&cli.log_level, &cli.log_format, cli.log_file.as_deref());
             startup_banner(&cli);

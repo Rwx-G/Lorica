@@ -124,6 +124,20 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) hot_upgrade: bool,
 
+    /// Cluster-plane listen address as an explicit `host:port`
+    /// (Story 9.2, opt-in; the plane is disabled when absent). A bare
+    /// port is refused; a wildcard host (`0.0.0.0` / `::`) is refused
+    /// unless `--cluster-listen-any` is also passed; the management
+    /// port is refused. See docs/cluster.md.
+    #[arg(long)]
+    pub(crate) cluster_listen: Option<String>,
+
+    /// Explicitly allow a wildcard host in `--cluster-listen`.
+    /// Without it a fleet listener can never be exposed on every
+    /// interface by accident.
+    #[arg(long)]
+    pub(crate) cluster_listen_any: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -203,6 +217,24 @@ pub(crate) enum Commands {
         #[arg(long)]
         password: String,
     },
+    /// Cluster-plane management commands (Story 9.2).
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ClusterAction {
+    /// Initialise this node as a cluster control plane: generate the
+    /// cluster CA and persist it in the configuration database (the
+    /// CA private key is encrypted at rest under the node master
+    /// key; see docs/cluster.md for what that implies).
+    Init {
+        /// Common name recorded on the generated CA certificate.
+        #[arg(long, default_value = "Lorica Cluster CA")]
+        common_name: String,
+    },
 }
 
 impl Cli {
@@ -243,7 +275,94 @@ impl Cli {
             argv.push("--upstream-crl-file".to_string());
             argv.push(crl.clone());
         }
+        if let Some(ref cluster_listen) = self.cluster_listen {
+            argv.push("--cluster-listen".to_string());
+            argv.push(cluster_listen.clone());
+        }
+        if self.cluster_listen_any {
+            argv.push("--cluster-listen-any".to_string());
+        }
         argv
+    }
+}
+
+/// Validate `--cluster-listen` per Story 9.2 AC #11: an explicit
+/// `host:port` is required (a bare port is refused), a wildcard host
+/// needs the separate `--cluster-listen-any` opt-in, and the
+/// management port is refused. Returns the parsed bind address; the
+/// startup path logs the effective bind at WARN.
+pub(crate) fn validate_cluster_listen(
+    value: &str,
+    management_port: u16,
+    allow_any: bool,
+) -> Result<std::net::SocketAddr, String> {
+    if !value.contains(':') {
+        return Err(format!(
+            "--cluster-listen `{value}`: a bare port is refused; pass an explicit host:port \
+             (e.g. 192.0.2.10:9444)"
+        ));
+    }
+    let addr: std::net::SocketAddr = value.parse().map_err(|_| {
+        format!(
+            "--cluster-listen `{value}`: not a valid host:port \
+             (an IP address is required; IPv6 as [::1]:9444)"
+        )
+    })?;
+    if addr.port() == 0 {
+        return Err(format!(
+            "--cluster-listen `{value}`: an explicit non-zero port is required"
+        ));
+    }
+    if addr.ip().is_unspecified() && !allow_any {
+        return Err(format!(
+            "--cluster-listen `{value}`: a wildcard host exposes the cluster plane on every \
+             interface; pass --cluster-listen-any to do that deliberately"
+        ));
+    }
+    if addr.port() == management_port {
+        return Err(format!(
+            "--cluster-listen `{value}`: port {management_port} is the management API port; \
+             the cluster plane must not share it"
+        ));
+    }
+    Ok(addr)
+}
+
+/// Implementation of `cluster init`: generate the cluster CA and
+/// persist it (certificate in clear, private key encrypted at rest).
+/// Idempotent by refusal: an existing CA is never overwritten.
+pub(crate) fn run_cluster_init(data_dir: &str, common_name: &str) {
+    use lorica_config::crypto::EncryptionKey;
+    use lorica_config::store::ConfigStore;
+
+    let data_dir = PathBuf::from(data_dir);
+    let key_path = data_dir.join("encryption.key");
+    let key = EncryptionKey::load_or_create(&key_path).expect("failed to load encryption key");
+    let db_path = data_dir.join("lorica.db");
+    let store = ConfigStore::open(&db_path, Some(key)).expect("failed to open database");
+
+    match store.get_cluster_ca() {
+        Ok(Some(_)) => {
+            println!("Cluster CA already initialised; refusing to overwrite it.");
+            println!("(Re-keying the fleet is a deliberate operation, not a re-run of init.)");
+        }
+        Ok(None) => {
+            let ca =
+                lorica_cluster::ClusterCa::generate(common_name).expect("CA generation failed");
+            store
+                .set_cluster_ca(ca.cert_pem(), &ca.key_pem())
+                .expect("failed to persist cluster CA");
+            println!("Cluster CA generated and persisted (CN: {common_name}).");
+            println!(
+                "The CA private key is encrypted under {} - that file is now the \
+                 identity root of the fleet. See docs/cluster.md.",
+                key_path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("failed to read cluster CA state: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -688,5 +807,48 @@ mod tests {
         assert_eq!(child.upstream_crl_file, original.upstream_crl_file);
         // `auto` is resolved to the concrete count for the child.
         assert_eq!(child.workers, Workers::Fixed(8));
+    }
+
+    #[test]
+    fn hot_upgrade_argv_inherits_cluster_flags() {
+        let original = Cli::parse_from([
+            "lorica",
+            "--cluster-listen",
+            "192.0.2.10:9444",
+            "--cluster-listen-any",
+        ]);
+        let child = Cli::parse_from(original.hot_upgrade_argv("/tmp/lorica.new", 1));
+        assert_eq!(child.cluster_listen, original.cluster_listen);
+        assert!(child.cluster_listen_any);
+    }
+
+    #[test]
+    fn cluster_listen_requires_explicit_host_and_port() {
+        // Story 9.2 AC #11 refusal matrix.
+        assert!(validate_cluster_listen("9444", 9443, false)
+            .unwrap_err()
+            .contains("bare port"));
+        assert!(validate_cluster_listen("192.0.2.10", 9443, false).is_err());
+        assert!(validate_cluster_listen("192.0.2.10:0", 9443, false)
+            .unwrap_err()
+            .contains("non-zero"));
+        // Wildcards refused without the explicit opt-in, v4 and v6.
+        assert!(validate_cluster_listen("0.0.0.0:9444", 9443, false)
+            .unwrap_err()
+            .contains("--cluster-listen-any"));
+        assert!(validate_cluster_listen("[::]:9444", 9443, false).is_err());
+        assert!(validate_cluster_listen("0.0.0.0:9444", 9443, true).is_ok());
+        // The management port is refused regardless of host.
+        assert!(validate_cluster_listen("192.0.2.10:9443", 9443, false)
+            .unwrap_err()
+            .contains("management"));
+        // Nominal accepts, v4 and v6.
+        assert_eq!(
+            validate_cluster_listen("192.0.2.10:9444", 9443, false)
+                .expect("valid")
+                .port(),
+            9444
+        );
+        assert!(validate_cluster_listen("[2001:db8::10]:9444", 9443, false).is_ok());
     }
 }
