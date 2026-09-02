@@ -16,6 +16,7 @@ lorica-metrics = { version = "1.6.0", path = "../lorica-metrics" }
 lorica-waf = { version = "1.6.0", path = "../lorica-waf" }
 lorica-notify = { version = "1.6.0", path = "../lorica-notify" }
 lorica-bench = { version = "1.6.0", path = "../lorica-bench" }
+lorica-cluster = { version = "1.6.0", path = "../lorica-cluster" }
 # Used in `certificates.rs::validate_certificate_bundle` to gate
 # every cert upload (POST /certificates, PUT /certificates/{id},
 # POST /config/import) with the exact loader the worker uses :

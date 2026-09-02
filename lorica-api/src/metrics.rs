@@ -76,6 +76,206 @@ static CERT_EXPIRY_DAYS: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+// ---- Cluster plane (Story 9.2 AC #12) ----
+//
+// Cardinality discipline: `node_id` is the SERVER-side identity a
+// node gets at enrollment (Story 9.3), never the follower-supplied
+// `node_name` - a compromised follower rotating its name on every
+// reconnect could otherwise mint unbounded series. `direction` is
+// inbound|outbound, `method` is a fixed protocol vocabulary
+// (hello|heartbeat|tls|bridge), `outcome` a fixed result vocabulary.
+
+/// Per-node cluster connection state (1 = in that state). Labels:
+/// node_id, state. Series appear once enrolled identities exist
+/// (Story 9.3); the family is registered here so the contract is
+/// stable from v1.7.0.
+static CLUSTER_CONNECTION_STATE: Lazy<GaugeVec> = Lazy::new(|| {
+    lorica_metrics::register_gauge_vec(
+        "lorica_cluster_connection_state",
+        "Cluster-plane connection state per node (1 = in this state)",
+        &["node_id", "state"],
+    )
+});
+
+/// Cluster RPC outcomes. Labels: direction, method, outcome.
+static CLUSTER_RPC_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "lorica_cluster_rpc_total",
+        "Cluster-plane RPCs by direction, method and outcome",
+        &["direction", "method", "outcome"],
+    )
+});
+
+/// Cluster RPC latency. Labels: direction, method. Observed by the
+/// per-node session layer (Story 9.3+); registered here with the
+/// rest of the AC #12 contract.
+static CLUSTER_RPC_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    lorica_metrics::register_histogram_vec(
+        "lorica_cluster_rpc_duration_seconds",
+        "Cluster-plane RPC latency in seconds",
+        &["direction", "method"],
+        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
+    )
+});
+
+/// Enrollment-listener pre-authentication rejections (Story 9.2
+/// AC #3). Labels: reason, a fixed five-value vocabulary.
+static CLUSTER_PREAUTH_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "lorica_cluster_preauth_rejections_total",
+        "Enrollment connections dropped by a pre-authentication budget",
+        &["reason"],
+    )
+});
+
+/// Whether the token-gated enrollment listener is currently open
+/// (1) or closed (0).
+static CLUSTER_ENROLLMENT_LISTENER_OPEN: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "lorica_cluster_enrollment_listener_open",
+        "1 while the enrollment listener is bound (a join token is live), else 0",
+    )
+});
+
+/// Last-synced snapshot of the cluster-plane atomics, so each scrape
+/// increments the Prometheus counters by exactly the delta since the
+/// previous scrape (the crate exposes monotonic atomics, not
+/// registry handles - it must stay free of the metrics dependency).
+#[derive(Default)]
+struct ClusterPlaneSnapshot {
+    tls_failures: u64,
+    sessions_admitted: u64,
+    sessions_retry_later: u64,
+    handshake_refusals: u64,
+    protocol_violations: u64,
+    heartbeats_served: u64,
+    rejected_handshake_timeout: u64,
+    rejected_concurrent_handshakes: u64,
+    rejected_inflight_enrollments: u64,
+    rejected_byte_budget: u64,
+    rejected_time_budget: u64,
+}
+
+struct ClusterPlaneStats {
+    operational: std::sync::Arc<lorica_cluster::OperationalStats>,
+    enrollment: std::sync::Arc<lorica_cluster::EnrollmentStats>,
+    last: std::sync::Mutex<ClusterPlaneSnapshot>,
+}
+
+static CLUSTER_PLANE_STATS: std::sync::OnceLock<ClusterPlaneStats> = std::sync::OnceLock::new();
+
+/// Hand the running control plane's listener counters to the
+/// Prometheus bridge. Called once at startup when `--cluster-listen`
+/// is set; a second call is ignored (the plane starts once).
+pub fn install_cluster_plane_stats(
+    operational: std::sync::Arc<lorica_cluster::OperationalStats>,
+    enrollment: std::sync::Arc<lorica_cluster::EnrollmentStats>,
+) {
+    let _ = CLUSTER_PLANE_STATS.set(ClusterPlaneStats {
+        operational,
+        enrollment,
+        last: std::sync::Mutex::new(ClusterPlaneSnapshot::default()),
+    });
+}
+
+/// Fold the cluster-plane atomics into the registry (delta since the
+/// last scrape). No-op when the plane is not running.
+fn sync_cluster_plane_metrics() {
+    use std::sync::atomic::Ordering;
+
+    let Some(stats) = CLUSTER_PLANE_STATS.get() else {
+        return;
+    };
+    let mut last = stats
+        .last
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    fn bump(counter: &IntCounterVec, labels: &[&str], now: u64, last: &mut u64) {
+        let delta = now.saturating_sub(*last);
+        if delta > 0 {
+            counter.with_label_values(labels).inc_by(delta);
+        }
+        *last = now;
+    }
+
+    let op = &stats.operational;
+    bump(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "admitted"],
+        op.sessions_admitted.load(Ordering::Relaxed),
+        &mut last.sessions_admitted,
+    );
+    bump(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "retry_later"],
+        op.sessions_retry_later.load(Ordering::Relaxed),
+        &mut last.sessions_retry_later,
+    );
+    bump(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "refused"],
+        op.handshake_refusals.load(Ordering::Relaxed),
+        &mut last.handshake_refusals,
+    );
+    bump(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "tls", "failed"],
+        op.tls_failures.load(Ordering::Relaxed),
+        &mut last.tls_failures,
+    );
+    bump(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "bridge", "protocol_violation"],
+        op.protocol_violations.load(Ordering::Relaxed),
+        &mut last.protocol_violations,
+    );
+    bump(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "heartbeat", "ok"],
+        op.heartbeats_served.load(Ordering::Relaxed),
+        &mut last.heartbeats_served,
+    );
+
+    let en = &stats.enrollment;
+    bump(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["handshake_timeout"],
+        en.rejected_handshake_timeout.load(Ordering::Relaxed),
+        &mut last.rejected_handshake_timeout,
+    );
+    bump(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["concurrent_handshakes"],
+        en.rejected_concurrent_handshakes.load(Ordering::Relaxed),
+        &mut last.rejected_concurrent_handshakes,
+    );
+    bump(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["inflight_enrollments"],
+        en.rejected_inflight_enrollments.load(Ordering::Relaxed),
+        &mut last.rejected_inflight_enrollments,
+    );
+    bump(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["byte_budget"],
+        en.rejected_byte_budget.load(Ordering::Relaxed),
+        &mut last.rejected_byte_budget,
+    );
+    bump(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["time_budget"],
+        en.rejected_time_budget.load(Ordering::Relaxed),
+        &mut last.rejected_time_budget,
+    );
+    let open = en.lifecycle_opens.load(Ordering::Relaxed) > en.lifecycle_closes.load(Ordering::Relaxed);
+    CLUSTER_ENROLLMENT_LISTENER_OPEN.set(i64::from(open));
+    // Touch the node-scoped families so they are registered (and
+    // visible as empty) from the first scrape.
+    Lazy::force(&CLUSTER_CONNECTION_STATE);
+    Lazy::force(&CLUSTER_RPC_DURATION_SECONDS);
+}
+
 /// WAF events counter. Labels: category, action (detected/blocked).
 static WAF_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
@@ -1323,6 +1523,10 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
         });
         set_system_metrics(cpu, mem);
     }
+
+    // Cluster-plane counters (Story 9.2): delta-synced from the
+    // listener atomics right before gathering.
+    sync_cluster_plane_metrics();
 
     // Encode and return
     let encoder = TextEncoder::new();
