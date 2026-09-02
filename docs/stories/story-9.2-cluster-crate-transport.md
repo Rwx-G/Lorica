@@ -1,7 +1,7 @@
 # Story 9.2: `lorica-cluster` Crate, Transport and Listeners
 
 **Epic:** 9 (v1.7.0)
-**Status:** Draft
+**Status:** Review
 **Author:** Romain G.
 
 **Depends on:** Story 9.1 (all of it).
@@ -66,23 +66,28 @@ API and never forces a follower to expose an inbound port.
 
 ## Tasks / Subtasks
 
-- [ ] AC #1: crate skeleton, three Dockerfiles, bump checklist,
-      cross-deps, lints.
-- [ ] AC #2: operational listener with mandatory client auth; separate
+- [x] AC #1: crate skeleton, three Dockerfiles, bump checklist,
+      cross-deps, lints. (Cross-dep direction: lorica-cluster depends
+      on lorica-config, not the reverse - the AC's list is a
+      cycle otherwise.)
+- [x] AC #2: operational listener with mandatory client auth; separate
       enrollment listener with token-gated lifecycle.
-- [ ] AC #3: pre-auth budget enforcement + counters.
-- [ ] AC #4: version range negotiation, post-auth exchange on the
+- [x] AC #3: pre-auth budget enforcement + counters.
+- [x] AC #4: version range negotiation, post-auth exchange on the
       operational path, opaque pre-auth error.
-- [ ] AC #5: schema version in the handshake + refusal path.
-- [ ] AC #6: separate proto package, whitelist bridge, protocol
+- [x] AC #5: schema version in the handshake + refusal path.
+- [x] AC #6: separate proto package, whitelist bridge, protocol
       violation handling.
-- [ ] AC #7: stream separation with independent credit.
-- [ ] AC #8: `cluster init`, CA generation and encrypted persistence.
-- [ ] AC #9: dialer, heartbeat, backoff, `ArcSwap` holder.
-- [ ] AC #10: convergence admission limit + `RETRY_LATER`.
-- [ ] AC #11: CLI parsing and refusals.
-- [ ] AC #12: metrics.
-- [ ] Docs: `docs/security/threat-model.md` gains a cluster-plane trust
+- [x] AC #7: stream separation with independent credit. (Second
+      option taken: separate connection; see Completion Notes.)
+- [x] AC #8: `cluster init`, CA generation and encrypted persistence.
+- [x] AC #9: dialer, heartbeat, backoff, `ArcSwap` holder.
+- [x] AC #10: convergence admission limit + `RETRY_LATER`.
+- [x] AC #11: CLI parsing and refusals.
+- [x] AC #12: metrics. (Families + plane-level counters live;
+      node_id-labelled series and the duration histogram populate in
+      9.3 when server-side identities exist - see Completion Notes.)
+- [x] Docs: `docs/security/threat-model.md` gains a cluster-plane trust
       boundary and actor; `docs/security/hardening-guide.md` gains the
       firewall stanza.
 
@@ -180,23 +185,106 @@ so a future hardening pass does not tighten `RestrictAddressFamilies`.
 
 ### Completion Notes
 
-(empty)
+- **Phase 1 review decisions (2026-09-02)**, all within the
+  established seam pattern, no AC text touched:
+  - AC #2's "off unless a join token is live": token mint/verify is
+    Story 9.3's contract, so 9.2 drives the enrollment listener's
+    lifecycle from a token-liveness watch (open on >0 live tokens,
+    auto-close on last burn/expiry) with the liveness source
+    abstracted; 9.3 wires it to its token table. The lifecycle
+    behaviour itself is fully testable in 9.2.
+  - AC #7: the "separate credit over one connection" option is
+    foreclosed by design - Story 9.1's QA documented the
+    one-endpoint-one-FIFO contract in `lorica-command/src/rpc.rs`.
+    9.2 takes the AC's second option: telemetry rides its own
+    connection (own RpcEndpoint), config/control another.
+  - AC #9's "cap scales with fleet size": the follower cannot know
+    fleet size before connecting, so the handshake ack carries a
+    fleet-size hint and the backoff cap derives from it (clamped,
+    documented default when no hint yet).
+  - Follower identity (client cert) is issued by 9.3's enrollment;
+    9.2 proves the dialer against in-process listeners with fixture
+    certs minted by the same CA code `cluster init` uses.
+- **Implementation notes (2026-09-02)**:
+  - Proto disjointness is PROVABLE, not just declared: ClusterFrame's
+    oneof uses tags 101/102 against Envelope's 1/2, so cross-plane
+    bytes decode to an empty kind (never a Command) - tested both
+    directions including a worker SHUTDOWN. The bridge whitelist
+    holds only Heartbeat in 9.2; every other body (or an out-of-phase
+    Hello) is a protocol violation that drops the connection.
+  - EKU split from 9.3 built now: serverAuth-only control-plane
+    leaves, clientAuth-only node leaves; the integration tests prove
+    each refuses the other role.
+  - Schema policy: a follower BELOW the control plane's schema is
+    refused SCHEMA_TOO_OLD; a follower AHEAD is admitted, so rolling
+    upgrades have an order (followers first).
+  - Enrollment listener binds `cluster port + 1` on the same host;
+    its liveness source is a watch channel the control plane owns at
+    0 - Story 9.3 publishes token counts on it. In 9.2 the socket
+    therefore never opens in production, while the lifecycle is
+    proven in-crate (open on >0, auto-close on 0, budgets counted).
+  - Control-plane server leaf is minted per boot from the persisted
+    CA (90 days >> process lifetime; nothing to persist or rotate).
+    Missing CA or bad bind is fatal at startup: the operator asked
+    for the plane.
+  - Admission: permit held from TLS accept through serve_hello
+    (convergence = handshake in 9.2; 9.4 must extend the hold across
+    the initial config pull). Defaults 32 concurrent / 128 queued /
+    retry-after 5 s.
+  - Dialer backoff: equal-jitter exponential, cap =
+    min(default_cap + fleet_hint s, 300 s), hint refreshed from
+    HelloAck and HeartbeatAck; RETRY_LATER's retry_after_s overrides
+    the next delay. Jitter via a tiny xorshift (no rand dependency).
+  - Metrics bridge: lorica-cluster stays free of the Prometheus
+    dependency and exposes monotonic atomics; lorica-api delta-syncs
+    them into `lorica_cluster_rpc_total` and
+    `lorica_cluster_preauth_rejections_total` at scrape time, plus a
+    `lorica_cluster_enrollment_listener_open` gauge.
+    `lorica_cluster_connection_state{node_id,state}` and
+    `lorica_cluster_rpc_duration_seconds` are registered (contract
+    stable from v1.7.0) and populate in 9.3 once server-side node
+    identities exist.
+  - Reuse of `x509-parser` via rcgen's feature: the crate was already
+    in the tree through lorica-api, no new dependency.
+  - Test hygiene lesson recorded: two mTLS integration tests
+    deadlocked for hours (one-shot server waiting for client EOF
+    while the test held the client endpoint and awaited the server).
+    Every cross-task await in cluster tests now sits under a 10 s
+    timeout so a regression fails fast instead of hanging CI.
+- **Handoffs**: 9.3 - token liveness publisher, roster-driven
+  fleet_size, node_id metric series + duration histogram, CRL
+  rebuild through SwappableAcceptor, PKI test helpers worth folding
+  into `tests/common/`; 9.4 - hold the admission permit across the
+  initial config pull, the dialer must keep its incoming-request half
+  (server-initiated pushes); 9.6 - telemetry gets its own Dialer
+  instance (separate connection, AC #7's chosen option).
 
 ## File List
 
-Anticipated:
-
-- `lorica-cluster/` (new crate)
-- `lorica-cluster/proto/cluster.proto` (new package)
-- `Cargo.toml`, `Dockerfile`, `Dockerfile.dev`,
+- `lorica-cluster/` (new crate: Cargo.toml, proto/cluster.proto,
+  src/{lib,messages,frame,version,ca,tls,handshake,listener,
+  admission,dialer,bridge}.rs, tests/{mtls_handshake,cluster_plane}.rs)
+- `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `Dockerfile.dev`,
   `tests-e2e-docker/Dockerfile`, `docs/BUMP-CHECKLIST.md`
-- `lorica/src/cli.rs` (`--cluster-listen`, `cluster init`)
+- `lorica-config/src/store/mod.rs` (migration 49, registry entry),
+  `lorica-config/src/store/cluster_ca.rs` (new),
+  `lorica-config/src/tests.rs`
+- `lorica/Cargo.toml`, `lorica/src/cli.rs` (`--cluster-listen`,
+  `--cluster-listen-any`, `cluster init`, validation matrix),
+  `lorica/src/main.rs`, `lorica/src/startup/cluster_plane.rs` (new),
+  `lorica/src/startup/{mod,single,supervisor}.rs`
+- `lorica-api/Cargo.toml`, `lorica-api/src/metrics.rs` (AC #12
+  families + delta-sync bridge)
 - `dist/lorica.service` (comment only), `dist/build-deb.sh`,
   `dist/rpm/lorica.spec`
-- `docs/security/threat-model.md`, `docs/security/hardening-guide.md`
+- `docs/security/threat-model.md`, `docs/security/hardening-guide.md`,
+  `docs/cluster.md` (new)
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Two-listener split replaces the first draft's contradictory single listener. Status Draft. | Romain G. |
+| 2026-09-02 | 0.2 | Phase 1 review: three scope decisions recorded (token-liveness seam, separate-connection option for AC #7, fleet hint in the handshake). Status InProgress. | Romain G. |
+| 2026-09-02 | 0.3 | Crate core (messages/frame/version/CA/TLS/handshake), encrypted CA storage (migration 49), cluster-plane docs and packaging banners landed. | Romain G. |
+| 2026-09-02 | 0.4 | Listeners with pre-auth budgets, admission gate, dialer, bridge whitelist, CLI (`--cluster-listen`, `cluster init`), startup wiring, Prometheus bridge. All ACs implemented. | Romain G. |
