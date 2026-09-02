@@ -55,6 +55,14 @@ pub enum HandshakeError {
     /// The control plane refused the session with this status.
     #[error("cluster handshake refused: {0:?}")]
     Refused(ClusterStatus),
+    /// The admission gate is full (AC #10); retry after this many
+    /// seconds. Split from [`HandshakeError::Refused`] so the dialer
+    /// can honour the server-provided delay.
+    #[error("cluster admission full; retry after {retry_after_s}s")]
+    RetryLater {
+        /// Server-provided delay before the next attempt.
+        retry_after_s: u32,
+    },
     /// The peer answered with something other than a HelloAck.
     #[error("cluster handshake protocol violation: unexpected response body")]
     ProtocolViolation,
@@ -163,6 +171,9 @@ pub async fn client_handshake(
             Some(cluster_response::Body::HelloAck(ack)) => Ok(ack),
             _ => Err(HandshakeError::ProtocolViolation),
         },
+        ClusterStatus::RetryLater => Err(HandshakeError::RetryLater {
+            retry_after_s: response.retry_after_s,
+        }),
         refused => Err(HandshakeError::Refused(refused)),
     }
 }

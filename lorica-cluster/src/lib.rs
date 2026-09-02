@@ -34,15 +34,26 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod admission;
+pub mod bridge;
 pub mod ca;
+pub mod dialer;
 pub mod frame;
 pub mod handshake;
+pub mod listener;
 pub mod messages;
 pub mod tls;
 pub mod version;
 
+pub use admission::{AdmissionDecision, AdmissionGate, AdmissionPermit};
+pub use bridge::{translate_cluster_request, BridgeOutcome, InPlaneAction};
 pub use ca::{CaError, ClusterCa};
+pub use dialer::{ClusterConnection, Dialer, DialerConfig, DialerHandle, DialerStats};
 pub use handshake::{client_handshake, evaluate_hello, serve_hello, HandshakeConfig, HandshakeError};
+pub use listener::{
+    EnrollmentHandle, EnrollmentListener, EnrollmentStats, OperationalHandle,
+    OperationalListener, OperationalStats, PreAuthBudgets, TokenLiveness,
+};
 pub use messages::{ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus};
 pub use tls::{
     client_config, enrollment_server_config, operational_server_config, ClusterTlsError,
