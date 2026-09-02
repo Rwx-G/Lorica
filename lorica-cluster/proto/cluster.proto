@@ -1,0 +1,108 @@
+// Cluster-plane protocol between a Lorica control-plane node and its
+// followers (Epic 9, Story 9.2). This file documents the wire format.
+// The actual Rust types are defined using prost derive macros in
+// src/messages.rs (no protoc compilation needed), mirroring the
+// lorica-command pattern.
+//
+// DISJOINT FROM `lorica.command` BY CONSTRUCTION (Story 9.2 AC #6).
+// This package shares no message with the worker plane, and
+// ClusterFrame's top-level oneof deliberately uses tags 101/102 while
+// the worker Envelope uses 1/2: bytes of one frame type decode to an
+// EMPTY frame (kind = None) on the other plane, never to a valid
+// message. A cluster peer therefore cannot smuggle a worker Command
+// (SHUTDOWN, BAN_IP, ...) through the framing; the bridge into
+// lorica-command is additionally an explicit whitelist translation
+// with no pass-through of any peer-supplied command type.
+//
+// Framing on the wire is the RpcEndpoint format:
+// [8 bytes LE length][prost-encoded ClusterFrame], carried inside the
+// mutual-TLS stream. Request/response matching uses per-direction
+// monotonic sequences exactly as on the worker plane.
+
+syntax = "proto3";
+package lorica.cluster.v1;
+
+// Top-level frame. Tags 101/102 (NOT 1/2) - see the disjointness note
+// above.
+message ClusterFrame {
+  oneof kind {
+    ClusterRequest request = 101;
+    ClusterResponse response = 102;
+  }
+}
+
+// A request from either side (the dialing follower or the control
+// plane). Body tags:
+//   10-19  session control (Story 9.2)
+//   20-39  RESERVED for configuration replication (Story 9.4)
+//   40-59  RESERVED for telemetry fan-in (Story 9.6)
+//   60-79  RESERVED for certificate distribution (Story 9.5)
+message ClusterRequest {
+  uint64 sequence = 1;    // Monotonic per direction, RpcEndpoint-managed
+  oneof body {
+    Hello hello = 10;
+    Heartbeat heartbeat = 11;
+  }
+}
+
+// A response matched to a request by `sequence`. `status` is a
+// ClusterStatus; `retry_after_s` is only meaningful with RETRY_LATER
+// (Story 9.2 AC #10 admission control).
+message ClusterResponse {
+  uint64 sequence = 1;
+  int32 status = 2;
+  uint32 retry_after_s = 3;
+  oneof body {
+    HelloAck hello_ack = 10;
+    HeartbeatAck heartbeat_ack = 11;
+  }
+}
+
+// First request on every operational connection, sent AFTER the mutual
+// TLS handshake has verified the client certificate (AC #4: the
+// version exchange is post-authentication on the operational path).
+message Hello {
+  // Protocol range the sender speaks (AC #4: minimum-compatible-version
+  // range, not exact equality, so rolling upgrades have a valid order).
+  uint32 protocol_min = 1;
+  uint32 protocol_max = 2;
+  // The sender's database schema version (AC #5). A follower below the
+  // control plane's schema must not apply configuration.
+  uint32 schema_version = 3;
+  // Display name only. Node IDENTITY is always the peer-certificate
+  // fingerprint recorded at enrollment (Story 9.3 AC #8); this field
+  // must never be used for authorization or as a metric label.
+  string node_name = 4;
+}
+
+// Control-plane answer to Hello when the session is admitted.
+message HelloAck {
+  uint32 negotiated_version = 1;   // Highest common protocol version
+  uint32 schema_version = 2;       // Control plane's schema version
+  // Approximate fleet size, so the follower can scale its reconnect
+  // backoff cap (Story 9.2 AC #9) without knowing the roster.
+  uint32 fleet_size_hint = 3;
+}
+
+// Liveness probe, either direction.
+message Heartbeat {
+  uint64 timestamp_ms = 1;
+}
+
+message HeartbeatAck {
+  uint64 timestamp_ms = 1;         // Echo of the probe's timestamp
+  uint32 fleet_size_hint = 2;      // Refreshed backoff-cap input
+}
+
+// Response status. UNSPECIFIED doubles as the OPAQUE refusal the
+// enrollment (pre-authentication) path sends for every failure class:
+// an unauthenticated peer must not learn build or protocol facts from
+// refusal shapes (AC #4); the real diagnostic is logged locally.
+enum ClusterStatus {
+  CLUSTER_STATUS_UNSPECIFIED = 0;  // Opaque refusal (pre-auth paths)
+  OK = 1;
+  RETRY_LATER = 2;                 // AC #10: admission queue full
+  INCOMPATIBLE_VERSION = 3;        // AC #4: no protocol overlap
+  SCHEMA_TOO_OLD = 4;              // AC #5: follower schema below ours
+  PROTOCOL_VIOLATION = 5;          // AC #6: malformed / wrong-plane frame
+}

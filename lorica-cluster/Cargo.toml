@@ -1,0 +1,29 @@
+[package]
+name = "lorica-cluster"
+version = "1.6.0"
+authors = ["Rwx-G"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "Cluster plane for Lorica: mTLS transport, handshake, and CA for multi-node fleets"
+
+[dependencies]
+arc-swap = "1"
+chrono = { version = "0.4", features = ["serde"] }
+lorica-command = { path = "../lorica-command" }
+prost = "0.13"
+# `x509-parser` feature: `Issuer::from_ca_cert_pem`, so a persisted CA
+# reloads with its real subject DN (issued leaves must chain to it).
+# The x509-parser crate is already in the workspace tree via lorica-api.
+rcgen = { version = "0.14", features = ["x509-parser"] }
+rustls-pki-types = { version = "1", features = ["alloc"] }
+thiserror = "2"
+# Pins the ring provider (no aws-lc-rs), matching lorica-api's
+# management listener so exactly one rustls crypto provider exists
+# process-wide.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

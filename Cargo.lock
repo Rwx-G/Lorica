@@ -3143,6 +3143,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lorica-cluster"
+version = "1.6.0"
+dependencies = [
+ "arc-swap",
+ "chrono",
+ "lorica-command",
+ "prost 0.13.5",
+ "rcgen",
+ "rustls-pki-types",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tracing",
+]
+
+[[package]]
 name = "lorica-command"
 version = "1.6.0"
 dependencies = [

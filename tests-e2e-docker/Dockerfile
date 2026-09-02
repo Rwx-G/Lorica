@@ -38,6 +38,7 @@ COPY lorica-proxy/ lorica-proxy/
 COPY lorica-runtime/ lorica-runtime/
 COPY lorica-timeout/ lorica-timeout/
 COPY lorica-tls/ lorica-tls/
+COPY lorica-cluster/ lorica-cluster/
 COPY lorica-command/ lorica-command/
 COPY lorica-shmem/ lorica-shmem/
 COPY lorica-waf/ lorica-waf/
