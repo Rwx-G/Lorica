@@ -122,6 +122,11 @@ ProcSubset=pid
 # and some glibc internals use it opportunistically ; keeping
 # it here keeps legitimate behaviour working while still
 # blocking AF_PACKET / AF_CAN / AF_BLUETOOTH / AF_AX25 / etc.
+# The opt-in cluster plane (--cluster-listen, 9444 by
+# convention) is already covered: it is plain AF_INET/AF_INET6
+# and the port is >1024 so CAP_NET_BIND_SERVICE is not
+# involved. Do NOT tighten this list in a future hardening
+# pass on the assumption that only 8080/8443/9443 exist.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 # Remove any POSIX shm / SysV IPC owned by the lorica user on
 # service stop. Lorica itself uses `memfd_create` (process-local,

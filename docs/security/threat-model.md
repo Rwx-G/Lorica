@@ -6,7 +6,7 @@
 
 ## Overview
 
-Lorica is a reverse proxy that sits between the Internet and backend services. It terminates TLS, routes HTTP traffic, provides WAF protection, and exposes a management dashboard on localhost. This document identifies threat categories and mitigations.
+Lorica is a reverse proxy that sits between the Internet and backend services. It terminates TLS, routes HTTP traffic, provides WAF protection, and exposes a management dashboard on localhost. Since v1.7.0 a node can additionally participate in a multi-node cluster over a dedicated, mutually authenticated cluster plane. This document identifies threat categories and mitigations.
 
 ## Trust Boundaries
 
@@ -16,12 +16,18 @@ Internet  -->  [ Lorica Proxy (8080/8443) ]  -->  Backend Services
                [ Management API (9443, localhost only) ]
                        |
                [ Admin User (browser) ]
+
+Follower nodes  -->  [ Cluster plane (--cluster-listen, opt-in) ]
+   (outbound only)         operational listener: mTLS mandatory
+                           enrollment listener: token-gated window
 ```
 
 1. **Internet to Proxy** - Untrusted. All inbound traffic is potentially malicious.
 2. **Proxy to Backends** - Semi-trusted. Backends are internal but may be compromised.
-3. **Admin to Management API** - Trusted after authentication. Localhost-only binding.
+3. **Admin to Management API** - Trusted after authentication. Localhost-only binding; the management API itself never accepts remote connections. Fleet coordination does NOT ride on this plane.
 4. **Database** - Trusted. SQLite on local filesystem with WAL mode.
+5. **Follower to Control Plane (cluster plane)** - Authenticated by mutual TLS against the fleet's own cluster CA; no public or system CA is trusted on this plane. Disabled by default; only exists when the operator passes `--cluster-listen` on the control plane. Followers dial OUT to the control plane and expose no inbound port of their own.
+6. **Enrollment listener** - The only unauthenticated network surface in the product. It is a separate listener from the operational one, is closed unless at least one join token is live, auto-closes when the last unexpired token is burned or expires, and enforces pre-authentication budgets (handshake timeout, concurrent-handshake cap, in-flight enrollment cap, per-connection byte and time budgets) before any token verification runs.
 
 ## Threat Categories
 
@@ -51,7 +57,7 @@ Internet  -->  [ Lorica Proxy (8080/8443) ]  -->  Backend Services
 |--------|-----------|--------|
 | Unauthorized access | Session-based auth with HTTP-only cookies | Implemented |
 | Brute force login | Rate limiter on /auth/login endpoint | Implemented |
-| Session hijacking | Localhost-only binding (127.0.0.1), no remote access | Implemented |
+| Session hijacking | Localhost-only binding (127.0.0.1); the management API accepts no remote access (fleet traffic uses the separate cluster plane) | Implemented |
 | CSRF | Same-origin cookie policy, JSON-only API | Implemented |
 | Weak passwords | 14-character minimum + complexity classes, forced change on first login | Implemented |
 | API abuse | All mutations require authenticated session | Implemented |
@@ -84,7 +90,21 @@ These RUSTSEC advisories are visible to `cargo audit` but hit only through forke
 
 `RUSTSEC-2026-0097` is resolved as of v1.5.8 (bumped to the fixed `rand 0.8.6`). `RUSTSEC-2025-0134` (`rustls-pemfile`) remains the one live transitive advisory: the forked crates inherit the upstream fix when Pingora migrates, and until then the mitigation is scope limitation (Lorica-native code does not call the affected API directly) plus the fact that it requires a condition we do not create (an unmaintained-but-functional parser on a known PEM format).
 
-### T6: Operational
+### T6: Cluster Plane (v1.7.0+)
+
+The cluster plane is opt-in: none of these surfaces exist unless the operator starts the control plane with `--cluster-listen`. See `docs/cluster.md` for the full trust model.
+
+| Threat | Mitigation | Status |
+|--------|-----------|--------|
+| Rogue node joins the fleet | Operational listener requires client certificates (rustls `WebPkiClientVerifier` without `allow_unauthenticated`); only leaves issued by the fleet's cluster CA verify | Implemented |
+| Impersonation of the control plane | Follower dialer trusts the cluster CA only (no system roots); control-plane leaves are `serverAuth`-only, node leaves `clientAuth`-only, so neither can stand in for the other | Implemented |
+| Abuse of the enrollment listener | Separate listener, closed unless a join token is live, auto-closes on last token burn/expiry; pre-auth budgets (handshake timeout, concurrency caps, byte/time budgets) enforced before any token work; refusals are opaque on the wire with the diagnostic logged locally | Implemented |
+| Confused deputy via cluster messages | Cluster protocol is a disjoint proto package from the worker command channel; the bridge into `lorica-command` is an explicit whitelist translation with no pass-through of a peer-supplied command type; a cluster frame that decodes as a worker command drops the connection | Implemented |
+| Version/build fingerprinting pre-auth | Version and schema negotiation happen after client-certificate verification on the operational path; the enrollment path returns an opaque code | Implemented |
+| Reconnect stampede after control-plane restart | Convergence admission control: concurrent-session limit with a queue and `RETRY_LATER`; follower backoff with jitter whose cap scales with fleet size | Implemented |
+| Cluster CA key theft | CA private key encrypted (AES-256-GCM) at rest under the node master key; covered by `lorica rotate-key`; the master-key file is the fleet's identity root (see Residual Risks) | Implemented |
+
+### T7: Operational
 
 | Threat | Mitigation | Status |
 |--------|-----------|--------|
@@ -96,9 +116,10 @@ These RUSTSEC advisories are visible to `cargo audit` but hit only through forke
 
 ## Residual Risks
 
-1. **Management API on localhost** - If an attacker gains local shell access, they can access the API. Mitigation: this is inherent to the deployment model (single-binary, self-hosted).
+1. **Management API on localhost** - If an attacker gains local shell access, they can access the API. Mitigation: this is inherent to the deployment model (single-binary, self-hosted). Note that "localhost only" describes the management API specifically; a clustered control plane additionally exposes the cluster plane, whose own boundary is described in T6.
 2. **WAF bypass** - Custom regex rules may have gaps. Mitigation: defense-in-depth, WAF is one layer.
 3. **ACME HTTP-01 requires port 80** - NAT/firewall may block validation. Mitigation: DNS-01 challenge alternative available.
+4. **Master key file as fleet identity root** - On a clustered control plane, `<data_dir>/encryption.key` (32 raw bytes, mode 0600, no KDF, no passphrase, no machine binding) encrypts the cluster CA private key. An attacker who reads that file plus the database can mint fleet identities. Mitigation: filesystem permissions, the systemd sandbox, and the firewall guidance in the hardening guide; `docs/cluster.md` states this promotion of the key file's blast radius explicitly.
 
 ## Review Schedule
 
