@@ -1182,14 +1182,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 46 is the current head of the tracked MIGRATIONS table (every
+        // 49 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            48
+            49
         );
     }
 
@@ -1207,7 +1207,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                48
+                49
             );
         }
     }
@@ -1311,6 +1311,44 @@ created_at = "2026-01-01T00:00:00Z"
                 "epoch and generation must not share a counter"
             );
         }
+    }
+
+    #[test]
+    fn test_cluster_ca_round_trips_and_rotates() {
+        // Story 9.2 AC #8: the cluster CA persists encrypted and is
+        // covered by table-driven key rotation from day one (the
+        // fleet identity root must never repeat the dns_providers
+        // rotation gap).
+        use crate::crypto::EncryptionKey;
+
+        let key1 = EncryptionKey::generate().expect("test setup: key generates");
+        let key2 = EncryptionKey::generate().expect("test setup: key generates");
+        let store = ConfigStore::open_in_memory_with_key(key1)
+            .expect("test setup: in-memory store opens with key");
+
+        assert!(
+            store.get_cluster_ca().expect("read").is_none(),
+            "no CA before cluster init"
+        );
+        store
+            .set_cluster_ca("-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----",
+                "-----BEGIN PRIVATE KEY-----\ncluster-ca-secret\n-----END PRIVATE KEY-----")
+            .expect("test setup: CA persists");
+        let (cert, key) = store
+            .get_cluster_ca()
+            .expect("read")
+            .expect("CA present");
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        assert!(key.contains("cluster-ca-secret"));
+
+        let count = store
+            .rotate_encryption_key(&key2)
+            .expect("test setup: rotation succeeds");
+        assert_eq!(count, 1, "the cluster CA key must rotate");
+        assert!(
+            store.get_cluster_ca().is_err(),
+            "post-rotation read under the old key must fail to decrypt"
+        );
     }
 
     #[test]
