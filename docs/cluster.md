@@ -44,7 +44,9 @@ Two distinct listeners live behind that surface:
   the handshake. Protocol version and schema negotiation happen after
   certificate verification.
 - The **enrollment listener** exists so that a node with no certificate
-  yet can join. It is the only unauthenticated network surface in the
+  yet can join. It binds the same host as the operational listener on
+  the next port (`--cluster-listen 192.0.2.1:9444` puts enrollment on
+  9445). It is the only unauthenticated network surface in the
   product and is treated accordingly: it is closed unless at least one
   join token is live, auto-closes when the last unexpired token is
   burned or expires, and enforces pre-authentication budgets (handshake
