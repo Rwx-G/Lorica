@@ -30,6 +30,9 @@ pub mod bot_stash;
 mod cert_export_acls;
 mod certs;
 mod cluster_ca;
+mod cluster_identity;
+mod cluster_nodes;
+mod cluster_tokens;
 mod dns_providers;
 mod loadtest;
 mod notifications;
@@ -160,6 +163,7 @@ const MIGRATIONS: &[Migration] = &[
     (47, migrate_acme_challenges),
     (48, migrate_cluster_state),
     (49, migrate_cluster_ca),
+    (50, migrate_cluster_registry),
 ];
 
 /// Whether `column` already exists on `table`, via `pragma_table_info`.
@@ -553,6 +557,73 @@ fn migrate_cluster_ca(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+fn migrate_cluster_registry(conn: &Connection) -> rusqlite::Result<()> {
+    // Story 9.3: the control plane's node registry (AC #9), join
+    // tokens (AC #1/#4, only the HMAC of the secret is stored), the
+    // revocation list source (AC #7), a follower's own identity
+    // (leaf key encrypted at rest) and the control plane's token HMAC
+    // key (encrypted at rest). Both encrypted columns are registered
+    // in ENCRYPTED_COLUMNS so key rotation covers them.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cluster_nodes (
+            node_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            cert_fingerprint TEXT NOT NULL UNIQUE,
+            cert_serial TEXT NOT NULL,
+            prev_cert_fingerprint TEXT,
+            prev_cert_serial TEXT,
+            address TEXT NOT NULL DEFAULT '',
+            version TEXT NOT NULL DEFAULT '',
+            schema_version INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            enrolled_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            applied_config_generation INTEGER NOT NULL DEFAULT 0,
+            applied_config_hash TEXT NOT NULL DEFAULT '',
+            cert_not_after TEXT NOT NULL,
+            revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_cluster_nodes_prev_fp
+            ON cluster_nodes(prev_cert_fingerprint);
+        CREATE TABLE IF NOT EXISTS cluster_join_tokens (
+            public_id TEXT PRIMARY KEY,
+            secret_hmac TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            bound_node_name TEXT,
+            bound_source_cidr TEXT,
+            burned_at TEXT,
+            burned_by_node_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_cluster_join_tokens_live
+            ON cluster_join_tokens(state, expires_at);
+        CREATE TABLE IF NOT EXISTS cluster_revoked_serials (
+            serial TEXT PRIMARY KEY,
+            revoked_at TEXT NOT NULL,
+            reason TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cluster_identity (
+            id TEXT PRIMARY KEY,
+            node_id TEXT NOT NULL,
+            node_name TEXT NOT NULL,
+            cert_pem TEXT NOT NULL,
+            key_pem BLOB NOT NULL,
+            ca_pem TEXT NOT NULL,
+            control_plane TEXT NOT NULL,
+            server_name TEXT NOT NULL,
+            enrolled_at TEXT NOT NULL,
+            cert_not_after TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cluster_secrets (
+            id TEXT PRIMARY KEY,
+            value BLOB NOT NULL,
+            created_at TEXT NOT NULL
+        );",
+    )
+}
+
 /// One encrypted-at-rest storage location the key rotation walks
 /// (Story 9.1 AC #8). Adding at-rest encryption anywhere in the store
 /// REQUIRES a matching entry here; the source-scan test
@@ -598,6 +669,19 @@ const ENCRYPTED_COLUMNS: &[EncryptedColumn] = &[
         table: "cluster_ca",
         id_col: "id",
         col: "key_pem",
+    },
+    // A follower's own fleet identity key (Story 9.3).
+    EncryptedColumn::Blob {
+        table: "cluster_identity",
+        id_col: "id",
+        col: "key_pem",
+    },
+    // The control plane's join-token HMAC key (Story 9.3): rotating
+    // the master key rotates it, invalidating outstanding tokens.
+    EncryptedColumn::Blob {
+        table: "cluster_secrets",
+        id_col: "id",
+        col: "value",
     },
     EncryptedColumn::Text {
         table: "notification_configs",
@@ -730,6 +814,22 @@ impl ConfigStore {
         }
     }
 
+    /// Encrypt raw bytes for a BLOB column (no UTF-8 assumption).
+    pub(super) fn encrypt_bytes(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        match &self.encryption_key {
+            Some(key) => key.encrypt(plaintext),
+            None => Ok(plaintext.to_vec()),
+        }
+    }
+
+    /// Decrypt raw bytes from a BLOB column.
+    pub(super) fn decrypt_bytes(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match &self.encryption_key {
+            Some(key) => key.decrypt(data),
+            None => Ok(data.to_vec()),
+        }
+    }
+
     pub(super) fn encrypt_config(&self, config: &str) -> Result<String> {
         match &self.encryption_key {
             Some(key) => {
@@ -835,9 +935,11 @@ impl ConfigStore {
                         "UPDATE {table} SET {col} = ?1 WHERE {id_col} = ?2"
                     ))?;
                     for (id, stored) in &rows {
-                        let plaintext = self.decrypt_key_pem(stored)?;
-                        let re_encrypted =
-                            Self::reencrypt_verified(new_key, plaintext.as_bytes())?;
+                        // Raw bytes: BLOB columns hold PEM text AND raw
+                        // keys (the token HMAC key), so no UTF-8
+                        // assumption belongs here.
+                        let plaintext = self.decrypt_bytes(stored)?;
+                        let re_encrypted = Self::reencrypt_verified(new_key, &plaintext)?;
                         update.execute(params![re_encrypted, id])?;
                         count += 1;
                     }

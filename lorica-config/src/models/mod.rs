@@ -6,6 +6,7 @@ mod ai_crawler;
 mod backend;
 mod cert_export_acl;
 mod certificate;
+mod cluster;
 mod enums;
 mod loadtest;
 mod notification;
@@ -26,6 +27,7 @@ pub use cert_export_acl::{
     pattern_matches, resolve as resolve_cert_export_acl, specificity, CertExportAcl,
 };
 pub use certificate::{Certificate, DnsProvider};
+pub use cluster::{ClusterIdentity, ClusterNode, JoinToken, NodeStatus, RevokedSerial, TokenState};
 pub use enums::{
     HeaderMatchType, HealthStatus, LifecycleState, LoadBalancing, NotificationChannel,
     PathMatchType, PreferenceValue, Role, WafMode,

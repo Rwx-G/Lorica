@@ -1182,14 +1182,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 49 is the current head of the tracked MIGRATIONS table (every
+        // 50 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            49
+            50
         );
     }
 
@@ -1207,7 +1207,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                49
+                50
             );
         }
     }
@@ -3710,5 +3710,207 @@ cert_critical_days = 3
             .expect("test setup: route fetch")
             .expect("test setup: value present");
         assert!(loaded.header_rules.is_empty());
+    }
+
+    // ---- Story 9.3: cluster registry, tokens, identity ----
+
+    fn sample_node(id: &str, fp: &str, serial: &str) -> crate::models::ClusterNode {
+        let now = chrono::Utc::now();
+        crate::models::ClusterNode {
+            node_id: id.to_string(),
+            name: format!("edge-{id}"),
+            cert_fingerprint: fp.to_string(),
+            cert_serial: serial.to_string(),
+            prev_cert_fingerprint: None,
+            prev_cert_serial: None,
+            address: String::new(),
+            version: String::new(),
+            schema_version: 0,
+            status: crate::models::NodeStatus::Pending,
+            enrolled_at: now,
+            last_seen_at: None,
+            applied_config_generation: 0,
+            applied_config_hash: String::new(),
+            cert_not_after: now + chrono::Duration::days(90),
+            revoked_at: None,
+        }
+    }
+
+    fn sample_token(public_id: &str, ttl: chrono::Duration) -> crate::models::JoinToken {
+        let now = chrono::Utc::now();
+        crate::models::JoinToken {
+            public_id: public_id.to_string(),
+            secret_hmac: "ab".repeat(32),
+            state: crate::models::TokenState::Unused,
+            created_at: now,
+            expires_at: now + ttl,
+            created_by: "admin".to_string(),
+            bound_node_name: None,
+            bound_source_cidr: None,
+            burned_at: None,
+            burned_by_node_id: None,
+        }
+    }
+
+    #[test]
+    fn test_join_token_burn_is_single_use_and_expiry_aware() {
+        // Story 9.3 AC #4: the burn is one conditional UPDATE; a
+        // second burn, a burn of an expired token and a burn of a
+        // revoked token all report zero rows.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let now = chrono::Utc::now();
+        store
+            .create_join_token(&sample_token("live", chrono::Duration::hours(1)))
+            .expect("mint");
+        store
+            .create_join_token(&sample_token("stale", chrono::Duration::seconds(-1)))
+            .expect("mint");
+        store
+            .create_join_token(&sample_token("pulled", chrono::Duration::hours(1)))
+            .expect("mint");
+        assert_eq!(store.count_live_join_tokens(now).expect("count"), 2);
+        assert!(store.revoke_join_token("pulled").expect("revoke"));
+        assert!(!store.revoke_join_token("pulled").expect("revoke twice"));
+        assert_eq!(store.count_live_join_tokens(now).expect("count"), 1);
+        assert!(store
+            .next_join_token_expiry(now)
+            .expect("expiry")
+            .is_some());
+
+        assert!(store.burn_join_token("live", "node-1", now).expect("burn"));
+        assert!(!store.burn_join_token("live", "node-2", now).expect("second burn"));
+        assert!(!store.burn_join_token("stale", "node-3", now).expect("expired burn"));
+        assert!(!store.burn_join_token("pulled", "node-4", now).expect("revoked burn"));
+        assert!(!store.burn_join_token("ghost", "node-5", now).expect("unknown burn"));
+        assert_eq!(store.count_live_join_tokens(now).expect("count"), 0);
+        assert!(store.next_join_token_expiry(now).expect("expiry").is_none());
+
+        let burned = store.get_join_token("live").expect("read").expect("row");
+        assert_eq!(burned.state, crate::models::TokenState::Burned);
+        assert_eq!(burned.burned_by_node_id.as_deref(), Some("node-1"));
+        assert_eq!(store.list_join_tokens().expect("list").len(), 3);
+    }
+
+    #[test]
+    fn test_cluster_node_lifecycle_and_revocation_list() {
+        // Story 9.3 AC #5/#7/#12: pending -> active once, revocation
+        // records every serial, renewal keeps the previous certificate
+        // resolvable until retired.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let now = chrono::Utc::now();
+        store
+            .create_cluster_node(&sample_node("n1", "fp1", "01AA"))
+            .expect("enroll");
+        assert!(store.activate_cluster_node("n1").expect("activate"));
+        assert!(!store.activate_cluster_node("n1").expect("activate twice"));
+        assert!(!store.activate_cluster_node("nope").expect("activate absent"));
+        assert_eq!(
+            store
+                .count_cluster_nodes_with_status(crate::models::NodeStatus::Active)
+                .expect("count"),
+            1
+        );
+
+        store
+            .touch_cluster_node("n1", "192.0.2.10:5000", "1.7.0", 50, now)
+            .expect("touch");
+        let node = store.get_cluster_node("n1").expect("read").expect("row");
+        assert_eq!(node.address, "192.0.2.10:5000");
+        assert_eq!(node.schema_version, 50);
+        assert!(node.last_seen_at.is_some());
+
+        // Renewal: fp2 becomes current, fp1 stays resolvable.
+        assert!(store
+            .record_cluster_node_renewal("n1", "fp2", "02BB", now + chrono::Duration::days(90), now)
+            .expect("renew"));
+        let by_old = store
+            .get_cluster_node_by_fingerprint("fp1")
+            .expect("read")
+            .expect("old fingerprint still resolves");
+        assert_eq!(by_old.node_id, "n1");
+        assert_eq!(by_old.cert_fingerprint, "fp2");
+        assert_eq!(by_old.prev_cert_serial.as_deref(), Some("01AA"));
+        assert!(store.list_cluster_revoked_serials().expect("crl").is_empty());
+
+        // First session on the new certificate retires the old one.
+        assert_eq!(
+            store
+                .retire_previous_cluster_certificate("n1", now)
+                .expect("retire"),
+            Some("01AA".to_string())
+        );
+        assert!(store
+            .retire_previous_cluster_certificate("n1", now)
+            .expect("retire twice")
+            .is_none());
+        assert!(store
+            .get_cluster_node_by_fingerprint("fp1")
+            .expect("read")
+            .is_none());
+        let crl = store.list_cluster_revoked_serials().expect("crl");
+        assert_eq!(crl.len(), 1);
+        assert_eq!(crl[0].reason, "superseded");
+
+        // Revocation records the current serial and is idempotent.
+        let revoked = store
+            .revoke_cluster_node("n1", now)
+            .expect("revoke")
+            .expect("row returned");
+        assert_eq!(revoked.status, crate::models::NodeStatus::Active);
+        assert!(store.revoke_cluster_node("n1", now).expect("revoke twice").is_none());
+        let node = store.get_cluster_node("n1").expect("read").expect("row");
+        assert_eq!(node.status, crate::models::NodeStatus::Revoked);
+        assert!(node.revoked_at.is_some());
+        let serials: Vec<String> = store
+            .list_cluster_revoked_serials()
+            .expect("crl")
+            .into_iter()
+            .map(|r| r.serial)
+            .collect();
+        assert_eq!(serials, vec!["01AA".to_string(), "02BB".to_string()]);
+        assert_eq!(store.list_cluster_nodes().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn test_cluster_identity_and_token_key_round_trip_and_rotate() {
+        // Story 9.3: the follower identity key and the token HMAC key
+        // are encrypted at rest and covered by rotation.
+        use crate::crypto::EncryptionKey;
+        let key1 = EncryptionKey::generate().expect("key");
+        let key2 = EncryptionKey::generate().expect("key");
+        let store = ConfigStore::open_in_memory_with_key(key1).expect("store");
+        assert!(store.get_cluster_identity().expect("read").is_none());
+
+        let now = chrono::Utc::now();
+        store
+            .set_cluster_identity(&crate::models::ClusterIdentity {
+                node_id: "n1".to_string(),
+                node_name: "edge-1".to_string(),
+                cert_pem: "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----".to_string(),
+                key_pem: "-----BEGIN PRIVATE KEY-----\nnode-secret\n-----END PRIVATE KEY-----".to_string(),
+                ca_pem: "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----".to_string(),
+                control_plane: "cp.example.com:9444".to_string(),
+                server_name: "cp.example.com".to_string(),
+                enrolled_at: now,
+                cert_not_after: now + chrono::Duration::days(90),
+            })
+            .expect("persist identity");
+        let identity = store.get_cluster_identity().expect("read").expect("row");
+        assert_eq!(identity.node_id, "n1");
+        assert!(identity.key_pem.contains("node-secret"));
+
+        let token_key = store.token_hmac_key().expect("token key");
+        assert_eq!(token_key, store.token_hmac_key().expect("stable"));
+        assert_ne!(token_key, [0u8; 32]);
+
+        // Rotation covers both blobs (plus nothing else in this store).
+        let count = store.rotate_encryption_key(&key2).expect("rotate");
+        assert_eq!(count, 2);
+        assert!(store.get_cluster_identity().is_err());
+        assert!(store.token_hmac_key().is_err());
+
+        // Leaving wipes the identity.
+        let store = ConfigStore::open_in_memory().expect("store");
+        assert!(!store.delete_cluster_identity().expect("delete absent"));
     }
 }
