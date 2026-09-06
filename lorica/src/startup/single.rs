@@ -357,6 +357,7 @@ pub(crate) fn run_single_process(cli: Cli) {
         let cluster_enrollment_listen = cli.cluster_enrollment_listen.clone();
         let cluster_advertise = cli.cluster_advertise.clone();
         let cluster_listen_any = cli.cluster_listen_any;
+        let cluster_auto_activate = cli.cluster_auto_activate;
         let http_port = cli.http_port;
         let https_port = cli.https_port;
         // `single_task_tracker` is already defined above (before the
@@ -364,6 +365,66 @@ pub(crate) fn run_single_process(cli: Cli) {
         // shutdown drain path.
         let api_task_tracker = single_task_tracker.clone();
         let shutdown_task_tracker = single_task_tracker.clone();
+        // Cluster plane (Stories 9.2/9.3): control-plane listeners and
+        // fleet registry, opt-in via --cluster-listen; or the follower
+        // dialer when this node holds a fleet identity. Spawned BEFORE
+        // the API so AppState carries the fleet role. A bad bind, a
+        // missing CA, or a node that is both is fatal - the operator
+        // asked for a role, running without it is the wrong failure
+        // mode. Handles stay alive for the process lifetime; the stats
+        // feed the Prometheus bridge.
+        let mut cluster_plane = match startup::cluster_plane::spawn_cluster_plane(
+            startup::cluster_plane::ClusterPlaneOptions {
+                cluster_listen,
+                enrollment_listen: cluster_enrollment_listen,
+                advertise: cluster_advertise,
+                listen_any: cluster_listen_any,
+                reserved: crate::cli::ReservedPorts {
+                    management: management_port,
+                    http: http_port,
+                    https: https_port,
+                },
+                // Single-process mode never hot-upgrades (it binds the
+                // management port fresh), so there is nothing to adopt.
+                inherited_operational: None,
+                auto_activate: cluster_auto_activate,
+                log_store: log_store.clone(),
+                alert_sender: alert_sender.clone(),
+            },
+            &store,
+        )
+        .await
+        {
+            Ok(Some(plane)) => {
+                lorica_api::metrics::install_cluster_plane_stats(
+                    Arc::clone(&plane.operational_stats),
+                    Arc::clone(&plane.enrollment_stats),
+                );
+                Some(plane)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                error!(error = %e, "cluster plane failed to start");
+                std::process::exit(1);
+            }
+        };
+        let mut follower_plane = match startup::cluster_follower::spawn_follower(
+            startup::cluster_follower::FollowerOptions {
+                is_control_plane: cluster_plane.is_some(),
+            },
+            &store,
+        )
+        .await
+        {
+            Ok(plane) => plane,
+            Err(e) => {
+                error!(error = %e, "cluster follower failed to start");
+                std::process::exit(1);
+            }
+        };
+        let cluster_runtime =
+            startup::cluster_runtime(cluster_plane.as_ref(), follower_plane.as_ref());
+
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store.clone(),
@@ -398,6 +459,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 log_store: api_log_store,
                 log_writer: log_writer.clone(),
                 task_tracker: api_task_tracker,
+                cluster: cluster_runtime,
             };
 
             // Session store + ACME auto-renewal + cert-expiry notifier
@@ -413,43 +475,6 @@ pub(crate) fn run_single_process(cli: Cli) {
         // store failed to open.
         startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
 
-        // Cluster plane (Story 9.2): control-plane listeners, opt-in
-        // via --cluster-listen. A bad bind or a missing CA is fatal -
-        // the operator asked for the plane, running without it is
-        // the wrong failure mode. Handles stay alive for the process
-        // lifetime; the stats feed the Prometheus bridge.
-        let mut cluster_plane = match startup::cluster_plane::spawn_cluster_plane(
-            startup::cluster_plane::ClusterPlaneOptions {
-                cluster_listen,
-                enrollment_listen: cluster_enrollment_listen,
-                advertise: cluster_advertise,
-                listen_any: cluster_listen_any,
-                reserved: crate::cli::ReservedPorts {
-                    management: management_port,
-                    http: http_port,
-                    https: https_port,
-                },
-                // Single-process mode never hot-upgrades (it binds the
-                // management port fresh), so there is nothing to adopt.
-                inherited_operational: None,
-            },
-            &store,
-        )
-        .await
-        {
-            Ok(Some(plane)) => {
-                lorica_api::metrics::install_cluster_plane_stats(
-                    Arc::clone(&plane.operational_stats),
-                    Arc::clone(&plane.enrollment_stats),
-                );
-                Some(plane)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                error!(error = %e, "cluster plane failed to start");
-                std::process::exit(1);
-            }
-        };
 
         // Background OCSP-staple refresh (Story 8.5). Reload swaps cert
         // bodies with no staple; this loop attaches OCSP responses out
@@ -535,6 +560,9 @@ pub(crate) fn run_single_process(cli: Cli) {
         // ones before the rest of the process winds down.
         if let Some(plane) = cluster_plane.take() {
             plane.shutdown();
+        }
+        if let Some(follower) = follower_plane.take() {
+            follower.shutdown();
         }
 
         // Drain tracked background tasks before tearing down the API

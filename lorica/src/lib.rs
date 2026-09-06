@@ -38,6 +38,7 @@
 
 pub mod ai_bot;
 pub mod bot;
+pub mod cli_cluster;
 pub mod bot_rdns;
 pub mod connection_filter;
 pub mod geoip;

@@ -968,60 +968,14 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // Capacity 1: a second upgrade while one is in flight is shed.
         let (upgrade_tx, mut upgrade_rx) =
             tokio::sync::mpsc::channel::<lorica_api::upgrade::StagedBinary>(1);
-        let api_handle = tokio::spawn(async move {
-            let state = AppState {
-                store: api_store,
-                log_buffer: api_log_buffer,
-                system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
-                active_connections: api_active_connections,
-                started_at: Instant::now(),
-                data_dir: PathBuf::from(&cli.data_dir),
-                http_port: cli.http_port,
-                https_port: cli.https_port,
-                config_reload_tx: Some(config_reload_tx),
-                // Supervisor: cache/ban are per-worker process, surfaced
-                // to the API as metrics aggregated over the command channel.
-                mode: lorica_api::server::Mode::Supervisor {
-                    worker_metrics: api_worker_metrics,
-                    aggregated_metrics: api_aggregated_metrics,
-                    metrics_refresher: Some(api_metrics_refresher),
-                    upgrade_trigger: upgrade_tx,
-                },
-                waf_event_buffer: Some(waf_event_buffer),
-                waf_engine: Some(waf_engine),
-                waf_rule_count: Some(waf_rule_count),
-                acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::with_db_path(api_db_path)),
-                pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
-                sla_collector: Some(Arc::clone(&sla_collector)),
-                load_test_engine: Some(load_test_engine),
-                notification_history: {
-                    let d = notify_dispatcher.lock().await;
-                    Some(d.history())
-                },
-                log_store: api_log_store,
-                log_writer: None,
-                task_tracker: api_task_tracker,
-            };
-            // Session store + ACME auto-renewal + cert-expiry notifier
-            // + server loop, shared with single-process mode (audit
-            // H-9, see `startup::run_api_server`). The management listener
-            // is pre-bound (or adopted from the outgoing supervisor) so it
-            // can be handed over on the next hot upgrade without a gap.
-            startup::run_api_server(management_port, state, api_alert_sender, Some(mgmt_listener))
-                .await;
-        });
-
-        // Hourly retention loop (access logs, probe results, WAF
-        // events, SLA buckets), shared across modes (audit H-9, see
-        // `startup::spawn_retention_loop`). No-op when the access-log
-        // store failed to open.
-        startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
-
-        // Cluster plane (Story 9.2): control-plane listeners, opt-in
-        // via --cluster-listen. A bad bind or a missing CA is fatal -
-        // the operator asked for the plane, running without it is
-        // the wrong failure mode. Handles stay alive for the process
-        // lifetime; the stats feed the Prometheus bridge.
+        // Cluster plane (Stories 9.2/9.3): control-plane listeners and
+        // fleet registry, opt-in via --cluster-listen; or the follower
+        // dialer when this node holds a fleet identity. Spawned BEFORE
+        // the API so AppState carries the fleet role. A bad bind, a
+        // missing CA, or a node that is both is fatal - the operator
+        // asked for a role, running without it is the wrong failure
+        // mode. Handles stay alive for the process lifetime; the stats
+        // feed the Prometheus bridge.
         // On a hot upgrade the operational cluster SOCKET is adopted
         // from the outgoing supervisor (Story 9.1's FD slot) so there
         // is no rebind gap; its sessions reconnect once, to this
@@ -1057,6 +1011,9 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     https: hu_cli.https_port,
                 },
                 inherited_operational,
+                auto_activate: hu_cli.cluster_auto_activate,
+                log_store: log_store.clone(),
+                alert_sender: alert_sender.clone(),
             },
             &store,
         )
@@ -1075,6 +1032,73 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 std::process::exit(1);
             }
         };
+        let mut follower_plane = match startup::cluster_follower::spawn_follower(
+            startup::cluster_follower::FollowerOptions {
+                is_control_plane: cluster_plane.is_some(),
+            },
+            &store,
+        )
+        .await
+        {
+            Ok(plane) => plane,
+            Err(e) => {
+                error!(error = %e, "cluster follower failed to start");
+                std::process::exit(1);
+            }
+        };
+        let cluster_runtime =
+            startup::cluster_runtime(cluster_plane.as_ref(), follower_plane.as_ref());
+
+        let api_handle = tokio::spawn(async move {
+            let state = AppState {
+                store: api_store,
+                log_buffer: api_log_buffer,
+                system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
+                active_connections: api_active_connections,
+                started_at: Instant::now(),
+                data_dir: PathBuf::from(&cli.data_dir),
+                http_port: cli.http_port,
+                https_port: cli.https_port,
+                config_reload_tx: Some(config_reload_tx),
+                // Supervisor: cache/ban are per-worker process, surfaced
+                // to the API as metrics aggregated over the command channel.
+                mode: lorica_api::server::Mode::Supervisor {
+                    worker_metrics: api_worker_metrics,
+                    aggregated_metrics: api_aggregated_metrics,
+                    metrics_refresher: Some(api_metrics_refresher),
+                    upgrade_trigger: upgrade_tx,
+                },
+                waf_event_buffer: Some(waf_event_buffer),
+                waf_engine: Some(waf_engine),
+                waf_rule_count: Some(waf_rule_count),
+                acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::with_db_path(api_db_path)),
+                pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
+                sla_collector: Some(Arc::clone(&sla_collector)),
+                load_test_engine: Some(load_test_engine),
+                notification_history: {
+                    let d = notify_dispatcher.lock().await;
+                    Some(d.history())
+                },
+                log_store: api_log_store,
+                log_writer: None,
+                task_tracker: api_task_tracker,
+                cluster: cluster_runtime,
+            };
+            // Session store + ACME auto-renewal + cert-expiry notifier
+            // + server loop, shared with single-process mode (audit
+            // H-9, see `startup::run_api_server`). The management listener
+            // is pre-bound (or adopted from the outgoing supervisor) so it
+            // can be handed over on the next hot upgrade without a gap.
+            startup::run_api_server(management_port, state, api_alert_sender, Some(mgmt_listener))
+                .await;
+        });
+
+        // Hourly retention loop (access logs, probe results, WAF
+        // events, SLA buckets), shared across modes (audit H-9, see
+        // `startup::spawn_retention_loop`). No-op when the access-log
+        // store failed to open.
+        startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
+
 
         // Worker monitoring loop (crash detection and restart with backoff)
         let manager = Arc::new(std::sync::Mutex::new(manager));
@@ -1353,6 +1377,9 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     if let Some(plane) = cluster_plane.take() {
                         plane.shutdown();
                     }
+                    if let Some(follower) = follower_plane.take() {
+                        follower.shutdown();
+                    }
                     // CRITICAL ordering: stop the worker monitor BEFORE
                     // telling workers to drain. The monitor respawns
                     // crashed workers; during shutdown the SIGKILL we
@@ -1458,6 +1485,9 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             // the old epoch and cut without a goodbye).
                             if let Some(plane) = cluster_plane.take() {
                                 plane.shutdown();
+                            }
+                            if let Some(follower) = follower_plane.take() {
+                                follower.shutdown();
                             }
                             // Stop the monitor so a drained worker is not
                             // seen as a crash and respawned.

@@ -69,6 +69,56 @@ fn main() {
             ClusterAction::Init { common_name } => {
                 run_cluster_init(&cli.data_dir, &common_name);
             }
+            ClusterAction::Join {
+                control_plane,
+                enrollment,
+                name,
+                token_file,
+                token_stdin,
+                server_name,
+            } => {
+                lorica::cli_cluster::run_cluster_join(
+                    &cli.data_dir,
+                    control_plane,
+                    enrollment,
+                    name,
+                    token_file,
+                    token_stdin,
+                    server_name,
+                );
+            }
+            ClusterAction::Leave { user, password } => {
+                lorica::cli_cluster::run_cluster_leave(
+                    &cli.data_dir,
+                    cli.management_port,
+                    user,
+                    password,
+                );
+            }
+            ClusterAction::Status { user, password } => {
+                lorica::cli_cluster::run_cluster_status(
+                    &cli.data_dir,
+                    cli.management_port,
+                    user,
+                    password,
+                );
+            }
+            ClusterAction::Token {
+                ttl_seconds,
+                node_name,
+                source_cidr,
+                user,
+                password,
+            } => {
+                lorica::cli_cluster::run_cluster_token(
+                    cli.management_port,
+                    ttl_seconds,
+                    node_name,
+                    source_cidr,
+                    user,
+                    password,
+                );
+            }
         },
         None => {
             init_logging(&cli.log_level, &cli.log_format, cli.log_file.as_deref());

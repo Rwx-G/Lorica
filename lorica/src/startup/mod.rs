@@ -21,6 +21,7 @@
 //! module is the single source of truth for one such cluster;
 //! mode-specific differences are explicit parameters, never copies.
 
+pub(crate) mod cluster_follower;
 pub(crate) mod cluster_plane;
 pub(crate) mod hot_upgrade;
 pub(crate) mod single;
@@ -751,6 +752,21 @@ pub(crate) fn restrict_key_permissions(path: &std::path::Path) -> bool {
         return false;
     }
     true
+}
+
+/// The fleet role handed to `AppState` (Story 9.3): the control-plane
+/// handle, the follower handle, or standalone.
+pub(crate) fn cluster_runtime(
+    plane: Option<&cluster_plane::ClusterPlane>,
+    follower: Option<&cluster_follower::FollowerPlane>,
+) -> lorica_api::cluster::ClusterRuntime {
+    match (plane, follower) {
+        (Some(plane), _) => lorica_api::cluster::ClusterRuntime::ControlPlane(Arc::clone(&plane.control)),
+        (None, Some(follower)) => {
+            lorica_api::cluster::ClusterRuntime::Follower(Arc::clone(&follower.runtime))
+        }
+        (None, None) => lorica_api::cluster::ClusterRuntime::Standalone,
+    }
 }
 
 /// Inspect `encryption.key` before promoting it to the identity root

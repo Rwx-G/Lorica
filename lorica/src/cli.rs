@@ -152,6 +152,13 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) cluster_advertise: Option<String>,
 
+    /// Enrolled nodes become `Active` immediately instead of waiting
+    /// for a SuperAdmin to activate them (Story 9.3 AC #5). Off by
+    /// default: a redeemed token is a Pending node with no
+    /// configuration until an operator looks at it.
+    #[arg(long)]
+    pub(crate) cluster_auto_activate: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -249,6 +256,90 @@ pub(crate) enum ClusterAction {
         #[arg(long, default_value = "Lorica Cluster CA")]
         common_name: String,
     },
+    /// Join a fleet (Story 9.3): redeem a join token on the control
+    /// plane's enrollment listener and persist this node's fleet
+    /// identity. The token is read from `--token-file`,
+    /// `--token-stdin` or `LORICA_JOIN_TOKEN`, never from the command
+    /// line. Restart lorica afterwards to start the cluster session.
+    Join {
+        /// The control plane's operational `host:port`
+        /// (its `--cluster-listen` bind or the name it advertises).
+        #[arg(long)]
+        control_plane: String,
+
+        /// The enrollment listener's `host:port`; defaults to the
+        /// control-plane host on the next port.
+        #[arg(long)]
+        enrollment: Option<String>,
+
+        /// Display name for this node; defaults to the hostname.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Read the join token from this file.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+
+        /// Read the join token from standard input.
+        #[arg(long)]
+        token_stdin: bool,
+
+        /// Name the control-plane certificate must carry in its SAN;
+        /// defaults to the `--control-plane` host.
+        #[arg(long)]
+        server_name: Option<String>,
+    },
+    /// Leave the fleet (Story 9.3 AC #13): wipe this node's fleet
+    /// identity. Authorised either by a SuperAdmin credential on the
+    /// local management API (the running instance tells the control
+    /// plane, wipes and audits) or, without credentials, by proof
+    /// that the control plane already deregistered this node (it
+    /// refuses the node's certificate).
+    Leave {
+        /// SuperAdmin username on the local management API.
+        #[arg(long)]
+        user: Option<String>,
+
+        /// SuperAdmin password on the local management API.
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Print this node's fleet role (Story 9.3 AC #14): the persisted
+    /// facts always, the live connection state and roster when
+    /// management credentials are passed.
+    Status {
+        /// Username on the local management API (Viewer+).
+        #[arg(long)]
+        user: Option<String>,
+
+        /// Password on the local management API.
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Mint a join token on this control plane through the local
+    /// management API (SuperAdmin). The token is printed once, apart
+    /// from the command that consumes it.
+    Token {
+        /// Lifetime in seconds (default 3600, max 86400).
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+
+        /// Bind the token to this node name.
+        #[arg(long)]
+        node_name: Option<String>,
+
+        /// Bind the token to this source CIDR.
+        #[arg(long)]
+        source_cidr: Option<String>,
+
+        /// SuperAdmin username
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// SuperAdmin password
+        #[arg(long)]
+        password: String,
+    },
 }
 
 impl Cli {
@@ -303,6 +394,9 @@ impl Cli {
         if let Some(ref advertise) = self.cluster_advertise {
             argv.push("--cluster-advertise".to_string());
             argv.push(advertise.clone());
+        }
+        if self.cluster_auto_activate {
+            argv.push("--cluster-auto-activate".to_string());
         }
         argv
     }
@@ -939,6 +1033,7 @@ mod tests {
             "--cluster-listen",
             "192.0.2.10:9444",
             "--cluster-listen-any",
+            "--cluster-auto-activate",
             "--cluster-enrollment-listen",
             "192.0.2.20:9500",
             "--cluster-advertise",
@@ -947,6 +1042,7 @@ mod tests {
         let child = Cli::parse_from(original.hot_upgrade_argv("/tmp/lorica.new", 1));
         assert_eq!(child.cluster_listen, original.cluster_listen);
         assert!(child.cluster_listen_any);
+        assert!(child.cluster_auto_activate);
         assert_eq!(child.cluster_enrollment_listen, original.cluster_enrollment_listen);
         assert_eq!(child.cluster_advertise, original.cluster_advertise);
     }
