@@ -1,7 +1,7 @@
 # Story 9.4: Configuration Replication
 
 **Epic:** 9 (v1.7.0)
-**Status:** Draft
+**Status:** InProgress
 **Author:** Romain G.
 
 **Depends on:** Stories 9.1, 9.2, 9.3.
@@ -199,11 +199,130 @@ possibly dropping a security-relevant setting.
 
 ### Debug Log
 
-(empty)
+- 2026-09-06: Phase 1 pre-implementation review against the shipped
+  9.1 canonical encoder (`lorica-config/src/canonical.rs`:
+  `CanonicalConfig` with `deny_unknown_fields`, `canonical_bytes`,
+  `canonical_hash`, `decode_canonical`), the 9.2/9.3 transport
+  (dialer drops its incoming half; body tags 20-39 reserved; 4 MiB
+  frame cap, 10 s request timeout), the worker two-phase coordinator
+  (`supervisor.rs::coordinate_config_reload`), the reload consumer in
+  both startup modes (a `watch<u64>` that coalesces), the 26
+  `notify_config_changed` call sites, and the store's per-table APIs.
 
 ### Completion Notes
 
-(empty)
+- **Phase 1 decisions**:
+  - **D1 - the payload is the 9.1 canonical blob**, nothing else.
+    `CanonicalGlobalSettings` IS the allowlist by construction (the
+    `every_global_setting_is_explicitly_routed` test forces every new
+    field through a replicate-or-node-local decision), and the strict
+    decoder refuses a blob with any field the follower does not know.
+    AC #1's "refused wholesale with a notification" is therefore the
+    follower's `decode_canonical` failure path: the blob is dropped,
+    the Prepare answers a semantic rejection naming the field, and a
+    `cluster_config_refused` alert fires on the follower.
+  - **D2 - replica-apply is one transaction over an explicit table
+    list** (`lorica-config/src/store/replica.rs`): global fleet-policy
+    fields merged into the local `GlobalSettings` (node-local fields
+    untouched), routes, backends, route_backends, waf_custom_rules,
+    waf_disabled_rules, cert_export_acls, ai_crawlers_custom (keyed on
+    `name`), probe_configs, sla_configs, and certificates (D3). Rows
+    absent from the blob are deleted in those tables; users,
+    preferences, sessions, notification channels and DNS providers are
+    never touched (the last two carry only secret digests in the blob
+    and are control-plane concerns: alerts are raised where they are
+    detected, DNS-01 is completed by the control plane per 9.5 AC #5).
+  - **D3 - certificates replicate as metadata in this story.** The
+    blob carries `sha256:<digest>` for `key_pem`. The follower keeps
+    its local key when a row with the same id exists and the digest
+    matches; a certificate whose key the follower does not hold gets
+    its row with an empty key and is skipped by the resolver with a
+    WARN until Story 9.5 delivers the key over its own path. A route
+    bound to such a certificate serves under the default certificate
+    until then. Stated in `docs/cluster.md`.
+  - **D4 - wire protocol, tags 20-39**: `ConfigPrepare {generation,
+    hash, blob}` / `ConfigPrepareAck {outcome}` (prepared, or rejected
+    with a reason), `ConfigCommit {generation}` / `ConfigCommitAck
+    {applied_generation, applied_hash}`, `ConfigAbort {generation}`,
+    and the pull path `ConfigPull {applied_generation, applied_hash}`
+    / `ConfigPullAck {generation, hash, blob}` where a matching hash
+    answers without a blob (the "delta keyed on the applied hash":
+    nothing to transfer). A real per-table delta is not built: the
+    blob is bounded by the 4 MiB frame cap and a fleet configuration
+    is tens of kilobytes; the story says so rather than pretending.
+    `Heartbeat` and `HelloAck` gain `applied_generation` /
+    `applied_hash` (follower side) and `current_generation` /
+    `current_hash` (control-plane side), so a missed commit converges
+    within one heartbeat interval and a reconnect converges at the
+    handshake (AC #7).
+  - **D5 - the dialer serves its incoming half.** Prepare, Commit and
+    Abort are control-plane-initiated; the follower dispatches them
+    through a follower-side whitelist to a `FollowerHandler` trait
+    (boxed futures, implemented in the binary over the store and the
+    reload trigger). Anything else from the control plane is a
+    protocol violation on the follower too.
+  - **D6 - coordinator on the control plane, after the local reload.**
+    The reload consumer in both startup modes already runs after
+    every mutation (one shared helper, per the 9.3 QA rule); it now
+    ends with `replicate_after_reload`: increment the persisted
+    generation, encode blob + hash, fan out Prepare to every connected
+    Active session under a per-node 10 s deadline (the 9.1 endpoint
+    value), then Commit or Abort. Transport timeout evicts the node
+    from the commit set and marks it drifted; three consecutive
+    evictions quarantine it (excluded from commit sets, converges by
+    pull); a semantic rejection aborts fleet-wide (AC #5). A Commit
+    failure after other commits is a split fleet: counted, reported,
+    reconciled by the next heartbeat's pull (AC #6). Pending and
+    quarantined nodes never receive a blob.
+  - **D7 - AC #8's completion channel is a report, not a blocking
+    response.** Changing 26 handlers' responses would couple every
+    mutation to fleet latency. `notify_config_changed` keeps its
+    signature; the coordinator publishes a `ReplicationReport` per
+    generation (prepared, evicted, rejected, committed, split) into
+    the control-plane handle, exposed as `GET /api/v1/cluster/
+    replication` (last report and the generation in flight); the
+    dashboard (9.7) polls it after a mutation.
+  - **D8 - follower read-only gate**: one axum layer in front of the
+    protected router: when the runtime is a follower and break-glass
+    is not active, a non-GET/HEAD request outside the allow-list
+    answers `409 Conflict` naming the control plane. The allow-list is
+    the story's read-like POSTs plus what is follower-local by design:
+    `/api/v1/auth/*`, `/api/v1/users*`, `/api/v1/audit*`,
+    `/api/v1/cluster/*` (leave, break-glass, status), the validation
+    and test endpoints, config export and import preview, load-test
+    start/abort.
+  - **D9 - break-glass** is `POST /api/v1/cluster/break-glass
+    {duration_s}` (SuperAdmin, follower only, cap 24 h) behind
+    `lorica cluster break-glass --duration`, kept in the follower
+    runtime as a watch of `until`; audited locally, bannered in
+    `cluster status` and the status endpoint (9.7 renders it), and
+    reported to the control plane in every heartbeat. When it ends,
+    or when the control plane is back, the follower pulls the current
+    generation and applies it wholesale (local edits are reconciled
+    away, which is the documented meaning of "the control plane owns
+    the configuration").
+  - **D10 - drift** is computed on the control plane from the live
+    registry plus the persisted `applied_config_*` columns:
+    `GET /api/v1/cluster/drift` lists nodes whose applied generation
+    or hash differs from the current one with the age of the
+    divergence (first observed in the registry). A `cluster_drift`
+    alert per node is suppressed by a per-node exponential backoff
+    (1 min doubling to 1 h) inside the coordinator, before the
+    dispatcher's global per-channel budget ever sees it.
+  - **D11 - `node_selector` lives on the route.** A new
+    `routes.node_selector` (JSON list of node names, empty means
+    fleet-wide) rides the canonical blob; the follower skips routes
+    whose selector does not name it. This is the same predicate Story
+    9.5 needs for need-to-know key distribution, so it is defined
+    once, on the entity it scopes.
+  - **D12 - the follower persists then reloads**: `apply_replica` in
+    one transaction, then `cluster_replica` (generation, hash,
+    applied_at), then the existing reload trigger; in follower mode
+    the reload consumer applies locally and never fans out.
+  - **D13 - metrics** from the registry snapshot:
+    `lorica_cluster_config_generation{node_id}`,
+    `lorica_cluster_config_apply_total{node_id, outcome}`,
+    `lorica_cluster_drift_nodes`.
 
 ## File List
 
@@ -222,3 +341,4 @@ Anticipated:
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Slow-node eviction replaces fleet-wide veto; replication allowlist replaces wholesale settings replication; break-glass added. Status Draft. | Romain G. |
+| 2026-09-06 | 0.2 | Phase 1 review: thirteen decisions recorded (canonical blob as payload, transactional replica-apply, certificate metadata in 9.4, tags 20-39 protocol with pull and heartbeat convergence, coordinator after the local reload, report-based completion, read-only gate, break-glass, drift with per-node suppression, node_selector on the route). Status InProgress. | Romain G. |
