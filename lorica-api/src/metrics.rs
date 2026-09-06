@@ -83,7 +83,8 @@ static CERT_EXPIRY_DAYS: Lazy<GaugeVec> = Lazy::new(|| {
 // `node_name` - a compromised follower rotating its name on every
 // reconnect could otherwise mint unbounded series. `direction` is
 // inbound|outbound, `method` is a fixed protocol vocabulary
-// (hello|heartbeat|tls|bridge), `outcome` a fixed result vocabulary.
+// (hello|heartbeat|tls|bridge|session), `outcome` a fixed result
+// vocabulary.
 
 /// Per-node cluster connection state (1 = in that state). Labels:
 /// node_id, state. Series appear once enrolled identities exist
@@ -119,12 +120,30 @@ static CLUSTER_RPC_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
 });
 
 /// Enrollment-listener pre-authentication rejections (Story 9.2
-/// AC #3). Labels: reason, a fixed five-value vocabulary.
+/// AC #3). Labels: reason, a fixed vocabulary.
 static CLUSTER_PREAUTH_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
         "lorica_cluster_preauth_rejections_total",
         "Enrollment connections dropped by a pre-authentication budget",
         &["reason"],
+    )
+});
+
+/// Connections accepted by the enrollment listener before any budget
+/// ran: the volume on the product's only unauthenticated surface.
+static CLUSTER_ENROLLMENT_CONNECTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "lorica_cluster_enrollment_connections_total",
+        "Connections accepted by the enrollment listener",
+    )
+});
+
+/// Enrollment listener bind attempts that failed while a join token
+/// was live (retried on a bounded backoff).
+static CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "lorica_cluster_enrollment_bind_failures_total",
+        "Enrollment listener bind failures while a join token was live",
     )
 });
 
@@ -143,17 +162,28 @@ static CLUSTER_ENROLLMENT_LISTENER_OPEN: Lazy<IntGauge> = Lazy::new(|| {
 /// registry handles - it must stay free of the metrics dependency).
 #[derive(Default)]
 struct ClusterPlaneSnapshot {
-    tls_failures: u64,
-    sessions_admitted: u64,
-    sessions_retry_later: u64,
-    handshake_refusals: u64,
-    protocol_violations: u64,
-    heartbeats_served: u64,
-    rejected_handshake_timeout: u64,
-    rejected_concurrent_handshakes: u64,
-    rejected_inflight_enrollments: u64,
-    rejected_byte_budget: u64,
-    rejected_time_budget: u64,
+    op_rejected_concurrent_handshakes: u64,
+    op_handshake_timeouts: u64,
+    op_tls_failures: u64,
+    op_alpn_refusals: u64,
+    op_sessions_admitted: u64,
+    op_sessions_retry_later: u64,
+    op_sessions_rejected_full: u64,
+    op_handshake_refusals: u64,
+    op_protocol_violations: u64,
+    op_unsupported_methods: u64,
+    op_heartbeats_served: u64,
+    op_sessions_ended: u64,
+    en_connections_total: u64,
+    en_rejected_handshake_failed: u64,
+    en_rejected_handshake_timeout: u64,
+    en_rejected_alpn: u64,
+    en_rejected_concurrent_handshakes: u64,
+    en_rejected_inflight_enrollments: u64,
+    en_rejected_byte_budget: u64,
+    en_rejected_time_budget: u64,
+    en_rejected_window_closed: u64,
+    en_bind_failures: u64,
 }
 
 struct ClusterPlaneStats {
@@ -178,10 +208,29 @@ pub fn install_cluster_plane_stats(
     });
 }
 
+/// Increment a labelled counter by the growth of a monotonic atomic
+/// since the previous scrape.
+fn bump_vec(counter: &IntCounterVec, labels: &[&str], now: u64, last: &mut u64) {
+    let delta = now.saturating_sub(*last);
+    if delta > 0 {
+        counter.with_label_values(labels).inc_by(delta);
+    }
+    *last = now;
+}
+
+/// Same for an unlabelled counter.
+fn bump(counter: &IntCounter, now: u64, last: &mut u64) {
+    let delta = now.saturating_sub(*last);
+    if delta > 0 {
+        counter.inc_by(delta);
+    }
+    *last = now;
+}
+
 /// Fold the cluster-plane atomics into the registry (delta since the
 /// last scrape). No-op when the plane is not running.
 fn sync_cluster_plane_metrics() {
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::Ordering::Relaxed;
 
     let Some(stats) = CLUSTER_PLANE_STATS.get() else {
         return;
@@ -191,84 +240,141 @@ fn sync_cluster_plane_metrics() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    fn bump(counter: &IntCounterVec, labels: &[&str], now: u64, last: &mut u64) {
-        let delta = now.saturating_sub(*last);
-        if delta > 0 {
-            counter.with_label_values(labels).inc_by(delta);
-        }
-        *last = now;
-    }
-
     let op = &stats.operational;
-    bump(
+    bump_vec(
         &CLUSTER_RPC_TOTAL,
-        &["inbound", "hello", "admitted"],
-        op.sessions_admitted.load(Ordering::Relaxed),
-        &mut last.sessions_admitted,
+        &["inbound", "tls", "concurrent_limit"],
+        op.rejected_concurrent_handshakes.load(Relaxed),
+        &mut last.op_rejected_concurrent_handshakes,
     );
-    bump(
+    bump_vec(
         &CLUSTER_RPC_TOTAL,
-        &["inbound", "hello", "retry_later"],
-        op.sessions_retry_later.load(Ordering::Relaxed),
-        &mut last.sessions_retry_later,
+        &["inbound", "tls", "timeout"],
+        op.handshake_timeouts.load(Relaxed),
+        &mut last.op_handshake_timeouts,
     );
-    bump(
-        &CLUSTER_RPC_TOTAL,
-        &["inbound", "hello", "refused"],
-        op.handshake_refusals.load(Ordering::Relaxed),
-        &mut last.handshake_refusals,
-    );
-    bump(
+    bump_vec(
         &CLUSTER_RPC_TOTAL,
         &["inbound", "tls", "failed"],
-        op.tls_failures.load(Ordering::Relaxed),
-        &mut last.tls_failures,
+        op.tls_failures.load(Relaxed),
+        &mut last.op_tls_failures,
     );
-    bump(
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "tls", "alpn_refused"],
+        op.alpn_refusals.load(Relaxed),
+        &mut last.op_alpn_refusals,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "admitted"],
+        op.sessions_admitted.load(Relaxed),
+        &mut last.op_sessions_admitted,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "retry_later"],
+        op.sessions_retry_later.load(Relaxed),
+        &mut last.op_sessions_retry_later,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "session_full"],
+        op.sessions_rejected_full.load(Relaxed),
+        &mut last.op_sessions_rejected_full,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "refused"],
+        op.handshake_refusals.load(Relaxed),
+        &mut last.op_handshake_refusals,
+    );
+    bump_vec(
         &CLUSTER_RPC_TOTAL,
         &["inbound", "bridge", "protocol_violation"],
-        op.protocol_violations.load(Ordering::Relaxed),
-        &mut last.protocol_violations,
+        op.protocol_violations.load(Relaxed),
+        &mut last.op_protocol_violations,
     );
-    bump(
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "bridge", "unsupported_method"],
+        op.unsupported_methods.load(Relaxed),
+        &mut last.op_unsupported_methods,
+    );
+    bump_vec(
         &CLUSTER_RPC_TOTAL,
         &["inbound", "heartbeat", "ok"],
-        op.heartbeats_served.load(Ordering::Relaxed),
-        &mut last.heartbeats_served,
+        op.heartbeats_served.load(Relaxed),
+        &mut last.op_heartbeats_served,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "session", "ended"],
+        op.sessions_ended.load(Relaxed),
+        &mut last.op_sessions_ended,
     );
 
     let en = &stats.enrollment;
     bump(
+        &CLUSTER_ENROLLMENT_CONNECTIONS_TOTAL,
+        en.connections_total.load(Relaxed),
+        &mut last.en_connections_total,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["handshake_failed"],
+        en.rejected_handshake_failed.load(Relaxed),
+        &mut last.en_rejected_handshake_failed,
+    );
+    bump_vec(
         &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
         &["handshake_timeout"],
-        en.rejected_handshake_timeout.load(Ordering::Relaxed),
-        &mut last.rejected_handshake_timeout,
+        en.rejected_handshake_timeout.load(Relaxed),
+        &mut last.en_rejected_handshake_timeout,
     );
-    bump(
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["alpn"],
+        en.rejected_alpn.load(Relaxed),
+        &mut last.en_rejected_alpn,
+    );
+    bump_vec(
         &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
         &["concurrent_handshakes"],
-        en.rejected_concurrent_handshakes.load(Ordering::Relaxed),
-        &mut last.rejected_concurrent_handshakes,
+        en.rejected_concurrent_handshakes.load(Relaxed),
+        &mut last.en_rejected_concurrent_handshakes,
     );
-    bump(
+    bump_vec(
         &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
         &["inflight_enrollments"],
-        en.rejected_inflight_enrollments.load(Ordering::Relaxed),
-        &mut last.rejected_inflight_enrollments,
+        en.rejected_inflight_enrollments.load(Relaxed),
+        &mut last.en_rejected_inflight_enrollments,
     );
-    bump(
+    bump_vec(
         &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
         &["byte_budget"],
-        en.rejected_byte_budget.load(Ordering::Relaxed),
-        &mut last.rejected_byte_budget,
+        en.rejected_byte_budget.load(Relaxed),
+        &mut last.en_rejected_byte_budget,
     );
-    bump(
+    bump_vec(
         &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
         &["time_budget"],
-        en.rejected_time_budget.load(Ordering::Relaxed),
-        &mut last.rejected_time_budget,
+        en.rejected_time_budget.load(Relaxed),
+        &mut last.en_rejected_time_budget,
     );
-    let open = en.lifecycle_opens.load(Ordering::Relaxed) > en.lifecycle_closes.load(Ordering::Relaxed);
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["window_closed"],
+        en.rejected_window_closed.load(Relaxed),
+        &mut last.en_rejected_window_closed,
+    );
+    bump(
+        &CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL,
+        en.bind_failures.load(Relaxed),
+        &mut last.en_bind_failures,
+    );
+
+    let open = en.lifecycle_opens.load(Relaxed) > en.lifecycle_closes.load(Relaxed);
     CLUSTER_ENROLLMENT_LISTENER_OPEN.set(i64::from(open));
     // Touch the node-scoped families so they are registered (and
     // visible as empty) from the first scrape.
