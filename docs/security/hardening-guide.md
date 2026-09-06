@@ -37,7 +37,7 @@ ssh -L 9443:localhost:9443 user@lorica-host
 The cluster plane only exists when a control plane is started with `--cluster-listen <host:port>` (9444 in the examples below). Two listeners share that surface:
 
 - **Operational listener**: mutual TLS is mandatory; only nodes holding a certificate issued by the fleet's cluster CA can complete the handshake. Still, do not expose it wider than needed: allow only the addresses of enrolled nodes.
-- **Enrollment listener** (cluster port + 1, so 9445 below): the only unauthenticated surface in the product. It is closed unless a join token is live and auto-closes when the last token is burned or expires, but the firewall should mirror that lifecycle: open it only for the duration of an enrollment window, and only from admin-controlled source addresses.
+- **Enrollment listener** (cluster port + 1 by default, so 9445 below; `--cluster-enrollment-listen host:port` moves it, for example onto an admin interface): the only unauthenticated surface in the product. It is closed unless a join token is live and auto-closes when the last token is burned or expires, but the firewall should mirror that lifecycle: open it only for the duration of an enrollment window, and only from admin-controlled source addresses.
 
 Followers dial out to the control plane and expose no inbound cluster port; no follower-side firewall opening is needed.
 

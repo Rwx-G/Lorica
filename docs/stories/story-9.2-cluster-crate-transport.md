@@ -251,6 +251,73 @@ so a future hardening pass does not tighten `RestrictAddressFamilies`.
     while the test held the client endpoint and awaited the server).
     Every cross-task await in cluster tests now sits under a 10 s
     timeout so a regression fails fast instead of hanging CI.
+- **QA iteration 1 (2026-09-06)**: four-auditor sweep (security,
+  architecture, quality, performance) returned 1 Critical, 5 High
+  after aggregation, and a set of Mediums; all fixed in one pass:
+  - Critical: hot upgrade of a control plane bound the cluster port
+    fresh while the outgoing supervisor still held it (EADDRINUSE
+    masked as a rollback). The operational socket now rides Story
+    9.1's FD slot: the old side exports a dup under
+    `cluster:op:<bind>`, the new side adopts it instead of binding.
+    The enrollment socket is deliberately not handed off (it only
+    exists inside an enrollment window and rebinds on the next
+    liveness edge).
+  - Operational listener (security + perf High): TLS handshakes are
+    now bounded BEFORE a task exists (`max_concurrent_handshakes`),
+    wrapped in `handshake_timeout`, the opener is read before the
+    admission permit is taken (a stalling authenticated peer cannot
+    hold convergence slots), queued admission waits are bounded
+    (`admit_within`, RETRY_LATER on expiry), and `max_sessions` caps
+    established sessions. ALPN `lorica-cluster/1` is required on
+    both listeners; every cluster TLS config is TLS 1.3-only.
+  - Wire format (arch High): `ClusterRequest.body_kind` discriminator
+    + `UNSUPPORTED_METHOD` + `BridgeOutcome::Unsupported`, so a newer
+    peer's unknown request is answered, not dropped as hostile; the
+    negotiated version now reaches the session (`SessionContext`,
+    with the peer certificate fingerprint captured before the stream
+    is split - 9.3's identity input - and the takeover epoch).
+  - Dialer: full tracing (warn on failure transitions with the real
+    error, info on connect, sticky error for version/schema
+    refusals), TCP+TLS connect timeout, `retry_after_s` clamped to
+    the backoff ceiling, `SessionHandle { generation, endpoint }` so
+    9.4 can detect a reconnect mid-exchange.
+  - `cluster_rpc_limits()` (4 MiB frames, 32-deep queues, 10 s
+    requests) replaces the same-host `RpcLimits::default()` on both
+    ends.
+  - Control-plane leaf keypair persisted (`cluster_ca` row
+    `control-plane-leaf`, encrypted, rotation-covered) and its cert
+    re-issued per boot: Story 9.3 pins the leaf SPKI in join tokens,
+    a per-boot keypair would have invalidated every token on restart.
+    `--cluster-advertise` sets the SAN followers dial.
+  - CLI: the derived enrollment bind goes through the same refusal
+    matrix (overflow, management and proxy ports), and
+    `--cluster-enrollment-listen` overrides it (admin interface).
+    `cluster init` restricts `encryption.key` to 0600 before
+    promoting it to fleet identity root.
+  - Enrollment listener: per-connection tasks in a JoinSet aborted on
+    close/shutdown, liveness re-checked after TLS, bind failures
+    retried on a bounded backoff, `handshake_failed` split from
+    `handshake_timeout`, `node_name` bounded (64 bytes, no control
+    chars). Protocol violations are logged with peer attribution.
+  - Metrics bridge extended to every new counter (enrollment
+    connections and bind failures exported).
+  - Response constructors no longer take a `sequence` the endpoint
+    overwrites; `HandshakeConfig::new`, `DialerConfig::new`,
+    `#[non_exhaustive]` on the public config/status types.
+  - Test hygiene: the ALPN requirement broke an enrollment budget
+    test whose anonymous client offered no ALPN - the test was wrong,
+    the guard right. The admission RETRY_LATER test became a
+    session-cap test (the deterministic path once the opener is read
+    before the permit).
+- **Deliberately NOT done this story** (recorded for 9.3/9.4):
+  session-handler trait (`ClusterSessionHandler`) so 9.4 dispatches
+  without pulling `ConfigStore` into the transport crate; metrics
+  observer inversion (push trait) before node-labelled series;
+  revocation eviction registry (needs identities); the dialer still
+  drops its incoming half (no server-initiated requests yet); audit
+  entry on protocol violation once identities are in the roster;
+  epoch-based session fencing consumer (9.3's identity-keyed
+  registry).
 - **Handoffs**: 9.3 - token liveness publisher, roster-driven
   fleet_size, node_id metric series + duration histogram, CRL
   rebuild through SwappableAcceptor, PKI test helpers worth folding
@@ -288,3 +355,4 @@ so a future hardening pass does not tighten `RestrictAddressFamilies`.
 | 2026-09-02 | 0.2 | Phase 1 review: three scope decisions recorded (token-liveness seam, separate-connection option for AC #7, fleet hint in the handshake). Status InProgress. | Romain G. |
 | 2026-09-02 | 0.3 | Crate core (messages/frame/version/CA/TLS/handshake), encrypted CA storage (migration 49), cluster-plane docs and packaging banners landed. | Romain G. |
 | 2026-09-02 | 0.4 | Listeners with pre-auth budgets, admission gate, dialer, bridge whitelist, CLI (`--cluster-listen`, `cluster init`), startup wiring, Prometheus bridge. All ACs implemented. | Romain G. |
+| 2026-09-06 | 0.5 | QA iteration 1: Critical hot-upgrade FD handoff closed, operational listener pre-TLS budgets/timeouts/session cap, wire-format discriminator, dialer observability and timeouts, WAN RpcLimits, persisted control-plane leaf keypair, enrollment bind validation/override, TLS 1.3 + ALPN. All green. | Romain G. |

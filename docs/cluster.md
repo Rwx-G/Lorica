@@ -55,9 +55,21 @@ Two distinct listeners live behind that surface:
   runs. On the wire it answers refusals with an opaque code; the real
   diagnostic is logged locally only.
 
-Telemetry and configuration never share a queue: they ride separate
-connections so a large configuration or certificate push cannot
-head-of-line-block a heartbeat into a false liveness timeout.
+Telemetry and configuration will never share a queue: the transport is
+one FIFO byte stream per endpoint by design, so telemetry (Story 9.6)
+rides its own connection rather than competing with a large
+configuration or certificate push and turning a delayed heartbeat into
+a false liveness timeout. In v1.7.0 the operational connection carries
+the handshake and heartbeats.
+
+Two further flags shape the plane: `--cluster-enrollment-listen
+host:port` overrides the derived enrollment bind (to put the
+unauthenticated surface on an admin interface, for instance), and
+`--cluster-advertise <host>` sets the name followers dial - it lands in
+the control plane's certificate SAN, so it is required whenever
+followers reach the control plane through DNS, NAT or a load balancer
+rather than the bound IP itself. Both listeners refuse the management
+and proxy ports, the derived enrollment port included.
 
 ## Trust Model
 
