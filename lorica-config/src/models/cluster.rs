@@ -195,6 +195,9 @@ pub struct RevokedSerial {
     pub revoked_at: DateTime<Utc>,
     /// `revoked` (operator action) or `superseded` (renewal).
     pub reason: String,
+    /// `notAfter` of the revoked certificate: past it the serial is
+    /// pruned, a CRL never needs an expired certificate.
+    pub expires_at: DateTime<Utc>,
 }
 
 #[cfg(test)]

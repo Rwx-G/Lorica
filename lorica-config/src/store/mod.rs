@@ -33,6 +33,7 @@ mod cluster_ca;
 mod cluster_identity;
 mod cluster_nodes;
 mod cluster_tokens;
+pub use cluster_nodes::LiveNodeFacts;
 mod dns_providers;
 mod loadtest;
 mod notifications;
@@ -602,8 +603,11 @@ fn migrate_cluster_registry(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS cluster_revoked_serials (
             serial TEXT PRIMARY KEY,
             revoked_at TEXT NOT NULL,
-            reason TEXT NOT NULL
+            reason TEXT NOT NULL,
+            expires_at TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS idx_cluster_revoked_serials_expiry
+            ON cluster_revoked_serials(expires_at);
         CREATE TABLE IF NOT EXISTS cluster_identity (
             id TEXT PRIMARY KEY,
             node_id TEXT NOT NULL,

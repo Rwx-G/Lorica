@@ -8,7 +8,7 @@
 //! node's serials, a completed renewal adds the superseded one.
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use super::row_helpers::{parse_datetime, parse_optional_datetime};
 use super::ConfigStore;
@@ -18,6 +18,27 @@ use crate::models::{ClusterNode, NodeStatus, RevokedSerial};
 const NODE_COLUMNS: &str = "node_id, name, cert_fingerprint, cert_serial, prev_cert_fingerprint, \
      prev_cert_serial, address, version, schema_version, status, enrolled_at, last_seen_at, \
      applied_config_generation, applied_config_hash, cert_not_after, revoked_at";
+
+/// Record one serial on the revocation list (idempotent).
+fn insert_revoked_serial(
+    conn: &Connection,
+    serial: &str,
+    reason: &str,
+    revoked_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO cluster_revoked_serials (serial, revoked_at, reason, expires_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            serial,
+            revoked_at.to_rfc3339(),
+            reason,
+            expires_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
 
 fn row_to_node(row: &rusqlite::Row<'_>) -> Result<ClusterNode> {
     let status: String = row.get(9)?;
@@ -47,12 +68,14 @@ impl ConfigStore {
     /// Insert a freshly enrolled node (status as given, normally
     /// `Pending`).
     pub fn create_cluster_node(&self, node: &ClusterNode) -> Result<()> {
+        // The INSERT list IS the SELECT list, so the three places that
+        // must agree on column order (this, NODE_COLUMNS, row_to_node)
+        // are two.
         self.conn.execute(
-            "INSERT INTO cluster_nodes (node_id, name, cert_fingerprint, cert_serial, \
-             prev_cert_fingerprint, prev_cert_serial, address, version, schema_version, status, \
-             enrolled_at, last_seen_at, applied_config_generation, applied_config_hash, \
-             cert_not_after, revoked_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            &format!(
+                "INSERT INTO cluster_nodes ({NODE_COLUMNS}) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+            ),
             params![
                 node.node_id,
                 node.name,
@@ -159,17 +182,11 @@ impl ConfigStore {
             "UPDATE cluster_nodes SET status = 'revoked', revoked_at = ?2 WHERE node_id = ?1",
             params![node_id, now.to_rfc3339()],
         )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO cluster_revoked_serials (serial, revoked_at, reason) \
-             VALUES (?1, ?2, 'revoked')",
-            params![node.cert_serial, now.to_rfc3339()],
-        )?;
+        insert_revoked_serial(&tx, &node.cert_serial, "revoked", now, node.cert_not_after)?;
         if let Some(prev) = &node.prev_cert_serial {
-            tx.execute(
-                "INSERT OR IGNORE INTO cluster_revoked_serials (serial, revoked_at, reason) \
-                 VALUES (?1, ?2, 'revoked')",
-                params![prev, now.to_rfc3339()],
-            )?;
+            // The superseded certificate was issued before the current
+            // one, so the current expiry bounds its lifetime.
+            insert_revoked_serial(&tx, prev, "revoked", now, node.cert_not_after)?;
         }
         tx.commit()?;
         Ok(Some(node))
@@ -185,17 +202,36 @@ impl ConfigStore {
         schema_version: i64,
         last_seen_at: DateTime<Utc>,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE cluster_nodes SET address = ?2, version = ?3, schema_version = ?4, \
-             last_seen_at = ?5 WHERE node_id = ?1",
-            params![
-                node_id,
-                address,
-                version,
-                schema_version,
-                last_seen_at.to_rfc3339()
-            ],
-        )?;
+        self.touch_cluster_nodes(&[LiveNodeFacts {
+            node_id: node_id.to_string(),
+            address: address.to_string(),
+            version: version.to_string(),
+            schema_version,
+            last_seen_at,
+        }])
+    }
+
+    /// [`ConfigStore::touch_cluster_node`] for a whole snapshot in one
+    /// transaction (the periodic flush: one commit per flush, not one
+    /// per node).
+    pub fn touch_cluster_nodes(&self, facts: &[LiveNodeFacts]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut update = tx.prepare(
+                "UPDATE cluster_nodes SET address = ?2, version = ?3, schema_version = ?4, \
+                 last_seen_at = ?5 WHERE node_id = ?1",
+            )?;
+            for f in facts {
+                update.execute(params![
+                    f.node_id,
+                    f.address,
+                    f.version,
+                    f.schema_version,
+                    f.last_seen_at.to_rfc3339()
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -203,7 +239,9 @@ impl ConfigStore {
     /// becomes `prev_*` (still accepted until the node's first session
     /// on the new one), the new one becomes current. A still-pending
     /// previous certificate (two renewals without a session in
-    /// between) is retired to the revocation list first.
+    /// between) is retired to the revocation list first. Only an
+    /// `Active` node renews (AC #5: a pending node receives no
+    /// certificates); `false` otherwise.
     pub fn record_cluster_node_renewal(
         &self,
         node_id: &str,
@@ -215,22 +253,21 @@ impl ConfigStore {
         let Some(node) = self.get_cluster_node(node_id)? else {
             return Ok(false);
         };
+        if node.status != NodeStatus::Active {
+            return Ok(false);
+        }
         let tx = self.conn.unchecked_transaction()?;
         if let Some(stale) = &node.prev_cert_serial {
-            tx.execute(
-                "INSERT OR IGNORE INTO cluster_revoked_serials (serial, revoked_at, reason) \
-                 VALUES (?1, ?2, 'superseded')",
-                params![stale, now.to_rfc3339()],
-            )?;
+            insert_revoked_serial(&tx, stale, "superseded", now, node.cert_not_after)?;
         }
-        tx.execute(
+        let changed = tx.execute(
             "UPDATE cluster_nodes SET prev_cert_fingerprint = cert_fingerprint, \
              prev_cert_serial = cert_serial, cert_fingerprint = ?2, cert_serial = ?3, \
-             cert_not_after = ?4 WHERE node_id = ?1",
+             cert_not_after = ?4 WHERE node_id = ?1 AND status = 'active'",
             params![node_id, new_fingerprint, new_serial, new_not_after.to_rfc3339()],
         )?;
         tx.commit()?;
-        Ok(true)
+        Ok(changed == 1)
     }
 
     /// The node's first session on its renewed certificate: retire the
@@ -249,11 +286,7 @@ impl ConfigStore {
             return Ok(None);
         };
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT OR IGNORE INTO cluster_revoked_serials (serial, revoked_at, reason) \
-             VALUES (?1, ?2, 'superseded')",
-            params![prev_serial, now.to_rfc3339()],
-        )?;
+        insert_revoked_serial(&tx, &prev_serial, "superseded", now, node.cert_not_after)?;
         tx.execute(
             "UPDATE cluster_nodes SET prev_cert_fingerprint = NULL, prev_cert_serial = NULL \
              WHERE node_id = ?1",
@@ -263,27 +296,58 @@ impl ConfigStore {
         Ok(Some(prev_serial))
     }
 
-    /// Every revoked serial, oldest first: the CRL input.
-    pub fn list_cluster_revoked_serials(&self) -> Result<Vec<RevokedSerial>> {
+    /// Every revoked serial whose certificate is still within its
+    /// validity at `now`, oldest first: the CRL input. Expired
+    /// certificates fail TLS on their own and never need a CRL entry.
+    pub fn list_cluster_revoked_serials(&self, now: DateTime<Utc>) -> Result<Vec<RevokedSerial>> {
         let mut stmt = self.conn.prepare(
-            "SELECT serial, revoked_at, reason FROM cluster_revoked_serials ORDER BY revoked_at, serial",
+            "SELECT serial, revoked_at, reason, expires_at FROM cluster_revoked_serials \
+             WHERE expires_at > ?1 ORDER BY revoked_at, serial",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![now.to_rfc3339()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (serial, revoked_at, reason) = r?;
+            let (serial, revoked_at, reason, expires_at) = r?;
             out.push(RevokedSerial {
                 serial,
                 revoked_at: parse_datetime(&revoked_at)?,
                 reason,
+                expires_at: parse_datetime(&expires_at)?,
             });
         }
         Ok(out)
     }
+
+    /// Drop revoked serials whose certificate expired before `now`
+    /// (the CRL stays bounded by the number of live certificates).
+    /// Returns how many were pruned.
+    pub fn prune_cluster_revoked_serials(&self, now: DateTime<Utc>) -> Result<u32> {
+        let pruned = self.conn.execute(
+            "DELETE FROM cluster_revoked_serials WHERE expires_at <= ?1",
+            params![now.to_rfc3339()],
+        )?;
+        Ok(u32::try_from(pruned).unwrap_or(u32::MAX))
+    }
+}
+
+/// Live facts the session layer persists for one node.
+#[derive(Debug, Clone)]
+pub struct LiveNodeFacts {
+    /// The node.
+    pub node_id: String,
+    /// Last observed transport address.
+    pub address: String,
+    /// Reported build version.
+    pub version: String,
+    /// Reported schema version.
+    pub schema_version: i64,
+    /// Last activity.
+    pub last_seen_at: DateTime<Utc>,
 }

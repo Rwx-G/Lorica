@@ -39,9 +39,10 @@ impl ConfigStore {
     /// Record a freshly minted token (its secret is already hashed).
     pub fn create_join_token(&self, token: &JoinToken) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO cluster_join_tokens (public_id, secret_hmac, state, created_at, \
-             expires_at, created_by, bound_node_name, bound_source_cidr, burned_at, \
-             burned_by_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            &format!(
+                "INSERT INTO cluster_join_tokens ({TOKEN_COLUMNS}) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            ),
             params![
                 token.public_id,
                 token.secret_hmac,

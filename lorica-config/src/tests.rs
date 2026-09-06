@@ -3819,7 +3819,14 @@ cert_critical_days = 3
         assert_eq!(node.schema_version, 50);
         assert!(node.last_seen_at.is_some());
 
-        // Renewal: fp2 becomes current, fp1 stays resolvable.
+        // A pending node cannot renew (AC #5); an active one can:
+        // fp2 becomes current, fp1 stays resolvable.
+        store
+            .create_cluster_node(&sample_node("pending", "fpp", "0FFF"))
+            .expect("enroll");
+        assert!(!store
+            .record_cluster_node_renewal("pending", "fpq", "0FFE", now, now)
+            .expect("pending renewal refused"));
         assert!(store
             .record_cluster_node_renewal("n1", "fp2", "02BB", now + chrono::Duration::days(90), now)
             .expect("renew"));
@@ -3830,7 +3837,7 @@ cert_critical_days = 3
         assert_eq!(by_old.node_id, "n1");
         assert_eq!(by_old.cert_fingerprint, "fp2");
         assert_eq!(by_old.prev_cert_serial.as_deref(), Some("01AA"));
-        assert!(store.list_cluster_revoked_serials().expect("crl").is_empty());
+        assert!(store.list_cluster_revoked_serials(now).expect("crl").is_empty());
 
         // First session on the new certificate retires the old one.
         assert_eq!(
@@ -3847,9 +3854,19 @@ cert_critical_days = 3
             .get_cluster_node_by_fingerprint("fp1")
             .expect("read")
             .is_none());
-        let crl = store.list_cluster_revoked_serials().expect("crl");
+        let crl = store.list_cluster_revoked_serials(now).expect("crl");
         assert_eq!(crl.len(), 1);
         assert_eq!(crl[0].reason, "superseded");
+        assert!(crl[0].expires_at > now);
+        // Past the certificate's expiry the serial leaves the CRL and
+        // is pruned.
+        let later = now + chrono::Duration::days(91);
+        assert!(store
+            .list_cluster_revoked_serials(later)
+            .expect("crl")
+            .is_empty());
+        assert_eq!(store.prune_cluster_revoked_serials(later).expect("prune"), 1);
+        assert_eq!(store.prune_cluster_revoked_serials(later).expect("prune twice"), 0);
 
         // Revocation records the current serial and is idempotent.
         let revoked = store
@@ -3862,13 +3879,35 @@ cert_critical_days = 3
         assert_eq!(node.status, crate::models::NodeStatus::Revoked);
         assert!(node.revoked_at.is_some());
         let serials: Vec<String> = store
-            .list_cluster_revoked_serials()
+            .list_cluster_revoked_serials(now)
             .expect("crl")
             .into_iter()
             .map(|r| r.serial)
             .collect();
-        assert_eq!(serials, vec!["01AA".to_string(), "02BB".to_string()]);
-        assert_eq!(store.list_cluster_nodes().expect("list").len(), 1);
+        assert_eq!(serials, vec!["02BB".to_string()], "01AA was pruned above");
+        assert_eq!(store.list_cluster_nodes().expect("list").len(), 2);
+        // The batched touch persists a whole snapshot in one go.
+        store
+            .touch_cluster_nodes(&[
+                crate::store::LiveNodeFacts {
+                    node_id: "n1".to_string(),
+                    address: "192.0.2.10:5001".to_string(),
+                    version: "1.7.1".to_string(),
+                    schema_version: 51,
+                    last_seen_at: now,
+                },
+                crate::store::LiveNodeFacts {
+                    node_id: "ghost".to_string(),
+                    address: String::new(),
+                    version: String::new(),
+                    schema_version: 0,
+                    last_seen_at: now,
+                },
+            ])
+            .expect("batch touch");
+        let node = store.get_cluster_node("n1").expect("read").expect("row");
+        assert_eq!(node.address, "192.0.2.10:5001");
+        assert_eq!(node.version, "1.7.1");
     }
 
     #[test]
