@@ -16,13 +16,25 @@
 //! TLS connection to the control plane, so a follower never exposes an
 //! inbound port.
 //!
-//! The reconnect loop: TCP + TLS connect under `connect_timeout`,
-//! session handshake, publish the endpoint (tagged with a session
-//! generation) into an [`arc_swap::ArcSwapOption`] read lock-free by
-//! the rest of the process, heartbeat until the connection dies, clear
-//! the slot, back off and retry. Every transition is logged: a
-//! follower that cannot reach its control plane is the epic's most
-//! common support case and must be debuggable from its own journal.
+//! The reconnect loop: resolve the control-plane name, TCP + TLS
+//! connect under `connect_timeout`, session handshake, publish the
+//! endpoint (tagged with a session generation) into an
+//! [`arc_swap::ArcSwapOption`] read lock-free by the rest of the
+//! process, heartbeat until the connection dies, clear the slot, back
+//! off and retry. Every transition is logged: a follower that cannot
+//! reach its control plane is the epic's most common support case and
+//! must be debuggable from its own journal.
+//!
+//! # The dial target is a NAME, resolved on every attempt
+//!
+//! `control_plane` is kept as an unresolved `host:port` and resolved
+//! inside each attempt (every address the name resolves to is tried
+//! in order). A control plane that fails over, is re-provisioned or
+//! is rescheduled onto another address is followed by the fleet on
+//! its next reconnect; pinning one `SocketAddr` at spawn time would
+//! turn every such event into a fleet-wide, silent, restart-only
+//! outage. The certificate identity (`server_name`) is independent of
+//! the address.
 //!
 //! # Backoff
 //!
@@ -34,10 +46,12 @@
 //! `HelloAck`/`HeartbeatAck` supplies `fleet_size_hint`, becomes
 //! `clamp(default_backoff_cap + hint seconds, default_backoff_cap,
 //! 300s)`: a 200-node fleet spreads its reconvergence over minutes, a
-//! 3-node lab stays snappy. A `RETRY_LATER` answer overrides the next
-//! delay with the server-provided `retry_after_s` (AC #10), clamped to
-//! the same 300 s ceiling so a buggy or hostile control plane cannot
-//! park a follower for years.
+//! 3-node lab stays snappy. A `RETRY_LATER` answer sets the next delay
+//! to the server-provided `retry_after_s` (AC #10), clamped to the
+//! same 300 s ceiling so a buggy or hostile control plane cannot park
+//! a follower for years, and floored by the exponential schedule so
+//! a control plane answering `retry_after_s = 0` forever cannot keep
+//! a follower in a one-second full-mTLS reconnect loop either.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,13 +74,24 @@ use crate::tls::{client_config, negotiated_cluster_alpn, ClusterTlsError};
 /// a server-provided `retry_after_s`.
 pub const BACKOFF_CAP_CEILING: Duration = Duration::from_secs(300);
 
+/// Why a dialer could not be spawned.
+#[derive(Debug, thiserror::Error)]
+pub enum DialerError {
+    /// The TLS material or server name was unusable.
+    #[error(transparent)]
+    Tls(#[from] ClusterTlsError),
+    /// `control_plane` is not a `host:port`.
+    #[error("invalid control-plane address {0:?}: expected host:port")]
+    Address(String),
+}
+
 /// Dialer counters (bridged to Prometheus by the binary, AC #12).
 #[derive(Debug, Default)]
 pub struct DialerStats {
     /// TCP+TLS connection attempts.
     pub connect_attempts: AtomicU64,
-    /// Attempts that failed before the session handshake (TCP, TLS,
-    /// `connect_timeout`, missing ALPN).
+    /// Attempts that failed before the session handshake (resolution,
+    /// TCP, TLS, `connect_timeout`, missing ALPN).
     pub connect_failures: AtomicU64,
     /// Sessions admitted by the control plane.
     pub handshakes_ok: AtomicU64,
@@ -85,10 +110,10 @@ pub struct DialerStats {
 /// Inputs for [`Dialer::spawn`]. Construct with [`DialerConfig::new`];
 /// every field stays public so callers (and tests) can tune it.
 #[derive(Clone)]
-#[non_exhaustive]
 pub struct DialerConfig {
-    /// Control-plane address to dial.
-    pub control_plane: SocketAddr,
+    /// Control-plane `host:port`, resolved on EVERY attempt (see the
+    /// module doc).
+    pub control_plane: String,
     /// Name the control-plane certificate must verify as (its SAN).
     pub server_name: String,
     /// Cluster CA bundle (the ONLY trust root).
@@ -108,8 +133,9 @@ pub struct DialerConfig {
     pub heartbeat_interval: Duration,
     /// Per-request timeout (handshake and heartbeats). Default 10 s.
     pub request_timeout: Duration,
-    /// Bound on TCP connect + TLS handshake together. Default 10 s: a
-    /// peer that accepts TCP and then stalls must not wedge the loop.
+    /// Bound on name resolution + TCP connect + TLS handshake
+    /// together. Default 10 s: a peer that accepts TCP and then
+    /// stalls must not wedge the loop.
     pub connect_timeout: Duration,
     /// First-failure backoff delay. Default 1 s.
     pub base_backoff: Duration,
@@ -120,8 +146,9 @@ pub struct DialerConfig {
 
 impl DialerConfig {
     /// A config with the documented defaults for every timing knob.
+    /// `control_plane` is a `host:port` (validated at spawn).
     pub fn new(
-        control_plane: SocketAddr,
+        control_plane: &str,
         server_name: &str,
         ca_pem: &str,
         client_cert_pem: &str,
@@ -129,7 +156,7 @@ impl DialerConfig {
         local_schema_version: u32,
     ) -> Self {
         Self {
-            control_plane,
+            control_plane: control_plane.to_string(),
             server_name: server_name.to_string(),
             ca_pem: ca_pem.to_string(),
             client_cert_pem: client_cert_pem.to_string(),
@@ -149,6 +176,22 @@ impl DialerConfig {
         self.node_name = node_name.to_string();
         self
     }
+}
+
+/// Split a `host:port` into its parts, refusing a bare host, a bare
+/// port and a non-numeric port. IPv6 literals must be bracketed.
+pub fn split_host_port(value: &str) -> Result<(&str, u16), DialerError> {
+    let (host, port) = value
+        .rsplit_once(':')
+        .ok_or_else(|| DialerError::Address(value.to_string()))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| DialerError::Address(value.to_string()))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return Err(DialerError::Address(value.to_string()));
+    }
+    Ok((host, port))
 }
 
 /// One established session: the endpoint plus a generation that
@@ -208,8 +251,10 @@ impl DialerHandle {
 pub struct Dialer;
 
 impl Dialer {
-    /// Validate the TLS material and spawn the reconnect loop.
-    pub fn spawn(config: DialerConfig) -> Result<DialerHandle, ClusterTlsError> {
+    /// Validate the address shape and the TLS material, then spawn the
+    /// reconnect loop.
+    pub fn spawn(config: DialerConfig) -> Result<DialerHandle, DialerError> {
+        split_host_port(&config.control_plane)?;
         let tls = client_config(&config.ca_pem, &config.client_cert_pem, &config.client_key_pem)?;
         let server_name: ServerName<'static> = ServerName::try_from(config.server_name.clone())
             .map_err(|e| ClusterTlsError::Parse(format!("invalid server name: {e}")))?;
@@ -246,8 +291,8 @@ async fn dial_loop(
     let mut fleet_hint: u32 = 0;
     let mut generation: u64 = 0;
     let mut jitter = Jitter::seeded();
-    // Set when the control plane answered RETRY_LATER: overrides the
-    // exponential delay once.
+    // Set when the control plane answered RETRY_LATER: the next delay
+    // is at least this long.
     let mut server_delay: Option<Duration> = None;
     // Sticky refusal state: the FIRST refusal of a given status logs
     // at error, repeats at debug, so a mis-ordered fleet upgrade is one
@@ -258,7 +303,7 @@ async fn dial_loop(
     loop {
         stats.connect_attempts.fetch_add(1, Ordering::Relaxed);
         match connect_once(&config, &connector, &server_name).await {
-            Ok((endpoint, ack_hint, negotiated_version)) => {
+            Ok((endpoint, ack_hint, negotiated_version, addr)) => {
                 stats.handshakes_ok.fetch_add(1, Ordering::Relaxed);
                 failures = 0;
                 server_delay = None;
@@ -268,6 +313,7 @@ async fn dial_loop(
                 was_connected = true;
                 tracing::info!(
                     control_plane = %config.control_plane,
+                    resolved = %addr,
                     generation,
                     protocol = negotiated_version,
                     fleet_size_hint = fleet_hint,
@@ -291,6 +337,9 @@ async fn dial_loop(
             }
             Err(DialFailure::RetryLater(retry_after_s)) => {
                 stats.retry_later.fetch_add(1, Ordering::Relaxed);
+                // Counted as a failure so the exponential schedule
+                // floors a control plane that keeps saying "now".
+                failures = failures.saturating_add(1);
                 let delay = Duration::from_secs(u64::from(retry_after_s.max(1)))
                     .min(BACKOFF_CAP_CEILING);
                 tracing::info!(
@@ -335,21 +384,23 @@ async fn dial_loop(
             }
         }
 
+        let scheduled = backoff_delay(
+            config.base_backoff,
+            backoff_cap(config.default_backoff_cap, fleet_hint),
+            failures,
+            &mut jitter,
+        );
         let delay = match server_delay.take() {
-            Some(d) => d,
-            None => backoff_delay(
-                config.base_backoff,
-                backoff_cap(config.default_backoff_cap, fleet_hint),
-                failures,
-                &mut jitter,
-            ),
+            Some(server) => server.max(scheduled),
+            None => scheduled,
         };
         tokio::time::sleep(delay).await;
     }
 }
 
 enum DialFailure {
-    /// TCP/TLS/transport-level failure, with the cause for the log.
+    /// Resolution/TCP/TLS/transport-level failure, with the cause for
+    /// the log.
     Transport(String),
     /// The control plane refused the session outright.
     Refused(ClusterStatus),
@@ -357,21 +408,41 @@ enum DialFailure {
     RetryLater(u32),
 }
 
+/// Resolve the control-plane name and connect to the first address
+/// that answers, all under `connect_timeout`.
+async fn connect_tcp(config: &DialerConfig) -> Result<(tokio::net::TcpStream, SocketAddr), String> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(config.control_plane.as_str())
+        .await
+        .map_err(|e| format!("resolve {}: {e}", config.control_plane))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("resolve {}: no addresses", config.control_plane));
+    }
+    let mut last_error = String::new();
+    for addr in addrs {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(tcp) => return Ok((tcp, addr)),
+            Err(e) => last_error = format!("tcp connect {addr}: {e}"),
+        }
+    }
+    Err(last_error)
+}
+
 async fn connect_once(
     config: &DialerConfig,
     connector: &TlsConnector,
     server_name: &ServerName<'static>,
-) -> Result<(RpcEndpoint<ClusterFrame>, u32, u32), DialFailure> {
-    // TCP + TLS under one budget: a peer that answers TCP and then
-    // stalls (route hijack, stale address) must not wedge the loop.
-    let tls = tokio::time::timeout(config.connect_timeout, async {
-        let tcp = tokio::net::TcpStream::connect(config.control_plane)
-            .await
-            .map_err(|e| DialFailure::Transport(format!("tcp connect: {e}")))?;
-        connector
+) -> Result<(RpcEndpoint<ClusterFrame>, u32, u32, SocketAddr), DialFailure> {
+    // Resolution + TCP + TLS under one budget: a peer that answers TCP
+    // and then stalls (route hijack, stale address) must not wedge the
+    // loop.
+    let (tls, addr) = tokio::time::timeout(config.connect_timeout, async {
+        let (tcp, addr) = connect_tcp(config).await.map_err(DialFailure::Transport)?;
+        let tls = connector
             .connect(server_name.clone(), tcp)
             .await
-            .map_err(|e| DialFailure::Transport(format!("tls connect: {e}")))
+            .map_err(|e| DialFailure::Transport(format!("tls connect {addr}: {e}")))?;
+        Ok::<_, DialFailure>((tls, addr))
     })
     .await
     .map_err(|_| DialFailure::Transport("connect timed out".to_string()))??;
@@ -392,7 +463,7 @@ async fn connect_once(
     )
     .await
     {
-        Ok(ack) => Ok((endpoint, ack.fleet_size_hint, ack.negotiated_version)),
+        Ok(ack) => Ok((endpoint, ack.fleet_size_hint, ack.negotiated_version, addr)),
         Err(HandshakeError::RetryLater { retry_after_s }) => {
             Err(DialFailure::RetryLater(retry_after_s))
         }
@@ -534,9 +605,27 @@ mod tests {
 
     #[test]
     fn config_defaults_keep_heartbeats_inside_the_frame_read_timeout() {
-        let cfg = DialerConfig::new("127.0.0.1:9444".parse().expect("addr"), "cp", "", "", "", 49);
+        let cfg = DialerConfig::new("cp.example.com:9444", "cp", "", "", "", 49);
         assert!(cfg.heartbeat_interval < cluster_rpc_limits().frame_read_timeout);
-        assert!(cfg.connect_timeout >= cfg.request_timeout || cfg.connect_timeout > Duration::ZERO);
+        assert!(cfg.connect_timeout > Duration::ZERO);
         assert_eq!(cfg.with_node_name("edge-1").node_name, "edge-1");
+    }
+
+    #[test]
+    fn host_port_shapes_are_validated_at_spawn() {
+        assert_eq!(
+            split_host_port("cp.example.com:9444").expect("dns name"),
+            ("cp.example.com", 9444)
+        );
+        assert_eq!(
+            split_host_port("[2001:db8::1]:9444").expect("v6 literal"),
+            ("2001:db8::1", 9444)
+        );
+        for bad in ["cp.example.com", "9444", ":9444", "cp.example.com:port"] {
+            assert!(
+                matches!(split_host_port(bad), Err(DialerError::Address(_))),
+                "{bad} must be refused"
+            );
+        }
     }
 }

@@ -25,11 +25,22 @@
 //! - the cluster CA and EKU-split leaf issuance ([`ca`], AC #8);
 //! - the three TLS 1.3-only configs and the arc-swappable acceptor
 //!   ([`tls`], AC #2's crypto half, Story 9.3's revocation seam);
-//! - the two [`listener`]s with pre-authentication budgets (AC #3),
-//!   convergence [`admission`] (AC #10), the follower [`dialer`]
-//!   (AC #9) and the confused-deputy [`bridge`] (AC #6).
+//! - the pre-authentication budgets and per-source gate ([`preauth`],
+//!   AC #3), the two [`listener`]s, convergence [`admission`]
+//!   (AC #10), the follower [`dialer`] (AC #9), the confused-deputy
+//!   [`bridge`] (AC #6) and the [`session`] contract later stories
+//!   consume.
 //!
 //! Enrollment (join tokens, issuance over the wire) is Story 9.3.
+//!
+//! # API stability rule
+//!
+//! `#[non_exhaustive]` marks types that evolve WITH THE WIRE and are
+//! matched by peers of other builds ([`ClusterStatus`]); configuration
+//! and outcome types stay exhaustive so the in-workspace consumers get
+//! a compile error, not a silent default, when a field or variant is
+//! added. Configs are built through `new()` constructors carrying the
+//! documented defaults and then adjusted field by field.
 //!
 //! [`Frame`]: lorica_command::Frame
 
@@ -45,6 +56,8 @@ pub mod handshake;
 pub mod limits;
 pub mod listener;
 pub mod messages;
+pub mod preauth;
+pub mod session;
 pub mod tls;
 pub mod version;
 
@@ -52,8 +65,8 @@ pub use admission::{AdmissionDecision, AdmissionGate, AdmissionPermit, DEFAULT_Q
 pub use bridge::{translate_cluster_request, BridgeOutcome, InPlaneAction};
 pub use ca::{CaError, ClusterCa};
 pub use dialer::{
-    ClusterConnection, Dialer, DialerConfig, DialerHandle, DialerStats, SessionHandle,
-    BACKOFF_CAP_CEILING,
+    split_host_port, ClusterConnection, Dialer, DialerConfig, DialerError, DialerHandle,
+    DialerStats, SessionHandle, BACKOFF_CAP_CEILING,
 };
 pub use handshake::{
     client_handshake, evaluate_hello, node_name_is_valid, serve_hello, HandshakeConfig,
@@ -62,14 +75,17 @@ pub use handshake::{
 pub use limits::{cluster_rpc_limits, CLUSTER_MAX_MESSAGE_SIZE, CLUSTER_QUEUE_CAP};
 pub use listener::{
     EnrollmentHandle, EnrollmentListener, EnrollmentStats, OperationalConfig, OperationalHandle,
-    OperationalListener, OperationalStats, PreAuthBudgets, SessionContext, TokenLiveness,
+    OperationalListener, OperationalStats, TokenLiveness, DEFAULT_MAX_SESSIONS,
+    DEFAULT_OPENER_TIMEOUT,
 };
 pub use messages::{
-    ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus, BODY_KIND_HEARTBEAT,
-    BODY_KIND_HELLO,
+    ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus, Heartbeat, HeartbeatAck, Hello,
+    HelloAck, BODY_KIND_HEARTBEAT, BODY_KIND_HELLO,
 };
+pub use preauth::{source_key, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
+pub use session::SessionContext;
 pub use tls::{
     client_config, enrollment_server_config, negotiated_cluster_alpn, operational_server_config,
-    ClusterTlsError, SwappableAcceptor, CLUSTER_ALPN,
+    peer_fingerprint, ClusterTlsError, SwappableAcceptor, CLUSTER_ALPN,
 };
 pub use version::{negotiate, PROTOCOL_MIN_COMPATIBLE, PROTOCOL_VERSION};

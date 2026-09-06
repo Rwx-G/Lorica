@@ -153,6 +153,15 @@ pub const BODY_KIND_HEARTBEAT: u32 = 11;
 /// unknown field, leaving `body = None`; without the scalar the two
 /// cases are indistinguishable and the wire format would freeze at
 /// this release.
+///
+/// # Invariant
+///
+/// When a body IS present, `body_kind` MUST equal that body's oneof
+/// tag. The constructors guarantee it on the sending side; every
+/// decode boundary (the handshake opener and the bridge) checks it
+/// with [`ClusterRequest::body_kind_matches`] and treats a mismatch as
+/// a `PROTOCOL_VIOLATION`, so the scalar can never be used to make the
+/// two readings of one request disagree.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ClusterRequest {
     /// Monotonic per direction, managed by `RpcEndpoint`.
@@ -217,6 +226,17 @@ impl ClusterRequest {
     /// Whether `body_kind` names a method THIS build implements.
     pub fn is_known_body_kind(body_kind: u32) -> bool {
         matches!(body_kind, BODY_KIND_HELLO | BODY_KIND_HEARTBEAT)
+    }
+
+    /// The invariant every decode boundary enforces: a present body's
+    /// oneof tag equals `body_kind`. An absent body always passes
+    /// (the scalar alone then decides between "unknown method" and
+    /// "no body at all").
+    pub fn body_kind_matches(&self) -> bool {
+        match &self.body {
+            Some(body) => self.body_kind == body.kind(),
+            None => true,
+        }
     }
 }
 
@@ -320,5 +340,260 @@ pub mod cluster_frame {
         /// A response to one of our requests.
         #[prost(message, tag = "102")]
         Response(ClusterResponse),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use prost::Message;
+
+    use super::*;
+
+    /// The published wire contract. The Rust types are hand-written
+    /// prost derives (no protoc at build time); this test is the drift
+    /// gate between the two.
+    const PROTO: &str = include_str!("../proto/cluster.proto");
+
+    /// `(block, field) -> tag` for every message field (oneof members
+    /// included, attributed to their enclosing message) and enum
+    /// value declared in the .proto.
+    fn proto_tags() -> HashMap<(String, String), u32> {
+        let mut out = HashMap::new();
+        let mut block: Option<String> = None;
+        let mut depth: usize = 0;
+        for raw in PROTO.lines() {
+            let line = raw.split("//").next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if depth == 0 {
+                if let Some(rest) = line
+                    .strip_prefix("message ")
+                    .or_else(|| line.strip_prefix("enum "))
+                {
+                    block = Some(rest.trim_end_matches('{').trim().to_string());
+                }
+            }
+            if let (Some(b), Some((lhs, rhs))) = (&block, line.split_once('=')) {
+                if line.ends_with(';') {
+                    let name = lhs.split_whitespace().last().expect("field name").to_string();
+                    let tag: u32 = rhs
+                        .trim()
+                        .trim_end_matches(';')
+                        .trim()
+                        .parse()
+                        .expect("numeric tag");
+                    out.insert((b.clone(), name), tag);
+                }
+            }
+            depth += line.matches('{').count();
+            depth = depth.saturating_sub(line.matches('}').count());
+            if depth == 0 && line.contains('}') {
+                block = None;
+            }
+        }
+        out
+    }
+
+    fn varint(bytes: &[u8]) -> (u64, usize) {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        for (i, byte) in bytes.iter().enumerate() {
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return (value, i + 1);
+            }
+            shift += 7;
+        }
+        panic!("truncated varint");
+    }
+
+    /// The field numbers present in an encoded message, in wire order.
+    fn field_numbers(bytes: &[u8]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let (key, n) = varint(&bytes[i..]);
+            i += n;
+            out.push((key >> 3) as u32);
+            match key & 7 {
+                0 => {
+                    let (_, n) = varint(&bytes[i..]);
+                    i += n;
+                }
+                1 => i += 8,
+                2 => {
+                    let (len, n) = varint(&bytes[i..]);
+                    i += n + len as usize;
+                }
+                5 => i += 4,
+                other => panic!("unexpected wire type {other}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rust_tags_match_the_published_proto() {
+        let tags = proto_tags();
+        let tag = |block: &str, field: &str| -> u32 {
+            *tags
+                .get(&(block.to_string(), field.to_string()))
+                .unwrap_or_else(|| panic!("{block}.{field} missing from cluster.proto"))
+        };
+
+        // Every scalar is non-zero so prost emits it.
+        let hello = Hello {
+            protocol_min: 1,
+            protocol_max: 1,
+            schema_version: 1,
+            node_name: "n".to_string(),
+        };
+        assert_eq!(
+            field_numbers(&hello.encode_to_vec()),
+            vec![
+                tag("Hello", "protocol_min"),
+                tag("Hello", "protocol_max"),
+                tag("Hello", "schema_version"),
+                tag("Hello", "node_name"),
+            ]
+        );
+        let ack = HelloAck {
+            negotiated_version: 1,
+            schema_version: 1,
+            fleet_size_hint: 1,
+        };
+        assert_eq!(
+            field_numbers(&ack.encode_to_vec()),
+            vec![
+                tag("HelloAck", "negotiated_version"),
+                tag("HelloAck", "schema_version"),
+                tag("HelloAck", "fleet_size_hint"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(&Heartbeat { timestamp_ms: 1 }.encode_to_vec()),
+            vec![tag("Heartbeat", "timestamp_ms")]
+        );
+        assert_eq!(
+            field_numbers(
+                &HeartbeatAck {
+                    timestamp_ms: 1,
+                    fleet_size_hint: 1
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("HeartbeatAck", "timestamp_ms"),
+                tag("HeartbeatAck", "fleet_size_hint"),
+            ]
+        );
+
+        let mut request = ClusterRequest::hello(Hello::default());
+        request.sequence = 1;
+        assert_eq!(
+            field_numbers(&request.encode_to_vec()),
+            vec![
+                tag("ClusterRequest", "sequence"),
+                tag("ClusterRequest", "body_kind"),
+                tag("ClusterRequest", "hello"),
+            ]
+        );
+        let mut request = ClusterRequest::heartbeat(Heartbeat::default());
+        request.sequence = 1;
+        assert_eq!(
+            field_numbers(&request.encode_to_vec()),
+            vec![
+                tag("ClusterRequest", "sequence"),
+                tag("ClusterRequest", "body_kind"),
+                tag("ClusterRequest", "heartbeat"),
+            ]
+        );
+        // `body_kind` IS the body's tag by definition.
+        assert_eq!(BODY_KIND_HELLO, tag("ClusterRequest", "hello"));
+        assert_eq!(BODY_KIND_HEARTBEAT, tag("ClusterRequest", "heartbeat"));
+
+        let mut response = ClusterResponse::retry_later(1);
+        response.sequence = 1;
+        response.body = Some(cluster_response::Body::HelloAck(HelloAck::default()));
+        assert_eq!(
+            field_numbers(&response.encode_to_vec()),
+            vec![
+                tag("ClusterResponse", "sequence"),
+                tag("ClusterResponse", "status"),
+                tag("ClusterResponse", "retry_after_s"),
+                tag("ClusterResponse", "hello_ack"),
+            ]
+        );
+        response.body = Some(cluster_response::Body::HeartbeatAck(HeartbeatAck::default()));
+        assert_eq!(
+            *field_numbers(&response.encode_to_vec()).last().expect("body"),
+            tag("ClusterResponse", "heartbeat_ack")
+        );
+
+        let frame = ClusterFrame {
+            kind: Some(cluster_frame::Kind::Request(ClusterRequest::default())),
+        };
+        assert_eq!(
+            field_numbers(&frame.encode_to_vec()),
+            vec![tag("ClusterFrame", "request")]
+        );
+        let frame = ClusterFrame {
+            kind: Some(cluster_frame::Kind::Response(ClusterResponse::default())),
+        };
+        assert_eq!(
+            field_numbers(&frame.encode_to_vec()),
+            vec![tag("ClusterFrame", "response")]
+        );
+    }
+
+    #[test]
+    fn status_values_match_the_published_enum() {
+        let tags = proto_tags();
+        let value = |name: &str| -> i32 {
+            *tags
+                .get(&("ClusterStatus".to_string(), name.to_string()))
+                .unwrap_or_else(|| panic!("ClusterStatus.{name} missing from cluster.proto"))
+                as i32
+        };
+        let pairs = [
+            ("CLUSTER_STATUS_UNSPECIFIED", ClusterStatus::Unspecified),
+            ("OK", ClusterStatus::Ok),
+            ("RETRY_LATER", ClusterStatus::RetryLater),
+            ("INCOMPATIBLE_VERSION", ClusterStatus::IncompatibleVersion),
+            ("SCHEMA_TOO_OLD", ClusterStatus::SchemaTooOld),
+            ("PROTOCOL_VIOLATION", ClusterStatus::ProtocolViolation),
+            ("UNSUPPORTED_METHOD", ClusterStatus::UnsupportedMethod),
+        ];
+        for (name, status) in pairs {
+            assert_eq!(status as i32, value(name), "{name}");
+            assert_eq!(ClusterStatus::from_i32(status as i32), status, "{name}");
+        }
+        // Every published value has a Rust arm (and vice versa).
+        let published = tags.keys().filter(|(b, _)| b == "ClusterStatus").count();
+        assert_eq!(published, pairs.len());
+        assert_eq!(ClusterStatus::from_i32(99), ClusterStatus::Unspecified);
+    }
+
+    #[test]
+    fn body_kind_invariant_holds_for_constructors_and_flags_mismatches() {
+        assert!(ClusterRequest::hello(Hello::default()).body_kind_matches());
+        assert!(ClusterRequest::heartbeat(Heartbeat::default()).body_kind_matches());
+        // No body: the scalar alone is authoritative.
+        assert!(ClusterRequest {
+            sequence: 0,
+            body_kind: 25,
+            body: None
+        }
+        .body_kind_matches());
+        let mut forged = ClusterRequest::heartbeat(Heartbeat::default());
+        forged.body_kind = BODY_KIND_HELLO;
+        assert!(!forged.body_kind_matches());
+        // Reserved ranges are unknown to this build.
+        for kind in [0, 12, 20, 39, 40, 59, 60, 79] {
+            assert!(!ClusterRequest::is_known_body_kind(kind), "{kind}");
+        }
     }
 }

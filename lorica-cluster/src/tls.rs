@@ -63,6 +63,16 @@ pub fn negotiated_cluster_alpn(conn: &CommonState) -> bool {
     conn.alpn_protocol() == Some(CLUSTER_ALPN)
 }
 
+/// Lowercase-hex SHA-256 of the peer's leaf certificate DER, if the
+/// TLS layer exposed one. The identity Story 9.3 records at
+/// enrollment and matches on every session; captured by the
+/// operational listener before the stream is split into an endpoint.
+pub fn peer_fingerprint(conn: &CommonState) -> Option<String> {
+    let leaf = conn.peer_certificates()?.first()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, leaf.as_ref());
+    Some(digest.as_ref().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Failure modes while assembling a cluster TLS config.
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterTlsError {

@@ -82,6 +82,12 @@ pub enum BridgeOutcome {
 ///
 /// [`Hello`]: crate::messages::Hello
 pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
+    // The scalar discriminator and the populated body must agree
+    // (`messages.rs`); a peer that makes them disagree is choosing
+    // which reading applies, the classic type-confusion shape.
+    if !request.body_kind_matches() {
+        return BridgeOutcome::ProtocolViolation;
+    }
     match &request.body {
         // ---- The whitelist. Every entry is a reviewed decision. ----
         Some(cluster_request::Body::Heartbeat(hb)) => BridgeOutcome::InPlane(
@@ -110,6 +116,21 @@ mod tests {
     use super::*;
     use crate::messages::{ClusterFrame, Heartbeat, Hello, BODY_KIND_HELLO};
     use lorica_command::{Frame, FrameKind};
+
+    #[test]
+    fn mismatched_body_kind_is_a_violation_even_for_whitelisted_bodies() {
+        let mut req = ClusterRequest::heartbeat(Heartbeat { timestamp_ms: 1 });
+        req.body_kind = 25;
+        assert_eq!(
+            translate_cluster_request(&req),
+            BridgeOutcome::ProtocolViolation
+        );
+        req.body_kind = BODY_KIND_HELLO;
+        assert_eq!(
+            translate_cluster_request(&req),
+            BridgeOutcome::ProtocolViolation
+        );
+    }
 
     #[test]
     fn heartbeat_is_whitelisted() {

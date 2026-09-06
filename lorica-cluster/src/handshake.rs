@@ -45,7 +45,6 @@ pub const MAX_NODE_NAME_BYTES: usize = 64;
 /// from this build's [`crate::version`] constants); the fields stay
 /// public so tests can simulate other builds.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct HandshakeConfig {
     /// Lowest protocol version this node still speaks.
     pub protocol_min: u32,
@@ -138,15 +137,18 @@ pub fn evaluate_hello(
 /// the ack or the distinct refusal, and returns the outcome so the
 /// caller can keep or drop the session.
 ///
-/// Anything other than a `Hello` as the opener is a protocol
-/// violation: the caller must drop the connection (AC #6 handling).
+/// Anything other than a `Hello` as the opener, or a `Hello` whose
+/// `body_kind` disagrees with its body, is a protocol violation: the
+/// caller must drop the connection (AC #6 handling).
 pub async fn serve_hello(
     incoming: IncomingRequest<ClusterFrame>,
     local: &HandshakeConfig,
     fleet_size_hint: u32,
 ) -> Result<Result<HelloAck, ClusterStatus>, ChannelError> {
     let hello = match &incoming.request().body {
-        Some(cluster_request::Body::Hello(hello)) => hello.clone(),
+        Some(cluster_request::Body::Hello(hello)) if incoming.request().body_kind_matches() => {
+            hello.clone()
+        }
         _ => {
             incoming
                 .reply_frame(ClusterResponse::refusal(ClusterStatus::ProtocolViolation))
