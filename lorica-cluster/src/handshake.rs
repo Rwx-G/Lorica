@@ -32,10 +32,20 @@ use crate::messages::{
     cluster_request, cluster_response, ClusterFrame, ClusterRequest, ClusterResponse,
     ClusterStatus, Hello, HelloAck,
 };
-use crate::version::negotiate;
+use crate::version::{negotiate, PROTOCOL_MIN_COMPATIBLE, PROTOCOL_VERSION};
+
+/// Longest `node_name` a [`Hello`] may carry. The field is display
+/// only, but it is peer-supplied: bound it before it can become a
+/// per-handshake allocation or a log-injection vector.
+pub const MAX_NODE_NAME_BYTES: usize = 64;
 
 /// The local side's handshake inputs.
+///
+/// Construct with [`HandshakeConfig::new`] (the protocol range comes
+/// from this build's [`crate::version`] constants); the fields stay
+/// public so tests can simulate other builds.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HandshakeConfig {
     /// Lowest protocol version this node still speaks.
     pub protocol_min: u32,
@@ -44,6 +54,17 @@ pub struct HandshakeConfig {
     /// This node's database schema version
     /// (`ConfigStore::schema_version()` at boot).
     pub schema_version: u32,
+}
+
+impl HandshakeConfig {
+    /// This build's protocol range with the node's `schema_version`.
+    pub fn new(schema_version: u32) -> Self {
+        Self {
+            protocol_min: PROTOCOL_MIN_COMPATIBLE,
+            protocol_max: PROTOCOL_VERSION,
+            schema_version,
+        }
+    }
 }
 
 /// Errors surfaced to the DIALING side of a handshake.
@@ -68,17 +89,27 @@ pub enum HandshakeError {
     ProtocolViolation,
 }
 
+/// Whether a peer-supplied `node_name` is acceptable: within
+/// [`MAX_NODE_NAME_BYTES`] and free of control characters.
+pub fn node_name_is_valid(node_name: &str) -> bool {
+    node_name.len() <= MAX_NODE_NAME_BYTES && !node_name.chars().any(char::is_control)
+}
+
 /// Server-side evaluation of a peer's [`Hello`] - pure, so every
 /// refusal path is unit-testable without sockets.
 ///
 /// Returns the [`HelloAck`] to send, or the DISTINCT refusal status
 /// for the operational path (enrollment callers map it through
-/// [`ClusterStatus::opaque`] before the wire).
+/// [`ClusterStatus::opaque`] before the wire). An oversized or
+/// control-character `node_name` is a protocol violation.
 pub fn evaluate_hello(
     local: &HandshakeConfig,
     fleet_size_hint: u32,
     hello: &Hello,
 ) -> Result<HelloAck, ClusterStatus> {
+    if !node_name_is_valid(&hello.node_name) {
+        return Err(ClusterStatus::ProtocolViolation);
+    }
     let Some(negotiated_version) = negotiate(
         local.protocol_min,
         local.protocol_max,
@@ -114,15 +145,11 @@ pub async fn serve_hello(
     local: &HandshakeConfig,
     fleet_size_hint: u32,
 ) -> Result<Result<HelloAck, ClusterStatus>, ChannelError> {
-    let sequence = incoming.sequence();
     let hello = match &incoming.request().body {
         Some(cluster_request::Body::Hello(hello)) => hello.clone(),
         _ => {
             incoming
-                .reply_frame(ClusterResponse::refusal(
-                    sequence,
-                    ClusterStatus::ProtocolViolation,
-                ))
+                .reply_frame(ClusterResponse::refusal(ClusterStatus::ProtocolViolation))
                 .await?;
             return Ok(Err(ClusterStatus::ProtocolViolation));
         }
@@ -131,17 +158,14 @@ pub async fn serve_hello(
     match evaluate_hello(local, fleet_size_hint, &hello) {
         Ok(ack) => {
             incoming
-                .reply_frame(ClusterResponse::ok(
-                    sequence,
-                    cluster_response::Body::HelloAck(ack.clone()),
-                ))
+                .reply_frame(ClusterResponse::ok(cluster_response::Body::HelloAck(
+                    ack.clone(),
+                )))
                 .await?;
             Ok(Ok(ack))
         }
         Err(status) => {
-            incoming
-                .reply_frame(ClusterResponse::refusal(sequence, status))
-                .await?;
+            incoming.reply_frame(ClusterResponse::refusal(status)).await?;
             Ok(Err(status))
         }
     }
@@ -156,15 +180,12 @@ pub async fn client_handshake(
     node_name: &str,
     timeout: Duration,
 ) -> Result<HelloAck, HandshakeError> {
-    let request = ClusterRequest {
-        sequence: 0, // stamped by RpcEndpoint
-        body: Some(cluster_request::Body::Hello(Hello {
-            protocol_min: local.protocol_min,
-            protocol_max: local.protocol_max,
-            schema_version: local.schema_version,
-            node_name: node_name.to_string(),
-        })),
-    };
+    let request = ClusterRequest::hello(Hello {
+        protocol_min: local.protocol_min,
+        protocol_max: local.protocol_max,
+        schema_version: local.schema_version,
+        node_name: node_name.to_string(),
+    });
     let response = endpoint.request(request, timeout).await?;
     match response.cluster_status() {
         ClusterStatus::Ok => match response.body {
@@ -181,14 +202,9 @@ pub async fn client_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::version::{PROTOCOL_MIN_COMPATIBLE, PROTOCOL_VERSION};
 
     fn local() -> HandshakeConfig {
-        HandshakeConfig {
-            protocol_min: PROTOCOL_MIN_COMPATIBLE,
-            protocol_max: PROTOCOL_VERSION,
-            schema_version: 49,
-        }
+        HandshakeConfig::new(49)
     }
 
     fn hello(min: u32, max: u32, schema: u32) -> Hello {
@@ -229,5 +245,28 @@ mod tests {
             evaluate_hello(&local(), 0, &hello(7, 9, 49)),
             Err(ClusterStatus::IncompatibleVersion)
         );
+    }
+
+    #[test]
+    fn oversized_or_control_character_node_names_are_violations() {
+        let mut long = hello(1, 1, 49);
+        long.node_name = "n".repeat(MAX_NODE_NAME_BYTES + 1);
+        assert_eq!(
+            evaluate_hello(&local(), 0, &long),
+            Err(ClusterStatus::ProtocolViolation)
+        );
+        let mut injected = hello(1, 1, 49);
+        injected.node_name = "edge\n[forged log line]".to_string();
+        assert_eq!(
+            evaluate_hello(&local(), 0, &injected),
+            Err(ClusterStatus::ProtocolViolation)
+        );
+        // Exactly at the bound is fine, and so is an empty name.
+        let mut max = hello(1, 1, 49);
+        max.node_name = "n".repeat(MAX_NODE_NAME_BYTES);
+        assert!(evaluate_hello(&local(), 0, &max).is_ok());
+        let mut empty = hello(1, 1, 49);
+        empty.node_name.clear();
+        assert!(evaluate_hello(&local(), 0, &empty).is_ok());
     }
 }

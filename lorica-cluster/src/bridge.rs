@@ -31,11 +31,16 @@
 //!   other worker-plane value) through to `lorica-command`. A future
 //!   entry that needs a worker-plane effect must CONSTRUCT the worker
 //!   command itself from validated fields.
-//! - Anything not on the whitelist, including an empty body (which is
-//!   what deliberately mis-sent worker-`Envelope` bytes decode to,
-//!   see [`crate::frame`]), is a [`BridgeOutcome::ProtocolViolation`]:
-//!   the caller drops the connection and increments its violation
-//!   counter.
+//! - A request whose `body_kind` names a method this build does not
+//!   implement (a NEWER peer) is [`BridgeOutcome::Unsupported`]: the
+//!   caller answers `UNSUPPORTED_METHOD` and keeps the connection, so
+//!   a rolling upgrade never turns a legitimate peer into a "hostile"
+//!   one (AC #4).
+//! - Anything else, including an empty body with no `body_kind`
+//!   (which is what deliberately mis-sent worker-`Envelope` bytes
+//!   decode to, see [`crate::frame`]) and an out-of-phase `Hello`, is
+//!   a [`BridgeOutcome::ProtocolViolation`]: the caller drops the
+//!   connection and increments its violation counter.
 
 use crate::messages::{cluster_request, ClusterRequest};
 
@@ -55,7 +60,13 @@ pub enum InPlaneAction {
 pub enum BridgeOutcome {
     /// The request is on the whitelist; handle it in-plane.
     InPlane(InPlaneAction),
-    /// The request is not on the whitelist (unknown, empty, or
+    /// Well-formed request for a method this build does not know:
+    /// refuse with `UNSUPPORTED_METHOD`, keep the connection.
+    Unsupported {
+        /// The peer's `body_kind`, for the diagnostic.
+        body_kind: u32,
+    },
+    /// The request is not on the whitelist (empty, malformed, or
     /// wrong-phase body): drop the connection.
     ProtocolViolation,
 }
@@ -65,7 +76,9 @@ pub enum BridgeOutcome {
 /// This is the single dispatch point for established sessions. A
 /// [`Hello`] here is a violation too: the opener is consumed by the
 /// handshake before a session reaches steady state, so a second one
-/// is a peer speaking out of phase.
+/// is a peer speaking out of phase. A `body_kind` that names one of
+/// OUR methods while the body is missing is malformed, not "newer",
+/// and is a violation as well.
 ///
 /// [`Hello`]: crate::messages::Hello
 pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
@@ -76,6 +89,14 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
                 timestamp_ms: hb.timestamp_ms,
             },
         ),
+        // ---- Newer peer: known shape, unknown method. ----
+        None if request.body_kind != 0
+            && !ClusterRequest::is_known_body_kind(request.body_kind) =>
+        {
+            BridgeOutcome::Unsupported {
+                body_kind: request.body_kind,
+            }
+        }
         // ---- Everything else is a violation. ----
         Some(cluster_request::Body::Hello(_)) | None => BridgeOutcome::ProtocolViolation,
     }
@@ -87,17 +108,12 @@ mod tests {
     use prost::Message;
 
     use super::*;
-    use crate::messages::{cluster_request, ClusterFrame, Heartbeat, Hello};
+    use crate::messages::{ClusterFrame, Heartbeat, Hello, BODY_KIND_HELLO};
     use lorica_command::{Frame, FrameKind};
 
     #[test]
     fn heartbeat_is_whitelisted() {
-        let req = ClusterRequest {
-            sequence: 1,
-            body: Some(cluster_request::Body::Heartbeat(Heartbeat {
-                timestamp_ms: 123,
-            })),
-        };
+        let req = ClusterRequest::heartbeat(Heartbeat { timestamp_ms: 123 });
         assert_eq!(
             translate_cluster_request(&req),
             BridgeOutcome::InPlane(InPlaneAction::Heartbeat { timestamp_ms: 123 })
@@ -106,20 +122,41 @@ mod tests {
 
     #[test]
     fn out_of_phase_hello_and_empty_bodies_are_violations() {
-        let hello = ClusterRequest {
-            sequence: 2,
-            body: Some(cluster_request::Body::Hello(Hello::default())),
-        };
+        let hello = ClusterRequest::hello(Hello::default());
         assert_eq!(
             translate_cluster_request(&hello),
             BridgeOutcome::ProtocolViolation
         );
-        let empty = ClusterRequest {
-            sequence: 3,
+        let empty = ClusterRequest::default();
+        assert_eq!(
+            translate_cluster_request(&empty),
+            BridgeOutcome::ProtocolViolation
+        );
+    }
+
+    #[test]
+    fn unknown_body_kind_is_unsupported_not_a_violation() {
+        // A peer from a newer release sends a tag-25 body (Story 9.4
+        // range). This build decodes it as an unknown field, body =
+        // None, but the scalar discriminator says "known shape".
+        let newer = ClusterRequest {
+            sequence: 4,
+            body_kind: 25,
             body: None,
         };
         assert_eq!(
-            translate_cluster_request(&empty),
+            translate_cluster_request(&newer),
+            BridgeOutcome::Unsupported { body_kind: 25 }
+        );
+        // The same scalar naming one of OUR kinds with no body is
+        // malformed, not newer.
+        let malformed = ClusterRequest {
+            sequence: 5,
+            body_kind: BODY_KIND_HELLO,
+            body: None,
+        };
+        assert_eq!(
+            translate_cluster_request(&malformed),
             BridgeOutcome::ProtocolViolation
         );
     }
@@ -131,8 +168,9 @@ mod tests {
         // disjointness makes it decode to an EMPTY cluster frame; the
         // endpoint reader drops empty frames, and even if a decoded
         // request with no recognisable body reached dispatch, the
-        // bridge answers ProtocolViolation. Either way no Command
-        // materialises.
+        // bridge answers ProtocolViolation (body_kind is 0: a worker
+        // Envelope has no field 3 inside a field-101 message). Either
+        // way no Command materialises.
         let env = Envelope {
             kind: Some(envelope::Kind::Command(Command::new(
                 CommandType::Shutdown,

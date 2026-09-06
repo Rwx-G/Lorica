@@ -37,8 +37,16 @@ message ClusterFrame {
 //   20-39  RESERVED for configuration replication (Story 9.4)
 //   40-59  RESERVED for telemetry fan-in (Story 9.6)
 //   60-79  RESERVED for certificate distribution (Story 9.5)
+//
+// `body_kind` duplicates the body's oneof tag as a scalar. A receiver
+// that does not know the body (an older build talking to a newer
+// peer) decodes the unknown tag as an unknown field and sees no body;
+// the scalar lets it answer UNSUPPORTED_METHOD and keep the connection
+// instead of treating the peer as hostile. `body_kind = 0` with no
+// body is a protocol violation.
 message ClusterRequest {
   uint64 sequence = 1;    // Monotonic per direction, RpcEndpoint-managed
+  uint32 body_kind = 3;   // The body's oneof tag, set by the sender
   oneof body {
     Hello hello = 10;
     Heartbeat heartbeat = 11;
@@ -97,7 +105,9 @@ message HeartbeatAck {
 // Response status. UNSPECIFIED doubles as the OPAQUE refusal the
 // enrollment (pre-authentication) path sends for every failure class:
 // an unauthenticated peer must not learn build or protocol facts from
-// refusal shapes (AC #4); the real diagnostic is logged locally.
+// refusal shapes (AC #4); the real diagnostic is logged locally. An
+// older peer also decodes any status it does not know as UNSPECIFIED,
+// so it cannot distinguish a newer status from an opaque refusal.
 enum ClusterStatus {
   CLUSTER_STATUS_UNSPECIFIED = 0;  // Opaque refusal (pre-auth paths)
   OK = 1;
@@ -105,4 +115,11 @@ enum ClusterStatus {
   INCOMPATIBLE_VERSION = 3;        // AC #4: no protocol overlap
   SCHEMA_TOO_OLD = 4;              // AC #5: follower schema below ours
   PROTOCOL_VIOLATION = 5;          // AC #6: malformed / wrong-plane frame
+  UNSUPPORTED_METHOD = 6;          // AC #4: known shape, method not in this build
 }
+
+// Transport: TLS 1.3 only, ALPN "lorica-cluster/1" negotiated on every
+// connection (a peer that does not negotiate it is dropped after the
+// handshake). Node names in Hello are bounded to 64 bytes with no
+// control characters; longer or injected names are a
+// PROTOCOL_VIOLATION.

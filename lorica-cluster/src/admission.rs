@@ -25,6 +25,7 @@
 //! [`ClusterStatus::RetryLater`]: crate::messages::ClusterStatus::RetryLater
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -48,6 +49,12 @@ pub enum AdmissionDecision {
     },
 }
 
+/// Default bound on a queued wait: shorter than the dialer's default
+/// request timeout (10 s) so the SERVER answers RetryLater before the
+/// CLIENT gives up, reconnects, and takes a second queue slot for a
+/// permit it no longer wants.
+pub const DEFAULT_QUEUE_WAIT: Duration = Duration::from_secs(5);
+
 /// Concurrent-session limit with a bounded wait queue (AC #10).
 pub struct AdmissionGate {
     /// Total occupancy bound: active + queued. `try_acquire` failing
@@ -57,52 +64,116 @@ pub struct AdmissionGate {
     /// converging; the rest of the slot holders are queued.
     active: Arc<Semaphore>,
     retry_after_s: u32,
+    queue_wait: Duration,
+    /// `(max_concurrent, max_concurrent + queue_depth)`: semaphores
+    /// never grow, so the created capacities are the occupancy
+    /// denominators for the gauges.
+    capacity: (usize, usize),
 }
 
 impl AdmissionGate {
     /// A gate admitting `max_concurrent` sessions at once, queueing up
     /// to `queue_depth` more, and telling everyone else to retry after
-    /// `retry_after_s` seconds.
+    /// `retry_after_s` seconds. Queued sessions wait at most
+    /// [`DEFAULT_QUEUE_WAIT`]; see [`AdmissionGate::with_queue_wait`].
     pub fn new(max_concurrent: usize, queue_depth: usize, retry_after_s: u32) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(max_concurrent + queue_depth)),
             active: Arc::new(Semaphore::new(max_concurrent)),
             retry_after_s,
+            queue_wait: DEFAULT_QUEUE_WAIT,
+            capacity: (max_concurrent, max_concurrent + queue_depth),
         }
     }
 
+    /// Override the bound on a queued wait (keep it below the peers'
+    /// request timeout, see [`DEFAULT_QUEUE_WAIT`]).
+    pub fn with_queue_wait(mut self, queue_wait: Duration) -> Self {
+        self.queue_wait = queue_wait;
+        self
+    }
+
+    /// The bound on a queued wait this gate applies in
+    /// [`AdmissionGate::admit`].
+    pub fn queue_wait(&self) -> Duration {
+        self.queue_wait
+    }
+
+    /// The `retry_after_s` this gate tells refused peers to wait, so
+    /// other refusal paths (the session cap) advertise the same delay.
+    pub fn retry_after_s_hint(&self) -> u32 {
+        self.retry_after_s
+    }
+
+    /// Currently converging sessions (active permits held).
+    pub fn active_count(&self) -> usize {
+        self.active_capacity() - self.active.available_permits()
+    }
+
+    /// Sessions waiting in the queue for an active slot.
+    pub fn queued_count(&self) -> usize {
+        let occupied = self.slots_capacity() - self.slots.available_permits();
+        occupied.saturating_sub(self.active_count())
+    }
+
+    fn active_capacity(&self) -> usize {
+        // Semaphores never grow; capacity is what was created.
+        self.capacity.0
+    }
+
+    fn slots_capacity(&self) -> usize {
+        self.capacity.1
+    }
+
     /// Try to admit one converging session: immediate `RetryLater`
-    /// when the queue is full, otherwise waits (in the bounded queue)
-    /// for an active slot.
+    /// when the queue is full, otherwise waits in the bounded queue for
+    /// an active slot for at most the gate's queue wait, answering
+    /// `RetryLater` on expiry.
     pub async fn admit(&self) -> AdmissionDecision {
+        self.admit_within(self.queue_wait).await
+    }
+
+    /// [`AdmissionGate::admit`] with an explicit bound on the queued
+    /// wait.
+    pub async fn admit_within(&self, wait: Duration) -> AdmissionDecision {
+        let retry_later = AdmissionDecision::RetryLater {
+            retry_after_s: self.retry_after_s,
+        };
         let slot = match Arc::clone(&self.slots).try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => {
-                return AdmissionDecision::RetryLater {
-                    retry_after_s: self.retry_after_s,
-                }
-            }
+            Err(_) => return retry_later,
         };
         // The semaphores are never closed, so acquire can only fail if
         // the gate itself were torn down mid-await; answer RetryLater
-        // rather than panicking in library code.
-        match Arc::clone(&self.active).acquire_owned().await {
-            Ok(active) => AdmissionDecision::Admitted(AdmissionPermit {
+        // rather than panicking in library code. The timeout is the
+        // queued-wait bound.
+        match tokio::time::timeout(wait, Arc::clone(&self.active).acquire_owned()).await {
+            Ok(Ok(active)) => AdmissionDecision::Admitted(AdmissionPermit {
                 _active: active,
                 _slot: slot,
             }),
-            Err(_) => AdmissionDecision::RetryLater {
-                retry_after_s: self.retry_after_s,
-            },
+            Ok(Err(_)) | Err(_) => retry_later,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
+
+    #[tokio::test]
+    async fn a_queued_session_is_told_to_retry_when_the_wait_expires() {
+        let gate = Arc::new(AdmissionGate::new(1, 1, 9));
+        let _active = admitted(gate.admit().await);
+        // Queue slot free, active slot held: the wait bound decides.
+        match gate.admit_within(Duration::from_millis(100)).await {
+            AdmissionDecision::RetryLater { retry_after_s } => assert_eq!(retry_after_s, 9),
+            AdmissionDecision::Admitted(_) => panic!("must not be admitted past the wait"),
+        }
+        // And the queue slot was released with the refusal.
+        assert_eq!(gate.queued_count(), 0);
+        assert_eq!(gate.active_count(), 1);
+    }
 
     fn admitted(d: AdmissionDecision) -> AdmissionPermit {
         match d {

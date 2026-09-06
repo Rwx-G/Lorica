@@ -85,15 +85,14 @@ mod tests {
     use crate::messages::{cluster_request, Hello};
 
     fn sample_frame() -> ClusterFrame {
-        ClusterFrame::from_request(ClusterRequest {
-            sequence: 42,
-            body: Some(cluster_request::Body::Hello(Hello {
-                protocol_min: 1,
-                protocol_max: 1,
-                schema_version: 49,
-                node_name: "edge-node".to_string(),
-            })),
-        })
+        let mut req = ClusterRequest::hello(Hello {
+            protocol_min: 1,
+            protocol_max: 1,
+            schema_version: 49,
+            node_name: "edge-node".to_string(),
+        });
+        req.sequence = 42;
+        ClusterFrame::from_request(req)
     }
 
     #[test]

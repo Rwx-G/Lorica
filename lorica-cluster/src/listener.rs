@@ -17,15 +17,21 @@
 //! - The **operational** listener accepts only peers that pass the
 //!   mandatory-mTLS acceptor ([`crate::tls::operational_server_config`]
 //!   via [`SwappableAcceptor`], so Story 9.3's revocation can rebuild
-//!   the config with CRLs without dropping the socket), runs the
-//!   session handshake behind the [`AdmissionGate`], then serves the
-//!   session with every inbound request routed through the
-//!   [`bridge`] whitelist.
+//!   the config with CRLs without dropping the socket). Before the TLS
+//!   handshake it is boxed in by the same pre-authentication budgets
+//!   as the enrollment listener (a concurrent-handshake permit taken
+//!   BEFORE the per-connection task exists, a handshake timeout): an
+//!   unauthenticated TCP peer must never be able to pin a task, a
+//!   socket or a rustls session. After TLS the flow is: opener read
+//!   (bounded) -> session cap -> [`AdmissionGate`] (bounded queued
+//!   wait) -> handshake -> steady state with every inbound request
+//!   routed through the [`bridge`] whitelist.
 //! - The **enrollment** listener is the only unauthenticated surface
 //!   in the product. It exists ONLY while at least one join token is
 //!   live: the socket binds when the [`TokenLiveness`] watch goes
-//!   above zero and is dropped the moment it returns to zero. Every
-//!   connection is boxed in by the [`PreAuthBudgets`] BEFORE any
+//!   above zero and is dropped, along with every in-flight
+//!   pre-authentication connection, the moment it returns to zero.
+//!   Every connection is boxed in by the [`PreAuthBudgets`] BEFORE any
 //!   token logic runs, and (in Story 9.2, where redemption does not
 //!   exist yet) is answered with the OPAQUE status.
 //!
@@ -43,19 +49,21 @@ use std::time::Duration;
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_rustls::rustls::CommonState;
 use tokio_rustls::TlsAcceptor;
 
-use lorica_command::RpcEndpoint;
+use lorica_command::{IncomingRequest, IncomingRequests, RpcEndpoint};
 
 use crate::admission::{AdmissionDecision, AdmissionGate};
 use crate::bridge::{translate_cluster_request, BridgeOutcome, InPlaneAction};
 use crate::handshake::{serve_hello, HandshakeConfig};
+use crate::limits::cluster_rpc_limits;
 use crate::messages::{
     cluster_frame, cluster_response, ClusterFrame, ClusterResponse, ClusterStatus, HeartbeatAck,
 };
-use crate::tls::SwappableAcceptor;
+use crate::tls::{negotiated_cluster_alpn, SwappableAcceptor};
 
 /// Live-join-token signal driving the enrollment listener's lifecycle
 /// (Story 9.2 AC #2). The value is the count of currently live
@@ -65,14 +73,17 @@ use crate::tls::SwappableAcceptor;
 /// keeps the listener closed.
 pub type TokenLiveness = watch::Receiver<u32>;
 
-/// Pre-authentication budgets on the enrollment listener (AC #3),
-/// enforced BEFORE any token verification.
+/// Pre-authentication budgets (AC #3), enforced BEFORE any token or
+/// message logic. The enrollment listener applies all five; the
+/// operational listener applies `handshake_timeout` and
+/// `max_concurrent_handshakes` to its TLS phase (the other three are
+/// enrollment-frame concerns).
 #[derive(Debug, Clone)]
 pub struct PreAuthBudgets {
     /// Max time for the TLS handshake to complete.
     pub handshake_timeout: Duration,
     /// Max TLS handshakes in flight at once; excess connections are
-    /// dropped immediately.
+    /// dropped immediately, before a task exists for them.
     pub max_concurrent_handshakes: usize,
     /// Max enrollment exchanges in flight at once (post-TLS), distinct
     /// from the handshake bound so slow token verifications (Story
@@ -97,15 +108,20 @@ impl Default for PreAuthBudgets {
 }
 
 /// Enrollment-listener counters, one atomic per budget plus lifecycle
-/// events. All monotonic except none; the binary exposes them as
-/// Prometheus counters (AC #3: "exceeding any drops the connection
-/// and increments a counter").
+/// events, all monotonic; the binary exposes them as Prometheus
+/// counters (AC #3: "exceeding any drops the connection and
+/// increments a counter").
 #[derive(Debug, Default)]
 pub struct EnrollmentStats {
     /// Connections accepted (before any budget ran).
     pub connections_total: AtomicU64,
-    /// Dropped: TLS handshake exceeded `handshake_timeout` or failed.
+    /// Dropped: the TLS handshake was rejected (bad ClientHello, no
+    /// overlap, garbage).
+    pub rejected_handshake_failed: AtomicU64,
+    /// Dropped: the TLS handshake exceeded `handshake_timeout`.
     pub rejected_handshake_timeout: AtomicU64,
+    /// Dropped: the peer completed TLS without the cluster ALPN.
+    pub rejected_alpn: AtomicU64,
     /// Dropped: `max_concurrent_handshakes` already in flight.
     pub rejected_concurrent_handshakes: AtomicU64,
     /// Dropped: `max_inflight_enrollments` already in flight.
@@ -115,6 +131,12 @@ pub struct EnrollmentStats {
     pub rejected_byte_budget: AtomicU64,
     /// Dropped: the connection outlived `per_conn_max_duration`.
     pub rejected_time_budget: AtomicU64,
+    /// Dropped: the enrollment window closed (last token gone) between
+    /// the accept and the post-TLS liveness re-check.
+    pub rejected_window_closed: AtomicU64,
+    /// Bind attempts that failed while a token was live (retried on a
+    /// bounded backoff).
+    pub bind_failures: AtomicU64,
     /// Times the listener socket opened (liveness went above zero).
     pub lifecycle_opens: AtomicU64,
     /// Times the listener socket closed (liveness returned to zero).
@@ -131,19 +153,30 @@ pub struct EnrollmentHandle {
 }
 
 impl EnrollmentHandle {
-    /// Stop the listener task. Any bound socket closes with it.
+    /// Stop the listener task. Any bound socket closes with it, and
+    /// so does every in-flight pre-authentication connection (they
+    /// live in a `JoinSet` owned by the task).
     pub fn shutdown(self) {
         self.task.abort();
     }
 }
+
+/// First delay after a failed bind while a token is live; doubles up
+/// to [`BIND_RETRY_MAX`].
+const BIND_RETRY_MIN: Duration = Duration::from_secs(1);
+/// Cap on the bind-retry backoff.
+const BIND_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// The token-gated, budget-boxed enrollment listener (AC #2/#3).
 pub struct EnrollmentListener;
 
 impl EnrollmentListener {
     /// Spawn the lifecycle task: bind `bind` while `liveness > 0`,
-    /// drop the socket when it returns to zero, reopen on the next
-    /// rise. Returns when the liveness sender is dropped.
+    /// drop the socket (and abort every in-flight connection) when it
+    /// returns to zero, reopen on the next rise. A failed bind while a
+    /// token is live is retried on a bounded backoff, not parked until
+    /// the next liveness edge. Returns when the liveness sender is
+    /// dropped.
     pub fn spawn(
         bind: SocketAddr,
         acceptor: Arc<SwappableAcceptor>,
@@ -161,17 +194,36 @@ impl EnrollmentListener {
                     }
                 }
 
-                let listener = match TcpListener::bind(bind).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        tracing::error!(%bind, error = %e, "enrollment listener bind failed");
-                        // Try again on the next liveness edge instead
-                        // of hot-looping.
-                        if liveness.changed().await.is_err() {
-                            return;
-                        }
-                        continue;
+                // Bind, retrying on a bounded backoff while the token
+                // stays live (a single failure must not leave a live
+                // token with no listener until the count CHANGES).
+                let mut retry = BIND_RETRY_MIN;
+                let listener = loop {
+                    if *liveness.borrow() == 0 {
+                        break None;
                     }
+                    match TcpListener::bind(bind).await {
+                        Ok(l) => break Some(l),
+                        Err(e) => {
+                            stats.bind_failures.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(
+                                %bind, error = %e, retry_in = ?retry,
+                                "enrollment listener bind failed while a join token is live"
+                            );
+                            tokio::select! {
+                                _ = tokio::time::sleep(retry) => {}
+                                changed = liveness.changed() => {
+                                    if changed.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            retry = (retry * 2).min(BIND_RETRY_MAX);
+                        }
+                    }
+                };
+                let Some(listener) = listener else {
+                    continue; // token gone while retrying: back to closed
                 };
                 let local = listener.local_addr().ok();
                 stats.lifecycle_opens.fetch_add(1, Ordering::Relaxed);
@@ -183,6 +235,10 @@ impl EnrollmentListener {
 
                 let handshakes = Arc::new(Semaphore::new(budgets.max_concurrent_handshakes));
                 let enrollments = Arc::new(Semaphore::new(budgets.max_inflight_enrollments));
+                // In-flight connections belong to the open phase:
+                // dropping the set (auto-close, or the whole task on
+                // shutdown) aborts them.
+                let mut conns: JoinSet<()> = JoinSet::new();
 
                 // Open phase: accept until liveness returns to zero.
                 loop {
@@ -203,14 +259,16 @@ impl EnrollmentListener {
                             let budgets = budgets.clone();
                             let stats = Arc::clone(&stats);
                             let enrollments = Arc::clone(&enrollments);
-                            tokio::spawn(async move {
+                            let liveness = liveness.clone();
+                            conns.spawn(async move {
                                 serve_enrollment_conn(
-                                    tcp, peer, acceptor, budgets, stats, enrollments,
+                                    tcp, peer, acceptor, budgets, stats, enrollments, liveness,
                                 )
                                 .await;
                                 drop(hs_permit);
                             });
                         }
+                        Some(_) = conns.join_next(), if !conns.is_empty() => {}
                         changed = liveness.changed() => {
                             if changed.is_err() {
                                 let _ = bound_tx.send(None);
@@ -223,8 +281,10 @@ impl EnrollmentListener {
                     }
                 }
 
-                // AC #2 auto-close: last token burned or expired.
+                // AC #2 auto-close: last token burned or expired. The
+                // socket AND every pre-authentication connection go.
                 drop(listener);
+                conns.abort_all();
                 stats.lifecycle_closes.fetch_add(1, Ordering::Relaxed);
                 let _ = bound_tx.send(None);
                 tracing::warn!("enrollment listener CLOSED (no live join token)");
@@ -249,6 +309,7 @@ async fn serve_enrollment_conn(
     budgets: PreAuthBudgets,
     stats: Arc<EnrollmentStats>,
     enrollments: Arc<Semaphore>,
+    liveness: TokenLiveness,
 ) {
     let overall = tokio::time::timeout(budgets.per_conn_max_duration, async {
         let tls_acceptor = TlsAcceptor::from(acceptor.current());
@@ -259,7 +320,7 @@ async fn serve_enrollment_conn(
             Ok(Err(e)) => {
                 tracing::debug!(%peer, error = %e, "enrollment TLS handshake failed");
                 stats
-                    .rejected_handshake_timeout
+                    .rejected_handshake_failed
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -270,6 +331,18 @@ async fn serve_enrollment_conn(
                 return;
             }
         };
+        if !negotiated_cluster_alpn(tls.get_ref().1) {
+            stats.rejected_alpn.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(%peer, "enrollment peer did not negotiate the cluster ALPN");
+            return;
+        }
+
+        // The window may have closed while this handshake ran: an
+        // enrollment must never proceed past the last token's death.
+        if *liveness.borrow() == 0 {
+            stats.rejected_window_closed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
         // Post-TLS: the enrollment-exchange budget (distinct from the
         // handshake budget so slow verifications cannot starve accepts).
@@ -307,13 +380,12 @@ async fn serve_enrollment_conn(
             Err(_) => 0,
         };
         tracing::debug!(%peer, "enrollment attempt refused (no redemption path in this release)");
-        let refusal = ClusterFrame {
-            kind: Some(cluster_frame::Kind::Response(ClusterResponse::refusal(
-                sequence,
-                ClusterStatus::opaque(),
-            ))),
+        let mut refusal = ClusterResponse::refusal(ClusterStatus::opaque());
+        refusal.sequence = sequence;
+        let frame = ClusterFrame {
+            kind: Some(cluster_frame::Kind::Response(refusal)),
         };
-        let encoded = refusal.encode_to_vec();
+        let encoded = frame.encode_to_vec();
         let mut wire = Vec::with_capacity(8 + encoded.len());
         wire.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
         wire.extend_from_slice(&encoded);
@@ -327,22 +399,96 @@ async fn serve_enrollment_conn(
 }
 
 /// Operational-listener counters (bridged to Prometheus by the
-/// binary, AC #12).
+/// binary, AC #12). All monotonic.
 #[derive(Debug, Default)]
 pub struct OperationalStats {
+    /// Connections dropped before a task existed for them:
+    /// `max_concurrent_handshakes` already in flight.
+    pub rejected_concurrent_handshakes: AtomicU64,
+    /// TLS handshakes that exceeded `handshake_timeout`.
+    pub handshake_timeouts: AtomicU64,
     /// TLS handshakes that failed (no/invalid client certificate).
     pub tls_failures: AtomicU64,
+    /// Authenticated peers dropped for not negotiating the cluster
+    /// ALPN.
+    pub alpn_refusals: AtomicU64,
     /// Sessions admitted through the handshake.
     pub sessions_admitted: AtomicU64,
     /// Sessions answered RETRY_LATER by the admission gate (AC #10).
     pub sessions_retry_later: AtomicU64,
+    /// Sessions answered RETRY_LATER because `max_sessions` are
+    /// already established.
+    pub sessions_rejected_full: AtomicU64,
     /// Handshakes refused (version / schema / protocol violation).
     pub handshake_refusals: AtomicU64,
     /// Established-session requests refused by the bridge whitelist;
     /// each one also dropped its connection (AC #6).
     pub protocol_violations: AtomicU64,
+    /// Requests for a method this build does not implement, answered
+    /// UNSUPPORTED_METHOD with the connection kept (AC #4).
+    pub unsupported_methods: AtomicU64,
     /// Heartbeats served in-plane.
     pub heartbeats_served: AtomicU64,
+    /// Established sessions that ended (any cause).
+    pub sessions_ended: AtomicU64,
+}
+
+/// Everything known about an established operational session; the
+/// per-session log context now, the handler input for Stories 9.3
+/// (identity, fencing) and 9.4 (dispatch).
+#[derive(Debug, Clone)]
+pub struct SessionContext {
+    /// The peer's transport address.
+    pub peer_addr: SocketAddr,
+    /// Lowercase-hex SHA-256 of the peer's leaf certificate DER - the
+    /// identity Story 9.3 records at enrollment and matches here.
+    /// `None` only if the TLS layer exposed no chain (it always does
+    /// on the operational path, where client auth is mandatory).
+    pub peer_cert_fingerprint: Option<String>,
+    /// The protocol version both sides agreed on (AC #4).
+    pub negotiated_version: u32,
+    /// The supervisor takeover epoch this session was accepted under
+    /// (Story 9.1 AC #7; Story 9.3's registry fences older epochs).
+    pub takeover_epoch: u64,
+}
+
+impl SessionContext {
+    /// First 16 hex characters of the fingerprint for log lines, or
+    /// `-` when absent.
+    pub fn fingerprint_prefix(&self) -> &str {
+        self.peer_cert_fingerprint
+            .as_deref()
+            .map(|fp| &fp[..fp.len().min(16)])
+            .unwrap_or("-")
+    }
+}
+
+/// Inputs for [`OperationalListener::spawn`].
+pub struct OperationalConfig {
+    /// The already-bound socket (the binary owns bind validation and
+    /// logging, AC #11).
+    pub listener: TcpListener,
+    /// Mandatory-mTLS acceptor; read per accept (Story 9.3's
+    /// revocation seam).
+    pub acceptor: Arc<SwappableAcceptor>,
+    /// Protocol range and schema version for the session handshake.
+    pub handshake: HandshakeConfig,
+    /// Fleet-size hint handed to peers (loaded per handshake and
+    /// heartbeat so it tracks roster growth).
+    pub fleet_size: Arc<AtomicU32>,
+    /// Convergence admission control (AC #10).
+    pub admission: Arc<AdmissionGate>,
+    /// Counters (bridged to Prometheus by the binary).
+    pub stats: Arc<OperationalStats>,
+    /// Pre-TLS budgets applied to the handshake phase
+    /// (`handshake_timeout`, `max_concurrent_handshakes`).
+    pub budgets: PreAuthBudgets,
+    /// Cap on established sessions; past it a peer is answered
+    /// RETRY_LATER after its opener.
+    pub max_sessions: usize,
+    /// The supervisor takeover epoch stamped into every
+    /// [`SessionContext`].
+    pub takeover_epoch: u64,
 }
 
 /// Handle to a running operational listener.
@@ -351,53 +497,84 @@ pub struct OperationalHandle {
 }
 
 impl OperationalHandle {
-    /// Stop accepting. Established sessions end when their tasks see
-    /// the connection close.
+    /// Stop accepting and tear down every established session (they
+    /// live in a `JoinSet` owned by the accept task).
     pub fn shutdown(self) {
         self.task.abort();
     }
+}
+
+/// State shared by every operational connection task.
+struct OperationalShared {
+    acceptor: Arc<SwappableAcceptor>,
+    handshake: HandshakeConfig,
+    fleet_size: Arc<AtomicU32>,
+    admission: Arc<AdmissionGate>,
+    stats: Arc<OperationalStats>,
+    budgets: PreAuthBudgets,
+    session_slots: Arc<Semaphore>,
+    takeover_epoch: u64,
 }
 
 /// The mandatory-mTLS operational listener (AC #2).
 pub struct OperationalListener;
 
 impl OperationalListener {
-    /// Spawn the accept loop on an already-bound listener (the binary
-    /// owns bind-address validation and logging, AC #11).
+    /// Spawn the accept loop.
     ///
-    /// Per connection: mTLS accept (each accept reads the CURRENT
-    /// config from `acceptor`, Story 9.3's revocation seam), the
-    /// admission gate (AC #10), the session handshake (AC #4/#5),
-    /// then the steady-state loop with every inbound request routed
-    /// through the bridge whitelist (AC #6). `fleet_size` is loaded
-    /// per handshake and heartbeat so the hint tracks roster growth.
-    pub fn spawn(
-        listener: TcpListener,
-        acceptor: Arc<SwappableAcceptor>,
-        handshake: HandshakeConfig,
-        fleet_size: Arc<AtomicU32>,
-        admission: Arc<AdmissionGate>,
-        stats: Arc<OperationalStats>,
-    ) -> OperationalHandle {
+    /// Per connection: a concurrent-handshake permit BEFORE the task
+    /// is spawned (excess connections are dropped and counted), mTLS
+    /// accept under `handshake_timeout` (each accept reads the CURRENT
+    /// config from the acceptor, Story 9.3's revocation seam), the
+    /// ALPN check, the opener read (bounded), the session cap, the
+    /// admission gate with a bounded queued wait (AC #10), the session
+    /// handshake (AC #4/#5), then the steady-state loop with every
+    /// inbound request routed through the bridge whitelist (AC #6).
+    pub fn spawn(config: OperationalConfig) -> OperationalHandle {
+        let OperationalConfig {
+            listener,
+            acceptor,
+            handshake,
+            fleet_size,
+            admission,
+            stats,
+            budgets,
+            max_sessions,
+            takeover_epoch,
+        } = config;
+        let shared = Arc::new(OperationalShared {
+            acceptor,
+            handshake,
+            fleet_size,
+            admission,
+            stats,
+            session_slots: Arc::new(Semaphore::new(max_sessions)),
+            takeover_epoch,
+            budgets,
+        });
+        let handshakes = Arc::new(Semaphore::new(shared.budgets.max_concurrent_handshakes));
         let task = tokio::spawn(async move {
             // Sessions live in a JoinSet so that aborting the accept
             // task (OperationalHandle::shutdown) also tears down every
             // established session, not just the accept loop.
-            let mut sessions = tokio::task::JoinSet::new();
+            let mut sessions: JoinSet<()> = JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let Ok((tcp, peer)) = accepted else { continue };
-                        let acceptor = Arc::clone(&acceptor);
-                        let handshake = handshake.clone();
-                        let fleet_size = Arc::clone(&fleet_size);
-                        let admission = Arc::clone(&admission);
-                        let stats = Arc::clone(&stats);
+                        // Pre-TLS bound: no task, no socket held, no
+                        // rustls state for a peer past the cap.
+                        let Ok(hs_permit) = Arc::clone(&handshakes).try_acquire_owned() else {
+                            shared
+                                .stats
+                                .rejected_concurrent_handshakes
+                                .fetch_add(1, Ordering::Relaxed);
+                            drop(tcp);
+                            continue;
+                        };
+                        let shared = Arc::clone(&shared);
                         sessions.spawn(async move {
-                            serve_operational_conn(
-                                tcp, peer, acceptor, handshake, fleet_size, admission, stats,
-                            )
-                            .await;
+                            serve_operational_conn(tcp, peer, shared, hs_permit).await;
                         });
                     }
                     // Reap finished sessions so the set stays small.
@@ -414,103 +591,184 @@ impl OperationalListener {
 /// forever.
 const OPERATIONAL_OPENER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Grace period for a refusal to flush before the endpoint (and its
+/// writer task) drops.
+const REFUSAL_FLUSH_GRACE: Duration = Duration::from_secs(2);
+
+/// Lowercase-hex SHA-256 of the peer's leaf certificate, if the TLS
+/// layer exposed one.
+fn peer_fingerprint(conn: &CommonState) -> Option<String> {
+    let leaf = conn.peer_certificates()?.first()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, leaf.as_ref());
+    Some(digest.as_ref().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 async fn serve_operational_conn(
     tcp: TcpStream,
     peer: SocketAddr,
-    acceptor: Arc<SwappableAcceptor>,
-    handshake: HandshakeConfig,
-    fleet_size: Arc<AtomicU32>,
-    admission: Arc<AdmissionGate>,
-    stats: Arc<OperationalStats>,
+    shared: Arc<OperationalShared>,
+    hs_permit: OwnedSemaphorePermit,
 ) {
-    let tls_acceptor = TlsAcceptor::from(acceptor.current());
-    let tls = match tls_acceptor.accept(tcp).await {
-        Ok(tls) => tls,
-        Err(e) => {
+    let stats = &shared.stats;
+    let tls_acceptor = TlsAcceptor::from(shared.acceptor.current());
+    let tls = match tokio::time::timeout(
+        shared.budgets.handshake_timeout,
+        tls_acceptor.accept(tcp),
+    )
+    .await
+    {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(e)) => {
             stats.tls_failures.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(%peer, error = %e, "operational mTLS handshake failed");
+            tracing::warn!(%peer, error = %e, "operational mTLS handshake refused");
+            return;
+        }
+        Err(_) => {
+            stats.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(%peer, "operational TLS handshake timed out");
             return;
         }
     };
+    // The TLS phase is over: release the pre-auth permit so the
+    // handshake cap only ever counts handshakes.
+    drop(hs_permit);
 
-    let (endpoint, mut incoming) = RpcEndpoint::<ClusterFrame>::from_stream(tls);
+    let conn: &CommonState = tls.get_ref().1;
+    if !negotiated_cluster_alpn(conn) {
+        stats.alpn_refusals.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(%peer, "authenticated peer did not negotiate the cluster ALPN; dropped");
+        return;
+    }
+    // Captured BEFORE the stream is split into the endpoint - the
+    // one value that becomes unreachable afterwards.
+    let fingerprint = peer_fingerprint(conn);
 
-    // Admission BEFORE the opener is read (AC #10): the gate bounds
-    // concurrent convergence, and a queued peer waits here.
-    let permit = match admission.admit().await {
-        AdmissionDecision::Admitted(permit) => Some(permit),
-        AdmissionDecision::RetryLater { retry_after_s } => {
-            // The peer still deserves a wire answer: read its opener
-            // (bounded) and reply RETRY_LATER on its sequence.
-            stats.sessions_retry_later.fetch_add(1, Ordering::Relaxed);
-            if let Ok(Some(opener)) =
-                tokio::time::timeout(OPERATIONAL_OPENER_TIMEOUT, incoming.recv()).await
-            {
-                let sequence = opener.sequence();
-                let _ = opener
-                    .reply_frame(ClusterResponse::retry_later(sequence, retry_after_s))
-                    .await;
-                // Give the reply a moment to flush before the writer
-                // aborts with the endpoint drop.
-                let _ = tokio::time::timeout(Duration::from_secs(2), incoming.recv()).await;
-            }
-            return;
-        }
-    };
+    // Session cap: taken before the opener so a stalling
+    // authenticated peer holds a bounded slot, never an unbounded task.
+    let session_permit = Arc::clone(&shared.session_slots).try_acquire_owned();
+
+    let (endpoint, mut incoming) =
+        RpcEndpoint::<ClusterFrame>::with_limits(tls, cluster_rpc_limits());
 
     let Ok(Some(opener)) =
         tokio::time::timeout(OPERATIONAL_OPENER_TIMEOUT, incoming.recv()).await
     else {
+        tracing::debug!(%peer, "authenticated peer sent no opener within the budget");
         return;
     };
-    let hint = fleet_size.load(Ordering::Relaxed);
-    match serve_hello(opener, &handshake, hint).await {
-        Ok(Ok(_ack)) => {
-            stats.sessions_admitted.fetch_add(1, Ordering::Relaxed);
+
+    let Ok(_session_permit) = session_permit else {
+        stats.sessions_rejected_full.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(%peer, "session cap reached; answering RETRY_LATER");
+        reply_retry_later(opener, &mut incoming, shared.admission.retry_after_s_hint()).await;
+        return;
+    };
+
+    // Admission (AC #10): bounded queued wait, RETRY_LATER on expiry.
+    let permit = match shared.admission.admit().await {
+        AdmissionDecision::Admitted(permit) => permit,
+        AdmissionDecision::RetryLater { retry_after_s } => {
+            stats.sessions_retry_later.fetch_add(1, Ordering::Relaxed);
+            reply_retry_later(opener, &mut incoming, retry_after_s).await;
+            return;
         }
+    };
+
+    let hint = shared.fleet_size.load(Ordering::Relaxed);
+    let ack = match serve_hello(opener, &shared.handshake, hint).await {
+        Ok(Ok(ack)) => ack,
         Ok(Err(status)) => {
             stats.handshake_refusals.fetch_add(1, Ordering::Relaxed);
-            tracing::info!(%peer, ?status, "cluster session refused at handshake");
+            tracing::warn!(%peer, ?status, "cluster session refused at handshake");
             // Keep the endpoint alive briefly so the refusal flushes.
-            let _ = tokio::time::timeout(Duration::from_secs(2), incoming.recv()).await;
+            let _ = tokio::time::timeout(REFUSAL_FLUSH_GRACE, incoming.recv()).await;
             return;
         }
         Err(e) => {
             tracing::debug!(%peer, error = %e, "cluster handshake transport failure");
             return;
         }
-    }
+    };
+    stats.sessions_admitted.fetch_add(1, Ordering::Relaxed);
     // Convergence is over once the handshake completed (Story 9.4
     // will extend the hold across the initial config pull).
     drop(permit);
 
-    serve_session(&endpoint, &mut incoming, &fleet_size, &stats).await;
-    tracing::debug!(%peer, "cluster session ended");
+    let ctx = SessionContext {
+        peer_addr: peer,
+        peer_cert_fingerprint: fingerprint,
+        negotiated_version: ack.negotiated_version,
+        takeover_epoch: shared.takeover_epoch,
+    };
+    tracing::info!(
+        peer = %ctx.peer_addr,
+        fingerprint = ctx.fingerprint_prefix(),
+        protocol = ctx.negotiated_version,
+        epoch = ctx.takeover_epoch,
+        "cluster session established"
+    );
+
+    serve_session(&endpoint, &mut incoming, &shared, &ctx).await;
+    stats.sessions_ended.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        peer = %ctx.peer_addr,
+        fingerprint = ctx.fingerprint_prefix(),
+        "cluster session ended"
+    );
+}
+
+/// Answer RETRY_LATER on the opener's sequence and give the reply a
+/// moment to flush before the endpoint drops.
+async fn reply_retry_later(
+    opener: IncomingRequest<ClusterFrame>,
+    incoming: &mut IncomingRequests<ClusterFrame>,
+    retry_after_s: u32,
+) {
+    let _ = opener
+        .reply_frame(ClusterResponse::retry_later(retry_after_s))
+        .await;
+    let _ = tokio::time::timeout(REFUSAL_FLUSH_GRACE, incoming.recv()).await;
 }
 
 /// Steady-state loop for an established operational session: EVERY
 /// inbound request routes through the bridge whitelist; a violation
-/// answers `PROTOCOL_VIOLATION` and drops the connection (AC #6).
+/// answers `PROTOCOL_VIOLATION` and drops the connection (AC #6), an
+/// unknown method answers `UNSUPPORTED_METHOD` and keeps it (AC #4).
 async fn serve_session(
     _endpoint: &RpcEndpoint<ClusterFrame>,
-    incoming: &mut lorica_command::IncomingRequests<ClusterFrame>,
-    fleet_size: &AtomicU32,
-    stats: &OperationalStats,
+    incoming: &mut IncomingRequests<ClusterFrame>,
+    shared: &OperationalShared,
+    ctx: &SessionContext,
 ) {
+    let stats = &shared.stats;
     while let Some(request) = incoming.recv().await {
-        let sequence = request.sequence();
         match translate_cluster_request(request.request()) {
             BridgeOutcome::InPlane(InPlaneAction::Heartbeat { timestamp_ms }) => {
                 stats.heartbeats_served.fetch_add(1, Ordering::Relaxed);
                 let ack = HeartbeatAck {
                     timestamp_ms,
-                    fleet_size_hint: fleet_size.load(Ordering::Relaxed),
+                    fleet_size_hint: shared.fleet_size.load(Ordering::Relaxed),
                 };
                 if request
-                    .reply_frame(ClusterResponse::ok(
-                        sequence,
-                        cluster_response::Body::HeartbeatAck(ack),
-                    ))
+                    .reply_frame(ClusterResponse::ok(cluster_response::Body::HeartbeatAck(
+                        ack,
+                    )))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            BridgeOutcome::Unsupported { body_kind } => {
+                stats.unsupported_methods.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    peer = %ctx.peer_addr,
+                    fingerprint = ctx.fingerprint_prefix(),
+                    body_kind,
+                    "cluster request for a method this build does not implement; refused, session kept"
+                );
+                if request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::UnsupportedMethod))
                     .await
                     .is_err()
                 {
@@ -519,11 +777,17 @@ async fn serve_session(
             }
             BridgeOutcome::ProtocolViolation => {
                 stats.protocol_violations.fetch_add(1, Ordering::Relaxed);
+                // The highest-signal security event on this plane: an
+                // enrolled node speaking out of plane or out of phase.
+                // Story 9.3 routes it into the audit log once the peer
+                // identity is in the roster.
+                tracing::warn!(
+                    peer = %ctx.peer_addr,
+                    fingerprint = ctx.fingerprint_prefix(),
+                    "cluster protocol violation from an authenticated peer; dropping the session"
+                );
                 let _ = request
-                    .reply_frame(ClusterResponse::refusal(
-                        sequence,
-                        ClusterStatus::ProtocolViolation,
-                    ))
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::ProtocolViolation))
                     .await;
                 // Drop the connection: returning drops the incoming
                 // half; the caller drops the endpoint.

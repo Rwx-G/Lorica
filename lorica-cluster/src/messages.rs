@@ -30,8 +30,12 @@
 /// real cause locally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum ClusterStatus {
-    /// Opaque refusal (and proto3 default for unknown values).
+    /// Opaque refusal (and proto3 default for unknown values). Note
+    /// that an OLDER peer also sees any status it does not know as
+    /// this value, so it cannot tell a newer status from a deliberate
+    /// opaque refusal; acceptable, and documented in the .proto.
     Unspecified = 0,
     /// Session admitted / request served.
     Ok = 1,
@@ -46,6 +50,10 @@ pub enum ClusterStatus {
     SchemaTooOld = 4,
     /// The peer sent a malformed or wrong-plane frame (AC #6).
     ProtocolViolation = 5,
+    /// The request had a well-formed shape but a `body_kind` this
+    /// build does not implement: the peer is NEWER, the request is
+    /// refused, the connection stays up (rolling-upgrade tolerance).
+    UnsupportedMethod = 6,
 }
 
 impl ClusterStatus {
@@ -58,6 +66,7 @@ impl ClusterStatus {
             3 => Self::IncompatibleVersion,
             4 => Self::SchemaTooOld,
             5 => Self::ProtocolViolation,
+            6 => Self::UnsupportedMethod,
             _ => Self::Unspecified,
         }
     }
@@ -124,17 +133,35 @@ pub struct HeartbeatAck {
     pub fleet_size_hint: u32,
 }
 
+/// `body_kind` value of a [`Hello`] request (its oneof tag).
+pub const BODY_KIND_HELLO: u32 = 10;
+/// `body_kind` value of a [`Heartbeat`] request (its oneof tag).
+pub const BODY_KIND_HEARTBEAT: u32 = 11;
+
 /// A request from either side of the cluster plane.
 ///
 /// Body tags: 10-19 session control (this story), 20-39 RESERVED for
 /// configuration replication (Story 9.4), 40-59 RESERVED for telemetry
 /// fan-in (Story 9.6), 60-79 RESERVED for certificate distribution
 /// (Story 9.5).
+///
+/// `body_kind` duplicates the body's oneof tag as a scalar so a
+/// receiver that does NOT know the body (an older build talking to a
+/// newer peer) can still tell "a method I do not implement" (answer
+/// `UNSUPPORTED_METHOD`, keep the connection) from "no body at all"
+/// (protocol violation, drop). prost decodes an unknown oneof tag as an
+/// unknown field, leaving `body = None`; without the scalar the two
+/// cases are indistinguishable and the wire format would freeze at
+/// this release.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ClusterRequest {
     /// Monotonic per direction, managed by `RpcEndpoint`.
     #[prost(uint64, tag = "1")]
     pub sequence: u64,
+    /// The body's oneof tag, set by the constructors; `0` means the
+    /// sender put no body at all.
+    #[prost(uint32, tag = "3")]
+    pub body_kind: u32,
     /// Typed request body.
     #[prost(oneof = "cluster_request::Body", tags = "10, 11")]
     pub body: ::core::option::Option<cluster_request::Body>,
@@ -153,6 +180,43 @@ pub mod cluster_request {
         /// Liveness probe.
         #[prost(message, tag = "11")]
         Heartbeat(Heartbeat),
+    }
+
+    impl Body {
+        /// The oneof tag of this body, for `ClusterRequest::body_kind`.
+        pub fn kind(&self) -> u32 {
+            match self {
+                Body::Hello(_) => super::BODY_KIND_HELLO,
+                Body::Heartbeat(_) => super::BODY_KIND_HEARTBEAT,
+            }
+        }
+    }
+}
+
+impl ClusterRequest {
+    /// A request carrying `body`, with `body_kind` set to match. The
+    /// sequence is stamped by `RpcEndpoint` on send.
+    pub fn with_body(body: cluster_request::Body) -> Self {
+        Self {
+            sequence: 0,
+            body_kind: body.kind(),
+            body: Some(body),
+        }
+    }
+
+    /// A session opener.
+    pub fn hello(hello: Hello) -> Self {
+        Self::with_body(cluster_request::Body::Hello(hello))
+    }
+
+    /// A liveness probe.
+    pub fn heartbeat(heartbeat: Heartbeat) -> Self {
+        Self::with_body(cluster_request::Body::Heartbeat(heartbeat))
+    }
+
+    /// Whether `body_kind` names a method THIS build implements.
+    pub fn is_known_body_kind(body_kind: u32) -> bool {
+        matches!(body_kind, BODY_KIND_HELLO | BODY_KIND_HEARTBEAT)
     }
 }
 
@@ -190,10 +254,12 @@ pub mod cluster_response {
 }
 
 impl ClusterResponse {
-    /// An admitted-or-served response carrying `body`.
-    pub fn ok(sequence: u64, body: cluster_response::Body) -> Self {
+    /// An admitted-or-served response carrying `body`. The sequence is
+    /// stamped by `RpcEndpoint::reply_frame` from the request being
+    /// answered; constructors never take one.
+    pub fn ok(body: cluster_response::Body) -> Self {
         Self {
-            sequence,
+            sequence: 0,
             status: ClusterStatus::Ok as i32,
             retry_after_s: 0,
             body: Some(body),
@@ -202,9 +268,9 @@ impl ClusterResponse {
 
     /// A refusal with `status` and no body. Enrollment-path callers
     /// must pass [`ClusterStatus::opaque()`] here (AC #4).
-    pub fn refusal(sequence: u64, status: ClusterStatus) -> Self {
+    pub fn refusal(status: ClusterStatus) -> Self {
         Self {
-            sequence,
+            sequence: 0,
             status: status as i32,
             retry_after_s: 0,
             body: None,
@@ -212,9 +278,9 @@ impl ClusterResponse {
     }
 
     /// The AC #10 admission-control answer.
-    pub fn retry_later(sequence: u64, retry_after_s: u32) -> Self {
+    pub fn retry_later(retry_after_s: u32) -> Self {
         Self {
-            sequence,
+            sequence: 0,
             status: ClusterStatus::RetryLater as i32,
             retry_after_s,
             body: None,

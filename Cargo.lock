@@ -3153,6 +3153,7 @@ dependencies = [
  "lorica-command",
  "prost 0.13.5",
  "rcgen",
+ "ring",
  "rustls-pki-types",
  "thiserror 2.0.20",
  "tokio",

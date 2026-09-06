@@ -16,12 +16,16 @@ prost = "0.13"
 # reloads with its real subject DN (issued leaves must chain to it).
 # The x509-parser crate is already in the workspace tree via lorica-api.
 rcgen = { version = "0.14", features = ["x509-parser"] }
+# Peer-certificate fingerprints (SHA-256 of the leaf DER); same crate
+# and version lorica-config already uses for its AES-GCM helpers.
+ring = "0.17"
 rustls-pki-types = { version = "1", features = ["alloc"] }
 thiserror = "2"
 # Pins the ring provider (no aws-lc-rs), matching lorica-api's
 # management listener so exactly one rustls crypto provider exists
-# process-wide.
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+# process-wide. No `tls12`: the cluster plane is a closed protocol
+# between identical rustls builds and speaks TLS 1.3 only.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring"] }
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros"] }
 tracing = "0.1"
 

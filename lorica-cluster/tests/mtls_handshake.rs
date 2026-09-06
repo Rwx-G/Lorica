@@ -28,7 +28,7 @@ use lorica_cluster::handshake::{client_handshake, serve_hello, HandshakeConfig};
 use lorica_cluster::messages::ClusterFrame;
 use lorica_cluster::{
     client_config, operational_server_config, ClusterCa, ClusterStatus, HandshakeError,
-    PROTOCOL_MIN_COMPATIBLE, PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
 };
 use lorica_command::RpcEndpoint;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -62,11 +62,7 @@ fn pki() -> Pki {
 }
 
 fn local_cfg(schema: u32) -> HandshakeConfig {
-    HandshakeConfig {
-        protocol_min: PROTOCOL_MIN_COMPATIBLE,
-        protocol_max: PROTOCOL_VERSION,
-        schema_version: schema,
-    }
+    HandshakeConfig::new(schema)
 }
 
 /// Accept one TLS connection and serve one Hello with the given

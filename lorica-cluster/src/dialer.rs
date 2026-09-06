@@ -16,10 +16,13 @@
 //! TLS connection to the control plane, so a follower never exposes an
 //! inbound port.
 //!
-//! The reconnect loop: TLS connect, session handshake, publish the
-//! endpoint into an [`arc_swap::ArcSwapOption`] read lock-free by the
-//! rest of the process, heartbeat until the connection dies, clear the
-//! slot, back off and retry.
+//! The reconnect loop: TCP + TLS connect under `connect_timeout`,
+//! session handshake, publish the endpoint (tagged with a session
+//! generation) into an [`arc_swap::ArcSwapOption`] read lock-free by
+//! the rest of the process, heartbeat until the connection dies, clear
+//! the slot, back off and retry. Every transition is logged: a
+//! follower that cannot reach its control plane is the epic's most
+//! common support case and must be debuggable from its own journal.
 //!
 //! # Backoff
 //!
@@ -32,8 +35,11 @@
 //! `clamp(default_backoff_cap + hint seconds, default_backoff_cap,
 //! 300s)`: a 200-node fleet spreads its reconvergence over minutes, a
 //! 3-node lab stays snappy. A `RETRY_LATER` answer overrides the next
-//! delay with the server-provided `retry_after_s` (AC #10).
+//! delay with the server-provided `retry_after_s` (AC #10), clamped to
+//! the same 300 s ceiling so a buggy or hostile control plane cannot
+//! park a follower for years.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,19 +52,21 @@ use tokio_rustls::TlsConnector;
 use lorica_command::RpcEndpoint;
 
 use crate::handshake::{client_handshake, HandshakeConfig, HandshakeError};
-use crate::messages::{cluster_request, cluster_response, ClusterFrame, ClusterRequest, Heartbeat};
-use crate::tls::{client_config, ClusterTlsError};
+use crate::limits::cluster_rpc_limits;
+use crate::messages::{cluster_response, ClusterFrame, ClusterRequest, ClusterStatus, Heartbeat};
+use crate::tls::{client_config, negotiated_cluster_alpn, ClusterTlsError};
 
-/// Hard ceiling on the reconnect backoff cap, whatever the fleet size
-/// hint says.
-const BACKOFF_CAP_CEILING: Duration = Duration::from_secs(300);
+/// Hard ceiling on every reconnect delay: the scaled backoff cap AND
+/// a server-provided `retry_after_s`.
+pub const BACKOFF_CAP_CEILING: Duration = Duration::from_secs(300);
 
 /// Dialer counters (bridged to Prometheus by the binary, AC #12).
 #[derive(Debug, Default)]
 pub struct DialerStats {
     /// TCP+TLS connection attempts.
     pub connect_attempts: AtomicU64,
-    /// Attempts that failed before the session handshake.
+    /// Attempts that failed before the session handshake (TCP, TLS,
+    /// `connect_timeout`, missing ALPN).
     pub connect_failures: AtomicU64,
     /// Sessions admitted by the control plane.
     pub handshakes_ok: AtomicU64,
@@ -74,11 +82,13 @@ pub struct DialerStats {
     pub disconnects: AtomicU64,
 }
 
-/// Inputs for [`Dialer::spawn`].
+/// Inputs for [`Dialer::spawn`]. Construct with [`DialerConfig::new`];
+/// every field stays public so callers (and tests) can tune it.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct DialerConfig {
-    /// Control-plane `host:port` to dial.
-    pub control_plane_addr: String,
+    /// Control-plane address to dial.
+    pub control_plane: SocketAddr,
     /// Name the control-plane certificate must verify as (its SAN).
     pub server_name: String,
     /// Cluster CA bundle (the ONLY trust root).
@@ -90,16 +100,67 @@ pub struct DialerConfig {
     /// Protocol/schema inputs for the session handshake.
     pub handshake: HandshakeConfig,
     /// Display name sent in the Hello (identity is the certificate).
+    /// Default: empty.
     pub node_name: String,
     /// Interval between liveness probes on an established session.
+    /// Default 15 s (must stay below the transport's 30 s
+    /// `frame_read_timeout`).
     pub heartbeat_interval: Duration,
-    /// Per-request timeout (handshake and heartbeats).
+    /// Per-request timeout (handshake and heartbeats). Default 10 s.
     pub request_timeout: Duration,
-    /// First-failure backoff delay.
+    /// Bound on TCP connect + TLS handshake together. Default 10 s: a
+    /// peer that accepts TCP and then stalls must not wedge the loop.
+    pub connect_timeout: Duration,
+    /// First-failure backoff delay. Default 1 s.
     pub base_backoff: Duration,
     /// Backoff cap before any fleet-size hint arrives; also the floor
-    /// of the scaled cap (see the module doc).
+    /// of the scaled cap (see the module doc). Default 60 s.
     pub default_backoff_cap: Duration,
+}
+
+impl DialerConfig {
+    /// A config with the documented defaults for every timing knob.
+    pub fn new(
+        control_plane: SocketAddr,
+        server_name: &str,
+        ca_pem: &str,
+        client_cert_pem: &str,
+        client_key_pem: &str,
+        local_schema_version: u32,
+    ) -> Self {
+        Self {
+            control_plane,
+            server_name: server_name.to_string(),
+            ca_pem: ca_pem.to_string(),
+            client_cert_pem: client_cert_pem.to_string(),
+            client_key_pem: client_key_pem.to_string(),
+            handshake: HandshakeConfig::new(local_schema_version),
+            node_name: String::new(),
+            heartbeat_interval: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(10),
+            base_backoff: Duration::from_secs(1),
+            default_backoff_cap: Duration::from_secs(60),
+        }
+    }
+
+    /// Set the display name sent in the Hello.
+    pub fn with_node_name(mut self, node_name: &str) -> Self {
+        self.node_name = node_name.to_string();
+        self
+    }
+}
+
+/// One established session: the endpoint plus a generation that
+/// increments on every successful handshake, so a consumer running a
+/// multi-step exchange (Story 9.4's Prepare/Commit) can tell that a
+/// reconnect happened in between and must not mix the two sessions.
+#[derive(Clone)]
+pub struct SessionHandle {
+    /// Monotonic per dialer; starts at 1.
+    pub generation: u64,
+    /// The live endpoint.
+    pub endpoint: Arc<RpcEndpoint<ClusterFrame>>,
 }
 
 /// Lock-free view of the follower's current control-plane connection.
@@ -108,13 +169,13 @@ pub struct DialerConfig {
 /// treat that as "control plane unreachable right now" and not queue.
 #[derive(Clone)]
 pub struct ClusterConnection {
-    slot: Arc<ArcSwapOption<RpcEndpoint<ClusterFrame>>>,
+    slot: Arc<ArcSwapOption<SessionHandle>>,
 }
 
 impl ClusterConnection {
-    /// The live endpoint, if a session is currently established.
-    pub fn current(&self) -> Option<Arc<RpcEndpoint<ClusterFrame>>> {
-        self.slot.load_full()
+    /// The live session, if one is currently established.
+    pub fn current(&self) -> Option<SessionHandle> {
+        self.slot.load_full().map(|s| (*s).clone())
     }
 }
 
@@ -154,8 +215,7 @@ impl Dialer {
             .map_err(|e| ClusterTlsError::Parse(format!("invalid server name: {e}")))?;
         let connector = TlsConnector::from(Arc::new(tls));
 
-        let slot: Arc<ArcSwapOption<RpcEndpoint<ClusterFrame>>> =
-            Arc::new(ArcSwapOption::empty());
+        let slot: Arc<ArcSwapOption<SessionHandle>> = Arc::new(ArcSwapOption::empty());
         let stats = Arc::new(DialerStats::default());
         let connection = ClusterConnection {
             slot: Arc::clone(&slot),
@@ -179,43 +239,99 @@ async fn dial_loop(
     config: DialerConfig,
     connector: TlsConnector,
     server_name: ServerName<'static>,
-    slot: Arc<ArcSwapOption<RpcEndpoint<ClusterFrame>>>,
+    slot: Arc<ArcSwapOption<SessionHandle>>,
     stats: Arc<DialerStats>,
 ) {
     let mut failures: u32 = 0;
     let mut fleet_hint: u32 = 0;
+    let mut generation: u64 = 0;
     let mut jitter = Jitter::seeded();
     // Set when the control plane answered RETRY_LATER: overrides the
     // exponential delay once.
     let mut server_delay: Option<Duration> = None;
+    // Sticky refusal state: the FIRST refusal of a given status logs
+    // at error, repeats at debug, so a mis-ordered fleet upgrade is one
+    // loud line rather than a silent retry loop or a log flood.
+    let mut sticky_refusal: Option<ClusterStatus> = None;
+    let mut was_connected = false;
 
     loop {
         stats.connect_attempts.fetch_add(1, Ordering::Relaxed);
         match connect_once(&config, &connector, &server_name).await {
-            Ok((endpoint, ack_hint)) => {
+            Ok((endpoint, ack_hint, negotiated_version)) => {
                 stats.handshakes_ok.fetch_add(1, Ordering::Relaxed);
                 failures = 0;
                 server_delay = None;
+                sticky_refusal = None;
                 fleet_hint = ack_hint;
+                generation += 1;
+                was_connected = true;
+                tracing::info!(
+                    control_plane = %config.control_plane,
+                    generation,
+                    protocol = negotiated_version,
+                    fleet_size_hint = fleet_hint,
+                    "cluster session established with the control plane"
+                );
                 let endpoint = Arc::new(endpoint);
-                slot.store(Some(Arc::clone(&endpoint)));
+                slot.store(Some(Arc::new(SessionHandle {
+                    generation,
+                    endpoint: Arc::clone(&endpoint),
+                })));
 
                 fleet_hint =
                     heartbeat_until_dead(&config, &endpoint, fleet_hint, &stats).await;
                 slot.store(None);
                 stats.disconnects.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    control_plane = %config.control_plane,
+                    generation,
+                    "cluster session lost; reconnecting"
+                );
             }
             Err(DialFailure::RetryLater(retry_after_s)) => {
                 stats.retry_later.fetch_add(1, Ordering::Relaxed);
-                server_delay = Some(Duration::from_secs(u64::from(retry_after_s.max(1))));
+                let delay = Duration::from_secs(u64::from(retry_after_s.max(1)))
+                    .min(BACKOFF_CAP_CEILING);
+                tracing::info!(
+                    control_plane = %config.control_plane,
+                    retry_in = ?delay,
+                    "control plane admission is full; retrying later"
+                );
+                server_delay = Some(delay);
             }
-            Err(DialFailure::Refused) => {
+            Err(DialFailure::Refused(status)) => {
                 stats.handshake_refusals.fetch_add(1, Ordering::Relaxed);
                 failures = failures.saturating_add(1);
+                if sticky_refusal != Some(status) {
+                    sticky_refusal = Some(status);
+                    tracing::error!(
+                        control_plane = %config.control_plane,
+                        ?status,
+                        "control plane refused the session; will keep retrying on the capped \
+                         schedule but this needs an operator (version or schema mismatch, or a \
+                         protocol fault)"
+                    );
+                } else {
+                    tracing::debug!(control_plane = %config.control_plane, ?status, "session still refused");
+                }
             }
-            Err(DialFailure::Transport) => {
+            Err(DialFailure::Transport(reason)) => {
                 stats.connect_failures.fetch_add(1, Ordering::Relaxed);
                 failures = failures.saturating_add(1);
+                // First failure after a connected period (or at boot)
+                // is the transition worth a warning; the rest of the
+                // storm stays at debug.
+                if failures == 1 || was_connected {
+                    was_connected = false;
+                    tracing::warn!(
+                        control_plane = %config.control_plane,
+                        reason = %reason,
+                        "cannot reach the control plane; backing off"
+                    );
+                } else {
+                    tracing::debug!(control_plane = %config.control_plane, reason = %reason, failures, "connect failed");
+                }
             }
         }
 
@@ -233,10 +349,10 @@ async fn dial_loop(
 }
 
 enum DialFailure {
-    /// TCP/TLS/transport-level failure.
-    Transport,
+    /// TCP/TLS/transport-level failure, with the cause for the log.
+    Transport(String),
     /// The control plane refused the session outright.
-    Refused,
+    Refused(ClusterStatus),
     /// The admission gate asked us to come back later (AC #10).
     RetryLater(u32),
 }
@@ -245,15 +361,29 @@ async fn connect_once(
     config: &DialerConfig,
     connector: &TlsConnector,
     server_name: &ServerName<'static>,
-) -> Result<(RpcEndpoint<ClusterFrame>, u32), DialFailure> {
-    let tcp = tokio::net::TcpStream::connect(&config.control_plane_addr)
-        .await
-        .map_err(|_| DialFailure::Transport)?;
-    let tls = connector
-        .connect(server_name.clone(), tcp)
-        .await
-        .map_err(|_| DialFailure::Transport)?;
-    let (endpoint, _incoming) = RpcEndpoint::<ClusterFrame>::from_stream(tls);
+) -> Result<(RpcEndpoint<ClusterFrame>, u32, u32), DialFailure> {
+    // TCP + TLS under one budget: a peer that answers TCP and then
+    // stalls (route hijack, stale address) must not wedge the loop.
+    let tls = tokio::time::timeout(config.connect_timeout, async {
+        let tcp = tokio::net::TcpStream::connect(config.control_plane)
+            .await
+            .map_err(|e| DialFailure::Transport(format!("tcp connect: {e}")))?;
+        connector
+            .connect(server_name.clone(), tcp)
+            .await
+            .map_err(|e| DialFailure::Transport(format!("tls connect: {e}")))
+    })
+    .await
+    .map_err(|_| DialFailure::Transport("connect timed out".to_string()))??;
+    if !negotiated_cluster_alpn(tls.get_ref().1) {
+        return Err(DialFailure::Transport(
+            "server did not negotiate the cluster ALPN".to_string(),
+        ));
+    }
+    // The incoming half is dropped: no server-initiated requests exist
+    // in Story 9.2 (Story 9.4 must keep it for pushes).
+    let (endpoint, _incoming) =
+        RpcEndpoint::<ClusterFrame>::with_limits(tls, cluster_rpc_limits());
     match client_handshake(
         &endpoint,
         &config.handshake,
@@ -262,14 +392,17 @@ async fn connect_once(
     )
     .await
     {
-        Ok(ack) => Ok((endpoint, ack.fleet_size_hint)),
+        Ok(ack) => Ok((endpoint, ack.fleet_size_hint, ack.negotiated_version)),
         Err(HandshakeError::RetryLater { retry_after_s }) => {
             Err(DialFailure::RetryLater(retry_after_s))
         }
-        Err(HandshakeError::Refused(_)) | Err(HandshakeError::ProtocolViolation) => {
-            Err(DialFailure::Refused)
+        Err(HandshakeError::Refused(status)) => Err(DialFailure::Refused(status)),
+        Err(HandshakeError::ProtocolViolation) => {
+            Err(DialFailure::Refused(ClusterStatus::ProtocolViolation))
         }
-        Err(HandshakeError::Transport(_)) => Err(DialFailure::Transport),
+        Err(HandshakeError::Transport(e)) => {
+            Err(DialFailure::Transport(format!("handshake transport: {e}")))
+        }
     }
 }
 
@@ -284,14 +417,12 @@ async fn heartbeat_until_dead(
     loop {
         tokio::time::sleep(config.heartbeat_interval).await;
         if endpoint.is_closed() {
+            tracing::debug!("cluster session endpoint closed");
             return fleet_hint;
         }
-        let probe = ClusterRequest {
-            sequence: 0, // stamped by the endpoint
-            body: Some(cluster_request::Body::Heartbeat(Heartbeat {
-                timestamp_ms: unix_millis(),
-            })),
-        };
+        let probe = ClusterRequest::heartbeat(Heartbeat {
+            timestamp_ms: unix_millis(),
+        });
         match endpoint.request(probe, config.request_timeout).await {
             Ok(resp) => match resp.body {
                 Some(cluster_response::Body::HeartbeatAck(ack)) => {
@@ -300,11 +431,13 @@ async fn heartbeat_until_dead(
                 }
                 _ => {
                     stats.heartbeat_failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(status = ?resp.cluster_status(), "heartbeat answered without an ack; dropping the session");
                     return fleet_hint;
                 }
             },
-            Err(_) => {
+            Err(e) => {
                 stats.heartbeat_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error = %e, "heartbeat failed; dropping the session");
                 return fleet_hint;
             }
         }
@@ -397,5 +530,13 @@ mod tests {
         for _ in 0..1000 {
             assert!(jitter.uniform(bound) <= bound);
         }
+    }
+
+    #[test]
+    fn config_defaults_keep_heartbeats_inside_the_frame_read_timeout() {
+        let cfg = DialerConfig::new("127.0.0.1:9444".parse().expect("addr"), "cp", "", "", "", 49);
+        assert!(cfg.heartbeat_interval < cluster_rpc_limits().frame_read_timeout);
+        assert!(cfg.connect_timeout >= cfg.request_timeout || cfg.connect_timeout > Duration::ZERO);
+        assert_eq!(cfg.with_node_name("edge-1").node_name, "edge-1");
     }
 }

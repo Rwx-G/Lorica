@@ -32,13 +32,13 @@ use tokio_rustls::TlsConnector;
 
 use lorica_cluster::handshake::{client_handshake, HandshakeConfig};
 use lorica_cluster::listener::{
-    EnrollmentListener, EnrollmentStats, OperationalListener, OperationalStats, PreAuthBudgets,
+    EnrollmentListener, EnrollmentStats, OperationalConfig, OperationalListener,
+    OperationalStats, PreAuthBudgets,
 };
 use lorica_cluster::messages::ClusterFrame;
 use lorica_cluster::{
     client_config, enrollment_server_config, operational_server_config, AdmissionGate, ClusterCa,
-    Dialer, DialerConfig, HandshakeError, SwappableAcceptor, PROTOCOL_MIN_COMPATIBLE,
-    PROTOCOL_VERSION,
+    Dialer, DialerConfig, HandshakeError, SwappableAcceptor,
 };
 use lorica_command::RpcEndpoint;
 
@@ -71,11 +71,29 @@ fn pki() -> Pki {
 }
 
 fn cfg(schema: u32) -> HandshakeConfig {
-    HandshakeConfig {
-        protocol_min: PROTOCOL_MIN_COMPATIBLE,
-        protocol_max: PROTOCOL_VERSION,
-        schema_version: schema,
-    }
+    HandshakeConfig::new(schema)
+}
+
+/// Spawn an operational listener with test-sized defaults.
+fn spawn_operational(
+    listener: tokio::net::TcpListener,
+    acceptor: Arc<SwappableAcceptor>,
+    fleet_size: u32,
+    admission: AdmissionGate,
+    stats: Arc<OperationalStats>,
+    max_sessions: usize,
+) -> lorica_cluster::listener::OperationalHandle {
+    OperationalListener::spawn(OperationalConfig {
+        listener,
+        acceptor,
+        handshake: cfg(49),
+        fleet_size: Arc::new(AtomicU32::new(fleet_size)),
+        admission: Arc::new(admission),
+        stats,
+        budgets: PreAuthBudgets::default(),
+        max_sessions,
+        takeover_epoch: 0,
+    })
 }
 
 /// A free 127.0.0.1 port: bind, read, drop. Racy in principle,
@@ -112,9 +130,12 @@ fn anonymous_client(p: &Pki) -> TlsConnector {
     for cert in CertificateDer::pem_slice_iter(p.ca.cert_pem().as_bytes()).flatten() {
         roots.add(cert.into_owned()).expect("ca root");
     }
-    let config = ClientConfig::builder()
+    let mut config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    // The enrollment listener drops peers that do not negotiate the
+    // cluster ALPN before any budget can be exercised.
+    config.alpn_protocols = vec![lorica_cluster::CLUSTER_ALPN.to_vec()];
     TlsConnector::from(Arc::new(config))
 }
 
@@ -223,7 +244,7 @@ async fn enrollment_budgets_drop_and_count() {
 }
 
 #[tokio::test]
-async fn admission_gate_answers_retry_later_end_to_end() {
+async fn session_cap_answers_retry_later_end_to_end() {
     install_ring();
     let p = pki();
     let server_config =
@@ -234,17 +255,18 @@ async fn admission_gate_answers_retry_later_end_to_end() {
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let stats = Arc::new(OperationalStats::default());
-    let handle = OperationalListener::spawn(
+    // One established session allowed; the gate's retry hint is what
+    // the cap advertises.
+    let handle = spawn_operational(
         listener,
         acceptor,
-        cfg(49),
-        Arc::new(AtomicU32::new(2)),
-        Arc::new(AdmissionGate::new(1, 0, 7)),
+        2,
+        AdmissionGate::new(8, 8, 7),
         Arc::clone(&stats),
+        1,
     );
 
-    // Client 1 completes TLS and then sits on its admission permit by
-    // never sending a Hello.
+    // Client 1 completes the full handshake and keeps its session.
     let tls_cfg = client_config(p.ca.cert_pem(), &p.client_cert, &p.client_key).expect("client");
     let connector = TlsConnector::from(Arc::new(tls_cfg));
     let name = ServerName::try_from(CP_HOST.to_string()).expect("name");
@@ -253,9 +275,14 @@ async fn admission_gate_answers_retry_later_end_to_end() {
         .await
         .expect("tls1 in time")
         .expect("mTLS 1");
-    let (_ep1, _in1) = RpcEndpoint::<ClusterFrame>::from_stream(tls1);
-    // Give the server a beat to take the only admission slot.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (ep1, _in1) = RpcEndpoint::<ClusterFrame>::from_stream(tls1);
+    tokio::time::timeout(
+        WAIT,
+        client_handshake(&ep1, &cfg(49), "node-a", Duration::from_secs(5)),
+    )
+    .await
+    .expect("handshake 1 in time")
+    .expect("first session admitted");
 
     // Client 2 must get RETRY_LATER with the configured delay.
     let tcp2 = tokio::net::TcpStream::connect(addr).await.expect("tcp2");
@@ -275,10 +302,12 @@ async fn admission_gate_answers_retry_later_end_to_end() {
         HandshakeError::RetryLater { retry_after_s } => assert_eq!(retry_after_s, 7),
         other => panic!("expected RetryLater, got {other:?}"),
     }
-    assert_eq!(stats.sessions_retry_later.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.sessions_rejected_full.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.sessions_admitted.load(Ordering::Relaxed), 1);
 
     drop(ep2);
     drop(in2);
+    drop(ep1);
     handle.shutdown();
 }
 
@@ -295,29 +324,30 @@ async fn dialer_reconnects_after_control_plane_restart() {
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let stats = Arc::new(OperationalStats::default());
-    let handle = OperationalListener::spawn(
+    let handle = spawn_operational(
         listener,
         Arc::clone(&acceptor),
-        cfg(49),
-        Arc::new(AtomicU32::new(3)),
-        Arc::new(AdmissionGate::new(8, 8, 5)),
+        3,
+        AdmissionGate::new(8, 8, 5),
         Arc::clone(&stats),
+        64,
     );
 
-    let dialer = Dialer::spawn(DialerConfig {
-        control_plane_addr: addr.to_string(),
-        server_name: CP_HOST.to_string(),
-        ca_pem: p.ca.cert_pem().to_string(),
-        client_cert_pem: p.client_cert.clone(),
-        client_key_pem: p.client_key.clone(),
-        handshake: cfg(49),
-        node_name: "node-a".to_string(),
-        heartbeat_interval: Duration::from_millis(100),
-        request_timeout: Duration::from_secs(1),
-        base_backoff: Duration::from_millis(50),
-        default_backoff_cap: Duration::from_millis(400),
-    })
-    .expect("dialer spawns");
+    let mut dialer_config = DialerConfig::new(
+        addr,
+        CP_HOST,
+        p.ca.cert_pem(),
+        &p.client_cert,
+        &p.client_key,
+        49,
+    )
+    .with_node_name("node-a");
+    dialer_config.heartbeat_interval = Duration::from_millis(100);
+    dialer_config.request_timeout = Duration::from_secs(1);
+    dialer_config.connect_timeout = Duration::from_secs(1);
+    dialer_config.base_backoff = Duration::from_millis(50);
+    dialer_config.default_backoff_cap = Duration::from_millis(400);
+    let dialer = Dialer::spawn(dialer_config).expect("dialer spawns");
     let connection = dialer.connection();
 
     eventually("dialer to establish", || connection.current().is_some()).await;
@@ -335,13 +365,13 @@ async fn dialer_reconnects_after_control_plane_restart() {
     // Restart on the SAME address; the dialer must come back on its
     // own and heartbeats must resume.
     let listener = tokio::net::TcpListener::bind(addr).await.expect("rebind");
-    let handle2 = OperationalListener::spawn(
+    let handle2 = spawn_operational(
         listener,
         acceptor,
-        cfg(49),
-        Arc::new(AtomicU32::new(3)),
-        Arc::new(AdmissionGate::new(8, 8, 5)),
+        3,
+        AdmissionGate::new(8, 8, 5),
         Arc::new(OperationalStats::default()),
+        64,
     );
     eventually("dialer to reconnect", || connection.current().is_some()).await;
     let resumed_floor = dialer_stats.heartbeats_ok.load(Ordering::Relaxed) + 2;

@@ -111,11 +111,36 @@ impl ClusterCa {
         self.key_pair.serialize_pem()
     }
 
-    /// Issue the control-plane leaf: EKU `serverAuth` ONLY, SAN =
-    /// `host` (DNS or IP), valid [`LEAF_VALIDITY_DAYS`]. Returns
-    /// `(cert_pem, key_pem)`.
+    /// Issue the control-plane leaf on a FRESH keypair: EKU
+    /// `serverAuth` ONLY, SAN = `host` (DNS or IP), valid
+    /// [`LEAF_VALIDITY_DAYS`]. Returns `(cert_pem, key_pem)`.
     pub fn issue_server_leaf(&self, host: &str) -> Result<(String, String), CaError> {
-        self.issue_leaf(host, ExtendedKeyUsagePurpose::ServerAuth, Some(host))
+        let leaf_key: KeyPair =
+            KeyPair::generate().map_err(|e| CaError::Generate(e.to_string()))?;
+        let cert_pem = self.issue_leaf(
+            host,
+            ExtendedKeyUsagePurpose::ServerAuth,
+            Some(host),
+            &leaf_key,
+        )?;
+        Ok((cert_pem, leaf_key.serialize_pem()))
+    }
+
+    /// Issue the control-plane leaf on a PERSISTED keypair, so the
+    /// control plane's SPKI is stable across restarts: Story 9.3 pins
+    /// the SHA-256 of that SPKI inside every join token, and a leaf
+    /// re-keyed per boot would invalidate outstanding tokens at every
+    /// restart. Validity stays short; only the key persists. Returns
+    /// the certificate PEM.
+    pub fn issue_server_leaf_with_key(&self, host: &str, key_pem: &str) -> Result<String, CaError> {
+        let leaf_key: KeyPair =
+            KeyPair::from_pem(key_pem).map_err(|e| CaError::Parse(e.to_string()))?;
+        self.issue_leaf(
+            host,
+            ExtendedKeyUsagePurpose::ServerAuth,
+            Some(host),
+            &leaf_key,
+        )
     }
 
     /// Issue a node (follower) leaf: EKU `clientAuth` ONLY, CN =
@@ -123,7 +148,11 @@ impl ClusterCa {
     /// not the other way around), valid [`LEAF_VALIDITY_DAYS`].
     /// Returns `(cert_pem, key_pem)`.
     pub fn issue_client_leaf(&self, node_id: &str) -> Result<(String, String), CaError> {
-        self.issue_leaf(node_id, ExtendedKeyUsagePurpose::ClientAuth, None)
+        let leaf_key: KeyPair =
+            KeyPair::generate().map_err(|e| CaError::Generate(e.to_string()))?;
+        let cert_pem =
+            self.issue_leaf(node_id, ExtendedKeyUsagePurpose::ClientAuth, None, &leaf_key)?;
+        Ok((cert_pem, leaf_key.serialize_pem()))
     }
 
     fn issue_leaf(
@@ -131,7 +160,8 @@ impl ClusterCa {
         common_name: &str,
         eku: ExtendedKeyUsagePurpose,
         san_host: Option<&str>,
-    ) -> Result<(String, String), CaError> {
+        leaf_key: &KeyPair,
+    ) -> Result<String, CaError> {
         let mut params: CertificateParams = CertificateParams::default();
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -144,8 +174,6 @@ impl ClusterCa {
         }
         set_validity(&mut params, LEAF_VALIDITY_DAYS);
 
-        let leaf_key: KeyPair =
-            KeyPair::generate().map_err(|e| CaError::Generate(e.to_string()))?;
         // Rebuild the issuer from the CA certificate itself so the
         // leaf's issuer DN always matches the CA's real subject DN,
         // whether this CA was just generated or reloaded from the
@@ -153,9 +181,9 @@ impl ClusterCa {
         let issuer = rcgen::Issuer::from_ca_cert_pem(&self.cert_pem, &self.key_pair)
             .map_err(|e| CaError::Parse(e.to_string()))?;
         let cert = params
-            .signed_by(&leaf_key, &issuer)
+            .signed_by(leaf_key, &issuer)
             .map_err(|e| CaError::Generate(e.to_string()))?;
-        Ok((cert.pem(), leaf_key.serialize_pem()))
+        Ok(cert.pem())
     }
 }
 
@@ -222,6 +250,27 @@ mod tests {
         // The EKU split itself (serverAuth-only vs clientAuth-only) is
         // asserted behaviourally in the TLS handshake tests: a client
         // leaf fails server verification and vice versa.
+    }
+
+    #[test]
+    fn server_leaf_reissued_on_a_persisted_key_keeps_the_key() {
+        let ca = ClusterCa::generate("Lorica Cluster CA").expect("generate");
+        let (_first_cert, key_pem) = ca.issue_server_leaf("cp.internal").expect("first leaf");
+        let reissued = ca
+            .issue_server_leaf_with_key("cp.internal", &key_pem)
+            .expect("reissue on the persisted key");
+        assert!(reissued.contains("BEGIN CERTIFICATE"));
+        // rustls refuses a certificate whose public key does not match
+        // the private key handed alongside it, so a successful config
+        // build proves the reissued leaf carries the persisted key's
+        // SPKI.
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        crate::tls::operational_server_config(ca.cert_pem(), &reissued, &key_pem)
+            .expect("reissued leaf must pair with the persisted key");
+        assert!(matches!(
+            ca.issue_server_leaf_with_key("cp.internal", "not a key"),
+            Err(CaError::Parse(_))
+        ));
     }
 
     #[test]

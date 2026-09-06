@@ -32,6 +32,18 @@
 //!
 //! Everything runs on the ring provider, matching the management
 //! listener so exactly one rustls crypto provider exists per process.
+//!
+//! # TLS 1.3 only, ALPN `lorica-cluster/1`
+//!
+//! The cluster plane is a closed protocol between identical rustls
+//! builds, the one place in the codebase where TLS 1.3-only costs
+//! nothing and removes a whole negotiation surface. Every config also
+//! carries the [`CLUSTER_ALPN`] token. rustls does NOT refuse a peer
+//! that offers no ALPN at all (it only fails when the peer offers a
+//! non-overlapping list), so "ALPN required" is enforced by the
+//! listeners and the dialer after the handshake via
+//! [`negotiated_cluster_alpn`]: a peer that did not negotiate the
+//! token is dropped before any frame is read.
 
 use std::sync::Arc;
 
@@ -39,7 +51,17 @@ use arc_swap::ArcSwap;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+use tokio_rustls::rustls::{version, ClientConfig, CommonState, RootCertStore, ServerConfig};
+
+/// ALPN protocol token every cluster connection must negotiate.
+pub const CLUSTER_ALPN: &[u8] = b"lorica-cluster/1";
+
+/// Whether `conn` negotiated the cluster ALPN token. Both listeners
+/// and the dialer check this right after the handshake (see the
+/// module doc for why rustls alone cannot enforce it).
+pub fn negotiated_cluster_alpn(conn: &CommonState) -> bool {
+    conn.alpn_protocol() == Some(CLUSTER_ALPN)
+}
 
 /// Failure modes while assembling a cluster TLS config.
 #[derive(Debug, thiserror::Error)]
@@ -93,13 +115,15 @@ pub fn operational_server_config(
     let verifier = WebPkiClientVerifier::builder(roots)
         .build()
         .map_err(|e| ClusterTlsError::Rustls(format!("client verifier: {e}")))?;
-    ServerConfig::builder()
+    let mut config = ServerConfig::builder_with_protocol_versions(&[&version::TLS13])
         .with_client_cert_verifier(verifier)
         .with_single_cert(
             certs_from_pem(server_cert_pem, "cluster server cert")?,
             key_from_pem(server_key_pem, "cluster server key")?,
         )
-        .map_err(|e| ClusterTlsError::Rustls(e.to_string()))
+        .map_err(|e| ClusterTlsError::Rustls(e.to_string()))?;
+    config.alpn_protocols = vec![CLUSTER_ALPN.to_vec()];
+    Ok(config)
 }
 
 /// Server config for the ENROLLMENT listener: no client authentication
@@ -111,13 +135,15 @@ pub fn enrollment_server_config(
     server_cert_pem: &str,
     server_key_pem: &str,
 ) -> Result<ServerConfig, ClusterTlsError> {
-    ServerConfig::builder()
+    let mut config = ServerConfig::builder_with_protocol_versions(&[&version::TLS13])
         .with_no_client_auth()
         .with_single_cert(
             certs_from_pem(server_cert_pem, "cluster server cert")?,
             key_from_pem(server_key_pem, "cluster server key")?,
         )
-        .map_err(|e| ClusterTlsError::Rustls(e.to_string()))
+        .map_err(|e| ClusterTlsError::Rustls(e.to_string()))?;
+    config.alpn_protocols = vec![CLUSTER_ALPN.to_vec()];
+    Ok(config)
 }
 
 /// Client config for the follower dialer (Story 9.2 AC #9): the
@@ -130,13 +156,15 @@ pub fn client_config(
     client_key_pem: &str,
 ) -> Result<ClientConfig, ClusterTlsError> {
     let roots = ca_root_store(ca_pem)?;
-    ClientConfig::builder()
+    let mut config = ClientConfig::builder_with_protocol_versions(&[&version::TLS13])
         .with_root_certificates(roots)
         .with_client_auth_cert(
             certs_from_pem(client_cert_pem, "node client cert")?,
             key_from_pem(client_key_pem, "node client key")?,
         )
-        .map_err(|e| ClusterTlsError::Rustls(e.to_string()))
+        .map_err(|e| ClusterTlsError::Rustls(e.to_string()))?;
+    config.alpn_protocols = vec![CLUSTER_ALPN.to_vec()];
+    Ok(config)
 }
 
 /// Hot-swappable holder for the operational listener's
