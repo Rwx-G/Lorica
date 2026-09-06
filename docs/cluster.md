@@ -111,9 +111,113 @@ encrypted column cannot silently escape rotation.
 
 ## Enrollment
 
-This section describes the listener lifecycle that ships with the
-transport layer; the token issuance and certificate enrollment flow is
-documented in the enrollment section as it lands.
+Joining a fleet is one short-lived token and one command. The design
+is shaped by what a token must NOT become: a standing credential, a
+CA-wide pass, or a certificate-signing request an attacker can enrich.
+
+### Tokens
+
+A SuperAdmin mints a join token on the control plane, from the
+dashboard's join dialog, from `POST /api/v1/cluster/tokens`, or with
+`lorica cluster token --user <superadmin> --password <...>`. A token
+is `<public_id>.<payload>`: the public half is the registry's lookup
+key, the payload carries a 256-bit secret and the SHA-256 of the
+control plane's current leaf public key. The registry stores only an
+HMAC-SHA256 of the secret under a server-side key (itself encrypted at
+rest and rotated with the master key); a stolen database yields no
+usable token, and a redemption is exactly one lookup and one
+constant-time verification whether or not the id exists, so the
+enrollment path cannot be turned into a CPU or memory amplifier.
+
+Tokens live at most 24 hours (one hour by default) and can be bound at
+mint time to an expected node name and a source CIDR, both enforced at
+redemption. Minting opens the enrollment listener; the window closes
+on its own when the last token is redeemed, withdrawn
+(`DELETE /api/v1/cluster/tokens/{public_id}`) or expires.
+
+**The token is shown once and never belongs on a command line.**
+`lorica cluster join` reads it from `--token-file`, `--token-stdin` or
+the `LORICA_JOIN_TOKEN` environment variable and refuses everything
+else, because argv is readable through `/proc`, lands in shell
+history, and is logged verbatim by CI and configuration-management
+`command` modules.
+
+### Joining
+
+```bash
+# On the control plane (or in the dashboard): mint a token.
+lorica cluster token --user admin --password '...'
+
+# On the new node, with the service stopped:
+lorica cluster join --control-plane cp.example.com:9444 --token-stdin < token.txt
+systemctl start lorica
+```
+
+The joiner authenticates the control plane before it holds any CA: it
+pins the leaf public key carried by the token (not the CA - pinning
+the CA would admit any certificate the cluster CA ever issued, i.e. a
+compromised follower posing as the control plane), checks the SAN
+against the `--control-plane` host (or `--server-name`), the validity
+window and the `serverAuth` EKU. It then sends its bare public key,
+never a CSR: the control plane assigns the subject, the `clientAuth`
+EKU, `CA:FALSE`, the serial and the 90-day validity itself, and only
+accepts Ed25519, P-256 and RSA keys of at least 2048 bits. The private
+key never leaves the node. The token is burned by one conditional
+database update before any certificate is signed, so three
+simultaneous joiners with one token yield exactly one enrolled node.
+
+A freshly enrolled node is **Pending**: it holds a certificate, can
+open its session, and shows up in the roster, but receives no
+configuration and no certificates until a SuperAdmin activates it
+(`POST /api/v1/cluster/nodes/{id}/activate`). A control plane started
+with `--cluster-auto-activate` skips that step; the flag is logged at
+WARN because it turns a one-hour token into a fleet member without an
+operator looking.
+
+### Identity, renewal, revocation
+
+A node's identity is the SHA-256 fingerprint of its certificate,
+recorded at enrollment and matched on every session; nothing in any
+payload can rename a session. A valid certificate with no registry
+entry is dropped before a single byte is read, and audited.
+
+Node certificates last 90 days and renew themselves at two thirds of
+that lifetime over the established session: the node generates a new
+key, sends the public half, and the control plane issues the
+replacement. The previous certificate stays valid until the node's
+first session on the new one, then goes on the revocation list as
+superseded, so a crash between issuance and persistence cannot lock a
+node out.
+
+Revocation (`DELETE /api/v1/cluster/nodes/{id}`, or the dashboard) is
+enforced at the TLS handshake: the node's serials go on a CRL signed
+by the cluster CA, the operational listener's configuration is rebuilt
+with it and swapped without dropping the socket, and the node's live
+session is ended synchronously rather than at its next heartbeat. The
+registry row stays, marked revoked, for the audit trail.
+
+### Leaving
+
+`lorica cluster leave` wipes the node's fleet identity (its private
+key and the CA bundle). It is authorised one of two ways: a SuperAdmin
+credential on the local management API (`--user/--password`), in
+which case the running instance tells the control plane over the live
+session so it revokes, audits and alerts, then wipes and audits
+locally; or, without credentials, proof that the control plane already
+deregistered the node (its certificate is refused at the handshake).
+A node the control plane still accepts cannot be dropped from a local
+shell alone. Replicated certificate private keys arrive with
+certificate distribution (Story 9.5) and are wiped by the same
+command.
+
+### Status
+
+`lorica cluster status` prints the persisted role (control plane,
+follower with its node id, or standalone) and, with management
+credentials, the live connection state and the roster from
+`GET /api/v1/cluster/status`.
+
+### Firewalling the window
 
 - An enrollment window opens when an operator mints a join token and
   closes on its own: the enrollment listener starts refusing

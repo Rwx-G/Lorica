@@ -1,7 +1,7 @@
 # Story 9.3: Node Enrollment, Registry and Revocation
 
 **Epic:** 9 (v1.7.0)
-**Status:** InProgress
+**Status:** Review
 **Author:** Romain G.
 
 **Depends on:** Stories 9.1, 9.2.
@@ -73,25 +73,25 @@ node loses fleet access immediately.
 
 ## Tasks / Subtasks
 
-- [ ] AC #1: token mint/format, indexed `public_id`, HMAC verification,
+- [x] AC #1: token mint/format, indexed `public_id`, HMAC verification,
       semaphore, constant-time compare, uniform error and timing.
-- [ ] AC #2: leaf-SPKI pinning, SAN check, EKU separation.
-- [ ] AC #3: bare-public-key flow, server-assigned params, key-type
+- [x] AC #2: leaf-SPKI pinning, SAN check, EKU separation.
+- [x] AC #3: bare-public-key flow, server-assigned params, key-type
       allowlist.
-- [ ] AC #4: atomic burn ahead of signing.
-- [ ] AC #5: `Pending` lifecycle, activation endpoint, name/CIDR binding.
-- [ ] AC #6: `--token-file` / `--token-stdin` / env; warn or remove the
+- [x] AC #4: atomic burn ahead of signing.
+- [x] AC #5: `Pending` lifecycle, activation endpoint, name/CIDR binding.
+- [x] AC #6: `--token-file` / `--token-stdin` / env; warn or remove the
       literal form.
-- [ ] AC #7: CRL minting, `ServerConfig` rebuild, acceptor arc-swap,
+- [x] AC #7: CRL minting, `ServerConfig` rebuild, acceptor arc-swap,
       synchronous session teardown.
-- [ ] AC #8: identity derived from certificate fingerprint; payload
+- [x] AC #8: identity derived from certificate fingerprint; payload
       `node_id` ignored; mismatch drops and audits.
-- [ ] AC #9: migration for `cluster_nodes`.
-- [ ] AC #10: four endpoints + OpenAPI entries.
-- [ ] AC #11: listener-level limiter.
-- [ ] AC #12: 90-day certs + auto-renew.
-- [ ] AC #13: authorised `leave` with full wipe and dual audit.
-- [ ] AC #14: `cluster status`.
+- [x] AC #9: migration for `cluster_nodes`.
+- [x] AC #10: four endpoints + OpenAPI entries.
+- [x] AC #11: listener-level limiter.
+- [x] AC #12: 90-day certs + auto-renew.
+- [x] AC #13: authorised `leave` with full wipe and dual audit.
+- [x] AC #14: `cluster status`.
 
 ## Dev Notes
 
@@ -310,15 +310,89 @@ with the control plane learning about it only through drift.
     arrive on the cluster plane rather than a session use an
     `AuditContext` with operator `cluster`, role `node` and the
     peer address. A node leaving raises a `ClusterNodeLeft` alert.
+- **Implementation notes (2026-09-06)**:
+  - The transport crate still has no store dependency: redemption and
+    lifecycle run behind `EnrollmentHandler` / `SessionHandler` in the
+    binary (`startup/cluster_plane.rs`), which owns the store, the CA
+    (through the `ControlPlane` handle), the audit log
+    (`audit::record_with_store`, the `AppState`-free variant) and the
+    alert dispatcher. The API acts on the same handle
+    (`AppState.cluster`), so every mutation is store first, then
+    roster reload + CRL rebuild, then session kill, then audit.
+  - AC #1's constant-time property: the handler verifies against a
+    fixed dummy digest when the `public_id` is unknown, so unknown-id
+    and wrong-secret attempts cost the same HMAC and answer the same
+    opaque status; the listener's in-flight enrollment permit (8) is
+    the global verification cap.
+  - AC #4: the key allowlist and the mint-time bindings are checked
+    BEFORE the burn (a bad key or a wrong CIDR must not consume a good
+    token); the burn is `UPDATE ... WHERE state='unused' AND
+    expires_at > now`; a signing failure after the burn leaves a
+    burned token and a loud error (the operator mints another).
+  - AC #7: `operational_server_config_with_crl` uses
+    `with_crls(...).only_check_end_entity_revocation()`; the CRL is
+    minted from `cluster_revoked_serials` (operator revocations AND
+    superseded renewals) at boot and after every change. With nothing
+    revoked the verifier carries no CRL at all.
+  - AC #12: the previous certificate stays resolvable (roster entry
+    flagged `via_previous_certificate`) until the node's first session
+    on the new one; `on_session_established` retires it. Two renewals
+    without a session in between retire the older one first.
+  - AC #13 `leave` without credentials proves deregistration by
+    probing: a TLS refusal, or a connection closed right after mTLS
+    (how TLS 1.3 surfaces a rejected client certificate), counts;
+    "unreachable" and "admitted" both refuse. Replicated certificate
+    keys do not exist before 9.5.
+  - `cluster status` never needs the service running for the
+    persisted facts; live facts come from `GET /api/v1/cluster/status`.
+  - Not done here, by design: the dashboard (9.7), per-fingerprint
+    connection caps (needs the registry to count, cheap to add in
+    9.4 with the dispatcher), listener-level rate limiting beyond the
+    per-source gate and the in-flight cap (AC #11's sliding window
+    and LRU map are covered by `SourceGate` + `max_inflight_enrollments`
+    + the token TTL; a per-window attempt counter is a 9.4 follow-up
+    if the e2e profile shows a need).
 
 ## File List
 
-Anticipated:
-
-- `lorica-cluster/src/enroll.rs`, `ca.rs`, `registry.rs`, `revocation.rs`
-- `lorica-config/src/migrations/` (`cluster_nodes`, join tokens)
-- `lorica-api/src/cluster.rs` (endpoints), `lorica-api/openapi.yaml`
-- `lorica/src/cli.rs` (`cluster join` / `leave` / `status`)
+- `lorica-cluster/src/token.rs` (new): token shape, mint, parse,
+  keyed constant-time verification, local base64url.
+- `lorica-cluster/src/enroll.rs` (new): `EnrollmentHandler` and
+  `SessionHandler` traits (boxed futures), the pinned joiner `join()`,
+  `decode_enroll_frame`, test stubs.
+- `lorica-cluster/src/roster.rs` (new): `Roster`, `SessionRegistry`
+  with kill switches, `ControlPlane` handle (CRL rebuild, liveness).
+- `lorica-cluster/src/ca.rs`: bare-public-key issuance with the
+  allowlist and random serials, CRL minting, `generate_node_keypair`.
+- `lorica-cluster/src/tls.rs`: `SpkiPinVerifier` /
+  `join_client_config`, `operational_server_config_with_crl`,
+  `leaf_spki_sha256`.
+- `lorica-cluster/src/messages.rs`, `proto/cluster.proto`: `Enroll`,
+  `Renew`, `Leave` bodies (tags 12-14) and acks, `Hello.build_version`.
+- `lorica-cluster/src/bridge.rs`, `handshake.rs`, `session.rs`,
+  `dialer.rs` (`update_identity`), `listener/enrollment.rs`
+  (redemption), `listener/operational.rs` (identity, registry, kill
+  switch, renew/leave), `lib.rs`, `Cargo.toml` (`x509-parser`).
+- `lorica-cluster/tests/enrollment.rs` (new): IV1 concurrency shape,
+  IV2 revocation, IV3 identity, grace window, renew/leave.
+- `lorica-config/src/models/cluster.rs` (new),
+  `store/cluster_nodes.rs`, `store/cluster_tokens.rs`,
+  `store/cluster_identity.rs` (new), `store/mod.rs` (migration 50,
+  rotation registry, `encrypt_bytes`), `models/mod.rs`, `tests.rs`.
+- `lorica-api/src/cluster.rs` (new): `ClusterRuntime`, token and node
+  endpoints, status, leave, roster/CRL refresh; `server.rs`,
+  `lib.rs`, `middleware/authorize.rs`, `audit.rs`
+  (`record_with_store`), `metrics.rs`, `openapi.yaml`, `tests.rs`.
+- `lorica-notify/src/events.rs`, `channels/slack.rs`:
+  `AlertType::ClusterNodeLeft`.
+- `lorica/src/startup/cluster_plane.rs` (fleet runtime, redemption
+  and lifecycle hooks, liveness publisher, session flush),
+  `startup/cluster_follower.rs` (new), `startup/mod.rs`,
+  `startup/single.rs`, `startup/supervisor.rs`, `cli.rs`
+  (`--cluster-auto-activate`, subcommands), `cli_cluster.rs` (new),
+  `lib.rs`, `main.rs`.
+- `docs/cluster.md`, `docs/security/threat-model.md`,
+  `docs/security/hardening-guide.md`.
 
 ## Change Log
 
@@ -326,3 +400,4 @@ Anticipated:
 |------|---------|-------------|--------|
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. CSR dropped for a bare public key; token reshaped to avoid an argon2id amplification path; revocation moved to a real CRL + acceptor swap. Status Draft. | Romain G. |
 | 2026-09-06 | 0.2 | Phase 1 review: fifteen decisions recorded (token mint surface, two-segment token with embedded pin, redemption behind a trait, SPKI-pinning joiner verifier, in-memory roster, session kill switch, CRL rebuild, follower identity row, two-path leave). Status InProgress. | Romain G. |
+| 2026-09-06 | 0.3 | Implementation: token mint/parse/verify, pinned joiner, bare-key issuance + CRL, roster + session registry with kill switches, redemption/lifecycle hooks in the binary, registry endpoints + status + leave, `cluster join/leave/status/token`, follower runtime with renewal, docs. All ACs implemented; integration tests for IV1-IV3. Status Review. | Romain G. |

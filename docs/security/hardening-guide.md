@@ -41,6 +41,13 @@ The cluster plane only exists when a control plane is started with `--cluster-li
 
 Followers dial out to the control plane and expose no inbound cluster port; no follower-side firewall opening is needed.
 
+Enrollment hygiene (Story 9.3):
+
+- Mint join tokens with the shortest lifetime the operation allows (`ttl_seconds`, default one hour, cap 24 hours) and bind them to the expected node name and source CIDR whenever they are known.
+- Hand the token to the joining node through a file with mode 0600, standard input, or `LORICA_JOIN_TOKEN`; never on a command line, never in a ticket. `lorica cluster join` refuses a token on argv.
+- Leave `--cluster-auto-activate` off in production: review each `pending` node in the roster and activate it deliberately.
+- Revoke decommissioned nodes on the control plane before wiping them (`DELETE /api/v1/cluster/nodes/{id}`); `lorica cluster leave` on the node then proves the deregistration and wipes the fleet identity.
+
 ### Firewall Rules
 
 ```bash

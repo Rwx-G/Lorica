@@ -103,6 +103,15 @@ The cluster plane is opt-in: none of these surfaces exist unless the operator st
 | Version/build fingerprinting pre-auth | Version and schema negotiation happen after client-certificate verification on the operational path; the enrollment path returns an opaque code | Implemented |
 | Reconnect stampede after control-plane restart | Convergence admission control: concurrent-session limit with a queue and `RETRY_LATER`; follower backoff with jitter whose cap scales with fleet size | Implemented |
 | Cluster CA key theft | CA private key encrypted (AES-256-GCM) at rest under the node master key; covered by `lorica rotate-key`; the master-key file is the fleet's identity root (see Residual Risks) | Implemented |
+| Enrollment as a resource-exhaustion primitive | Token is `<public_id>.<payload>`: one indexed lookup and one constant-time HMAC-SHA256 verification per attempt (a dummy digest when the id is unknown), no memory-hard KDF; verification runs under the listener's in-flight enrollment cap | Implemented |
+| Rogue control plane harvesting a token | The token pins the SHA-256 of the control-plane LEAF public key, not the CA; the joiner also checks the SAN against the `--control-plane` host, the validity window and the `serverAuth` EKU before sending anything | Implemented |
+| Privilege escalation through a CSR | No CSR: the node sends a bare public key and the control plane assigns subject, EKU (`clientAuth` only), `CA:FALSE`, serial and validity; key type allowlist (Ed25519, P-256, RSA-2048+) | Implemented |
+| Token replay / concurrent redemption | The burn is one conditional `UPDATE ... WHERE state='unused' AND expires_at > now` that must affect exactly one row BEFORE any signing; a bad key or binding mismatch refuses without burning | Implemented |
+| A one-hour token becoming a permanent identity | Enrollment lands `Pending`: no configuration or certificates until a SuperAdmin activates (or `--cluster-auto-activate`, logged at WARN); tokens can be bound to a node name and a source CIDR | Implemented |
+| Token leakage through argv | `lorica cluster join` accepts the token only from `--token-file`, `--token-stdin` or `LORICA_JOIN_TOKEN`; the CLI and the dashboard show it apart from the command that consumes it | Implemented |
+| A revoked node keeping access | Revocation puts the node's serials on a CA-signed CRL, rebuilds the operational verifier `with_crls` and arc-swaps it; the live session is ended synchronously through the session registry | Implemented |
+| Node impersonation via a payload `node_id` | Identity is the certificate fingerprint recorded at enrollment; payloads carry no trusted identity; a valid certificate with no roster entry, or a revoked one, is dropped before any byte is read and audited | Implemented |
+| A local shell dropping a node while keeping fleet keys | `lorica cluster leave` requires a SuperAdmin credential on the local API (the instance notifies the control plane) or proof of control-plane-side deregistration; it wipes the identity and audits on both sides | Implemented |
 
 ### T7: Operational
 
