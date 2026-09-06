@@ -680,6 +680,10 @@ mod tests {
 
     #[test]
     fn tls_connector_rejects_key_without_cert() {
+        // `ClientConfig::builder()` needs a process-level provider;
+        // which test installs it first is scheduling luck, so install
+        // it here too (idempotent).
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let mut config = test_config("host01:6514", SyslogTransport::TcpTls);
         config.tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----".to_string());
         // expect_err needs Debug on the Ok side, which TlsConnector

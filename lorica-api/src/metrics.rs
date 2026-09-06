@@ -84,7 +84,9 @@ static CERT_EXPIRY_DAYS: Lazy<GaugeVec> = Lazy::new(|| {
 // reconnect could otherwise mint unbounded series. `direction` is
 // inbound|outbound, `method` is a fixed protocol vocabulary
 // (hello|heartbeat|tls|bridge|session), `outcome` a fixed result
-// vocabulary.
+// vocabulary. Every fixed label combination is created at install
+// time so a reason that never fired reads as 0, not as an absent
+// series (`rate()` alerts on absent series do not fire).
 
 /// Per-node cluster connection state (1 = in that state). Labels:
 /// node_id, state. Series appear once enrolled identities exist
@@ -129,6 +131,17 @@ static CLUSTER_PREAUTH_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     )
 });
 
+/// Failed `accept()` calls per listener (descriptor exhaustion and
+/// the like; each one pauses the accept loop). Labels: listener
+/// (operational|enrollment).
+static CLUSTER_ACCEPT_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "lorica_cluster_accept_errors_total",
+        "Cluster listener accept() failures",
+        &["listener"],
+    )
+});
+
 /// Connections accepted by the enrollment listener before any budget
 /// ran: the volume on the product's only unauthenticated surface.
 static CLUSTER_ENROLLMENT_CONNECTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
@@ -156,6 +169,39 @@ static CLUSTER_ENROLLMENT_LISTENER_OPEN: Lazy<IntGauge> = Lazy::new(|| {
     )
 });
 
+/// The fixed `lorica_cluster_rpc_total` label triples the operational
+/// listener feeds, one per `OperationalStats` counter.
+const CLUSTER_RPC_LABELS: &[&[&str]] = &[
+    &["inbound", "tls", "concurrent_limit"],
+    &["inbound", "tls", "per_source_limit"],
+    &["inbound", "tls", "timeout"],
+    &["inbound", "tls", "failed"],
+    &["inbound", "tls", "alpn_refused"],
+    &["inbound", "hello", "opener_timeout"],
+    &["inbound", "hello", "transport_failure"],
+    &["inbound", "hello", "admitted"],
+    &["inbound", "hello", "retry_later"],
+    &["inbound", "hello", "session_full"],
+    &["inbound", "hello", "refused"],
+    &["inbound", "bridge", "protocol_violation"],
+    &["inbound", "bridge", "unsupported_method"],
+    &["inbound", "heartbeat", "ok"],
+    &["inbound", "session", "ended"],
+];
+
+/// The fixed `lorica_cluster_preauth_rejections_total` reasons.
+const CLUSTER_PREAUTH_REASONS: &[&str] = &[
+    "handshake_failed",
+    "handshake_timeout",
+    "alpn",
+    "concurrent_handshakes",
+    "per_source",
+    "inflight_enrollments",
+    "byte_budget",
+    "time_budget",
+    "window_closed",
+];
+
 /// Last-synced snapshot of the cluster-plane atomics, so each scrape
 /// increments the Prometheus counters by exactly the delta since the
 /// previous scrape (the crate exposes monotonic atomics, not
@@ -163,9 +209,12 @@ static CLUSTER_ENROLLMENT_LISTENER_OPEN: Lazy<IntGauge> = Lazy::new(|| {
 #[derive(Default)]
 struct ClusterPlaneSnapshot {
     op_rejected_concurrent_handshakes: u64,
+    op_rejected_per_source: u64,
     op_handshake_timeouts: u64,
     op_tls_failures: u64,
     op_alpn_refusals: u64,
+    op_opener_timeouts: u64,
+    op_handshake_transport_failures: u64,
     op_sessions_admitted: u64,
     op_sessions_retry_later: u64,
     op_sessions_rejected_full: u64,
@@ -174,15 +223,18 @@ struct ClusterPlaneSnapshot {
     op_unsupported_methods: u64,
     op_heartbeats_served: u64,
     op_sessions_ended: u64,
+    op_accept_errors: u64,
     en_connections_total: u64,
     en_rejected_handshake_failed: u64,
     en_rejected_handshake_timeout: u64,
     en_rejected_alpn: u64,
     en_rejected_concurrent_handshakes: u64,
+    en_rejected_per_source: u64,
     en_rejected_inflight_enrollments: u64,
     en_rejected_byte_budget: u64,
     en_rejected_time_budget: u64,
     en_rejected_window_closed: u64,
+    en_accept_errors: u64,
     en_bind_failures: u64,
 }
 
@@ -192,15 +244,35 @@ struct ClusterPlaneStats {
     last: std::sync::Mutex<ClusterPlaneSnapshot>,
 }
 
+/// Set once per process. The plane starts once and is never
+/// restarted in-process; if that ever changes, a fresh set of atomics
+/// would under-count until it passed the old snapshot, and this must
+/// become a swap that resets the snapshot.
 static CLUSTER_PLANE_STATS: std::sync::OnceLock<ClusterPlaneStats> = std::sync::OnceLock::new();
 
 /// Hand the running control plane's listener counters to the
 /// Prometheus bridge. Called once at startup when `--cluster-listen`
-/// is set; a second call is ignored (the plane starts once).
+/// is set; a second call is ignored (the plane starts once). Every
+/// fixed label combination is created here so it scrapes as 0 from
+/// the first scrape.
 pub fn install_cluster_plane_stats(
     operational: std::sync::Arc<lorica_cluster::OperationalStats>,
     enrollment: std::sync::Arc<lorica_cluster::EnrollmentStats>,
 ) {
+    for labels in CLUSTER_RPC_LABELS {
+        CLUSTER_RPC_TOTAL.with_label_values(labels);
+    }
+    for reason in CLUSTER_PREAUTH_REASONS {
+        CLUSTER_PREAUTH_REJECTIONS_TOTAL.with_label_values(&[reason]);
+    }
+    for listener in ["operational", "enrollment"] {
+        CLUSTER_ACCEPT_ERRORS_TOTAL.with_label_values(&[listener]);
+    }
+    Lazy::force(&CLUSTER_ENROLLMENT_CONNECTIONS_TOTAL);
+    Lazy::force(&CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL);
+    Lazy::force(&CLUSTER_ENROLLMENT_LISTENER_OPEN);
+    Lazy::force(&CLUSTER_CONNECTION_STATE);
+    Lazy::force(&CLUSTER_RPC_DURATION_SECONDS);
     let _ = CLUSTER_PLANE_STATS.set(ClusterPlaneStats {
         operational,
         enrollment,
@@ -249,6 +321,12 @@ fn sync_cluster_plane_metrics() {
     );
     bump_vec(
         &CLUSTER_RPC_TOTAL,
+        &["inbound", "tls", "per_source_limit"],
+        op.rejected_per_source.load(Relaxed),
+        &mut last.op_rejected_per_source,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
         &["inbound", "tls", "timeout"],
         op.handshake_timeouts.load(Relaxed),
         &mut last.op_handshake_timeouts,
@@ -264,6 +342,18 @@ fn sync_cluster_plane_metrics() {
         &["inbound", "tls", "alpn_refused"],
         op.alpn_refusals.load(Relaxed),
         &mut last.op_alpn_refusals,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "opener_timeout"],
+        op.opener_timeouts.load(Relaxed),
+        &mut last.op_opener_timeouts,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "transport_failure"],
+        op.handshake_transport_failures.load(Relaxed),
+        &mut last.op_handshake_transport_failures,
     );
     bump_vec(
         &CLUSTER_RPC_TOTAL,
@@ -313,6 +403,12 @@ fn sync_cluster_plane_metrics() {
         op.sessions_ended.load(Relaxed),
         &mut last.op_sessions_ended,
     );
+    bump_vec(
+        &CLUSTER_ACCEPT_ERRORS_TOTAL,
+        &["operational"],
+        op.accept_errors.load(Relaxed),
+        &mut last.op_accept_errors,
+    );
 
     let en = &stats.enrollment;
     bump(
@@ -346,6 +442,12 @@ fn sync_cluster_plane_metrics() {
     );
     bump_vec(
         &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["per_source"],
+        en.rejected_per_source.load(Relaxed),
+        &mut last.en_rejected_per_source,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
         &["inflight_enrollments"],
         en.rejected_inflight_enrollments.load(Relaxed),
         &mut last.en_rejected_inflight_enrollments,
@@ -368,6 +470,12 @@ fn sync_cluster_plane_metrics() {
         en.rejected_window_closed.load(Relaxed),
         &mut last.en_rejected_window_closed,
     );
+    bump_vec(
+        &CLUSTER_ACCEPT_ERRORS_TOTAL,
+        &["enrollment"],
+        en.accept_errors.load(Relaxed),
+        &mut last.en_accept_errors,
+    );
     bump(
         &CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL,
         en.bind_failures.load(Relaxed),
@@ -376,10 +484,6 @@ fn sync_cluster_plane_metrics() {
 
     let open = en.lifecycle_opens.load(Relaxed) > en.lifecycle_closes.load(Relaxed);
     CLUSTER_ENROLLMENT_LISTENER_OPEN.set(i64::from(open));
-    // Touch the node-scoped families so they are registered (and
-    // visible as empty) from the first scrape.
-    Lazy::force(&CLUSTER_CONNECTION_STATE);
-    Lazy::force(&CLUSTER_RPC_DURATION_SECONDS);
 }
 
 /// WAF events counter. Labels: category, action (detected/blocked).
