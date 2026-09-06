@@ -24,15 +24,20 @@
 //! the enrollment socket stays closed in this release even when the
 //! plane is enabled.
 //!
-//! Hot upgrade: the operational socket is handed to the next
-//! supervisor through Story 9.1's cluster FD slot, so established
-//! follower sessions survive a binary upgrade like proxy connections
-//! do. The enrollment socket is deliberately not handed off - it is
-//! bound only inside an enrollment window and rebinds on the next
-//! liveness edge, which is the honest lifecycle for a socket that
-//! usually does not exist.
+//! Hot upgrade: the operational SOCKET is handed to the next
+//! supervisor through Story 9.1's cluster FD slot, so there is no
+//! rebind gap and no EADDRINUSE against the outgoing process. The
+//! sessions on it do not survive: the outgoing supervisor stops its
+//! cluster plane as soon as the new one is confirmed up, and followers
+//! reconnect once, to the new process, under the new takeover epoch.
+//! The socket is adopted only when the inherited bind equals the
+//! configured one; a mismatch is logged and the socket bound fresh.
+//! The enrollment socket is deliberately not handed off - it is bound
+//! only inside an enrollment window and rebinds on the next liveness
+//! edge, which is the honest lifecycle for a socket that usually does
+//! not exist.
 
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
@@ -55,10 +60,6 @@ const ADMISSION_MAX_CONCURRENT: usize = 32;
 const ADMISSION_QUEUE_DEPTH: usize = 128;
 const ADMISSION_RETRY_AFTER_S: u32 = 5;
 
-/// Cap on established operational sessions (one per follower plus
-/// headroom); past it a peer is answered RETRY_LATER after its opener.
-const MAX_OPERATIONAL_SESSIONS: usize = 1024;
-
 /// Inputs for [`spawn_cluster_plane`], lifted from the CLI.
 pub(crate) struct ClusterPlaneOptions {
     /// `--cluster-listen`; the plane is disabled when `None`.
@@ -72,8 +73,10 @@ pub(crate) struct ClusterPlaneOptions {
     /// Ports the cluster plane must never share.
     pub reserved: ReservedPorts,
     /// The operational listening socket inherited from an outgoing
-    /// supervisor on `--hot-upgrade`, adopted instead of binding.
-    pub inherited_operational_fd: Option<RawFd>,
+    /// supervisor on `--hot-upgrade`, as `(bind, fd)`: adopted instead
+    /// of binding when `bind` equals the configured operational bind,
+    /// closed otherwise.
+    pub inherited_operational: Option<(String, RawFd)>,
 }
 
 /// Live handles for a running control-plane cluster plane. Dropping
@@ -121,6 +124,14 @@ impl ClusterPlane {
     }
 }
 
+/// Close an inherited descriptor this process will not use.
+pub(crate) fn close_inherited_fd(fd: RawFd) {
+    // SAFETY: `fd` was received via SCM_RIGHTS in
+    // `pull_inherited_listeners`, is owned exclusively by this process
+    // and is wrapped exactly once; dropping the `OwnedFd` closes it.
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+}
+
 /// Validate the CLI binds, load the CA, and start the listeners.
 /// `Ok(None)` when `--cluster-listen` is absent (plane disabled).
 ///
@@ -133,6 +144,13 @@ pub(crate) async fn spawn_cluster_plane(
     store: &Arc<Mutex<ConfigStore>>,
 ) -> Result<Option<ClusterPlane>, String> {
     let Some(value) = opts.cluster_listen.as_deref() else {
+        if let Some((bind, fd)) = opts.inherited_operational {
+            warn!(
+                inherited = %bind,
+                "hot upgrade: inherited a cluster listener but --cluster-listen is not set; closing it"
+            );
+            close_inherited_fd(fd);
+        }
         return Ok(None);
     };
     let binds = validate_cluster_listen(
@@ -171,28 +189,31 @@ pub(crate) async fn spawn_cluster_plane(
     // boot (90 days, comfortably beyond any process lifetime): Story
     // 9.3 pins the leaf SPKI in join tokens, so a keypair minted per
     // boot would invalidate every outstanding token on restart. The
-    // SAN is the advertised name, which is what followers dial.
+    // SAN is the advertised name, which is what followers dial. The
+    // stored row is refreshed with the certificate actually served.
     let host = binds.advertise_host.as_str();
-    let (server_cert, server_key) = match stored_leaf {
+    let (server_cert, server_key, first_boot) = match stored_leaf {
         Some((_, key_pem)) => {
             let cert = ca.issue_server_leaf_with_key(host, &key_pem).map_err(|e| {
                 format!("cluster plane: failed to re-issue the control-plane leaf: {e}")
             })?;
-            (cert, key_pem)
+            (cert, key_pem, false)
         }
         None => {
             let (cert, key) = ca.issue_server_leaf(host).map_err(|e| {
                 format!("cluster plane: failed to issue the control-plane leaf: {e}")
             })?;
-            store
-                .lock()
-                .await
-                .set_control_plane_leaf(&cert, &key)
-                .map_err(|e| format!("cluster plane: failed to persist the leaf keypair: {e}"))?;
-            info!("cluster plane: control-plane leaf keypair generated and persisted");
-            (cert, key)
+            (cert, key, true)
         }
     };
+    store
+        .lock()
+        .await
+        .set_control_plane_leaf(&server_cert, &server_key)
+        .map_err(|e| format!("cluster plane: failed to persist the control-plane leaf: {e}"))?;
+    if first_boot {
+        info!("cluster plane: control-plane leaf keypair generated and persisted");
+    }
 
     let operational_config =
         lorica_cluster::operational_server_config(ca.cert_pem(), &server_cert, &server_key)
@@ -201,15 +222,36 @@ pub(crate) async fn spawn_cluster_plane(
         .map_err(|e| format!("cluster plane: enrollment TLS config: {e}"))?;
 
     // Adopt the inherited socket on a hot upgrade (no rebind gap, no
-    // EADDRINUSE against the outgoing supervisor), else bind fresh.
-    let std_listener: std::net::TcpListener = match opts.inherited_operational_fd {
-        Some(fd) => {
+    // EADDRINUSE against the outgoing supervisor) - but only the
+    // socket bound where THIS process is configured to listen. A
+    // divergent bind means the two binaries disagree; serving the old
+    // socket while logging the new address would be undebuggable.
+    let configured_bind = binds.operational.to_string();
+    let adopted: Option<std::net::TcpListener> = match opts.inherited_operational {
+        Some((bind, fd)) if bind == configured_bind => {
             // SAFETY: `fd` was received via SCM_RIGHTS in
-            // `pull_inherited_listeners` and is owned exclusively here;
-            // it refers to the same kernel listening socket the outgoing
-            // supervisor accepts cluster sessions on.
-            unsafe { std::net::TcpListener::from_raw_fd(fd) }
+            // `pull_inherited_listeners` and is owned exclusively here
+            // (the supervisor closes every other inherited cluster
+            // descriptor); it refers to the same kernel listening
+            // socket the outgoing supervisor accepts cluster sessions
+            // on, and it is wrapped exactly once.
+            Some(unsafe { std::net::TcpListener::from_raw_fd(fd) })
         }
+        Some((bind, fd)) => {
+            warn!(
+                inherited = %bind,
+                configured = %configured_bind,
+                "hot upgrade: inherited cluster listener bind differs from --cluster-listen; \
+                 closing it and binding fresh"
+            );
+            close_inherited_fd(fd);
+            None
+        }
+        None => None,
+    };
+    let adopted_bind: Option<&str> = adopted.as_ref().map(|_| configured_bind.as_str());
+    let std_listener: std::net::TcpListener = match adopted {
+        Some(listener) => listener,
         None => std::net::TcpListener::bind(binds.operational)
             .map_err(|e| format!("cluster plane: failed to bind {}: {e}", binds.operational))?,
     };
@@ -224,21 +266,20 @@ pub(crate) async fn spawn_cluster_plane(
 
     let fleet_size = Arc::new(AtomicU32::new(0));
     let operational_stats = Arc::new(OperationalStats::default());
-    let operational = OperationalListener::spawn(OperationalConfig {
+    let mut operational_config = OperationalConfig::new(
         listener,
-        acceptor: Arc::new(SwappableAcceptor::new(Arc::new(operational_config))),
-        handshake: HandshakeConfig::new(u32::try_from(schema_version).unwrap_or(u32::MAX)),
-        fleet_size: Arc::clone(&fleet_size),
-        admission: Arc::new(AdmissionGate::new(
-            ADMISSION_MAX_CONCURRENT,
-            ADMISSION_QUEUE_DEPTH,
-            ADMISSION_RETRY_AFTER_S,
-        )),
-        stats: Arc::clone(&operational_stats),
-        budgets: PreAuthBudgets::default(),
-        max_sessions: MAX_OPERATIONAL_SESSIONS,
-        takeover_epoch,
-    });
+        Arc::new(SwappableAcceptor::new(Arc::new(operational_config))),
+        HandshakeConfig::new(u32::try_from(schema_version).unwrap_or(u32::MAX)),
+    );
+    operational_config.fleet_size = Arc::clone(&fleet_size);
+    operational_config.admission = Arc::new(AdmissionGate::new(
+        ADMISSION_MAX_CONCURRENT,
+        ADMISSION_QUEUE_DEPTH,
+        ADMISSION_RETRY_AFTER_S,
+    ));
+    operational_config.stats = Arc::clone(&operational_stats);
+    operational_config.takeover_epoch = takeover_epoch;
+    let operational = OperationalListener::spawn(operational_config);
 
     let (token_liveness, liveness_rx) = watch::channel(0u32);
     let enrollment_stats = Arc::new(EnrollmentStats::default());
@@ -256,7 +297,7 @@ pub(crate) async fn spawn_cluster_plane(
         operational = %binds.operational,
         enrollment = %binds.enrollment,
         advertise = %binds.advertise_host,
-        adopted = opts.inherited_operational_fd.is_some(),
+        adopted_bind = adopted_bind.unwrap_or("-"),
         takeover_epoch,
         "cluster plane enabled: operational listener bound (mTLS mandatory); \
          enrollment listener opens only while a join token is live"

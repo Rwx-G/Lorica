@@ -162,11 +162,16 @@ where
 
     let mut io_vec = [IoSliceMut::new(payload); 1];
     let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
+    // MSG_CMSG_CLOEXEC: descriptors received over SCM_RIGHTS arrive
+    // with FD_CLOEXEC clear, and this process forks+execs workers
+    // that must never inherit a listening socket (least of all the
+    // cluster control plane's). Freshly bound sockets already carry
+    // the flag; this makes inherited ones match.
     let msg = socket::recvmsg::<SockaddrStorage>(
         fd,
         &mut io_vec,
         Some(&mut cmsg_buf),
-        socket::MsgFlags::empty(),
+        socket::MsgFlags::MSG_CMSG_CLOEXEC,
     )
     .unwrap();
 

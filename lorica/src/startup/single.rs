@@ -431,7 +431,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 },
                 // Single-process mode never hot-upgrades (it binds the
                 // management port fresh), so there is nothing to adopt.
-                inherited_operational_fd: None,
+                inherited_operational: None,
             },
             &store,
         )

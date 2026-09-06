@@ -753,6 +753,50 @@ pub(crate) fn restrict_key_permissions(path: &std::path::Path) -> bool {
     true
 }
 
+/// Inspect `encryption.key` before promoting it to the identity root
+/// of a fleet (`lorica cluster init`), then tighten it to 0600.
+///
+/// Returns `Err` when the file is owned by a different uid than this
+/// process (a key someone else controls must not become the fleet
+/// root), `Ok(Some(warning))` when the file WAS readable beyond its
+/// owner before being tightened (the key may already have leaked and
+/// the operator must decide), and `Ok(None)` when it was already
+/// private. The process uid is read from `/proc/self`, which the
+/// kernel owns by the effective uid, so no libc binding is needed.
+pub(crate) fn check_key_file_before_promotion(
+    path: &std::path::Path,
+) -> Result<Option<String>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+    let process_uid = std::fs::metadata("/proc/self")
+        .map(|m| m.uid())
+        .map_err(|e| format!("cannot determine the process uid from /proc/self: {e}"))?;
+    if meta.uid() != process_uid {
+        return Err(format!(
+            "{} is owned by uid {} but this process runs as uid {}; the fleet identity root \
+             must be owned by the service user",
+            path.display(),
+            meta.uid(),
+            process_uid
+        ));
+    }
+    let mode = meta.mode() & 0o777;
+    let exposure = (mode & 0o077 != 0).then(|| {
+        format!(
+            "{} was mode {:04o} (readable beyond its owner) before being tightened to 0600; \
+             treat the key as possibly exposed and consider `lorica rotate-key` before \
+             clustering",
+            path.display(),
+            mode
+        )
+    });
+    if !restrict_key_permissions(path) {
+        return Err(format!("cannot restrict {} to mode 0600", path.display()));
+    }
+    Ok(exposure)
+}
+
 /// Persist the first-run admin password to a 0600 file under the data
 /// directory and return its path.
 ///

@@ -673,6 +673,35 @@ mod tests {
     }
 
     #[test]
+    fn cluster_handoff_entries_round_trip_through_the_fds_table() {
+        // What `ClusterPlane::handoff_fds()` produces goes through
+        // `build_fds_table` on the old side and `partition_inherited_fds`
+        // on the new one; the (role, bind, fd) triple must survive the
+        // trip byte for byte, IPv6 binds included (the bind carries
+        // colons of its own).
+        let cluster = vec![
+            (
+                ClusterListenerRole::Operational,
+                "192.0.2.1:9444".to_string(),
+                31,
+            ),
+            (
+                ClusterListenerRole::Operational,
+                "[2001:db8::1]:9444".to_string(),
+                32,
+            ),
+        ];
+        let table = build_fds_table(&[("0.0.0.0:8080".to_string(), 10)], 12, 9443, &cluster);
+        let (keys, fds) = table.serialize();
+        let mut inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
+        assert_eq!(inherited.proxy, vec![("0.0.0.0:8080".to_string(), 10)]);
+        assert_eq!(inherited.management, Some(12));
+        // The table is a map: compare order-independently.
+        inherited.cluster.sort_by_key(|(_, _, fd)| *fd);
+        assert_eq!(inherited.cluster, cluster);
+    }
+
+    #[test]
     fn partition_rejects_duplicate_and_malformed_keys() {
         // A duplicate management key would silently leak the earlier
         // descriptor; the wire format's only producer is our own

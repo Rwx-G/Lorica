@@ -1022,18 +1022,29 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // the operator asked for the plane, running without it is
         // the wrong failure mode. Handles stay alive for the process
         // lifetime; the stats feed the Prometheus bridge.
-        // On a hot upgrade the operational cluster socket is adopted
-        // from the outgoing supervisor (Story 9.1's FD slot), so
-        // established follower sessions survive the handoff exactly
-        // like proxy connections do. The enrollment socket is not
-        // handed off: it only exists while a join token is live and
-        // rebinds on the next liveness edge.
-        let inherited_operational_fd: Option<RawFd> = inherited.as_ref().and_then(|i| {
-            i.cluster
-                .iter()
-                .find(|(role, _, _)| *role == hot_upgrade::ClusterListenerRole::Operational)
-                .map(|(_, _, fd)| *fd)
-        });
+        // On a hot upgrade the operational cluster SOCKET is adopted
+        // from the outgoing supervisor (Story 9.1's FD slot) so there
+        // is no rebind gap; its sessions reconnect once, to this
+        // process. Exactly one descriptor is adoptable (the
+        // operational one, when the plane is configured); every
+        // other inherited cluster descriptor is closed here so it
+        // cannot leak for the process lifetime. The enrollment socket
+        // is never handed off: it only exists while a join token is
+        // live and rebinds on the next liveness edge.
+        let mut inherited_operational: Option<(String, RawFd)> = None;
+        if let Some(inherited) = inherited.as_ref() {
+            for (role, bind, fd) in &inherited.cluster {
+                let adoptable = *role == hot_upgrade::ClusterListenerRole::Operational
+                    && hu_cli.cluster_listen.is_some()
+                    && inherited_operational.is_none();
+                if adoptable {
+                    inherited_operational = Some((bind.clone(), *fd));
+                } else {
+                    info!(?role, %bind, "hot upgrade: closing an inherited cluster listener this process does not adopt");
+                    startup::cluster_plane::close_inherited_fd(*fd);
+                }
+            }
+        }
         let mut cluster_plane = match startup::cluster_plane::spawn_cluster_plane(
             startup::cluster_plane::ClusterPlaneOptions {
                 cluster_listen: hu_cli.cluster_listen.clone(),
@@ -1045,7 +1056,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     http: hu_cli.http_port,
                     https: hu_cli.https_port,
                 },
-                inherited_operational_fd,
+                inherited_operational,
             },
             &store,
         )
@@ -1438,6 +1449,16 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     match run.decision {
                         hot_upgrade::HandoffDecision::Drain => {
                             info!("hot upgrade: new supervisor is up; draining old workers");
+                            // The new supervisor owns its own dup of
+                            // the cluster socket and serves the new
+                            // takeover epoch: stop accepting and end
+                            // every session here NOW, so no follower
+                            // lands a session on a process that is
+                            // about to exit (it would be stamped with
+                            // the old epoch and cut without a goodbye).
+                            if let Some(plane) = cluster_plane.take() {
+                                plane.shutdown();
+                            }
                             // Stop the monitor so a drained worker is not
                             // seen as a crash and respawned.
                             shutting_down.store(true, std::sync::atomic::Ordering::Release);

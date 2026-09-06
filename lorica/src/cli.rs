@@ -325,8 +325,11 @@ pub(crate) struct ClusterBinds {
 /// the two proxy listeners.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReservedPorts {
+    /// The loopback management API port.
     pub management: u16,
+    /// The HTTP proxy listener port.
     pub http: u16,
+    /// The HTTPS proxy listener port.
     pub https: u16,
 }
 
@@ -448,14 +451,15 @@ pub(crate) fn run_cluster_init(data_dir: &str, common_name: &str) {
     let key_path = data_dir.join("encryption.key");
     let key = EncryptionKey::load_or_create(&key_path).expect("failed to load encryption key");
     // This file is about to become the identity root of the fleet
-    // (docs/cluster.md): refuse to promote a key anyone else can read.
-    if !crate::startup::restrict_key_permissions(&key_path) {
-        eprintln!(
-            "refusing to initialise the cluster CA: {} must be mode 0600 and owned by the \
-             service user",
-            key_path.display()
-        );
-        std::process::exit(1);
+    // (docs/cluster.md): refuse a key someone else owns, and say so
+    // loudly when it was readable beyond its owner until now.
+    match crate::startup::check_key_file_before_promotion(&key_path) {
+        Ok(None) => {}
+        Ok(Some(warning)) => eprintln!("WARNING: {warning}"),
+        Err(reason) => {
+            eprintln!("refusing to initialise the cluster CA: {reason}");
+            std::process::exit(1);
+        }
     }
     let db_path = data_dir.join("lorica.db");
     let store = ConfigStore::open(&db_path, Some(key)).expect("failed to open database");
