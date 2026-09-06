@@ -343,13 +343,28 @@ pub async fn record(
     before: Option<&serde_json::Value>,
     after: Option<&serde_json::Value>,
 ) {
+    record_with_store(state.log_store.clone(), ctx, action, target, before, after).await;
+}
+
+/// [`record`] for callers that hold the log store but no `AppState`:
+/// the cluster plane's lifecycle hooks (enrollment, renewal, leave,
+/// identity refusals), which run in the binary before and beside the
+/// API. Same persistence, same sink copy, same failure policy.
+pub async fn record_with_store(
+    log_store: Option<std::sync::Arc<crate::log_store::LogStore>>,
+    ctx: &AuditContext,
+    action: &str,
+    target: (&str, &str),
+    before: Option<&serde_json::Value>,
+    after: Option<&serde_json::Value>,
+) {
     let (target_type, target_id) = target;
     // One timestamp shared by the persisted row and the sink copy, so
     // the SIEM-side and DB-side records agree exactly (QA finding:
     // timestamp equality is the cheapest out-of-band join key).
     let timestamp = chrono::Utc::now().to_rfc3339();
 
-    let Some(log_store) = state.log_store.clone() else {
+    let Some(log_store) = log_store else {
         emit_audit_event(ctx, action, target_type, target_id, "", &timestamp);
         return;
     };

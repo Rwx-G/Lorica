@@ -21,6 +21,7 @@ pub mod ban;
 pub mod cache;
 pub mod cert_export;
 pub mod certificates;
+pub mod cluster;
 pub mod config;
 pub mod connections;
 pub mod db;

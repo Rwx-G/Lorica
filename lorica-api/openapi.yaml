@@ -52,6 +52,8 @@ tags:
     description: Pre-flight validation helpers (mTLS PEM, forward-auth health check)
   - name: Audit
     description: Admin audit log (tamper-evident hash chain)
+  - name: Cluster
+    description: Fleet registry, join tokens and node lifecycle (control plane), fleet status and leave (follower)
 
 paths:
   # ---------------------------------------------------------------------------
@@ -3450,6 +3452,273 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /api/v1/cluster/status:
+    get:
+      tags: [Cluster]
+      summary: This node's fleet role and connection state (Viewer+)
+      description: >-
+        Story 9.3 AC #14. `role` is `standalone`, `control_plane` or
+        `follower`. A control plane returns the roster in `fleet`; a
+        follower returns its node id, the control plane it dials and its
+        connection state. `applied_config_generation` is 0 until Story 9.4.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Cluster status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/ClusterStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/cluster/tokens:
+    get:
+      tags: [Cluster]
+      summary: List join tokens (SuperAdmin; secrets never stored)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Tokens, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/JoinToken"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: This node is not a control plane
+    post:
+      tags: [Cluster]
+      summary: Mint a join token (SuperAdmin); the token is shown once
+      description: >-
+        Story 9.3 AC #1/#2/#5. The token pins the control plane's current
+        leaf SPKI. Minting opens the enrollment listener until the last
+        live token is burned, revoked or expires. Pass the token to the
+        joining node through `--token-file`, `--token-stdin` or
+        `LORICA_JOIN_TOKEN`, never on a command line.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl_seconds:
+                  type: integer
+                  description: Lifetime in seconds (default 3600, max 86400).
+                node_name:
+                  type: string
+                  description: When set, only a node presenting exactly this name may redeem.
+                source_cidr:
+                  type: string
+                  description: When set, only a connection from this CIDR may redeem.
+      responses:
+        "201":
+          description: Token minted (shown once)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      token:
+                        type: string
+                        description: The full token. Never stored, never logged.
+                      public_id:
+                        type: string
+                      expires_at:
+                        type: string
+                        format: date-time
+                      bound_node_name:
+                        type: string
+                        nullable: true
+                      bound_source_cidr:
+                        type: string
+                        nullable: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: This node is not a control plane
+  /api/v1/cluster/tokens/{public_id}:
+    parameters:
+      - name: public_id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      tags: [Cluster]
+      summary: Withdraw an unused join token (SuperAdmin)
+      security:
+        - sessionCookie: []
+      responses:
+        "204":
+          description: Token revoked; the enrollment window closes if it was the last live token
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No unused token with this public id
+        "409":
+          description: This node is not a control plane
+  /api/v1/cluster/nodes:
+    get:
+      tags: [Cluster]
+      summary: The fleet roster with live session facts (Viewer+)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Enrolled nodes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ClusterNode"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: This node is not a control plane
+  /api/v1/cluster/nodes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Cluster]
+      summary: One enrolled node (Viewer+)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The node
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/ClusterNode"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: This node is not a control plane
+    delete:
+      tags: [Cluster]
+      summary: Revoke a node (SuperAdmin)
+      description: >-
+        Story 9.3 AC #7. The node's certificate serials go on the CRL, the
+        operational acceptor is rebuilt, and the node's live session is
+        ended synchronously. The registry row stays, marked `revoked`.
+      security:
+        - sessionCookie: []
+      responses:
+        "204":
+          description: Node revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Node not found or already revoked
+        "409":
+          description: This node is not a control plane
+  /api/v1/cluster/nodes/{id}/activate:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Cluster]
+      summary: Activate a pending node (SuperAdmin)
+      description: >-
+        Story 9.3 AC #5. A `pending` node holds a certificate but receives
+        no configuration and no certificates until activated.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The activated node
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/ClusterNode"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The node is not pending, or this node is not a control plane
+  /api/v1/cluster/leave:
+    post:
+      tags: [Cluster]
+      summary: Leave the fleet (SuperAdmin, follower only)
+      description: >-
+        Story 9.3 AC #13. Tells the control plane over the live session
+        (which revokes, audits and alerts on its side), then wipes this
+        node's fleet identity and audits locally. When the control plane
+        could not be reached, `control_plane_notified` is `false` and the
+        operator must revoke the node on the control plane.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Left the fleet
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      node_id:
+                        type: string
+                      control_plane_notified:
+                        type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: This node is not a follower
+
 components:
   securitySchemes:
     sessionCookie:
@@ -3467,6 +3736,139 @@ components:
         format: uuid
 
   schemas:
+    ClusterNode:
+      type: object
+      description: One enrolled node (Story 9.3 AC #9) plus its live session facts. Fingerprints and serials are public values.
+      properties:
+        node_id:
+          type: string
+        name:
+          type: string
+        cert_fingerprint:
+          type: string
+          description: Lowercase-hex SHA-256 of the current certificate DER.
+        cert_serial:
+          type: string
+        prev_cert_fingerprint:
+          type: string
+          nullable: true
+        prev_cert_serial:
+          type: string
+          nullable: true
+        address:
+          type: string
+        version:
+          type: string
+        schema_version:
+          type: integer
+        status:
+          type: string
+          enum: [pending, active, revoked]
+        enrolled_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+          nullable: true
+        applied_config_generation:
+          type: integer
+        applied_config_hash:
+          type: string
+        cert_not_after:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        connected:
+          type: boolean
+        session_peer:
+          type: string
+          nullable: true
+        session_last_seen_unix:
+          type: integer
+          nullable: true
+    JoinToken:
+      type: object
+      description: A join token's public facts. The secret half is never stored (only its HMAC), so it can never be listed.
+      properties:
+        public_id:
+          type: string
+        state:
+          type: string
+          enum: [unused, burned, revoked]
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+        bound_node_name:
+          type: string
+          nullable: true
+        bound_source_cidr:
+          type: string
+          nullable: true
+        burned_at:
+          type: string
+          format: date-time
+          nullable: true
+        burned_by_node_id:
+          type: string
+          nullable: true
+    ClusterStatus:
+      type: object
+      description: This node's fleet role (Story 9.3 AC #14).
+      properties:
+        role:
+          type: string
+          enum: [standalone, control_plane, follower]
+        build_version:
+          type: string
+        node_id:
+          type: string
+          nullable: true
+        node_name:
+          type: string
+          nullable: true
+        control_plane:
+          type: string
+          nullable: true
+        connection_state:
+          type: string
+          nullable: true
+          enum: [connected, disconnected]
+        session_generation:
+          type: integer
+          nullable: true
+        applied_config_generation:
+          type: integer
+        fleet:
+          type: array
+          items:
+            type: object
+            properties:
+              node_id:
+                type: string
+              name:
+                type: string
+              status:
+                type: string
+                enum: [pending, active, revoked]
+              connected:
+                type: boolean
+              last_seen_at:
+                type: string
+                format: date-time
+                nullable: true
+              version:
+                type: string
+              applied_config_generation:
+                type: integer
     User:
       type: object
       description: A dashboard / API user account (password hash never serialized).
@@ -3939,7 +4341,7 @@ components:
           type: array
           items:
             type: string
-          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`).
+          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`, `cluster_node_left`).
 
     CreateNotificationRequest:
       type: object

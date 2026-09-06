@@ -51,6 +51,23 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
         return Role::Operator;
     }
 
+    // Cluster registry (Story 9.3 AC #10). A join token is a
+    // credential, so the token endpoints are SuperAdmin for every
+    // method; node mutations (activate, revoke) and leaving the fleet
+    // are SuperAdmin; roster and status reads stay Viewer.
+    if path == "/api/v1/cluster/tokens"
+        || path.starts_with("/api/v1/cluster/tokens/")
+        || path == "/api/v1/cluster/leave"
+    {
+        return Role::SuperAdmin;
+    }
+    if path.starts_with("/api/v1/cluster/nodes")
+        && method != http::Method::GET
+        && method != http::Method::HEAD
+    {
+        return Role::SuperAdmin;
+    }
+
     if method == http::Method::GET || method == http::Method::HEAD {
         // `format=key` / `format=full` return the private key; the
         // whole download endpoint is treated as secret material
@@ -109,6 +126,46 @@ pub async fn authorize(req: Request, next: Next) -> Result<Response, ApiError> {
 mod tests {
     use super::*;
     use http::Method;
+
+    #[test]
+    fn cluster_endpoints_follow_the_story_9_3_floors() {
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/cluster/tokens"),
+            Role::SuperAdmin
+        );
+        assert_eq!(
+            required_role(&Method::POST, "/api/v1/cluster/tokens"),
+            Role::SuperAdmin
+        );
+        assert_eq!(
+            required_role(&Method::DELETE, "/api/v1/cluster/tokens/abc"),
+            Role::SuperAdmin
+        );
+        assert_eq!(
+            required_role(&Method::POST, "/api/v1/cluster/leave"),
+            Role::SuperAdmin
+        );
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/cluster/nodes"),
+            Role::Viewer
+        );
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/cluster/nodes/abc"),
+            Role::Viewer
+        );
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/cluster/status"),
+            Role::Viewer
+        );
+        assert_eq!(
+            required_role(&Method::POST, "/api/v1/cluster/nodes/abc/activate"),
+            Role::SuperAdmin
+        );
+        assert_eq!(
+            required_role(&Method::DELETE, "/api/v1/cluster/nodes/abc"),
+            Role::SuperAdmin
+        );
+    }
 
     #[test]
     fn users_endpoints_are_super_admin_for_all_methods() {

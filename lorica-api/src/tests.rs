@@ -53,6 +53,7 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         log_store: None,
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        cluster: crate::cluster::ClusterRuntime::Standalone,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -4670,6 +4671,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         log_store: None,
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        cluster: crate::cluster::ClusterRuntime::Standalone,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -4709,6 +4711,7 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         log_store: None,
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        cluster: crate::cluster::ClusterRuntime::Standalone,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -5898,4 +5901,352 @@ async fn test_settings_schema_bounds_match_validator() {
             );
         }
     }
+}
+
+// ---- Story 9.3: cluster registry endpoints ----
+
+/// A control-plane runtime for the API tests: a fresh CA, a leaf, and
+/// the fleet handles wired the way the binary wires them. Returns the
+/// handle and the token-liveness receiver the enrollment listener
+/// would watch.
+fn test_control_plane() -> (
+    std::sync::Arc<lorica_cluster::ControlPlane>,
+    tokio::sync::watch::Receiver<u32>,
+) {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let ca = lorica_cluster::ClusterCa::generate("Test Cluster CA").expect("test setup");
+    let (leaf_cert, leaf_key) = ca.issue_server_leaf("cp.internal").expect("test setup");
+    let config = lorica_cluster::operational_server_config(ca.cert_pem(), &leaf_cert, &leaf_key)
+        .expect("test setup");
+    let acceptor = std::sync::Arc::new(lorica_cluster::SwappableAcceptor::new(
+        std::sync::Arc::new(config),
+    ));
+    let (liveness_tx, liveness_rx) = tokio::sync::watch::channel(0u32);
+    let control = std::sync::Arc::new(lorica_cluster::ControlPlane::new(
+        ca,
+        &leaf_cert,
+        &leaf_key,
+        acceptor,
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        liveness_tx,
+        false,
+        "cp.internal",
+        "test",
+    ));
+    (control, liveness_rx)
+}
+
+async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
+}
+
+#[tokio::test]
+async fn test_cluster_status_standalone_and_role_floors() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "viewer1",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    // Standalone status is Viewer-readable.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/status",
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let status = body_json(resp).await;
+    assert_eq!(status["data"]["role"], "standalone");
+    assert_eq!(status["data"]["fleet"].as_array().map(Vec::len), Some(0));
+
+    // Tokens are SuperAdmin for every method, even the list.
+    for (method, path) in [
+        ("GET", "/api/v1/cluster/tokens"),
+        ("POST", "/api/v1/cluster/tokens"),
+        ("DELETE", "/api/v1/cluster/tokens/abc"),
+        ("POST", "/api/v1/cluster/nodes/abc/activate"),
+        ("DELETE", "/api/v1/cluster/nodes/abc"),
+        ("POST", "/api/v1/cluster/leave"),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            path,
+            &viewer,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+
+    // On a standalone node the control-plane endpoints answer 409,
+    // not 500, and leave is a follower-only operation.
+    for (method, path) in [
+        ("GET", "/api/v1/cluster/nodes"),
+        ("GET", "/api/v1/cluster/tokens"),
+        ("POST", "/api/v1/cluster/tokens"),
+        ("POST", "/api/v1/cluster/leave"),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            path,
+            &admin,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    let (control, mut liveness) = test_control_plane();
+    state.cluster = crate::cluster::ClusterRuntime::ControlPlane(std::sync::Arc::clone(&control));
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Mint: the token is returned once, the window opens.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/cluster/tokens",
+        &admin,
+        Some(serde_json::json!({ "ttl_seconds": 600, "node_name": "edge-1" })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let minted = body_json(resp).await;
+    let token_value = minted["data"]["token"].as_str().expect("token").to_string();
+    let public_id = minted["data"]["public_id"].as_str().expect("public id").to_string();
+    assert!(token_value.starts_with(&format!("{public_id}.")));
+    assert_eq!(minted["data"]["bound_node_name"], "edge-1");
+    assert_eq!(*liveness.borrow_and_update(), 1, "the enrollment window opened");
+    // The token pins the control plane's leaf SPKI.
+    let parsed = lorica_cluster::token::parse(&token_value).expect("parse");
+    assert_eq!(
+        parsed.pin,
+        lorica_cluster::leaf_spki_sha256(&control.leaf_cert_pem).expect("pin")
+    );
+
+    // Bad inputs are 400.
+    for body in [
+        serde_json::json!({ "ttl_seconds": 0 }),
+        serde_json::json!({ "ttl_seconds": 90000 }),
+        serde_json::json!({ "source_cidr": "not-a-cidr" }),
+        serde_json::json!({ "node_name": "" }),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/cluster/tokens",
+            &admin,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    // The list never carries the secret or its HMAC.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/tokens",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listed = body_json(resp).await;
+    let entries = listed["data"].as_array().expect("array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["public_id"], public_id);
+    assert_eq!(entries[0]["state"], "unused");
+    assert!(entries[0].get("secret_hmac").is_none());
+    assert!(entries[0].get("token").is_none());
+
+    // Withdraw: the window closes; a second withdrawal is 404.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/cluster/tokens/{public_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(*liveness.borrow_and_update(), 0, "the enrollment window closed");
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/cluster/tokens/{public_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // A node enrolled through the registry (what the redemption
+    // handler writes) shows up pending, activates once, then revokes.
+    let node_id = "11111111-2222-4333-8444-555555555555";
+    {
+        let store = state.store.lock().await;
+        let now = chrono::Utc::now();
+        store
+            .create_cluster_node(&lorica_config::models::ClusterNode {
+                node_id: node_id.to_string(),
+                name: "edge-1".to_string(),
+                cert_fingerprint: "ab".repeat(32),
+                cert_serial: "4A".repeat(16),
+                prev_cert_fingerprint: None,
+                prev_cert_serial: None,
+                address: "192.0.2.10:5000".to_string(),
+                version: "1.7.0".to_string(),
+                schema_version: 50,
+                status: lorica_config::models::NodeStatus::Pending,
+                enrolled_at: now,
+                last_seen_at: None,
+                applied_config_generation: 0,
+                applied_config_hash: String::new(),
+                cert_not_after: now + chrono::Duration::days(90),
+                revoked_at: None,
+            })
+            .expect("test setup");
+    }
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/nodes",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let nodes = body_json(resp).await;
+    assert_eq!(nodes["data"][0]["node_id"], node_id);
+    assert_eq!(nodes["data"][0]["status"], "pending");
+    assert_eq!(nodes["data"][0]["connected"], false);
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        &format!("/api/v1/cluster/nodes/{node_id}/activate"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["status"], "active");
+    assert_eq!(
+        control.roster.lookup(&"ab".repeat(32)).map(|n| n.state),
+        Some(lorica_cluster::NodeState::Active),
+        "the roster is reloaded after activation"
+    );
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        &format!("/api/v1/cluster/nodes/{node_id}/activate"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "already active");
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/cluster/nodes/{node_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        control.roster.lookup(&"ab".repeat(32)).map(|n| n.state),
+        Some(lorica_cluster::NodeState::Revoked)
+    );
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/cluster/nodes/{node_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["status"], "revoked");
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/cluster/nodes/{node_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "revoking twice");
+    {
+        let store = state.store.lock().await;
+        let serials: Vec<String> = store
+            .list_cluster_revoked_serials()
+            .expect("crl")
+            .into_iter()
+            .map(|r| r.serial)
+            .collect();
+        assert_eq!(serials, vec!["4A".repeat(16)]);
+    }
+
+    // Status on a control plane lists the roster.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/status",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let status = body_json(resp).await;
+    assert_eq!(status["data"]["role"], "control_plane");
+    assert_eq!(status["data"]["fleet"][0]["status"], "revoked");
 }

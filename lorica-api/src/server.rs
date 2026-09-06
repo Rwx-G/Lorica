@@ -100,6 +100,9 @@ pub const RL_LOGS_CLEAR: u32 = 1;
 /// Users CRUD (Story 8.3). Moderate cap : account management is
 /// low-frequency, and create/update run an argon2 hash per call.
 pub const RL_USERS: u32 = 20;
+/// Cluster registry mutations (token mint/revoke, activate, revoke,
+/// leave) per window: operator-driven, a few per incident at most.
+pub const RL_CLUSTER: u32 = 30;
 
 /// Type-erased metrics refresher closure (WPAR-7 pull-on-scrape).
 ///
@@ -240,7 +243,12 @@ pub struct AppState {
     /// calls `task_tracker.close(); task_tracker.wait().await` so
     /// in-flight work completes rather than being dropped mid-step.
     /// Cheap to clone (internal `Arc`).
+    /// (`cluster` below carries the fleet role; see
+    /// `crate::cluster::ClusterRuntime`.)
     pub task_tracker: tokio_util::task::TaskTracker,
+    /// This process's fleet role and its live handles (Story 9.3):
+    /// `Standalone` on every install without a cluster role.
+    pub cluster: crate::cluster::ClusterRuntime,
 }
 
 impl AppState {
@@ -514,6 +522,35 @@ pub fn build_router(
                 .put(crate::users::update_user)
                 .delete(crate::users::delete_user)
                 .layer(rl("users", RL_USERS, RL_WINDOW_S)),
+        )
+        // Cluster registry (Story 9.3). Role floors live in the
+        // authorize middleware: tokens and every mutation are
+        // SuperAdmin, reads are Viewer+.
+        .route("/api/v1/cluster/status", get(crate::cluster::get_status))
+        .route(
+            "/api/v1/cluster/tokens",
+            get(crate::cluster::list_tokens)
+                .post(crate::cluster::mint_token)
+                .layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/tokens/{public_id}",
+            delete(crate::cluster::revoke_token).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route("/api/v1/cluster/nodes", get(crate::cluster::list_nodes))
+        .route(
+            "/api/v1/cluster/nodes/{id}",
+            get(crate::cluster::get_node)
+                .delete(crate::cluster::revoke_node)
+                .layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/nodes/{id}/activate",
+            post(crate::cluster::activate_node).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/leave",
+            post(crate::cluster::leave).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
         )
         .route("/api/v1/routes", get(crate::routes::list_routes))
         .route(

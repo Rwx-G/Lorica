@@ -131,6 +131,16 @@ static CLUSTER_PREAUTH_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     )
 });
 
+/// Token redemptions on the enrollment listener (Story 9.3 AC #1/#4).
+/// Labels: outcome (granted|refused).
+static CLUSTER_ENROLLMENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "lorica_cluster_enrollments_total",
+        "Join-token redemptions by outcome",
+        &["outcome"],
+    )
+});
+
 /// Failed `accept()` calls per listener (descriptor exhaustion and
 /// the like; each one pauses the accept loop). Labels: listener
 /// (operational|enrollment).
@@ -177,6 +187,7 @@ const CLUSTER_RPC_LABELS: &[&[&str]] = &[
     &["inbound", "tls", "timeout"],
     &["inbound", "tls", "failed"],
     &["inbound", "tls", "alpn_refused"],
+    &["inbound", "tls", "identity_refused"],
     &["inbound", "hello", "opener_timeout"],
     &["inbound", "hello", "transport_failure"],
     &["inbound", "hello", "admitted"],
@@ -186,6 +197,9 @@ const CLUSTER_RPC_LABELS: &[&[&str]] = &[
     &["inbound", "bridge", "protocol_violation"],
     &["inbound", "bridge", "unsupported_method"],
     &["inbound", "heartbeat", "ok"],
+    &["inbound", "renew", "ok"],
+    &["inbound", "leave", "ok"],
+    &["inbound", "session", "killed"],
     &["inbound", "session", "ended"],
 ];
 
@@ -213,6 +227,7 @@ struct ClusterPlaneSnapshot {
     op_handshake_timeouts: u64,
     op_tls_failures: u64,
     op_alpn_refusals: u64,
+    op_identity_refusals: u64,
     op_opener_timeouts: u64,
     op_handshake_transport_failures: u64,
     op_sessions_admitted: u64,
@@ -222,6 +237,9 @@ struct ClusterPlaneSnapshot {
     op_protocol_violations: u64,
     op_unsupported_methods: u64,
     op_heartbeats_served: u64,
+    op_renewals_served: u64,
+    op_leaves_served: u64,
+    op_sessions_killed: u64,
     op_sessions_ended: u64,
     op_accept_errors: u64,
     en_connections_total: u64,
@@ -235,6 +253,8 @@ struct ClusterPlaneSnapshot {
     en_rejected_time_budget: u64,
     en_rejected_window_closed: u64,
     en_accept_errors: u64,
+    en_enrollments_granted: u64,
+    en_enrollments_refused: u64,
     en_bind_failures: u64,
 }
 
@@ -267,6 +287,9 @@ pub fn install_cluster_plane_stats(
     }
     for listener in ["operational", "enrollment"] {
         CLUSTER_ACCEPT_ERRORS_TOTAL.with_label_values(&[listener]);
+    }
+    for outcome in ["granted", "refused"] {
+        CLUSTER_ENROLLMENTS_TOTAL.with_label_values(&[outcome]);
     }
     Lazy::force(&CLUSTER_ENROLLMENT_CONNECTIONS_TOTAL);
     Lazy::force(&CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL);
@@ -345,6 +368,12 @@ fn sync_cluster_plane_metrics() {
     );
     bump_vec(
         &CLUSTER_RPC_TOTAL,
+        &["inbound", "tls", "identity_refused"],
+        op.identity_refusals.load(Relaxed),
+        &mut last.op_identity_refusals,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
         &["inbound", "hello", "opener_timeout"],
         op.opener_timeouts.load(Relaxed),
         &mut last.op_opener_timeouts,
@@ -396,6 +425,24 @@ fn sync_cluster_plane_metrics() {
         &["inbound", "heartbeat", "ok"],
         op.heartbeats_served.load(Relaxed),
         &mut last.op_heartbeats_served,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "renew", "ok"],
+        op.renewals_served.load(Relaxed),
+        &mut last.op_renewals_served,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "leave", "ok"],
+        op.leaves_served.load(Relaxed),
+        &mut last.op_leaves_served,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "session", "killed"],
+        op.sessions_killed.load(Relaxed),
+        &mut last.op_sessions_killed,
     );
     bump_vec(
         &CLUSTER_RPC_TOTAL,
@@ -475,6 +522,18 @@ fn sync_cluster_plane_metrics() {
         &["enrollment"],
         en.accept_errors.load(Relaxed),
         &mut last.en_accept_errors,
+    );
+    bump_vec(
+        &CLUSTER_ENROLLMENTS_TOTAL,
+        &["granted"],
+        en.enrollments_granted.load(Relaxed),
+        &mut last.en_enrollments_granted,
+    );
+    bump_vec(
+        &CLUSTER_ENROLLMENTS_TOTAL,
+        &["refused"],
+        en.enrollments_refused.load(Relaxed),
+        &mut last.en_enrollments_refused,
     );
     bump(
         &CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL,
