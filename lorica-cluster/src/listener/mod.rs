@@ -46,7 +46,7 @@ pub use crate::preauth::PreAuthBudgets;
 pub use crate::session::SessionContext;
 pub use enrollment::{EnrollmentHandle, EnrollmentListener, EnrollmentStats};
 pub use operational::{
-    OperationalConfig, OperationalHandle, OperationalListener, OperationalStats,
+    FleetHooks, OperationalConfig, OperationalHandle, OperationalListener, OperationalStats,
     DEFAULT_ADMISSION_MAX_CONCURRENT, DEFAULT_ADMISSION_QUEUE_DEPTH,
     DEFAULT_ADMISSION_RETRY_AFTER_S, DEFAULT_MAX_SESSIONS, DEFAULT_OPENER_TIMEOUT,
 };

@@ -12,19 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The mandatory-mTLS operational listener (Story 9.2 AC #2/#10).
+//! The mandatory-mTLS operational listener (Story 9.2 AC #2/#10,
+//! Story 9.3 AC #7/#8).
 //!
 //! Per connection, in order: handshake permit and per-source slot
 //! (taken in the accept loop, before a task exists), mTLS accept under
 //! `handshake_timeout` (each accept reads the CURRENT config from the
-//! acceptor - Story 9.3's revocation seam), the ALPN check, the opener
-//! read under `opener_timeout` while the handshake permit is STILL
-//! held (an authenticated peer that never speaks holds a bounded,
-//! per-source-capped pre-session slot and no session slot), the
-//! session cap, then the handshake permit is released into the session
-//! pool, the admission gate with a bounded queued wait (AC #10), the
-//! session handshake (AC #4/#5), and the steady-state loop with every
-//! inbound request routed through the bridge whitelist (AC #6).
+//! acceptor - the revocation seam), the ALPN check, identity
+//! resolution from the peer certificate fingerprint against the
+//! roster (unknown or revoked: dropped and audited, nothing read), the
+//! opener read under `opener_timeout` while the handshake permit is
+//! STILL held (an authenticated peer that never speaks holds a
+//! bounded, per-source-capped pre-session slot and no session slot),
+//! the session cap, then the handshake permit is released into the
+//! session pool, the admission gate with a bounded queued wait
+//! (AC #10), the session handshake (AC #4/#5), registration in the
+//! session registry (superseding the node's older session; the
+//! registry's kill switch ends the session synchronously on
+//! revocation), and the steady-state loop with every inbound request
+//! routed through the bridge whitelist (AC #6).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -41,10 +47,15 @@ use lorica_command::{IncomingRequest, IncomingRequests, RpcEndpoint};
 
 use crate::admission::{AdmissionDecision, AdmissionGate};
 use crate::bridge::{translate_cluster_request, BridgeOutcome, InPlaneAction};
+use crate::enroll::{RenewRequest, SessionHandler};
 use crate::handshake::{serve_hello, HandshakeConfig};
 use crate::limits::cluster_rpc_limits;
-use crate::messages::{cluster_response, ClusterFrame, ClusterResponse, ClusterStatus, HeartbeatAck};
+use crate::messages::{
+    cluster_response, ClusterFrame, ClusterResponse, ClusterStatus, HeartbeatAck, LeaveAck,
+    RenewAck,
+};
 use crate::preauth::{accept_error_pause, PreAuthBudgets, SourceGate, SourceSlot};
+use crate::roster::{NodeIdentity, NodeState, Roster, SessionGuard, SessionRegistry};
 use crate::session::SessionContext;
 use crate::tls::{negotiated_cluster_alpn, peer_fingerprint, SwappableAcceptor};
 
@@ -85,11 +96,16 @@ pub struct OperationalStats {
     pub rejected_per_source: AtomicU64,
     /// TLS handshakes that exceeded `handshake_timeout`.
     pub handshake_timeouts: AtomicU64,
-    /// TLS handshakes that failed (no/invalid client certificate).
+    /// TLS handshakes that failed (no/invalid/revoked client
+    /// certificate).
     pub tls_failures: AtomicU64,
     /// Authenticated peers dropped for not negotiating the cluster
     /// ALPN.
     pub alpn_refusals: AtomicU64,
+    /// Authenticated peers whose certificate resolved to no enrolled
+    /// node, or to a revoked one (Story 9.3 AC #8): dropped and
+    /// audited before any byte was read.
+    pub identity_refusals: AtomicU64,
     /// Authenticated peers that sent no opener within
     /// `opener_timeout`.
     pub opener_timeouts: AtomicU64,
@@ -113,8 +129,29 @@ pub struct OperationalStats {
     pub unsupported_methods: AtomicU64,
     /// Heartbeats served in-plane.
     pub heartbeats_served: AtomicU64,
+    /// Certificate renewals issued over a session (Story 9.3 AC #12).
+    pub renewals_served: AtomicU64,
+    /// Nodes that left the fleet over their session (Story 9.3
+    /// AC #13).
+    pub leaves_served: AtomicU64,
+    /// Sessions ended by the registry's kill switch (revocation or
+    /// supersession by a newer session of the same node).
+    pub sessions_killed: AtomicU64,
     /// Established sessions that ended (any cause).
     pub sessions_ended: AtomicU64,
+}
+
+/// The fleet layer the listener consults once a peer is
+/// authenticated: identity resolution, the session registry and the
+/// binary's lifecycle hooks. Absent in transport-only tests.
+#[derive(Clone)]
+pub struct FleetHooks {
+    /// Fingerprint -> identity.
+    pub roster: Arc<Roster>,
+    /// Live sessions with kill switches.
+    pub sessions: Arc<SessionRegistry>,
+    /// Renewal, leave and audit hooks.
+    pub handler: Arc<dyn SessionHandler>,
 }
 
 /// Inputs for [`OperationalListener::spawn`]. Construct with
@@ -124,8 +161,7 @@ pub struct OperationalConfig {
     /// The already-bound socket (the binary owns bind validation and
     /// logging, AC #11).
     pub listener: TcpListener,
-    /// Mandatory-mTLS acceptor; read per accept (Story 9.3's
-    /// revocation seam).
+    /// Mandatory-mTLS acceptor; read per accept (the revocation seam).
     pub acceptor: Arc<SwappableAcceptor>,
     /// Protocol range and schema version for the session handshake.
     pub handshake: HandshakeConfig,
@@ -150,6 +186,10 @@ pub struct OperationalConfig {
     /// The supervisor takeover epoch stamped into every
     /// [`SessionContext`]. Default 0.
     pub takeover_epoch: u64,
+    /// The fleet layer (roster, registry, hooks). Default `None`:
+    /// every authenticated peer is served without identity, the
+    /// transport-only mode the 9.2 tests exercise.
+    pub fleet: Option<FleetHooks>,
 }
 
 impl OperationalConfig {
@@ -175,6 +215,7 @@ impl OperationalConfig {
             max_sessions: DEFAULT_MAX_SESSIONS,
             opener_timeout: DEFAULT_OPENER_TIMEOUT,
             takeover_epoch: 0,
+            fleet: None,
         }
     }
 }
@@ -203,6 +244,7 @@ struct OperationalShared {
     session_slots: Arc<Semaphore>,
     opener_timeout: Duration,
     takeover_epoch: u64,
+    fleet: Option<FleetHooks>,
 }
 
 /// The mandatory-mTLS operational listener (AC #2).
@@ -223,6 +265,7 @@ impl OperationalListener {
             max_sessions,
             opener_timeout,
             takeover_epoch,
+            fleet,
         } = config;
         let handshakes = Arc::new(Semaphore::new(budgets.max_concurrent_handshakes));
         let sources = SourceGate::new(budgets.max_per_source);
@@ -236,6 +279,7 @@ impl OperationalListener {
             session_slots: Arc::new(Semaphore::new(max_sessions)),
             opener_timeout,
             takeover_epoch,
+            fleet,
         });
         let task = tokio::spawn(async move {
             // Sessions live in a JoinSet so that aborting the accept
@@ -285,6 +329,49 @@ impl OperationalListener {
     }
 }
 
+/// Resolve the authenticated peer against the roster (Story 9.3
+/// AC #8). `Ok(None)` when no fleet layer is installed.
+async fn resolve_identity(
+    shared: &OperationalShared,
+    fingerprint: Option<&str>,
+    peer: SocketAddr,
+) -> Result<Option<NodeIdentity>, ()> {
+    let Some(fleet) = &shared.fleet else {
+        return Ok(None);
+    };
+    let Some(fingerprint) = fingerprint else {
+        // Mandatory client auth always yields a chain; treat its
+        // absence as unknown rather than trusting the peer.
+        shared.stats.identity_refusals.fetch_add(1, Ordering::Relaxed);
+        fleet
+            .handler
+            .on_identity_refused("-", peer, "no peer certificate exposed")
+            .await;
+        return Err(());
+    };
+    match fleet.roster.lookup(fingerprint) {
+        Some(identity) if identity.state != NodeState::Revoked => Ok(Some(identity)),
+        Some(_) => {
+            shared.stats.identity_refusals.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%peer, fingerprint = &fingerprint[..16], "revoked node reached identity resolution; dropped");
+            fleet
+                .handler
+                .on_identity_refused(fingerprint, peer, "certificate revoked")
+                .await;
+            Err(())
+        }
+        None => {
+            shared.stats.identity_refusals.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%peer, fingerprint = &fingerprint[..16], "valid cluster certificate with no enrolled node; dropped");
+            fleet
+                .handler
+                .on_identity_refused(fingerprint, peer, "no enrolled node for this certificate")
+                .await;
+            Err(())
+        }
+    }
+}
+
 /// One operational connection from accept to session end.
 /// `_source_slot` is held for the connection's whole life, so one
 /// source holds at most `max_per_source` connections in ANY phase,
@@ -326,6 +413,11 @@ async fn serve_operational_conn(
     // Captured BEFORE the stream is split into the endpoint - the
     // one value that becomes unreachable afterwards.
     let fingerprint = peer_fingerprint(conn);
+    // Identity from the certificate, never from a payload (AC #8),
+    // resolved before a single application byte is read.
+    let Ok(node) = resolve_identity(&shared, fingerprint.as_deref(), peer).await else {
+        return;
+    };
 
     // The endpoint is bounded by the handshake permit (still held)
     // and the per-source slot until the peer earns a session slot.
@@ -372,8 +464,8 @@ async fn serve_operational_conn(
     };
 
     let hint = shared.fleet_size.load(Ordering::Relaxed);
-    let ack = match serve_hello(opener, &shared.handshake, hint).await {
-        Ok(Ok(ack)) => ack,
+    let (ack, hello) = match serve_hello(opener, &shared.handshake, hint).await {
+        Ok(Ok(admitted)) => admitted,
         Ok(Err(status)) => {
             stats.handshake_refusals.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(%peer, ?status, "cluster session refused at handshake");
@@ -399,20 +491,49 @@ async fn serve_operational_conn(
         peer_cert_fingerprint: fingerprint,
         negotiated_version: ack.negotiated_version,
         takeover_epoch: shared.takeover_epoch,
+        node: node.clone(),
     };
     tracing::info!(
         peer = %ctx.peer_addr,
         fingerprint = ctx.fingerprint_prefix(),
+        node_id = ctx.node_id().unwrap_or("-"),
         protocol = ctx.negotiated_version,
         epoch = ctx.takeover_epoch,
         "cluster session established"
     );
 
-    serve_session(&mut incoming, &shared, &ctx).await;
+    // Register in the fleet layer: supersede the node's older
+    // session, tell the binary (it retires a superseded certificate
+    // on the first session over the new one), hold the kill switch.
+    let guard: Option<SessionGuard> = match (&shared.fleet, &node) {
+        (Some(fleet), Some(identity)) => {
+            let guard = fleet.sessions.register(
+                &identity.node_id,
+                peer,
+                &hello.build_version,
+                hello.schema_version,
+            );
+            fleet
+                .handler
+                .on_session_established(
+                    &identity.node_id,
+                    identity.via_previous_certificate,
+                    peer,
+                    &hello.build_version,
+                    hello.schema_version,
+                )
+                .await;
+            Some(guard)
+        }
+        _ => None,
+    };
+
+    serve_session(&mut incoming, &shared, &ctx, guard).await;
     stats.sessions_ended.fetch_add(1, Ordering::Relaxed);
     tracing::info!(
         peer = %ctx.peer_addr,
         fingerprint = ctx.fingerprint_prefix(),
+        node_id = ctx.node_id().unwrap_or("-"),
         "cluster session ended"
     );
 }
@@ -430,70 +551,191 @@ async fn reply_retry_later(
     let _ = tokio::time::timeout(REFUSAL_FLUSH_GRACE, incoming.recv()).await;
 }
 
+/// Why the steady-state loop returned.
+enum SessionEnd {
+    /// The peer went away or the loop chose to drop it.
+    Closed,
+    /// The registry's kill switch fired.
+    Killed,
+}
+
 /// Steady-state loop for an established operational session: EVERY
 /// inbound request routes through the bridge whitelist; a violation
 /// answers `PROTOCOL_VIOLATION` and drops the connection (AC #6), an
 /// unknown method answers `UNSUPPORTED_METHOD` and keeps it (AC #4).
+/// The registry's kill switch (revocation, supersession) ends the
+/// loop synchronously.
 async fn serve_session(
     incoming: &mut IncomingRequests<ClusterFrame>,
     shared: &OperationalShared,
     ctx: &SessionContext,
+    mut guard: Option<SessionGuard>,
 ) {
     let stats = &shared.stats;
-    while let Some(request) = incoming.recv().await {
-        match translate_cluster_request(request.request()) {
-            BridgeOutcome::InPlane(InPlaneAction::Heartbeat { timestamp_ms }) => {
-                stats.heartbeats_served.fetch_add(1, Ordering::Relaxed);
-                let ack = HeartbeatAck {
-                    timestamp_ms,
-                    fleet_size_hint: shared.fleet_size.load(Ordering::Relaxed),
-                };
-                if request
-                    .reply_frame(ClusterResponse::ok(cluster_response::Body::HeartbeatAck(
-                        ack,
-                    )))
-                    .await
-                    .is_err()
-                {
-                    return;
+    loop {
+        let request = match &mut guard {
+            Some(guard) => {
+                tokio::select! {
+                    next = incoming.recv() => match next {
+                        Some(request) => request,
+                        None => break,
+                    },
+                    _ = guard.killed() => {
+                        stats.sessions_killed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            peer = %ctx.peer_addr,
+                            node_id = ctx.node_id().unwrap_or("-"),
+                            "cluster session ended by the registry (revoked or superseded)"
+                        );
+                        return;
+                    }
                 }
             }
-            BridgeOutcome::Unsupported { body_kind } => {
-                stats.unsupported_methods.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
-                    peer = %ctx.peer_addr,
-                    fingerprint = ctx.fingerprint_prefix(),
-                    body_kind,
-                    "cluster request for a method this build does not implement; refused, session kept"
-                );
-                if request
+            None => match incoming.recv().await {
+                Some(request) => request,
+                None => break,
+            },
+        };
+        if let Some(guard) = &guard {
+            guard.entry().touch();
+        }
+        match serve_request(request, shared, ctx).await {
+            Some(SessionEnd::Closed) => return,
+            Some(SessionEnd::Killed) => return,
+            None => {}
+        }
+    }
+}
+
+/// Serve one inbound request; `Some` ends the session.
+async fn serve_request(
+    request: IncomingRequest<ClusterFrame>,
+    shared: &OperationalShared,
+    ctx: &SessionContext,
+) -> Option<SessionEnd> {
+    let stats = &shared.stats;
+    match translate_cluster_request(request.request()) {
+        BridgeOutcome::InPlane(InPlaneAction::Heartbeat { timestamp_ms }) => {
+            stats.heartbeats_served.fetch_add(1, Ordering::Relaxed);
+            let ack = HeartbeatAck {
+                timestamp_ms,
+                fleet_size_hint: shared.fleet_size.load(Ordering::Relaxed),
+            };
+            request
+                .reply_frame(ClusterResponse::ok(cluster_response::Body::HeartbeatAck(
+                    ack,
+                )))
+                .await
+                .err()
+                .map(|_| SessionEnd::Closed)
+        }
+        BridgeOutcome::InPlane(InPlaneAction::Renew { public_key_der }) => {
+            let (Some(fleet), Some(node_id)) = (&shared.fleet, ctx.node_id()) else {
+                // No fleet layer: the method exists but nobody can
+                // serve it here.
+                return request
                     .reply_frame(ClusterResponse::refusal(ClusterStatus::UnsupportedMethod))
                     .await
-                    .is_err()
-                {
-                    return;
+                    .err()
+                    .map(|_| SessionEnd::Closed);
+            };
+            let renewed = fleet
+                .handler
+                .on_renew(RenewRequest {
+                    node_id: node_id.to_string(),
+                    public_key_der,
+                })
+                .await;
+            let reply = match renewed {
+                Ok(grant) => {
+                    stats.renewals_served.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(peer = %ctx.peer_addr, node_id, "node certificate renewed");
+                    ClusterResponse::ok(cluster_response::Body::RenewAck(RenewAck {
+                        cert_pem: grant.cert_pem,
+                        cert_not_after: grant.cert_not_after,
+                    }))
+                }
+                Err(reason) => {
+                    tracing::warn!(peer = %ctx.peer_addr, node_id, %reason, "node certificate renewal refused");
+                    ClusterResponse::refusal(ClusterStatus::Unspecified)
+                }
+            };
+            request
+                .reply_frame(reply)
+                .await
+                .err()
+                .map(|_| SessionEnd::Closed)
+        }
+        BridgeOutcome::InPlane(InPlaneAction::Leave) => {
+            let (Some(fleet), Some(node_id)) = (&shared.fleet, ctx.node_id()) else {
+                return request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::UnsupportedMethod))
+                    .await
+                    .err()
+                    .map(|_| SessionEnd::Closed);
+            };
+            match fleet.handler.on_leave(node_id, ctx.peer_addr).await {
+                Ok(()) => {
+                    stats.leaves_served.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(peer = %ctx.peer_addr, node_id, "node left the fleet");
+                    let _ = request
+                        .reply_frame(ClusterResponse::ok(cluster_response::Body::LeaveAck(
+                            LeaveAck {},
+                        )))
+                        .await;
+                    // The node is revoked now; its session ends with
+                    // the acknowledgement.
+                    tokio::time::sleep(REFUSAL_FLUSH_GRACE).await;
+                    Some(SessionEnd::Killed)
+                }
+                Err(reason) => {
+                    tracing::warn!(peer = %ctx.peer_addr, node_id, %reason, "leave refused");
+                    request
+                        .reply_frame(ClusterResponse::refusal(ClusterStatus::Unspecified))
+                        .await
+                        .err()
+                        .map(|_| SessionEnd::Closed)
                 }
             }
-            BridgeOutcome::ProtocolViolation => {
-                stats.protocol_violations.fetch_add(1, Ordering::Relaxed);
-                // The highest-signal security event on this plane: an
-                // enrolled node speaking out of plane or out of phase.
-                // Story 9.3 routes it into the audit log once the peer
-                // identity is in the roster.
-                tracing::warn!(
-                    peer = %ctx.peer_addr,
-                    fingerprint = ctx.fingerprint_prefix(),
-                    "cluster protocol violation from an authenticated peer; dropping the session"
-                );
-                let _ = request
-                    .reply_frame(ClusterResponse::refusal(ClusterStatus::ProtocolViolation))
+        }
+        BridgeOutcome::Unsupported { body_kind } => {
+            stats.unsupported_methods.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                peer = %ctx.peer_addr,
+                fingerprint = ctx.fingerprint_prefix(),
+                body_kind,
+                "cluster request for a method this build does not implement; refused, session kept"
+            );
+            request
+                .reply_frame(ClusterResponse::refusal(ClusterStatus::UnsupportedMethod))
+                .await
+                .err()
+                .map(|_| SessionEnd::Closed)
+        }
+        BridgeOutcome::ProtocolViolation => {
+            stats.protocol_violations.fetch_add(1, Ordering::Relaxed);
+            // The highest-signal security event on this plane: an
+            // enrolled node speaking out of plane or out of phase.
+            tracing::warn!(
+                peer = %ctx.peer_addr,
+                fingerprint = ctx.fingerprint_prefix(),
+                node_id = ctx.node_id().unwrap_or("-"),
+                "cluster protocol violation from an authenticated peer; dropping the session"
+            );
+            if let (Some(fleet), Some(node_id)) = (&shared.fleet, ctx.node_id()) {
+                fleet
+                    .handler
+                    .on_protocol_violation(node_id, ctx.peer_addr)
                     .await;
-                // Let the refusal flush (the caller drops the endpoint,
-                // and with it the writer, the moment this returns),
-                // then drop the connection.
-                let _ = tokio::time::timeout(REFUSAL_FLUSH_GRACE, incoming.recv()).await;
-                return;
             }
+            let _ = request
+                .reply_frame(ClusterResponse::refusal(ClusterStatus::ProtocolViolation))
+                .await;
+            // Let the refusal flush (the caller drops the endpoint,
+            // and with it the writer, the moment this returns),
+            // then drop the connection.
+            tokio::time::sleep(REFUSAL_FLUSH_GRACE).await;
+            Some(SessionEnd::Closed)
         }
     }
 }

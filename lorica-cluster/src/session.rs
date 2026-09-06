@@ -18,8 +18,10 @@
 
 use std::net::SocketAddr;
 
+use crate::roster::NodeIdentity;
+
 /// Everything known about an established operational session; the
-/// per-session log context now, the handler input for Stories 9.3
+/// per-session log context, and the handler input for Stories 9.3
 /// (identity, fencing) and 9.4 (dispatch).
 #[derive(Debug, Clone)]
 pub struct SessionContext {
@@ -33,8 +35,11 @@ pub struct SessionContext {
     /// The protocol version both sides agreed on (AC #4).
     pub negotiated_version: u32,
     /// The supervisor takeover epoch this session was accepted under
-    /// (Story 9.1 AC #7; Story 9.3's registry fences older epochs).
+    /// (Story 9.1 AC #7; the registry fences older epochs).
     pub takeover_epoch: u64,
+    /// The enrolled node behind the certificate (Story 9.3 AC #8),
+    /// `None` only when the listener runs without a fleet layer.
+    pub node: Option<NodeIdentity>,
 }
 
 impl SessionContext {
@@ -45,6 +50,11 @@ impl SessionContext {
             .as_deref()
             .map(|fp| &fp[..fp.len().min(16)])
             .unwrap_or("-")
+    }
+
+    /// The node id from the certificate identity, when resolved.
+    pub fn node_id(&self) -> Option<&str> {
+        self.node.as_ref().map(|n| n.node_id.as_str())
     }
 }
 
@@ -59,8 +69,10 @@ mod tests {
             peer_cert_fingerprint: Some("ab".repeat(32)),
             negotiated_version: 1,
             takeover_epoch: 0,
+            node: None,
         };
         assert_eq!(ctx.fingerprint_prefix(), "abababababababab");
+        assert!(ctx.node_id().is_none());
         ctx.peer_cert_fingerprint = Some("abc".to_string());
         assert_eq!(ctx.fingerprint_prefix(), "abc");
         ctx.peer_cert_fingerprint = None;

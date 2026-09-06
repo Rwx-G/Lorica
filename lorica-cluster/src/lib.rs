@@ -31,7 +31,11 @@
 //!   [`bridge`] (AC #6) and the [`session`] contract later stories
 //!   consume.
 //!
-//! Enrollment (join tokens, issuance over the wire) is Story 9.3.
+//! Story 9.3 adds the fleet layer: join [`token`]s, the redemption
+//! and lifecycle hooks in [`enroll`], the in-memory [`roster`] with
+//! its session registry and kill switches, bare-public-key issuance
+//! and CRL minting in [`ca`], and the SPKI-pinning joiner config in
+//! [`tls`].
 //!
 //! # API stability rule
 //!
@@ -51,41 +55,60 @@ pub mod admission;
 pub mod bridge;
 pub mod ca;
 pub mod dialer;
+pub mod enroll;
 pub mod frame;
 pub mod handshake;
 pub mod limits;
 pub mod listener;
 pub mod messages;
 pub mod preauth;
+pub mod roster;
 pub mod session;
 pub mod tls;
+pub mod token;
 pub mod version;
 
 pub use admission::{AdmissionDecision, AdmissionGate, AdmissionPermit, DEFAULT_QUEUE_WAIT};
 pub use bridge::{translate_cluster_request, BridgeOutcome, InPlaneAction};
-pub use ca::{CaError, ClusterCa};
+pub use ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
+pub use enroll::{
+    join, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, JoinError, JoinParams,
+    NoopSessionHandler, RefuseAllEnrollments, RenewGrant, RenewRequest, SessionHandler,
+};
 pub use dialer::{
     split_host_port, ClusterConnection, Dialer, DialerConfig, DialerError, DialerHandle,
     DialerStats, SessionHandle, BACKOFF_CAP_CEILING,
 };
 pub use handshake::{
-    client_handshake, evaluate_hello, node_name_is_valid, serve_hello, HandshakeConfig,
-    HandshakeError, MAX_NODE_NAME_BYTES,
+    client_handshake, display_field_is_valid, evaluate_hello, node_name_is_valid, serve_hello,
+    HandshakeConfig, HandshakeError, MAX_NODE_NAME_BYTES,
 };
 pub use limits::{cluster_rpc_limits, CLUSTER_MAX_MESSAGE_SIZE, CLUSTER_QUEUE_CAP};
 pub use listener::{
-    EnrollmentHandle, EnrollmentListener, EnrollmentStats, OperationalConfig, OperationalHandle,
-    OperationalListener, OperationalStats, TokenLiveness, DEFAULT_MAX_SESSIONS,
-    DEFAULT_OPENER_TIMEOUT,
+    EnrollmentHandle, EnrollmentListener, EnrollmentStats, FleetHooks, OperationalConfig,
+    OperationalHandle, OperationalListener, OperationalStats, TokenLiveness,
+    DEFAULT_MAX_SESSIONS, DEFAULT_OPENER_TIMEOUT,
 };
 pub use messages::{
-    ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus, Heartbeat, HeartbeatAck, Hello,
-    HelloAck, BODY_KIND_HEARTBEAT, BODY_KIND_HELLO,
+    ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus, Enroll, EnrollAck, Heartbeat,
+    HeartbeatAck, Hello, HelloAck, Leave, LeaveAck, Renew, RenewAck, BODY_KIND_ENROLL,
+    BODY_KIND_HEARTBEAT, BODY_KIND_HELLO, BODY_KIND_LEAVE, BODY_KIND_RENEW,
 };
 pub use preauth::{source_key, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
+pub use roster::{
+    ControlPlane, LiveSessionSnapshot, NodeIdentity, NodeState, Roster, SessionGuard,
+    SessionRegistry,
+};
 pub use session::SessionContext;
 pub use tls::{
-    client_config, enrollment_server_config, negotiated_cluster_alpn, operational_server_config,
+    client_config, enrollment_server_config, join_client_config, leaf_spki_sha256,
+    negotiated_cluster_alpn, operational_server_config, operational_server_config_with_crl,
     peer_fingerprint, ClusterTlsError, SwappableAcceptor, CLUSTER_ALPN,
 };
+pub use token::{MintedToken, ParsedToken, TokenFormatError};
 pub use version::{negotiate, PROTOCOL_MIN_COMPATIBLE, PROTOCOL_VERSION};
+
+/// The TLS stack this crate's configs are built for, re-exported so
+/// callers build connectors and acceptors against the same rustls
+/// without pinning it themselves.
+pub use tokio_rustls;

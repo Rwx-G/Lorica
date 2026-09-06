@@ -44,7 +44,8 @@
 
 use crate::messages::{cluster_request, ClusterRequest};
 
-/// The in-plane actions the whitelist admits (Story 9.2 set).
+/// The in-plane actions the whitelist admits (Story 9.2 session
+/// traffic, Story 9.3 lifecycle).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InPlaneAction {
     /// A liveness probe carrying the sender's clock (unix ms).
@@ -52,6 +53,15 @@ pub enum InPlaneAction {
         /// The probe's `timestamp_ms`, echoed in the ack.
         timestamp_ms: u64,
     },
+    /// The node asks for a new certificate on a new public key
+    /// (Story 9.3 AC #12). Identity comes from the session, never
+    /// from this payload.
+    Renew {
+        /// The new `SubjectPublicKeyInfo`, DER.
+        public_key_der: Vec<u8>,
+    },
+    /// The node is leaving the fleet (Story 9.3 AC #13).
+    Leave,
 }
 
 /// Outcome of routing one inbound cluster request through the
@@ -95,6 +105,10 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
                 timestamp_ms: hb.timestamp_ms,
             },
         ),
+        Some(cluster_request::Body::Renew(renew)) => BridgeOutcome::InPlane(InPlaneAction::Renew {
+            public_key_der: renew.public_key_der.clone(),
+        }),
+        Some(cluster_request::Body::Leave(_)) => BridgeOutcome::InPlane(InPlaneAction::Leave),
         // ---- Newer peer: known shape, unknown method. ----
         None if request.body_kind != 0
             && !ClusterRequest::is_known_body_kind(request.body_kind) =>
@@ -103,8 +117,11 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
                 body_kind: request.body_kind,
             }
         }
-        // ---- Everything else is a violation. ----
-        Some(cluster_request::Body::Hello(_)) | None => BridgeOutcome::ProtocolViolation,
+        // ---- Everything else is a violation. An Enroll on the
+        // ---- operational plane is a peer using the wrong listener.
+        Some(cluster_request::Body::Hello(_))
+        | Some(cluster_request::Body::Enroll(_))
+        | None => BridgeOutcome::ProtocolViolation,
     }
 }
 
@@ -128,6 +145,28 @@ mod tests {
         req.body_kind = BODY_KIND_HELLO;
         assert_eq!(
             translate_cluster_request(&req),
+            BridgeOutcome::ProtocolViolation
+        );
+    }
+
+    #[test]
+    fn lifecycle_requests_are_whitelisted_and_enroll_is_not() {
+        let renew = ClusterRequest::renew(crate::messages::Renew {
+            public_key_der: vec![1, 2, 3],
+        });
+        assert_eq!(
+            translate_cluster_request(&renew),
+            BridgeOutcome::InPlane(InPlaneAction::Renew {
+                public_key_der: vec![1, 2, 3]
+            })
+        );
+        assert_eq!(
+            translate_cluster_request(&ClusterRequest::leave()),
+            BridgeOutcome::InPlane(InPlaneAction::Leave)
+        );
+        let enroll = ClusterRequest::enroll(crate::messages::Enroll::default());
+        assert_eq!(
+            translate_cluster_request(&enroll),
             BridgeOutcome::ProtocolViolation
         );
     }

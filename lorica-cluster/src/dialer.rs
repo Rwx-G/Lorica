@@ -58,7 +58,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio::task::JoinHandle;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
@@ -226,6 +226,8 @@ impl ClusterConnection {
 pub struct DialerHandle {
     connection: ClusterConnection,
     stats: Arc<DialerStats>,
+    connector: Arc<ArcSwap<TlsConnector>>,
+    ca_pem: String,
     task: JoinHandle<()>,
 }
 
@@ -238,6 +240,19 @@ impl DialerHandle {
     /// The dialer's counters.
     pub fn stats(&self) -> Arc<DialerStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Swap in a renewed identity (Story 9.3 AC #12): the NEXT
+    /// connection presents the new leaf; the established session is
+    /// untouched.
+    pub fn update_identity(
+        &self,
+        client_cert_pem: &str,
+        client_key_pem: &str,
+    ) -> Result<(), ClusterTlsError> {
+        let tls = client_config(&self.ca_pem, client_cert_pem, client_key_pem)?;
+        self.connector.store(Arc::new(TlsConnector::from(Arc::new(tls))));
+        Ok(())
     }
 
     /// Stop dialing and clear the connection slot.
@@ -258,23 +273,28 @@ impl Dialer {
         let tls = client_config(&config.ca_pem, &config.client_cert_pem, &config.client_key_pem)?;
         let server_name: ServerName<'static> = ServerName::try_from(config.server_name.clone())
             .map_err(|e| ClusterTlsError::Parse(format!("invalid server name: {e}")))?;
-        let connector = TlsConnector::from(Arc::new(tls));
+        let connector: Arc<ArcSwap<TlsConnector>> =
+            Arc::new(ArcSwap::from_pointee(TlsConnector::from(Arc::new(tls))));
 
         let slot: Arc<ArcSwapOption<SessionHandle>> = Arc::new(ArcSwapOption::empty());
         let stats = Arc::new(DialerStats::default());
         let connection = ClusterConnection {
             slot: Arc::clone(&slot),
         };
+        let ca_pem = config.ca_pem.clone();
 
         let loop_slot = Arc::clone(&slot);
         let loop_stats = Arc::clone(&stats);
+        let loop_connector = Arc::clone(&connector);
         let task = tokio::spawn(async move {
-            dial_loop(config, connector, server_name, loop_slot, loop_stats).await;
+            dial_loop(config, loop_connector, server_name, loop_slot, loop_stats).await;
         });
 
         Ok(DialerHandle {
             connection,
             stats,
+            connector,
+            ca_pem,
             task,
         })
     }
@@ -282,7 +302,7 @@ impl Dialer {
 
 async fn dial_loop(
     config: DialerConfig,
-    connector: TlsConnector,
+    connector: Arc<ArcSwap<TlsConnector>>,
     server_name: ServerName<'static>,
     slot: Arc<ArcSwapOption<SessionHandle>>,
     stats: Arc<DialerStats>,
@@ -302,7 +322,10 @@ async fn dial_loop(
 
     loop {
         stats.connect_attempts.fetch_add(1, Ordering::Relaxed);
-        match connect_once(&config, &connector, &server_name).await {
+        // Loaded per attempt so a renewed identity takes effect on
+        // the next connection.
+        let current_connector = connector.load_full();
+        match connect_once(&config, &current_connector, &server_name).await {
             Ok((endpoint, ack_hint, negotiated_version, addr)) => {
                 stats.handshakes_ok.fetch_add(1, Ordering::Relaxed);
                 failures = 0;

@@ -33,7 +33,9 @@ message ClusterFrame {
 
 // A request from either side (the dialing follower or the control
 // plane). Body tags:
-//   10-19  session control (Story 9.2)
+//   10-19  session control (Story 9.2) and lifecycle (Story 9.3:
+//          enroll on the enrollment listener, renew and leave on an
+//          established session)
 //   20-39  RESERVED for configuration replication (Story 9.4)
 //   40-59  RESERVED for telemetry fan-in (Story 9.6)
 //   60-79  RESERVED for certificate distribution (Story 9.5)
@@ -50,6 +52,9 @@ message ClusterRequest {
   oneof body {
     Hello hello = 10;
     Heartbeat heartbeat = 11;
+    Enroll enroll = 12;
+    Renew renew = 13;
+    Leave leave = 14;
   }
 }
 
@@ -63,6 +68,9 @@ message ClusterResponse {
   oneof body {
     HelloAck hello_ack = 10;
     HeartbeatAck heartbeat_ack = 11;
+    EnrollAck enroll_ack = 12;
+    RenewAck renew_ack = 13;
+    LeaveAck leave_ack = 14;
   }
 }
 
@@ -81,7 +89,52 @@ message Hello {
   // fingerprint recorded at enrollment (Story 9.3 AC #8); this field
   // must never be used for authorization or as a metric label.
   string node_name = 4;
+  // The sender's build version, display only (Story 9.3 AC #9's
+  // `version` column). Bounded like node_name.
+  string build_version = 5;
 }
+
+// Token redemption (Story 9.3 AC #1/#3), the ONLY frame the
+// enrollment listener accepts, sent inside a TLS session pinned to
+// the control-plane leaf SPKI carried by the token. No CSR: the node
+// sends its bare public key and the control plane assigns every
+// certificate parameter itself.
+message Enroll {
+  string public_id = 1;        // Token lookup half
+  bytes secret = 2;            // Token secret half (32 bytes)
+  bytes public_key_der = 3;    // The node's SubjectPublicKeyInfo, DER
+  string node_name = 4;        // Requested display name (bounded)
+  string build_version = 5;    // Display only (bounded)
+  uint32 schema_version = 6;   // The node's database schema version
+}
+
+// A granted enrollment. Any refusal is the opaque status with no
+// body (Story 9.2 AC #4).
+message EnrollAck {
+  string node_id = 1;          // Server-assigned identity
+  string cert_pem = 2;         // The node's clientAuth leaf
+  string ca_pem = 3;           // The cluster CA bundle
+  string status = 4;           // "pending" or "active" (AC #5)
+  string cert_not_after = 5;   // RFC 3339
+}
+
+// Certificate renewal over an established session (AC #12): the node
+// sends a NEW bare public key; the previous certificate stays valid
+// until the node's first session on the new one.
+message Renew {
+  bytes public_key_der = 1;
+}
+
+message RenewAck {
+  string cert_pem = 1;
+  string cert_not_after = 2;   // RFC 3339
+}
+
+// The node is leaving the fleet (AC #13): the control plane revokes
+// it, audits and alerts; the session ends with the acknowledgement.
+message Leave {}
+
+message LeaveAck {}
 
 // Control-plane answer to Hello when the session is admitted.
 message HelloAck {

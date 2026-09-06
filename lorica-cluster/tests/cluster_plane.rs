@@ -39,7 +39,8 @@ use lorica_cluster::listener::{
 use lorica_cluster::messages::{cluster_request, ClusterFrame, ClusterRequest, Heartbeat};
 use lorica_cluster::{
     client_config, enrollment_server_config, operational_server_config, AdmissionGate, ClusterCa,
-    ClusterStatus, Dialer, DialerConfig, HandshakeError, SwappableAcceptor, BODY_KIND_HELLO,
+    ClusterStatus, Dialer, DialerConfig, HandshakeError, RefuseAllEnrollments, SwappableAcceptor,
+    BODY_KIND_HELLO,
 };
 use lorica_command::RpcEndpoint;
 
@@ -196,6 +197,7 @@ async fn enrollment_listener_follows_token_liveness() {
         tokens_rx,
         PreAuthBudgets::default(),
         Arc::clone(&stats),
+        Arc::new(RefuseAllEnrollments),
     );
     let mut bound = handle.bound.clone();
 
@@ -253,6 +255,7 @@ async fn enrollment_budgets_drop_and_count() {
         tokens_rx,
         budgets,
         Arc::clone(&stats),
+        Arc::new(RefuseAllEnrollments),
     );
     let mut bound = handle.bound.clone();
     eventually("listener to open", || bound.borrow_and_update().is_some()).await;
@@ -305,6 +308,7 @@ async fn enrollment_per_source_cap_drops_the_excess_before_tls() {
         tokens_rx,
         budgets,
         Arc::clone(&stats),
+        Arc::new(RefuseAllEnrollments),
     );
     let mut bound = handle.bound.clone();
     eventually("listener to open", || bound.borrow_and_update().is_some()).await;

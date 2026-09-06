@@ -28,11 +28,27 @@
 //! control-plane certificate is `serverAuth`-ONLY, so a stolen node
 //! certificate cannot impersonate the control plane and vice versa.
 
-use chrono::Datelike;
+use chrono::{DateTime, Datelike, Utc};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, CertificateRevocationListParams, DistinguishedName,
+    DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
+    RevocationReason, RevokedCertParams, SanType, SerialNumber, SubjectPublicKeyInfo,
 };
+use ring::rand::{SecureRandom, SystemRandom};
+use rustls_pki_types::CertificateRevocationListDer;
+use x509_parser::prelude::FromDer;
+use x509_parser::public_key::PublicKey;
+
+/// Bytes in a node-certificate serial (RFC 5280 allows up to 20).
+const SERIAL_LEN: usize = 16;
+
+/// Smallest RSA modulus the fleet accepts (Story 9.3 AC #3).
+const MIN_RSA_BITS: usize = 2048;
+
+/// How long a minted CRL declares itself current; the control plane
+/// re-mints on every revocation and at every boot, so this is a
+/// ceiling, not a schedule.
+const CRL_VALIDITY_DAYS: i64 = 365;
 
 /// CA certificate validity (10 years): rotating the fleet root is a
 /// re-enrollment event, not routine maintenance.
@@ -51,7 +67,135 @@ pub enum CaError {
     /// The persisted CA material did not parse back into a signer.
     #[error("cluster CA material rejected: {0}")]
     Parse(String),
+    /// A joiner's public key is not on the allowlist (Ed25519, P-256,
+    /// RSA of at least 2048 bits) or is not a valid SPKI.
+    #[error("public key refused: {0}")]
+    PublicKey(String),
 }
+
+/// A node certificate issued on a bare public key (Story 9.3 AC #3).
+#[derive(Debug, Clone)]
+pub struct IssuedLeaf {
+    /// The certificate, PEM.
+    pub cert_pem: String,
+    /// Uppercase-hex serial (CRLs revoke by serial).
+    pub serial_hex: String,
+    /// Lowercase-hex SHA-256 of the certificate DER (the identity the
+    /// operational listener matches).
+    pub fingerprint_sha256: String,
+    /// `notAfter` (midnight UTC of the expiry date).
+    pub not_after: DateTime<Utc>,
+}
+
+/// One entry of the CRL the control plane mints (Story 9.3 AC #7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokedEntry {
+    /// Uppercase-hex serial.
+    pub serial_hex: String,
+    /// When the control plane processed the revocation.
+    pub revoked_at: DateTime<Utc>,
+    /// `true` for a certificate superseded by a renewal, `false` for
+    /// an operator revocation.
+    pub superseded: bool,
+}
+
+/// Generate a node keypair for `lorica cluster join` and renewals
+/// (P-256, the allowlist's default): `(spki_der, key_pem)`. The
+/// private key never leaves the node (Story 9.3 AC #3).
+pub fn generate_node_keypair() -> Result<(Vec<u8>, String), CaError> {
+    use rcgen::PublicKeyData;
+    let key_pair: KeyPair = KeyPair::generate().map_err(|e| CaError::Generate(e.to_string()))?;
+    Ok((key_pair.subject_public_key_info(), key_pair.serialize_pem()))
+}
+
+/// Check a joiner's DER SPKI against the allowlist (AC #3): Ed25519,
+/// P-256, RSA with a modulus of at least [`MIN_RSA_BITS`]. Anything
+/// else (P-384, small RSA, DSA, malformed) is refused BEFORE any
+/// signing.
+pub fn check_public_key_allowlist(spki_der: &[u8]) -> Result<(), CaError> {
+    use x509_parser::oid_registry::{
+        OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_PKCS1_RSAENCRYPTION, OID_SIG_ED25519,
+    };
+    let (rest, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki_der)
+        .map_err(|e| CaError::PublicKey(format!("not a SubjectPublicKeyInfo: {e}")))?;
+    if !rest.is_empty() {
+        return Err(CaError::PublicKey("trailing bytes after the key".into()));
+    }
+    let alg = &spki.algorithm.algorithm;
+    if *alg == OID_SIG_ED25519 {
+        return Ok(());
+    }
+    if *alg == OID_KEY_TYPE_EC_PUBLIC_KEY {
+        let curve = spki
+            .algorithm
+            .parameters
+            .as_ref()
+            .and_then(|p| p.as_oid().ok());
+        return match curve {
+            Some(curve) if curve == OID_EC_P256 => Ok(()),
+            _ => Err(CaError::PublicKey(
+                "elliptic-curve key is not P-256".into(),
+            )),
+        };
+    }
+    if *alg == OID_PKCS1_RSAENCRYPTION {
+        return match spki.parsed() {
+            Ok(PublicKey::RSA(rsa)) if rsa.key_size() >= MIN_RSA_BITS => Ok(()),
+            Ok(PublicKey::RSA(rsa)) => Err(CaError::PublicKey(format!(
+                "RSA modulus of {} bits is below {MIN_RSA_BITS}",
+                rsa.key_size()
+            ))),
+            _ => Err(CaError::PublicKey("malformed RSA key".into())),
+        };
+    }
+    Err(CaError::PublicKey(format!(
+        "algorithm {alg} is not on the allowlist (Ed25519, P-256, RSA-2048+)"
+    )))
+}
+
+/// A random positive serial whose DER encoding is exactly
+/// [`SERIAL_LEN`] bytes (first byte in `0x40..=0x7f`), so the hex the
+/// registry stores equals what any parser reads back.
+fn random_serial() -> Result<[u8; SERIAL_LEN], CaError> {
+    let mut bytes = [0u8; SERIAL_LEN];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| CaError::Generate("serial randomness unavailable".into()))?;
+    bytes[0] = (bytes[0] & 0x3f) | 0x40;
+    Ok(bytes)
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Result<Vec<u8>, CaError> {
+    if !s.len().is_multiple_of(2) {
+        return Err(CaError::Parse(format!("odd-length serial {s:?}")));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| CaError::Parse(format!("non-hex serial {s:?}")))
+        })
+        .collect()
+}
+
+/// Midnight UTC of `now + days`, the instant `set_validity` encodes.
+fn midnight_after(now: DateTime<Utc>, days: i64) -> DateTime<Utc> {
+    let date = (now + chrono::Duration::days(days)).date_naive();
+    DateTime::<Utc>::from_naive_utc_and_offset(
+        date.and_hms_opt(0, 0, 0).unwrap_or_default(),
+        Utc,
+    )
+}
+
+
 
 /// A cluster CA loaded in memory, able to issue leaves.
 pub struct ClusterCa {
@@ -141,6 +285,89 @@ impl ClusterCa {
             Some(host),
             &leaf_key,
         )
+    }
+
+    /// Issue a node leaf on the node's BARE public key (Story 9.3
+    /// AC #3: no CSR, every parameter server-assigned): CN =
+    /// `node_id`, EKU `clientAuth` ONLY, `CA:FALSE`, a random
+    /// 16-byte serial, valid [`LEAF_VALIDITY_DAYS`]. The key is
+    /// checked against the allowlist first.
+    pub fn issue_node_leaf_for_public_key(
+        &self,
+        node_id: &str,
+        spki_der: &[u8],
+    ) -> Result<IssuedLeaf, CaError> {
+        check_public_key_allowlist(spki_der)?;
+        let public_key = SubjectPublicKeyInfo::from_der(spki_der)
+            .map_err(|e| CaError::PublicKey(format!("unusable public key: {e}")))?;
+        let serial = random_serial()?;
+        let now = Utc::now();
+
+        let mut params: CertificateParams = CertificateParams::default();
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params.serial_number = Some(SerialNumber::from_slice(&serial));
+        let mut dn: DistinguishedName = DistinguishedName::new();
+        dn.push(DnType::CommonName, node_id);
+        params.distinguished_name = dn;
+        set_validity(&mut params, LEAF_VALIDITY_DAYS);
+
+        let issuer = rcgen::Issuer::from_ca_cert_pem(&self.cert_pem, &self.key_pair)
+            .map_err(|e| CaError::Parse(e.to_string()))?;
+        let cert = params
+            .signed_by(&public_key, &issuer)
+            .map_err(|e| CaError::Generate(e.to_string()))?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, cert.der().as_ref());
+        Ok(IssuedLeaf {
+            cert_pem: cert.pem(),
+            serial_hex: hex_upper(&serial),
+            fingerprint_sha256: hex_lower(digest.as_ref()),
+            not_after: midnight_after(now, LEAF_VALIDITY_DAYS),
+        })
+    }
+
+    /// Mint a CRL over `revoked` (Story 9.3 AC #7), signed by the CA
+    /// (`cRLSign` is in its key usage). Day granularity on the dates:
+    /// the control plane re-mints on every change, and rustls does
+    /// not schedule by `nextUpdate`.
+    pub fn mint_crl(
+        &self,
+        revoked: &[RevokedEntry],
+    ) -> Result<CertificateRevocationListDer<'static>, CaError> {
+        let now = Utc::now();
+        // rcgen's date type is not nameable without the `time` crate;
+        // a closure infers it.
+        let ymd = |dt: DateTime<Utc>| rcgen::date_time_ymd(dt.year(), dt.month() as u8, dt.day() as u8);
+        let mut revoked_certs = Vec::with_capacity(revoked.len());
+        for entry in revoked {
+            revoked_certs.push(RevokedCertParams {
+                serial_number: SerialNumber::from_slice(&unhex(&entry.serial_hex)?),
+                revocation_time: ymd(entry.revoked_at),
+                reason_code: Some(if entry.superseded {
+                    RevocationReason::Superseded
+                } else {
+                    RevocationReason::CessationOfOperation
+                }),
+                invalidity_date: None,
+            });
+        }
+        // Monotonic enough: unix seconds, big-endian, top bit clear.
+        let crl_number = u64::try_from(now.timestamp()).unwrap_or(0) & 0x7fff_ffff_ffff_ffff;
+        let params = CertificateRevocationListParams {
+            this_update: ymd(now - chrono::Duration::days(1)),
+            next_update: ymd(now + chrono::Duration::days(CRL_VALIDITY_DAYS)),
+            crl_number: SerialNumber::from_slice(&crl_number.to_be_bytes()),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: KeyIdMethod::Sha256,
+        };
+        let issuer = rcgen::Issuer::from_ca_cert_pem(&self.cert_pem, &self.key_pair)
+            .map_err(|e| CaError::Parse(e.to_string()))?;
+        let crl = params
+            .signed_by(&issuer)
+            .map_err(|e| CaError::Generate(format!("CRL: {e}")))?;
+        Ok(crl.into())
     }
 
     /// Issue a node (follower) leaf: EKU `clientAuth` ONLY, CN =
@@ -269,6 +496,92 @@ mod tests {
             .expect("reissued leaf must pair with the persisted key");
         assert!(matches!(
             ca.issue_server_leaf_with_key("cp.internal", "not a key"),
+            Err(CaError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn bare_public_keys_are_issued_only_from_the_allowlist() {
+        use rcgen::PublicKeyData;
+        let ca = ClusterCa::generate("Lorica Cluster CA").expect("generate");
+        let p256 = KeyPair::generate().expect("p256");
+        let issued = ca
+            .issue_node_leaf_for_public_key("node-1", &p256.subject_public_key_info())
+            .expect("P-256 accepted");
+        assert!(issued.cert_pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(issued.serial_hex.len(), SERIAL_LEN * 2);
+        assert_eq!(issued.fingerprint_sha256.len(), 64);
+        assert!(issued.not_after > Utc::now());
+        // The serial the registry stores is the one in the certificate.
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        let der = tokio_rustls::rustls::pki_types::CertificateDer::from_pem_slice(
+            issued.cert_pem.as_bytes(),
+        )
+        .expect("der");
+        let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(der.as_ref())
+            .expect("parse");
+        assert_eq!(hex_upper(parsed.raw_serial()), issued.serial_hex);
+        assert_eq!(parsed.subject().to_string(), "CN=node-1");
+        let eku = parsed
+            .extended_key_usage()
+            .expect("eku")
+            .expect("eku present");
+        assert!(eku.value.client_auth && !eku.value.server_auth);
+
+        let ed = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("ed25519");
+        ca.issue_node_leaf_for_public_key("node-2", &ed.subject_public_key_info())
+            .expect("Ed25519 accepted");
+        let p384 = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).expect("p384");
+        assert!(matches!(
+            ca.issue_node_leaf_for_public_key("node-3", &p384.subject_public_key_info()),
+            Err(CaError::PublicKey(_))
+        ));
+        assert!(matches!(
+            check_public_key_allowlist(b"not a key"),
+            Err(CaError::PublicKey(_))
+        ));
+        // Two issuances never share a serial or a fingerprint.
+        let again = ca
+            .issue_node_leaf_for_public_key("node-1", &p256.subject_public_key_info())
+            .expect("reissue");
+        assert_ne!(again.serial_hex, issued.serial_hex);
+        assert_ne!(again.fingerprint_sha256, issued.fingerprint_sha256);
+    }
+
+    #[test]
+    fn crl_mints_over_revoked_serials_and_parses() {
+        let ca = ClusterCa::generate("Lorica Cluster CA").expect("generate");
+        let empty = ca.mint_crl(&[]).expect("empty CRL");
+        assert!(!empty.as_ref().is_empty());
+        let crl = ca
+            .mint_crl(&[
+                RevokedEntry {
+                    serial_hex: "4A".repeat(SERIAL_LEN),
+                    revoked_at: Utc::now(),
+                    superseded: false,
+                },
+                RevokedEntry {
+                    serial_hex: "5B".repeat(SERIAL_LEN),
+                    revoked_at: Utc::now(),
+                    superseded: true,
+                },
+            ])
+            .expect("CRL");
+        let (_, parsed) = x509_parser::revocation_list::CertificateRevocationList::from_der(
+            crl.as_ref(),
+        )
+        .expect("parse CRL");
+        let serials: Vec<String> = parsed
+            .iter_revoked_certificates()
+            .map(|r| hex_upper(&r.user_certificate.to_bytes_be()))
+            .collect();
+        assert_eq!(serials, vec!["4A".repeat(SERIAL_LEN), "5B".repeat(SERIAL_LEN)]);
+        assert!(matches!(
+            ca.mint_crl(&[RevokedEntry {
+                serial_hex: "zz".to_string(),
+                revoked_at: Utc::now(),
+                superseded: false
+            }]),
             Err(CaError::Parse(_))
         ));
     }

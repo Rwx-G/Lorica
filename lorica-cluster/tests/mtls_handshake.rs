@@ -82,7 +82,8 @@ async fn one_shot_server(
         .ok_or_else(|| "no opener".to_string())?;
     let outcome = serve_hello(first, &server_cfg, fleet_size_hint)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .map(|(ack, _hello)| ack);
     // Dropping the endpoint aborts its writer task, which may still
     // hold the queued reply; stay alive until the CLIENT hangs up
     // (recv() returns None on peer EOF) so the reply is flushed.

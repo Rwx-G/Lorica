@@ -90,6 +90,7 @@ mod tests {
             protocol_max: 1,
             schema_version: 49,
             node_name: "edge-node".to_string(),
+            build_version: String::new(),
         });
         req.sequence = 42;
         ClusterFrame::from_request(req)

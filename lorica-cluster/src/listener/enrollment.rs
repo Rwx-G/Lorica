@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The token-gated enrollment listener (Story 9.2 AC #2/#3): the only
-//! unauthenticated surface in the product.
+//! The token-gated enrollment listener (Story 9.2 AC #2/#3, Story 9.3
+//! AC #1/#4): the only unauthenticated surface in the product.
 //!
 //! The socket exists only while a join token is live. Every accepted
 //! connection takes a handshake permit and a per-source slot before a
@@ -21,9 +21,11 @@
 //! negotiate the cluster ALPN, is re-checked against token liveness,
 //! and then enters the (smaller) enrollment-exchange pool, at which
 //! point the handshake permit is released (see the permit rule in
-//! [`crate::preauth`]). In Story 9.2, where redemption does not exist
-//! yet, the exchange itself answers the OPAQUE status; Story 9.3
-//! replaces that answer with token redemption behind a handler trait.
+//! [`crate::preauth`]). The exchange is one bounded frame in, one
+//! frame out: the frame is handed to the [`EnrollmentHandler`] (the
+//! binary's redemption over the store and the CA), and whatever the
+//! outcome, a refusal goes out as the OPAQUE status with the reason in
+//! the local journal only.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,10 +39,19 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
+use crate::enroll::{decode_enroll_frame, EnrollRequest, EnrollmentHandler};
+use crate::handshake::display_field_is_valid;
 use crate::listener::TokenLiveness;
-use crate::messages::{cluster_frame, ClusterFrame, ClusterResponse, ClusterStatus};
+use crate::messages::{
+    cluster_frame, cluster_response, ClusterFrame, ClusterResponse, ClusterStatus, EnrollAck,
+};
 use crate::preauth::{accept_error_pause, PreAuthBudgets, SourceGate, SourceSlot};
 use crate::tls::{negotiated_cluster_alpn, SwappableAcceptor};
+use crate::token::SECRET_LEN;
+
+/// Largest DER SubjectPublicKeyInfo accepted from a joiner (an RSA-4096
+/// SPKI is under 600 bytes).
+const MAX_PUBLIC_KEY_DER: usize = 4096;
 
 /// Enrollment-listener counters, one atomic per budget plus lifecycle
 /// events, all monotonic; the binary exposes them as Prometheus
@@ -75,6 +86,12 @@ pub struct EnrollmentStats {
     /// Dropped: the enrollment window closed (last token gone) between
     /// the accept and the post-TLS liveness re-check.
     pub rejected_window_closed: AtomicU64,
+    /// Redemptions the handler granted (a node was enrolled).
+    pub enrollments_granted: AtomicU64,
+    /// Redemptions refused (malformed frame, unknown or burned token,
+    /// wrong secret, binding mismatch, unacceptable key), each
+    /// answered with the opaque status.
+    pub enrollments_refused: AtomicU64,
     /// Bind attempts that failed while a token was live (retried on a
     /// bounded backoff).
     pub bind_failures: AtomicU64,
@@ -114,6 +131,7 @@ struct EnrollmentShared {
     budgets: PreAuthBudgets,
     stats: Arc<EnrollmentStats>,
     enrollments: Arc<Semaphore>,
+    handler: Arc<dyn EnrollmentHandler>,
 }
 
 /// The token-gated, budget-boxed enrollment listener (AC #2/#3).
@@ -125,13 +143,14 @@ impl EnrollmentListener {
     /// returns to zero, reopen on the next rise. A failed bind while a
     /// token is live is retried on a bounded backoff, not parked until
     /// the next liveness edge. Returns when the liveness sender is
-    /// dropped.
+    /// dropped. `handler` redeems the tokens.
     pub fn spawn(
         bind: SocketAddr,
         acceptor: Arc<SwappableAcceptor>,
         mut liveness: TokenLiveness,
         budgets: PreAuthBudgets,
         stats: Arc<EnrollmentStats>,
+        handler: Arc<dyn EnrollmentHandler>,
     ) -> EnrollmentHandle {
         let (bound_tx, bound_rx) = watch::channel(None);
         let task = tokio::spawn(async move {
@@ -189,6 +208,7 @@ impl EnrollmentListener {
                     budgets: budgets.clone(),
                     stats: Arc::clone(&stats),
                     enrollments: Arc::new(Semaphore::new(budgets.max_inflight_enrollments)),
+                    handler: Arc::clone(&handler),
                 });
                 // In-flight connections belong to the open phase:
                 // dropping the set (auto-close, or the whole task on
@@ -309,8 +329,8 @@ async fn serve_enrollment_conn(
 
         // The window may have closed while this handshake ran: an
         // enrollment must never proceed past the last token's death.
-        // (Point-in-time read; Story 9.3 re-checks liveness inside the
-        // redemption transaction, where the burn is.)
+        // (Point-in-time read; the burn itself is conditional on the
+        // token still being live inside the store.)
         if *liveness.borrow() == 0 {
             stats.rejected_window_closed.fetch_add(1, Ordering::Relaxed);
             return;
@@ -343,22 +363,73 @@ async fn serve_enrollment_conn(
             return;
         }
 
-        // Story 9.2: token redemption does not exist yet, and a
-        // pre-authentication peer learns nothing from refusal shapes
-        // (AC #4): whatever was sent, answer the OPAQUE status with
-        // the request's sequence when one is recoverable.
-        let sequence = match ClusterFrame::decode(body.as_slice()) {
-            Ok(frame) => match frame.kind {
-                Some(cluster_frame::Kind::Request(req)) => req.sequence,
-                _ => 0,
-            },
-            Err(_) => 0,
+        // Redeem. A pre-authentication peer learns nothing from
+        // refusal shapes (Story 9.2 AC #4): every refusal is the
+        // OPAQUE status, the diagnostic stays in the journal.
+        let (sequence, response) = match decode_enroll_frame(&body) {
+            Some((sequence, enroll)) => {
+                let shaped = enroll.secret.len() == SECRET_LEN
+                    && enroll.public_key_der.len() <= MAX_PUBLIC_KEY_DER
+                    && !enroll.public_key_der.is_empty()
+                    && display_field_is_valid(&enroll.node_name)
+                    && display_field_is_valid(&enroll.build_version);
+                if !shaped {
+                    tracing::warn!(%peer, "enrollment refused: malformed enrollment request");
+                    (sequence, None)
+                } else {
+                    let request = EnrollRequest {
+                        peer,
+                        public_id: enroll.public_id,
+                        secret: enroll.secret,
+                        public_key_der: enroll.public_key_der,
+                        node_name: enroll.node_name,
+                        build_version: enroll.build_version,
+                        schema_version: enroll.schema_version,
+                    };
+                    match shared.handler.redeem(request).await {
+                        Ok(grant) => {
+                            tracing::info!(
+                                %peer,
+                                node_id = %grant.node_id,
+                                status = %grant.status,
+                                "node enrolled"
+                            );
+                            (
+                                sequence,
+                                Some(EnrollAck {
+                                    node_id: grant.node_id,
+                                    cert_pem: grant.cert_pem,
+                                    ca_pem: grant.ca_pem,
+                                    status: grant.status,
+                                    cert_not_after: grant.cert_not_after,
+                                }),
+                            )
+                        }
+                        Err(refusal) => {
+                            tracing::warn!(%peer, %refusal, "enrollment refused");
+                            (sequence, None)
+                        }
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(%peer, "enrollment refused: not an enrollment frame");
+                (0, None)
+            }
         };
-        tracing::debug!(%peer, "enrollment attempt refused (no redemption path in this release)");
-        let mut refusal = ClusterResponse::refusal(ClusterStatus::opaque());
-        refusal.sequence = sequence;
+        let mut reply = match response {
+            Some(ack) => {
+                stats.enrollments_granted.fetch_add(1, Ordering::Relaxed);
+                ClusterResponse::ok(cluster_response::Body::EnrollAck(ack))
+            }
+            None => {
+                stats.enrollments_refused.fetch_add(1, Ordering::Relaxed);
+                ClusterResponse::refusal(ClusterStatus::opaque())
+            }
+        };
+        reply.sequence = sequence;
         let frame = ClusterFrame {
-            kind: Some(cluster_frame::Kind::Response(refusal)),
+            kind: Some(cluster_frame::Kind::Response(reply)),
         };
         let encoded = frame.encode_to_vec();
         let mut wire = Vec::with_capacity(8 + encoded.len());

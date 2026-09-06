@@ -53,6 +53,9 @@ pub struct HandshakeConfig {
     /// This node's database schema version
     /// (`ConfigStore::schema_version()` at boot).
     pub schema_version: u32,
+    /// This build's version string, sent in the Hello for display
+    /// (Story 9.3 AC #9). Default empty.
+    pub build_version: String,
 }
 
 impl HandshakeConfig {
@@ -62,7 +65,14 @@ impl HandshakeConfig {
             protocol_min: PROTOCOL_MIN_COMPATIBLE,
             protocol_max: PROTOCOL_VERSION,
             schema_version,
+            build_version: String::new(),
         }
+    }
+
+    /// Set the build version sent in the Hello.
+    pub fn with_build_version(mut self, build_version: &str) -> Self {
+        self.build_version = build_version.to_string();
+        self
     }
 }
 
@@ -88,10 +98,17 @@ pub enum HandshakeError {
     ProtocolViolation,
 }
 
-/// Whether a peer-supplied `node_name` is acceptable: within
-/// [`MAX_NODE_NAME_BYTES`] and free of control characters.
+/// Whether a peer-supplied display field (`node_name`,
+/// `build_version`) is acceptable: within [`MAX_NODE_NAME_BYTES`] and
+/// free of control characters.
+pub fn display_field_is_valid(value: &str) -> bool {
+    value.len() <= MAX_NODE_NAME_BYTES && !value.chars().any(char::is_control)
+}
+
+/// Whether a peer-supplied `node_name` is acceptable (see
+/// [`display_field_is_valid`]).
 pub fn node_name_is_valid(node_name: &str) -> bool {
-    node_name.len() <= MAX_NODE_NAME_BYTES && !node_name.chars().any(char::is_control)
+    display_field_is_valid(node_name)
 }
 
 /// Server-side evaluation of a peer's [`Hello`] - pure, so every
@@ -106,7 +123,7 @@ pub fn evaluate_hello(
     fleet_size_hint: u32,
     hello: &Hello,
 ) -> Result<HelloAck, ClusterStatus> {
-    if !node_name_is_valid(&hello.node_name) {
+    if !node_name_is_valid(&hello.node_name) || !display_field_is_valid(&hello.build_version) {
         return Err(ClusterStatus::ProtocolViolation);
     }
     let Some(negotiated_version) = negotiate(
@@ -134,8 +151,9 @@ pub fn evaluate_hello(
 
 /// Serve one incoming request AS the handshake opener: the first
 /// request on an operational session must be a [`Hello`]. Replies with
-/// the ack or the distinct refusal, and returns the outcome so the
-/// caller can keep or drop the session.
+/// the ack or the distinct refusal, and returns the outcome (the ack
+/// sent and the validated `Hello`) so the caller can keep or drop the
+/// session.
 ///
 /// Anything other than a `Hello` as the opener, or a `Hello` whose
 /// `body_kind` disagrees with its body, is a protocol violation: the
@@ -144,7 +162,7 @@ pub async fn serve_hello(
     incoming: IncomingRequest<ClusterFrame>,
     local: &HandshakeConfig,
     fleet_size_hint: u32,
-) -> Result<Result<HelloAck, ClusterStatus>, ChannelError> {
+) -> Result<Result<(HelloAck, Hello), ClusterStatus>, ChannelError> {
     let hello = match &incoming.request().body {
         Some(cluster_request::Body::Hello(hello)) if incoming.request().body_kind_matches() => {
             hello.clone()
@@ -164,7 +182,7 @@ pub async fn serve_hello(
                     ack.clone(),
                 )))
                 .await?;
-            Ok(Ok(ack))
+            Ok(Ok((ack, hello)))
         }
         Err(status) => {
             incoming.reply_frame(ClusterResponse::refusal(status)).await?;
@@ -187,6 +205,7 @@ pub async fn client_handshake(
         protocol_max: local.protocol_max,
         schema_version: local.schema_version,
         node_name: node_name.to_string(),
+        build_version: local.build_version.clone(),
     });
     let response = endpoint.request(request, timeout).await?;
     match response.cluster_status() {
@@ -215,7 +234,22 @@ mod tests {
             protocol_max: max,
             schema_version: schema,
             node_name: "node".to_string(),
+            build_version: "1.7.0".to_string(),
         }
+    }
+
+    #[test]
+    fn build_version_is_bounded_like_the_node_name() {
+        let mut long = hello(1, 1, 49);
+        long.build_version = "v".repeat(MAX_NODE_NAME_BYTES + 1);
+        assert_eq!(
+            evaluate_hello(&local(), 0, &long),
+            Err(ClusterStatus::ProtocolViolation)
+        );
+        assert_eq!(
+            HandshakeConfig::new(1).with_build_version("1.7.0").build_version,
+            "1.7.0"
+        );
     }
 
     #[test]

@@ -97,6 +97,10 @@ pub struct Hello {
     /// authorization input, never a metric label (AC #12).
     #[prost(string, tag = "4")]
     pub node_name: ::prost::alloc::string::String,
+    /// The sender's build version, display only (Story 9.3 AC #9);
+    /// bounded like `node_name`.
+    #[prost(string, tag = "5")]
+    pub build_version: ::prost::alloc::string::String,
 }
 
 /// Control-plane answer to a [`Hello`] when the session is admitted.
@@ -133,10 +137,91 @@ pub struct HeartbeatAck {
     pub fleet_size_hint: u32,
 }
 
+/// Token redemption (Story 9.3 AC #1/#3): the only frame the
+/// enrollment listener accepts. No CSR: the node sends its bare
+/// public key and the control plane assigns every certificate
+/// parameter.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Enroll {
+    /// Token lookup half.
+    #[prost(string, tag = "1")]
+    pub public_id: ::prost::alloc::string::String,
+    /// Token secret half (32 bytes); never logged.
+    #[prost(bytes = "vec", tag = "2")]
+    pub secret: ::prost::alloc::vec::Vec<u8>,
+    /// The node's `SubjectPublicKeyInfo`, DER.
+    #[prost(bytes = "vec", tag = "3")]
+    pub public_key_der: ::prost::alloc::vec::Vec<u8>,
+    /// Requested display name (bounded).
+    #[prost(string, tag = "4")]
+    pub node_name: ::prost::alloc::string::String,
+    /// Display only (bounded).
+    #[prost(string, tag = "5")]
+    pub build_version: ::prost::alloc::string::String,
+    /// The node's database schema version.
+    #[prost(uint32, tag = "6")]
+    pub schema_version: u32,
+}
+
+/// A granted enrollment. Refusals carry the opaque status and no
+/// body.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct EnrollAck {
+    /// Server-assigned identity.
+    #[prost(string, tag = "1")]
+    pub node_id: ::prost::alloc::string::String,
+    /// The node's `clientAuth` leaf, PEM.
+    #[prost(string, tag = "2")]
+    pub cert_pem: ::prost::alloc::string::String,
+    /// The cluster CA bundle, PEM.
+    #[prost(string, tag = "3")]
+    pub ca_pem: ::prost::alloc::string::String,
+    /// `pending` or `active` (Story 9.3 AC #5).
+    #[prost(string, tag = "4")]
+    pub status: ::prost::alloc::string::String,
+    /// RFC 3339 `notAfter` of the leaf.
+    #[prost(string, tag = "5")]
+    pub cert_not_after: ::prost::alloc::string::String,
+}
+
+/// Certificate renewal over an established session (Story 9.3
+/// AC #12): a NEW bare public key.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Renew {
+    /// The node's new `SubjectPublicKeyInfo`, DER.
+    #[prost(bytes = "vec", tag = "1")]
+    pub public_key_der: ::prost::alloc::vec::Vec<u8>,
+}
+
+/// A renewed certificate.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RenewAck {
+    /// The new leaf, PEM.
+    #[prost(string, tag = "1")]
+    pub cert_pem: ::prost::alloc::string::String,
+    /// RFC 3339 `notAfter` of the new leaf.
+    #[prost(string, tag = "2")]
+    pub cert_not_after: ::prost::alloc::string::String,
+}
+
+/// The node is leaving the fleet (Story 9.3 AC #13).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Leave {}
+
+/// Leave acknowledged; the session ends with it.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct LeaveAck {}
+
 /// `body_kind` value of a [`Hello`] request (its oneof tag).
 pub const BODY_KIND_HELLO: u32 = 10;
 /// `body_kind` value of a [`Heartbeat`] request (its oneof tag).
 pub const BODY_KIND_HEARTBEAT: u32 = 11;
+/// `body_kind` value of an [`Enroll`] request (its oneof tag).
+pub const BODY_KIND_ENROLL: u32 = 12;
+/// `body_kind` value of a [`Renew`] request (its oneof tag).
+pub const BODY_KIND_RENEW: u32 = 13;
+/// `body_kind` value of a [`Leave`] request (its oneof tag).
+pub const BODY_KIND_LEAVE: u32 = 14;
 
 /// A request from either side of the cluster plane.
 ///
@@ -172,13 +257,13 @@ pub struct ClusterRequest {
     #[prost(uint32, tag = "3")]
     pub body_kind: u32,
     /// Typed request body.
-    #[prost(oneof = "cluster_request::Body", tags = "10, 11")]
+    #[prost(oneof = "cluster_request::Body", tags = "10, 11, 12, 13, 14")]
     pub body: ::core::option::Option<cluster_request::Body>,
 }
 
 /// Typed body variants for [`ClusterRequest`].
 pub mod cluster_request {
-    use super::{Heartbeat, Hello};
+    use super::{Enroll, Heartbeat, Hello, Leave, Renew};
 
     /// Request payloads (see the tag-range note on `ClusterRequest`).
     #[derive(Clone, PartialEq, ::prost::Oneof)]
@@ -189,6 +274,15 @@ pub mod cluster_request {
         /// Liveness probe.
         #[prost(message, tag = "11")]
         Heartbeat(Heartbeat),
+        /// Token redemption (enrollment listener only).
+        #[prost(message, tag = "12")]
+        Enroll(Enroll),
+        /// Certificate renewal (established session).
+        #[prost(message, tag = "13")]
+        Renew(Renew),
+        /// Leaving the fleet (established session).
+        #[prost(message, tag = "14")]
+        Leave(Leave),
     }
 
     impl Body {
@@ -197,6 +291,9 @@ pub mod cluster_request {
             match self {
                 Body::Hello(_) => super::BODY_KIND_HELLO,
                 Body::Heartbeat(_) => super::BODY_KIND_HEARTBEAT,
+                Body::Enroll(_) => super::BODY_KIND_ENROLL,
+                Body::Renew(_) => super::BODY_KIND_RENEW,
+                Body::Leave(_) => super::BODY_KIND_LEAVE,
             }
         }
     }
@@ -223,9 +320,27 @@ impl ClusterRequest {
         Self::with_body(cluster_request::Body::Heartbeat(heartbeat))
     }
 
+    /// A token redemption (enrollment listener).
+    pub fn enroll(enroll: Enroll) -> Self {
+        Self::with_body(cluster_request::Body::Enroll(enroll))
+    }
+
+    /// A certificate renewal.
+    pub fn renew(renew: Renew) -> Self {
+        Self::with_body(cluster_request::Body::Renew(renew))
+    }
+
+    /// A leave announcement.
+    pub fn leave() -> Self {
+        Self::with_body(cluster_request::Body::Leave(Leave {}))
+    }
+
     /// Whether `body_kind` names a method THIS build implements.
     pub fn is_known_body_kind(body_kind: u32) -> bool {
-        matches!(body_kind, BODY_KIND_HELLO | BODY_KIND_HEARTBEAT)
+        matches!(
+            body_kind,
+            BODY_KIND_HELLO | BODY_KIND_HEARTBEAT | BODY_KIND_ENROLL | BODY_KIND_RENEW | BODY_KIND_LEAVE
+        )
     }
 
     /// The invariant every decode boundary enforces: a present body's
@@ -253,13 +368,13 @@ pub struct ClusterResponse {
     #[prost(uint32, tag = "3")]
     pub retry_after_s: u32,
     /// Typed response body; `None` on refusals.
-    #[prost(oneof = "cluster_response::Body", tags = "10, 11")]
+    #[prost(oneof = "cluster_response::Body", tags = "10, 11, 12, 13, 14")]
     pub body: ::core::option::Option<cluster_response::Body>,
 }
 
 /// Typed body variants for [`ClusterResponse`].
 pub mod cluster_response {
-    use super::{HeartbeatAck, HelloAck};
+    use super::{EnrollAck, HeartbeatAck, HelloAck, LeaveAck, RenewAck};
 
     /// Response payloads (tag ranges mirror `cluster_request::Body`).
     #[derive(Clone, PartialEq, ::prost::Oneof)]
@@ -270,6 +385,15 @@ pub mod cluster_response {
         /// Liveness answer.
         #[prost(message, tag = "11")]
         HeartbeatAck(HeartbeatAck),
+        /// Enrollment granted.
+        #[prost(message, tag = "12")]
+        EnrollAck(EnrollAck),
+        /// Certificate renewed.
+        #[prost(message, tag = "13")]
+        RenewAck(RenewAck),
+        /// Leave acknowledged.
+        #[prost(message, tag = "14")]
+        LeaveAck(LeaveAck),
     }
 }
 
@@ -450,6 +574,7 @@ mod tests {
             protocol_max: 1,
             schema_version: 1,
             node_name: "n".to_string(),
+            build_version: "v".to_string(),
         };
         assert_eq!(
             field_numbers(&hello.encode_to_vec()),
@@ -458,8 +583,90 @@ mod tests {
                 tag("Hello", "protocol_max"),
                 tag("Hello", "schema_version"),
                 tag("Hello", "node_name"),
+                tag("Hello", "build_version"),
             ]
         );
+        let enroll = Enroll {
+            public_id: "p".to_string(),
+            secret: vec![1],
+            public_key_der: vec![1],
+            node_name: "n".to_string(),
+            build_version: "v".to_string(),
+            schema_version: 1,
+        };
+        assert_eq!(
+            field_numbers(&enroll.encode_to_vec()),
+            vec![
+                tag("Enroll", "public_id"),
+                tag("Enroll", "secret"),
+                tag("Enroll", "public_key_der"),
+                tag("Enroll", "node_name"),
+                tag("Enroll", "build_version"),
+                tag("Enroll", "schema_version"),
+            ]
+        );
+        let enroll_ack = EnrollAck {
+            node_id: "n".to_string(),
+            cert_pem: "c".to_string(),
+            ca_pem: "a".to_string(),
+            status: "s".to_string(),
+            cert_not_after: "t".to_string(),
+        };
+        assert_eq!(
+            field_numbers(&enroll_ack.encode_to_vec()),
+            vec![
+                tag("EnrollAck", "node_id"),
+                tag("EnrollAck", "cert_pem"),
+                tag("EnrollAck", "ca_pem"),
+                tag("EnrollAck", "status"),
+                tag("EnrollAck", "cert_not_after"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(
+                &Renew {
+                    public_key_der: vec![1]
+                }
+                .encode_to_vec()
+            ),
+            vec![tag("Renew", "public_key_der")]
+        );
+        assert_eq!(
+            field_numbers(
+                &RenewAck {
+                    cert_pem: "c".to_string(),
+                    cert_not_after: "t".to_string()
+                }
+                .encode_to_vec()
+            ),
+            vec![tag("RenewAck", "cert_pem"), tag("RenewAck", "cert_not_after")]
+        );
+        for (request, block_field) in [
+            (ClusterRequest::enroll(Enroll::default()), "enroll"),
+            (ClusterRequest::renew(Renew::default()), "renew"),
+            (ClusterRequest::leave(), "leave"),
+        ] {
+            let mut request = request;
+            request.sequence = 1;
+            assert_eq!(
+                *field_numbers(&request.encode_to_vec()).last().expect("body"),
+                tag("ClusterRequest", block_field),
+                "{block_field}"
+            );
+            assert_eq!(request.body_kind, tag("ClusterRequest", block_field));
+        }
+        for (body, block_field) in [
+            (cluster_response::Body::EnrollAck(EnrollAck::default()), "enroll_ack"),
+            (cluster_response::Body::RenewAck(RenewAck::default()), "renew_ack"),
+            (cluster_response::Body::LeaveAck(LeaveAck::default()), "leave_ack"),
+        ] {
+            let response = ClusterResponse::ok(body);
+            assert_eq!(
+                *field_numbers(&response.encode_to_vec()).last().expect("body"),
+                tag("ClusterResponse", block_field),
+                "{block_field}"
+            );
+        }
         let ack = HelloAck {
             negotiated_version: 1,
             schema_version: 1,
@@ -592,8 +799,11 @@ mod tests {
         forged.body_kind = BODY_KIND_HELLO;
         assert!(!forged.body_kind_matches());
         // Reserved ranges are unknown to this build.
-        for kind in [0, 12, 20, 39, 40, 59, 60, 79] {
+        for kind in [0, 15, 19, 20, 39, 40, 59, 60, 79] {
             assert!(!ClusterRequest::is_known_body_kind(kind), "{kind}");
+        }
+        for kind in [BODY_KIND_ENROLL, BODY_KIND_RENEW, BODY_KIND_LEAVE] {
+            assert!(ClusterRequest::is_known_body_kind(kind), "{kind}");
         }
     }
 }
