@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -277,6 +277,7 @@ impl SessionHandler for RecordingSessionHandler {
         Box::pin(async move {
             self.renewals.fetch_add(1, Ordering::SeqCst);
             assert_eq!(request.node_id, "node-a", "identity comes from the certificate");
+            assert!(request.peer.ip().is_loopback(), "the peer travels with the request");
             Ok(RenewGrant {
                 cert_pem: "-----BEGIN CERTIFICATE-----\nrenewed\n-----END CERTIFICATE-----"
                     .to_string(),
@@ -445,6 +446,38 @@ async fn identity_comes_from_the_certificate_and_unknown_ones_are_dropped() {
     ));
     assert_eq!(fleet.handler.renewals.load(Ordering::SeqCst), 1);
     assert_eq!(fleet.stats.renewals_served.load(Ordering::Relaxed), 1);
+    // A renewal flood is a protocol violation: the session is dropped.
+    for _ in 0..2 {
+        let _ = endpoint
+            .request(
+                ClusterRequest::renew(Renew {
+                    public_key_der: vec![1, 2, 3],
+                }),
+                WAIT,
+            )
+            .await
+            .expect("renewals within the budget are answered");
+    }
+    let flood = endpoint
+        .request(
+            ClusterRequest::renew(Renew {
+                public_key_der: vec![1, 2, 3],
+            }),
+            WAIT,
+        )
+        .await
+        .expect("the violation is answered before the drop");
+    assert_eq!(flood.cluster_status(), ClusterStatus::ProtocolViolation);
+    assert_eq!(fleet.handler.violations.load(Ordering::SeqCst), 1);
+    eventually("flooding session to end", || {
+        fleet.stats.sessions_ended.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    // Reconnect for the rest of the flow.
+    let endpoint = open_session(&pki, &known, fleet.addr)
+        .await
+        .expect("re-admitted after the drop");
+    eventually("session to register again", || fleet.sessions.is_connected("node-a")).await;
 
     // A reconnect supersedes the older session (newest wins).
     let second = open_session(&pki, &known, fleet.addr)
@@ -581,7 +614,6 @@ async fn a_superseded_certificate_is_accepted_until_the_new_one_connects() {
     })
     .await;
     assert_eq!(fleet.handler.established.load(Ordering::SeqCst), 2);
-    let _ = AtomicU64::new(0);
     drop(via_new);
     fleet.handle.shutdown();
 }

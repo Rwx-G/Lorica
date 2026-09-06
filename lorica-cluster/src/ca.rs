@@ -139,13 +139,31 @@ pub fn check_public_key_allowlist(spki_der: &[u8]) -> Result<(), CaError> {
         };
     }
     if *alg == OID_PKCS1_RSAENCRYPTION {
-        return match spki.parsed() {
-            Ok(PublicKey::RSA(rsa)) if rsa.key_size() >= MIN_RSA_BITS => Ok(()),
-            Ok(PublicKey::RSA(rsa)) => Err(CaError::PublicKey(format!(
-                "RSA modulus of {} bits is below {MIN_RSA_BITS}",
-                rsa.key_size()
-            ))),
-            _ => Err(CaError::PublicKey("malformed RSA key".into())),
+        let Ok(PublicKey::RSA(rsa)) = spki.parsed() else {
+            return Err(CaError::PublicKey("malformed RSA key".into()));
+        };
+        // The parser's `key_size` counts one leading zero at most; a
+        // modulus padded with more zero bytes would report an inflated
+        // size, so measure the significant bytes ourselves.
+        let significant = rsa
+            .modulus
+            .iter()
+            .position(|b| *b != 0)
+            .map(|i| rsa.modulus.len() - i)
+            .unwrap_or(0);
+        if significant * 8 < MIN_RSA_BITS {
+            return Err(CaError::PublicKey(format!(
+                "RSA modulus of {} significant bytes is below {MIN_RSA_BITS} bits",
+                significant
+            )));
+        }
+        // A tiny or even exponent makes the signature forgeable by
+        // anyone holding the certificate.
+        return match rsa.try_exponent() {
+            Ok(e) if e >= 65537 && e % 2 == 1 => Ok(()),
+            _ => Err(CaError::PublicKey(
+                "RSA public exponent must be an odd value of at least 65537".into(),
+            )),
         };
     }
     Err(CaError::PublicKey(format!(
@@ -370,18 +388,6 @@ impl ClusterCa {
         Ok(crl.into())
     }
 
-    /// Issue a node (follower) leaf: EKU `clientAuth` ONLY, CN =
-    /// `node_id`, no SAN needed (the dialer authenticates the server,
-    /// not the other way around), valid [`LEAF_VALIDITY_DAYS`].
-    /// Returns `(cert_pem, key_pem)`.
-    pub fn issue_client_leaf(&self, node_id: &str) -> Result<(String, String), CaError> {
-        let leaf_key: KeyPair =
-            KeyPair::generate().map_err(|e| CaError::Generate(e.to_string()))?;
-        let cert_pem =
-            self.issue_leaf(node_id, ExtendedKeyUsagePurpose::ClientAuth, None, &leaf_key)?;
-        Ok((cert_pem, leaf_key.serialize_pem()))
-    }
-
     fn issue_leaf(
         &self,
         common_name: &str,
@@ -460,23 +466,83 @@ mod tests {
         let reloaded =
             ClusterCa::from_pem(ca.cert_pem(), &ca.key_pem()).expect("reload from PEM");
         // The reloaded CA must still be able to sign.
-        let (leaf_pem, leaf_key) = reloaded
-            .issue_client_leaf("node-a")
+        let (spki, key_pem) = generate_node_keypair().expect("keypair");
+        let issued = reloaded
+            .issue_node_leaf_for_public_key("node-a", &spki)
             .expect("issue after reload");
-        assert!(leaf_pem.contains("BEGIN CERTIFICATE"));
-        assert!(leaf_key.contains("PRIVATE KEY"));
+        assert!(issued.cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(key_pem.contains("PRIVATE KEY"));
     }
 
     #[test]
     fn leaves_issue_with_distinct_material() {
         let ca = ClusterCa::generate("Lorica Cluster CA").expect("generate");
-        let (server_pem, server_key) = ca.issue_server_leaf("cp.internal").expect("server leaf");
-        let (client_pem, client_key) = ca.issue_client_leaf("node-a").expect("client leaf");
-        assert_ne!(server_pem, client_pem);
-        assert_ne!(server_key, client_key);
+        let (server_pem, _server_key) = ca.issue_server_leaf("cp.internal").expect("server leaf");
+        let (spki, _key) = generate_node_keypair().expect("keypair");
+        let client = ca
+            .issue_node_leaf_for_public_key("node-a", &spki)
+            .expect("client leaf");
+        assert_ne!(server_pem, client.cert_pem);
         // The EKU split itself (serverAuth-only vs clientAuth-only) is
         // asserted behaviourally in the TLS handshake tests: a client
         // leaf fails server verification and vice versa.
+    }
+
+    #[test]
+    fn rsa_keys_need_a_real_modulus_and_a_sane_exponent() {
+        // Hand-built SPKI: rsaEncryption with a modulus of 2048 bits
+        // of leading zeros (one significant byte) and exponent 1.
+        fn der_len(len: usize) -> Vec<u8> {
+            if len < 128 {
+                vec![len as u8]
+            } else if len < 256 {
+                vec![0x81, len as u8]
+            } else {
+                vec![0x82, (len >> 8) as u8, len as u8]
+            }
+        }
+        fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            out.extend(der_len(body.len()));
+            out.extend_from_slice(body);
+            out
+        }
+        fn rsa_spki(modulus: &[u8], exponent: &[u8]) -> Vec<u8> {
+            let rsa_key = tlv(0x30, &[tlv(0x02, modulus), tlv(0x02, exponent)].concat());
+            let alg = tlv(
+                0x30,
+                &[
+                    tlv(0x06, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]),
+                    vec![0x05, 0x00],
+                ]
+                .concat(),
+            );
+            let mut bit_string = vec![0u8];
+            bit_string.extend(rsa_key);
+            tlv(0x30, &[alg, tlv(0x03, &bit_string)].concat())
+        }
+        let mut padded = vec![0u8; 256];
+        padded[255] = 0x03;
+        assert!(matches!(
+            check_public_key_allowlist(&rsa_spki(&padded, &[0x01])),
+            Err(CaError::PublicKey(_))
+        ));
+        // A real-sized modulus with a tiny exponent is refused too.
+        let mut modulus = vec![0xC5u8; 256];
+        modulus.insert(0, 0x00);
+        assert!(matches!(
+            check_public_key_allowlist(&rsa_spki(&modulus, &[0x03])),
+            Err(CaError::PublicKey(_))
+        ));
+        // 2048 significant bits with e = 65537 pass the allowlist
+        // (ring cannot generate RSA keys, so the SPKI is hand-built;
+        // whether the key is usable is rcgen's concern at issuance).
+        check_public_key_allowlist(&rsa_spki(&modulus, &[0x01, 0x00, 0x01]))
+            .expect("RSA-2048 accepted");
+        assert!(matches!(
+            check_public_key_allowlist(&rsa_spki(&modulus[..129], &[0x01, 0x00, 0x01])),
+            Err(CaError::PublicKey(_))
+        ));
     }
 
     #[test]

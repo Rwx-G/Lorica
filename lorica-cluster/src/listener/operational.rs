@@ -81,6 +81,13 @@ pub const DEFAULT_ADMISSION_RETRY_AFTER_S: u32 = 5;
 /// writer task) drops.
 const REFUSAL_FLUSH_GRACE: Duration = Duration::from_secs(1);
 
+/// Renewals one session may request before it is treated as a
+/// protocol violation: a well-behaved follower renews once per
+/// session, twice at most across a retry; more is a peer abusing the
+/// signing path (each grant costs the control plane a signature and
+/// a CRL entry).
+const MAX_RENEWALS_PER_SESSION: u32 = 3;
+
 /// Operational-listener counters (bridged to Prometheus by the
 /// binary, AC #12). All monotonic.
 #[derive(Debug, Default)]
@@ -349,11 +356,12 @@ async fn resolve_identity(
             .await;
         return Err(());
     };
+    let prefix = &fingerprint[..fingerprint.len().min(16)];
     match fleet.roster.lookup(fingerprint) {
         Some(identity) if identity.state != NodeState::Revoked => Ok(Some(identity)),
         Some(_) => {
             shared.stats.identity_refusals.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(%peer, fingerprint = &fingerprint[..16], "revoked node reached identity resolution; dropped");
+            tracing::warn!(%peer, fingerprint = prefix, "revoked node reached identity resolution; dropped");
             fleet
                 .handler
                 .on_identity_refused(fingerprint, peer, "certificate revoked")
@@ -362,7 +370,7 @@ async fn resolve_identity(
         }
         None => {
             shared.stats.identity_refusals.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(%peer, fingerprint = &fingerprint[..16], "valid cluster certificate with no enrolled node; dropped");
+            tracing::warn!(%peer, fingerprint = prefix, "valid cluster certificate with no enrolled node; dropped");
             fleet
                 .handler
                 .on_identity_refused(fingerprint, peer, "no enrolled node for this certificate")
@@ -572,6 +580,7 @@ async fn serve_session(
     mut guard: Option<SessionGuard>,
 ) {
     let stats = &shared.stats;
+    let mut renewals: u32 = 0;
     loop {
         let request = match &mut guard {
             Some(guard) => {
@@ -599,7 +608,7 @@ async fn serve_session(
         if let Some(guard) = &guard {
             guard.entry().touch();
         }
-        match serve_request(request, shared, ctx).await {
+        match serve_request(request, shared, ctx, &mut renewals).await {
             Some(SessionEnd::Closed) => return,
             Some(SessionEnd::Killed) => return,
             None => {}
@@ -612,6 +621,7 @@ async fn serve_request(
     request: IncomingRequest<ClusterFrame>,
     shared: &OperationalShared,
     ctx: &SessionContext,
+    renewals: &mut u32,
 ) -> Option<SessionEnd> {
     let stats = &shared.stats;
     match translate_cluster_request(request.request()) {
@@ -639,10 +649,25 @@ async fn serve_request(
                     .err()
                     .map(|_| SessionEnd::Closed);
             };
+            *renewals += 1;
+            if *renewals > MAX_RENEWALS_PER_SESSION {
+                stats.protocol_violations.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(peer = %ctx.peer_addr, node_id, "renewal flood; dropping the session");
+                fleet
+                    .handler
+                    .on_protocol_violation(node_id, ctx.peer_addr)
+                    .await;
+                let _ = request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::ProtocolViolation))
+                    .await;
+                tokio::time::sleep(REFUSAL_FLUSH_GRACE).await;
+                return Some(SessionEnd::Closed);
+            }
             let renewed = fleet
                 .handler
                 .on_renew(RenewRequest {
                     node_id: node_id.to_string(),
+                    peer: ctx.peer_addr,
                     public_key_der,
                 })
                 .await;

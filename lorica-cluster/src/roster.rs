@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use tokio::sync::watch;
 
-use crate::ca::{ClusterCa, RevokedEntry};
+use crate::ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
 use crate::tls::{operational_server_config_with_crl, ClusterTlsError, SwappableAcceptor};
 
 /// Lifecycle state of a roster entry, mirroring the registry's
@@ -306,8 +306,18 @@ pub struct ControlPlane {
     /// The operational acceptor, rebuilt with a fresh CRL on every
     /// revocation.
     pub acceptor: Arc<SwappableAcceptor>,
-    /// The fleet CA (issues node leaves, signs CRLs).
-    pub ca: ClusterCa,
+    /// The fleet CA. Private: signing reaches the API only through
+    /// [`ControlPlane::issue_node_leaf`] and the CRL rebuild, never
+    /// as a bare signer any handler could misuse.
+    ca: ClusterCa,
+    /// The serials the current acceptor's CRL covers, so a refresh
+    /// that changes nothing revocation-related skips the mint and
+    /// the rustls rebuild.
+    crl_serials: Mutex<Vec<String>>,
+    /// Serializes "read the store, swap roster and acceptor" so two
+    /// concurrent refreshes cannot land out of order and undo a
+    /// revocation. Held by the caller across the whole refresh.
+    pub refresh_lock: tokio::sync::Mutex<()>,
     /// The control plane's own leaf, PEM (its SPKI is what tokens pin).
     pub leaf_cert_pem: String,
     /// The control plane's own leaf key, PEM (for the acceptor rebuild).
@@ -346,6 +356,8 @@ impl ControlPlane {
             sessions: SessionRegistry::new(),
             acceptor,
             ca,
+            crl_serials: Mutex::new(Vec::new()),
+            refresh_lock: tokio::sync::Mutex::new(()),
             leaf_cert_pem: leaf_cert_pem.to_string(),
             leaf_key_pem: leaf_key_pem.to_string(),
             fleet_size,
@@ -363,11 +375,33 @@ impl ControlPlane {
         self.fleet_size.store(size, Ordering::Relaxed);
     }
 
+    /// The CA certificate PEM (what enrolled nodes verify the control
+    /// plane with).
+    pub fn ca_pem(&self) -> &str {
+        self.ca.cert_pem()
+    }
+
+    /// Issue a node leaf on a bare public key (AC #3), the only
+    /// signing path the API and the redemption hooks get.
+    pub fn issue_node_leaf(&self, node_id: &str, spki_der: &[u8]) -> Result<IssuedLeaf, CaError> {
+        self.ca.issue_node_leaf_for_public_key(node_id, spki_der)
+    }
+
     /// Rebuild the operational acceptor over `revoked` (AC #7): mints
     /// a CRL when the list is non-empty, swaps the config in, so every
     /// accept from now on refuses those serials. Established sessions
-    /// are handled separately by [`SessionRegistry::kill`].
-    pub fn rebuild_acceptor(&self, revoked: &[RevokedEntry]) -> Result<(), ClusterTlsError> {
+    /// are handled separately by [`SessionRegistry::kill`]. A call
+    /// whose serial set equals the one already served is a no-op
+    /// (`Ok(false)`); `Ok(true)` means the acceptor was swapped.
+    pub fn rebuild_acceptor(&self, revoked: &[RevokedEntry]) -> Result<bool, ClusterTlsError> {
+        let mut serials: Vec<String> = revoked.iter().map(|r| r.serial_hex.clone()).collect();
+        serials.sort();
+        {
+            let current = self.crl_serials.lock().unwrap_or_else(|p| p.into_inner());
+            if *current == serials {
+                return Ok(false);
+            }
+        }
         let crl = if revoked.is_empty() {
             None
         } else {
@@ -384,7 +418,8 @@ impl ControlPlane {
             crl,
         )?;
         self.acceptor.swap(Arc::new(config));
-        Ok(())
+        *self.crl_serials.lock().unwrap_or_else(|p| p.into_inner()) = serials;
+        Ok(true)
     }
 
     /// Publish the live-token count to the enrollment listener.

@@ -67,6 +67,15 @@ pub struct PreAuthBudgets {
     /// /64) may hold at once; excess connections from that source are
     /// dropped before a task exists.
     pub max_per_source: usize,
+    /// Enrollment listener only: max accepted connections per source
+    /// in any [`PreAuthBudgets::attempt_window`] (Story 9.3 AC #11's
+    /// sliding window); excess is dropped before TLS.
+    pub max_attempts_per_window: usize,
+    /// The sliding window for `max_attempts_per_window`.
+    pub attempt_window: Duration,
+    /// Hard cap on the sources the attempt limiter tracks (oldest
+    /// evicted past it).
+    pub attempt_map_cap: usize,
     /// Max enrollment exchanges in flight at once (post-TLS), distinct
     /// from the handshake bound so slow token verifications (Story
     /// 9.3) cannot be used to starve the TLS accept path. This is also
@@ -84,6 +93,9 @@ impl Default for PreAuthBudgets {
             handshake_timeout: Duration::from_secs(3),
             max_concurrent_handshakes: 256,
             max_per_source: 8,
+            max_attempts_per_window: 20,
+            attempt_window: Duration::from_secs(60),
+            attempt_map_cap: 4096,
             max_inflight_enrollments: 8,
             per_conn_max_bytes: 16 * 1024,
             per_conn_max_duration: Duration::from_secs(15),
@@ -176,6 +188,72 @@ impl Drop for SourceSlot {
     }
 }
 
+/// Per-source sliding-window attempt limiter for the enrollment
+/// listener (Story 9.3 AC #11): at most `max_attempts` accepted
+/// connections per [`SourceKey`] in any `window`, on top of the
+/// concurrency gate. The map is hard-capped: past `max_entries` the
+/// entry with the oldest most-recent attempt is evicted (a bounded
+/// scan at the cap, so no external LRU dependency).
+pub struct AttemptWindow {
+    window: Duration,
+    max_attempts: usize,
+    max_entries: usize,
+    attempts: Mutex<HashMap<SourceKey, std::collections::VecDeque<std::time::Instant>>>,
+}
+
+impl AttemptWindow {
+    /// A limiter allowing `max_attempts` per `window` per source, with
+    /// at most `max_entries` sources tracked at once.
+    pub fn new(window: Duration, max_attempts: usize, max_entries: usize) -> Self {
+        Self {
+            window,
+            max_attempts: max_attempts.max(1),
+            max_entries: max_entries.max(1),
+            attempts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record an attempt from `peer` now; `false` when the source is
+    /// over its budget (the attempt is not recorded then, so a source
+    /// being refused does not extend its own penalty).
+    pub fn allow(&self, peer: IpAddr) -> bool {
+        self.allow_at(peer, std::time::Instant::now())
+    }
+
+    fn allow_at(&self, peer: IpAddr, now: std::time::Instant) -> bool {
+        let key = source_key(peer);
+        let mut attempts = self.attempts.lock().unwrap_or_else(|p| p.into_inner());
+        let window = self.window;
+        if !attempts.contains_key(&key) && attempts.len() >= self.max_entries {
+            // Evict the source whose latest attempt is the oldest.
+            let victim = attempts
+                .iter()
+                .min_by_key(|(_, times)| times.back().copied().unwrap_or(now))
+                .map(|(k, _)| *k);
+            if let Some(victim) = victim {
+                attempts.remove(&victim);
+            }
+        }
+        let times = attempts.entry(key).or_default();
+        while times
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= window)
+        {
+            times.pop_front();
+        }
+        if times.len() >= self.max_attempts {
+            return false;
+        }
+        times.push_back(now);
+        true
+    }
+
+    /// Sources currently tracked (bounded by `max_entries`).
+    pub fn tracked_sources(&self) -> usize {
+        self.attempts.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
 /// Pause after a failed `accept()` so a persistent condition (EMFILE,
 /// ENFILE, ENOBUFS) is a logged, throttled retry rather than a hot
 /// spin pinning a core with nothing in the journal.
@@ -234,6 +312,34 @@ mod tests {
         assert!(gate.try_enter(peer).is_some(), "released slot is reusable");
         drop(second);
         drop(elsewhere);
+    }
+
+    #[test]
+    fn attempt_window_slides_and_evicts_the_coldest_source_at_the_cap() {
+        let limiter = AttemptWindow::new(Duration::from_secs(60), 2, 2);
+        let a: IpAddr = "192.0.2.10".parse().expect("v4");
+        let b: IpAddr = "192.0.2.11".parse().expect("v4");
+        let c: IpAddr = "192.0.2.12".parse().expect("v4");
+        let t0 = std::time::Instant::now();
+        assert!(limiter.allow_at(a, t0));
+        assert!(limiter.allow_at(a, t0 + Duration::from_secs(1)));
+        assert!(!limiter.allow_at(a, t0 + Duration::from_secs(2)), "third in the window");
+        // Refusals do not extend the penalty: once the first attempt
+        // ages out (at exactly the window), one slot frees while the
+        // second attempt still counts.
+        assert!(limiter.allow_at(a, t0 + Duration::from_secs(60)));
+        assert!(!limiter.allow_at(a, t0 + Duration::from_secs(60)));
+        assert!(limiter.allow_at(b, t0 + Duration::from_secs(62)));
+        assert_eq!(limiter.tracked_sources(), 2);
+        // The cap evicts a (its latest attempt is the oldest), not b.
+        assert!(limiter.allow_at(c, t0 + Duration::from_secs(63)));
+        assert_eq!(limiter.tracked_sources(), 2);
+        assert!(limiter.allow_at(b, t0 + Duration::from_secs(64)));
+        assert!(!limiter.allow_at(b, t0 + Duration::from_secs(65)));
+        // A zero budget clamps to one attempt.
+        let one = AttemptWindow::new(Duration::from_secs(60), 0, 0);
+        assert!(one.allow_at(a, t0));
+        assert!(!one.allow_at(a, t0));
     }
 
     #[test]

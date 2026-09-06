@@ -62,7 +62,11 @@ struct Pki {
 fn pki() -> Pki {
     let ca = ClusterCa::generate("Lorica Cluster CA").expect("ca");
     let (server_cert, server_key) = ca.issue_server_leaf(CP_HOST).expect("server leaf");
-    let (client_cert, client_key) = ca.issue_client_leaf("node-a").expect("client leaf");
+    let (spki, client_key) = lorica_cluster::ca::generate_node_keypair().expect("keypair");
+    let client_cert = ca
+        .issue_node_leaf_for_public_key("node-a", &spki)
+        .expect("client leaf")
+        .cert_pem;
     Pki {
         ca,
         server_cert,

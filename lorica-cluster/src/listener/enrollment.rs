@@ -45,9 +45,9 @@ use crate::listener::TokenLiveness;
 use crate::messages::{
     cluster_frame, cluster_response, ClusterFrame, ClusterResponse, ClusterStatus, EnrollAck,
 };
-use crate::preauth::{accept_error_pause, PreAuthBudgets, SourceGate, SourceSlot};
+use crate::preauth::{accept_error_pause, AttemptWindow, PreAuthBudgets, SourceGate, SourceSlot};
 use crate::tls::{negotiated_cluster_alpn, SwappableAcceptor};
-use crate::token::SECRET_LEN;
+use crate::token::{public_id_is_valid, SECRET_LEN};
 
 /// Largest DER SubjectPublicKeyInfo accepted from a joiner (an RSA-4096
 /// SPKI is under 600 bytes).
@@ -76,6 +76,9 @@ pub struct EnrollmentStats {
     /// Dropped: the peer's source already holds `max_per_source`
     /// pre-authentication connections.
     pub rejected_per_source: AtomicU64,
+    /// Dropped: the peer's source exceeded `max_attempts_per_window`
+    /// in the sliding window (Story 9.3 AC #11).
+    pub rejected_attempt_window: AtomicU64,
     /// Dropped: `max_inflight_enrollments` already in flight.
     pub rejected_inflight_enrollments: AtomicU64,
     /// Dropped: the peer announced or sent more than
@@ -203,6 +206,11 @@ impl EnrollmentListener {
 
                 let handshakes = Arc::new(Semaphore::new(budgets.max_concurrent_handshakes));
                 let sources = SourceGate::new(budgets.max_per_source);
+                let attempts = AttemptWindow::new(
+                    budgets.attempt_window,
+                    budgets.max_attempts_per_window,
+                    budgets.attempt_map_cap,
+                );
                 let shared = Arc::new(EnrollmentShared {
                     acceptor: Arc::clone(&acceptor),
                     budgets: budgets.clone(),
@@ -247,6 +255,11 @@ impl EnrollmentListener {
                                 drop(tcp);
                                 continue;
                             };
+                            if !attempts.allow(peer.ip()) {
+                                stats.rejected_attempt_window.fetch_add(1, Ordering::Relaxed);
+                                drop(tcp);
+                                continue;
+                            }
                             let shared = Arc::clone(&shared);
                             let liveness = liveness.clone();
                             conns.spawn(async move {
@@ -368,9 +381,14 @@ async fn serve_enrollment_conn(
         // OPAQUE status, the diagnostic stays in the journal.
         let (sequence, response) = match decode_enroll_frame(&body) {
             Some((sequence, enroll)) => {
-                let shaped = enroll.secret.len() == SECRET_LEN
+                // Every field is shape-checked here, at the
+                // unauthenticated boundary, before the handler (and
+                // the store) sees any of it.
+                let shaped = public_id_is_valid(&enroll.public_id)
+                    && enroll.secret.len() == SECRET_LEN
                     && enroll.public_key_der.len() <= MAX_PUBLIC_KEY_DER
                     && !enroll.public_key_der.is_empty()
+                    && !enroll.node_name.is_empty()
                     && display_field_is_valid(&enroll.node_name)
                     && display_field_is_valid(&enroll.build_version);
                 if !shaped {

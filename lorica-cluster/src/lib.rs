@@ -76,8 +76,8 @@ pub use enroll::{
     NoopSessionHandler, RefuseAllEnrollments, RenewGrant, RenewRequest, SessionHandler,
 };
 pub use dialer::{
-    split_host_port, ClusterConnection, Dialer, DialerConfig, DialerError, DialerHandle,
-    DialerStats, SessionHandle, BACKOFF_CAP_CEILING,
+    resolve_and_connect, split_host_port, ClusterConnection, Dialer, DialerConfig, DialerError,
+    DialerHandle, DialerStats, SessionHandle, BACKOFF_CAP_CEILING,
 };
 pub use handshake::{
     client_handshake, display_field_is_valid, evaluate_hello, node_name_is_valid, serve_hello,
@@ -94,10 +94,10 @@ pub use messages::{
     HeartbeatAck, Hello, HelloAck, Leave, LeaveAck, Renew, RenewAck, BODY_KIND_ENROLL,
     BODY_KIND_HEARTBEAT, BODY_KIND_HELLO, BODY_KIND_LEAVE, BODY_KIND_RENEW,
 };
-pub use preauth::{source_key, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
+pub use preauth::{source_key, AttemptWindow, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
 pub use roster::{
-    ControlPlane, LiveSessionSnapshot, NodeIdentity, NodeState, Roster, SessionGuard,
-    SessionRegistry,
+    ControlPlane, LiveSession, LiveSessionSnapshot, NodeIdentity, NodeState, Roster,
+    SessionGuard, SessionRegistry,
 };
 pub use session::SessionContext;
 pub use tls::{
@@ -105,7 +105,7 @@ pub use tls::{
     negotiated_cluster_alpn, operational_server_config, operational_server_config_with_crl,
     peer_fingerprint, ClusterTlsError, SwappableAcceptor, CLUSTER_ALPN,
 };
-pub use token::{MintedToken, ParsedToken, TokenFormatError};
+pub use token::{public_id_is_valid, MintError, MintedToken, ParsedToken, TokenFormatError};
 pub use version::{negotiate, PROTOCOL_MIN_COMPATIBLE, PROTOCOL_VERSION};
 
 /// The TLS stack this crate's configs are built for, re-exported so

@@ -55,6 +55,24 @@ pub const PIN_LEN: usize = 32;
 #[error("malformed join token")]
 pub struct TokenFormatError;
 
+/// Why a token could not be minted.
+#[derive(Debug, thiserror::Error)]
+pub enum MintError {
+    /// The system RNG failed.
+    #[error("token randomness unavailable")]
+    Randomness,
+}
+
+/// Whether `public_id` has the exact shape a minted token's lookup
+/// half has: [`PUBLIC_ID_LEN`] bytes as lowercase hex. Checked at the
+/// unauthenticated boundary before any store access.
+pub fn public_id_is_valid(public_id: &str) -> bool {
+    public_id.len() == PUBLIC_ID_LEN * 2
+        && public_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// A freshly minted token: what the operator sees ONCE, and what the
 /// registry stores.
 #[derive(Debug)]
@@ -82,14 +100,12 @@ pub struct ParsedToken {
 
 /// Mint a token pinning `leaf_spki_sha256` (the control plane's
 /// current leaf SPKI digest) and hash its secret under `hmac_key`.
-pub fn mint(hmac_key: &[u8], leaf_spki_sha256: &[u8; PIN_LEN]) -> Result<MintedToken, String> {
+pub fn mint(hmac_key: &[u8], leaf_spki_sha256: &[u8; PIN_LEN]) -> Result<MintedToken, MintError> {
     let rng = SystemRandom::new();
     let mut public = [0u8; PUBLIC_ID_LEN];
     let mut secret = [0u8; SECRET_LEN];
-    rng.fill(&mut public)
-        .map_err(|_| "token randomness unavailable".to_string())?;
-    rng.fill(&mut secret)
-        .map_err(|_| "token randomness unavailable".to_string())?;
+    rng.fill(&mut public).map_err(|_| MintError::Randomness)?;
+    rng.fill(&mut secret).map_err(|_| MintError::Randomness)?;
     let public_id = hex(&public);
     let mut payload = Vec::with_capacity(SECRET_LEN + PIN_LEN);
     payload.extend_from_slice(&secret);
@@ -107,9 +123,7 @@ pub fn mint(hmac_key: &[u8], leaf_spki_sha256: &[u8; PIN_LEN]) -> Result<MintedT
 pub fn parse(token: &str) -> Result<ParsedToken, TokenFormatError> {
     let token = token.trim();
     let (public_id, payload) = token.split_once('.').ok_or(TokenFormatError)?;
-    if public_id.len() != PUBLIC_ID_LEN * 2
-        || !public_id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
+    if !public_id_is_valid(public_id) {
         return Err(TokenFormatError);
     }
     let bytes = base64url_decode(payload).ok_or(TokenFormatError)?;
@@ -262,6 +276,16 @@ mod tests {
         }
         assert!(base64url_decode("Z").is_none());
         assert!(base64url_decode("Zm9v=").is_none());
+    }
+
+    #[test]
+    fn public_id_shape_is_exact() {
+        let minted = mint(&[1u8; 32], &[0u8; PIN_LEN]).expect("mint");
+        assert!(public_id_is_valid(&minted.public_id));
+        assert!(!public_id_is_valid(""));
+        assert!(!public_id_is_valid(&"A".repeat(PUBLIC_ID_LEN * 2)));
+        assert!(!public_id_is_valid(&"a".repeat(PUBLIC_ID_LEN * 2 + 1)));
+        assert!(!public_id_is_valid(&"g".repeat(PUBLIC_ID_LEN * 2)));
     }
 
     #[test]

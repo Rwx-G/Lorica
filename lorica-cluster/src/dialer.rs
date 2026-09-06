@@ -228,6 +228,7 @@ pub struct DialerHandle {
     stats: Arc<DialerStats>,
     connector: Arc<ArcSwap<TlsConnector>>,
     ca_pem: String,
+    reconnect: Arc<tokio::sync::Notify>,
     task: JoinHandle<()>,
 }
 
@@ -253,6 +254,14 @@ impl DialerHandle {
         let tls = client_config(&self.ca_pem, client_cert_pem, client_key_pem)?;
         self.connector.store(Arc::new(TlsConnector::from(Arc::new(tls))));
         Ok(())
+    }
+
+    /// Drop the established session and dial again immediately (no
+    /// backoff): after a renewal, so the control plane sees the new
+    /// certificate now and retires the superseded one, instead of
+    /// whenever the old session happens to end.
+    pub fn reconnect(&self) {
+        self.reconnect.notify_one();
     }
 
     /// Stop dialing and clear the connection slot.
@@ -283,11 +292,21 @@ impl Dialer {
         };
         let ca_pem = config.ca_pem.clone();
 
+        let reconnect = Arc::new(tokio::sync::Notify::new());
         let loop_slot = Arc::clone(&slot);
         let loop_stats = Arc::clone(&stats);
         let loop_connector = Arc::clone(&connector);
+        let loop_reconnect = Arc::clone(&reconnect);
         let task = tokio::spawn(async move {
-            dial_loop(config, loop_connector, server_name, loop_slot, loop_stats).await;
+            dial_loop(
+                config,
+                loop_connector,
+                server_name,
+                loop_slot,
+                loop_stats,
+                loop_reconnect,
+            )
+            .await;
         });
 
         Ok(DialerHandle {
@@ -295,6 +314,7 @@ impl Dialer {
             stats,
             connector,
             ca_pem,
+            reconnect,
             task,
         })
     }
@@ -306,6 +326,7 @@ async fn dial_loop(
     server_name: ServerName<'static>,
     slot: Arc<ArcSwapOption<SessionHandle>>,
     stats: Arc<DialerStats>,
+    reconnect: Arc<tokio::sync::Notify>,
 ) {
     let mut failures: u32 = 0;
     let mut fleet_hint: u32 = 0;
@@ -348,10 +369,21 @@ async fn dial_loop(
                     endpoint: Arc::clone(&endpoint),
                 })));
 
-                fleet_hint =
-                    heartbeat_until_dead(&config, &endpoint, fleet_hint, &stats).await;
+                let (hint, requested) = tokio::select! {
+                    hint = heartbeat_until_dead(&config, &endpoint, fleet_hint, &stats) => (hint, false),
+                    _ = reconnect.notified() => (fleet_hint, true),
+                };
+                fleet_hint = hint;
                 slot.store(None);
                 stats.disconnects.fetch_add(1, Ordering::Relaxed);
+                if requested {
+                    tracing::info!(
+                        control_plane = %config.control_plane,
+                        generation,
+                        "cluster session dropped on request; reconnecting now"
+                    );
+                    continue;
+                }
                 tracing::warn!(
                     control_plane = %config.control_plane,
                     generation,
@@ -431,15 +463,19 @@ enum DialFailure {
     RetryLater(u32),
 }
 
-/// Resolve the control-plane name and connect to the first address
-/// that answers, all under `connect_timeout`.
-async fn connect_tcp(config: &DialerConfig) -> Result<(tokio::net::TcpStream, SocketAddr), String> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(config.control_plane.as_str())
+/// Resolve a `host:port` and connect to the first address that
+/// answers, in resolution order. Shared by the dialer, the joiner and
+/// the CLI so "how the fleet reaches a name" has one definition. The
+/// caller bounds it with a timeout.
+pub async fn resolve_and_connect(
+    target: &str,
+) -> Result<(tokio::net::TcpStream, SocketAddr), String> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(target)
         .await
-        .map_err(|e| format!("resolve {}: {e}", config.control_plane))?
+        .map_err(|e| format!("resolve {target}: {e}"))?
         .collect();
     if addrs.is_empty() {
-        return Err(format!("resolve {}: no addresses", config.control_plane));
+        return Err(format!("resolve {target}: no addresses"));
     }
     let mut last_error = String::new();
     for addr in addrs {
@@ -460,7 +496,9 @@ async fn connect_once(
     // and then stalls (route hijack, stale address) must not wedge the
     // loop.
     let (tls, addr) = tokio::time::timeout(config.connect_timeout, async {
-        let (tcp, addr) = connect_tcp(config).await.map_err(DialFailure::Transport)?;
+        let (tcp, addr) = resolve_and_connect(&config.control_plane)
+            .await
+            .map_err(DialFailure::Transport)?;
         let tls = connector
             .connect(server_name.clone(), tcp)
             .await

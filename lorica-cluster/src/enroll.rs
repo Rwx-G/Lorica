@@ -33,7 +33,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
-use crate::dialer::split_host_port;
+use crate::dialer::{resolve_and_connect, split_host_port};
 use crate::messages::{
     cluster_frame, cluster_request, cluster_response, ClusterFrame, ClusterRequest,
     ClusterStatus, Enroll,
@@ -123,6 +123,8 @@ impl EnrollmentHandler for RefuseAllEnrollments {
 pub struct RenewRequest {
     /// The requesting node (from its certificate, never the payload).
     pub node_id: String,
+    /// The session's peer address (the audit source).
+    pub peer: SocketAddr,
     /// The node's NEW bare public key, DER SPKI.
     pub public_key_der: Vec<u8>,
 }
@@ -274,7 +276,9 @@ pub async fn join(params: JoinParams) -> Result<EnrollGrant, JoinError> {
         .map_err(|e| JoinError::Transport(format!("invalid control-plane host: {e}")))?;
 
     tokio::time::timeout(params.timeout, async move {
-        let tcp = connect_first(&params.enrollment_addr).await?;
+        let (tcp, _addr) = resolve_and_connect(&params.enrollment_addr)
+            .await
+            .map_err(JoinError::Transport)?;
         let mut tls = connector
             .connect(server_name, tcp)
             .await
@@ -334,22 +338,6 @@ pub async fn join(params: JoinParams) -> Result<EnrollGrant, JoinError> {
     })
     .await
     .map_err(|_| JoinError::Transport("timed out".to_string()))?
-}
-
-/// Resolve `host:port` and connect to the first address that answers.
-async fn connect_first(addr: &str) -> Result<tokio::net::TcpStream, JoinError> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(addr)
-        .await
-        .map_err(|e| JoinError::Transport(format!("resolve {addr}: {e}")))?
-        .collect();
-    let mut last = format!("resolve {addr}: no addresses");
-    for candidate in addrs {
-        match tokio::net::TcpStream::connect(candidate).await {
-            Ok(tcp) => return Ok(tcp),
-            Err(e) => last = format!("tcp connect {candidate}: {e}"),
-        }
-    }
-    Err(JoinError::Transport(last))
 }
 
 /// Decode the single frame an enrollment connection sends into an

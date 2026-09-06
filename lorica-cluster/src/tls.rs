@@ -210,9 +210,9 @@ pub fn client_config(
     Ok(config)
 }
 
-/// Lowercase-hex SHA-256 of a certificate's SubjectPublicKeyInfo:
-/// what join tokens pin (Story 9.3 AC #2). Takes the first
-/// certificate in `cert_pem`.
+/// SHA-256 of a certificate's SubjectPublicKeyInfo (raw bytes): what
+/// join tokens pin (Story 9.3 AC #2). Takes the first certificate in
+/// `cert_pem`.
 pub fn leaf_spki_sha256(cert_pem: &str) -> Result<[u8; 32], ClusterTlsError> {
     let der = CertificateDer::from_pem_slice(cert_pem.as_bytes())
         .map_err(|e| ClusterTlsError::Parse(format!("leaf PEM: {e}")))?;
@@ -410,12 +410,15 @@ mod tests {
         install_ring();
         let ca = ClusterCa::generate("Lorica Cluster CA").expect("ca");
         let (server_pem, server_key) = ca.issue_server_leaf("cp.internal").expect("server leaf");
-        let (client_pem, client_key) = ca.issue_client_leaf("node-a").expect("client leaf");
+        let (spki, client_key) = crate::ca::generate_node_keypair().expect("keypair");
+        let client = ca
+            .issue_node_leaf_for_public_key("node-a", &spki)
+            .expect("client leaf");
 
         operational_server_config(ca.cert_pem(), &server_pem, &server_key)
             .expect("operational config");
         enrollment_server_config(&server_pem, &server_key).expect("enrollment config");
-        client_config(ca.cert_pem(), &client_pem, &client_key).expect("client config");
+        client_config(ca.cert_pem(), &client.cert_pem, &client_key).expect("client config");
     }
 
     #[test]
@@ -433,7 +436,11 @@ mod tests {
         let ca = ClusterCa::generate("Lorica Cluster CA").expect("ca");
         let (server_pem, _key) = ca.issue_server_leaf("cp.internal").expect("server leaf");
         let (other_pem, _key) = ca.issue_server_leaf("cp.internal").expect("other leaf");
-        let (client_pem, _key) = ca.issue_client_leaf("node-a").expect("client leaf");
+        let (spki, _key) = crate::ca::generate_node_keypair().expect("keypair");
+        let client_pem = ca
+            .issue_node_leaf_for_public_key("node-a", &spki)
+            .expect("client leaf")
+            .cert_pem;
         let (ip_pem, _key) = ca.issue_server_leaf("192.0.2.10").expect("ip leaf");
         let pin = leaf_spki_sha256(&server_pem).expect("pin");
         let algorithms = tokio_rustls::rustls::crypto::ring::default_provider()
