@@ -354,7 +354,11 @@ pub(crate) fn run_single_process(cli: Cli) {
         let api_log_store = log_store.clone();
         let management_port = cli.management_port;
         let cluster_listen = cli.cluster_listen.clone();
+        let cluster_enrollment_listen = cli.cluster_enrollment_listen.clone();
+        let cluster_advertise = cli.cluster_advertise.clone();
         let cluster_listen_any = cli.cluster_listen_any;
+        let http_port = cli.http_port;
+        let https_port = cli.https_port;
         // `single_task_tracker` is already defined above (before the
         // WAF blocklist refresh spawn). Clone it for AppState and the
         // shutdown drain path.
@@ -415,9 +419,20 @@ pub(crate) fn run_single_process(cli: Cli) {
         // the wrong failure mode. Handles stay alive for the process
         // lifetime; the stats feed the Prometheus bridge.
         let mut cluster_plane = match startup::cluster_plane::spawn_cluster_plane(
-            cluster_listen.as_deref(),
-            cluster_listen_any,
-            management_port,
+            startup::cluster_plane::ClusterPlaneOptions {
+                cluster_listen,
+                enrollment_listen: cluster_enrollment_listen,
+                advertise: cluster_advertise,
+                listen_any: cluster_listen_any,
+                reserved: crate::cli::ReservedPorts {
+                    management: management_port,
+                    http: http_port,
+                    https: https_port,
+                },
+                // Single-process mode never hot-upgrades (it binds the
+                // management port fresh), so there is nothing to adopt.
+                inherited_operational_fd: None,
+            },
             &store,
         )
         .await

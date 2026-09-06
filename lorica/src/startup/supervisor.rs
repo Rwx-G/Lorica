@@ -88,9 +88,10 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 info!(
                     proxy_listeners = i.proxy.len(),
                     has_management = i.management.is_some(),
-                    // Cluster slots always empty until Story 9.2 wires
-                    // --cluster-listen; logged so an upgraded
-                    // control-plane node can verify the handoff.
+                    // The operational cluster listener is handed off
+                    // (Story 9.2); the enrollment one is not (its
+                    // socket is only bound while a join token is
+                    // live, and it rebinds on the next liveness edge).
                     cluster_listeners = i.cluster.len(),
                     "hot upgrade: pulled inherited listeners from outgoing supervisor"
                 );
@@ -1021,10 +1022,31 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // the operator asked for the plane, running without it is
         // the wrong failure mode. Handles stay alive for the process
         // lifetime; the stats feed the Prometheus bridge.
+        // On a hot upgrade the operational cluster socket is adopted
+        // from the outgoing supervisor (Story 9.1's FD slot), so
+        // established follower sessions survive the handoff exactly
+        // like proxy connections do. The enrollment socket is not
+        // handed off: it only exists while a join token is live and
+        // rebinds on the next liveness edge.
+        let inherited_operational_fd: Option<RawFd> = inherited.as_ref().and_then(|i| {
+            i.cluster
+                .iter()
+                .find(|(role, _, _)| *role == hot_upgrade::ClusterListenerRole::Operational)
+                .map(|(_, _, fd)| *fd)
+        });
         let mut cluster_plane = match startup::cluster_plane::spawn_cluster_plane(
-            hu_cli.cluster_listen.as_deref(),
-            hu_cli.cluster_listen_any,
-            management_port,
+            startup::cluster_plane::ClusterPlaneOptions {
+                cluster_listen: hu_cli.cluster_listen.clone(),
+                enrollment_listen: hu_cli.cluster_enrollment_listen.clone(),
+                advertise: hu_cli.cluster_advertise.clone(),
+                listen_any: hu_cli.cluster_listen_any,
+                reserved: crate::cli::ReservedPorts {
+                    management: management_port,
+                    http: hu_cli.http_port,
+                    https: hu_cli.https_port,
+                },
+                inherited_operational_fd,
+            },
             &store,
         )
         .await
@@ -1402,9 +1424,13 @@ pub(crate) fn run_supervisor(cli: Cli) {
                         proxy_fds: handoff_proxy_fds.clone(),
                         management_fd: mgmt_handoff_fd,
                         management_port,
-                        // Story 9.1 AC #7 seam: populated by Story 9.2
-                        // once --cluster-listen exists.
-                        cluster_fds: Vec::new(),
+                        // The operational cluster listener rides the
+                        // same FD handoff as the proxy sockets; the
+                        // enrollment one is rebound by the new side.
+                        cluster_fds: cluster_plane
+                            .as_ref()
+                            .map(|plane| plane.handoff_fds())
+                            .unwrap_or_default(),
                         child_argv,
                     })
                     .await;

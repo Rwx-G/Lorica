@@ -132,11 +132,25 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) cluster_listen: Option<String>,
 
-    /// Explicitly allow a wildcard host in `--cluster-listen`.
-    /// Without it a fleet listener can never be exposed on every
-    /// interface by accident.
+    /// Explicitly allow a wildcard host in `--cluster-listen` (and in
+    /// `--cluster-enrollment-listen`). Without it a fleet listener
+    /// can never be exposed on every interface by accident.
     #[arg(long)]
     pub(crate) cluster_listen_any: bool,
+
+    /// Enrollment listener bind as an explicit `host:port`. Defaults
+    /// to the `--cluster-listen` host on the next port; set it to put
+    /// the only unauthenticated surface on a different interface
+    /// (an admin VLAN) than the operational plane.
+    #[arg(long)]
+    pub(crate) cluster_enrollment_listen: Option<String>,
+
+    /// Hostname or IP followers dial to reach this control plane
+    /// (the SAN on its TLS certificate). Defaults to the
+    /// `--cluster-listen` host; required whenever followers reach the
+    /// control plane through DNS, NAT or a load balancer.
+    #[arg(long)]
+    pub(crate) cluster_advertise: Option<String>,
 
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
@@ -282,50 +296,145 @@ impl Cli {
         if self.cluster_listen_any {
             argv.push("--cluster-listen-any".to_string());
         }
+        if let Some(ref enrollment) = self.cluster_enrollment_listen {
+            argv.push("--cluster-enrollment-listen".to_string());
+            argv.push(enrollment.clone());
+        }
+        if let Some(ref advertise) = self.cluster_advertise {
+            argv.push("--cluster-advertise".to_string());
+            argv.push(advertise.clone());
+        }
         argv
     }
 }
 
-/// Validate `--cluster-listen` per Story 9.2 AC #11: an explicit
-/// `host:port` is required (a bare port is refused), a wildcard host
-/// needs the separate `--cluster-listen-any` opt-in, and the
-/// management port is refused. Returns the parsed bind address; the
-/// startup path logs the effective bind at WARN.
-pub(crate) fn validate_cluster_listen(
+/// The validated cluster-plane binds (Story 9.2 AC #11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClusterBinds {
+    /// The mandatory-mTLS operational listener.
+    pub operational: std::net::SocketAddr,
+    /// The token-gated enrollment listener (explicit or derived as
+    /// operational host, port + 1).
+    pub enrollment: std::net::SocketAddr,
+    /// The name followers dial, placed in the control-plane leaf's
+    /// SAN (explicit `--cluster-advertise` or the operational host).
+    pub advertise_host: String,
+}
+
+/// Ports the cluster plane must never share: the management API and
+/// the two proxy listeners.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReservedPorts {
+    pub management: u16,
+    pub http: u16,
+    pub https: u16,
+}
+
+fn parse_cluster_bind(
+    flag: &str,
     value: &str,
-    management_port: u16,
     allow_any: bool,
 ) -> Result<std::net::SocketAddr, String> {
     if !value.contains(':') {
         return Err(format!(
-            "--cluster-listen `{value}`: a bare port is refused; pass an explicit host:port \
+            "{flag} `{value}`: a bare port is refused; pass an explicit host:port \
              (e.g. 192.0.2.10:9444)"
         ));
     }
     let addr: std::net::SocketAddr = value.parse().map_err(|_| {
         format!(
-            "--cluster-listen `{value}`: not a valid host:port \
+            "{flag} `{value}`: not a valid host:port \
              (an IP address is required; IPv6 as [::1]:9444)"
         )
     })?;
     if addr.port() == 0 {
-        return Err(format!(
-            "--cluster-listen `{value}`: an explicit non-zero port is required"
-        ));
+        return Err(format!("{flag} `{value}`: an explicit non-zero port is required"));
     }
     if addr.ip().is_unspecified() && !allow_any {
         return Err(format!(
-            "--cluster-listen `{value}`: a wildcard host exposes the cluster plane on every \
+            "{flag} `{value}`: a wildcard host exposes the cluster plane on every \
              interface; pass --cluster-listen-any to do that deliberately"
         ));
     }
-    if addr.port() == management_port {
+    Ok(addr)
+}
+
+fn refuse_reserved(flag: &str, addr: std::net::SocketAddr, reserved: ReservedPorts) -> Result<(), String> {
+    let port = addr.port();
+    let clash = if port == reserved.management {
+        Some("the management API port")
+    } else if port == reserved.http || port == reserved.https {
+        Some("a proxy listener port")
+    } else {
+        None
+    };
+    match clash {
+        Some(what) => Err(format!(
+            "{flag} `{addr}`: port {port} is {what}; the cluster plane must not share it"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Validate the cluster-plane CLI per Story 9.2 AC #11. Both binds
+/// need an explicit `host:port` (a bare port is refused), a wildcard
+/// host needs the separate `--cluster-listen-any` opt-in, and neither
+/// bind may land on the management or proxy ports - the DERIVED
+/// enrollment bind included, so `host:65535` (overflow) and
+/// `host:9442` (enrollment would sit on 9443) are refused rather
+/// than silently misplacing the only unauthenticated surface. The
+/// startup path logs the effective binds at WARN.
+pub(crate) fn validate_cluster_listen(
+    value: &str,
+    enrollment_override: Option<&str>,
+    advertise: Option<&str>,
+    reserved: ReservedPorts,
+    allow_any: bool,
+) -> Result<ClusterBinds, String> {
+    let operational = parse_cluster_bind("--cluster-listen", value, allow_any)?;
+    refuse_reserved("--cluster-listen", operational, reserved)?;
+
+    let enrollment = match enrollment_override {
+        Some(explicit) => parse_cluster_bind("--cluster-enrollment-listen", explicit, allow_any)?,
+        None => {
+            let port = operational.port().checked_add(1).ok_or_else(|| {
+                format!(
+                    "--cluster-listen `{value}`: the derived enrollment port (port + 1) \
+                     overflows; pass --cluster-enrollment-listen explicitly"
+                )
+            })?;
+            std::net::SocketAddr::new(operational.ip(), port)
+        }
+    };
+    refuse_reserved("--cluster-enrollment-listen", enrollment, reserved)?;
+    if enrollment == operational {
         return Err(format!(
-            "--cluster-listen `{value}`: port {management_port} is the management API port; \
-             the cluster plane must not share it"
+            "--cluster-enrollment-listen `{enrollment}`: the enrollment and operational \
+             listeners must not share a bind"
         ));
     }
-    Ok(addr)
+
+    let advertise_host = match advertise {
+        Some(name) => {
+            let name = name.trim();
+            if name.is_empty()
+                || name.len() > 253
+                || name.chars().any(|c| c.is_whitespace() || c.is_control() || c == '/')
+            {
+                return Err(format!(
+                    "--cluster-advertise `{name}`: expected a hostname or IP address"
+                ));
+            }
+            name.to_string()
+        }
+        None => operational.ip().to_string(),
+    };
+
+    Ok(ClusterBinds {
+        operational,
+        enrollment,
+        advertise_host,
+    })
 }
 
 /// Implementation of `cluster init`: generate the cluster CA and
@@ -338,6 +447,16 @@ pub(crate) fn run_cluster_init(data_dir: &str, common_name: &str) {
     let data_dir = PathBuf::from(data_dir);
     let key_path = data_dir.join("encryption.key");
     let key = EncryptionKey::load_or_create(&key_path).expect("failed to load encryption key");
+    // This file is about to become the identity root of the fleet
+    // (docs/cluster.md): refuse to promote a key anyone else can read.
+    if !crate::startup::restrict_key_permissions(&key_path) {
+        eprintln!(
+            "refusing to initialise the cluster CA: {} must be mode 0600 and owned by the \
+             service user",
+            key_path.display()
+        );
+        std::process::exit(1);
+    }
     let db_path = data_dir.join("lorica.db");
     let store = ConfigStore::open(&db_path, Some(key)).expect("failed to open database");
 
@@ -816,39 +935,127 @@ mod tests {
             "--cluster-listen",
             "192.0.2.10:9444",
             "--cluster-listen-any",
+            "--cluster-enrollment-listen",
+            "192.0.2.20:9500",
+            "--cluster-advertise",
+            "cp.example.com",
         ]);
         let child = Cli::parse_from(original.hot_upgrade_argv("/tmp/lorica.new", 1));
         assert_eq!(child.cluster_listen, original.cluster_listen);
         assert!(child.cluster_listen_any);
+        assert_eq!(child.cluster_enrollment_listen, original.cluster_enrollment_listen);
+        assert_eq!(child.cluster_advertise, original.cluster_advertise);
+    }
+
+    const RESERVED: ReservedPorts = ReservedPorts {
+        management: 9443,
+        http: 8080,
+        https: 8443,
+    };
+
+    fn validate(value: &str, allow_any: bool) -> Result<ClusterBinds, String> {
+        validate_cluster_listen(value, None, None, RESERVED, allow_any)
     }
 
     #[test]
     fn cluster_listen_requires_explicit_host_and_port() {
         // Story 9.2 AC #11 refusal matrix.
-        assert!(validate_cluster_listen("9444", 9443, false)
-            .unwrap_err()
-            .contains("bare port"));
-        assert!(validate_cluster_listen("192.0.2.10", 9443, false).is_err());
-        assert!(validate_cluster_listen("192.0.2.10:0", 9443, false)
+        assert!(validate("9444", false).unwrap_err().contains("bare port"));
+        assert!(validate("192.0.2.10", false).is_err());
+        assert!(validate("192.0.2.10:0", false)
             .unwrap_err()
             .contains("non-zero"));
         // Wildcards refused without the explicit opt-in, v4 and v6.
-        assert!(validate_cluster_listen("0.0.0.0:9444", 9443, false)
+        assert!(validate("0.0.0.0:9444", false)
             .unwrap_err()
             .contains("--cluster-listen-any"));
-        assert!(validate_cluster_listen("[::]:9444", 9443, false).is_err());
-        assert!(validate_cluster_listen("0.0.0.0:9444", 9443, true).is_ok());
-        // The management port is refused regardless of host.
-        assert!(validate_cluster_listen("192.0.2.10:9443", 9443, false)
+        assert!(validate("[::]:9444", false).is_err());
+        assert!(validate("0.0.0.0:9444", true).is_ok());
+        // The management and proxy ports are refused regardless of host.
+        assert!(validate("192.0.2.10:9443", false)
             .unwrap_err()
             .contains("management"));
-        // Nominal accepts, v4 and v6.
-        assert_eq!(
-            validate_cluster_listen("192.0.2.10:9444", 9443, false)
-                .expect("valid")
-                .port(),
-            9444
+        assert!(validate("192.0.2.10:8443", false)
+            .unwrap_err()
+            .contains("proxy"));
+        // Nominal accepts, v4 and v6; enrollment derives as port + 1 on
+        // the same host and the advertised name defaults to the host.
+        let binds = validate("192.0.2.10:9444", false).expect("valid");
+        assert_eq!(binds.operational.port(), 9444);
+        assert_eq!(binds.enrollment, "192.0.2.10:9445".parse().expect("addr"));
+        assert_eq!(binds.advertise_host, "192.0.2.10");
+        assert!(validate("[2001:db8::10]:9444", false).is_ok());
+    }
+
+    #[test]
+    fn derived_enrollment_bind_is_validated_too() {
+        // port + 1 must not overflow or land on a reserved port: the
+        // enrollment listener is the product's only unauthenticated
+        // surface, it must never end up somewhere the operator did
+        // not firewall.
+        assert!(validate("192.0.2.10:65535", false)
+            .unwrap_err()
+            .contains("overflows"));
+        assert!(validate("192.0.2.10:9442", false)
+            .unwrap_err()
+            .contains("--cluster-enrollment-listen"));
+        assert!(validate("192.0.2.10:8079", false).is_err());
+
+        // An explicit enrollment bind goes through the same matrix and
+        // may sit on another interface.
+        let binds = validate_cluster_listen(
+            "192.0.2.10:9444",
+            Some("192.0.2.20:9500"),
+            None,
+            RESERVED,
+            false,
+        )
+        .expect("valid");
+        assert_eq!(binds.enrollment, "192.0.2.20:9500".parse().expect("addr"));
+        assert!(
+            validate_cluster_listen("192.0.2.10:9444", Some("9500"), None, RESERVED, false)
+                .is_err()
         );
-        assert!(validate_cluster_listen("[2001:db8::10]:9444", 9443, false).is_ok());
+        assert!(validate_cluster_listen(
+            "192.0.2.10:9444",
+            Some("192.0.2.10:9444"),
+            None,
+            RESERVED,
+            false
+        )
+        .unwrap_err()
+        .contains("must not share"));
+        assert!(validate_cluster_listen(
+            "192.0.2.10:9444",
+            Some("0.0.0.0:9500"),
+            None,
+            RESERVED,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn advertise_name_is_shape_checked() {
+        let binds = validate_cluster_listen(
+            "192.0.2.10:9444",
+            None,
+            Some(" cp.example.com "),
+            RESERVED,
+            false,
+        )
+        .expect("valid");
+        assert_eq!(binds.advertise_host, "cp.example.com");
+        assert!(
+            validate_cluster_listen("192.0.2.10:9444", None, Some(""), RESERVED, false).is_err()
+        );
+        assert!(validate_cluster_listen(
+            "192.0.2.10:9444",
+            None,
+            Some("cp example"),
+            RESERVED,
+            false
+        )
+        .is_err());
     }
 }
