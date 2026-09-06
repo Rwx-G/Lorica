@@ -309,6 +309,78 @@ so a future hardening pass does not tighten `RestrictAddressFamilies`.
     the guard right. The admission RETRY_LATER test became a
     session-cap test (the deterministic path once the opener is read
     before the permit).
+- **QA iteration 2 (2026-09-06, incremental re-audit of the iteration
+  1 diff by a security auditor and an architect)**: 3 High, 10 Medium,
+  a dozen Lows; all High and Medium fixed, Lows fixed where they were
+  one-liners:
+  - High (security): the global handshake permit pool inverted into a
+    remote lockout - sixteen silent TCP sockets re-opened every
+    handshake timeout kept every permit busy and every follower was
+    dropped at accept, for the price of no cryptography. New
+    `preauth` module: the pool is 256 (not 16), the pre-auth handshake
+    timeout 3 s (not 5 s), and a `SourceGate` bounds what one source
+    (IPv4 address or IPv6 /64) may hold at once (8), so exhausting the
+    pool takes 32 distinct prefixes. The permit RULE is now written
+    down and identical on both listeners: held from accept until the
+    connection enters the next bounded pool (the enrollment-exchange
+    permit, the session slot) or dies - never released into an
+    unbounded phase (the iteration 1 operational path released it
+    after TLS and built an unpermitted endpoint), never held past a
+    smaller pool (the iteration 1 enrollment path held it for the
+    whole connection).
+  - High (architecture): the dialer pinned one `SocketAddr` for the
+    process lifetime; a control plane that failed over, was
+    re-provisioned or rescheduled would have been a fleet-wide,
+    silent, restart-only outage. The dial target is a `host:port`
+    string resolved on every attempt, every resolved address tried in
+    order; the test dials `localhost` so resolution is exercised.
+  - High (architecture): the outgoing supervisor kept accepting
+    cluster sessions on the shared socket during the whole hot-upgrade
+    drain and cut them at `exit(0)`, under the OLD takeover epoch. The
+    drain branch now stops the plane the moment the new supervisor is
+    confirmed up; the module doc and `docs/cluster.md` say what is
+    true: the socket survives, sessions reconnect once.
+  - Medium: inherited cluster descriptors were not close-on-exec, so
+    every worker forked after a hot upgrade inherited the control
+    plane's listening socket (`MSG_CMSG_CLOEXEC` at the SCM_RIGHTS
+    receive, which also covers the management listener); the adopted
+    socket is now checked against the configured bind (mismatch:
+    close, bind fresh, WARN) and every non-adopted inherited cluster
+    descriptor is closed instead of leaking; a silent authenticated
+    peer no longer holds a session slot (the slot is taken after the
+    opener, under the still-held handshake permit) and is counted
+    (`opener_timeouts`, `handshake_transport_failures`); `accept()`
+    errors pause the loop for 100 ms and are counted instead of
+    spinning a core silently; the `body_kind`/body invariant is
+    enforced at both decode boundaries (bridge and opener) and
+    documented in `messages.rs` and the `.proto`; a `.proto` drift
+    test parses the published schema and checks every Rust tag and
+    enum value against the bytes prost actually emits; the
+    `#[non_exhaustive]` rule is written in `lib.rs` (wire-evolving
+    types only) and applied (configs are exhaustive again,
+    `OperationalConfig::new` carries defaults); `listener.rs` split
+    into `listener/{enrollment,operational}.rs`, `peer_fingerprint`
+    moved to `tls.rs`, `SessionContext` to `session.rs`; `cluster
+    init` now inspects the key file (refuses a foreign owner, warns
+    when the mode was wider than 0600) instead of chmod-ing and
+    claiming to have checked; the stored control-plane leaf row is
+    refreshed with the certificate actually served; RETRY_LATER is
+    floored by the exponential schedule so `retry_after_s = 0` cannot
+    hold a follower in a one-second mTLS loop; every fixed metric
+    label combination is created at install so absent-series alerts
+    fire; `lorica_cluster_accept_errors_total{listener}` added.
+  - Tests added: ALPN refusal end-to-end, UNSUPPORTED_METHOD answered
+    with the session kept and a forged discriminator dropping it,
+    opener timeout counted with the session slot left free,
+    per-source cap on both listeners, handoff key round trip through
+    the FD table (IPv6 bind included), host:port validation, source
+    key /64 and IPv4-mapped collapsing, gate release at zero.
+  - Lows fixed: unused `_endpoint` parameter, `ReservedPorts` docs,
+    root re-exports of the message types, `OnceLock` comment.
+  - Lows left as recorded: the enrollment path still frames by hand
+    (Story 9.3 rewrites that exchange around the redemption trait and
+    will share `lorica-command`'s framing then); a per-fingerprint
+    connection cap needs identities (9.3).
 - **Deliberately NOT done this story** (recorded for 9.3/9.4):
   session-handler trait (`ClusterSessionHandler`) so 9.4 dispatches
   without pulling `ConfigStore` into the transport crate; metrics
@@ -356,3 +428,4 @@ so a future hardening pass does not tighten `RestrictAddressFamilies`.
 | 2026-09-02 | 0.3 | Crate core (messages/frame/version/CA/TLS/handshake), encrypted CA storage (migration 49), cluster-plane docs and packaging banners landed. | Romain G. |
 | 2026-09-02 | 0.4 | Listeners with pre-auth budgets, admission gate, dialer, bridge whitelist, CLI (`--cluster-listen`, `cluster init`), startup wiring, Prometheus bridge. All ACs implemented. | Romain G. |
 | 2026-09-06 | 0.5 | QA iteration 1: Critical hot-upgrade FD handoff closed, operational listener pre-TLS budgets/timeouts/session cap, wire-format discriminator, dialer observability and timeouts, WAN RpcLimits, persisted control-plane leaf keypair, enrollment bind validation/override, TLS 1.3 + ALPN. All green. | Romain G. |
+| 2026-09-06 | 0.6 | QA iteration 2 (incremental re-audit): handshake-pool lockout closed (pool 256, per-source gate, permit rule), dialer resolves per attempt, plane stopped on the hot-upgrade drain, CLOEXEC on inherited descriptors, bind-checked adoption, body_kind invariant enforced, .proto drift test, listener split. All green. | Romain G. |

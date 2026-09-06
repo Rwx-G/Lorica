@@ -1,7 +1,7 @@
 # Story 9.3: Node Enrollment, Registry and Revocation
 
 **Epic:** 9 (v1.7.0)
-**Status:** Draft
+**Status:** InProgress
 **Author:** Romain G.
 
 **Depends on:** Stories 9.1, 9.2.
@@ -184,11 +184,132 @@ with the control plane learning about it only through drift.
 
 ### Debug Log
 
-(empty)
+- 2026-09-06: Phase 1 pre-implementation review against the 9.2
+  transport as shipped (listener.rs, dialer.rs, tls.rs, ca.rs,
+  messages.rs), rustls 0.23.43 `with_crls` /
+  `only_check_end_entity_revocation`, rcgen 0.14.9
+  (`SubjectPublicKeyInfo::from_der`, `CertificateParams::signed_by`
+  taking any `PublicKeyData`, `CertificateRevocationListParams`).
+  Everything the story needs exists in the pinned versions; no
+  feature flip and no new workspace dependency.
 
 ### Completion Notes
 
-(empty)
+- **Phase 1 decisions** (each one is a place where the ACs left a
+  gap or two ACs pulled against each other):
+  - **D1 - token minting has a surface the AC list forgot.** AC #10
+    names only node endpoints, but 9.7 AC #2 mints tokens from the
+    dashboard and AC #6 forbids the token in argv. Added:
+    `POST /api/v1/cluster/tokens` (SuperAdmin; returns the token
+    exactly once), `GET /api/v1/cluster/tokens` (SuperAdmin; never
+    the secret), `DELETE /api/v1/cluster/tokens/{public_id}`
+    (SuperAdmin; revokes an unused token, closes the window). The
+    CLI form `lorica cluster token` calls the local management API
+    with SuperAdmin credentials, the `run_unban` precedent.
+  - **D2 - token shape satisfies AC #1 and AC #2 literally.**
+    `<public_id>.<payload>` with `public_id` = 12 random bytes hex
+    (the indexed lookup key) and `payload` = base64url of
+    `secret[32] || control_plane_leaf_spki_sha256[32]`. The HMAC
+    covers the 32-byte secret only. The server-side HMAC key is a
+    dedicated encrypted row in a new `cluster_secrets` table,
+    registered in the rotation registry (Story 9.1 gate). Redemption
+    order: SELECT by `public_id` -> `ring::hmac::verify` (constant
+    time; an unknown id verifies against a fixed dummy so timing and
+    error are identical) -> the conditional burn UPDATE must report
+    one row -> only then sign. A token is not burned by a wrong
+    secret.
+  - **D3 - redemption logic lives in the binary, behind a trait.**
+    The transport crate stays free of `ConfigStore` (the 9.2
+    deferral). `lorica-cluster` defines `EnrollmentHandler`
+    (boxed-future methods, no `async-trait`); the binary implements
+    it with the store, the CA, the HMAC key and `ipnet` for the CIDR
+    binding. The listener's existing `max_inflight_enrollments`
+    semaphore IS the AC #1 global verification cap.
+  - **D4 - the joiner has no CA yet, so it pins.** A custom
+    `ServerCertVerifier` (`tls::join_client_config`) accepts the
+    control plane iff the leaf SPKI SHA-256 equals the token's pin,
+    the SAN matches the `--control-plane` host, the validity window
+    holds and EKU carries `serverAuth`. Parsing uses `x509-parser`
+    (already in the tree at 0.18 through lorica-api and rcgen's
+    feature). The verifier is the one `dangerous()` use in the crate
+    and is confined to the enrollment dial.
+  - **D5 - server-assigned node certificates.** CN = `node_id`
+    (UUID v4), `clientAuth` only, `CA:FALSE`, 90 days, serial = 16
+    random bytes (top bit cleared) recorded in the registry because
+    CRLs revoke by serial, not by fingerprint. Key-type allowlist
+    checked on the bare SPKI: Ed25519, P-256, RSA with a modulus of
+    at least 2048 bits.
+  - **D6 - roster in memory, store as the source of truth.**
+    `cluster_nodes` gets AC #9's columns plus `cert_serial`,
+    `prev_cert_fingerprint`, `prev_cert_serial`. The crate keeps an
+    `ArcSwap<HashMap<fingerprint, NodeIdentity>>` the binary reloads
+    after every registry mutation, so a connection never touches
+    SQLite. An unknown fingerprint (valid certificate, no row) or a
+    `Revoked` row is dropped and audited; a `Pending` node is
+    admitted to a session (heartbeats, visibility) and Story 9.4
+    gates configuration on `Active`.
+  - **D7 - session registry with a kill switch.** Sessions register
+    by `node_id` after identity resolution; a newer session for the
+    same node supersedes the older one; revocation flips the
+    session's watch and the loop exits synchronously (AC #7 second
+    half). Live facts (connected, last seen, peer address, build
+    version, schema) live in the registry and a 30 s flush persists
+    `last_seen_at` / `address` / `version` / `schema_version`. Hello
+    gains `build_version` (tag 5, bounded like `node_name`).
+  - **D8 - CRL.** rcgen mints one CRL over every `Revoked` (and
+    superseded) serial; the acceptor is rebuilt with
+    `with_crls(...).only_check_end_entity_revocation()` and swapped;
+    the same rebuild runs at boot. With nothing revoked the verifier
+    carries no CRL at all (no phantom "unknown status" failures).
+  - **D9 - one handle for the API.** `lorica_cluster::ControlPlane`
+    owns roster, session registry, acceptor, CA, CRL state, fleet
+    size and the token-liveness sender; `AppState` carries it as
+    `cluster_control: Option<Arc<ControlPlane>>` and every mutating
+    endpoint writes the store first, then calls the handle.
+  - **D10 - listener-level limiter, no `lru`.** `EnrollmentLimiter`
+    runs at accept, before TLS: sliding window per key (IPv4 /32,
+    IPv6 /64), per-key concurrent cap, the existing global semaphore,
+    a hard map cap (4096) with oldest-entry eviction implemented in
+    place (a bounded scan at the cap beats a new dependency).
+  - **D11 - follower runtime.** New single-row `cluster_identity`
+    (node id, name, certificate, encrypted key in the registry, CA
+    PEM, control-plane address and server name, enrolled_at).
+    Startup spawns the dialer in both modes when the row exists.
+    `lorica cluster join` writes the row and asks for a restart; it
+    refuses on a control plane (CA row present) or an enrolled node.
+    Renewal is follower-initiated (`Renew{public_key_der}` at two
+    thirds of lifetime over the session); the control plane keeps
+    the previous certificate valid until the first session on the
+    new one, then revokes it as superseded (a crash between issuance
+    and persistence does not brick the node).
+    `DialerHandle::update_identity` swaps the connector for the next
+    reconnect.
+  - **D12 - `leave` is two paths, both authorised.** With SuperAdmin
+    credentials: `POST /api/v1/cluster/leave` on the local API sends
+    `Leave` over the session (the control plane revokes, audits,
+    alerts), then wipes and audits locally. Without credentials: the
+    CLI dials the control plane with the node identity; a TLS
+    refusal proves control-plane-side deregistration and the CLI
+    wipes and writes the local audit row through `LogStore`; an
+    admitted session means "still registered" and the command
+    refuses. Replicated certificate private keys do not exist before
+    Story 9.5; the wipe covers the identity and 9.5 extends it with
+    its provenance column (recorded in that story's file list).
+  - **D13 - `cluster status`.** Offline facts from the database
+    (role, node id, enrolled_at); live facts through
+    `GET /api/v1/cluster/status` (Viewer+) when credentials are
+    passed: connection state, applied generation (0 until 9.4), and
+    the roster on a control plane.
+  - **D14 - `--cluster-auto-activate`** is the explicit opt-in of
+    AC #5, inherited across hot upgrades and logged at WARN.
+  - **D15 - audit and alerts.** Every lifecycle operation goes
+    through `audit::record` on the control plane (`cluster.token.mint`,
+    `cluster.token.revoke`, `cluster.node.enroll`,
+    `cluster.node.activate`, `cluster.node.revoke`,
+    `cluster.node.renew`, `cluster.node.leave`). Operations that
+    arrive on the cluster plane rather than a session use an
+    `AuditContext` with operator `cluster`, role `node` and the
+    peer address. A node leaving raises a `ClusterNodeLeft` alert.
 
 ## File List
 
@@ -204,3 +325,4 @@ Anticipated:
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. CSR dropped for a bare public key; token reshaped to avoid an argon2id amplification path; revocation moved to a real CRL + acceptor swap. Status Draft. | Romain G. |
+| 2026-09-06 | 0.2 | Phase 1 review: fifteen decisions recorded (token mint surface, two-segment token with embedded pin, redemption behind a trait, SPKI-pinning joiner verifier, in-memory roster, session kill switch, CRL rebuild, follower identity row, two-path leave). Status InProgress. | Romain G. |

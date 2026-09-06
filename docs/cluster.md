@@ -50,10 +50,22 @@ Two distinct listeners live behind that surface:
   product and is treated accordingly: it is closed unless at least one
   join token is live, auto-closes when the last unexpired token is
   burned or expires, and enforces pre-authentication budgets (handshake
-  timeout, concurrent-handshake cap, in-flight enrollment cap,
-  per-connection byte and time budgets) before any token verification
-  runs. On the wire it answers refusals with an opaque code; the real
-  diagnostic is logged locally only.
+  timeout, concurrent-handshake cap, a per-source cap keyed by IPv4
+  address or IPv6 /64, in-flight enrollment cap, per-connection byte
+  and time budgets) before any token verification runs. On the wire it
+  answers refusals with an opaque code; the real diagnostic is logged
+  locally only. The operational listener applies the same handshake,
+  concurrency and per-source bounds to every connection before and
+  during its TLS handshake, so a handful of silent sockets cannot lock
+  legitimate followers out.
+
+During a hot binary upgrade the operational socket is handed to the
+new process so there is no rebind gap; established follower sessions
+are closed by the outgoing process as soon as the new one is confirmed
+and reconnect once, to the new process. Followers dial the control
+plane by name and resolve it on every attempt, so a control plane that
+moves to another address is followed by the fleet on its next
+reconnect.
 
 Telemetry and configuration will never share a queue: the transport is
 one FIFO byte stream per endpoint by design, so telemetry (Story 9.6)
