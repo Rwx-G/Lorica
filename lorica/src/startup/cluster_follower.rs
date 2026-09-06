@@ -19,6 +19,13 @@
 //! session (AC #12), and stop when `POST /api/v1/cluster/leave` wipes
 //! the identity.
 //!
+//! Renewals are jittered: the lead is drawn once per process between
+//! 25 and 30 days before expiry, so a batch of nodes enrolled together
+//! spreads its renewals over days instead of hitting the control
+//! plane's signing path in the same ten minutes. After a successful
+//! renewal the dialer reconnects immediately on the new certificate,
+//! which is what lets the control plane retire the superseded one.
+//!
 //! Shared by both startup modes: the follower runtime lives in the
 //! supervisor (or the single process); workers never dial.
 
@@ -41,9 +48,11 @@ use tracing::{error, info, warn};
 /// lifetime.
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(600);
 
-/// Renew when this much of the 90-day lifetime is left (a third:
-/// AC #12's "two thirds of lifetime").
-const RENEWAL_LEAD: chrono::Duration = chrono::Duration::days(30);
+/// The renewal lead is drawn in `[RENEWAL_LEAD_MIN_DAYS,
+/// RENEWAL_LEAD_MAX_DAYS]` before expiry: a third of the 90-day
+/// lifetime at most (AC #12's "two thirds of lifetime"), jittered.
+const RENEWAL_LEAD_MIN_DAYS: i64 = 25;
+const RENEWAL_LEAD_MAX_DAYS: i64 = 30;
 
 /// Bound on one renewal exchange.
 const RENEWAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -85,6 +94,13 @@ impl FollowerPlane {
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(e.to_string())
+}
+
+/// This process's renewal lead, drawn once (the jitter).
+fn renewal_lead() -> chrono::Duration {
+    let span = (RENEWAL_LEAD_MAX_DAYS - RENEWAL_LEAD_MIN_DAYS) as u64 * 86_400;
+    let offset = rand::random::<u64>() % (span + 1);
+    chrono::Duration::days(RENEWAL_LEAD_MIN_DAYS) + chrono::Duration::seconds(offset as i64)
 }
 
 /// Start the follower runtime when a fleet identity exists.
@@ -158,7 +174,8 @@ pub(crate) async fn spawn_follower(
         warn!("follower: left the fleet; cluster session closed");
     });
 
-    // Renewal task (AC #12).
+    // Renewal task (AC #12), jittered per process.
+    let lead = renewal_lead();
     let renew_dialer = Arc::clone(&dialer);
     let renew_store = Arc::clone(store);
     let renew_connection = connection;
@@ -172,7 +189,7 @@ pub(crate) async fn spawn_follower(
             let Ok(Some(current)) = current else {
                 continue;
             };
-            if Utc::now() + RENEWAL_LEAD < current.cert_not_after {
+            if Utc::now() + lead < current.cert_not_after {
                 continue;
             }
             let Some(session) = renew_connection.current() else {
@@ -181,15 +198,15 @@ pub(crate) async fn spawn_follower(
             };
             match renew_once(&session.endpoint, &current, &renew_store).await {
                 Ok((cert_pem, key_pem, not_after)) => {
-                    let swapped = renew_dialer
+                    let outcome = renew_dialer
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .as_ref()
-                        .map(|d| d.update_identity(&cert_pem, &key_pem));
-                    match swapped {
+                        .map(|d| d.update_identity(&cert_pem, &key_pem).map(|()| d.reconnect()));
+                    match outcome {
                         Some(Ok(())) => info!(
                             not_after = %not_after.to_rfc3339(),
-                            "follower: node certificate renewed; the next connection presents it"
+                            "follower: node certificate renewed; reconnecting on it now"
                         ),
                         Some(Err(e)) => error!(error = %e, "follower: renewed identity rejected by the dialer"),
                         None => {}
@@ -205,6 +222,7 @@ pub(crate) async fn spawn_follower(
         node_name = %identity.node_name,
         control_plane = %identity.control_plane,
         cert_not_after = %identity.cert_not_after.to_rfc3339(),
+        renewal_lead_days = lead.num_days(),
         "follower mode: dialing the control plane"
     );
     Ok(Some(FollowerPlane {
@@ -256,4 +274,18 @@ async fn renew_once(
     .await
     .map_err(|e| e.to_string())?;
     Ok((ack.cert_pem, key_pem, not_after))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renewal_lead_stays_inside_the_jitter_band() {
+        for _ in 0..100 {
+            let lead = renewal_lead();
+            assert!(lead >= chrono::Duration::days(RENEWAL_LEAD_MIN_DAYS));
+            assert!(lead <= chrono::Duration::days(RENEWAL_LEAD_MAX_DAYS));
+        }
+    }
 }

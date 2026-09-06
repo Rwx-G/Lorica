@@ -13,13 +13,15 @@
 // limitations under the License.
 
 mod cli;
+mod cli_client;
+mod cli_cluster;
 mod health;
 mod startup;
 
 use clap::Parser;
 
 use crate::cli::{
-    init_logging, run_cluster_init, run_rotate_key, run_unban, run_upgrade, startup_banner, Cli,
+    init_logging, run_rotate_key, run_unban, run_upgrade, startup_banner, Cli,
     ClusterAction, Commands,
 };
 
@@ -67,7 +69,7 @@ fn main() {
         }
         Some(Commands::Cluster { action }) => match action {
             ClusterAction::Init { common_name } => {
-                run_cluster_init(&cli.data_dir, &common_name);
+                cli_cluster::run_cluster_init(&cli.data_dir, &common_name);
             }
             ClusterAction::Join {
                 control_plane,
@@ -77,7 +79,7 @@ fn main() {
                 token_stdin,
                 server_name,
             } => {
-                lorica::cli_cluster::run_cluster_join(
+                cli_cluster::run_cluster_join(
                     &cli.data_dir,
                     control_plane,
                     enrollment,
@@ -87,30 +89,43 @@ fn main() {
                     server_name,
                 );
             }
-            ClusterAction::Leave { user, password } => {
-                lorica::cli_cluster::run_cluster_leave(
-                    &cli.data_dir,
-                    cli.management_port,
-                    user,
-                    password,
-                );
+            ClusterAction::Leave {
+                user,
+                password_file,
+                password_stdin,
+                password,
+            } => {
+                let password = user.as_ref().map(|_| {
+                    cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
+                        .unwrap_or_else(|e| cli_client::fail(e))
+                });
+                cli_cluster::run_cluster_leave(&cli.data_dir, cli.management_port, user, password);
             }
-            ClusterAction::Status { user, password } => {
-                lorica::cli_cluster::run_cluster_status(
-                    &cli.data_dir,
-                    cli.management_port,
-                    user,
-                    password,
-                );
+            ClusterAction::Status {
+                user,
+                password_file,
+                password_stdin,
+                password,
+            } => {
+                let password = user.as_ref().map(|_| {
+                    cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
+                        .unwrap_or_else(|e| cli_client::fail(e))
+                });
+                cli_cluster::run_cluster_status(&cli.data_dir, cli.management_port, user, password);
             }
             ClusterAction::Token {
                 ttl_seconds,
                 node_name,
                 source_cidr,
                 user,
+                password_file,
+                password_stdin,
                 password,
             } => {
-                lorica::cli_cluster::run_cluster_token(
+                let password =
+                    cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
+                        .unwrap_or_else(|e| cli_client::fail(e));
+                cli_cluster::run_cluster_token(
                     cli.management_port,
                     ttl_seconds,
                     node_name,

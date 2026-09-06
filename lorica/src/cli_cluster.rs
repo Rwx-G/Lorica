@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `lorica cluster join | leave | status | token` (Story 9.3
-//! AC #6/#13/#14, and the token CLI the dashboard-less operator
-//! needs).
+//! `lorica cluster init | join | leave | status | token` (Story 9.2
+//! AC #8, Story 9.3 AC #6/#13/#14, and the token CLI the
+//! dashboard-less operator needs).
 //!
-//! `join` and the credential-less `leave` work on the node's database
-//! directly (the service is normally stopped, or restarts afterwards);
-//! `status` reads the database and, with credentials, the running
-//! instance; `token` and the credential-backed `leave` go through the
-//! local management API exactly like `lorica unban` does.
+//! `init`, `join` and the credential-less `leave` work on the node's
+//! database directly (the service is normally stopped, or restarts
+//! afterwards); `status` reads the database and, with credentials,
+//! the running instance; `token` and the credential-backed `leave` go
+//! through the local management API like `lorica unban` does.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -28,25 +28,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use lorica_api::audit::{record_with_store, AuditContext};
+use lorica_cluster::tokio_rustls::rustls::pki_types::ServerName;
+use lorica_cluster::tokio_rustls::rustls::{AlertDescription, Error as TlsError};
+use lorica_cluster::tokio_rustls::TlsConnector;
 use lorica_cluster::{
-    client_config, display_field_is_valid, join, split_host_port, token, HandshakeConfig,
-    HandshakeError, JoinParams,
+    client_config, display_field_is_valid, join, resolve_and_connect, split_host_port, token,
+    JoinParams,
 };
 use lorica_config::models::ClusterIdentity;
 use lorica_config::store::ConfigStore;
-use lorica_cluster::tokio_rustls::rustls::pki_types::ServerName;
-use lorica_cluster::tokio_rustls::TlsConnector;
+use tokio::io::AsyncReadExt;
+
+use crate::cli_client::{fail, management_client, management_data, management_login};
 
 /// Bound on one enrollment exchange.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound on the deregistration probe of a credential-less `leave`.
+/// Bound on each step of the deregistration probe of a
+/// credential-less `leave`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn fail(message: impl std::fmt::Display) -> ! {
-    eprintln!("{message}");
-    std::process::exit(1);
-}
+/// How long the probe waits for the control plane's verdict after
+/// the TLS handshake: a certificate alert arrives at once; silence
+/// means the control plane admitted the certificate and is waiting
+/// for the session opener.
+const PROBE_VERDICT_WINDOW: Duration = Duration::from_secs(3);
 
 /// Open the node's configuration database the way the service does.
 fn open_store(data_dir: &Path) -> ConfigStore {
@@ -54,6 +61,51 @@ fn open_store(data_dir: &Path) -> ConfigStore {
         .unwrap_or_else(|e| fail(format!("failed to load the encryption key: {e}")));
     ConfigStore::open(&data_dir.join("lorica.db"), Some(key))
         .unwrap_or_else(|e| fail(format!("failed to open the configuration database: {e}")))
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Runtime::new().expect("tokio runtime")
+}
+
+fn install_tls_provider() {
+    let _ = lorica_cluster::tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+}
+
+/// `lorica cluster init`: generate the cluster CA and persist it
+/// (certificate in clear, private key encrypted at rest). Idempotent
+/// by refusal: an existing CA is never overwritten.
+pub(crate) fn run_cluster_init(data_dir: &str, common_name: &str) {
+    let data_dir = PathBuf::from(data_dir);
+    let key_path = data_dir.join("encryption.key");
+    let store = open_store(&data_dir);
+    // This file is about to become the identity root of the fleet
+    // (docs/cluster.md): refuse a key someone else owns, and say so
+    // loudly when it was readable beyond its owner until now.
+    match crate::startup::check_key_file_before_promotion(&key_path) {
+        Ok(None) => {}
+        Ok(Some(warning)) => eprintln!("WARNING: {warning}"),
+        Err(reason) => fail(format!("refusing to initialise the cluster CA: {reason}")),
+    }
+    match store.get_cluster_ca() {
+        Ok(Some(_)) => {
+            println!("Cluster CA already initialised; refusing to overwrite it.");
+            println!("(Re-keying the fleet is a deliberate operation, not a re-run of init.)");
+        }
+        Ok(None) => {
+            let ca = lorica_cluster::ClusterCa::generate(common_name)
+                .unwrap_or_else(|e| fail(format!("CA generation failed: {e}")));
+            store
+                .set_cluster_ca(ca.cert_pem(), &ca.key_pem())
+                .unwrap_or_else(|e| fail(format!("failed to persist the cluster CA: {e}")));
+            println!("Cluster CA generated and persisted (CN: {common_name}).");
+            println!(
+                "The CA private key is encrypted under {} - that file is now the \
+                 identity root of the fleet. See docs/cluster.md.",
+                key_path.display()
+            );
+        }
+        Err(e) => fail(format!("failed to read the cluster CA state: {e}")),
+    }
 }
 
 /// The join token from the documented paths (AC #6): `--token-file`,
@@ -101,7 +153,7 @@ fn join_host_port(host: &str, port: u16) -> String {
 }
 
 /// `lorica cluster join`.
-pub fn run_cluster_join(
+pub(crate) fn run_cluster_join(
     data_dir: &str,
     control_plane: String,
     enrollment: Option<String>,
@@ -163,10 +215,9 @@ pub fn run_cluster_join(
         schema_version,
         timeout: JOIN_TIMEOUT,
     };
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let _ = lorica_cluster::tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    install_tls_provider();
     println!("Enrolling with {enrollment_addr} (control plane {control_plane}) as {node_name}...");
-    let grant = rt
+    let grant = runtime()
         .block_on(join(params))
         .unwrap_or_else(|e| fail(format!("join failed: {e}")));
     let cert_not_after = DateTime::parse_from_rfc3339(&grant.cert_not_after)
@@ -202,61 +253,41 @@ pub fn run_cluster_join(
     println!("Restart lorica to start the cluster session (this node dials {control_plane}).");
 }
 
-/// A client for the loopback management API. The self-signed
-/// management certificate has no chain to validate and the target is
-/// always 127.0.0.1, hence the accepted invalid certificate (the same
-/// trade `lorica unban` makes).
-fn management_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .cookie_store(true)
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("HTTP client")
-}
-
-async fn management_login(client: &reqwest::Client, port: u16, user: &str, password: &str) {
-    let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
-    match client
-        .post(&login_url)
-        .json(&serde_json::json!({ "username": user, "password": password }))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => {}
-        Ok(r) => fail(format!("Login failed ({}). Check credentials.", r.status())),
-        Err(e) => fail(format!(
-            "Cannot connect to management API on port {port}: {e}. \
-             Hint: is lorica running and is --management-port correct?"
-        )),
-    }
-}
-
-/// Read the `data` envelope of a management API answer, or fail with
-/// the body.
-async fn management_data(response: reqwest::Response, what: &str) -> serde_json::Value {
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        fail(format!("{what} failed ({status}): {body}"));
-    }
-    serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v.get("data").cloned())
-        .unwrap_or_else(|| fail(format!("{what}: unexpected answer: {body}")))
-}
-
 /// Outcome of the credential-less deregistration probe.
 enum Probe {
-    /// The control plane refused the node's certificate (or closed the
-    /// connection right after mTLS): deregistered on that side.
+    /// The control plane answered the node's certificate with a
+    /// certificate-level TLS alert: deregistered on that side.
     Deregistered(String),
-    /// The control plane admitted a session: still registered.
+    /// The control plane admitted the certificate: still registered.
     StillRegistered,
-    /// Could not reach the control plane: nothing proven.
+    /// Anything else (unreachable, reset, closed without an alert):
+    /// nothing proven.
     Unreachable(String),
 }
 
-async fn probe_registration(identity: &ClusterIdentity, schema_version: u32) -> Probe {
+/// Whether a TLS read error carries the control plane's verdict on
+/// OUR certificate. Only these alerts prove deregistration; a reset,
+/// an EOF or an unrelated alert proves nothing (an attacker who can
+/// disturb the connection must not be able to trigger an identity
+/// wipe).
+fn certificate_alert(error: &std::io::Error) -> Option<AlertDescription> {
+    let tls = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<TlsError>())?;
+    match tls {
+        TlsError::AlertReceived(
+            alert @ (AlertDescription::CertificateRevoked
+            | AlertDescription::CertificateUnknown
+            | AlertDescription::CertificateExpired
+            | AlertDescription::UnknownCA
+            | AlertDescription::AccessDenied
+            | AlertDescription::BadCertificate),
+        ) => Some(*alert),
+        _ => None,
+    }
+}
+
+async fn probe_registration(identity: &ClusterIdentity) -> Probe {
     let tls = match client_config(&identity.ca_pem, &identity.cert_pem, &identity.key_pem) {
         Ok(tls) => tls,
         Err(e) => return Probe::Unreachable(format!("local identity unusable: {e}")),
@@ -266,54 +297,48 @@ async fn probe_registration(identity: &ClusterIdentity, schema_version: u32) -> 
         Ok(name) => name,
         Err(e) => return Probe::Unreachable(format!("invalid server name: {e}")),
     };
-    let tcp = match tokio::time::timeout(
-        PROBE_TIMEOUT,
-        tokio::net::TcpStream::connect(identity.control_plane.as_str()),
-    )
-    .await
+    let tcp = match tokio::time::timeout(PROBE_TIMEOUT, resolve_and_connect(&identity.control_plane))
+        .await
     {
-        Ok(Ok(tcp)) => tcp,
-        Ok(Err(e)) => return Probe::Unreachable(format!("tcp connect: {e}")),
+        Ok(Ok((tcp, _))) => tcp,
+        Ok(Err(e)) => return Probe::Unreachable(e),
         Err(_) => return Probe::Unreachable("tcp connect timed out".to_string()),
     };
-    let tls = match tokio::time::timeout(PROBE_TIMEOUT, connector.connect(server_name, tcp)).await
+    let mut tls = match tokio::time::timeout(PROBE_TIMEOUT, connector.connect(server_name, tcp))
+        .await
     {
         Ok(Ok(tls)) => tls,
-        Ok(Err(e)) => return Probe::Deregistered(format!("TLS refused: {e}")),
+        Ok(Err(e)) => {
+            return match certificate_alert(&e) {
+                Some(alert) => Probe::Deregistered(format!("TLS alert {alert:?}")),
+                None => Probe::Unreachable(format!("TLS handshake failed without a certificate alert: {e}")),
+            }
+        }
         Err(_) => return Probe::Unreachable("TLS handshake timed out".to_string()),
     };
-    let (endpoint, _incoming) =
-        lorica_command::RpcEndpoint::<lorica_cluster::ClusterFrame>::from_stream(tls);
-    let handshake = HandshakeConfig::new(schema_version).with_build_version(env!("CARGO_PKG_VERSION"));
-    match tokio::time::timeout(
-        PROBE_TIMEOUT,
-        lorica_cluster::client_handshake(&endpoint, &handshake, &identity.node_name, PROBE_TIMEOUT),
-    )
-    .await
-    {
-        Ok(Ok(_)) => Probe::StillRegistered,
-        // TLS 1.3 client-certificate failures (revoked serial, unknown
-        // identity) surface here: the control plane closes right after
-        // the handshake, before any answer.
-        Ok(Err(HandshakeError::Transport(e))) => {
-            Probe::Deregistered(format!("session refused after mTLS: {e}"))
-        }
-        Ok(Err(other)) => Probe::Unreachable(format!(
-            "the control plane admitted the certificate but refused the session ({other}); \
-             nothing proves deregistration"
-        )),
-        Err(_) => Probe::Unreachable("handshake timed out".to_string()),
+    // TLS 1.3: the server verifies the client certificate after our
+    // Finished and answers with an alert on the first read. Silence
+    // means it admitted the certificate and waits for the opener.
+    let mut byte = [0u8; 1];
+    match tokio::time::timeout(PROBE_VERDICT_WINDOW, tls.read(&mut byte)).await {
+        Ok(Err(e)) => match certificate_alert(&e) {
+            Some(alert) => Probe::Deregistered(format!("TLS alert {alert:?}")),
+            None => Probe::Unreachable(format!("connection ended without a certificate alert: {e}")),
+        },
+        Ok(Ok(0)) => Probe::Unreachable("connection closed without a certificate alert".to_string()),
+        Ok(Ok(_)) => Probe::Unreachable("unexpected data before the session opener".to_string()),
+        Err(_) => Probe::StillRegistered,
     }
 }
 
 /// `lorica cluster leave`.
-pub fn run_cluster_leave(
+pub(crate) fn run_cluster_leave(
     data_dir: &str,
     management_port: u16,
     user: Option<String>,
     password: Option<String>,
 ) {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let rt = runtime();
     if let (Some(user), Some(password)) = (user, password) {
         // Authorised by a SuperAdmin credential: the running instance
         // tells the control plane, wipes and audits.
@@ -353,27 +378,24 @@ pub fn run_cluster_leave(
         Ok(None) => fail("this node holds no fleet identity (it is not a follower)"),
         Err(e) => fail(format!("failed to read the fleet identity: {e}")),
     };
-    let schema_version = store
-        .schema_version()
-        .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
-        .unwrap_or_else(|e| fail(format!("failed to read the schema version: {e}")));
-    let _ = lorica_cluster::tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    install_tls_provider();
     println!(
         "No credentials given: checking whether {} already deregistered node {}...",
         identity.control_plane, identity.node_id
     );
-    match rt.block_on(probe_registration(&identity, schema_version)) {
+    match rt.block_on(probe_registration(&identity)) {
         Probe::StillRegistered => fail(format!(
             "the control plane still accepts this node ({}). Leaving requires either its \
              deregistration there (DELETE /api/v1/cluster/nodes/{}) or a SuperAdmin \
-             credential on the local management API (--user/--password), which tells the \
-             control plane, wipes and audits.",
+             credential on the local management API (--user with --password-file, \
+             --password-stdin or LORICA_ADMIN_PASSWORD), which tells the control plane, \
+             wipes and audits.",
             identity.node_id, identity.node_id
         )),
         Probe::Unreachable(reason) => {
             eprintln!(
                 "cannot prove deregistration ({reason}). Revoke the node on the control plane, \
-                 or pass --user/--password for a SuperAdmin-authorised leave."
+                 or pass a SuperAdmin credential for an authorised leave."
             );
             std::process::exit(2);
         }
@@ -382,32 +404,35 @@ pub fn run_cluster_leave(
             let wiped = store
                 .delete_cluster_identity()
                 .unwrap_or_else(|e| fail(format!("failed to wipe the fleet identity: {e}")));
-            // Local audit row (AC #13: audited on both sides). The
-            // control plane audited its revocation already.
-            match lorica_api::log_store::LogStore::open(&data_dir) {
-                Ok(log_store) => {
-                    let after = serde_json::json!({
-                        "identity_wiped": wiped,
-                        "reason": "control plane deregistered this node",
-                    });
-                    let entry = lorica_api::audit::NewAuditEntry {
-                        timestamp: Utc::now().to_rfc3339(),
-                        operator_username: "cli".to_string(),
-                        operator_role: "local".to_string(),
-                        action: "cluster.node.leave".to_string(),
-                        target_type: "cluster_node".to_string(),
-                        target_id: identity.node_id.clone(),
-                        before_payload_hash: String::new(),
-                        after_payload_hash: lorica_api::audit::hash_payload(Some(&after)),
-                        ip: String::new(),
-                        user_agent: "lorica-cli".to_string(),
-                    };
-                    if let Err(e) = log_store.insert_audit(&entry) {
-                        eprintln!("warning: the local audit entry could not be written: {e}");
-                    }
+            // Local audit row (AC #13: audited on both sides), through
+            // the same path every other cluster audit takes so the
+            // sink copy and the failure metric apply. The control
+            // plane audited its revocation already.
+            let log_store = match lorica_api::log_store::LogStore::open(&data_dir) {
+                Ok(log_store) => Some(Arc::new(log_store)),
+                Err(e) => {
+                    eprintln!("warning: the local audit log could not be opened: {e}");
+                    None
                 }
-                Err(e) => eprintln!("warning: the local audit log could not be opened: {e}"),
-            }
+            };
+            let ctx = AuditContext {
+                username: "cli".to_string(),
+                role: "local".to_string(),
+                ip: String::new(),
+                user_agent: "lorica-cli".to_string(),
+            };
+            let after = serde_json::json!({
+                "identity_wiped": wiped,
+                "reason": "control plane deregistered this node",
+            });
+            rt.block_on(record_with_store(
+                log_store,
+                &ctx,
+                "cluster.node.leave",
+                ("cluster_node", &identity.node_id),
+                None,
+                Some(&after),
+            ));
             println!(
                 "Node {} left the fleet. Restart lorica so it runs standalone.",
                 identity.node_id
@@ -417,7 +442,7 @@ pub fn run_cluster_leave(
 }
 
 /// `lorica cluster status`.
-pub fn run_cluster_status(
+pub(crate) fn run_cluster_status(
     data_dir: &str,
     management_port: u16,
     user: Option<String>,
@@ -452,11 +477,10 @@ pub fn run_cluster_status(
     println!("Applied configuration generation: {generation}");
 
     let (Some(user), Some(password)) = (user, password) else {
-        println!("(Pass --user/--password for the live connection state and the roster.)");
+        println!("(Pass --user and a password source for the live connection state and the roster.)");
         return;
     };
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async {
+    runtime().block_on(async {
         let client = management_client();
         management_login(&client, management_port, &user, &password).await;
         let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/status");
@@ -475,7 +499,7 @@ pub fn run_cluster_status(
 }
 
 /// `lorica cluster token`.
-pub fn run_cluster_token(
+pub(crate) fn run_cluster_token(
     management_port: u16,
     ttl_seconds: Option<u64>,
     node_name: Option<String>,
@@ -483,8 +507,7 @@ pub fn run_cluster_token(
     user: String,
     password: String,
 ) {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async {
+    runtime().block_on(async {
         let client = management_client();
         management_login(&client, management_port, &user, &password).await;
         let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/tokens");

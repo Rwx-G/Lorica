@@ -968,7 +968,9 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // Capacity 1: a second upgrade while one is in flight is shed.
         let (upgrade_tx, mut upgrade_rx) =
             tokio::sync::mpsc::channel::<lorica_api::upgrade::StagedBinary>(1);
-        // Cluster plane (Stories 9.2/9.3): control-plane listeners and
+        // Cluster plane (Stories 9.2/9.3): the fleet role, shared by
+        // both startup modes (see `startup::spawn_cluster_runtime`);
+        // spawned BEFORE the API so AppState carries it.
         // fleet registry, opt-in via --cluster-listen; or the follower
         // dialer when this node holds a fleet identity. Spawned BEFORE
         // the API so AppState carries the fleet role. A bad bind, a
@@ -999,7 +1001,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 }
             }
         }
-        let mut cluster_plane = match startup::cluster_plane::spawn_cluster_plane(
+        let startup::ClusterStartup {
+            plane: mut cluster_plane,
+            follower: mut follower_plane,
+            runtime: cluster_runtime,
+        } = startup::spawn_cluster_runtime(
             startup::cluster_plane::ClusterPlaneOptions {
                 cluster_listen: hu_cli.cluster_listen.clone(),
                 enrollment_listen: hu_cli.cluster_enrollment_listen.clone(),
@@ -1017,37 +1023,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
             },
             &store,
         )
-        .await
-        {
-            Ok(Some(plane)) => {
-                lorica_api::metrics::install_cluster_plane_stats(
-                    Arc::clone(&plane.operational_stats),
-                    Arc::clone(&plane.enrollment_stats),
-                );
-                Some(plane)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                error!(error = %e, "cluster plane failed to start");
-                std::process::exit(1);
-            }
-        };
-        let mut follower_plane = match startup::cluster_follower::spawn_follower(
-            startup::cluster_follower::FollowerOptions {
-                is_control_plane: cluster_plane.is_some(),
-            },
-            &store,
-        )
-        .await
-        {
-            Ok(plane) => plane,
-            Err(e) => {
-                error!(error = %e, "cluster follower failed to start");
-                std::process::exit(1);
-            }
-        };
-        let cluster_runtime =
-            startup::cluster_runtime(cluster_plane.as_ref(), follower_plane.as_ref());
+        .await;
 
         let api_handle = tokio::spawn(async move {
             let state = AppState {

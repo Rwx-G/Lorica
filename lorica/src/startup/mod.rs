@@ -754,18 +754,69 @@ pub(crate) fn restrict_key_permissions(path: &std::path::Path) -> bool {
     true
 }
 
-/// The fleet role handed to `AppState` (Story 9.3): the control-plane
-/// handle, the follower handle, or standalone.
-pub(crate) fn cluster_runtime(
-    plane: Option<&cluster_plane::ClusterPlane>,
-    follower: Option<&cluster_follower::FollowerPlane>,
-) -> lorica_api::cluster::ClusterRuntime {
-    match (plane, follower) {
-        (Some(plane), _) => lorica_api::cluster::ClusterRuntime::ControlPlane(Arc::clone(&plane.control)),
+/// What [`spawn_cluster_runtime`] hands back to a startup mode.
+pub(crate) struct ClusterStartup {
+    /// The control plane, when `--cluster-listen` is set.
+    pub plane: Option<cluster_plane::ClusterPlane>,
+    /// The follower, when this node holds a fleet identity.
+    pub follower: Option<cluster_follower::FollowerPlane>,
+    /// The role handed to `AppState`.
+    pub runtime: lorica_api::cluster::ClusterRuntime,
+}
+
+/// Start the fleet role shared by both startup modes (Stories
+/// 9.2/9.3): the control-plane listeners and registry, opt-in via
+/// `--cluster-listen`, or the follower dialer when this node holds a
+/// fleet identity. Registers the Prometheus bridge. A bad bind, a
+/// missing CA, or a node that is both is fatal: the operator asked
+/// for a role, running without it is the wrong failure mode. The only
+/// mode-specific input is the inherited operational socket inside
+/// `opts`.
+pub(crate) async fn spawn_cluster_runtime(
+    opts: cluster_plane::ClusterPlaneOptions,
+    store: &Arc<Mutex<ConfigStore>>,
+) -> ClusterStartup {
+    let plane = match cluster_plane::spawn_cluster_plane(opts, store).await {
+        Ok(Some(plane)) => {
+            lorica_api::metrics::install_cluster_plane_stats(
+                Arc::clone(&plane.operational_stats),
+                Arc::clone(&plane.enrollment_stats),
+            );
+            Some(plane)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!(error = %e, "cluster plane failed to start");
+            std::process::exit(1);
+        }
+    };
+    let follower = match cluster_follower::spawn_follower(
+        cluster_follower::FollowerOptions {
+            is_control_plane: plane.is_some(),
+        },
+        store,
+    )
+    .await
+    {
+        Ok(follower) => follower,
+        Err(e) => {
+            error!(error = %e, "cluster follower failed to start");
+            std::process::exit(1);
+        }
+    };
+    let runtime = match (&plane, &follower) {
+        (Some(plane), _) => {
+            lorica_api::cluster::ClusterRuntime::ControlPlane(Arc::clone(&plane.control))
+        }
         (None, Some(follower)) => {
             lorica_api::cluster::ClusterRuntime::Follower(Arc::clone(&follower.runtime))
         }
         (None, None) => lorica_api::cluster::ClusterRuntime::Standalone,
+    };
+    ClusterStartup {
+        plane,
+        follower,
+        runtime,
     }
 }
 

@@ -24,6 +24,16 @@
 //! least one join token is live; a liveness publisher task recounts
 //! live tokens on every mutation and at every expiry edge.
 //!
+//! # The store lock and the signing path
+//!
+//! The configuration store is one async mutex shared with the reload
+//! path and every management handler. Redemption and renewal
+//! therefore hold it only for the reads and the writes: the atomic
+//! burn or the eligibility check first, then the certificate is signed
+//! on the blocking pool with NO store lock, then a second short lock
+//! persists the result. A fleet enrolling or renewing in a burst
+//! never serializes the data plane's reload behind rcgen.
+//!
 //! Hot upgrade: the operational SOCKET is handed to the next
 //! supervisor through Story 9.1's cluster FD slot, so there is no
 //! rebind gap and no EADDRINUSE against the outgoing process. The
@@ -37,15 +47,16 @@
 //! edge, which is the honest lifecycle for a socket that usually does
 //! not exist.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::AtomicU32;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use lorica_api::audit::{record_with_store, AuditContext};
-use lorica_api::cluster::{publish_token_liveness, refresh_control_plane};
+use lorica_api::cluster::{publish_token_liveness, refresh_control_plane, revoke_node_fully};
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
 use lorica_api::log_store::LogStore;
@@ -54,12 +65,12 @@ use lorica_cluster::enroll::{
     RenewRequest, SessionHandler,
 };
 use lorica_cluster::{
-    token, AdmissionGate, ClusterCa, ControlPlane, EnrollmentHandle, EnrollmentListener,
-    EnrollmentStats, FleetHooks, HandshakeConfig, OperationalConfig, OperationalHandle,
+    token, ClusterCa, ControlPlane, EnrollmentHandle, EnrollmentListener, EnrollmentStats,
+    FleetHooks, HandshakeConfig, IssuedLeaf, OperationalConfig, OperationalHandle,
     OperationalListener, OperationalStats, PreAuthBudgets, SwappableAcceptor,
 };
 use lorica_config::models::{ClusterNode, NodeStatus};
-use lorica_config::store::ConfigStore;
+use lorica_config::store::{ConfigStore, LiveNodeFacts};
 use lorica_notify::events::{AlertEvent, AlertType};
 use lorica_notify::AlertSender;
 use tokio::sync::{watch, Mutex};
@@ -69,17 +80,21 @@ use tracing::{error, info, warn};
 use crate::cli::{validate_cluster_listen, ReservedPorts};
 use crate::startup::hot_upgrade::ClusterListenerRole;
 
-/// Convergence admission defaults (AC #10): concurrent sessions
-/// admitted through the handshake at once, how many more may queue,
-/// and what a queued-out peer is told to wait before retrying.
-const ADMISSION_MAX_CONCURRENT: usize = 32;
-const ADMISSION_QUEUE_DEPTH: usize = 128;
-const ADMISSION_RETRY_AFTER_S: u32 = 5;
-
 /// How often live-session facts (last seen, address, version) are
-/// persisted to `cluster_nodes`, and the longest the liveness
-/// publisher sleeps between recounts.
+/// persisted to `cluster_nodes` and expired revoked serials are
+/// pruned, and the longest the liveness publisher sleeps between
+/// recounts.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// A renewal is served only when this much (or less) of the
+/// certificate's lifetime is left: the follower asks at 30 days
+/// (with jitter down to 25), so anything asking earlier is not a
+/// renewal (Story 9.3 AC #12).
+const RENEWAL_ACCEPT_WINDOW: chrono::Duration = chrono::Duration::days(35);
+
+/// One renewal grant per node per this interval; a second request
+/// inside it is refused (a grant costs a signature and a CRL entry).
+const RENEWAL_COOLDOWN: Duration = Duration::from_secs(3600);
 
 /// Inputs for [`spawn_cluster_plane`], lifted from the CLI and the
 /// process.
@@ -196,6 +211,154 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(e.to_string())
 }
 
+/// What phase one of a redemption decided under the store lock.
+struct BurnedToken {
+    node_id: String,
+    public_id: String,
+}
+
+/// Sign on the blocking pool with no store lock held (the module doc's
+/// rule).
+async fn sign_node_leaf(
+    control: &Arc<ControlPlane>,
+    node_id: &str,
+    spki_der: Vec<u8>,
+) -> Result<IssuedLeaf, String> {
+    let control = Arc::clone(control);
+    let node_id = node_id.to_string();
+    tokio::task::spawn_blocking(move || control.issue_node_leaf(&node_id, &spki_der))
+        .await
+        .map_err(|e| format!("signing task failed: {e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// The redemption pipeline (Story 9.3 AC #1/#3/#4/#5), separable from
+/// the audit and refresh side effects so it can be tested against a
+/// real store:
+///
+/// 1. under the store lock: ONE indexed lookup and ONE constant-time
+///    verification (a dummy digest when the id is unknown), the
+///    mint-time bindings, the key allowlist, then the atomic burn;
+/// 2. with no lock: the certificate is signed on a bare public key;
+/// 3. under the store lock again: the registry row.
+///
+/// A signing failure after the burn leaves a burned token and a loud
+/// error: the operator mints another. The `Ok(Err(reason))` layer is
+/// the refusal diagnostic that stays in the journal.
+pub(crate) async fn redeem_with_store(
+    store: &Arc<Mutex<ConfigStore>>,
+    control: &Arc<ControlPlane>,
+    request: EnrollRequest,
+    now: DateTime<Utc>,
+) -> Result<EnrollGrant, EnrollRefusal> {
+    let peer = request.peer;
+    let public_key_der = request.public_key_der.clone();
+    let node_name = request.node_name.clone();
+    let build_version = request.build_version.clone();
+    let schema_version = request.schema_version;
+
+    // Phase 1: verify, bind, allowlist, burn.
+    let burned = db_blocking(store, move |store| {
+        let token_row = store.get_join_token(&request.public_id).map_err(internal)?;
+        let key = store.token_hmac_key().map_err(internal)?;
+        let stored = token_row
+            .as_ref()
+            .map(|t| t.secret_hmac.clone())
+            .unwrap_or_else(token::dummy_secret_hmac_hex);
+        let verified = token::verify_secret(&key, &request.secret, &stored);
+        let Some(token_row) = token_row.filter(|_| verified) else {
+            return Ok(Err("unknown token or wrong secret"));
+        };
+        if let Some(bound) = &token_row.bound_node_name {
+            if *bound != request.node_name {
+                return Ok(Err("node name does not match the token's binding"));
+            }
+        }
+        if let Some(cidr) = &token_row.bound_source_cidr {
+            let inside = cidr
+                .parse::<ipnet::IpNet>()
+                .map(|net| net.contains(&peer.ip()))
+                .unwrap_or(false);
+            if !inside {
+                return Ok(Err("source address is outside the token's CIDR binding"));
+            }
+        }
+        // The key must be acceptable BEFORE the burn: a bad key must
+        // not consume a good token.
+        if lorica_cluster::ca::check_public_key_allowlist(&request.public_key_der).is_err() {
+            return Ok(Err(
+                "public key is not on the allowlist (Ed25519, P-256, RSA-2048+)",
+            ));
+        }
+        let node_id = new_node_id();
+        if !store
+            .burn_join_token(&token_row.public_id, &node_id, now)
+            .map_err(internal)?
+        {
+            return Ok(Err("token expired, already redeemed or revoked"));
+        }
+        Ok::<_, ApiError>(Ok(BurnedToken {
+            node_id,
+            public_id: token_row.public_id,
+        }))
+    })
+    .await
+    .map_err(|e| EnrollRefusal::Internal(e.to_string()))?
+    .map_err(EnrollRefusal::Refused)?;
+
+    // Phase 2: sign, lock-free.
+    let issued = sign_node_leaf(control, &burned.node_id, public_key_der)
+        .await
+        .map_err(|e| {
+            error!(
+                node_id = %burned.node_id,
+                token_public_id = %burned.public_id,
+                error = %e,
+                "token burned but the node certificate could not be signed; mint another token"
+            );
+            EnrollRefusal::Internal(e)
+        })?;
+
+    // Phase 3: the registry row.
+    let status = if control.auto_activate {
+        NodeStatus::Active
+    } else {
+        NodeStatus::Pending
+    };
+    let node_id = burned.node_id.clone();
+    let row = ClusterNode {
+        node_id: node_id.clone(),
+        name: node_name,
+        cert_fingerprint: issued.fingerprint_sha256.clone(),
+        cert_serial: issued.serial_hex.clone(),
+        prev_cert_fingerprint: None,
+        prev_cert_serial: None,
+        address: peer.to_string(),
+        version: build_version,
+        schema_version: i64::from(schema_version),
+        status,
+        enrolled_at: now,
+        last_seen_at: Some(now),
+        applied_config_generation: 0,
+        applied_config_hash: String::new(),
+        cert_not_after: issued.not_after,
+        revoked_at: None,
+    };
+    db_blocking(store, move |store| {
+        store.create_cluster_node(&row).map_err(internal)
+    })
+    .await
+    .map_err(|e| EnrollRefusal::Internal(e.to_string()))?;
+
+    Ok(EnrollGrant {
+        node_id,
+        cert_pem: issued.cert_pem,
+        ca_pem: control.ca_pem().to_string(),
+        status: status.as_str().to_string(),
+        cert_not_after: issued.not_after.to_rfc3339(),
+    })
+}
+
 /// The binary's redemption and lifecycle hooks: the store, the CA
 /// (through the control-plane handle), the audit log and the alert
 /// dispatcher behind the transport crate's traits.
@@ -204,6 +367,8 @@ struct FleetHandlers {
     store: Arc<Mutex<ConfigStore>>,
     log_store: Option<Arc<LogStore>>,
     alert_sender: AlertSender,
+    /// Last renewal grant per node, for [`RENEWAL_COOLDOWN`].
+    renewals: StdMutex<HashMap<String, Instant>>,
 }
 
 impl FleetHandlers {
@@ -230,126 +395,47 @@ impl FleetHandlers {
         )
         .await;
     }
+
+    /// Whether `node_id` may be granted a renewal now (and record
+    /// that it was).
+    fn renewal_allowed(&self, node_id: &str) -> bool {
+        let mut renewals = self.renewals.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        // Keep the map bounded by the fleet: drop entries past the
+        // cooldown while we are here.
+        renewals.retain(|_, granted| now.duration_since(*granted) < RENEWAL_COOLDOWN);
+        if renewals.contains_key(node_id) {
+            return false;
+        }
+        renewals.insert(node_id.to_string(), now);
+        true
+    }
 }
 
 impl EnrollmentHandler for FleetHandlers {
     fn redeem(&self, request: EnrollRequest) -> BoxFuture<'_, Result<EnrollGrant, EnrollRefusal>> {
         Box::pin(async move {
-            let now = Utc::now();
             let peer = request.peer;
-            let control = Arc::clone(&self.control);
-            let auto_activate = control.auto_activate;
-            let outcome = db_blocking(&self.store, move |store| {
-                // 1. Lookup by the indexed half, then ONE constant-time
-                //    verification whether or not the id exists (AC #1).
-                let token_row = store.get_join_token(&request.public_id).map_err(internal)?;
-                let key = store.token_hmac_key().map_err(internal)?;
-                let stored = token_row
-                    .as_ref()
-                    .map(|t| t.secret_hmac.clone())
-                    .unwrap_or_else(token::dummy_secret_hmac_hex);
-                let verified = token::verify_secret(&key, &request.secret, &stored);
-                let Some(token_row) = token_row.filter(|_| verified) else {
-                    return Ok(Err("unknown token or wrong secret"));
-                };
-                // 2. Mint-time bindings (AC #5).
-                if let Some(bound) = &token_row.bound_node_name {
-                    if *bound != request.node_name {
-                        return Ok(Err("node name does not match the token's binding"));
-                    }
-                }
-                if let Some(cidr) = &token_row.bound_source_cidr {
-                    let inside = cidr
-                        .parse::<ipnet::IpNet>()
-                        .map(|net| net.contains(&peer.ip()))
-                        .unwrap_or(false);
-                    if !inside {
-                        return Ok(Err("source address is outside the token's CIDR binding"));
-                    }
-                }
-                // 3. The key must be acceptable BEFORE the burn: a bad
-                //    key must not consume a good token.
-                if lorica_cluster::ca::check_public_key_allowlist(&request.public_key_der).is_err()
-                {
-                    return Ok(Err("public key is not on the allowlist (Ed25519, P-256, RSA-2048+)"));
-                }
-                // 4. The atomic burn, BEFORE any signing (AC #4).
-                let node_id = new_node_id();
-                if !store
-                    .burn_join_token(&token_row.public_id, &node_id, now)
-                    .map_err(internal)?
-                {
-                    return Ok(Err("token expired, already redeemed or revoked"));
-                }
-                // 5. Server-assigned certificate on the bare key (AC #3).
-                let issued = control
-                    .ca
-                    .issue_node_leaf_for_public_key(&node_id, &request.public_key_der)
-                    .map_err(internal)?;
-                let status = if auto_activate {
-                    NodeStatus::Active
-                } else {
-                    NodeStatus::Pending
-                };
-                store
-                    .create_cluster_node(&ClusterNode {
-                        node_id: node_id.clone(),
-                        name: request.node_name.clone(),
-                        cert_fingerprint: issued.fingerprint_sha256.clone(),
-                        cert_serial: issued.serial_hex.clone(),
-                        prev_cert_fingerprint: None,
-                        prev_cert_serial: None,
-                        address: peer.to_string(),
-                        version: request.build_version.clone(),
-                        schema_version: i64::from(request.schema_version),
-                        status,
-                        enrolled_at: now,
-                        last_seen_at: Some(now),
-                        applied_config_generation: 0,
-                        applied_config_hash: String::new(),
-                        cert_not_after: issued.not_after,
-                        revoked_at: None,
-                    })
-                    .map_err(internal)?;
-                Ok::<_, ApiError>(Ok((
-                    node_id,
-                    issued,
-                    status,
-                    token_row.public_id,
-                    request.node_name,
-                )))
-            })
-            .await;
-            match outcome {
-                Err(e) => Err(EnrollRefusal::Internal(e.to_string())),
-                Ok(Err(reason)) => Err(EnrollRefusal::Refused(reason)),
-                Ok(Ok((node_id, issued, status, public_id, node_name))) => {
-                    self.refresh().await;
-                    match publish_token_liveness(&self.control, &self.store).await {
-                        Ok(live) => info!(live_tokens = live, "join token redeemed"),
-                        Err(e) => error!(error = %e, "token liveness recount failed"),
-                    }
-                    self.audit(
-                        peer,
-                        "cluster.node.enroll",
-                        ("cluster_node", &node_id),
-                        Some(serde_json::json!({
-                            "name": node_name,
-                            "status": status.as_str(),
-                            "token_public_id": public_id,
-                            "cert_fingerprint": issued.fingerprint_sha256,
-                        })),
-                    )
-                    .await;
-                    Ok(EnrollGrant {
-                        node_id,
-                        cert_pem: issued.cert_pem,
-                        ca_pem: self.control.ca.cert_pem().to_string(),
-                        status: status.as_str().to_string(),
-                        cert_not_after: issued.not_after.to_rfc3339(),
-                    })
-                }
+            let node_name = request.node_name.clone();
+            let public_id = request.public_id.clone();
+            let grant = redeem_with_store(&self.store, &self.control, request, Utc::now()).await?;
+            self.refresh().await;
+            match publish_token_liveness(&self.control, &self.store).await {
+                Ok(live) => info!(live_tokens = live, "join token redeemed"),
+                Err(e) => error!(error = %e, "token liveness recount failed"),
             }
+            self.audit(
+                peer,
+                "cluster.node.enroll",
+                ("cluster_node", &grant.node_id),
+                Some(serde_json::json!({
+                    "name": node_name,
+                    "status": grant.status,
+                    "token_public_id": public_id,
+                })),
+            )
+            .await;
+            Ok(grant)
         })
     }
 }
@@ -400,32 +486,59 @@ impl SessionHandler for FleetHandlers {
 
     fn on_renew(&self, request: RenewRequest) -> BoxFuture<'_, Result<RenewGrant, String>> {
         Box::pin(async move {
-            let control = Arc::clone(&self.control);
             let node_id = request.node_id.clone();
-            let issued = db_blocking(&self.store, move |store| {
-                let issued = control
-                    .ca
-                    .issue_node_leaf_for_public_key(&request.node_id, &request.public_key_der)
-                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-                let recorded = store
-                    .record_cluster_node_renewal(
-                        &request.node_id,
-                        &issued.fingerprint_sha256,
-                        &issued.serial_hex,
-                        issued.not_after,
-                        Utc::now(),
-                    )
-                    .map_err(internal)?;
-                if !recorded {
-                    return Err(ApiError::NotFound("node not registered".into()));
+            let peer = request.peer;
+            // Eligibility first (Active, inside the renewal window,
+            // outside the cooldown), under a short lock; then sign
+            // lock-free; then persist.
+            let id = node_id.clone();
+            let now = Utc::now();
+            db_blocking(&self.store, move |store| {
+                let node = store
+                    .get_cluster_node(&id)
+                    .map_err(internal)?
+                    .ok_or_else(|| ApiError::NotFound("node not registered".into()))?;
+                if node.status != NodeStatus::Active {
+                    return Err(ApiError::Forbidden(format!(
+                        "node is {}; only an active node renews (AC #5)",
+                        node.status.as_str()
+                    )));
                 }
-                Ok::<_, ApiError>(issued)
+                if node.cert_not_after - now > RENEWAL_ACCEPT_WINDOW {
+                    return Err(ApiError::Conflict(format!(
+                        "certificate is valid until {}; renewal is not due",
+                        node.cert_not_after.to_rfc3339()
+                    )));
+                }
+                Ok::<_, ApiError>(())
             })
             .await
             .map_err(|e| e.to_string())?;
+            if !self.renewal_allowed(&node_id) {
+                return Err("renewal cooldown: one grant per hour per node".to_string());
+            }
+            let issued = sign_node_leaf(&self.control, &node_id, request.public_key_der).await?;
+            let id = node_id.clone();
+            let persisted = issued.clone();
+            let recorded = db_blocking(&self.store, move |store| {
+                store
+                    .record_cluster_node_renewal(
+                        &id,
+                        &persisted.fingerprint_sha256,
+                        &persisted.serial_hex,
+                        persisted.not_after,
+                        Utc::now(),
+                    )
+                    .map_err(internal)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            if !recorded {
+                return Err("node is no longer active".to_string());
+            }
             self.refresh().await;
             self.audit(
-                "0.0.0.0:0".parse().unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0))),
+                peer,
                 "cluster.node.renew",
                 ("cluster_node", &node_id),
                 Some(serde_json::json!({
@@ -444,31 +557,27 @@ impl SessionHandler for FleetHandlers {
     fn on_leave(&self, node_id: &str, peer: SocketAddr) -> BoxFuture<'_, Result<(), String>> {
         let node_id = node_id.to_string();
         Box::pin(async move {
-            let id = node_id.clone();
-            let revoked = db_blocking(&self.store, move |store| {
-                store.revoke_cluster_node(&id, Utc::now()).map_err(internal)
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-            let Some(node) = revoked else {
-                return Err("node not registered or already revoked".to_string());
-            };
-            self.refresh().await;
-            warn!(node_id, name = %node.name, %peer, "node left the fleet; revoked");
+            let outcome = revoke_node_fully(&self.control, &self.store, &node_id, Utc::now())
+                .await?
+                .ok_or_else(|| "node not registered".to_string())?;
+            warn!(node_id, name = %outcome.node.name, %peer, "node left the fleet; revoked");
             self.alert_sender.send(
                 AlertEvent::new(
                     AlertType::ClusterNodeLeft,
-                    format!("cluster node {} ({}) left the fleet", node.name, node_id),
+                    format!(
+                        "cluster node {} ({}) left the fleet",
+                        outcome.node.name, node_id
+                    ),
                 )
                 .with_detail("node_id", node_id.clone())
-                .with_detail("node_name", node.name.clone())
+                .with_detail("node_name", outcome.node.name.clone())
                 .with_detail("peer", peer.to_string()),
             );
             self.audit(
                 peer,
                 "cluster.node.leave",
                 ("cluster_node", &node_id),
-                Some(serde_json::json!({ "name": node.name, "status": "revoked" })),
+                Some(serde_json::json!({ "name": outcome.node.name, "status": "revoked" })),
             )
             .await;
             Ok(())
@@ -545,8 +654,10 @@ fn spawn_liveness_publisher(
     })
 }
 
-/// Persist live-session facts every [`FLUSH_INTERVAL`] (AC #9's
-/// `last_seen_at`, `address`, `version`, `schema_version`).
+/// Persist live-session facts every [`FLUSH_INTERVAL`] in one
+/// transaction (AC #9's `last_seen_at`, `address`, `version`,
+/// `schema_version`) and prune revoked serials whose certificate
+/// expired (the CRL stays bounded by the live certificates).
 fn spawn_session_flush(
     control: Arc<ControlPlane>,
     store: Arc<Mutex<ConfigStore>>,
@@ -554,32 +665,40 @@ fn spawn_session_flush(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(FLUSH_INTERVAL).await;
-            let snapshot = control.sessions.snapshot();
-            if snapshot.is_empty() {
-                continue;
-            }
-            let flushed = db_blocking(&store, move |store| {
-                for s in snapshot {
-                    let seen = DateTime::<Utc>::from_timestamp(
+            let facts: Vec<LiveNodeFacts> = control
+                .sessions
+                .snapshot()
+                .into_iter()
+                .map(|s| LiveNodeFacts {
+                    node_id: s.node_id,
+                    address: s.peer_addr.to_string(),
+                    version: s.build_version,
+                    schema_version: i64::from(s.schema_version),
+                    last_seen_at: DateTime::<Utc>::from_timestamp(
                         i64::try_from(s.last_seen_unix).unwrap_or(0),
                         0,
                     )
-                    .unwrap_or_else(Utc::now);
-                    store
-                        .touch_cluster_node(
-                            &s.node_id,
-                            &s.peer_addr.to_string(),
-                            &s.build_version,
-                            i64::from(s.schema_version),
-                            seen,
-                        )
-                        .map_err(internal)?;
+                    .unwrap_or_else(Utc::now),
+                })
+                .collect();
+            let flushed = db_blocking(&store, move |store| {
+                if !facts.is_empty() {
+                    store.touch_cluster_nodes(&facts).map_err(internal)?;
                 }
-                Ok::<_, ApiError>(())
+                store
+                    .prune_cluster_revoked_serials(Utc::now())
+                    .map_err(internal)
             })
             .await;
-            if let Err(e) = flushed {
-                error!(error = %e, "cluster session flush failed");
+            match flushed {
+                Ok(pruned) if pruned > 0 => {
+                    info!(pruned, "expired revoked serials pruned from the CRL source");
+                    if let Err(e) = refresh_control_plane(&control, &store).await {
+                        error!(error = %e, "cluster plane: refresh after CRL prune failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => error!(error = %e, "cluster session flush failed"),
             }
         }
     })
@@ -752,6 +871,7 @@ pub(crate) async fn spawn_cluster_plane(
         store: Arc::clone(store),
         log_store: opts.log_store,
         alert_sender: opts.alert_sender,
+        renewals: StdMutex::new(HashMap::new()),
     });
 
     let operational_stats = Arc::new(OperationalStats::default());
@@ -762,11 +882,6 @@ pub(crate) async fn spawn_cluster_plane(
             .with_build_version(env!("CARGO_PKG_VERSION")),
     );
     operational_config.fleet_size = fleet_size;
-    operational_config.admission = Arc::new(AdmissionGate::new(
-        ADMISSION_MAX_CONCURRENT,
-        ADMISSION_QUEUE_DEPTH,
-        ADMISSION_RETRY_AFTER_S,
-    ));
     operational_config.stats = Arc::clone(&operational_stats);
     operational_config.takeover_epoch = takeover_epoch;
     operational_config.fleet = Some(FleetHooks {
@@ -818,4 +933,202 @@ pub(crate) async fn spawn_cluster_plane(
         handoff_listener,
         operational_bind: binds.operational,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lorica_config::models::{JoinToken, TokenState};
+
+    fn test_control(auto_activate: bool) -> Arc<ControlPlane> {
+        let _ = lorica_cluster::tokio_rustls::rustls::crypto::ring::default_provider()
+            .install_default();
+        let ca = ClusterCa::generate("Test CA").expect("ca");
+        let (leaf, key) = ca.issue_server_leaf("cp.internal").expect("leaf");
+        let config = lorica_cluster::operational_server_config(ca.cert_pem(), &leaf, &key)
+            .expect("config");
+        let acceptor = Arc::new(SwappableAcceptor::new(Arc::new(config)));
+        let (liveness, _rx) = watch::channel(0u32);
+        Arc::new(ControlPlane::new(
+            ca,
+            &leaf,
+            &key,
+            acceptor,
+            Arc::new(AtomicU32::new(0)),
+            liveness,
+            auto_activate,
+            "cp.internal",
+            "test",
+        ))
+    }
+
+    /// Mint a token straight into the store and return the request a
+    /// joiner presenting it would send.
+    fn minted_request(
+        store: &ConfigStore,
+        control: &ControlPlane,
+        peer: &str,
+        node_name: &str,
+        bound_node_name: Option<&str>,
+        bound_source_cidr: Option<&str>,
+    ) -> (EnrollRequest, String) {
+        let key = store.token_hmac_key().expect("hmac key");
+        let pin = lorica_cluster::leaf_spki_sha256(&control.leaf_cert_pem).expect("pin");
+        let minted = token::mint(&key, &pin).expect("mint");
+        let now = Utc::now();
+        store
+            .create_join_token(&JoinToken {
+                public_id: minted.public_id.clone(),
+                secret_hmac: minted.secret_hmac.clone(),
+                state: TokenState::Unused,
+                created_at: now,
+                expires_at: now + chrono::Duration::hours(1),
+                created_by: "admin".to_string(),
+                bound_node_name: bound_node_name.map(str::to_string),
+                bound_source_cidr: bound_source_cidr.map(str::to_string),
+                burned_at: None,
+                burned_by_node_id: None,
+            })
+            .expect("token row");
+        let parsed = token::parse(&minted.token).expect("parse");
+        let (spki, _key_pem) = lorica_cluster::ca::generate_node_keypair().expect("keypair");
+        (
+            EnrollRequest {
+                peer: peer.parse().expect("peer"),
+                public_id: parsed.public_id,
+                secret: parsed.secret.to_vec(),
+                public_key_der: spki,
+                node_name: node_name.to_string(),
+                build_version: "test".to_string(),
+                schema_version: 50,
+            },
+            minted.public_id,
+        )
+    }
+
+    fn store_with_key() -> Arc<Mutex<ConfigStore>> {
+        let key = lorica_config::crypto::EncryptionKey::generate().expect("key");
+        Arc::new(Mutex::new(
+            ConfigStore::open_in_memory_with_key(key).expect("store"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn redemption_burns_once_and_registers_pending_or_active() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let (request, public_id) = {
+            let s = store.lock().await;
+            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", None, None)
+        };
+        let replay = request.clone();
+        let grant = redeem_with_store(&store, &control, request, Utc::now())
+            .await
+            .expect("redeemed");
+        assert_eq!(grant.status, "pending");
+        assert_eq!(grant.ca_pem, control.ca_pem());
+        {
+            let s = store.lock().await;
+            let node = s.get_cluster_node(&grant.node_id).expect("read").expect("row");
+            assert_eq!(node.status, NodeStatus::Pending);
+            assert_eq!(node.name, "edge-1");
+            let tok = s.get_join_token(&public_id).expect("read").expect("row");
+            assert_eq!(tok.state, TokenState::Burned);
+            assert_eq!(tok.burned_by_node_id.as_deref(), Some(grant.node_id.as_str()));
+        }
+        // Replay of the same token is refused, and refused the same
+        // way as an unknown one.
+        let replayed = redeem_with_store(&store, &control, replay, Utc::now()).await;
+        assert!(matches!(replayed, Err(EnrollRefusal::Refused(_))));
+
+        let auto = test_control(true);
+        let (request, _) = {
+            let s = store.lock().await;
+            minted_request(&s, &auto, "192.0.2.11:5000", "edge-2", None, None)
+        };
+        let grant = redeem_with_store(&store, &auto, request, Utc::now())
+            .await
+            .expect("redeemed");
+        assert_eq!(grant.status, "active");
+    }
+
+    #[tokio::test]
+    async fn refusals_before_the_burn_keep_the_token_live() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let (good, public_id) = {
+            let s = store.lock().await;
+            minted_request(
+                &s,
+                &control,
+                "192.0.2.10:5000",
+                "edge-1",
+                Some("edge-1"),
+                Some("192.0.2.0/24"),
+            )
+        };
+        // Wrong secret (unknown-id path shares it).
+        let mut wrong_secret = good.clone();
+        wrong_secret.secret = vec![0u8; 32];
+        assert!(matches!(
+            redeem_with_store(&store, &control, wrong_secret, Utc::now()).await,
+            Err(EnrollRefusal::Refused("unknown token or wrong secret"))
+        ));
+        let mut unknown = good.clone();
+        unknown.public_id = "0".repeat(24);
+        assert!(matches!(
+            redeem_with_store(&store, &control, unknown, Utc::now()).await,
+            Err(EnrollRefusal::Refused("unknown token or wrong secret"))
+        ));
+        // Name binding.
+        let mut wrong_name = good.clone();
+        wrong_name.node_name = "edge-9".to_string();
+        assert!(matches!(
+            redeem_with_store(&store, &control, wrong_name, Utc::now()).await,
+            Err(EnrollRefusal::Refused(r)) if r.contains("binding")
+        ));
+        // CIDR binding.
+        let mut wrong_source = good.clone();
+        wrong_source.peer = "198.51.100.7:5000".parse().expect("peer");
+        assert!(matches!(
+            redeem_with_store(&store, &control, wrong_source, Utc::now()).await,
+            Err(EnrollRefusal::Refused(r)) if r.contains("CIDR")
+        ));
+        // Key allowlist, checked before the burn.
+        let mut bad_key = good.clone();
+        bad_key.public_key_der = vec![1, 2, 3];
+        assert!(matches!(
+            redeem_with_store(&store, &control, bad_key, Utc::now()).await,
+            Err(EnrollRefusal::Refused(r)) if r.contains("allowlist")
+        ));
+        // None of that burned the token.
+        {
+            let s = store.lock().await;
+            let tok = s.get_join_token(&public_id).expect("read").expect("row");
+            assert_eq!(tok.state, TokenState::Unused);
+        }
+        // The right request still goes through.
+        redeem_with_store(&store, &control, good, Utc::now())
+            .await
+            .expect("redeemed");
+    }
+
+    #[tokio::test]
+    async fn three_simultaneous_redemptions_of_one_token_enroll_one_node() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let (request, _) = {
+            let s = store.lock().await;
+            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", None, None)
+        };
+        let (a, b, c) = tokio::join!(
+            redeem_with_store(&store, &control, request.clone(), Utc::now()),
+            redeem_with_store(&store, &control, request.clone(), Utc::now()),
+            redeem_with_store(&store, &control, request.clone(), Utc::now())
+        );
+        let granted = [&a, &b, &c].iter().filter(|o| o.is_ok()).count();
+        assert_eq!(granted, 1);
+        let s = store.lock().await;
+        assert_eq!(s.list_cluster_nodes().expect("list").len(), 1);
+    }
 }

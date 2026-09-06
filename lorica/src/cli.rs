@@ -300,7 +300,17 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         user: Option<String>,
 
-        /// SuperAdmin password on the local management API.
+        /// Read the SuperAdmin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the SuperAdmin password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// SuperAdmin password on the command line (discouraged: argv
+        /// is visible to every local process and lands in shell
+        /// history; `LORICA_ADMIN_PASSWORD` is also read).
         #[arg(long)]
         password: Option<String>,
     },
@@ -312,7 +322,15 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         user: Option<String>,
 
-        /// Password on the local management API.
+        /// Read the password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// Password on the command line (discouraged; see `leave`).
         #[arg(long)]
         password: Option<String>,
     },
@@ -336,9 +354,18 @@ pub(crate) enum ClusterAction {
         #[arg(long, default_value = "admin")]
         user: String,
 
-        /// SuperAdmin password
+        /// Read the SuperAdmin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the SuperAdmin password from standard input.
         #[arg(long)]
-        password: String,
+        password_stdin: bool,
+
+        /// SuperAdmin password on the command line (discouraged: it
+        /// mints the credentials AC #6 keeps off argv; see `leave`).
+        #[arg(long)]
+        password: Option<String>,
     },
 }
 
@@ -534,55 +561,6 @@ pub(crate) fn validate_cluster_listen(
     })
 }
 
-/// Implementation of `cluster init`: generate the cluster CA and
-/// persist it (certificate in clear, private key encrypted at rest).
-/// Idempotent by refusal: an existing CA is never overwritten.
-pub(crate) fn run_cluster_init(data_dir: &str, common_name: &str) {
-    use lorica_config::crypto::EncryptionKey;
-    use lorica_config::store::ConfigStore;
-
-    let data_dir = PathBuf::from(data_dir);
-    let key_path = data_dir.join("encryption.key");
-    let key = EncryptionKey::load_or_create(&key_path).expect("failed to load encryption key");
-    // This file is about to become the identity root of the fleet
-    // (docs/cluster.md): refuse a key someone else owns, and say so
-    // loudly when it was readable beyond its owner until now.
-    match crate::startup::check_key_file_before_promotion(&key_path) {
-        Ok(None) => {}
-        Ok(Some(warning)) => eprintln!("WARNING: {warning}"),
-        Err(reason) => {
-            eprintln!("refusing to initialise the cluster CA: {reason}");
-            std::process::exit(1);
-        }
-    }
-    let db_path = data_dir.join("lorica.db");
-    let store = ConfigStore::open(&db_path, Some(key)).expect("failed to open database");
-
-    match store.get_cluster_ca() {
-        Ok(Some(_)) => {
-            println!("Cluster CA already initialised; refusing to overwrite it.");
-            println!("(Re-keying the fleet is a deliberate operation, not a re-run of init.)");
-        }
-        Ok(None) => {
-            let ca =
-                lorica_cluster::ClusterCa::generate(common_name).expect("CA generation failed");
-            store
-                .set_cluster_ca(ca.cert_pem(), &ca.key_pem())
-                .expect("failed to persist cluster CA");
-            println!("Cluster CA generated and persisted (CN: {common_name}).");
-            println!(
-                "The CA private key is encrypted under {} - that file is now the \
-                 identity root of the fleet. See docs/cluster.md.",
-                key_path.display()
-            );
-        }
-        Err(e) => {
-            eprintln!("failed to read cluster CA state: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 /// Guard that must be held alive for the non-blocking file appender to flush.
 /// Stored in main() to keep it alive for the process lifetime.
 #[allow(dead_code)]
@@ -760,38 +738,8 @@ pub(crate) fn run_rotate_key(data_dir: &str, new_key_file: &str) {
 pub(crate) fn run_unban(port: u16, ip: String, user: String, password: String) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        // The management API is served over TLS on localhost (Story 8.8
-        // AC #1), by default with an auto-generated self-signed cert.
-        // `danger_accept_invalid_certs(true)` is intentional: the target
-        // is always `127.0.0.1`, so there is no MITM surface to defend
-        // against, and the self-signed leaf has no chain to validate.
-        let client = reqwest::Client::builder()
-            .cookie_store(true)
-            .danger_accept_invalid_certs(true)
-            .build()
-            .expect("HTTP client");
-
-        // Login
-        let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
-        let login_res = client
-            .post(&login_url)
-            .json(&serde_json::json!({ "username": user, "password": password }))
-            .send()
-            .await;
-        match login_res {
-            Ok(r) if r.status().is_success() => {}
-            Ok(r) => {
-                eprintln!("Login failed ({}). Check credentials.", r.status());
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!(
-                    "Cannot connect to management API on port {port}: {e}. \
-                     Hint: is lorica running and is --management-port correct?"
-                );
-                std::process::exit(1);
-            }
-        }
+        let client = crate::cli_client::management_client();
+        crate::cli_client::management_login(&client, port, &user, &password).await;
 
         // Unban
         let unban_url = format!("https://127.0.0.1:{port}/api/v1/bans/{ip}");
