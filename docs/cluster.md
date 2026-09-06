@@ -119,7 +119,11 @@ CA-wide pass, or a certificate-signing request an attacker can enrich.
 
 A SuperAdmin mints a join token on the control plane, from the
 dashboard's join dialog, from `POST /api/v1/cluster/tokens`, or with
-`lorica cluster token --user <superadmin> --password <...>`. A token
+`lorica cluster token --user <superadmin> --password-file <path>` (the
+password also comes from `--password-stdin` or `LORICA_ADMIN_PASSWORD`;
+`--password` on the command line is accepted with a warning, because it
+would leak the credential that mints the tokens the next paragraph
+keeps off argv). A token
 is `<public_id>.<payload>`: the public half is the registry's lookup
 key, the payload carries a 256-bit secret and the SHA-256 of the
 control plane's current leaf public key. The registry stores only an
@@ -146,7 +150,7 @@ history, and is logged verbatim by CI and configuration-management
 
 ```bash
 # On the control plane (or in the dashboard): mint a token.
-lorica cluster token --user admin --password '...'
+lorica cluster token --user admin --password-file <path-to-0600-file>
 
 # On the new node, with the service stopped:
 lorica cluster join --control-plane cp.example.com:9444 --token-stdin < token.txt
@@ -182,12 +186,15 @@ payload can rename a session. A valid certificate with no registry
 entry is dropped before a single byte is read, and audited.
 
 Node certificates last 90 days and renew themselves at two thirds of
-that lifetime over the established session: the node generates a new
-key, sends the public half, and the control plane issues the
-replacement. The previous certificate stays valid until the node's
-first session on the new one, then goes on the revocation list as
-superseded, so a crash between issuance and persistence cannot lock a
-node out.
+that lifetime over the established session (the exact lead is drawn
+per node between 25 and 30 days before expiry, so a batch of nodes
+enrolled together does not renew in the same minute): the node
+generates a new key, sends the public half, and the control plane
+issues the replacement only to an `Active` node whose certificate is
+actually due, at most once an hour. The node then reconnects on the
+new certificate at once; the previous one stays valid until that first
+session, then goes on the revocation list as superseded, so a crash
+between issuance and persistence cannot lock a node out.
 
 Revocation (`DELETE /api/v1/cluster/nodes/{id}`, or the dashboard) is
 enforced at the TLS handshake: the node's serials go on a CRL signed
@@ -200,13 +207,17 @@ registry row stays, marked revoked, for the audit trail.
 
 `lorica cluster leave` wipes the node's fleet identity (its private
 key and the CA bundle). It is authorised one of two ways: a SuperAdmin
-credential on the local management API (`--user/--password`), in
+credential on the local management API (`--user` with
+`--password-file`, `--password-stdin` or `LORICA_ADMIN_PASSWORD`), in
 which case the running instance tells the control plane over the live
 session so it revokes, audits and alerts, then wipes and audits
 locally; or, without credentials, proof that the control plane already
-deregistered the node (its certificate is refused at the handshake).
-A node the control plane still accepts cannot be dropped from a local
-shell alone. Replicated certificate private keys arrive with
+deregistered the node: it must answer the node's certificate with a
+certificate-level TLS alert. A reset, a closed connection or an
+unreachable control plane proves nothing and the command refuses, so a
+disturbed network cannot be turned into an identity wipe. A node the
+control plane still accepts cannot be dropped from a local shell
+alone. Replicated certificate private keys arrive with
 certificate distribution (Story 9.5) and are wiped by the same
 command.
 

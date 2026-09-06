@@ -45,6 +45,7 @@ Enrollment hygiene (Story 9.3):
 
 - Mint join tokens with the shortest lifetime the operation allows (`ttl_seconds`, default one hour, cap 24 hours) and bind them to the expected node name and source CIDR whenever they are known.
 - Hand the token to the joining node through a file with mode 0600, standard input, or `LORICA_JOIN_TOKEN`; never on a command line, never in a ticket. `lorica cluster join` refuses a token on argv.
+- The same goes for the SuperAdmin password the `cluster token`, `cluster leave` and `cluster status` commands need: use `--password-file` (mode 0600), `--password-stdin` or `LORICA_ADMIN_PASSWORD`; `--password` on argv only prints a warning.
 - Leave `--cluster-auto-activate` off in production: review each `pending` node in the roster and activate it deliberately.
 - Revoke decommissioned nodes on the control plane before wiping them (`DELETE /api/v1/cluster/nodes/{id}`); `lorica cluster leave` on the node then proves the deregistration and wipes the fleet identity.
 

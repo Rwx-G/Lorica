@@ -345,13 +345,78 @@ with the control plane learning about it only through drift.
     keys do not exist before 9.5.
   - `cluster status` never needs the service running for the
     persisted facts; live facts come from `GET /api/v1/cluster/status`.
-  - Not done here, by design: the dashboard (9.7), per-fingerprint
-    connection caps (needs the registry to count, cheap to add in
-    9.4 with the dispatcher), listener-level rate limiting beyond the
-    per-source gate and the in-flight cap (AC #11's sliding window
-    and LRU map are covered by `SourceGate` + `max_inflight_enrollments`
-    + the token TTL; a per-window attempt counter is a 9.4 follow-up
-    if the e2e profile shows a need).
+  - Not done here, by design: the dashboard (9.7); a per-fingerprint
+    connection cap (the registry counts sessions per node, so a
+    per-identity cap is a 9.4 follow-up alongside the dispatcher).
+- **QA iteration 1 (2026-09-06)**: four auditors (security,
+  architecture, quality, performance) returned 1 Critical, 6 High
+  after aggregation and about seventeen Mediums; every Critical, High
+  and Medium fixed, most Lows too:
+  - Critical (performance): redemption and renewal held the store's
+    async mutex across rcgen signing, serializing the reload path and
+    every management handler behind cluster-plane crypto. Both are now
+    three phases: verify + bindings + allowlist + atomic burn (or the
+    renewal eligibility check) under a short lock, signing on the
+    blocking pool with NO lock, then a second short lock to persist.
+  - High: `Renew` was served to any session without an eligibility
+    check, so a `Pending` node self-renewed forever (AC #5 defeated)
+    and any node could loop the signing path at line rate. A renewal
+    now requires `Active`, at most 35 days of remaining validity, one
+    grant per node per hour, and at most three requests per session
+    (more is a protocol violation that drops the session); the store
+    guard mirrors the `Active` rule in its UPDATE.
+  - High: revocation was a non-atomic, non-retryable sequence (store
+    write, refresh, kill) whose refresh error skipped the session
+    kill and whose retry hit 404. `revoke_node_fully` in the runtime
+    layer kills the session even when the refresh fails and is
+    idempotent: a repeated DELETE re-runs the CRL rebuild and the kill.
+  - High: two concurrent refreshes could land out of order and undo a
+    revocation; `refresh_control_plane` now holds the control plane's
+    refresh lock across the read AND the swaps, rebuilds the acceptor
+    BEFORE swapping the roster, and skips the mint + rustls rebuild
+    when the revoked-serial set is unchanged.
+  - High: followers renewed at a fixed 30-day lead with no jitter (a
+    batch enrolled together renewed together); the lead is drawn per
+    process in 25..30 days. A successful renewal now drops the session
+    and reconnects on the new certificate immediately, so the
+    superseded one is retired within seconds instead of "whenever the
+    old session ends".
+  - High: the renewal audit row carried a fabricated `0.0.0.0:0`;
+    `RenewRequest` carries the session peer.
+  - Medium (security): the RSA allowlist could be inflated with a
+    zero-padded modulus and never looked at the exponent (`e = 1`
+    forgeable); significant bytes are counted and `e` must be odd and
+    at least 65537. The credential-less `leave` treated any transport
+    failure as proof of deregistration; only a certificate-level TLS
+    alert from the control plane counts now, a reset, an EOF or a
+    timeout refuses the wipe. The cluster CLI took the SuperAdmin
+    password on argv: `--password-file`, `--password-stdin` and
+    `LORICA_ADMIN_PASSWORD` are the documented sources (`--password`
+    stays with a warning).
+  - Medium (architecture): the fleet runtime rule moved out of the
+    HTTP handlers into `lorica-api/src/cluster/runtime.rs`; both
+    startup modes call one `startup::spawn_cluster_runtime`; the
+    cluster CLI lives in the binary (`cli_cluster.rs`, `cluster init`
+    included) with one shared management-API client (`cli_client.rs`,
+    `unban` rewritten on it); `ControlPlane.ca` is private (signing
+    only through `issue_node_leaf`); `issue_client_leaf` (control
+    plane generating node keys) is gone; the `public_id` shape is
+    checked at the unauthenticated boundary; the credential-less
+    leave audits through `record_with_store`; the redemption pipeline
+    is a free function unit-tested against a real store (allowlist
+    and bindings before the burn, replay, concurrency, auto-activate).
+  - Medium (performance): revoked serials carry the certificate's
+    expiry, expired ones are pruned every flush and excluded from the
+    CRL; the session flush is one transaction.
+  - AC #11 completed: a per-source sliding-window attempt limiter on
+    the enrollment listener (20 per 60 s per source, 4096 sources
+    tracked, oldest evicted at the cap), counted as
+    `attempt_window`.
+  - Lows fixed: leftover statement in a test, INSERT lists derived
+    from the SELECT constants, `token::mint` typed error,
+    `LiveSession` re-exported, doc wording, admission constants no
+    longer duplicated in the binary, no-empty node name at the
+    boundary.
 
 ## File List
 
@@ -401,3 +466,4 @@ with the control plane learning about it only through drift.
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. CSR dropped for a bare public key; token reshaped to avoid an argon2id amplification path; revocation moved to a real CRL + acceptor swap. Status Draft. | Romain G. |
 | 2026-09-06 | 0.2 | Phase 1 review: fifteen decisions recorded (token mint surface, two-segment token with embedded pin, redemption behind a trait, SPKI-pinning joiner verifier, in-memory roster, session kill switch, CRL rebuild, follower identity row, two-path leave). Status InProgress. | Romain G. |
 | 2026-09-06 | 0.3 | Implementation: token mint/parse/verify, pinned joiner, bare-key issuance + CRL, roster + session registry with kill switches, redemption/lifecycle hooks in the binary, registry endpoints + status + leave, `cluster join/leave/status/token`, follower runtime with renewal, docs. All ACs implemented; integration tests for IV1-IV3. Status Review. | Romain G. |
+| 2026-09-06 | 0.4 | QA iteration 1: store lock released around signing (Critical), renewal eligibility/cooldown/per-session cap, idempotent revocation with the kill before the error, serialized refresh, jittered renewals with immediate reconnect, RSA allowlist hardened, leave probe requires a certificate alert, password sources for the CLI, runtime layer split, shared startup helper, AC #11 sliding window. | Romain G. |
