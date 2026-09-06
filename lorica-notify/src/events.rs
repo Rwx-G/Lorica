@@ -25,6 +25,9 @@ pub enum AlertType {
     SlaBreached,
     SlaRecovered,
     IpBanned,
+    /// A cluster node left the fleet or was revoked (Story 9.3
+    /// AC #13); raised on the control plane.
+    ClusterNodeLeft,
 }
 
 impl AlertType {
@@ -42,6 +45,7 @@ impl AlertType {
             Self::SlaBreached => "sla_breached",
             Self::SlaRecovered => "sla_recovered",
             Self::IpBanned => "ip_banned",
+            Self::ClusterNodeLeft => "cluster_node_left",
         }
     }
 }
@@ -57,6 +61,7 @@ impl std::str::FromStr for AlertType {
             "sla_breached" => Ok(Self::SlaBreached),
             "sla_recovered" => Ok(Self::SlaRecovered),
             "ip_banned" => Ok(Self::IpBanned),
+            "cluster_node_left" => Ok(Self::ClusterNodeLeft),
             other => Err(format!("unknown alert type: {other}")),
         }
     }
@@ -107,6 +112,7 @@ mod tests {
             ("sla_breached", AlertType::SlaBreached),
             ("sla_recovered", AlertType::SlaRecovered),
             ("ip_banned", AlertType::IpBanned),
+            ("cluster_node_left", AlertType::ClusterNodeLeft),
         ] {
             assert_eq!(
                 s.parse::<AlertType>().expect("known AlertType variant"),

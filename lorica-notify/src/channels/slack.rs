@@ -35,6 +35,7 @@ pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), Noti
         crate::events::AlertType::SlaBreached => ":chart_with_downwards_trend:",
         crate::events::AlertType::SlaRecovered => ":white_check_mark:",
         crate::events::AlertType::IpBanned => ":no_entry:",
+        crate::events::AlertType::ClusterNodeLeft => ":wave:",
     };
 
     let mut text = format!(
