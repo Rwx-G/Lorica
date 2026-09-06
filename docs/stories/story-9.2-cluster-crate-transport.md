@@ -1,7 +1,7 @@
 # Story 9.2: `lorica-cluster` Crate, Transport and Listeners
 
 **Epic:** 9 (v1.7.0)
-**Status:** Review
+**Status:** Done
 **Author:** Romain G.
 
 **Depends on:** Story 9.1 (all of it).
@@ -428,4 +428,4 @@ so a future hardening pass does not tighten `RestrictAddressFamilies`.
 | 2026-09-02 | 0.3 | Crate core (messages/frame/version/CA/TLS/handshake), encrypted CA storage (migration 49), cluster-plane docs and packaging banners landed. | Romain G. |
 | 2026-09-02 | 0.4 | Listeners with pre-auth budgets, admission gate, dialer, bridge whitelist, CLI (`--cluster-listen`, `cluster init`), startup wiring, Prometheus bridge. All ACs implemented. | Romain G. |
 | 2026-09-06 | 0.5 | QA iteration 1: Critical hot-upgrade FD handoff closed, operational listener pre-TLS budgets/timeouts/session cap, wire-format discriminator, dialer observability and timeouts, WAN RpcLimits, persisted control-plane leaf keypair, enrollment bind validation/override, TLS 1.3 + ALPN. All green. | Romain G. |
-| 2026-09-06 | 0.6 | QA iteration 2 (incremental re-audit): handshake-pool lockout closed (pool 256, per-source gate, permit rule), dialer resolves per attempt, plane stopped on the hot-upgrade drain, CLOEXEC on inherited descriptors, bind-checked adoption, body_kind invariant enforced, .proto drift test, listener split. All green. | Romain G. |
+| 2026-09-06 | 0.6 | QA iteration 2 (incremental re-audit): handshake-pool lockout closed (pool 256, per-source gate, permit rule), dialer resolves per attempt, plane stopped on the hot-upgrade drain, CLOEXEC on inherited descriptors, bind-checked adoption, body_kind invariant enforced, .proto drift test, listener split. All green. Status Done. | Romain G. |
