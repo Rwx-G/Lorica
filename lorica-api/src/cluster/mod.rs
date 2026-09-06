@@ -1,12 +1,12 @@
-//! Cluster registry endpoints and the fleet runtime handle (Story 9.3
-//! AC #5/#10/#13/#14, plus the token-minting surface Story 9.7's
-//! dialog needs).
+//! Cluster registry endpoints (Story 9.3 AC #5/#10/#13/#14, plus the
+//! token-minting surface Story 9.7's dialog needs). The fleet runtime
+//! rule (store first, serialized refresh, then the session registry)
+//! lives in [`runtime`]; the handlers only call it and audit.
 //!
-//! Every mutation writes the store first, then acts on the running
-//! control plane through [`ClusterRuntime::ControlPlane`] (roster
-//! reload, CRL rebuild, session kill, token liveness), then audits.
 //! Role floors live in the authorize middleware: token endpoints and
 //! every node mutation are SuperAdmin, reads are Viewer+.
+
+mod runtime;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,19 +17,19 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use lorica_cluster::{
-    display_field_is_valid, leaf_spki_sha256, token, ClusterConnection, ClusterRequest,
-    ControlPlane, NodeIdentity, NodeState, RevokedEntry,
-};
+use lorica_cluster::{display_field_is_valid, leaf_spki_sha256, token, ClusterRequest, ControlPlane};
 use lorica_config::models::{ClusterNode, JoinToken, NodeStatus, TokenState};
-use lorica_config::ConfigStore;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, Mutex};
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
+
+pub use runtime::{
+    publish_token_liveness, refresh_control_plane, revoke_node as revoke_node_fully,
+    roster_from_nodes, ClusterRuntime, FollowerRuntime, RevokeOutcome,
+};
 
 /// Default join-token lifetime.
 pub const DEFAULT_TOKEN_TTL_S: u64 = 3600;
@@ -40,127 +40,6 @@ pub const MAX_TOKEN_TTL_S: u64 = 24 * 3600;
 /// How long `POST /api/v1/cluster/leave` waits for the control plane
 /// to acknowledge before wiping locally anyway.
 const LEAVE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// What this process is in the fleet, as the API sees it.
-#[derive(Clone)]
-pub enum ClusterRuntime {
-    /// No cluster role (the default install).
-    Standalone,
-    /// This process serves the cluster plane.
-    ControlPlane(Arc<ControlPlane>),
-    /// This process dials a control plane.
-    Follower(Arc<FollowerRuntime>),
-}
-
-/// The follower side's live handles.
-pub struct FollowerRuntime {
-    /// This node's server-assigned id.
-    pub node_id: String,
-    /// This node's display name.
-    pub node_name: String,
-    /// The control plane's `host:port`.
-    pub control_plane: String,
-    /// The dialer's connection slot.
-    pub connection: ClusterConnection,
-    /// Flipped to `true` by `POST /api/v1/cluster/leave`; the follower
-    /// runtime stops dialing when it sees it.
-    pub left: watch::Sender<bool>,
-}
-
-impl ClusterRuntime {
-    /// `snake_case` role name for responses.
-    pub fn role_name(&self) -> &'static str {
-        match self {
-            Self::Standalone => "standalone",
-            Self::ControlPlane(_) => "control_plane",
-            Self::Follower(_) => "follower",
-        }
-    }
-}
-
-/// Build the roster the transport crate consults from the registry:
-/// one entry per current fingerprint, plus one flagged
-/// `via_previous_certificate` for every superseded certificate still
-/// in its grace window.
-pub fn roster_from_nodes(nodes: &[ClusterNode]) -> HashMap<String, NodeIdentity> {
-    let mut map = HashMap::with_capacity(nodes.len() * 2);
-    for node in nodes {
-        let state = match node.status {
-            NodeStatus::Pending => NodeState::Pending,
-            NodeStatus::Active => NodeState::Active,
-            NodeStatus::Revoked => NodeState::Revoked,
-        };
-        map.insert(
-            node.cert_fingerprint.clone(),
-            NodeIdentity {
-                node_id: node.node_id.clone(),
-                name: node.name.clone(),
-                state,
-                via_previous_certificate: false,
-            },
-        );
-        if let Some(prev) = &node.prev_cert_fingerprint {
-            map.insert(
-                prev.clone(),
-                NodeIdentity {
-                    node_id: node.node_id.clone(),
-                    name: node.name.clone(),
-                    state,
-                    via_previous_certificate: true,
-                },
-            );
-        }
-    }
-    map
-}
-
-/// Reload the roster, the fleet-size hint and the CRL-backed acceptor
-/// from the store. Called after every registry mutation and at boot.
-pub async fn refresh_control_plane(
-    control: &Arc<ControlPlane>,
-    store: &Arc<Mutex<ConfigStore>>,
-) -> Result<(), String> {
-    let (nodes, revoked) = db_blocking(store, |store| {
-        let nodes = store
-            .list_cluster_nodes()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let revoked = store
-            .list_cluster_revoked_serials()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok::<_, ApiError>((nodes, revoked))
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    control.replace_roster(roster_from_nodes(&nodes));
-    let entries: Vec<RevokedEntry> = revoked
-        .into_iter()
-        .map(|r| RevokedEntry {
-            serial_hex: r.serial,
-            revoked_at: r.revoked_at,
-            superseded: r.reason == "superseded",
-        })
-        .collect();
-    control
-        .rebuild_acceptor(&entries)
-        .map_err(|e| format!("acceptor rebuild: {e}"))
-}
-
-/// Recount live tokens and publish the count to the enrollment
-/// listener (opens or closes the window).
-pub async fn publish_token_liveness(
-    control: &Arc<ControlPlane>,
-    store: &Arc<Mutex<ConfigStore>>,
-) -> Result<u32, String> {
-    let live = db_blocking(store, |store| {
-        store
-            .count_live_join_tokens(Utc::now())
-            .map_err(|e| ApiError::Internal(e.to_string()))
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    control.publish_token_liveness(live);
-    Ok(live)
-}
 
 fn control_plane(state: &AppState) -> Result<Arc<ControlPlane>, ApiError> {
     match &state.cluster {
@@ -237,7 +116,7 @@ pub async fn mint_token(
         let key = store
             .token_hmac_key()
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let minted = token::mint(&key, &pin).map_err(ApiError::Internal)?;
+        let minted = token::mint(&key, &pin).map_err(|e| ApiError::Internal(e.to_string()))?;
         store
             .create_join_token(&JoinToken {
                 public_id: minted.public_id.clone(),
@@ -466,7 +345,10 @@ pub async fn activate_node(
 
 /// DELETE /api/v1/cluster/nodes/{id} - revoke (SuperAdmin, AC #7):
 /// the serials go on the CRL, the acceptor is rebuilt, the live
-/// session is ended synchronously.
+/// session is ended synchronously. Idempotent: revoking an already
+/// revoked node re-runs the CRL rebuild and the session kill, so a
+/// half-applied first attempt can be retried; only an absent node is
+/// 404.
 pub async fn revoke_node(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
@@ -475,29 +357,32 @@ pub async fn revoke_node(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
-    let node_id = id.clone();
-    let before = db_blocking(&state.store, move |store| {
-        store
-            .revoke_cluster_node(&node_id, Utc::now())
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::NotFound("node not found or already revoked".into()))
-    })
-    .await?;
-    // CRL and roster first, then the session: a node whose session
-    // is killed must not be able to reconnect in the gap.
-    refresh_control_plane(&control, &state.store)
+    let outcome = revoke_node_fully(&control, &state.store, &id, Utc::now())
         .await
-        .map_err(ApiError::Internal)?;
-    let had_session = control.sessions.kill(&id);
-    tracing::warn!(node_id = %id, name = %before.name, had_session, "cluster node revoked");
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
+    tracing::warn!(
+        node_id = %id,
+        name = %outcome.node.name,
+        newly_revoked = outcome.newly_revoked,
+        session_ended = outcome.session_ended,
+        "cluster node revoked"
+    );
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     crate::audit::record(
         &state,
         &audit_ctx,
         "cluster.node.revoke",
         ("cluster_node", &id),
-        Some(&serde_json::json!({ "status": before.status.as_str(), "name": before.name })),
-        Some(&serde_json::json!({ "status": "revoked", "session_ended": had_session })),
+        Some(&serde_json::json!({
+            "status": outcome.node.status.as_str(),
+            "name": outcome.node.name,
+        })),
+        Some(&serde_json::json!({
+            "status": "revoked",
+            "newly_revoked": outcome.newly_revoked,
+            "session_ended": outcome.session_ended,
+        })),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
@@ -708,46 +593,4 @@ pub async fn leave(
         node_id: follower.node_id.clone(),
         control_plane_notified: notified,
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn node(id: &str, fp: &str, prev: Option<&str>, status: NodeStatus) -> ClusterNode {
-        let now = Utc::now();
-        ClusterNode {
-            node_id: id.to_string(),
-            name: id.to_string(),
-            cert_fingerprint: fp.to_string(),
-            cert_serial: "01".to_string(),
-            prev_cert_fingerprint: prev.map(str::to_string),
-            prev_cert_serial: prev.map(|_| "00".to_string()),
-            address: String::new(),
-            version: String::new(),
-            schema_version: 0,
-            status,
-            enrolled_at: now,
-            last_seen_at: None,
-            applied_config_generation: 0,
-            applied_config_hash: String::new(),
-            cert_not_after: now,
-            revoked_at: None,
-        }
-    }
-
-    #[test]
-    fn roster_maps_current_and_superseded_fingerprints() {
-        let roster = roster_from_nodes(&[
-            node("a", "fp-a", None, NodeStatus::Active),
-            node("b", "fp-b", Some("fp-b-old"), NodeStatus::Pending),
-            node("c", "fp-c", None, NodeStatus::Revoked),
-        ]);
-        assert_eq!(roster.len(), 4);
-        assert_eq!(roster["fp-a"].state, NodeState::Active);
-        assert!(!roster["fp-b"].via_previous_certificate);
-        assert!(roster["fp-b-old"].via_previous_certificate);
-        assert_eq!(roster["fp-b-old"].node_id, "b");
-        assert_eq!(roster["fp-c"].state, NodeState::Revoked);
-    }
 }

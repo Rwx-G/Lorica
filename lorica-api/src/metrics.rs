@@ -210,6 +210,7 @@ const CLUSTER_PREAUTH_REASONS: &[&str] = &[
     "alpn",
     "concurrent_handshakes",
     "per_source",
+    "attempt_window",
     "inflight_enrollments",
     "byte_budget",
     "time_budget",
@@ -248,6 +249,7 @@ struct ClusterPlaneSnapshot {
     en_rejected_alpn: u64,
     en_rejected_concurrent_handshakes: u64,
     en_rejected_per_source: u64,
+    en_rejected_attempt_window: u64,
     en_rejected_inflight_enrollments: u64,
     en_rejected_byte_budget: u64,
     en_rejected_time_budget: u64,
@@ -492,6 +494,12 @@ fn sync_cluster_plane_metrics() {
         &["per_source"],
         en.rejected_per_source.load(Relaxed),
         &mut last.en_rejected_per_source,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["attempt_window"],
+        en.rejected_attempt_window.load(Relaxed),
+        &mut last.en_rejected_attempt_window,
     );
     bump_vec(
         &CLUSTER_PREAUTH_REJECTIONS_TOTAL,

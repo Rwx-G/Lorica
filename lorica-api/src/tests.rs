@@ -6222,11 +6222,15 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
         None,
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "revoking twice");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "revoking twice is idempotent (re-runs CRL rebuild and session kill)"
+    );
     {
         let store = state.store.lock().await;
         let serials: Vec<String> = store
-            .list_cluster_revoked_serials()
+            .list_cluster_revoked_serials(chrono::Utc::now())
             .expect("crl")
             .into_iter()
             .map(|r| r.serial)
