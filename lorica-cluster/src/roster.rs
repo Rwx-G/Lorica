@@ -36,7 +36,9 @@ use lorica_command::RpcEndpoint;
 
 use crate::ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
 use crate::messages::ClusterFrame;
-use crate::replication::{AppliedConfig, ConfigVersion, Replicator};
+use crate::replication::{
+    AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
+};
 use crate::tls::{operational_server_config_with_crl, ClusterTlsError, SwappableAcceptor};
 
 /// Sliding window of the per-node session rate limit.
@@ -508,11 +510,12 @@ pub struct ControlPlane {
     /// This control plane's build version (reported in `cluster
     /// status`).
     pub build_version: String,
-    /// The configuration version the fleet must converge on (Story 9.4
-    /// AC #3). Shared with the operational listener through
-    /// [`ControlPlane::config_version_handle`], so a `HelloAck` and
-    /// every `HeartbeatAck` carry the current value without a lock.
-    config_version: Arc<ArcSwap<ConfigVersion>>,
+    /// The configuration the fleet has ACCEPTED (Story 9.4 AC #3/#6):
+    /// the version advertised by every `HelloAck` and `HeartbeatAck`,
+    /// and the encoded payload a convergence pull is answered from. A
+    /// generation enters it when Prepare succeeds fleet-wide, never
+    /// before; see [`AcceptedConfig`].
+    pub accepted: AcceptedConfig,
     /// The replication coordinator (Story 9.4 D6): one round at a time,
     /// with the eviction and quarantine bookkeeping that survives it.
     pub replication: Replicator,
@@ -547,20 +550,14 @@ impl ControlPlane {
             auto_activate,
             advertise_host: advertise_host.to_string(),
             build_version: build_version.to_string(),
-            config_version: Arc::new(ArcSwap::from_pointee(ConfigVersion::default())),
+            accepted: AcceptedConfig::new(),
             replication: Replicator::new(),
         }
     }
 
     /// The configuration version the fleet must converge on.
     pub fn config_version(&self) -> ConfigVersion {
-        (**self.config_version.load()).clone()
-    }
-
-    /// Publish a new configuration version, after the mutation is
-    /// persisted and the local reload ran (Story 9.4 D6).
-    pub fn set_config_version(&self, version: ConfigVersion) {
-        self.config_version.store(Arc::new(version));
+        self.accepted.version()
     }
 
     /// The shared version slot, handed to
@@ -568,7 +565,15 @@ impl ControlPlane {
     /// handshake and the heartbeat answer the current value with no
     /// lock and no back-reference to this handle.
     pub fn config_version_handle(&self) -> Arc<ArcSwap<ConfigVersion>> {
-        Arc::clone(&self.config_version)
+        self.accepted.version_handle()
+    }
+
+    /// Run one replication round and publish the generation only if
+    /// the fleet accepts it (Story 9.4 AC #6).
+    pub async fn replicate(&self, payload: ConfigPayload) -> ReplicationReport {
+        self.replication
+            .replicate(&self.sessions, &self.accepted, payload)
+            .await
     }
 
     /// Take the refresh lock: the guard is the proof
@@ -873,12 +878,19 @@ mod tests {
         );
         assert_eq!(control_plane.config_version(), ConfigVersion::default());
         let shared = control_plane.config_version_handle();
-        let next = ConfigVersion {
+        let next = ConfigPayload {
             generation: 12,
             hash: "abcd".to_string(),
+            blob: b"{}".to_vec(),
         };
-        control_plane.set_config_version(next.clone());
-        assert_eq!(control_plane.config_version(), next);
+        control_plane.accepted.publish(next.clone());
+        assert_eq!(control_plane.config_version(), next.version());
+        assert_eq!(
+            control_plane.accepted.payload().map(|p| (*p).clone()),
+            Some(next.clone()),
+            "a convergence pull is answered from the same slot"
+        );
+        let next = next.version();
         assert_eq!(
             **shared.load(),
             next,

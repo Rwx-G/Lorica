@@ -19,8 +19,10 @@
 //!
 //! Covered: a Prepare/Commit round landing on the follower and in the
 //! registry, a semantic rejection aborting the round for the node that
-//! had already staged it, a follower behind the control plane pulling
-//! at the handshake, and a break-glass follower being skipped.
+//! had already staged it AND leaving the generation unpublished, a
+//! follower behind the control plane pulling at the handshake, a
+//! break-glass follower being skipped, and a node awaiting activation
+//! being refused the configuration it asks for.
 //!
 //! Test hygiene: every await that depends on another task sits under an
 //! explicit timeout, so a regression fails in seconds instead of
@@ -32,7 +34,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lorica_cluster::arc_swap::ArcSwap;
 use lorica_cluster::enroll::{BoxFuture, RenewGrant, RenewRequest, SessionHandler};
 use lorica_cluster::handshake::HandshakeConfig;
 use lorica_cluster::listener::{
@@ -40,7 +41,7 @@ use lorica_cluster::listener::{
 };
 use lorica_cluster::messages::cluster_response;
 use lorica_cluster::replication::{
-    AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
+    AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
 };
 use lorica_cluster::{
     operational_server_config, ClusterCa, ClusterRequest, ConfigPull, Dialer, DialerConfig,
@@ -179,26 +180,45 @@ struct Fleet {
     stats: Arc<OperationalStats>,
     sessions: Arc<SessionRegistry>,
     hooks: Arc<ControlPlaneHooks>,
-    config_version: Arc<ArcSwap<ConfigVersion>>,
+    accepted: AcceptedConfig,
     replicator: Replicator,
     handle: OperationalHandle,
 }
 
 impl Fleet {
-    /// Publish a configuration version, the way the binary does after
-    /// persisting a mutation.
-    fn publish(&self, version: ConfigVersion) {
-        self.config_version.store(Arc::new(version));
+    /// Publish an accepted configuration, the way the binary does at
+    /// boot from what the store already holds.
+    fn publish(&self, payload: ConfigPayload) {
+        self.accepted.publish(payload);
+    }
+
+    /// The version the handshake and every heartbeat advertise.
+    fn advertised(&self) -> ConfigVersion {
+        self.accepted.version()
     }
 
     async fn replicate(&self, payload: ConfigPayload) -> ReplicationReport {
-        tokio::time::timeout(WAIT, self.replicator.replicate(&self.sessions, payload))
-            .await
-            .expect("a replication round must finish inside the test budget")
+        tokio::time::timeout(
+            WAIT,
+            self.replicator
+                .replicate(&self.sessions, &self.accepted, payload),
+        )
+        .await
+        .expect("a replication round must finish inside the test budget")
     }
 }
 
 async fn spawn_control_plane(pki: &ControlPlanePki, nodes: &[&Node]) -> Fleet {
+    spawn_control_plane_with_state(pki, nodes, NodeState::Active).await
+}
+
+/// A control plane whose roster puts every node in `state`, so the
+/// tests can exercise what a node awaiting activation is allowed to do.
+async fn spawn_control_plane_with_state(
+    pki: &ControlPlanePki,
+    nodes: &[&Node],
+    state: NodeState,
+) -> Fleet {
     let acceptor = Arc::new(SwappableAcceptor::new(Arc::new(
         operational_server_config(pki.ca.cert_pem(), &pki.server_cert, &pki.server_key)
             .expect("server config"),
@@ -217,7 +237,7 @@ async fn spawn_control_plane(pki: &ControlPlanePki, nodes: &[&Node]) -> Fleet {
                 NodeIdentity {
                     node_id: node.node_id.clone(),
                     name: node.node_id.clone(),
-                    state: NodeState::Active,
+                    state,
                     via_previous_certificate: false,
                 },
             )
@@ -234,7 +254,10 @@ async fn spawn_control_plane(pki: &ControlPlanePki, nodes: &[&Node]) -> Fleet {
         sessions: Arc::clone(&sessions),
         handler: Arc::clone(&hooks) as Arc<dyn SessionHandler>,
     });
-    let config_version = Arc::clone(&config.config_version);
+    // The listener reads the SAME slot the coordinator publishes into,
+    // exactly as `ControlPlane` wires it in the binary.
+    let accepted = AcceptedConfig::new();
+    config.config_version = accepted.version_handle();
     let stats = Arc::clone(&config.stats);
     let handle = OperationalListener::spawn(config);
 
@@ -247,7 +270,7 @@ async fn spawn_control_plane(pki: &ControlPlanePki, nodes: &[&Node]) -> Fleet {
         stats,
         sessions,
         hooks,
-        config_version,
+        accepted,
         replicator,
         handle,
     }
@@ -468,6 +491,22 @@ async fn a_rejecting_follower_aborts_the_round_for_the_node_that_had_staged_it()
     assert_eq!(good.applied().generation, 0, "nothing was applied");
     assert_eq!(count(&bad.aborts), 0, "a rejecting node never staged it");
 
+    // The abort has to hold: the generation is not advertised, so no
+    // heartbeat tells a follower it is behind and no pull hands the
+    // rejected configuration out through the back door.
+    assert_eq!(
+        fleet.advertised(),
+        ConfigVersion::default(),
+        "an aborted generation must not become the version the fleet converges on"
+    );
+    let settled = count(&good.behind);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        count(&good.behind),
+        settled,
+        "no follower may be told it is behind an aborted generation"
+    );
+
     good_dialer.shutdown();
     bad_dialer.shutdown();
     fleet.handle.shutdown();
@@ -484,10 +523,7 @@ async fn a_follower_behind_the_control_plane_pulls_and_the_pull_is_served() {
     // follower has applied nothing, so the HelloAck alone makes it
     // pull (AC #7).
     let current = payload(5);
-    fleet.publish(ConfigVersion {
-        generation: current.generation,
-        hash: current.hash.clone(),
-    });
+    fleet.publish(current.clone());
     *fleet.hooks.available.lock().expect("lock") = Some(current.clone());
 
     let follower = TestFollower::new(false, false);
@@ -569,5 +605,51 @@ async fn a_break_glass_follower_is_skipped_by_the_round() {
 
     normal_dialer.shutdown();
     broken_glass_dialer.shutdown();
+    fleet.handle.shutdown();
+}
+
+#[tokio::test]
+async fn a_pending_node_is_refused_the_configuration_it_asks_for() {
+    install_ring();
+    let pki = control_plane_pki();
+    let node = issue_node(&pki, "node-a");
+    // Enrolled, session admitted, but no operator has activated it.
+    let fleet = spawn_control_plane_with_state(&pki, &[&node], NodeState::Pending).await;
+
+    let current = payload(4);
+    fleet.publish(current.clone());
+    *fleet.hooks.available.lock().expect("lock") = Some(current);
+
+    let follower = TestFollower::new(false, false);
+    let dialer = spawn_follower(
+        &pki,
+        &node,
+        fleet.addr,
+        Arc::clone(&follower),
+        Duration::from_millis(200),
+    );
+
+    // The HelloAck advertises generation 4, so the follower asks. The
+    // pull is refused before the handler is ever consulted, and the
+    // node keeps asking rather than being told it is up to date, which
+    // is the honest answer: it is behind and not allowed to catch up.
+    eventually("the pull to be refused", || {
+        fleet.stats.config_pull_refusals.load(Ordering::Relaxed) >= 1
+    })
+    .await;
+    assert_eq!(
+        fleet.hooks.pulls.load(Ordering::SeqCst),
+        0,
+        "a pending node's pull must not reach the handler that encodes the blob"
+    );
+    assert_eq!(fleet.stats.config_pulls_served.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        follower.applied().generation,
+        0,
+        "no configuration reaches a node awaiting activation"
+    );
+    assert!(follower.pulled.lock().expect("lock").is_none());
+
+    dialer.shutdown();
     fleet.handle.shutdown();
 }

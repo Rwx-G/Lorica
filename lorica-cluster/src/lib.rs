@@ -110,8 +110,9 @@ pub use messages::{
 };
 pub use preauth::{source_key, AttemptWindow, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
 pub use replication::{
-    AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
-    DEFAULT_PER_NODE_DEADLINE, DEFAULT_QUARANTINE_THRESHOLD, MAX_REJECTION_REASON_BYTES,
+    safe_reason, AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport,
+    Replicator, DEFAULT_PER_NODE_DEADLINE, DEFAULT_QUARANTINE_THRESHOLD,
+    MAX_HONOURED_BREAK_GLASS, MAX_REJECTION_REASON_BYTES,
 };
 pub use roster::{
     ControlPlane, LiveSession, LiveSessionSnapshot, NodeIdentity, NodeState, RefreshGuard, Roster,

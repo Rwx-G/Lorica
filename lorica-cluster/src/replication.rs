@@ -38,8 +38,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 use lorica_command::RpcEndpoint;
 use tokio::task::JoinSet;
@@ -59,6 +61,11 @@ pub const DEFAULT_PER_NODE_DEADLINE: Duration = Duration::from_secs(10);
 /// is quarantined (skipped by later rounds until it converges by pull
 /// or an operator releases it).
 pub const DEFAULT_QUARANTINE_THRESHOLD: u32 = 3;
+
+/// Longest a peer's asserted break-glass window is honoured: the cap
+/// the management API enforces when an operator opens one (24 h), plus
+/// nothing. Past it the node is addressed by replication again.
+pub const MAX_HONOURED_BREAK_GLASS: Duration = Duration::from_secs(24 * 3600);
 
 /// Longest peer-supplied rejection reason kept verbatim in a report.
 /// Anything longer, or carrying control characters, is replaced: the
@@ -117,6 +124,80 @@ impl ConfigPayload {
             generation: self.generation,
             hash: self.hash.clone(),
         }
+    }
+}
+
+/// The configuration the fleet has ACCEPTED: the version advertised in
+/// every `HelloAck` and `HeartbeatAck`, and the encoded payload a
+/// convergence pull is answered from.
+///
+/// # Why the publication point is between the two phases
+///
+/// A generation enters here at the moment PREPARE succeeded
+/// fleet-wide, which is exactly where the all-or-none guarantee is
+/// made. Publishing earlier would make an abort meaningless: the
+/// advertised version would still move, every follower would compute
+/// itself behind on its next heartbeat, and the pull path would hand
+/// out the generation the round had just rejected. Publishing later,
+/// after the commits, would tell a node that has just applied the
+/// generation that it is AHEAD of the control plane, and it would
+/// converge backwards.
+///
+/// Serving pulls from this cache rather than re-encoding the store
+/// also keeps a convergence pull off the store lock entirely: a
+/// follower cannot make the control plane walk every replicated table
+/// by asking often.
+#[derive(Clone)]
+pub struct AcceptedConfig {
+    version: Arc<ArcSwap<ConfigVersion>>,
+    payload: Arc<ArcSwapOption<ConfigPayload>>,
+}
+
+impl Default for AcceptedConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AcceptedConfig {
+    /// An empty slot: generation 0, no payload. A control plane that
+    /// has never replicated advertises this until it is seeded from
+    /// the store at boot.
+    pub fn new() -> Self {
+        Self {
+            version: Arc::new(ArcSwap::from_pointee(ConfigVersion::default())),
+            payload: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+
+    /// The version every handshake and heartbeat advertises.
+    pub fn version(&self) -> ConfigVersion {
+        (**self.version.load()).clone()
+    }
+
+    /// The encoded payload a convergence pull is answered from, or
+    /// `None` before the first publication.
+    pub fn payload(&self) -> Option<Arc<ConfigPayload>> {
+        self.payload.load_full()
+    }
+
+    /// The shared version slot, handed to
+    /// [`crate::listener::OperationalConfig::config_version`] so the
+    /// accept path reads it with no lock.
+    pub fn version_handle(&self) -> Arc<ArcSwap<ConfigVersion>> {
+        Arc::clone(&self.version)
+    }
+
+    /// Publish a generation the fleet has accepted.
+    ///
+    /// The payload lands BEFORE the version, so a follower that learns
+    /// version N from a heartbeat can always be served payload N; the
+    /// reverse order would leave a window where a node is told it is
+    /// behind and then handed the previous generation.
+    pub fn publish(&self, payload: ConfigPayload) {
+        let version = payload.version();
+        self.payload.store(Some(Arc::new(payload)));
+        self.version.store(Arc::new(version));
     }
 }
 
@@ -182,9 +263,21 @@ pub struct Replicator {
     /// Consecutive transport evictions per node; reset by a successful
     /// Prepare.
     evictions: Mutex<HashMap<String, u32>>,
+    /// Consecutive SEMANTIC rejections per node; reset by a successful
+    /// Prepare. A rejection aborts the round fleet-wide, so a node that
+    /// rejects every generation would otherwise veto the fleet forever
+    /// at no cost to itself: it answers well inside the deadline, so
+    /// the transport eviction streak never moves.
+    rejections: Mutex<HashMap<String, u32>>,
     /// Nodes excluded from every round until they converge by pull or
     /// an operator releases them.
     quarantined: Mutex<HashSet<String>>,
+    /// When each node was first seen asserting break-glass, so the
+    /// claim can be capped. `break_glass` is a bit the PEER sets: a
+    /// compromised follower that asserts it forever would otherwise be
+    /// skipped by every round, never evicted, never quarantined, and
+    /// reported as the operator's own doing.
+    break_glass_since: Mutex<HashMap<String, Instant>>,
     /// The last finished round.
     last: Mutex<Option<ReplicationReport>>,
     /// Generation of the round currently running; `0` means idle.
@@ -210,7 +303,9 @@ impl Replicator {
     pub fn new() -> Self {
         Self {
             evictions: Mutex::new(HashMap::new()),
+            rejections: Mutex::new(HashMap::new()),
             quarantined: Mutex::new(HashSet::new()),
+            break_glass_since: Mutex::new(HashMap::new()),
             last: Mutex::new(None),
             in_flight: AtomicU64::new(0),
             round: tokio::sync::Mutex::new(()),
@@ -265,6 +360,10 @@ impl Replicator {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(node_id);
+        self.rejections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(node_id);
         self.quarantined
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -281,11 +380,12 @@ impl Replicator {
     pub async fn replicate(
         &self,
         sessions: &SessionRegistry,
+        accepted: &AcceptedConfig,
         payload: ConfigPayload,
     ) -> ReplicationReport {
         let _round = self.round.lock().await;
         self.in_flight.store(payload.generation, Ordering::Relaxed);
-        let report = self.run_round(sessions, payload).await;
+        let report = self.run_round(sessions, accepted, payload).await;
         self.in_flight.store(0, Ordering::Relaxed);
         *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(report.clone());
         report
@@ -294,6 +394,7 @@ impl Replicator {
     async fn run_round(
         &self,
         sessions: &SessionRegistry,
+        accepted: &AcceptedConfig,
         payload: ConfigPayload,
     ) -> ReplicationReport {
         let mut report = ReplicationReport {
@@ -307,9 +408,10 @@ impl Replicator {
         for (node_id, endpoint, applied) in sessions.active_sessions() {
             if self.is_quarantined(&node_id) {
                 report.skipped_quarantined.push(node_id);
-            } else if applied.break_glass {
+            } else if applied.break_glass && self.honour_break_glass(&node_id) {
                 report.skipped_break_glass.push(node_id);
             } else {
+                self.clear_break_glass_claim(&node_id);
                 report.targets.push(node_id.clone());
                 targets.push((node_id, endpoint));
             }
@@ -350,7 +452,16 @@ impl Replicator {
                     }
                     report.prepared.push(node_id);
                 }
-                PrepareOutcome::Rejected(reason) => report.rejected.push((node_id, reason)),
+                PrepareOutcome::Rejected(reason) => {
+                    if self.note_rejection(&node_id) {
+                        tracing::warn!(
+                            node_id = %node_id,
+                            threshold = self.quarantine_threshold,
+                            "node quarantined from configuration replication after consecutive                              semantic rejections; it no longer aborts the fleet's rounds and                              converges by pull once it can take a generation"
+                        );
+                    }
+                    report.rejected.push((node_id, reason));
+                }
                 PrepareOutcome::Evicted(reason) => {
                     if self.note_eviction(&node_id) {
                         tracing::warn!(
@@ -366,18 +477,30 @@ impl Replicator {
         }
 
         if !report.rejected.is_empty() {
+            // The generation is NOT published: it never becomes the
+            // version the fleet converges on, so no follower learns it
+            // from a heartbeat and pulls it behind the abort's back.
+            // The control plane is now ahead of its own fleet, which is
+            // the honest state and what the caller logs.
             report.aborted = true;
             abort_all(&prepared, payload.generation, self.per_node_deadline).await;
             finish(&mut report);
             return report;
         }
 
+        // Prepare succeeded fleet-wide: this is the all-or-none point,
+        // and the generation becomes the one the fleet converges on.
+        // Every commit below, and every pull from here on, refers to
+        // it.
+        accepted.publish(payload.clone());
+
         let mut commits: JoinSet<(String, Result<AppliedConfig, String>)> = JoinSet::new();
         for (node_id, endpoint) in prepared {
             let deadline = self.per_node_deadline;
             let generation = payload.generation;
+            let hash = payload.hash.clone();
             commits.spawn(async move {
-                let outcome = commit_one(&endpoint, generation, deadline).await;
+                let outcome = commit_one(&endpoint, generation, &hash, deadline).await;
                 (node_id, outcome)
             });
         }
@@ -416,9 +539,73 @@ impl Replicator {
             .insert(node_id.to_string())
     }
 
+    /// Whether a node's asserted break-glass window is still inside
+    /// the longest one an operator can legitimately open.
+    ///
+    /// A genuine window is capped by the API at
+    /// `MAX_BREAK_GLASS_SECS`, so a node still claiming one well past
+    /// that cap is either lying or has lost its own timer, and either
+    /// way it stops being a reason to skip it. The clock starts at the
+    /// first round that saw the claim, which over-counts by at most one
+    /// round interval and never under-counts.
+    fn honour_break_glass(&self, node_id: &str) -> bool {
+        let mut since = self
+            .break_glass_since
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let first = *since.entry(node_id.to_string()).or_insert_with(Instant::now);
+        if first.elapsed() <= MAX_HONOURED_BREAK_GLASS {
+            return true;
+        }
+        tracing::warn!(
+            node_id = %node_id,
+            cap_s = MAX_HONOURED_BREAK_GLASS.as_secs(),
+            "node has claimed a break-glass window for longer than one can legitimately last;              it is being addressed by replication again"
+        );
+        false
+    }
+
+    /// Forget a node's break-glass claim once it stops making it.
+    fn clear_break_glass_claim(&self, node_id: &str) {
+        self.break_glass_since
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(node_id);
+    }
+
+    /// Count one SEMANTIC rejection and quarantine the node past the
+    /// threshold. `true` iff this call quarantined it.
+    ///
+    /// A rejection is cheap for the peer and expensive for everyone
+    /// else: it aborts the round fleet-wide. Without a streak of its
+    /// own a node could reject every generation forever, well inside
+    /// the deadline, and never accrue a transport eviction. The
+    /// threshold is the same one transport failures use, so "three
+    /// strikes and you converge by pull" reads the same way whatever
+    /// the node did.
+    fn note_rejection(&self, node_id: &str) -> bool {
+        let streak = {
+            let mut rejections = self.rejections.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = rejections.entry(node_id.to_string()).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        if streak < self.quarantine_threshold {
+            return false;
+        }
+        self.quarantined
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(node_id.to_string())
+    }
+
     /// A node that staged the generation is healthy again.
     fn note_prepared(&self, node_id: &str) {
         self.evictions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(node_id);
+        self.rejections
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(node_id);
@@ -480,6 +667,7 @@ async fn prepare_one(
 async fn commit_one(
     endpoint: &RpcEndpoint<ClusterFrame>,
     generation: u64,
+    hash: &str,
     deadline: Duration,
 ) -> Result<AppliedConfig, String> {
     let response = endpoint
@@ -494,6 +682,18 @@ async fn commit_one(
         Some(cluster_response::Body::ConfigCommitAck(ack)) => {
             if !config_hash_is_valid(&ack.applied_hash) {
                 return Err("commit acknowledged with a malformed hash".to_string());
+            }
+            // This is the one exchange where the control plane already
+            // knows the right answer, so it checks instead of
+            // believing. A node that acknowledges some other version
+            // has not applied what was committed, and recording its
+            // claim would make it permanently invisible to drift
+            // detection.
+            if ack.applied_generation != generation || ack.applied_hash != hash {
+                return Err(format!(
+                    "commit acknowledged generation {} instead of {generation}",
+                    ack.applied_generation
+                ));
             }
             Ok(AppliedConfig {
                 generation: ack.applied_generation,
@@ -534,7 +734,12 @@ async fn abort_all(
 }
 
 /// A peer-supplied rejection reason, made safe to log and to publish.
-fn safe_reason(reason: &str) -> String {
+///
+/// Public because BOTH ends need it: the control plane bounds what a
+/// follower says about a blob, and the follower bounds what a control
+/// plane's blob makes it say. Either side's string reaches a journal
+/// line and a notification channel.
+pub fn safe_reason(reason: &str) -> String {
     if reason.is_empty() {
         return "no reason given".to_string();
     }
@@ -595,6 +800,9 @@ mod tests {
         Reject,
         /// Never answer anything.
         Silent,
+        /// Stage, then acknowledge the commit with a version it was
+        /// never asked to apply.
+        LieOnCommit,
     }
 
     /// A scripted follower over an in-process duplex pair, plus the
@@ -665,7 +873,7 @@ mod tests {
             let reply = match &request.request().body {
                 Some(cluster_request::Body::ConfigPrepare(_)) => {
                     prepares.fetch_add(1, Ordering::SeqCst);
-                    let accepted = behaviour == Behaviour::Accept;
+                    let accepted = behaviour != Behaviour::Reject;
                     ClusterResponse::ok(cluster_response::Body::ConfigPrepareAck(
                         ConfigPrepareAck {
                             accepted,
@@ -679,8 +887,12 @@ mod tests {
                 }
                 Some(cluster_request::Body::ConfigCommit(commit)) => {
                     commits.fetch_add(1, Ordering::SeqCst);
+                    let applied_generation = match behaviour {
+                        Behaviour::LieOnCommit => u64::MAX,
+                        _ => commit.generation,
+                    };
                     ClusterResponse::ok(cluster_response::Body::ConfigCommitAck(ConfigCommitAck {
-                        applied_generation: commit.generation,
+                        applied_generation,
                         applied_hash: HASH.to_string(),
                     }))
                 }
@@ -717,8 +929,9 @@ mod tests {
         );
         let mut replicator = Replicator::new();
         fast(&mut replicator);
+        let accepted = AcceptedConfig::new();
 
-        let report = replicator.replicate(&registry, payload(7)).await;
+        let report = replicator.replicate(&registry, &accepted, payload(7)).await;
         assert_eq!(report.targets, vec!["node-a", "node-b"]);
         assert_eq!(report.prepared, vec!["node-a", "node-b"]);
         assert_eq!(report.committed, vec!["node-a", "node-b"]);
@@ -754,8 +967,9 @@ mod tests {
         );
         let mut replicator = Replicator::new();
         fast(&mut replicator);
+        let accepted = AcceptedConfig::new();
 
-        let report = replicator.replicate(&registry, payload(8)).await;
+        let report = replicator.replicate(&registry, &accepted, payload(8)).await;
         assert!(report.aborted);
         assert_eq!(report.prepared, vec!["node-a"]);
         assert!(report.committed.is_empty());
@@ -769,7 +983,86 @@ mod tests {
         assert!(registry
             .applied("node-a")
             .is_some_and(|a| a == AppliedConfig::default()));
+        // And the generation is NOT published, so no follower learns it
+        // from a heartbeat and pulls it behind the abort's back.
+        assert_eq!(
+            accepted.version(),
+            ConfigVersion::default(),
+            "an aborted generation must never become the version the fleet converges on"
+        );
+        assert!(
+            accepted.payload().is_none(),
+            "an aborted generation must not be servable by a convergence pull"
+        );
         drop((good, bad));
+    }
+
+    #[tokio::test]
+    async fn a_node_that_rejects_every_generation_is_quarantined_and_stops_aborting_the_fleet() {
+        let registry = SessionRegistry::new();
+        let good = spawn_follower(
+            &registry,
+            "node-a",
+            Behaviour::Accept,
+            AppliedConfig::default(),
+        );
+        let bad = spawn_follower(
+            &registry,
+            "node-b",
+            Behaviour::Reject,
+            AppliedConfig::default(),
+        );
+        let mut replicator = Replicator::new();
+        fast(&mut replicator);
+        let accepted = AcceptedConfig::new();
+
+        // A semantic rejection answers well inside the deadline, so it
+        // never accrues a TRANSPORT eviction: without a streak of its
+        // own, one node would veto every generation forever at no cost.
+        for generation in 1..DEFAULT_QUARANTINE_THRESHOLD as u64 + 1 {
+            let report = replicator
+                .replicate(&registry, &accepted, payload(generation))
+                .await;
+            assert!(report.aborted, "generation {generation}");
+        }
+        assert!(replicator.is_quarantined("node-b"));
+
+        // Quarantined, it is skipped and the fleet moves again.
+        let report = replicator.replicate(&registry, &accepted, payload(9)).await;
+        assert!(!report.aborted);
+        assert_eq!(report.committed, vec!["node-a"]);
+        assert_eq!(report.skipped_quarantined, vec!["node-b"]);
+        assert_eq!(accepted.version().generation, 9);
+        drop((good, bad));
+    }
+
+    #[tokio::test]
+    async fn a_commit_acknowledging_another_generation_is_a_commit_failure() {
+        let registry = SessionRegistry::new();
+        let liar = spawn_follower(
+            &registry,
+            "node-a",
+            Behaviour::LieOnCommit,
+            AppliedConfig::default(),
+        );
+        let mut replicator = Replicator::new();
+        fast(&mut replicator);
+        let accepted = AcceptedConfig::new();
+
+        let report = replicator.replicate(&registry, &accepted, payload(6)).await;
+        assert_eq!(report.prepared, vec!["node-a"]);
+        assert!(
+            report.committed.is_empty(),
+            "a node that acknowledges a version it was not asked to apply has not committed"
+        );
+        assert_eq!(report.commit_failed.len(), 1);
+        // Its claim must not reach the registry, or it would read as
+        // in sync forever and drift detection would never see it.
+        assert_ne!(
+            registry.applied("node-a").map(|a| a.generation),
+            Some(u64::MAX)
+        );
+        drop(liar);
     }
 
     #[tokio::test]
@@ -789,9 +1082,10 @@ mod tests {
         );
         let mut replicator = Replicator::new();
         fast(&mut replicator);
+        let accepted = AcceptedConfig::new();
 
         for generation in 1..=2 {
-            let report = replicator.replicate(&registry, payload(generation)).await;
+            let report = replicator.replicate(&registry, &accepted, payload(generation)).await;
             assert!(!report.aborted, "a transport failure must not veto a round");
             assert_eq!(report.committed, vec!["node-a"]);
             assert_eq!(report.evicted.len(), 1, "generation {generation}");
@@ -800,20 +1094,20 @@ mod tests {
         assert!(!replicator.is_quarantined("node-b"));
 
         // Third consecutive eviction: quarantined.
-        let report = replicator.replicate(&registry, payload(3)).await;
+        let report = replicator.replicate(&registry, &accepted, payload(3)).await;
         assert_eq!(report.evicted.len(), 1);
         assert!(replicator.is_quarantined("node-b"));
         assert_eq!(replicator.quarantined(), vec!["node-b"]);
 
         // From now on it is not even addressed.
-        let report = replicator.replicate(&registry, payload(4)).await;
+        let report = replicator.replicate(&registry, &accepted, payload(4)).await;
         assert_eq!(report.targets, vec!["node-a"]);
         assert_eq!(report.skipped_quarantined, vec!["node-b"]);
         assert!(report.evicted.is_empty());
 
         assert!(replicator.release("node-b"));
         assert!(!replicator.release("node-b"), "already released");
-        let report = replicator.replicate(&registry, payload(5)).await;
+        let report = replicator.replicate(&registry, &accepted, payload(5)).await;
         assert_eq!(report.targets, vec!["node-a", "node-b"]);
         assert_eq!(good.prepares.load(Ordering::SeqCst), 5);
         drop((good, silent));
@@ -840,8 +1134,9 @@ mod tests {
         );
         let mut replicator = Replicator::new();
         fast(&mut replicator);
+        let accepted = AcceptedConfig::new();
 
-        let report = replicator.replicate(&registry, payload(9)).await;
+        let report = replicator.replicate(&registry, &accepted, payload(9)).await;
         assert_eq!(report.targets, vec!["node-a"]);
         assert_eq!(report.skipped_break_glass, vec!["node-b"]);
         assert_eq!(report.committed, vec!["node-a"]);
@@ -899,8 +1194,9 @@ mod tests {
     async fn a_round_with_no_live_session_is_an_empty_report() {
         let registry = SessionRegistry::new();
         let replicator = Replicator::new();
+        let accepted = AcceptedConfig::new();
         assert_eq!(replicator.last_report(), None);
-        let report = replicator.replicate(&registry, payload(1)).await;
+        let report = replicator.replicate(&registry, &accepted, payload(1)).await;
         assert!(report.targets.is_empty() && !report.aborted);
         assert_eq!(report.generation, 1);
         assert!(report.finished_unix >= report.started_unix);

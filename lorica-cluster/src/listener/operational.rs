@@ -734,6 +734,27 @@ async fn serve_request(
                     .err()
                     .map(|_| SessionEnd::Closed);
             };
+            // The SAME gate the push path applies in
+            // `SessionRegistry::active_sessions`, and for the same
+            // reason: a node awaiting operator activation is visible
+            // and alive but receives no configuration (Story 9.3
+            // AC #5). Without it the pull path hands the whole fleet
+            // blob to anyone who redeemed a join token, and the
+            // activation review an operator performs would protect
+            // nothing.
+            if ctx.node.as_ref().map(|n| n.state) != Some(NodeState::Active) {
+                stats.config_pull_refusals.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    peer = %ctx.peer_addr,
+                    node_id,
+                    "configuration pull refused: the node is not active"
+                );
+                return request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::Unspecified))
+                    .await
+                    .err()
+                    .map(|_| SessionEnd::Closed);
+            }
             if let Some(guard) = guard {
                 guard.entry().record_applied(applied.clone());
             }
