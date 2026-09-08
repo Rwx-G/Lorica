@@ -1003,6 +1003,50 @@ pub fn ocsp_refresh_notify() -> &'static tokio::sync::Notify {
     &OCSP_REFRESH_NOTIFY
 }
 
+/// Turn certificate rows into resolver input, holding back the ones
+/// that have no private key yet and publishing how many there are
+/// (Story 9.5 decision D12).
+///
+/// A row with a chain and no key is what a follower holds between
+/// receiving a configuration that announces a certificate and
+/// receiving the key on the distribution channel. Feeding it to the
+/// resolver would count it as an invalid bundle, which is the alert
+/// for a BROKEN certificate; the two need opposite responses, so the
+/// keyless ones are counted on their own gauge and left out.
+///
+/// Shared by the three places that load certificates into a resolver
+/// (reload, single-process boot, worker boot) so the gauge cannot
+/// disagree with itself across process modes.
+pub fn cert_data_for_resolver(
+    certs: &[lorica_config::models::Certificate],
+) -> Vec<CertData> {
+    let (with_key, awaiting): (Vec<_>, Vec<_>) =
+        certs.iter().partition(|c| !c.key_pem.is_empty());
+    lorica_api::metrics::set_certificates_awaiting_key(awaiting.len());
+    if !awaiting.is_empty() {
+        let domains: Vec<&str> = awaiting.iter().map(|c| c.domain.as_str()).collect();
+        info!(
+            count = awaiting.len(),
+            ?domains,
+            "certificates held back from the resolver: no private key yet \
+             (a follower gets one on the distribution channel)"
+        );
+    }
+    with_key
+        .into_iter()
+        .map(|c| CertData {
+            domain: c.domain.clone(),
+            san_domains: c.san_domains.clone(),
+            cert_pem: c.cert_pem.clone(),
+            key_pem: c.key_pem.clone(),
+            not_after_epoch: c.not_after.timestamp(),
+            // OCSP is fetched out of band by the background refresh
+            // loop, never on this path.
+            ocsp_response: None,
+        })
+        .collect()
+}
+
 /// Reload the TLS certificate resolver from the database.
 /// Only loads certificates that are actively referenced by at least one route.
 /// Called alongside `reload_proxy_config` when certificates change.
@@ -1056,17 +1100,7 @@ pub async fn reload_cert_resolver(
         .collect();
     drop(s);
 
-    let cert_data: Vec<CertData> = active_certs
-        .iter()
-        .map(|c| CertData {
-            domain: c.domain.clone(),
-            san_domains: c.san_domains.clone(),
-            cert_pem: c.cert_pem.clone(),
-            key_pem: c.key_pem.clone(),
-            not_after_epoch: c.not_after.timestamp(),
-            ocsp_response: None,
-        })
-        .collect();
+    let cert_data = cert_data_for_resolver(&active_certs);
 
     match cert_resolver.reload(cert_data) {
         Ok(stats) => {

@@ -279,21 +279,28 @@ async fn purge_superseded_acme_orphans(store: &Arc<Mutex<ConfigStore>>) {
 
 /// Spawn the hourly retention loop shared by supervisor and
 /// single-process modes (audit H-9 dedup): access-log retention, probe
-/// result purge (keep 1000), WAF event retention (keep 100 000), and
-/// the daily SLA bucket purge.
+/// result purge (keep 1000), WAF event retention (keep 100 000),
+/// expired ACME challenge purge (Story 9.5), and the daily SLA bucket
+/// purge.
 ///
-/// No-op when the access-log store failed to open (`log_store` is
-/// `None`), exactly like the original `if let Some(...)` guard at both
-/// call sites. The `JoinHandle` was discarded at both original call
-/// sites, so it is not returned. Must be called from within a tokio
-/// runtime context.
+/// A `None` `log_store` (the access-log store failed to open) skips
+/// only the jobs that read it. The configuration-store jobs still run:
+/// Story 9.5 iteration 1 found the challenge purge silently disabled
+/// on any node whose log store was missing, which is exactly the
+/// degraded node where stale rows accumulate unnoticed.
+///
+/// The `JoinHandle` was discarded at both original call sites, so it
+/// is not returned. Must be called from within a tokio runtime
+/// context.
 pub(crate) fn spawn_retention_loop(
     log_store: Option<Arc<lorica_api::log_store::LogStore>>,
     config_store: Arc<Mutex<ConfigStore>>,
 ) {
-    let Some(retention_log_store) = log_store else {
-        return;
-    };
+    // The loop runs even with no log store: several of its jobs
+    // (expired ACME challenges, probe results, SLA windows) live in
+    // the configuration store and must not be hostage to whether this
+    // process happens to keep access logs.
+    let retention_log_store = log_store;
     let retention_config_store = config_store;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
@@ -312,9 +319,11 @@ pub(crate) fn spawn_retention_loop(
                     })
                     .unwrap_or((100_000, 100_000, 90))
             };
-            if retention > 0 {
-                if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
-                    tracing::warn!(error = %e, "access log retention cleanup failed");
+            if let Some(logs) = &retention_log_store {
+                if retention > 0 {
+                    if let Err(e) = logs.enforce_retention(retention as u64) {
+                        tracing::warn!(error = %e, "access log retention cleanup failed");
+                    }
                 }
             }
             // Expired ACME challenges (Story 9.5 AC #6). Reclaiming the
@@ -338,17 +347,22 @@ pub(crate) fn spawn_retention_loop(
             // Audit-log retention is day-based and chain-safe: the
             // store writes a retention seal before truncating so
             // /api/v1/audit/verify keeps passing (Story 8.9 AC #9).
-            if audit_retention_days > 0 {
-                let cutoff = (chrono::Utc::now()
-                    - chrono::Duration::days(i64::from(audit_retention_days)))
-                .to_rfc3339();
-                match retention_log_store.enforce_audit_retention(&cutoff) {
-                    Ok(0) => {}
-                    Ok(deleted) => {
-                        tracing::info!(deleted, "audit log retention: expired rows sealed and removed");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "audit log retention cleanup failed");
+            if let Some(logs) = &retention_log_store {
+                if audit_retention_days > 0 {
+                    let cutoff = (chrono::Utc::now()
+                        - chrono::Duration::days(i64::from(audit_retention_days)))
+                    .to_rfc3339();
+                    match logs.enforce_audit_retention(&cutoff) {
+                        Ok(0) => {}
+                        Ok(deleted) => {
+                            tracing::info!(
+                                deleted,
+                                "audit log retention: expired rows sealed and removed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "audit log retention cleanup failed");
+                        }
                     }
                 }
             }
@@ -358,9 +372,11 @@ pub(crate) fn spawn_retention_loop(
                     tracing::warn!(error = %e, "probe result retention cleanup failed");
                 }
             }
-            if waf_retention > 0 {
-                if let Err(e) = retention_log_store.enforce_waf_retention(waf_retention as u64) {
-                    tracing::warn!(error = %e, "WAF event retention cleanup failed");
+            if let Some(logs) = &retention_log_store {
+                if waf_retention > 0 {
+                    if let Err(e) = logs.enforce_waf_retention(waf_retention as u64) {
+                        tracing::warn!(error = %e, "WAF event retention cleanup failed");
+                    }
                 }
             }
             last_sla_purge_day =

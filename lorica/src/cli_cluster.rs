@@ -182,6 +182,17 @@ pub(crate) fn run_cluster_join(
     };
     let expected_host = server_name.unwrap_or_else(|| host.to_string());
     let node_name = name.unwrap_or_else(local_hostname);
+    // The same rule a route's `node_selector` entry must satisfy: a
+    // name outside that alphabet could never be selected, so accepting
+    // it here would enrol a node that can never receive a certificate
+    // key and give the operator no clue why.
+    if let Err(reason) = lorica_config::models::validate_node_selector_names(
+        std::slice::from_ref(&node_name),
+    ) {
+        fail(format!(
+            "node name {node_name:?} is not usable in a route selector: {reason}.              Pass --name with a name over lowercase letters, digits, '-' and '_'."
+        ));
+    }
     if node_name.is_empty() || !display_field_is_valid(&node_name) {
         fail("the node name must be 1-64 bytes without control characters");
     }
@@ -590,7 +601,7 @@ pub(crate) fn run_cluster_break_glass(
 pub(crate) fn run_cluster_token(
     management_port: u16,
     ttl_seconds: Option<u64>,
-    node_name: Option<String>,
+    node_name: String,
     source_cidr: Option<String>,
     user: String,
     password: String,

@@ -343,10 +343,19 @@ pub(crate) async fn redeem_with_store(
         let Some(token_row) = token_row.filter(|_| verified) else {
             return Ok(Err("unknown token or wrong secret"));
         };
-        if let Some(bound) = &token_row.bound_node_name {
-            if *bound != request.node_name {
-                return Ok(Err("node name does not match the token's binding"));
-            }
+        // The binding is mandatory at mint time since the Story 9.5 QA
+        // (D15), and it is enforced here as a REQUIREMENT rather than
+        // as an optional check: an unbound row can only come from a
+        // token minted by an older build, and honouring it would
+        // reopen the path where a joiner claims a name a route already
+        // selects. Failing closed costs that operator one new token.
+        let Some(bound) = &token_row.bound_node_name else {
+            return Ok(Err(
+                "this token is not bound to a node name; mint a new one",
+            ));
+        };
+        if *bound != request.node_name {
+            return Ok(Err("node name does not match the token's binding"));
         }
         if let Some(cidr) = &token_row.bound_source_cidr {
             let inside = cidr
@@ -655,9 +664,14 @@ impl SessionHandler for FleetHandlers {
         })
     }
 
-    /// A follower asks for the current configuration (Story 9.4 AC #7).
-    /// `Ok(None)` means it already holds it and nothing transfers: the
-    /// "delta keyed on the applied hash" is the absence of a delta.
+    /// A follower asks for certificate keys it lacks (Story 9.5 AC #8).
+    ///
+    /// The id list is a hint about what the node is missing, never an
+    /// authorization input: entitlement is re-resolved here from the
+    /// store for every id, and an id the node is not selected for is
+    /// dropped in silence rather than refused, so the answer does not
+    /// tell the node whether that certificate exists. Answering with
+    /// fewer bundles than were asked for, or none, is the normal case.
     fn on_cert_pull(
         &self,
         node_id: &str,
@@ -697,7 +711,7 @@ impl SessionHandler for FleetHandlers {
                 sent = bundles.len(),
                 "answered a certificate pull"
             );
-            lorica_api::metrics::inc_cluster_cert_push(&node_id, "pulled");
+            lorica_api::metrics::inc_cluster_cert_push_by(&node_id, "served", bundles.len());
             Ok(bundles)
         })
     }

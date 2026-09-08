@@ -71,6 +71,16 @@ const RENEWAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// bounds but a slow WAN link still takes time to deliver.
 const PULL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often a follower checks whether it is missing certificate keys
+/// and asks for them (Story 9.5 AC #8).
+///
+/// Short, because the window it closes is a hostname served by the
+/// default certificate: a renewal whose key did not arrive leaves the
+/// node functional but wrong, and every interval is time a client
+/// spends getting the wrong certificate. Cheap too, since the check
+/// short-circuits on an empty result without touching the session.
+const KEY_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Inputs for [`spawn_follower`].
 pub(crate) struct FollowerOptions {
     /// Whether this process also runs a control plane (`--cluster-listen`).
@@ -158,6 +168,15 @@ struct ReplicaHandler {
     config_reload: watch::Sender<u64>,
     alert_sender: AlertSender,
     staged: StdMutex<Option<StagedConfig>>,
+    /// The dialer's connection slot, set once right after the dialer
+    /// spawns. It is a `OnceLock` because of a construction cycle: the
+    /// dialer needs this handler, and this handler needs the slot the
+    /// dialer creates.
+    ///
+    /// Without it the key reconciliation could only run from inside a
+    /// request the control plane initiated, which is precisely the bug
+    /// that made AC #8 conditional.
+    connection: std::sync::OnceLock<lorica_cluster::ClusterConnection>,
     /// `(generation, phase)` pairs already alerted on, so a generation
     /// this node cannot take raises one alert instead of one per
     /// heartbeat. Bounded by the number of generations this process
@@ -370,14 +389,7 @@ impl ReplicaHandler {
         if self.on_prepare(payload).await.is_err() {
             return;
         }
-        if self.on_commit(generation).await.is_err() {
-            return;
-        }
-        // The apply just wrote every certificate this node holds no key
-        // for. Asking now, on the session that is already open, is what
-        // makes AC #8 true: a node that was offline through an issuance
-        // catches up at the first configuration it converges on.
-        self.pull_missing_certs(&session).await;
+        let _ = self.on_commit(generation).await;
     }
 
     /// Install certificate material the control plane sent (Story 9.5
@@ -393,14 +405,16 @@ impl ReplicaHandler {
     async fn install_certs(&self, bundles: Vec<CertBundle>) -> CertInstallReport {
         let mut report = CertInstallReport::default();
         for bundle in bundles {
-            // The digest is the same shape the canonical blob carries,
-            // so this check is what ties the key to the configuration
-            // that announced it. A mismatch means the two channels
-            // disagree, and writing either one would be a guess.
-            let computed = format!(
-                "sha256:{}",
-                lorica_config::canonical::sha256_hex(bundle.key_pem.as_bytes())
-            );
+            // Computed with the SAME function the canonical blob uses,
+            // so this check cannot pass here and fail there.
+            //
+            // What it proves and what it does not: both the key and the
+            // digest arrived in the same message from the same sender,
+            // so this detects corruption in transit, NOT a disagreement
+            // between the key channel and the configuration channel.
+            // Proving that would need the digest the blob announced,
+            // and the replica apply does not keep it.
+            let computed = lorica_config::canonical::secret_digest(&bundle.key_pem);
             if computed != bundle.key_digest {
                 report.refused.push((
                     bundle.cert_id.clone(),
@@ -449,7 +463,11 @@ impl ReplicaHandler {
                 refused = report.refused.len(),
                 "installed certificate keys from the control plane"
             );
-            lorica_api::metrics::inc_cluster_cert_push(&self.node_id, "installed");
+            lorica_api::metrics::inc_cluster_cert_push_by(
+                &self.node_id,
+                "installed",
+                report.installed.len(),
+            );
             // The resolver reads keys at reload, and until now these
             // certificates were being skipped for having none.
             self.config_reload
@@ -478,6 +496,38 @@ impl ReplicaHandler {
         if let Ok(Some((settings, acls))) = inputs {
             lorica_api::cert_export::export_after_release(settings, acls, cert).await;
         }
+    }
+
+    /// Reconcile this node's certificate keys with the control plane
+    /// (AC #8).
+    ///
+    /// # Why this is a reconciler and not a step of the apply
+    ///
+    /// It was originally chained to the end of a configuration pull,
+    /// which made it unreachable on the ordinary path: a node that a
+    /// push brought up to date is by definition NOT behind, so the
+    /// pull that carried the chained request never ran again. A node
+    /// could sit indefinitely holding a certificate row with no key,
+    /// serving the default certificate, with nothing left to ask.
+    ///
+    /// Configuration has a reconciler, the version comparison on every
+    /// heartbeat. Keys need their own, driven by what the node is
+    /// missing rather than by what generation it is on.
+    ///
+    /// # Why break-glass does not gate this
+    ///
+    /// A key overwrites no operator edit (D9). Gating it was the same
+    /// mistake in a second place: it would let a certificate expire in
+    /// the middle of the incident the window was opened for, which is
+    /// exactly what D9 exists to prevent.
+    async fn reconcile_keys(&self) {
+        let Some(connection) = self.connection.get() else {
+            return;
+        };
+        let Some(session) = connection.current() else {
+            return;
+        };
+        self.pull_missing_certs(&session).await;
     }
 
     /// Ask the control plane for the keys this node is missing (AC #8).
@@ -546,8 +596,10 @@ impl ReplicaHandler {
             return;
         }
         let bundles: Vec<CertBundle> = bundles.into_iter().map(CertBundle::from_material).collect();
+        // `install_certs` counts what was installed and what was
+        // refused; counting the pull here too would book the same
+        // certificates twice under this node id.
         let report = self.install_certs(bundles).await;
-        lorica_api::metrics::inc_cluster_cert_push(&self.node_id, "pulled");
         info!(
             installed = report.installed.len(),
             refused = report.refused.len(),
@@ -641,6 +693,12 @@ impl FollowerHandler for ReplicaHandler {
             }
             applied
         })
+        // Reconciliation is NOT chained here on purpose. The commit ack
+        // is on the control plane's per-node deadline, and a key pull
+        // is a second round trip on the same session; the periodic
+        // reconciler picks it up within its interval instead. Chaining
+        // it would put an unrelated exchange inside the budget the
+        // coordinator measures.
     }
 
     fn on_abort(&self, generation: u64) -> BoxFuture<'_, ()> {
@@ -785,6 +843,7 @@ pub(crate) async fn spawn_follower(
         alert_sender: opts.alert_sender,
         staged: StdMutex::new(None),
         alerted: StdMutex::new(HashSet::new()),
+        connection: std::sync::OnceLock::new(),
     });
 
     let mut config = DialerConfig::new(
@@ -796,12 +855,16 @@ pub(crate) async fn spawn_follower(
         u32::try_from(schema_version).unwrap_or(u32::MAX),
     )
     .with_node_name(&identity.node_name)
-    .with_follower(replica as Arc<dyn FollowerHandler>);
+    .with_follower(Arc::clone(&replica) as Arc<dyn FollowerHandler>);
     config.handshake = config
         .handshake
         .with_build_version(env!("CARGO_PKG_VERSION"));
     let dialer = Dialer::spawn(config).map_err(|e| format!("follower: dialer: {e}"))?;
     let connection = dialer.connection();
+    // Close the construction cycle: the dialer owns the slot, and the
+    // handler needs it to reconcile keys outside any request the
+    // control plane initiated.
+    let _ = replica.connection.set(connection.clone());
     let (left_tx, mut left_rx) = watch::channel(false);
     let runtime = Arc::new(FollowerRuntime {
         node_id: identity.node_id.clone(),
@@ -892,6 +955,17 @@ pub(crate) async fn spawn_follower(
         }
     });
 
+    // Key reconciliation (AC #8). Driven by what this node is missing,
+    // never by what generation it is on, and deliberately outside the
+    // break-glass gate.
+    let reconcile_handler = Arc::clone(&replica);
+    let key_reconciler = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(KEY_RECONCILE_INTERVAL).await;
+            reconcile_handler.reconcile_keys().await;
+        }
+    });
+
     warn!(
         node_id = %identity.node_id,
         node_name = %identity.node_name,
@@ -911,7 +985,7 @@ pub(crate) async fn spawn_follower(
     Ok(Some(FollowerPlane {
         runtime,
         dialer,
-        tasks: vec![leave_task, renewal_task],
+        tasks: vec![leave_task, renewal_task, key_reconciler],
     }))
 }
 

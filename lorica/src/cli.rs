@@ -392,9 +392,12 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         ttl_seconds: Option<u64>,
 
-        /// Bind the token to this node name.
+        /// The node name this token may enrol. Required: route
+        /// selectors resolve against this name to decide which node
+        /// receives which private key, so the token, not the joining
+        /// machine, decides which name may be claimed.
         #[arg(long)]
-        node_name: Option<String>,
+        node_name: String,
 
         /// Bind the token to this source CIDR.
         #[arg(long)]
