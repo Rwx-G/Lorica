@@ -1,12 +1,13 @@
 //! Cluster registry endpoints (Story 9.3 AC #5/#10/#13/#14, plus the
 //! token-minting surface Story 9.7's dialog needs). The fleet runtime
 //! rule (store first, serialized refresh, then the session registry)
-//! lives in [`runtime`]; the handlers only call it and audit.
+//! lives in [`runtime`], a public module the control-plane binary
+//! imports by name; the handlers here only call it and audit.
 //!
 //! Role floors live in the authorize middleware: token endpoints and
 //! every node mutation are SuperAdmin, reads are Viewer+.
 
-mod runtime;
+pub mod runtime;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,10 +27,7 @@ use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
 
-pub use runtime::{
-    publish_token_liveness, refresh_control_plane, revoke_node as revoke_node_fully,
-    roster_from_nodes, ClusterRuntime, FollowerRuntime, RevokeOutcome,
-};
+pub use runtime::{ClusterRuntime, FollowerRuntime};
 
 /// Default join-token lifetime.
 pub const DEFAULT_TOKEN_TTL_S: u64 = 3600;
@@ -135,9 +133,7 @@ pub async fn mint_token(
     })
     .await?;
 
-    let live = publish_token_liveness(&control, &state.store)
-        .await
-        .map_err(ApiError::Internal)?;
+    let live = runtime::publish_token_liveness(&control, &state.store).await?;
     tracing::warn!(
         public_id = %minted.public_id,
         live_tokens = live,
@@ -210,9 +206,7 @@ pub async fn revoke_token(
             "no unused token with this public id".into(),
         ));
     }
-    publish_token_liveness(&control, &state.store)
-        .await
-        .map_err(ApiError::Internal)?;
+    runtime::publish_token_liveness(&control, &state.store).await?;
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     crate::audit::record(
         &state,
@@ -326,9 +320,7 @@ pub async fn activate_node(
             .ok_or_else(|| ApiError::NotFound("node not found".into()))
     })
     .await?;
-    refresh_control_plane(&control, &state.store)
-        .await
-        .map_err(ApiError::Internal)?;
+    runtime::refresh_control_plane(&control, &state.store).await?;
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     crate::audit::record(
         &state,
@@ -348,7 +340,8 @@ pub async fn activate_node(
 /// session is ended synchronously. Idempotent: revoking an already
 /// revoked node re-runs the CRL rebuild and the session kill, so a
 /// half-applied first attempt can be retried; only an absent node is
-/// 404.
+/// 404. A refresh failure is audited (the row flip and the session
+/// kill happened) and then answered 500, so the operator retries.
 pub async fn revoke_node(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
@@ -357,15 +350,15 @@ pub async fn revoke_node(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
-    let outcome = revoke_node_fully(&control, &state.store, &id, Utc::now())
-        .await
-        .map_err(ApiError::Internal)?
+    let outcome = runtime::revoke_node(&control, &state.store, &id, Utc::now())
+        .await?
         .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
     tracing::warn!(
         node_id = %id,
         name = %outcome.node.name,
         newly_revoked = outcome.newly_revoked,
         session_ended = outcome.session_ended,
+        refresh_error = outcome.refresh_error.as_ref().map(|e| e.to_string()).as_deref().unwrap_or("-"),
         "cluster node revoked"
     );
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
@@ -382,9 +375,13 @@ pub async fn revoke_node(
             "status": "revoked",
             "newly_revoked": outcome.newly_revoked,
             "session_ended": outcome.session_ended,
+            "refresh_error": outcome.refresh_error.as_ref().map(|e| e.to_string()),
         })),
     )
     .await;
+    if let Some(refresh_error) = outcome.refresh_error {
+        return Err(refresh_error.into());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

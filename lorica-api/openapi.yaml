@@ -3639,17 +3639,20 @@ paths:
         Story 9.3 AC #7. The node's certificate serials go on the CRL, the
         operational acceptor is rebuilt, and the node's live session is
         ended synchronously. The registry row stays, marked `revoked`.
+        Idempotent: revoking an already revoked node answers 204 and
+        re-runs the CRL rebuild and the session kill, so a first attempt
+        that failed half-way (500) can simply be retried.
       security:
         - sessionCookie: []
       responses:
         "204":
-          description: Node revoked
+          description: Node revoked (or already revoked; the refresh ran again)
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          description: Node not found or already revoked
+          description: Node not found
         "409":
           description: This node is not a control plane
   /api/v1/cluster/nodes/{id}/activate:
