@@ -37,6 +37,12 @@
 //! can push configuration down it, and the `HelloAck` plus every
 //! `HeartbeatAck` advertise the control plane's configuration version,
 //! so a follower that is behind pulls (AC #7) instead of drifting.
+//!
+//! Story 9.5 adds one dispatch arm on the same endpoint clone: a
+//! follower's certificate pull (AC #8). It reuses the configuration
+//! pull's `NodeState::Active` gate verbatim, for the same reason and
+//! then some: a node awaiting operator activation must not receive
+//! private keys either.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -54,12 +60,13 @@ use lorica_command::{IncomingRequest, IncomingRequests, RpcEndpoint};
 
 use crate::admission::{AdmissionDecision, AdmissionGate};
 use crate::bridge::{translate_cluster_request, BridgeOutcome, InPlaneAction};
+use crate::certs::{CertBundle, MAX_CERT_BUNDLES};
 use crate::enroll::{RenewRequest, SessionHandler};
 use crate::handshake::{serve_hello, HandshakeConfig};
 use crate::limits::cluster_rpc_limits;
 use crate::messages::{
-    cluster_response, ClusterFrame, ClusterResponse, ClusterStatus, ConfigPullAck, HeartbeatAck,
-    LeaveAck, RenewAck,
+    cluster_response, CertPullAck, ClusterFrame, ClusterResponse, ClusterStatus, ConfigPullAck,
+    HeartbeatAck, LeaveAck, RenewAck,
 };
 use crate::preauth::{accept_error_pause, PreAuthBudgets, SourceGate, SourceSlot};
 use crate::replication::{AppliedConfig, ConfigVersion};
@@ -163,6 +170,13 @@ pub struct OperationalStats {
     /// Convergence pulls the handler could not answer (the blob could
     /// not be built): refused opaquely, session kept.
     pub config_pull_refusals: AtomicU64,
+    /// Certificate pulls served (Story 9.5 AC #8), whatever number of
+    /// bundles the node turned out to be entitled to.
+    pub cert_pulls_served: AtomicU64,
+    /// Certificate pulls refused: the node is not Active, or the
+    /// handler could not read the material. Opaque refusal, session
+    /// kept.
+    pub cert_pull_refusals: AtomicU64,
     /// Certificate renewals issued over a session (Story 9.3 AC #12).
     pub renewals_served: AtomicU64,
     /// Nodes that left the fleet over their session (Story 9.3
@@ -787,6 +801,74 @@ async fn serve_request(
                 Err(reason) => {
                     stats.config_pull_refusals.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(peer = %ctx.peer_addr, node_id, %reason, "convergence pull refused");
+                    ClusterResponse::refusal(ClusterStatus::Unspecified)
+                }
+            };
+            request
+                .reply_frame(reply)
+                .await
+                .err()
+                .map(|_| SessionEnd::Closed)
+        }
+        BridgeOutcome::InPlane(InPlaneAction::CertPull { cert_ids }) => {
+            let (Some(fleet), Some(node_id)) = (&shared.fleet, ctx.node_id()) else {
+                return request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::UnsupportedMethod))
+                    .await
+                    .err()
+                    .map(|_| SessionEnd::Closed);
+            };
+            // The SAME gate the configuration pull applies, and the
+            // reason is stronger here: a node awaiting operator
+            // activation is visible and alive, and what it would
+            // receive on this path is private keys.
+            if ctx.node.as_ref().map(|n| n.state) != Some(NodeState::Active) {
+                stats.cert_pull_refusals.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    peer = %ctx.peer_addr,
+                    node_id,
+                    "certificate pull refused: the node is not active"
+                );
+                return request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::Unspecified))
+                    .await
+                    .err()
+                    .map(|_| SessionEnd::Closed);
+            }
+            let requested = cert_ids.len();
+            let reply = match fleet.handler.on_cert_pull(node_id, cert_ids).await {
+                Ok(bundles) if bundles.len() > MAX_CERT_BUNDLES => {
+                    // A local invariant, not a peer fact: an over-cap
+                    // answer would be refused at the follower's decode
+                    // boundary and drop the session, so it is refused
+                    // here where it can be logged with its cause.
+                    stats.cert_pull_refusals.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        peer = %ctx.peer_addr,
+                        node_id,
+                        bundles = bundles.len(),
+                        cap = MAX_CERT_BUNDLES,
+                        "certificate pull resolved more bundles than one answer may carry; \
+                         refusing rather than sending a batch the follower must reject"
+                    );
+                    ClusterResponse::refusal(ClusterStatus::Unspecified)
+                }
+                Ok(bundles) => {
+                    stats.cert_pulls_served.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        peer = %ctx.peer_addr,
+                        node_id,
+                        requested,
+                        granted = bundles.len(),
+                        "certificate pull served"
+                    );
+                    ClusterResponse::ok(cluster_response::Body::CertPullAck(CertPullAck {
+                        bundles: bundles.iter().map(CertBundle::to_material).collect(),
+                    }))
+                }
+                Err(reason) => {
+                    stats.cert_pull_refusals.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(peer = %ctx.peer_addr, node_id, %reason, "certificate pull refused");
                     ClusterResponse::refusal(ClusterStatus::Unspecified)
                 }
             };

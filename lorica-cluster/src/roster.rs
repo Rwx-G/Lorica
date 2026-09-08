@@ -35,6 +35,8 @@ use tokio::sync::watch;
 use lorica_command::RpcEndpoint;
 
 use crate::ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
+use crate::certs::{CertBundle, CertDistributor, CertPushReport};
+use crate::challenge::{ChallengeFanout, ChallengeReport};
 use crate::messages::ClusterFrame;
 use crate::replication::{
     AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
@@ -519,6 +521,15 @@ pub struct ControlPlane {
     /// The replication coordinator (Story 9.4 D6): one round at a time,
     /// with the eviction and quarantine bookkeeping that survives it.
     pub replication: Replicator,
+    /// The certificate distribution coordinator (Story 9.5 AC #7):
+    /// one best-effort push round at a time, on a path deliberately
+    /// independent of the configuration commit, so a slow follower
+    /// cannot hold up a fleet renewal.
+    pub distribution: CertDistributor,
+    /// The HTTP-01 challenge fan-out (Story 9.5 AC #6). Stateless and
+    /// deliberately unserialized: two orders for different hostnames
+    /// have no reason to queue behind each other.
+    pub challenges: ChallengeFanout,
 }
 
 impl ControlPlane {
@@ -552,6 +563,8 @@ impl ControlPlane {
             build_version: build_version.to_string(),
             accepted: AcceptedConfig::new(),
             replication: Replicator::new(),
+            distribution: CertDistributor::new(),
+            challenges: ChallengeFanout::new(),
         }
     }
 
@@ -574,6 +587,71 @@ impl ControlPlane {
         self.replication
             .replicate(&self.sessions, &self.accepted, payload)
             .await
+    }
+
+    /// Push certificate material to the nodes `recipients` names
+    /// (Story 9.5 AC #7).
+    ///
+    /// `recipients` is resolved by the CALLER, control-plane side and
+    /// down to a `node_id` (D3): certificate hostname, then the routes
+    /// bound to it, then their `node_selector`, then names resolved
+    /// against `cluster_nodes`. This method never widens that list and
+    /// never resolves a name itself, because a node name is chosen by
+    /// the joining node and is not an authorization input.
+    ///
+    /// Never fails and never blocks a caller's own work: a push is an
+    /// optimisation, and every node it could not reach asks for what
+    /// it lacks on the certificate pull path (D2).
+    pub async fn distribute_certificates(
+        &self,
+        recipients: &[String],
+        bundles: Vec<CertBundle>,
+    ) -> CertPushReport {
+        self.distribution
+            .push(&self.sessions, recipients, bundles)
+            .await
+    }
+
+    /// Publish an HTTP-01 challenge token to the nodes `recipients`
+    /// names, and report PER NODE (Story 9.5 AC #6).
+    ///
+    /// `recipients` is resolved by the caller from `identifier` (the
+    /// per-SAN hostname, not the order's primary domain) through the
+    /// routes bound to it and their `node_selector`. This method never
+    /// widens it and never addresses a non-Active session.
+    ///
+    /// It takes NO all-or-nothing decision. The caller is the ACME
+    /// solver, and it is the layer that must refuse the whole order
+    /// unless [`ChallengeReport::is_complete`] holds: telling the
+    /// authority to validate while one node has nothing is the opaque
+    /// failure AC #6 exists to remove, and only the caller knows an
+    /// order is at stake.
+    pub async fn publish_challenge(
+        &self,
+        recipients: &[String],
+        identifier: &str,
+        token: &str,
+        key_authorization: &str,
+    ) -> ChallengeReport {
+        self.challenges
+            .publish(
+                &self.sessions,
+                recipients,
+                identifier,
+                token,
+                key_authorization,
+            )
+            .await
+    }
+
+    /// Stop serving `token` on the named nodes. Best effort and
+    /// silent: it runs on both the success and the failure path of an
+    /// order, and a node that never answers drops the entry on its own
+    /// deadline.
+    pub async fn retract_challenge(&self, recipients: &[String], token: &str) {
+        self.challenges
+            .retract(&self.sessions, recipients, token)
+            .await;
     }
 
     /// Take the refresh lock: the guard is the proof

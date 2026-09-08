@@ -28,6 +28,7 @@ use tokio::sync::watch;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
+use lorica_cluster::certs::CertBundle;
 use lorica_cluster::enroll::{
     BoxFuture, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, RenewGrant,
     RenewRequest, SessionHandler,
@@ -319,6 +320,16 @@ impl SessionHandler for RecordingSessionHandler {
         // Story 9.3's tests hold no configuration; replication has its
         // own suite in tests/replication.rs.
         Box::pin(async { Ok(None) })
+    }
+
+    fn on_cert_pull(
+        &self,
+        _node_id: &str,
+        _cert_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<Vec<CertBundle>, String>> {
+        // Same: certificate distribution has its own coverage in
+        // tests/replication.rs, over the same real-mTLS harness.
+        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

@@ -29,12 +29,14 @@
 //!
 //! Story 9.2 dropped the endpoint's incoming half: nothing was
 //! server-initiated. Since Story 9.4 the control plane PUSHES
-//! configuration down this same connection, so the dialer serves that
+//! configuration down this same connection, and since Story 9.5 it
+//! pushes certificate material down it too, so the dialer serves that
 //! half for the life of the session: every inbound request goes through
-//! [`translate_control_plane_request`], the three configuration pushes
-//! reach the [`FollowerHandler`], an unknown method is refused without
-//! dropping the session, and anything else is a protocol violation that
-//! ends it. A node without a [`FollowerHandler`] answers every push
+//! [`translate_control_plane_request`], the three configuration pushes,
+//! the certificate push and the HTTP-01 challenge pair reach the
+//! [`FollowerHandler`], an unknown method is refused without dropping
+//! the session, and anything else is a protocol violation that ends it.
+//! A node without a [`FollowerHandler`] answers every push
 //! `UNSUPPORTED_METHOD`, which keeps the transport-only tests honest.
 //!
 //! # The dial target is a NAME, resolved on every attempt
@@ -78,12 +80,14 @@ use tokio_rustls::TlsConnector;
 use lorica_command::{IncomingRequest, IncomingRequests, RpcEndpoint};
 
 use crate::bridge::{translate_control_plane_request, FollowerAction, FollowerBridgeOutcome};
+use crate::certs::{CertBundle, CertInstallReport};
 use crate::enroll::BoxFuture;
 use crate::handshake::{client_handshake, HandshakeConfig, HandshakeError};
 use crate::limits::cluster_rpc_limits;
 use crate::messages::{
-    cluster_response, config_hash_is_valid, ClusterFrame, ClusterRequest, ClusterResponse,
-    ClusterStatus, ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, Heartbeat, HelloAck,
+    cluster_response, config_hash_is_valid, CertPushAck, CertRefusal, ChallengePublishAck,
+    ChallengeRetractAck, ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus,
+    ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, Heartbeat, HelloAck,
 };
 use crate::replication::{AppliedConfig, ConfigPayload, ConfigVersion};
 use crate::tls::{client_config, negotiated_cluster_alpn, ClusterTlsError};
@@ -132,6 +136,22 @@ pub struct DialerStats {
     pub config_commits: AtomicU64,
     /// `ConfigAbort` requests served.
     pub config_aborts: AtomicU64,
+    /// `CertPush` requests served on the incoming half (Story 9.5).
+    pub cert_pushes: AtomicU64,
+    /// Certificates installed from a push.
+    pub certs_installed: AtomicU64,
+    /// Certificates a push offered that this node would not or could
+    /// not install. Never fatal: the node asks for them again on its
+    /// next certificate pull (Story 9.5 D2).
+    pub cert_install_refusals: AtomicU64,
+    /// HTTP-01 challenge tokens this node was asked to serve
+    /// (Story 9.5 AC #6).
+    pub challenges_published: AtomicU64,
+    /// Publications this node could not take. Each one stops an ACME
+    /// order on the control plane, so it is the counter to alert on.
+    pub challenge_publish_failures: AtomicU64,
+    /// HTTP-01 challenge tokens this node was asked to stop serving.
+    pub challenges_retracted: AtomicU64,
     /// Times an ack revealed the control plane is on another
     /// configuration version and a pull was started (AC #7).
     pub behind_detected: AtomicU64,
@@ -140,8 +160,8 @@ pub struct DialerStats {
     pub protocol_violations: AtomicU64,
 }
 
-/// The follower runtime the dialer serves configuration pushes to
-/// (Story 9.4 D5).
+/// The follower runtime the dialer serves control-plane pushes to
+/// (Story 9.4 D5, Story 9.5 AC #7).
 ///
 /// Implemented by the binary over the configuration store and the
 /// reload trigger; a node without one (the transport-only tests)
@@ -168,6 +188,49 @@ pub trait FollowerHandler: Send + Sync + 'static {
     /// `session` and apply (AC #7). At most one call is in flight per
     /// session; the dialer skips the check while a previous pull runs.
     fn on_behind(&self, session: SessionHandle, current: ConfigVersion) -> BoxFuture<'_, ()>;
+
+    /// Install certificate material the control plane pushed (AC #7).
+    ///
+    /// Infallible by signature on purpose: a certificate push is best
+    /// effort (D2), so a per-certificate problem belongs in the
+    /// returned [`CertInstallReport`] and never ends the session. The
+    /// bundles are already bounded and well formed
+    /// ([`crate::certs::cert_bundle_defect`]); what remains for the
+    /// implementation is checking `key_digest` against `key_pem` and
+    /// writing through the store's encrypt-on-write path.
+    ///
+    /// Never refuses for break-glass: a key overwrites no operator
+    /// edit, so the reason Story 9.4 excludes a break-glass node from
+    /// replication does not apply, and suspending delivery could
+    /// expire a certificate in the middle of the incident the window
+    /// was opened for (D9).
+    fn on_cert_push(&self, bundles: Vec<CertBundle>) -> BoxFuture<'_, CertInstallReport>;
+
+    /// Publish an HTTP-01 challenge token so this node's data plane can
+    /// answer the certificate authority for `identifier` (AC #6).
+    ///
+    /// Fallible, unlike [`FollowerHandler::on_cert_push`], and the
+    /// asymmetry is the point: an ACME order is about to be validated
+    /// against this node, so `Err` here must stop the order rather
+    /// than be counted. The reason names the cause without echoing the
+    /// key authorization.
+    ///
+    /// The entry's DEADLINE is stamped by this implementation from
+    /// this node's own clock. Nothing on the wire carries one, and
+    /// nothing should: see the note on
+    /// [`crate::messages::ChallengePublish`].
+    fn on_challenge_publish(
+        &self,
+        identifier: String,
+        token: String,
+        key_authorization: String,
+    ) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Retract a token. Infallible by contract, like the driver
+    /// cleanup it mirrors: it runs on both the success and the failure
+    /// path of an order, has nothing useful to report, and the entry's
+    /// own deadline removes it anyway.
+    fn on_challenge_retract(&self, token: String) -> BoxFuture<'_, ()>;
 }
 
 /// Inputs for [`Dialer::spawn`]. Construct with [`DialerConfig::new`];
@@ -829,7 +892,7 @@ async fn serve_control_plane(
     }
 }
 
-/// Serve one whitelisted configuration push. `false` means the reply
+/// Serve one whitelisted control-plane push. `false` means the reply
 /// could not be sent and the session is over.
 async fn serve_follower_action(
     config: &DialerConfig,
@@ -896,6 +959,85 @@ async fn serve_follower_action(
             handler.on_abort(generation).await;
             tracing::info!(generation, "dropped a staged configuration on the control plane's abort");
             ClusterResponse::ok(cluster_response::Body::ConfigAbortAck(ConfigAbortAck {}))
+        }
+        FollowerAction::InstallCerts(bundles) => {
+            stats.cert_pushes.fetch_add(1, Ordering::Relaxed);
+            let offered = bundles.len();
+            let report = handler.on_cert_push(bundles).await;
+            stats
+                .certs_installed
+                .fetch_add(report.installed.len() as u64, Ordering::Relaxed);
+            stats
+                .cert_install_refusals
+                .fetch_add(report.refused.len() as u64, Ordering::Relaxed);
+            if report.refused.is_empty() {
+                tracing::info!(
+                    offered,
+                    installed = report.installed.len(),
+                    "installed certificate material pushed by the control plane"
+                );
+            } else {
+                // Not an error: the push is best effort, and whatever
+                // was refused is asked for again on the next pull.
+                tracing::warn!(
+                    offered,
+                    installed = report.installed.len(),
+                    refused = report.refused.len(),
+                    "part of a pushed certificate batch was not installed; it is requested again \
+                     on the next certificate pull"
+                );
+            }
+            ClusterResponse::ok(cluster_response::Body::CertPushAck(CertPushAck {
+                installed: report.installed,
+                refused: report
+                    .refused
+                    .into_iter()
+                    .map(|(cert_id, reason)| CertRefusal { cert_id, reason })
+                    .collect(),
+            }))
+        }
+        FollowerAction::PublishChallenge {
+            identifier,
+            token,
+            key_authorization,
+        } => {
+            stats.challenges_published.fetch_add(1, Ordering::Relaxed);
+            match handler
+                .on_challenge_publish(identifier.clone(), token, key_authorization)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        %identifier,
+                        "serving an HTTP-01 challenge for the control plane's order"
+                    );
+                    ClusterResponse::ok(cluster_response::Body::ChallengePublishAck(
+                        ChallengePublishAck {},
+                    ))
+                }
+                Err(reason) => {
+                    stats
+                        .challenge_publish_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    // The control plane's order stops on this refusal
+                    // rather than telling the authority to validate
+                    // against a node that would answer nothing.
+                    tracing::error!(
+                        %identifier,
+                        %reason,
+                        "cannot serve the HTTP-01 challenge; the control plane's order fails here \
+                         instead of failing opaquely at the certificate authority"
+                    );
+                    ClusterResponse::refusal(ClusterStatus::Unspecified)
+                }
+            }
+        }
+        FollowerAction::RetractChallenge { token } => {
+            stats.challenges_retracted.fetch_add(1, Ordering::Relaxed);
+            handler.on_challenge_retract(token).await;
+            ClusterResponse::ok(cluster_response::Body::ChallengeRetractAck(
+                ChallengeRetractAck {},
+            ))
         }
     };
     request.reply_frame(reply).await.is_ok()

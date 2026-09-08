@@ -41,7 +41,11 @@ message ClusterFrame {
 //          the only frames a follower accepts on its incoming half;
 //          23 is the follower's convergence pull.
 //   40-59  RESERVED for telemetry fan-in (Story 9.6)
-//   60-79  RESERVED for certificate distribution (Story 9.5)
+//   60-79  certificate distribution and HTTP-01 challenge fan-out
+//          (Story 9.5: 60-63 in use, the rest reserved). 60, 62 and
+//          63 are CONTROL-PLANE-INITIATED, 61 is the follower's
+//          certificate pull; each is a PROTOCOL_VIOLATION in the
+//          opposite direction.
 //
 // `body_kind` duplicates the body's oneof tag as a scalar. A receiver
 // that does not know the body (an older build talking to a newer
@@ -62,6 +66,10 @@ message ClusterRequest {
     ConfigCommit config_commit = 21;
     ConfigAbort config_abort = 22;
     ConfigPull config_pull = 23;
+    CertPush cert_push = 60;
+    CertPull cert_pull = 61;
+    ChallengePublish challenge_publish = 62;
+    ChallengeRetract challenge_retract = 63;
   }
 }
 
@@ -82,6 +90,10 @@ message ClusterResponse {
     ConfigCommitAck config_commit_ack = 21;
     ConfigAbortAck config_abort_ack = 22;
     ConfigPullAck config_pull_ack = 23;
+    CertPushAck cert_push_ack = 60;
+    CertPullAck cert_pull_ack = 61;
+    ChallengePublishAck challenge_publish_ack = 62;
+    ChallengeRetractAck challenge_retract_ack = 63;
   }
 }
 
@@ -217,6 +229,113 @@ message ConfigPullAck {
   bytes blob = 3;
   bool up_to_date = 4;
 }
+
+// ---- Certificate distribution (Story 9.5), tags 60-61 ----
+//
+// Deliberately NOT on the configuration commit path (AC #7): if keys
+// rode Prepare/Commit, one slow or drifted follower would block fleet
+// renewals until expiry. CertPush is control-plane-initiated and
+// travels on the follower's incoming half; a follower sending one is
+// pushing private keys AT its control plane and is a
+// PROTOCOL_VIOLATION. CertPull is the reverse, and a control plane
+// sending one is equally a violation.
+//
+// The push is best effort (D2): a failed or refused push is counted
+// and logged, never fatal. The pull is the guarantee, and it inherits
+// the same NodeState::Active gate the configuration pull has, so a
+// node awaiting operator activation receives no key material.
+//
+// The mutual-TLS channel is the confidentiality boundary (D5): key_pem
+// travels in the clear inside it, because no per-node public key
+// exists to wrap a key to. key_digest is the `sha256:<hex>` the
+// canonical blob carries in place of the key, so a follower can check
+// that what arrived is what the configuration announced.
+
+// One certificate's material.
+message CertMaterial {
+  string cert_id = 1;      // The certificate's stable id (a UUID)
+  string domain = 2;       // Primary hostname; display only
+  string cert_pem = 3;     // PEM leaf + chain
+  string key_pem = 4;      // PEM private key; never logged
+  string key_digest = 5;   // "sha256:" + 64 lowercase hex of key_pem
+}
+
+// Install this material now (AC #7). At most 64 bundles per batch;
+// a longer batch is a PROTOCOL_VIOLATION.
+message CertPush {
+  repeated CertMaterial bundles = 1;
+}
+
+// One certificate the follower would not or could not install.
+message CertRefusal {
+  string cert_id = 1;
+  string reason = 2;       // Never echoes key material
+}
+
+// What the follower did with the batch.
+message CertPushAck {
+  repeated string installed = 1;
+  repeated CertRefusal refused = 2;
+}
+
+// A follower asks for keys it lacks (AC #8). At most 256 ids; the
+// list is a REQUEST, never an authorization input: the control plane
+// resolves entitlement itself and may answer with fewer bundles.
+message CertPull {
+  repeated string cert_ids = 1;
+}
+
+message CertPullAck {
+  repeated CertMaterial bundles = 1;
+}
+
+// ---- HTTP-01 challenge fan-out (Story 9.5), tags 62-63 ----
+//
+// AC #6: the control plane holds the ACME account and completes the
+// order, but the certificate authority validates HTTP-01 against the
+// hostname, which a follower serves. So the token is distributed to
+// the nodes plausibly serving that hostname before the authority is
+// told to validate. Both frames are CONTROL-PLANE-INITIATED; a
+// follower sending either is choosing what the fleet answers a
+// certificate authority, and is a PROTOCOL_VIOLATION.
+//
+// Publication is reported PER NODE and the transport takes no
+// all-or-nothing decision. The caller is the ACME solver, and it is
+// the one that refuses the order unless every recipient took the
+// token: telling the authority to validate while one node has nothing
+// is the opaque failure this story exists to remove. Retraction is
+// best effort and reports nothing.
+//
+// NO EXPIRY FIELD, DELIBERATELY. The follower stamps its own deadline
+// from its own clock when it writes the entry. A timestamp taken on
+// the control plane's clock and evaluated on the follower's produces,
+// under skew, either a token already expired on arrival or one that
+// outlives the validation window on a node nobody is watching, and
+// neither is visible where it is caused. Do not add the field back.
+
+message ChallengePublish {
+  // The per-SAN hostname being validated, not the order's primary
+  // domain: node selection is per hostname.
+  string identifier = 1;
+  // base64url, RFC 8555 section 8.3. It becomes the last path segment
+  // of /.well-known/acme-challenge/<token>, so its ALPHABET is
+  // checked at the decode boundary, not just its length.
+  string token = 2;
+  // Served verbatim as the response body; bounded for the same reason.
+  string key_authorization = 3;
+}
+
+// The follower is serving the token. Anything else is a refusal
+// status with no body, and the caller aborts the order.
+message ChallengePublishAck {}
+
+// Stop serving a token. The token alone identifies the entry, so the
+// key authorization does not travel a second time.
+message ChallengeRetract {
+  string token = 1;
+}
+
+message ChallengeRetractAck {}
 
 // Control-plane answer to Hello when the session is admitted.
 message HelloAck {

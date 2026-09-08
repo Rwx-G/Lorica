@@ -749,7 +749,11 @@ pub fn safe_reason(reason: &str) -> String {
     reason.to_string()
 }
 
-fn unix_now() -> u64 {
+/// Unix seconds, saturating to `0` if the clock predates the epoch.
+///
+/// Crate-visible because [`crate::certs`] stamps its own reports the
+/// same way; the two modules must not disagree about what "now" is.
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -24,6 +24,17 @@
 //! break-glass follower being skipped, and a node awaiting activation
 //! being refused the configuration it asks for.
 //!
+//! Story 9.5 rides the SAME harness, deliberately: certificate
+//! distribution is a second directed pair on the same sessions, and
+//! the interesting assertions are about who receives key material, not
+//! about the transport. Covered here: a push reaching only the
+//! resolved recipients, a follower pull answered over the live
+//! session, a node awaiting activation refused a certificate pull, and
+//! a follower that pushes certificates UPWARDS losing its session.
+//! Plus the HTTP-01 fan-out (AC #6): one node taking the token while
+//! another refuses it, reported per node so the ACME solver can refuse
+//! the order rather than let the authority fail opaquely.
+//!
 //! Test hygiene: every await that depends on another task sits under an
 //! explicit timeout, so a regression fails in seconds instead of
 //! hanging a CI run.
@@ -34,12 +45,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use lorica_cluster::certs::{CertBundle, CertDistributor, CertInstallReport};
+use lorica_cluster::challenge::ChallengeFanout;
 use lorica_cluster::enroll::{BoxFuture, RenewGrant, RenewRequest, SessionHandler};
 use lorica_cluster::handshake::HandshakeConfig;
 use lorica_cluster::listener::{
     FleetHooks, OperationalConfig, OperationalHandle, OperationalListener, OperationalStats,
 };
-use lorica_cluster::messages::cluster_response;
+use lorica_cluster::messages::{
+    cluster_response, CertMaterial, CertPull, CertPush, MAX_CONFIG_HASH_BYTES,
+};
 use lorica_cluster::replication::{
     AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
 };
@@ -56,6 +71,24 @@ const SCHEMA: u32 = 50;
 /// A plausible canonical hash: 64 lowercase hex characters.
 fn hash_for(generation: u64) -> String {
     format!("{generation:064x}")
+}
+
+/// A plausible HTTP-01 challenge: the token is base64url, which the
+/// decode boundary enforces because it becomes a path segment.
+const IDENTIFIER: &str = "edge.example.com";
+const TOKEN: &str = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
+const KEY_AUTH: &str = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0.9jg46WB3rR_AHD-EBXd";
+
+/// A well-formed bundle: the digest has the `sha256:` shape the
+/// canonical blob carries, so it passes the decode boundary.
+fn cert_bundle(cert_id: &str) -> CertBundle {
+    CertBundle {
+        cert_id: cert_id.to_string(),
+        domain: format!("{cert_id}.example.com"),
+        cert_pem: "-----BEGIN CERTIFICATE-----".to_string(),
+        key_pem: format!("-----BEGIN PRIVATE KEY----- {cert_id}"),
+        key_digest: format!("sha256:{}", "a".repeat(MAX_CONFIG_HASH_BYTES)),
+    }
 }
 
 fn payload(generation: u64) -> ConfigPayload {
@@ -127,6 +160,14 @@ struct ControlPlaneHooks {
     /// What a pull hands back. `None` answers "you are up to date".
     available: Mutex<Option<ConfigPayload>>,
     pulls: AtomicUsize,
+    /// What a certificate pull hands back, whatever was asked for:
+    /// entitlement is resolved control-plane side (Story 9.5 D3), so
+    /// the answer is deliberately not a function of the request.
+    certs_available: Mutex<Vec<CertBundle>>,
+    cert_pulls: AtomicUsize,
+    /// The ids the last certificate pull carried, so a test can assert
+    /// what actually crossed the wire.
+    cert_pull_ids: Mutex<Vec<String>>,
 }
 
 impl SessionHandler for ControlPlaneHooks {
@@ -172,6 +213,18 @@ impl SessionHandler for ControlPlaneHooks {
             Ok(self.available.lock().expect("lock").clone())
         })
     }
+
+    fn on_cert_pull(
+        &self,
+        _node_id: &str,
+        cert_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<Vec<CertBundle>, String>> {
+        Box::pin(async move {
+            self.cert_pulls.fetch_add(1, Ordering::SeqCst);
+            *self.cert_pull_ids.lock().expect("lock") = cert_ids;
+            Ok(self.certs_available.lock().expect("lock").clone())
+        })
+    }
 }
 
 /// A running control plane: listener, fleet layer, coordinator.
@@ -182,6 +235,8 @@ struct Fleet {
     hooks: Arc<ControlPlaneHooks>,
     accepted: AcceptedConfig,
     replicator: Replicator,
+    distributor: CertDistributor,
+    challenges: ChallengeFanout,
     handle: OperationalHandle,
 }
 
@@ -265,6 +320,8 @@ async fn spawn_control_plane_with_state(
     // A wedged follower must not stall the whole suite; the eviction
     // path is unit-tested at length in `src/replication.rs`.
     replicator.per_node_deadline = Duration::from_secs(5);
+    let mut distributor = CertDistributor::new();
+    distributor.per_node_deadline = Duration::from_secs(5);
     Fleet {
         addr,
         stats,
@@ -272,6 +329,10 @@ async fn spawn_control_plane_with_state(
         hooks,
         accepted,
         replicator,
+        distributor,
+        challenges: ChallengeFanout {
+            per_node_deadline: Duration::from_secs(5),
+        },
         handle,
     }
 }
@@ -288,10 +349,39 @@ struct TestFollower {
     aborts: AtomicUsize,
     behind: AtomicUsize,
     pulled: Mutex<Option<ConfigPayload>>,
+    /// Story 9.5.
+    behaviour: PushBehaviour,
+    installed: Mutex<Vec<CertBundle>>,
+    cert_pushes: AtomicUsize,
+    pulled_certs: Mutex<Vec<CertBundle>>,
+    /// `(identifier, token, key_authorization)` this node is serving.
+    served: Mutex<Vec<(String, String, String)>>,
+    challenge_publishes: AtomicUsize,
+    challenge_retractions: AtomicUsize,
+}
+
+/// What a test follower does on the Story 9.5 push paths.
+#[derive(Clone, Default)]
+struct PushBehaviour {
+    /// Ids to ask for the next time the dialer says this node is
+    /// behind; empty means it never asks.
+    wants: Vec<String>,
+    /// Refuse every pushed bundle instead of installing it.
+    refuse: bool,
+    /// Send a `CertPush` UPWARDS instead of pulling: the direction no
+    /// follower may take, and the control plane must end the session.
+    push_upward: bool,
+    /// Refuse every HTTP-01 publication: the node the ACME solver must
+    /// notice before it tells the authority to validate.
+    refuse_challenge: bool,
 }
 
 impl TestFollower {
     fn new(reject: bool, break_glass: bool) -> Arc<Self> {
+        Self::new_with(reject, break_glass, PushBehaviour::default())
+    }
+
+    fn new_with(reject: bool, break_glass: bool, behaviour: PushBehaviour) -> Arc<Self> {
         Arc::new(Self {
             reject,
             applied: Mutex::new(AppliedConfig {
@@ -305,11 +395,30 @@ impl TestFollower {
             aborts: AtomicUsize::new(0),
             behind: AtomicUsize::new(0),
             pulled: Mutex::new(None),
+            behaviour,
+            installed: Mutex::new(Vec::new()),
+            cert_pushes: AtomicUsize::new(0),
+            pulled_certs: Mutex::new(Vec::new()),
+            served: Mutex::new(Vec::new()),
+            challenge_publishes: AtomicUsize::new(0),
+            challenge_retractions: AtomicUsize::new(0),
         })
     }
 
     fn applied(&self) -> AppliedConfig {
         self.applied.lock().expect("lock").clone()
+    }
+
+    fn installed_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .installed
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|b| b.cert_id.clone())
+            .collect();
+        ids.sort();
+        ids
     }
 }
 
@@ -355,9 +464,86 @@ impl FollowerHandler for TestFollower {
         })
     }
 
+    fn on_cert_push(&self, bundles: Vec<CertBundle>) -> BoxFuture<'_, CertInstallReport> {
+        Box::pin(async move {
+            self.cert_pushes.fetch_add(1, Ordering::SeqCst);
+            if self.behaviour.refuse {
+                return CertInstallReport {
+                    installed: Vec::new(),
+                    refused: bundles
+                        .into_iter()
+                        .map(|b| (b.cert_id, "no route binds this hostname here".to_string()))
+                        .collect(),
+                };
+            }
+            let installed = bundles.iter().map(|b| b.cert_id.clone()).collect();
+            self.installed.lock().expect("lock").extend(bundles);
+            CertInstallReport {
+                installed,
+                refused: Vec::new(),
+            }
+        })
+    }
+
+    fn on_challenge_publish(
+        &self,
+        identifier: String,
+        token: String,
+        key_authorization: String,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.challenge_publishes.fetch_add(1, Ordering::SeqCst);
+            if self.behaviour.refuse_challenge {
+                return Err("no data plane is listening on this node".to_string());
+            }
+            self.served
+                .lock()
+                .expect("lock")
+                .push((identifier, token, key_authorization));
+            Ok(())
+        })
+    }
+
+    fn on_challenge_retract(&self, token: String) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.challenge_retractions.fetch_add(1, Ordering::SeqCst);
+            self.served.lock().expect("lock").retain(|(_, t, _)| t != &token);
+        })
+    }
+
     fn on_behind(&self, session: SessionHandle, _current: ConfigVersion) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.behind.fetch_add(1, Ordering::SeqCst);
+            if self.behaviour.push_upward {
+                // A follower offering key material to its control
+                // plane. The session must not survive it.
+                let request = ClusterRequest::cert_push(CertPush {
+                    bundles: vec![CertMaterial {
+                        cert_id: "cert-forged".to_string(),
+                        domain: "forged.example.com".to_string(),
+                        cert_pem: "-----BEGIN CERTIFICATE-----".to_string(),
+                        key_pem: "-----BEGIN PRIVATE KEY-----".to_string(),
+                        key_digest: format!("sha256:{}", "a".repeat(MAX_CONFIG_HASH_BYTES)),
+                    }],
+                });
+                let _ = session.endpoint.request(request, WAIT).await;
+                return;
+            }
+            if !self.behaviour.wants.is_empty() {
+                // AC #8: the follower asks for exactly what it counted
+                // as missing, and takes whatever subset it is given.
+                let request = ClusterRequest::cert_pull(CertPull {
+                    cert_ids: self.behaviour.wants.clone(),
+                });
+                if let Ok(response) = session.endpoint.request(request, WAIT).await {
+                    if let Some(cluster_response::Body::CertPullAck(ack)) = response.body {
+                        self.pulled_certs
+                            .lock()
+                            .expect("lock")
+                            .extend(ack.bundles.into_iter().map(CertBundle::from_material));
+                    }
+                }
+            }
             let applied = self.applied();
             let request = ClusterRequest::config_pull(ConfigPull {
                 applied_generation: applied.generation,
@@ -605,6 +791,294 @@ async fn a_break_glass_follower_is_skipped_by_the_round() {
 
     normal_dialer.shutdown();
     broken_glass_dialer.shutdown();
+    fleet.handle.shutdown();
+}
+
+#[tokio::test]
+async fn a_certificate_push_reaches_the_resolved_recipient_and_nobody_else() {
+    install_ring();
+    let pki = control_plane_pki();
+    let recipient = issue_node(&pki, "node-a");
+    let bystander = issue_node(&pki, "node-b");
+    let fleet = spawn_control_plane(&pki, &[&recipient, &bystander]).await;
+
+    let wanted = TestFollower::new(false, false);
+    let unwanted = TestFollower::new(false, false);
+    let a = spawn_follower(&pki, &recipient, fleet.addr, Arc::clone(&wanted), QUIET);
+    let b = spawn_follower(&pki, &bystander, fleet.addr, Arc::clone(&unwanted), QUIET);
+    eventually("both followers to register", || {
+        fleet.sessions.is_connected("node-a") && fleet.sessions.is_connected("node-b")
+    })
+    .await;
+
+    // The recipient list is resolved control-plane side (D3) and this
+    // call must not widen it, even though both sessions are Active and
+    // live.
+    let report = tokio::time::timeout(
+        WAIT,
+        fleet.distributor.push(
+            &fleet.sessions,
+            &["node-a".to_string()],
+            vec![cert_bundle("cert-1"), cert_bundle("cert-2")],
+        ),
+    )
+    .await
+    .expect("a push round must finish inside the test budget");
+
+    assert_eq!(report.targets, vec!["node-a".to_string()]);
+    assert_eq!(report.installed, vec![("node-a".to_string(), 2)]);
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(
+        wanted.installed_ids(),
+        vec!["cert-1".to_string(), "cert-2".to_string()]
+    );
+    assert_eq!(
+        unwanted.cert_pushes.load(Ordering::SeqCst),
+        0,
+        "need-to-know: a live session that was not resolved as a recipient sees no key material"
+    );
+    // The keys travelled on their own path: nothing about the
+    // configuration generation moved (AC #7).
+    assert_eq!(fleet.advertised(), ConfigVersion::default());
+    assert_eq!(count(&wanted.prepares), 0);
+    assert_eq!(a.stats().protocol_violations.load(Ordering::Relaxed), 0);
+
+    a.shutdown();
+    b.shutdown();
+    fleet.handle.shutdown();
+}
+
+#[tokio::test]
+async fn a_follower_pull_is_answered_with_what_the_control_plane_resolves() {
+    install_ring();
+    let pki = control_plane_pki();
+    let node = issue_node(&pki, "node-a");
+    let fleet = spawn_control_plane(&pki, &[&node]).await;
+
+    // The follower asks for two certificates; the control plane
+    // resolves entitlement itself and hands back only one. A shorter
+    // answer is the normal case, not an error (D3).
+    *fleet.hooks.certs_available.lock().expect("lock") = vec![cert_bundle("cert-1")];
+    fleet.publish(payload(5));
+    *fleet.hooks.available.lock().expect("lock") = Some(payload(5));
+
+    let follower = TestFollower::new_with(
+        false,
+        false,
+        PushBehaviour {
+            wants: vec!["cert-1".to_string(), "cert-2".to_string()],
+            ..PushBehaviour::default()
+        },
+    );
+    let dialer = spawn_follower(
+        &pki,
+        &node,
+        fleet.addr,
+        Arc::clone(&follower),
+        Duration::from_millis(200),
+    );
+
+    eventually("the certificate pull to be served", || {
+        fleet.hooks.cert_pulls.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    eventually("the follower to hold the bundle", || {
+        !follower.pulled_certs.lock().expect("lock").is_empty()
+    })
+    .await;
+    let pulled = follower.pulled_certs.lock().expect("lock").clone();
+    assert_eq!(pulled[0], cert_bundle("cert-1"));
+    assert_eq!(
+        *fleet.hooks.cert_pull_ids.lock().expect("lock"),
+        vec!["cert-1".to_string(), "cert-2".to_string()],
+        "the ids the follower named reach the handler verbatim, as a request and not as a grant"
+    );
+    assert_eq!(fleet.stats.cert_pull_refusals.load(Ordering::Relaxed), 0);
+    assert!(fleet.stats.cert_pulls_served.load(Ordering::Relaxed) >= 1);
+    assert_eq!(
+        dialer.stats().protocol_violations.load(Ordering::Relaxed),
+        0
+    );
+
+    dialer.shutdown();
+    fleet.handle.shutdown();
+}
+
+#[tokio::test]
+async fn a_pending_node_is_refused_a_certificate_pull() {
+    install_ring();
+    let pki = control_plane_pki();
+    let node = issue_node(&pki, "node-a");
+    // Enrolled, session admitted, but no operator has activated it.
+    let fleet = spawn_control_plane_with_state(&pki, &[&node], NodeState::Pending).await;
+
+    *fleet.hooks.certs_available.lock().expect("lock") = vec![cert_bundle("cert-1")];
+    fleet.publish(payload(4));
+
+    let follower = TestFollower::new_with(
+        false,
+        false,
+        PushBehaviour {
+            wants: vec!["cert-1".to_string()],
+            ..PushBehaviour::default()
+        },
+    );
+    let dialer = spawn_follower(
+        &pki,
+        &node,
+        fleet.addr,
+        Arc::clone(&follower),
+        Duration::from_millis(200),
+    );
+
+    eventually("the certificate pull to be refused", || {
+        fleet.stats.cert_pull_refusals.load(Ordering::Relaxed) >= 1
+    })
+    .await;
+    assert_eq!(
+        fleet.hooks.cert_pulls.load(Ordering::SeqCst),
+        0,
+        "a pending node's pull must not reach the handler that reads private keys"
+    );
+    assert_eq!(fleet.stats.cert_pulls_served.load(Ordering::Relaxed), 0);
+    assert!(
+        follower.pulled_certs.lock().expect("lock").is_empty(),
+        "no key material reaches a node awaiting activation"
+    );
+    // Refused, not disconnected: an unactivated node stays visible.
+    assert_eq!(
+        dialer.stats().protocol_violations.load(Ordering::Relaxed),
+        0
+    );
+
+    dialer.shutdown();
+    fleet.handle.shutdown();
+}
+
+#[tokio::test]
+async fn a_follower_pushing_certificates_upwards_loses_its_session() {
+    install_ring();
+    let pki = control_plane_pki();
+    let node = issue_node(&pki, "node-a");
+    let fleet = spawn_control_plane(&pki, &[&node]).await;
+
+    // Generation 5 is advertised, so the dialer tells the follower it
+    // is behind and the scripted follower takes that as its cue to
+    // offer key material to its control plane.
+    fleet.publish(payload(5));
+
+    let follower = TestFollower::new_with(
+        false,
+        false,
+        PushBehaviour {
+            push_upward: true,
+            ..PushBehaviour::default()
+        },
+    );
+    let dialer = spawn_follower(
+        &pki,
+        &node,
+        fleet.addr,
+        Arc::clone(&follower),
+        Duration::from_millis(200),
+    );
+
+    eventually("the control plane to record the violation", || {
+        fleet.stats.protocol_violations.load(Ordering::Relaxed) >= 1
+    })
+    .await;
+    assert_eq!(
+        fleet.hooks.cert_pulls.load(Ordering::SeqCst),
+        0,
+        "a push travelling upwards must never be served as anything"
+    );
+
+    dialer.shutdown();
+    fleet.handle.shutdown();
+}
+
+#[tokio::test]
+async fn a_node_that_will_not_take_the_token_is_reported_while_the_others_are_delivered() {
+    install_ring();
+    let pki = control_plane_pki();
+    let good_node = issue_node(&pki, "node-a");
+    let bad_node = issue_node(&pki, "node-b");
+    let fleet = spawn_control_plane(&pki, &[&good_node, &bad_node]).await;
+
+    let good = TestFollower::new(false, false);
+    let bad = TestFollower::new_with(
+        false,
+        false,
+        PushBehaviour {
+            refuse_challenge: true,
+            ..PushBehaviour::default()
+        },
+    );
+    let good_dialer = spawn_follower(&pki, &good_node, fleet.addr, Arc::clone(&good), QUIET);
+    let bad_dialer = spawn_follower(&pki, &bad_node, fleet.addr, Arc::clone(&bad), QUIET);
+    eventually("both followers to register", || {
+        fleet.sessions.is_connected("node-a") && fleet.sessions.is_connected("node-b")
+    })
+    .await;
+
+    let recipients = vec!["node-a".to_string(), "node-b".to_string()];
+    let report = tokio::time::timeout(
+        WAIT,
+        fleet.challenges.publish(
+            &fleet.sessions,
+            &recipients,
+            IDENTIFIER,
+            TOKEN,
+            KEY_AUTH,
+        ),
+    )
+    .await
+    .expect("a challenge fan-out must finish inside the test budget");
+
+    // The transport reports both halves and decides nothing. This is
+    // what lets the solver refuse the order instead of telling the
+    // authority to validate against a node serving nothing.
+    assert_eq!(report.delivered, vec!["node-a".to_string()]);
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(report.failed[0].0, "node-b");
+    assert!(!report.is_complete());
+
+    assert_eq!(
+        *good.served.lock().expect("lock"),
+        vec![(
+            IDENTIFIER.to_string(),
+            TOKEN.to_string(),
+            KEY_AUTH.to_string()
+        )]
+    );
+    assert!(bad.served.lock().expect("lock").is_empty());
+    assert_eq!(count(&bad.challenge_publishes), 1, "it was asked, and it refused");
+    // A refusal is not a protocol violation: the session stays up so
+    // the order can be retried once the node is fixed.
+    assert_eq!(fleet.stats.protocol_violations.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        good_dialer.stats().protocol_violations.load(Ordering::Relaxed),
+        0
+    );
+
+    // Retraction is best effort and silent, and it reaches the node
+    // that refused as readily as the one that took it.
+    tokio::time::timeout(
+        WAIT,
+        fleet
+            .challenges
+            .retract(&fleet.sessions, &recipients, TOKEN),
+    )
+    .await
+    .expect("a retraction must finish inside the test budget");
+    eventually("both followers to be retracted", || {
+        count(&good.challenge_retractions) == 1 && count(&bad.challenge_retractions) == 1
+    })
+    .await;
+    assert!(good.served.lock().expect("lock").is_empty());
+
+    good_dialer.shutdown();
+    bad_dialer.shutdown();
     fleet.handle.shutdown();
 }
 

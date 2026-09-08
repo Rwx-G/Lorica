@@ -33,6 +33,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
+use crate::certs::CertBundle;
 use crate::dialer::{resolve_and_connect, split_host_port};
 use crate::messages::{
     cluster_frame, cluster_request, cluster_response, ClusterFrame, ClusterRequest,
@@ -192,6 +193,24 @@ pub trait SessionHandler: Send + Sync + 'static {
         node_id: &str,
         applied: AppliedConfig,
     ) -> BoxFuture<'_, Result<Option<ConfigPayload>, String>>;
+
+    /// A follower asks for keys it lacks (Story 9.5 AC #8).
+    ///
+    /// The implementation resolves entitlement itself, from the
+    /// certificate hostname through the routes bound to it and their
+    /// `node_selector` to a `node_id` (D3); `cert_ids` is peer-supplied
+    /// and must NEVER be trusted as an authorization input. Answering
+    /// with fewer bundles than were asked for, or none, is the normal
+    /// case and not an error.
+    ///
+    /// `Err` is a local failure (the material could not be read or
+    /// decrypted) and is answered with the opaque refusal, session
+    /// kept.
+    fn on_cert_pull(
+        &self,
+        node_id: &str,
+        cert_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<Vec<CertBundle>, String>>;
 }
 
 /// A session handler that records nothing and refuses renewals and
@@ -239,6 +258,16 @@ impl SessionHandler for NoopSessionHandler {
         // No configuration source: the follower is told it is already
         // up to date rather than being handed an empty generation.
         Box::pin(async { Ok(None) })
+    }
+
+    fn on_cert_pull(
+        &self,
+        _node_id: &str,
+        _cert_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<Vec<CertBundle>, String>> {
+        // No certificate source: the node is entitled to nothing here,
+        // which is a valid answer rather than a failure.
+        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

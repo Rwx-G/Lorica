@@ -338,6 +338,155 @@ pub struct ConfigPullAck {
     pub up_to_date: bool,
 }
 
+/// One certificate's material as it travels on the wire (Story 9.5
+/// AC #7).
+///
+/// The in-crate twin is [`crate::certs::CertBundle`], exactly as
+/// [`ConfigPrepare`] is the wire twin of
+/// [`crate::replication::ConfigPayload`]: peer-supplied strings are
+/// bounded once, at the bridge, and only the validated form travels
+/// further in.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct CertMaterial {
+    /// The certificate's stable id (its `certificates.id`).
+    #[prost(string, tag = "1")]
+    pub cert_id: ::prost::alloc::string::String,
+    /// The primary hostname the certificate binds to. Display and
+    /// diagnostics only; never an authorization input.
+    #[prost(string, tag = "2")]
+    pub domain: ::prost::alloc::string::String,
+    /// PEM leaf plus chain.
+    #[prost(string, tag = "3")]
+    pub cert_pem: ::prost::alloc::string::String,
+    /// PEM private key, in the clear INSIDE the mutual-TLS channel
+    /// (Story 9.5 D5: that channel is the confidentiality boundary,
+    /// because no per-node public key exists to wrap a key to). Never
+    /// logged, never echoed in a refusal reason.
+    #[prost(string, tag = "4")]
+    pub key_pem: ::prost::alloc::string::String,
+    /// `sha256:<lowercase hex>` of `key_pem`, the same shape the
+    /// canonical blob carries, so a follower can verify what arrived
+    /// matches what the configuration announced before writing it.
+    #[prost(string, tag = "5")]
+    pub key_digest: ::prost::alloc::string::String,
+}
+
+/// Certificate distribution (Story 9.5 AC #7), control plane to
+/// follower: install this material now, independently of any
+/// configuration commit.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct CertPush {
+    /// The batch, at most [`crate::certs::MAX_CERT_BUNDLES`] entries.
+    #[prost(message, repeated, tag = "1")]
+    pub bundles: ::prost::alloc::vec::Vec<CertMaterial>,
+}
+
+/// One certificate a follower would not or could not install.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct CertRefusal {
+    /// The certificate that was refused.
+    #[prost(string, tag = "1")]
+    pub cert_id: ::prost::alloc::string::String,
+    /// Why, without echoing key material; bounded by
+    /// [`crate::replication::safe_reason`] before it reaches a report.
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+
+/// What a follower did with a [`CertPush`].
+///
+/// A push is best effort by Story 9.5 D2: a refusal here is recorded
+/// and logged, never fatal, and the follower converges on the pull
+/// path instead.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct CertPushAck {
+    /// Certificate ids now installed with a usable key.
+    #[prost(string, repeated, tag = "1")]
+    pub installed: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Certificates refused or failed.
+    #[prost(message, repeated, tag = "2")]
+    pub refused: ::prost::alloc::vec::Vec<CertRefusal>,
+}
+
+/// Certificate convergence pull (Story 9.5 AC #8), follower to control
+/// plane: "I count these certificates as missing a usable key".
+///
+/// The list is peer-supplied and is a REQUEST, never an authorization
+/// input: the control plane resolves entitlement itself and may answer
+/// with fewer bundles than were asked for, or none.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct CertPull {
+    /// The ids the follower lacks, at most
+    /// [`crate::certs::MAX_CERT_PULL_IDS`] entries.
+    #[prost(string, repeated, tag = "1")]
+    pub cert_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+
+/// Answer to a [`CertPull`]: the subset the node is entitled to.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct CertPullAck {
+    /// The material, at most [`crate::certs::MAX_CERT_BUNDLES`]
+    /// entries.
+    #[prost(message, repeated, tag = "1")]
+    pub bundles: ::prost::alloc::vec::Vec<CertMaterial>,
+}
+
+/// An HTTP-01 challenge token to serve (Story 9.5 AC #6), control
+/// plane to follower.
+///
+/// # There is deliberately NO expiry field, and adding one is a bug
+///
+/// The follower stamps its own deadline from its OWN clock when it
+/// writes the entry. An expiry on the wire would be a timestamp taken
+/// on the control plane's clock and evaluated on the follower's: a
+/// skew either way produces a token that is already expired the moment
+/// it arrives, or one that outlives the validation window on a node
+/// nobody is looking at. Neither failure is visible at the point it is
+/// caused. A duration would have the same problem in transit. The
+/// window is short and identical on every node, so the node that owns
+/// the clock owns the deadline.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ChallengePublish {
+    /// The per-SAN hostname being validated, NOT the order's primary
+    /// domain: node selection is per hostname.
+    #[prost(string, tag = "1")]
+    pub identifier: ::prost::alloc::string::String,
+    /// The challenge token, base64url (RFC 8555 section 8.3). It
+    /// becomes the last path segment of
+    /// `/.well-known/acme-challenge/<token>`, which is why its
+    /// alphabet is checked and not merely its length.
+    #[prost(string, tag = "2")]
+    pub token: ::prost::alloc::string::String,
+    /// The key authorization the node serves for that token: the token
+    /// joined to the account key's JWK thumbprint.
+    #[prost(string, tag = "3")]
+    pub key_authorization: ::prost::alloc::string::String,
+}
+
+/// The follower is serving the token. An error is a REFUSAL status,
+/// not a field: the caller aborts the order on anything but this
+/// acknowledgement.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ChallengePublishAck {}
+
+/// Stop serving a token (Story 9.5 AC #6), control plane to follower.
+///
+/// The token alone identifies the entry; the follower needs neither
+/// the identifier nor the key authorization to delete it, and sending
+/// them again would put a second copy of the key authorization on the
+/// wire for no gain.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ChallengeRetract {
+    /// The token to stop serving.
+    #[prost(string, tag = "1")]
+    pub token: ::prost::alloc::string::String,
+}
+
+/// Retraction acknowledged. Retraction is best effort by contract: the
+/// entry's own deadline removes it on a node that never answered.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ChallengeRetractAck {}
+
 /// `body_kind` value of a [`Hello`] request (its oneof tag).
 pub const BODY_KIND_HELLO: u32 = 10;
 /// `body_kind` value of a [`Heartbeat`] request (its oneof tag).
@@ -356,6 +505,14 @@ pub const BODY_KIND_CONFIG_COMMIT: u32 = 21;
 pub const BODY_KIND_CONFIG_ABORT: u32 = 22;
 /// `body_kind` value of a [`ConfigPull`] request (its oneof tag).
 pub const BODY_KIND_CONFIG_PULL: u32 = 23;
+/// `body_kind` value of a [`CertPush`] request (its oneof tag).
+pub const BODY_KIND_CERT_PUSH: u32 = 60;
+/// `body_kind` value of a [`CertPull`] request (its oneof tag).
+pub const BODY_KIND_CERT_PULL: u32 = 61;
+/// `body_kind` value of a [`ChallengePublish`] request (its oneof tag).
+pub const BODY_KIND_CHALLENGE_PUBLISH: u32 = 62;
+/// `body_kind` value of a [`ChallengeRetract`] request (its oneof tag).
+pub const BODY_KIND_CHALLENGE_RETRACT: u32 = 63;
 
 /// Longest configuration hash any message may carry: a SHA-256 in
 /// lowercase hex.
@@ -373,13 +530,106 @@ pub fn config_hash_is_valid(hash: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Prefix every key digest carries, matching what the canonical blob
+/// writes in place of a secret.
+pub const CERT_DIGEST_PREFIX: &str = "sha256:";
+
+/// Longest certificate id any message may carry. Ids are UUIDs (36
+/// characters); the margin covers a future scheme without letting a
+/// peer name a certificate with a paragraph.
+pub const MAX_CERT_ID_BYTES: usize = 64;
+
+/// Longest hostname a certificate bundle may announce: the DNS limit.
+pub const MAX_CERT_DOMAIN_BYTES: usize = 253;
+
+/// Whether a peer-supplied key digest has the shape the canonical blob
+/// uses: [`CERT_DIGEST_PREFIX`] followed by exactly
+/// [`MAX_CONFIG_HASH_BYTES`] lowercase hexadecimal characters.
+///
+/// Unlike [`config_hash_is_valid`] the empty string is NOT valid: a
+/// bundle with no digest cannot be checked against the configuration
+/// that announced it, which is the whole point of carrying one.
+pub fn cert_digest_is_valid(digest: &str) -> bool {
+    match digest.strip_prefix(CERT_DIGEST_PREFIX) {
+        Some(hex) => hex.len() == MAX_CONFIG_HASH_BYTES && config_hash_is_valid(hex),
+        None => false,
+    }
+}
+
+/// Whether a peer-supplied certificate id is acceptable: non-empty, at
+/// most [`MAX_CERT_ID_BYTES`], no control characters. The id reaches a
+/// log line, a report and a store lookup.
+pub fn cert_id_is_valid(cert_id: &str) -> bool {
+    !cert_id.is_empty()
+        && cert_id.len() <= MAX_CERT_ID_BYTES
+        && !cert_id.chars().any(char::is_control)
+}
+
+/// Whether a peer-supplied certificate hostname is acceptable:
+/// non-empty, at most [`MAX_CERT_DOMAIN_BYTES`], no control
+/// characters.
+pub fn cert_domain_is_valid(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= MAX_CERT_DOMAIN_BYTES
+        && !domain.chars().any(char::is_control)
+}
+
+/// Longest HTTP-01 challenge token any message may carry. A real one
+/// is base64url of at least 128 bits of entropy, so around 43
+/// characters; the cap is generous enough to survive a CA that uses
+/// more entropy and finite enough that a peer cannot name a token with
+/// a paragraph.
+pub const MAX_CHALLENGE_TOKEN_BYTES: usize = 128;
+
+/// Longest key authorization any message may carry. It is the token
+/// joined to a base64url JWK thumbprint, so a little over twice a
+/// token; the cap keeps the same generous margin.
+pub const MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES: usize = 256;
+
+/// Whether `b` is in the base64url alphabet (RFC 4648 section 5, the
+/// unpadded form ACME uses).
+fn is_base64url(b: u8) -> bool {
+    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_')
+}
+
+/// Whether a peer-supplied challenge token is acceptable: non-empty,
+/// at most [`MAX_CHALLENGE_TOKEN_BYTES`], base64url alphabet only.
+///
+/// The alphabet is checked rather than just the control characters,
+/// and it is the stricter rule on purpose. RFC 8555 section 8.3 makes
+/// base64url normative, and the token becomes the last path segment of
+/// `/.well-known/acme-challenge/<token>` and a primary key in the
+/// challenge table. A token carrying `/` or `.` is a path-traversal
+/// shape reaching a filesystem-adjacent name, and no legitimate CA
+/// produces one.
+pub fn challenge_token_is_valid(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_CHALLENGE_TOKEN_BYTES
+        && token.bytes().all(is_base64url)
+}
+
+/// Whether a peer-supplied key authorization is acceptable: non-empty,
+/// at most [`MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES`], base64url
+/// alphabet plus the `.` that joins the token to the thumbprint.
+///
+/// The value is served verbatim as an HTTP response body, so the same
+/// argument as [`challenge_token_is_valid`] applies: what a node will
+/// hand to an unauthenticated caller is bounded here or nowhere.
+pub fn challenge_key_authorization_is_valid(key_authorization: &str) -> bool {
+    !key_authorization.is_empty()
+        && key_authorization.len() <= MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES
+        && key_authorization
+            .bytes()
+            .all(|b| is_base64url(b) || b == b'.')
+}
+
 /// A request from either side of the cluster plane.
 ///
 /// Body tags: 10-19 session control (Story 9.2) and lifecycle
 /// (Story 9.3), 20-39 configuration replication (Story 9.4: 20-23 in
 /// use, 24-39 reserved), 40-59 RESERVED for telemetry fan-in
-/// (Story 9.6), 60-79 RESERVED for certificate distribution
-/// (Story 9.5).
+/// (Story 9.6), 60-79 certificate distribution and HTTP-01 challenge
+/// fan-out (Story 9.5: 60-63 in use, 64-79 reserved).
 ///
 /// `body_kind` duplicates the body's oneof tag as a scalar so a
 /// receiver that does NOT know the body (an older build talking to a
@@ -410,7 +660,7 @@ pub struct ClusterRequest {
     /// Typed request body.
     #[prost(
         oneof = "cluster_request::Body",
-        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23"
+        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23, 60, 61, 62, 63"
     )]
     pub body: ::core::option::Option<cluster_request::Body>,
 }
@@ -418,8 +668,8 @@ pub struct ClusterRequest {
 /// Typed body variants for [`ClusterRequest`].
 pub mod cluster_request {
     use super::{
-        ConfigAbort, ConfigCommit, ConfigPrepare, ConfigPull, Enroll, Heartbeat, Hello, Leave,
-        Renew,
+        CertPull, CertPush, ChallengePublish, ChallengeRetract, ConfigAbort, ConfigCommit,
+        ConfigPrepare, ConfigPull, Enroll, Heartbeat, Hello, Leave, Renew,
     };
 
     /// Request payloads (see the tag-range note on `ClusterRequest`).
@@ -453,6 +703,25 @@ pub mod cluster_request {
         /// Convergence pull (follower to control plane).
         #[prost(message, tag = "23")]
         ConfigPull(ConfigPull),
+        /// Certificate material (control plane to follower,
+        /// Story 9.5). It travels DOWNWARDS only: a follower sending
+        /// one is pushing private keys at its control plane.
+        #[prost(message, tag = "60")]
+        CertPush(CertPush),
+        /// A follower asks for certificates it lacks (Story 9.5); the
+        /// mirror image, upwards only.
+        #[prost(message, tag = "61")]
+        CertPull(CertPull),
+        /// An HTTP-01 token to serve (control plane to follower,
+        /// Story 9.5). Downwards only: a follower that publishes a
+        /// challenge to its control plane is choosing what the fleet
+        /// answers a certificate authority.
+        #[prost(message, tag = "62")]
+        ChallengePublish(ChallengePublish),
+        /// Stop serving a token (control plane to follower); downwards
+        /// only for the same reason.
+        #[prost(message, tag = "63")]
+        ChallengeRetract(ChallengeRetract),
     }
 
     impl Body {
@@ -468,6 +737,10 @@ pub mod cluster_request {
                 Body::ConfigCommit(_) => super::BODY_KIND_CONFIG_COMMIT,
                 Body::ConfigAbort(_) => super::BODY_KIND_CONFIG_ABORT,
                 Body::ConfigPull(_) => super::BODY_KIND_CONFIG_PULL,
+                Body::CertPush(_) => super::BODY_KIND_CERT_PUSH,
+                Body::CertPull(_) => super::BODY_KIND_CERT_PULL,
+                Body::ChallengePublish(_) => super::BODY_KIND_CHALLENGE_PUBLISH,
+                Body::ChallengeRetract(_) => super::BODY_KIND_CHALLENGE_RETRACT,
             }
         }
     }
@@ -531,6 +804,30 @@ impl ClusterRequest {
         Self::with_body(cluster_request::Body::ConfigPull(pull))
     }
 
+    /// A certificate push (Story 9.5), control plane to follower.
+    pub fn cert_push(push: CertPush) -> Self {
+        Self::with_body(cluster_request::Body::CertPush(push))
+    }
+
+    /// A certificate pull (Story 9.5), follower to control plane.
+    pub fn cert_pull(pull: CertPull) -> Self {
+        Self::with_body(cluster_request::Body::CertPull(pull))
+    }
+
+    /// An HTTP-01 challenge publication (Story 9.5), control plane to
+    /// follower.
+    pub fn challenge_publish(publish: ChallengePublish) -> Self {
+        Self::with_body(cluster_request::Body::ChallengePublish(publish))
+    }
+
+    /// An HTTP-01 challenge retraction (Story 9.5), control plane to
+    /// follower.
+    pub fn challenge_retract(token: &str) -> Self {
+        Self::with_body(cluster_request::Body::ChallengeRetract(ChallengeRetract {
+            token: token.to_string(),
+        }))
+    }
+
     /// Whether `body_kind` names a method THIS build implements.
     pub fn is_known_body_kind(body_kind: u32) -> bool {
         matches!(
@@ -544,6 +841,10 @@ impl ClusterRequest {
                 | BODY_KIND_CONFIG_COMMIT
                 | BODY_KIND_CONFIG_ABORT
                 | BODY_KIND_CONFIG_PULL
+                | BODY_KIND_CERT_PUSH
+                | BODY_KIND_CERT_PULL
+                | BODY_KIND_CHALLENGE_PUBLISH
+                | BODY_KIND_CHALLENGE_RETRACT
         )
     }
 
@@ -574,7 +875,7 @@ pub struct ClusterResponse {
     /// Typed response body; `None` on refusals.
     #[prost(
         oneof = "cluster_response::Body",
-        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23"
+        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23, 60, 61, 62, 63"
     )]
     pub body: ::core::option::Option<cluster_response::Body>,
 }
@@ -582,8 +883,9 @@ pub struct ClusterResponse {
 /// Typed body variants for [`ClusterResponse`].
 pub mod cluster_response {
     use super::{
-        ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, ConfigPullAck, EnrollAck, HeartbeatAck,
-        HelloAck, LeaveAck, RenewAck,
+        CertPullAck, CertPushAck, ChallengePublishAck, ChallengeRetractAck, ConfigAbortAck,
+        ConfigCommitAck, ConfigPrepareAck, ConfigPullAck, EnrollAck, HeartbeatAck, HelloAck,
+        LeaveAck, RenewAck,
     };
 
     /// Response payloads (tag ranges mirror `cluster_request::Body`).
@@ -616,6 +918,18 @@ pub mod cluster_response {
         /// Pull answer.
         #[prost(message, tag = "23")]
         ConfigPullAck(ConfigPullAck),
+        /// What the follower did with a pushed batch (Story 9.5).
+        #[prost(message, tag = "60")]
+        CertPushAck(CertPushAck),
+        /// The certificates a follower was entitled to (Story 9.5).
+        #[prost(message, tag = "61")]
+        CertPullAck(CertPullAck),
+        /// The follower is serving the token (Story 9.5).
+        #[prost(message, tag = "62")]
+        ChallengePublishAck(ChallengePublishAck),
+        /// The follower stopped serving the token (Story 9.5).
+        #[prost(message, tag = "63")]
+        ChallengeRetractAck(ChallengeRetractAck),
     }
 }
 
@@ -1084,6 +1398,186 @@ mod tests {
         assert_eq!(BODY_KIND_CONFIG_ABORT, tag("ClusterRequest", "config_abort"));
         assert_eq!(BODY_KIND_CONFIG_PULL, tag("ClusterRequest", "config_pull"));
 
+        // Story 9.5 certificate-distribution bodies.
+        assert_eq!(
+            field_numbers(
+                &CertMaterial {
+                    cert_id: "c".to_string(),
+                    domain: "d".to_string(),
+                    cert_pem: "p".to_string(),
+                    key_pem: "k".to_string(),
+                    key_digest: "s".to_string(),
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("CertMaterial", "cert_id"),
+                tag("CertMaterial", "domain"),
+                tag("CertMaterial", "cert_pem"),
+                tag("CertMaterial", "key_pem"),
+                tag("CertMaterial", "key_digest"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(
+                &CertPush {
+                    bundles: vec![CertMaterial::default()],
+                }
+                .encode_to_vec()
+            ),
+            vec![tag("CertPush", "bundles")]
+        );
+        assert_eq!(
+            field_numbers(
+                &CertRefusal {
+                    cert_id: "c".to_string(),
+                    reason: "r".to_string(),
+                }
+                .encode_to_vec()
+            ),
+            vec![tag("CertRefusal", "cert_id"), tag("CertRefusal", "reason")]
+        );
+        assert_eq!(
+            field_numbers(
+                &CertPushAck {
+                    installed: vec!["c".to_string()],
+                    refused: vec![CertRefusal::default()],
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("CertPushAck", "installed"),
+                tag("CertPushAck", "refused"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(
+                &CertPull {
+                    cert_ids: vec!["c".to_string()],
+                }
+                .encode_to_vec()
+            ),
+            vec![tag("CertPull", "cert_ids")]
+        );
+        assert_eq!(
+            field_numbers(
+                &CertPullAck {
+                    bundles: vec![CertMaterial::default()],
+                }
+                .encode_to_vec()
+            ),
+            vec![tag("CertPullAck", "bundles")]
+        );
+        for (request, block_field) in [
+            (ClusterRequest::cert_push(CertPush::default()), "cert_push"),
+            (ClusterRequest::cert_pull(CertPull::default()), "cert_pull"),
+        ] {
+            let mut request = request;
+            request.sequence = 1;
+            assert_eq!(
+                *field_numbers(&request.encode_to_vec()).last().expect("body"),
+                tag("ClusterRequest", block_field),
+                "{block_field}"
+            );
+            assert_eq!(request.body_kind, tag("ClusterRequest", block_field));
+        }
+        for (body, block_field) in [
+            (
+                cluster_response::Body::CertPushAck(CertPushAck::default()),
+                "cert_push_ack",
+            ),
+            (
+                cluster_response::Body::CertPullAck(CertPullAck::default()),
+                "cert_pull_ack",
+            ),
+        ] {
+            let response = ClusterResponse::ok(body);
+            assert_eq!(
+                *field_numbers(&response.encode_to_vec()).last().expect("body"),
+                tag("ClusterResponse", block_field),
+                "{block_field}"
+            );
+        }
+        assert_eq!(BODY_KIND_CERT_PUSH, tag("ClusterRequest", "cert_push"));
+        assert_eq!(BODY_KIND_CERT_PULL, tag("ClusterRequest", "cert_pull"));
+
+        // Story 9.5 HTTP-01 challenge fan-out.
+        assert_eq!(
+            field_numbers(
+                &ChallengePublish {
+                    identifier: "d".to_string(),
+                    token: "t".to_string(),
+                    key_authorization: "k".to_string(),
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("ChallengePublish", "identifier"),
+                tag("ChallengePublish", "token"),
+                tag("ChallengePublish", "key_authorization"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(
+                &ChallengeRetract {
+                    token: "t".to_string(),
+                }
+                .encode_to_vec()
+            ),
+            vec![tag("ChallengeRetract", "token")]
+        );
+        for (request, block_field) in [
+            (
+                ClusterRequest::challenge_publish(ChallengePublish::default()),
+                "challenge_publish",
+            ),
+            (ClusterRequest::challenge_retract("t"), "challenge_retract"),
+        ] {
+            let mut request = request;
+            request.sequence = 1;
+            assert_eq!(
+                *field_numbers(&request.encode_to_vec()).last().expect("body"),
+                tag("ClusterRequest", block_field),
+                "{block_field}"
+            );
+            assert_eq!(request.body_kind, tag("ClusterRequest", block_field));
+        }
+        for (body, block_field) in [
+            (
+                cluster_response::Body::ChallengePublishAck(ChallengePublishAck {}),
+                "challenge_publish_ack",
+            ),
+            (
+                cluster_response::Body::ChallengeRetractAck(ChallengeRetractAck {}),
+                "challenge_retract_ack",
+            ),
+        ] {
+            let response = ClusterResponse::ok(body);
+            assert_eq!(
+                *field_numbers(&response.encode_to_vec()).last().expect("body"),
+                tag("ClusterResponse", block_field),
+                "{block_field}"
+            );
+        }
+        assert_eq!(
+            BODY_KIND_CHALLENGE_PUBLISH,
+            tag("ClusterRequest", "challenge_publish")
+        );
+        assert_eq!(
+            BODY_KIND_CHALLENGE_RETRACT,
+            tag("ClusterRequest", "challenge_retract")
+        );
+        // The absence that matters: no expiry, no ttl, no deadline
+        // anywhere on the challenge messages. The follower stamps its
+        // own from its own clock, and a field here would be a
+        // cross-clock timestamp nobody can evaluate correctly.
+        for forbidden in ["expiry", "expires_at", "ttl_s", "deadline"] {
+            assert!(
+                !tags.contains_key(&("ChallengePublish".to_string(), forbidden.to_string())),
+                "ChallengePublish must not carry {forbidden}"
+            );
+        }
+
         let mut request = ClusterRequest::hello(Hello::default());
         request.sequence = 1;
         assert_eq!(
@@ -1185,8 +1679,9 @@ mod tests {
         forged.body_kind = BODY_KIND_HELLO;
         assert!(!forged.body_kind_matches());
         // Reserved ranges are unknown to this build. 20-23 are Story
-        // 9.4's and now known; 24-39 stay reserved.
-        for kind in [0, 15, 19, 24, 39, 40, 59, 60, 79] {
+        // 9.4's and 60-63 Story 9.5's, both now known; 24-39, 40-59 and
+        // 64-79 stay reserved.
+        for kind in [0, 15, 19, 24, 39, 40, 59, 64, 79] {
             assert!(!ClusterRequest::is_known_body_kind(kind), "{kind}");
         }
         for kind in [
@@ -1197,6 +1692,10 @@ mod tests {
             BODY_KIND_CONFIG_COMMIT,
             BODY_KIND_CONFIG_ABORT,
             BODY_KIND_CONFIG_PULL,
+            BODY_KIND_CERT_PUSH,
+            BODY_KIND_CERT_PULL,
+            BODY_KIND_CHALLENGE_PUBLISH,
+            BODY_KIND_CHALLENGE_RETRACT,
         ] {
             assert!(ClusterRequest::is_known_body_kind(kind), "{kind}");
         }
@@ -1213,5 +1712,69 @@ mod tests {
         assert!(!config_hash_is_valid("ABCDEF"));
         assert!(!config_hash_is_valid("zz"));
         assert!(!config_hash_is_valid("ab cd"));
+    }
+
+    #[test]
+    fn a_key_digest_is_checked_against_the_canonical_blob_shape() {
+        let hex = "a".repeat(MAX_CONFIG_HASH_BYTES);
+        assert!(cert_digest_is_valid(&format!("sha256:{hex}")));
+        // Missing prefix, wrong prefix, short or long hex, uppercase,
+        // and the empty string: all refused before the value can be
+        // compared against what the configuration announced.
+        assert!(!cert_digest_is_valid(""));
+        assert!(!cert_digest_is_valid(&hex));
+        assert!(!cert_digest_is_valid(&format!("sha512:{hex}")));
+        assert!(!cert_digest_is_valid("sha256:"));
+        assert!(!cert_digest_is_valid(&format!("sha256:{}", "a".repeat(63))));
+        assert!(!cert_digest_is_valid(&format!("sha256:{}", "a".repeat(65))));
+        assert!(!cert_digest_is_valid(&format!(
+            "sha256:{}",
+            "A".repeat(MAX_CONFIG_HASH_BYTES)
+        )));
+    }
+
+    #[test]
+    fn a_certificate_id_and_domain_are_bounded_at_the_decode_boundary() {
+        assert!(cert_id_is_valid("3f1b0d2e-0000-4000-8000-000000000001"));
+        assert!(!cert_id_is_valid(""));
+        assert!(!cert_id_is_valid(&"c".repeat(MAX_CERT_ID_BYTES + 1)));
+        assert!(!cert_id_is_valid("forged\nlog line"));
+        assert!(cert_domain_is_valid("edge.example.com"));
+        assert!(!cert_domain_is_valid(""));
+        assert!(!cert_domain_is_valid(&"d".repeat(MAX_CERT_DOMAIN_BYTES + 1)));
+        assert!(!cert_domain_is_valid("edge.example.com\r\n"));
+    }
+
+    #[test]
+    fn a_challenge_token_is_held_to_the_alphabet_the_rfc_makes_normative() {
+        assert!(challenge_token_is_valid("LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"));
+        assert!(challenge_token_is_valid(&"a".repeat(MAX_CHALLENGE_TOKEN_BYTES)));
+        assert!(!challenge_token_is_valid(""));
+        assert!(!challenge_token_is_valid(
+            &"a".repeat(MAX_CHALLENGE_TOKEN_BYTES + 1)
+        ));
+        // The reason the alphabet is checked and not just the control
+        // characters: the token is the last path segment of
+        // /.well-known/acme-challenge/<token>.
+        assert!(!challenge_token_is_valid("../../etc/passwd"));
+        assert!(!challenge_token_is_valid("tok/en"));
+        assert!(!challenge_token_is_valid("tok.en"));
+        assert!(!challenge_token_is_valid("tok en"));
+        assert!(!challenge_token_is_valid("tok\nen"));
+    }
+
+    #[test]
+    fn a_key_authorization_is_bounded_because_a_node_serves_it_verbatim() {
+        assert!(challenge_key_authorization_is_valid("token.thumbprint-_9"));
+        assert!(challenge_key_authorization_is_valid(
+            &"a".repeat(MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES)
+        ));
+        assert!(!challenge_key_authorization_is_valid(""));
+        assert!(!challenge_key_authorization_is_valid(
+            &"a".repeat(MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES + 1)
+        ));
+        assert!(!challenge_key_authorization_is_valid("token thumbprint"));
+        assert!(!challenge_key_authorization_is_valid("token\r\nInjected: 1"));
+        assert!(!challenge_key_authorization_is_valid("<script>"));
     }
 }

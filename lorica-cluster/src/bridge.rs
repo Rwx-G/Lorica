@@ -34,6 +34,20 @@
 //!   to the control plane is trying to push configuration UPWARDS and
 //!   is a violation; a control plane that sends a `Renew` or a
 //!   `ConfigPull` DOWNWARDS is equally out of role.
+//! - Story 9.5 adds a second directed pair on the same principle, and
+//!   it is the one where direction matters most: `CertPush` carries
+//!   PRIVATE KEYS downwards, so a follower sending one is offering key
+//!   material to its control plane and is a violation; `CertPull` goes
+//!   upwards only, so a control plane sending one is out of role. Both
+//!   are validated here, at the decode boundary, against the single
+//!   [`cert_bundle_defect`] rule.
+//! - Story 9.5 also adds the HTTP-01 challenge pair,
+//!   `ChallengePublish` and `ChallengeRetract`, both downwards only. A
+//!   follower that publishes a challenge to its control plane is
+//!   choosing what the fleet answers a certificate authority, which is
+//!   a violation for the same reason a follower may not push
+//!   configuration. They are validated against the single
+//!   [`challenge_defect`] rule.
 //! - Nothing here ever passes a peer-supplied `CommandType` (or any
 //!   other worker-plane value) through to `lorica-command`. A future
 //!   entry that needs a worker-plane effect must CONSTRUCT the worker
@@ -49,7 +63,12 @@
 //!   a [`BridgeOutcome::ProtocolViolation`]: the caller drops the
 //!   connection and increments its violation counter.
 
-use crate::messages::{cluster_request, config_hash_is_valid, ClusterRequest};
+use crate::certs::{cert_bundle_defect, CertBundle, MAX_CERT_BUNDLES, MAX_CERT_PULL_IDS};
+use crate::challenge::challenge_defect;
+use crate::messages::{
+    cert_id_is_valid, challenge_token_is_valid, cluster_request, config_hash_is_valid,
+    ClusterRequest,
+};
 use crate::replication::{AppliedConfig, ConfigPayload};
 
 /// The in-plane actions the control-plane whitelist admits (Story 9.2
@@ -79,6 +98,14 @@ pub enum InPlaneAction {
     },
     /// The node is leaving the fleet (Story 9.3 AC #13).
     Leave,
+    /// The follower asks for certificate material it counted as
+    /// missing (Story 9.5 AC #8).
+    CertPull {
+        /// The ids the follower named. A REQUEST, never an
+        /// authorization input: the control plane resolves entitlement
+        /// itself and may answer with fewer bundles, or none.
+        cert_ids: Vec<String>,
+    },
 }
 
 /// Outcome of routing one inbound cluster request through the
@@ -99,8 +126,9 @@ pub enum BridgeOutcome {
 }
 
 /// The actions a FOLLOWER accepts from its control plane (Story 9.4
-/// D5). All three are configuration pushes; nothing else exists in
-/// this direction.
+/// D5, Story 9.5 AC #6/#7): three configuration pushes, one
+/// certificate push, and the HTTP-01 challenge pair. Nothing else
+/// exists in this direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FollowerAction {
     /// Stage this generation without applying it.
@@ -114,6 +142,26 @@ pub enum FollowerAction {
     Abort {
         /// The staged generation to drop.
         generation: u64,
+    },
+    /// Install certificate material the control plane pushed
+    /// (Story 9.5 AC #7). Independent of any staged generation: it
+    /// applies immediately and does not participate in the two-phase
+    /// round.
+    InstallCerts(Vec<CertBundle>),
+    /// Serve an HTTP-01 challenge token so the certificate authority
+    /// can validate `identifier` against this node (Story 9.5 AC #6).
+    PublishChallenge {
+        /// The per-SAN hostname being validated.
+        identifier: String,
+        /// The challenge token, base64url.
+        token: String,
+        /// What the node answers for that token.
+        key_authorization: String,
+    },
+    /// Stop serving a token. The token alone identifies the entry.
+    RetractChallenge {
+        /// The token to stop serving.
+        token: String,
     },
 }
 
@@ -146,6 +194,12 @@ pub enum FollowerBridgeOutcome {
 /// "newer", and is a violation as well. A configuration PUSH
 /// (`ConfigPrepare` / `ConfigCommit` / `ConfigAbort`) arriving here is a
 /// follower trying to configure its control plane: a violation.
+///
+/// A certificate PUSH (`CertPush`) arriving here is a follower
+/// offering private keys to its control plane: a violation, and the
+/// direction that matters most on this plane (Story 9.5). A
+/// `ChallengePublish` or `ChallengeRetract` is the same class: a
+/// follower choosing what the fleet answers a certificate authority.
 ///
 /// [`Hello`]: crate::messages::Hello
 pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
@@ -189,6 +243,19 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
             public_key_der: renew.public_key_der.clone(),
         }),
         Some(cluster_request::Body::Leave(_)) => BridgeOutcome::InPlane(InPlaneAction::Leave),
+        Some(cluster_request::Body::CertPull(pull)) => {
+            // The list is peer-supplied: bound its length and every id
+            // in it here, or a follower could make the control plane
+            // allocate and log arbitrary strings just by asking.
+            if pull.cert_ids.len() > MAX_CERT_PULL_IDS
+                || !pull.cert_ids.iter().all(|id| cert_id_is_valid(id))
+            {
+                return BridgeOutcome::ProtocolViolation;
+            }
+            BridgeOutcome::InPlane(InPlaneAction::CertPull {
+                cert_ids: pull.cert_ids.clone(),
+            })
+        }
         // ---- Newer peer: known shape, unknown method. ----
         None if request.body_kind != 0
             && !ClusterRequest::is_known_body_kind(request.body_kind) =>
@@ -206,6 +273,9 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
         | Some(cluster_request::Body::ConfigPrepare(_))
         | Some(cluster_request::Body::ConfigCommit(_))
         | Some(cluster_request::Body::ConfigAbort(_))
+        | Some(cluster_request::Body::CertPush(_))
+        | Some(cluster_request::Body::ChallengePublish(_))
+        | Some(cluster_request::Body::ChallengeRetract(_))
         | None => BridgeOutcome::ProtocolViolation,
     }
 }
@@ -213,14 +283,15 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
 /// Route one control-plane-initiated request through the FOLLOWER's
 /// whitelist (Story 9.4 D5).
 ///
-/// The follower serves exactly three methods, all configuration pushes.
-/// Every other body is a control plane out of role: a `Hello` or a
+/// The follower serves exactly six methods: three configuration
+/// pushes, one certificate push and the HTTP-01 challenge pair. Every
+/// other body is a control plane out of role: a `Hello` or a
 /// `Heartbeat` (the follower is the one that opens and probes), an
 /// `Enroll` (wrong listener entirely), a `Renew` or a `Leave` (those
-/// travel upwards), or a `ConfigPull` (the follower is the puller). An
-/// unknown `body_kind` means the control plane is NEWER: refused
-/// without dropping the session, so a control-plane upgrade never
-/// disconnects the fleet.
+/// travel upwards), a `ConfigPull` or a `CertPull` (the follower is
+/// the puller in both). An unknown `body_kind` means the control plane
+/// is NEWER: refused without dropping the session, so a control-plane
+/// upgrade never disconnects the fleet.
 pub fn translate_control_plane_request(request: &ClusterRequest) -> FollowerBridgeOutcome {
     if !request.body_kind_matches() {
         return FollowerBridgeOutcome::ProtocolViolation;
@@ -246,6 +317,48 @@ pub fn translate_control_plane_request(request: &ClusterRequest) -> FollowerBrid
                 generation: abort.generation,
             })
         }
+        Some(cluster_request::Body::CertPush(push)) => {
+            if push.bundles.len() > MAX_CERT_BUNDLES {
+                return FollowerBridgeOutcome::ProtocolViolation;
+            }
+            let bundles: Vec<CertBundle> = push
+                .bundles
+                .iter()
+                .cloned()
+                .map(CertBundle::from_material)
+                .collect();
+            if bundles.iter().any(|b| cert_bundle_defect(b).is_some()) {
+                return FollowerBridgeOutcome::ProtocolViolation;
+            }
+            FollowerBridgeOutcome::Serve(FollowerAction::InstallCerts(bundles))
+        }
+        Some(cluster_request::Body::ChallengePublish(publish)) => {
+            // The token becomes a path segment the data plane serves
+            // and the key authorization becomes a response body: both
+            // are bounded here, at the decode boundary, or nowhere.
+            if challenge_defect(
+                &publish.identifier,
+                &publish.token,
+                &publish.key_authorization,
+            )
+            .is_some()
+            {
+                return FollowerBridgeOutcome::ProtocolViolation;
+            }
+            FollowerBridgeOutcome::Serve(FollowerAction::PublishChallenge {
+                identifier: publish.identifier.clone(),
+                token: publish.token.clone(),
+                key_authorization: publish.key_authorization.clone(),
+            })
+        }
+        Some(cluster_request::Body::ChallengeRetract(retract)) => {
+            if !challenge_token_is_valid(&retract.token) {
+                return FollowerBridgeOutcome::ProtocolViolation;
+            }
+            FollowerBridgeOutcome::Serve(FollowerAction::RetractChallenge {
+                token: retract.token.clone(),
+            })
+        }
         None if request.body_kind != 0
             && !ClusterRequest::is_known_body_kind(request.body_kind) =>
         {
@@ -259,6 +372,7 @@ pub fn translate_control_plane_request(request: &ClusterRequest) -> FollowerBrid
         | Some(cluster_request::Body::Renew(_))
         | Some(cluster_request::Body::Leave(_))
         | Some(cluster_request::Body::ConfigPull(_))
+        | Some(cluster_request::Body::CertPull(_))
         | None => FollowerBridgeOutcome::ProtocolViolation,
     }
 }
@@ -270,9 +384,34 @@ mod tests {
 
     use super::*;
     use crate::messages::{
-        ClusterFrame, ConfigPrepare, ConfigPull, Heartbeat, Hello, BODY_KIND_HELLO,
+        CertMaterial, CertPull, CertPush, ChallengePublish, ClusterFrame, ConfigPrepare,
+        ConfigPull, Heartbeat, Hello, BODY_KIND_HELLO, MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES,
+        MAX_CHALLENGE_TOKEN_BYTES, MAX_CONFIG_HASH_BYTES,
     };
+
+    const IDENTIFIER: &str = "edge.example.com";
+    const TOKEN: &str = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
+    const KEY_AUTH: &str = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0.9jg46WB3rR_AHD-EBXd";
+
+    fn publication() -> ChallengePublish {
+        ChallengePublish {
+            identifier: IDENTIFIER.to_string(),
+            token: TOKEN.to_string(),
+            key_authorization: KEY_AUTH.to_string(),
+        }
+    }
     use lorica_command::{Frame, FrameKind};
+
+    /// A well-formed bundle in wire form.
+    fn material(cert_id: &str) -> CertMaterial {
+        CertMaterial {
+            cert_id: cert_id.to_string(),
+            domain: "edge.example.com".to_string(),
+            cert_pem: "-----BEGIN CERTIFICATE-----".to_string(),
+            key_pem: "-----BEGIN PRIVATE KEY-----".to_string(),
+            key_digest: format!("sha256:{}", "a".repeat(MAX_CONFIG_HASH_BYTES)),
+        }
+    }
 
     fn heartbeat(timestamp_ms: u64) -> Heartbeat {
         Heartbeat {
@@ -420,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn the_follower_serves_only_the_three_configuration_pushes() {
+    fn the_follower_serves_the_three_configuration_pushes() {
         let prepare = ClusterRequest::config_prepare(ConfigPrepare {
             generation: 9,
             hash: "ab".to_string(),
@@ -498,6 +637,167 @@ mod tests {
             translate_control_plane_request(&malformed),
             FollowerBridgeOutcome::ProtocolViolation
         );
+    }
+
+    #[test]
+    fn a_certificate_pull_is_whitelisted_on_the_control_plane_only() {
+        let pull = ClusterRequest::cert_pull(CertPull {
+            cert_ids: vec!["cert-1".to_string(), "cert-2".to_string()],
+        });
+        assert_eq!(
+            translate_cluster_request(&pull),
+            BridgeOutcome::InPlane(InPlaneAction::CertPull {
+                cert_ids: vec!["cert-1".to_string(), "cert-2".to_string()],
+            })
+        );
+        // The mirror image: a control plane asking a follower for keys
+        // is out of role, and the follower drops the session.
+        assert_eq!(
+            translate_control_plane_request(&pull),
+            FollowerBridgeOutcome::ProtocolViolation
+        );
+    }
+
+    #[test]
+    fn a_certificate_push_is_whitelisted_on_the_follower_only() {
+        let push = ClusterRequest::cert_push(CertPush {
+            bundles: vec![material("cert-1")],
+        });
+        assert_eq!(
+            translate_control_plane_request(&push),
+            FollowerBridgeOutcome::Serve(FollowerAction::InstallCerts(vec![
+                CertBundle::from_material(material("cert-1"))
+            ]))
+        );
+        // A follower pushing PRIVATE KEYS at its control plane is the
+        // violation this table exists for.
+        assert_eq!(
+            translate_cluster_request(&push),
+            BridgeOutcome::ProtocolViolation
+        );
+    }
+
+    #[test]
+    fn a_malformed_certificate_batch_never_reaches_a_handler() {
+        // Over the cap.
+        let oversized = ClusterRequest::cert_push(CertPush {
+            bundles: (0..=MAX_CERT_BUNDLES)
+                .map(|i| material(&format!("cert-{i}")))
+                .collect(),
+        });
+        assert_eq!(
+            translate_control_plane_request(&oversized),
+            FollowerBridgeOutcome::ProtocolViolation
+        );
+        // One defect anywhere in the batch refuses the whole batch:
+        // an injected id or domain, a chain or key that is not there,
+        // and a digest that cannot be checked against the blob.
+        let mut injected = material("cert-1");
+        injected.cert_id = "cert\n1".to_string();
+        let mut no_key = material("cert-2");
+        no_key.key_pem = String::new();
+        let mut bad_digest = material("cert-3");
+        bad_digest.key_digest = "sha256:zz".to_string();
+        for bad in [injected, no_key, bad_digest] {
+            let push = ClusterRequest::cert_push(CertPush {
+                bundles: vec![material("cert-0"), bad.clone()],
+            });
+            assert_eq!(
+                translate_control_plane_request(&push),
+                FollowerBridgeOutcome::ProtocolViolation,
+                "cert {}",
+                bad.cert_id
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_certificate_pull_never_reaches_a_handler() {
+        let oversized = ClusterRequest::cert_pull(CertPull {
+            cert_ids: vec!["cert-1".to_string(); MAX_CERT_PULL_IDS + 1],
+        });
+        assert_eq!(
+            translate_cluster_request(&oversized),
+            BridgeOutcome::ProtocolViolation
+        );
+        for bad_id in ["", "cert\n1", &"c".repeat(65)] {
+            let pull = ClusterRequest::cert_pull(CertPull {
+                cert_ids: vec!["cert-0".to_string(), bad_id.to_string()],
+            });
+            assert_eq!(
+                translate_cluster_request(&pull),
+                BridgeOutcome::ProtocolViolation,
+                "id {bad_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_challenge_pair_is_whitelisted_on_the_follower_only() {
+        let publish = ClusterRequest::challenge_publish(publication());
+        assert_eq!(
+            translate_control_plane_request(&publish),
+            FollowerBridgeOutcome::Serve(FollowerAction::PublishChallenge {
+                identifier: IDENTIFIER.to_string(),
+                token: TOKEN.to_string(),
+                key_authorization: KEY_AUTH.to_string(),
+            })
+        );
+        let retract = ClusterRequest::challenge_retract(TOKEN);
+        assert_eq!(
+            translate_control_plane_request(&retract),
+            FollowerBridgeOutcome::Serve(FollowerAction::RetractChallenge {
+                token: TOKEN.to_string(),
+            })
+        );
+        // Upwards, both are a follower choosing what the fleet answers
+        // a certificate authority.
+        for upward in [publish, retract] {
+            assert_eq!(
+                translate_cluster_request(&upward),
+                BridgeOutcome::ProtocolViolation,
+                "body_kind {}",
+                upward.body_kind
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_challenge_never_reaches_a_handler() {
+        let long_token = "a".repeat(MAX_CHALLENGE_TOKEN_BYTES + 1);
+        let long_auth = "a".repeat(MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES + 1);
+        // An injected identifier, a token that is a path-traversal
+        // shape or unbounded, and a key authorization carrying a header
+        // break: a node would serve every one of these to an
+        // unauthenticated caller.
+        for (identifier, token, key_authorization) in [
+            ("", TOKEN, KEY_AUTH),
+            ("edge.example.com\nforged", TOKEN, KEY_AUTH),
+            (IDENTIFIER, "../../etc/passwd", KEY_AUTH),
+            (IDENTIFIER, "", KEY_AUTH),
+            (IDENTIFIER, long_token.as_str(), KEY_AUTH),
+            (IDENTIFIER, TOKEN, ""),
+            (IDENTIFIER, TOKEN, "auth\r\nInjected: 1"),
+            (IDENTIFIER, TOKEN, long_auth.as_str()),
+        ] {
+            let publish = ClusterRequest::challenge_publish(ChallengePublish {
+                identifier: identifier.to_string(),
+                token: token.to_string(),
+                key_authorization: key_authorization.to_string(),
+            });
+            assert_eq!(
+                translate_control_plane_request(&publish),
+                FollowerBridgeOutcome::ProtocolViolation,
+                "{identifier:?} {token:?} {key_authorization:?}"
+            );
+        }
+        for bad_token in ["", "tok/en", "../x"] {
+            assert_eq!(
+                translate_control_plane_request(&ClusterRequest::challenge_retract(bad_token)),
+                FollowerBridgeOutcome::ProtocolViolation,
+                "{bad_token:?}"
+            );
+        }
     }
 
     #[test]
