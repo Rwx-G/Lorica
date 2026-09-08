@@ -29,12 +29,17 @@
 //! # The transport reports; it does not decide (AC #6)
 //!
 //! [`ChallengeFanout::publish`] returns a per-node
-//! [`ChallengeReport`] and takes NO all-or-nothing decision. The
-//! caller is the ACME solver, and it is the one that refuses the whole
-//! order unless every recipient took the token, because it is the only
-//! layer that knows an order is at stake. Deciding here would put that
-//! judgement in a crate that cannot see the order, and a later caller
-//! with a different tolerance would have to work around it.
+//! [`ChallengeReport`] and takes NO decision. The caller is the ACME
+//! solver, and it is the one that decides whether an order may
+//! proceed, because it is the only layer that knows an order is at
+//! stake. Deciding here would put that judgement in a crate that
+//! cannot see the order, and a later caller with a different tolerance
+//! would have to work around it.
+//!
+//! What the report DOES do is tell the two misses apart
+//! ([`ChallengeMiss`], decision D16): a node with no live session, and
+//! a live node that refused. Only the second can make the authority
+//! see a 404, so only the second blocks an order.
 //!
 //! Retraction is the mirror image and is best effort: it reports
 //! nothing, because the driver calls it unconditionally on both the
@@ -71,31 +76,80 @@ use crate::messages::{
 use crate::replication::DEFAULT_PER_NODE_DEADLINE;
 use crate::roster::SessionRegistry;
 
+/// Why a recipient is not serving the token.
+///
+/// The distinction is the caller's whole decision, so it is a type
+/// rather than a reason string (decision D16). It mirrors
+/// [`crate::replication::PrepareOutcome`]'s split between a node that
+/// REFUSED and a node that was merely unreachable, for the same
+/// reason: one is a fact about the fleet, the other is a fact about a
+/// link.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChallengeMiss {
+    /// The recipient has no live Active session. It is not answering
+    /// the cluster plane, so it is not answering HTTP either, and a
+    /// certificate authority that resolves to it gets a connection
+    /// failure whether or not the token was published there.
+    Offline,
+    /// A node with a live session refused the publication, or the
+    /// exchange failed or timed out. This one IS answering HTTP, and
+    /// what it will answer is 404.
+    Refused(String),
+}
+
+impl std::fmt::Display for ChallengeMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Offline => f.write_str("no live session for an active node"),
+            Self::Refused(reason) => f.write_str(reason),
+        }
+    }
+}
+
 /// Which nodes took a token and which did not.
 ///
 /// Both vectors are sorted by node id, so two runs of the same fan-out
 /// produce identical reports regardless of which follower answered
-/// first. A recipient with no live Active session appears in
-/// [`ChallengeReport::failed`] rather than being silently absent: for
-/// a challenge, unlike a certificate push, "not reachable" IS the
-/// answer the caller needs, because it decides whether to tell the
-/// authority to validate.
+/// first.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChallengeReport {
     /// Node ids now serving the token.
     pub delivered: Vec<String>,
-    /// `(node_id, reason)`: refused, unreachable, or not addressable.
-    pub failed: Vec<(String, String)>,
+    /// `(node_id, miss)` for every recipient that is not serving it.
+    pub failed: Vec<(String, ChallengeMiss)>,
 }
 
 impl ChallengeReport {
     /// Whether every recipient took the token.
-    ///
-    /// The ACME solver's whole decision: `false` means the authority
-    /// must NOT be told to validate, because at least one node it may
-    /// reach would answer nothing.
     pub fn is_complete(&self) -> bool {
         self.failed.is_empty()
+    }
+
+    /// The misses that must stop the caller from telling a certificate
+    /// authority to validate (decision D16).
+    ///
+    /// [`ChallengeMiss::Offline`] is deliberately NOT among them. A
+    /// node that is not answering the cluster plane is not answering
+    /// the authority's fetch either, so refusing to attempt validation
+    /// because of it prevents nothing and costs a renewal: with one
+    /// follower down, an all-or-nothing verdict stops renewing every
+    /// certificate on a fleet-wide route until that node comes back.
+    /// A node that IS up and refused the token is the opposite case,
+    /// and is what this returns.
+    pub fn blocking(&self) -> Vec<&(String, ChallengeMiss)> {
+        self.failed
+            .iter()
+            .filter(|(_, miss)| matches!(miss, ChallengeMiss::Refused(_)))
+            .collect()
+    }
+
+    /// Recipients skipped because they had no live session.
+    pub fn offline(&self) -> Vec<&str> {
+        self.failed
+            .iter()
+            .filter(|(_, miss)| matches!(miss, ChallengeMiss::Offline))
+            .map(|(node_id, _)| node_id.as_str())
+            .collect()
     }
 }
 
@@ -184,15 +238,19 @@ impl ChallengeFanout {
                 defect,
                 "refusing to distribute a malformed HTTP-01 challenge; nothing was sent"
             );
+            // A local bug, not a fleet fact: it must block, so it is
+            // recorded as a refusal against every recipient.
             for node_id in recipients {
-                report.failed.push((node_id.clone(), defect.to_string()));
+                report
+                    .failed
+                    .push((node_id.clone(), ChallengeMiss::Refused(defect.to_string())));
             }
             finish(&mut report);
             return report;
         }
 
         let mut sends: JoinSet<(String, Result<(), String>)> = JoinSet::new();
-        for (node_id, endpoint) in targets(sessions, recipients) {
+        for (node_id, endpoint) in sessions.addressable(recipients) {
             let request = ClusterRequest::challenge_publish(ChallengePublish {
                 identifier: identifier.to_string(),
                 token: token.to_string(),
@@ -221,25 +279,22 @@ impl ChallengeFanout {
                         node_id = %node_id,
                         identifier,
                         %reason,
-                        "a follower did not take the HTTP-01 token; the caller must not tell the \
-                         certificate authority to validate"
+                        "a LIVE follower did not take the HTTP-01 token; it will answer the \
+                         certificate authority with a 404, so the caller must not tell the \
+                         authority to validate"
                     );
-                    report.failed.push((node_id, reason));
+                    report.failed.push((node_id, ChallengeMiss::Refused(reason)));
                 }
             }
         }
-        // A recipient that never became a target (no session, or a
-        // session whose node is not Active) is a FAILURE here, not a
-        // silent omission the way it is for a certificate push. The
-        // caller is about to tell a certificate authority to validate,
-        // and a hostname's node that is serving nothing is exactly
-        // what must stop it.
+        // A recipient that never became a target has no live session.
+        // It is recorded, but as `Offline`, and the caller does not
+        // treat that as a veto: see `ChallengeReport::blocking`.
         for node_id in recipients {
             if !answered.contains(node_id.as_str()) {
-                report.failed.push((
-                    node_id.clone(),
-                    "no live session for an active node".to_string(),
-                ));
+                report
+                    .failed
+                    .push((node_id.clone(), ChallengeMiss::Offline));
             }
         }
 
@@ -259,7 +314,7 @@ impl ChallengeFanout {
             return;
         }
         let mut sends: JoinSet<()> = JoinSet::new();
-        for (node_id, endpoint) in targets(sessions, recipients) {
+        for (node_id, endpoint) in sessions.addressable(recipients) {
             let request = ClusterRequest::challenge_retract(token);
             let deadline = self.per_node_deadline;
             sends.spawn(async move {
@@ -277,25 +332,12 @@ impl ChallengeFanout {
     }
 }
 
-/// The `(node_id, endpoint)` pairs a fan-out may address: the
-/// caller-resolved recipients intersected with the Active sessions.
-///
-/// Break-glass is deliberately NOT a filter here, unlike a replication
-/// round: a challenge token is not configuration, it overwrites no
-/// operator edit, and skipping a node would fail an order the operator
-/// never chose to fail.
-fn targets(
-    sessions: &SessionRegistry,
-    recipients: &[String],
-) -> Vec<(String, RpcEndpoint<ClusterFrame>)> {
-    let wanted: HashSet<&str> = recipients.iter().map(String::as_str).collect();
-    sessions
-        .active_sessions()
-        .into_iter()
-        .filter(|(node_id, _, _)| wanted.contains(node_id.as_str()))
-        .map(|(node_id, endpoint, _)| (node_id, endpoint))
-        .collect()
-}
+// The intersection itself lives on `SessionRegistry::addressable`,
+// shared with certificate distribution. Break-glass is deliberately
+// NOT a filter on either fan-out, unlike a replication round: a
+// challenge token is not configuration, it overwrites no operator
+// edit, and skipping a node would fail an order the operator never
+// chose to fail.
 
 /// Sort both lists and log the fan-out.
 fn finish(report: &mut ChallengeReport) {
@@ -527,6 +569,11 @@ mod tests {
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, "node-b");
         assert!(!report.is_complete());
+        assert_eq!(
+            report.blocking().len(),
+            1,
+            "node-b is UP and refused, so it will answer the authority with a 404: this one              blocks the order"
+        );
         assert_eq!(good.publishes.load(Ordering::SeqCst), 1);
         assert_eq!(bad.publishes.load(Ordering::SeqCst), 1);
         drop((good, bad));
@@ -546,13 +593,18 @@ mod tests {
         let report = publish(&fanout(), &registry, &["node-a"]).await;
         assert!(report.delivered.is_empty());
         assert_eq!(report.failed.len(), 1);
-        assert!(report.failed[0].1.contains("transport"));
+        assert!(report.failed[0].1.to_string().contains("transport"));
         assert!(!report.is_complete());
+        assert_eq!(
+            report.blocking().len(),
+            1,
+            "a node that holds a session and then goes silent is up: it blocks"
+        );
         drop(silent);
     }
 
     #[tokio::test]
-    async fn a_recipient_with_no_live_session_is_a_failure_not_an_omission() {
+    async fn a_recipient_with_no_live_session_is_reported_but_does_not_block() {
         let registry = SessionRegistry::new();
         let connected = spawn_follower(
             &registry,
@@ -563,18 +615,22 @@ mod tests {
         );
 
         // node-b was resolved as plausibly serving the hostname and is
-        // simply not connected. The authority may still reach it, so
-        // the caller has to know.
+        // simply not connected. The caller has to know, so it is
+        // reported; but it is NOT a veto (D16), because a node that
+        // answers nothing on the cluster plane answers nothing on
+        // port 80 either.
         let report = publish(&fanout(), &registry, &["node-a", "node-b"]).await;
         assert_eq!(report.delivered, vec!["node-a".to_string()]);
         assert_eq!(
             report.failed,
-            vec![(
-                "node-b".to_string(),
-                "no live session for an active node".to_string()
-            )]
+            vec![("node-b".to_string(), ChallengeMiss::Offline)]
         );
         assert!(!report.is_complete());
+        assert!(
+            report.blocking().is_empty(),
+            "an offline recipient must not stop an order: refusing here would stop renewing              every certificate on a fleet-wide route while one follower is down"
+        );
+        assert_eq!(report.offline(), vec!["node-b"]);
         drop(connected);
     }
 
@@ -592,7 +648,7 @@ mod tests {
         let report = publish(&fanout(), &registry, &["node-a"]).await;
         assert_eq!(pending.publishes.load(Ordering::SeqCst), 0);
         assert!(report.delivered.is_empty());
-        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed, vec![("node-a".to_string(), ChallengeMiss::Offline)]);
         assert!(!report.is_complete());
         drop(pending);
     }
@@ -642,7 +698,18 @@ mod tests {
                 .publish(&registry, &names(&["node-a"]), identifier, token, key_auth)
                 .await;
             assert!(report.delivered.is_empty());
-            assert_eq!(report.failed, vec![("node-a".to_string(), expected.to_string())]);
+            assert_eq!(
+                report.failed,
+                vec![(
+                    "node-a".to_string(),
+                    ChallengeMiss::Refused(expected.to_string())
+                )]
+            );
+            assert_eq!(
+                report.blocking().len(),
+                1,
+                "a malformed publication is a local bug, and it must block the order"
+            );
         }
         assert_eq!(
             follower.publishes.load(Ordering::SeqCst),
@@ -750,7 +817,39 @@ mod tests {
             failed: Vec::new(),
         };
         assert!(report.is_complete());
-        report.failed.push(("node-b".to_string(), "no".to_string()));
+        report
+            .failed
+            .push(("node-b".to_string(), ChallengeMiss::Refused("no".to_string())));
         assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn only_a_live_refusal_blocks_an_order() {
+        // The D16 boundary, stated once as a unit fact so it cannot be
+        // changed by accident: an incomplete report is not the same
+        // thing as a report that must stop an order.
+        let report = ChallengeReport {
+            delivered: vec!["node-a".to_string()],
+            failed: vec![
+                ("node-b".to_string(), ChallengeMiss::Offline),
+                (
+                    "node-c".to_string(),
+                    ChallengeMiss::Refused("refused with status Unspecified".to_string()),
+                ),
+            ],
+        };
+        assert!(!report.is_complete());
+        assert_eq!(report.offline(), vec!["node-b"]);
+        assert_eq!(report.blocking().len(), 1);
+        assert_eq!(report.blocking()[0].0, "node-c");
+
+        let only_offline = ChallengeReport {
+            delivered: vec!["node-a".to_string()],
+            failed: vec![("node-b".to_string(), ChallengeMiss::Offline)],
+        };
+        assert!(
+            only_offline.blocking().is_empty(),
+            "a fleet with one node down still renews its certificates"
+        );
     }
 }

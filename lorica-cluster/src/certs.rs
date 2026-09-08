@@ -51,12 +51,17 @@
 //! # Recipients are resolved by the caller, never widened here (D3)
 //!
 //! [`CertDistributor::push`] addresses exactly the node ids it is
-//! given, intersected with the Active sessions. It never falls back to
-//! "every session" when the list is empty, and it never resolves a
-//! name: a node name is chosen by the joining node and is not an
-//! authorization input (`roster.rs`).
+//! given, intersected with the Active sessions
+//! ([`crate::roster::SessionRegistry::addressable`]). It never falls
+//! back to "every session" when the list is empty, and it never
+//! resolves a name.
+//!
+//! Names ARE an authorization input, since a route `node_selector`
+//! lists them: that is precisely why the resolution happens on the
+//! control plane, against the registry, and why the name is bound to
+//! the enrollment token rather than chosen by the joining node
+//! (`roster.rs`).
 
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -341,13 +346,9 @@ impl CertDistributor {
             return report;
         }
 
-        let wanted: HashSet<&str> = recipients.iter().map(String::as_str).collect();
-        let mut targets: Vec<(String, RpcEndpoint<ClusterFrame>)> = Vec::new();
-        for (node_id, endpoint, _applied) in sessions.active_sessions() {
-            if wanted.contains(node_id.as_str()) {
-                report.targets.push(node_id.clone());
-                targets.push((node_id, endpoint));
-            }
+        let targets = sessions.addressable(recipients);
+        for (node_id, _) in &targets {
+            report.targets.push(node_id.clone());
         }
 
         let material: Vec<CertMaterial> = bundles.iter().map(CertBundle::to_material).collect();

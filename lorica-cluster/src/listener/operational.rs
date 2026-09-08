@@ -111,6 +111,14 @@ const MAX_RENEWALS_PER_SESSION: u32 = 3;
 /// but each refused request still costs a store read).
 const MAX_RENEWAL_REFUSALS_PER_SESSION: u32 = 8;
 
+/// Certificate pulls one session may issue (Story 9.5). A follower
+/// pulls once on reconnect and once a minute from the reconciler, so
+/// a long-lived session legitimately reaches double digits; the cap
+/// is set where a follower would have to be looping to hit it. Each
+/// pull costs a store pass over the certificate table AND decrypts
+/// private keys, which is why it is capped at all.
+const MAX_CERT_PULLS_PER_SESSION: u32 = 240;
+
 /// What a node past its per-node session rate is told to wait, in
 /// seconds (the sliding window itself).
 const SESSION_RATE_RETRY_AFTER_S: u32 = SESSION_RATE_WINDOW.as_secs() as u32;
@@ -661,7 +669,7 @@ async fn serve_session(
     mut guard: Option<SessionGuard>,
 ) {
     let stats = &shared.stats;
-    let mut renewals = RenewalTally::default();
+    let mut tally = SessionTally::default();
     loop {
         let request = match &mut guard {
             Some(guard) => {
@@ -689,7 +697,7 @@ async fn serve_session(
         if let Some(guard) = &guard {
             guard.entry().touch();
         }
-        match serve_request(request, shared, ctx, guard.as_ref(), &mut renewals).await {
+        match serve_request(request, shared, ctx, guard.as_ref(), &mut tally).await {
             Some(SessionEnd::Closed) => return,
             Some(SessionEnd::Killed) => return,
             None => {}
@@ -697,11 +705,13 @@ async fn serve_session(
     }
 }
 
-/// Renewal outcomes seen on one session, for the per-session caps.
+/// What one session has already been granted, for the per-session
+/// caps on the paths that cost the control plane real work.
 #[derive(Default)]
-struct RenewalTally {
-    granted: u32,
-    refused: u32,
+struct SessionTally {
+    renewals_granted: u32,
+    renewals_refused: u32,
+    cert_pulls: u32,
 }
 
 /// Serve one inbound request; `Some` ends the session.
@@ -710,7 +720,7 @@ async fn serve_request(
     shared: &OperationalShared,
     ctx: &SessionContext,
     guard: Option<&SessionGuard>,
-    renewals: &mut RenewalTally,
+    tally: &mut SessionTally,
 ) -> Option<SessionEnd> {
     let stats = &shared.stats;
     match translate_cluster_request(request.request()) {
@@ -835,6 +845,25 @@ async fn serve_request(
                     .err()
                     .map(|_| SessionEnd::Closed);
             }
+            if tally.cert_pulls >= MAX_CERT_PULLS_PER_SESSION {
+                stats.protocol_violations.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    peer = %ctx.peer_addr,
+                    node_id,
+                    cap = MAX_CERT_PULLS_PER_SESSION,
+                    "certificate pull flood; dropping the session"
+                );
+                fleet
+                    .handler
+                    .on_protocol_violation(node_id, ctx.peer_addr)
+                    .await;
+                let _ = request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::ProtocolViolation))
+                    .await;
+                tokio::time::sleep(REFUSAL_FLUSH_GRACE).await;
+                return Some(SessionEnd::Closed);
+            }
+            tally.cert_pulls += 1;
             let requested = cert_ids.len();
             let reply = match fleet.handler.on_cert_pull(node_id, cert_ids).await {
                 Ok(bundles) if bundles.len() > MAX_CERT_BUNDLES => {
@@ -888,7 +917,7 @@ async fn serve_request(
                     .err()
                     .map(|_| SessionEnd::Closed);
             };
-            if renewals.granted >= MAX_RENEWALS_PER_SESSION {
+            if tally.renewals_granted >= MAX_RENEWALS_PER_SESSION {
                 stats.protocol_violations.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(peer = %ctx.peer_addr, node_id, "renewal flood; dropping the session");
                 fleet
@@ -901,7 +930,7 @@ async fn serve_request(
                 tokio::time::sleep(REFUSAL_FLUSH_GRACE).await;
                 return Some(SessionEnd::Closed);
             }
-            if renewals.refused >= MAX_RENEWAL_REFUSALS_PER_SESSION {
+            if tally.renewals_refused >= MAX_RENEWAL_REFUSALS_PER_SESSION {
                 tracing::warn!(
                     peer = %ctx.peer_addr,
                     node_id,
@@ -927,7 +956,7 @@ async fn serve_request(
                 .await;
             let reply = match renewed {
                 Ok(grant) => {
-                    renewals.granted += 1;
+                    tally.renewals_granted += 1;
                     stats.renewals_served.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(peer = %ctx.peer_addr, node_id, "node certificate renewed");
                     ClusterResponse::ok(cluster_response::Body::RenewAck(RenewAck {
@@ -936,7 +965,7 @@ async fn serve_request(
                     }))
                 }
                 Err(reason) => {
-                    renewals.refused += 1;
+                    tally.renewals_refused += 1;
                     tracing::warn!(peer = %ctx.peer_addr, node_id, %reason, "node certificate renewal refused");
                     ClusterResponse::refusal(ClusterStatus::Unspecified)
                 }

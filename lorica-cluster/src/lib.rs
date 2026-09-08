@@ -104,7 +104,7 @@ pub use certs::{
     cert_bundle_defect, safe_cert_id, CertBundle, CertDistributor, CertInstallReport,
     CertPushReport, MAX_CERT_BUNDLES, MAX_CERT_PULL_IDS,
 };
-pub use challenge::{challenge_defect, ChallengeFanout, ChallengeReport};
+pub use challenge::{challenge_defect, ChallengeFanout, ChallengeMiss, ChallengeReport};
 pub use enroll::{
     join, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, JoinError, JoinParams,
     NoopSessionHandler, RefuseAllEnrollments, RenewGrant, RenewRequest, SessionHandler,

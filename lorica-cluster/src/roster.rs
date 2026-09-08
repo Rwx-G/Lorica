@@ -23,7 +23,7 @@
 //! a connection never touches SQLite and the transport crate never
 //! depends on it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -72,7 +72,13 @@ pub enum NodeState {
 pub struct NodeIdentity {
     /// Server-assigned node id (the only identity the plane uses).
     pub node_id: String,
-    /// Display name (never an authorization input).
+    /// Operator-facing name. The transport never authorizes on it: a
+    /// session is admitted on the certificate and resolved to
+    /// `node_id`. The control plane is a different matter, since a
+    /// route `node_selector` names nodes and therefore decides which
+    /// keys a node is entitled to. That is why the name is bound at
+    /// mint time and enforced at redemption rather than chosen by the
+    /// joining node.
     pub name: String,
     /// Lifecycle state.
     pub state: NodeState,
@@ -340,6 +346,27 @@ impl SessionRegistry {
                     session.applied(),
                 )
             })
+            .collect()
+    }
+
+    /// The `(node_id, endpoint)` pairs a need-to-know fan-out may
+    /// address: `recipients`, as resolved by the control plane,
+    /// intersected with the Active sessions (Story 9.5).
+    ///
+    /// It NEVER widens what it is given. A recipient with no live
+    /// session is simply absent from the result, and both fan-outs
+    /// treat that as "converges later" rather than as an error, so
+    /// this returning fewer pairs than recipients is expected.
+    ///
+    /// Shared by certificate distribution and the HTTP-01 challenge
+    /// fan-out: two expressions of "who may receive this" would be
+    /// two places for an entitlement rule to drift.
+    pub fn addressable(&self, recipients: &[String]) -> Vec<(String, RpcEndpoint<ClusterFrame>)> {
+        let wanted: HashSet<&str> = recipients.iter().map(String::as_str).collect();
+        self.active_sessions()
+            .into_iter()
+            .filter(|(node_id, _, _)| wanted.contains(node_id.as_str()))
+            .map(|(node_id, endpoint, _)| (node_id, endpoint))
             .collect()
     }
 
