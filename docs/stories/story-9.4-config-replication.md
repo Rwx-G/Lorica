@@ -1,7 +1,7 @@
 # Story 9.4: Configuration Replication
 
 **Epic:** 9 (v1.7.0)
-**Status:** Review
+**Status:** Done
 **Author:** Romain G.
 
 **Depends on:** Stories 9.1, 9.2, 9.3.
@@ -384,6 +384,86 @@ possibly dropping a security-relevant setting.
     per-node backoff belong to the periodic task, so reading the
     endpoint cannot consume a node's suppression budget.
 
+### QA iteration 1 (2026-09-08)
+
+Four auditors in parallel (security, penetration, quality, architecture)
+against the six implementation commits. Three of the four independently
+found the same top defect, which is what makes the review credible: it
+was not four restatements of the story document.
+
+**Two Critical, both fixed.**
+
+1. **An aborted round was defeated within one heartbeat.** The version
+   was published BEFORE the round and never rolled back, so a semantic
+   rejection told every node to drop what it staged and the next
+   heartbeat told them all they were behind; they pulled, and the pull
+   path served the generation the round had just rejected. The
+   all-or-none guarantee stated in the story, in `docs/cluster.md` and
+   in the module doc degraded to a fifteen second delay, and the abort
+   log line claimed the opposite of what happened. Fixed by
+   `AcceptedConfig`: a generation becomes the version the fleet
+   converges on at the moment PREPARE succeeds fleet-wide, which is
+   where the guarantee is actually made. Publishing earlier makes an
+   abort meaningless; publishing after the commits would tell a node
+   that just applied the generation that it is ahead of the control
+   plane. Serving pulls from the same slot closed the store-lock
+   amplification finding as a side effect.
+2. **Break-glass edits were never reconciled.** Only a replica apply
+   writes the applied marker, so local edits inside a window left it
+   untouched; when the window closed the node still reported the
+   generation it last replicated, `is_behind` said no, and the divergent
+   configuration stood indefinitely while the drift view counted the
+   node in sync. Both the story and the documentation promised the
+   opposite. Fixed by invalidating the marker when the window opens, so
+   the existing heartbeat pull does the reconciliation.
+
+**Five High, all fixed.** A node awaiting operator activation could pull
+the entire fleet blob (the push path filtered on the active state, the
+pull path did not, so the activation review protected nothing); an
+unrate-limited pull re-encoded the whole configuration twice under the
+store lock; a semantic rejection cost the rejecting node nothing, so one
+follower could veto fleet configuration forever; a commit
+acknowledgement was recorded without being checked against what was
+committed, making a lying node permanently invisible to drift detection;
+and the replica error type collapsed "the blob is bad" and "the disk
+failed" into one string, so a local failure could have vetoed the fleet.
+
+**Nine Medium fixed**, including a control plane restored from an older
+backup making every follower delete itself (no generation monotonicity
+check), a follower asserting break-glass forever to exempt itself, drift
+suppression resetting on every return to sync so a flapping node alerted
+once a minute, refusal alerts with no suppression at all, unbounded peer
+strings reaching journal lines and notification channels, the read-only
+gate failing open on a missing extension, the selector predicate
+existing twice on two sides of the replication boundary, and
+`cluster status` printing a confident wrong answer when a store read
+fails - on the one command an operator trusts when the management API is
+down.
+
+**Two mistakes of my own, caught by the gates.** A scripted edit aborted
+partway on a line-ending mismatch, leaving a call to a helper I had
+already removed; and my new pending-node test waited on a counter my
+refusal path never incremented. The second was a real gap, not a bad
+test: a node being turned away was invisible in the listener statistics,
+which is the silent-failure shape this story exists to avoid.
+
+**Deferred deliberately**, backlog #56-#62. The largest is #56: the blob
+is fleet-wide and node targeting is evaluated by the recipient, so it
+scopes serving rather than disclosure. Harmless here because the payload
+carries only digests, but decision D11 assumed this predicate would
+carry Story 9.5's need-to-know key distribution, and it cannot in its
+current position. Moving the filter to the control plane means each node
+converges on its own payload, which changes the single fleet-wide hash
+this design rests on. That is a decision to take at the START of 9.5,
+not a fix to improvise at the end of 9.4, so it is recorded rather than
+implemented.
+
+Gates after iteration 1: three clippy gates clean, 738 tests passing
+(including five new regression tests for the abort, the rejection
+quarantine, the lying acknowledgement, the pending pull and the
+break-glass round trip), `cargo audit` at its three allowed warnings.
+
+
 ## File List
 
 Created:
@@ -430,3 +510,4 @@ Modified:
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Slow-node eviction replaces fleet-wide veto; replication allowlist replaces wholesale settings replication; break-glass added. Status Draft. | Romain G. |
 | 2026-09-06 | 0.2 | Phase 1 review: thirteen decisions recorded (canonical blob as payload, transactional replica-apply, certificate metadata in 9.4, tags 20-39 protocol with pull and heartbeat convergence, coordinator after the local reload, report-based completion, read-only gate, break-glass, drift with per-node suppression, node_selector on the route). Status InProgress. | Romain G. |
 | 2026-09-08 | 0.3 | Implementation complete across the four layers: transport (`replication.rs`, bidirectional dialer, tags 20-23), store (`replica.rs`, `cluster_replica.rs`, migration 52 with `routes.node_selector`), API (replication/drift/break-glass endpoints, follower read-only gate, three Prometheus families), binary (replication watch, drift watch, `ReplicaHandler`, `cluster break-glass`). Three clippy gates green. Status Review. | Romain G. |
+| 2026-09-08 | 0.4 | QA iteration 1: four parallel auditors. Two Critical fixed (an aborted round was served to the whole fleet by the pull path within one heartbeat; break-glass edits were never reconciled because only a replica apply writes the applied marker), five High, nine Medium. Publication moved between the two phases so all-or-none is true by construction; pulls served from the accepted payload instead of re-encoding under the store lock. Seven items deferred to backlog #56-#62, chief among them per-recipient payloads for Story 9.5. Status Done. | Romain G. |
