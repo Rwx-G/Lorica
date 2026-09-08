@@ -1,7 +1,7 @@
 # Story 9.6: Telemetry Fan-In
 
 **Epic:** 9 (v1.7.0)
-**Status:** Draft
+**Status:** InProgress
 **Author:** Romain G.
 
 **Depends on:** Stories 9.1, 9.2, 9.3.
@@ -57,18 +57,47 @@ so that I stop opening three SSH tunnels to correlate one incident.
 
 ## Tasks / Subtasks
 
-- [ ] AC #1: six table migrations + `sla_buckets` UNIQUE change; hot-path
-      row-growth measurement.
-- [ ] AC #2: separate telemetry store and connection.
-- [ ] AC #3: per-node quota, chunked deletes, MIN/MAX estimate.
-- [ ] AC #4: measure the ceiling, document it.
-- [ ] AC #5: ring buffer + drain task + drop counters.
-- [ ] AC #6: decide and document the execution model.
-- [ ] AC #7: supervisor-side reader over the shared store.
-- [ ] AC #8: ingest quota + storage watermark.
-- [ ] AC #9: endpoints, index, pagination without COUNT.
-- [ ] AC #10: ban fan-in + fleet-wide ban push.
-- [ ] AC #11: `docs/cluster.md`.
+Reshaped by the Phase 1 review; see D2, D3, D4 and D5 for why three of
+the original tasks are smaller than drafted and one is larger.
+
+- [ ] AC #1 + D2: `node_id` in the TELEMETRY schema only, stamped by
+      the control plane from the session. No migration on
+      `access_logs`, `waf_events`, `sla_buckets` or `probe_results`;
+      the `UNIQUE(node_id, ...)` lands on the fan-in copy.
+- [ ] AC #2: `cluster-telemetry.db`, its own connection, migration 55.
+- [ ] AC #3 + D9: per-node quota, chunked deletes that release the
+      lock, and `enforce_waf_retention`'s `COUNT(*)` replaced by the
+      `MIN(id)`/`MAX(id)` estimate the access-log path already uses.
+- [ ] AC #4: measure the ceiling on this hardware, state it in
+      `docs/cluster.md` with the topology to use beyond it.
+- [ ] AC #5 + AC #7 + D5: supervisor-side drain task walking the
+      shared store by rowid cursor. No new hot-path queue on the
+      access-log and WAF paths.
+- [ ] AC #5 + D3: ring buffer for the ban snapshot, the one kind with
+      no shared store behind it.
+- [ ] AC #6 + D6: tokio task, not the log-writer OS thread; recorded
+      in the module doc.
+- [ ] AC #8 + D8: per-node rate and byte quota at ingest, plus the
+      global storage watermark that sheds telemetry before
+      configuration or audit writes.
+- [ ] AC #9: `/cluster/logs` and `/cluster/waf-events`, composite
+      `(node_id, timestamp)` index, cursor pagination, no per-page
+      `COUNT(*)`.
+- [ ] AC #10 + D3: ban snapshot fan-in and a fleet-wide ban push;
+      automatic per-node auto-ban stays local, with the reason
+      written down.
+- [ ] AC #11 + D1: EXTEND `docs/cluster.md` (fan-in ceiling, worked
+      Prometheus federation config, standalone-to-cluster migration,
+      ban rationale), replacing the Story 9.8 stub.
+- [ ] D12: the `cluster` e2e profile, which covers Stories 9.2-9.6.
+      Tracked apart from the code tasks so a partial outcome shows.
+
+Explicitly NOT in this story, with the reason recorded:
+
+- Audit fan-in (D4): Story 9.9 AC #2/#3 own the separate insert path,
+  the per-node seals and the partitioned verify.
+- Flipping `metrics_require_auth` (D10): a release-level deliverable
+  with a release-note obligation, done at the epic close.
 
 ## Dev Notes
 
@@ -189,7 +218,189 @@ worked federation config in AC #11.
 
 ### Completion Notes
 
-(empty)
+- **Phase 1 decisions.** Every Dev Notes claim was re-verified against
+  the current tree before any of this was decided; stories 9.1-9.5 and
+  9.8 landed after this story was drafted, so every line number in the
+  Dev Notes is stale even where the claim itself still holds. The
+  substantive claims all survived: one mutexed `Connection`
+  (`log_store.rs:19-21`), an OS-thread writer with
+  `QUEUE_CAP = 8192` / `BATCH_MAX = 256` and a `try_send`/drop contract
+  (`log_writer.rs:33,36,62-72`), an outbound RPC queue that awaits
+  rather than drops (`rpc.rs:123,545-560`), global count-based
+  retention at 100 000 rows (`settings.rs:541-547`), `COUNT(*)` on
+  every logs page (`log_store.rs:291`), and no `node_id` on any
+  non-cluster table.
+
+  - **D1 - `docs/cluster.md` is EXTENDED, not created.** AC #11 says
+    "New `docs/cluster.md`" and the File List repeats it. The file has
+    existed since Story 9.3 and now carries eight major sections
+    through Story 9.5. What AC #11 actually still owes: the access-log
+    fan-in ceiling, a worked Prometheus federation config, the
+    standalone-to-cluster migration path, and the ban rationale AC #10
+    asks for. `## Node Identity in Telemetry` is a nine-line stub from
+    Story 9.8 that this story replaces with the real treatment.
+
+    Worth knowing before writing: `## Ports and Listeners` already
+    states as settled doctrine that "telemetry (Story 9.6) rides its
+    own connection". That was written ahead of the implementation, so
+    it is a claim this story has to make true rather than a
+    description of anything.
+
+  - **D2 - `node_id` lives ONLY in the telemetry database, and the
+    control plane stamps it from the SESSION.** This deviates from
+    AC #1 as written, deliberately, on two grounds.
+
+    First, cost. AC #1 asks for the column on access-log rows, WAF
+    events, SLA samples, probe results, bans and audit entries, and
+    names the per-row growth on the hot path as a known cost. But
+    AC #2 puts fan-in in a separate `cluster-telemetry.db`. In a
+    per-node database the node id is a CONSTANT: every row in that
+    file came from that node. Paying per-row storage on the hot path
+    to record a constant, on six tables, is waste. The node is
+    identified once per batch on the wire instead.
+
+    Second, and this is the one that settles it: a `node_id` written
+    by the node is a node-supplied identity, and Story 9.5's D15 is
+    the whole lesson about what that costs. The control plane stamps
+    every fanned-in row with the `node_id` the mutual-TLS session
+    already proves, and never reads an identity out of the payload.
+    Taking the column from the sender would let a compromised
+    follower file rows under another node's name, which is exactly
+    the confusion an incident-correlation view must not have.
+
+    So: zero migrations on `access_logs`, `waf_events`, `sla_buckets`
+    and `probe_results`. The `UNIQUE(node_id, route_id, bucket_start,
+    source)` AC #1 asks for is created in the TELEMETRY schema, where
+    many nodes' buckets genuinely do coexist; the config database's
+    `UNIQUE(route_id, bucket_start, source)`
+    (`003_sla_metrics.sql:27`) is correct for a single node's own
+    buckets and is left alone.
+
+  - **D3 - there is no bans table, so there is no ban migration.**
+    AC #1 counts bans among "six table migrations". Bans are an
+    in-memory `DashMap<String, BanRecord>` (`lorica-api/src/ban.rs:33`)
+    rebuilt from nothing on restart; only the auto-ban THRESHOLDS are
+    persisted, as two columns on `routes`
+    (`009_cache_and_protection.sql:6-7`). AC #10's "bans fan in for
+    visibility" is therefore a periodic snapshot of live state, not a
+    row stream off a table, and it is inherently lossy across a
+    restart. That is acceptable for a visibility feature and is said
+    out loud in the docs rather than papered over.
+
+  - **D4 - audit fan-in belongs to Story 9.9 and is not built here.**
+    AC #1 lists audit entries. Story 9.9 AC #2 and AC #3 specify the
+    separate insert path that must not chain through `insert_audit`,
+    the per-node `retention_seal:<node_id>` seals, and the partitioned
+    verify. Building half of that here would either duplicate 9.9 or
+    corrupt the control plane's own chain. 9.6 stops at the telemetry
+    kinds it owns.
+
+  - **D5 - the drain reads the shared store; there is NO new hot-path
+    queue for access logs and WAF events.** This collapses AC #5,
+    AC #6 and AC #7 into one design and is the decision the story
+    turns on.
+
+    AC #7 already requires the follower supervisor to read the shared
+    log store rather than add a worker-to-supervisor RPC per request.
+    Take that seriously and the rest follows: `access-log.db` IS the
+    ring buffer. It is already written off the hot path by
+    `log_writer`'s OS thread, already bounded by retention, already
+    has a drop counter for overflow
+    (`lorica_log_write_dropped_total{kind}`), and is already shared
+    across worker processes under WAL
+    (`worker.rs:723-728`). A second in-process ring buffer in front of
+    it would duplicate a bound that exists, add a second drop
+    counter for the same event, and still not solve worker mode.
+
+    So the fan-in producer is a supervisor-side tokio task that walks
+    the shared store by rowid cursor and ships batches. The request
+    path is not touched at all, which satisfies the epic's one hard
+    invariant by construction rather than by a bound that has to be
+    argued about.
+
+    AC #5's ring buffer is not discarded: it still applies to the
+    kinds that are NOT already in a shared store, which after D3 and
+    D4 is the ban snapshot. That path is low-volume and periodic.
+
+  - **D6 - the execution model (AC #6) is a tokio task, and it has to
+    be.** `log_writer`'s consumer is deliberately a plain OS thread so
+    it behaves identically in all three process modes regardless of
+    which runtime is current at spawn
+    (`log_writer.rs:19-23`). Fan-out cannot live there: it sends on
+    `RpcEndpoint`, which is tokio, and the supervisor's cluster
+    connection is a tokio construct. Under D5 the question mostly
+    dissolves, since the drain's input is a SQLite cursor rather than
+    a channel from that thread, so nothing crosses the runtime
+    boundary at all.
+
+  - **D7 - the outbound queue must never be reached from a request
+    task, and under D5 it cannot be.** `RpcEndpoint`'s outbound path
+    tries `try_send` and then falls back to `send(frame).await`
+    inside a `select!` that only adds a warning timer
+    (`rpc.rs:545-560`): it awaits, it does not drop. The Dev Notes
+    were right that asserting drop-oldest over it would be untrue.
+    `ClusterConnection`'s own doc already states the rule consumers
+    must follow ("treat that as control plane unreachable right now
+    and not queue", `dialer.rs:359-360`). The drain task is the only
+    producer, it holds a cursor rather than a backlog, and a
+    disconnected control plane means it simply stops advancing.
+
+  - **D8 - ingest is quotaed per node and shed globally, and the
+    quota is enforced on the CONTROL PLANE.** Nothing today caps what
+    a control plane accepts. The follower-side bound protects the
+    follower. Per-node rate and byte quotas with excess dropped and
+    counted, plus a storage watermark that sheds telemetry before it
+    can affect configuration or audit writes, because those two are
+    the writes that must never fail.
+
+  - **D9 - retention is per node, and the WAF `COUNT(*)` is fixed on
+    the way past.** `enforce_waf_retention` still opens with
+    `SELECT COUNT(*) FROM waf_events` (`log_store.rs:676-691`) while
+    the access-log path deliberately avoids exactly that with a
+    `MIN(id)`/`MAX(id)` estimate and a comment explaining that a
+    count "could freeze the writer's `Mutex<Connection>` for hundreds
+    of milliseconds at millions of rows" (`:436-444`). The reasoning
+    applies verbatim to the path that still does it.
+
+    The contention argument has also got worse since the story was
+    drafted, and the Dev Notes predate it: the same hourly loop
+    iteration now additionally runs the expired-ACME-challenge purge
+    (Story 9.5), audit-log retention, the probe-result purge and the
+    daily SLA purge. Chunked deletes that release the lock between
+    chunks matter more than the story assumed.
+
+  - **D10 - `metrics_require_auth` has NOT been flipped, and it is not
+    this story's to flip.** `settings.rs` documents the field as
+    flipping "to `true` in v1.7.0 with a release-note migration
+    paragraph", and the default is still `false` (`:696`), with
+    `/metrics` pass-through (`server.rs:479-489`). Nothing in 9.1-9.5
+    or 9.8 scheduled it. It is a release-level deliverable with a
+    release-note obligation, not a telemetry change, so it is done at
+    the epic close rather than buried here. Recorded so it is not
+    dropped; AC #11's argument for federation over a fleet-wide
+    `/metrics` does not depend on it either way, since the
+    cardinality argument stands on its own.
+
+  - **D11 - a correction to carry forward.** The Dev Notes state the
+    cross-worker aggregation covers 13 counters. It covers 16: Story
+    9.8 added `lorica_log_sink_dropped_total`,
+    `lorica_log_sink_sent_total` and `lorica_log_sink_truncated_total`
+    (`metrics.rs:1207-1214`). The argument the number supports (the
+    project collapses the per-worker dimension rather than labelling
+    it, so labelling `node` at fleet level would invert its own
+    precedent) is unaffected and still correct.
+
+  - **D12 - the `cluster` e2e profile does not exist, and that is an
+    epic-level debt this story inherits rather than creates.**
+    `tests-e2e-docker/run.sh:51` lists fifteen profiles; none is
+    `cluster`. The PRD designates one `cluster` profile to absorb
+    transport, enrollment, configuration replication, certificate
+    distribution and telemetry, and Story 9.5's record says plainly
+    that it "ships on unit tests only". So the Integration
+    Verification for 9.2 through 9.5 has never run. Building it once
+    here covers five stories at once, which is the cheapest point to
+    pay it. Tracked separately from the code tasks below so that a
+    partial outcome is visible rather than hidden.
 
 ## File List
 
@@ -207,4 +418,5 @@ Anticipated:
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-09-09 | 0.2 | Phase 1 review: twelve decisions recorded, every Dev Notes claim re-verified against the current tree first (all substantive claims held; every line number was stale, and the cross-worker counter list is 16 not 13 since Story 9.8). Four AC corrections. AC #1's six migrations become zero on the hot-path tables: node_id belongs to the telemetry schema only and is stamped by the control plane from the mutual-TLS session, never taken from the payload (the Story 9.5 D15 lesson). AC #1 counts bans among the migrations, but bans have no table (in-memory DashMap), so AC #10 is a live-state snapshot. AC #1 counts audit entries, which are Story 9.9's. AC #11 says "new docs/cluster.md", which has existed since 9.3 and now has eight sections. The story's centre of gravity: AC #5, #6 and #7 collapse into one design where the shared access-log store IS the ring buffer and a supervisor-side tokio task drains it by rowid cursor, leaving the request path untouched. Also inherits the epic-level debt that the `cluster` e2e profile has never existed, so 9.2-9.5 Integration Verification has never run. Status InProgress. | Romain G. |
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Separate telemetry store, per-node quotas and a documented fan-in ceiling replace the first draft's reuse of the single-node retention plumbing; fleet /metrics aggregation dropped in favour of federation. Status Draft. | Romain G. |
