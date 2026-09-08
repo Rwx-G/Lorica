@@ -1182,14 +1182,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 50 is the current head of the tracked MIGRATIONS table (every
+        // 51 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            50
+            51
         );
     }
 
@@ -1207,7 +1207,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                50
+                51
             );
         }
     }

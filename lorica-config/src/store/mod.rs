@@ -165,6 +165,7 @@ const MIGRATIONS: &[Migration] = &[
     (48, migrate_cluster_state),
     (49, migrate_cluster_ca),
     (50, migrate_cluster_registry),
+    (51, migrate_cluster_revoked_serial_expiry),
 ];
 
 /// Whether `column` already exists on `table`, via `pragma_table_info`.
@@ -603,11 +604,8 @@ fn migrate_cluster_registry(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS cluster_revoked_serials (
             serial TEXT PRIMARY KEY,
             revoked_at TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            expires_at TEXT NOT NULL
+            reason TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_cluster_revoked_serials_expiry
-            ON cluster_revoked_serials(expires_at);
         CREATE TABLE IF NOT EXISTS cluster_identity (
             id TEXT PRIMARY KEY,
             node_id TEXT NOT NULL,
@@ -625,6 +623,27 @@ fn migrate_cluster_registry(conn: &Connection) -> rusqlite::Result<()> {
             value BLOB NOT NULL,
             created_at TEXT NOT NULL
         );",
+    )
+}
+
+fn migrate_cluster_revoked_serial_expiry(conn: &Connection) -> rusqlite::Result<()> {
+    // Story 9.3 QA: a revoked serial carries its certificate's expiry
+    // so the CRL stays bounded by the live certificates (expired ones
+    // are pruned). Its own migration, not a column slipped into
+    // migration 50: databases created earlier in the v1.7.0 cycle are
+    // already at 50 and would never see the column otherwise. The
+    // epoch default only ever applies to rows written before this
+    // migration on such a database; they are pruned at the next flush,
+    // which is the right outcome for serials whose expiry is unknown.
+    add_column_if_absent(
+        conn,
+        "cluster_revoked_serials",
+        "expires_at",
+        "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_cluster_revoked_serials_expiry
+            ON cluster_revoked_serials(expires_at);",
     )
 }
 
