@@ -79,6 +79,7 @@ mod tests {
             geoip: None,
             bot_protection: None,
             group_name: String::new(),
+            node_selector: Vec::new(),
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
@@ -305,6 +306,102 @@ mod tests {
             .expect("test setup")
             .expect("test setup");
         assert_eq!(got.group_name, "retired");
+    }
+
+    #[test]
+    fn test_route_node_selector_round_trips_and_scopes_the_route() {
+        // Story 9.4 D11 / AC #13: the selector is a new column, so
+        // INSERT, UPDATE, SELECT and the canonical blob must all carry
+        // it end to end.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let mut route = make_route();
+        route.id = "r-selector".into();
+        route.node_selector = vec!["edge-1".into(), "edge-2".into()];
+        store.create_route(&route).expect("test setup");
+
+        let got = store
+            .get_route("r-selector")
+            .expect("test setup")
+            .expect("test setup");
+        assert_eq!(got.node_selector, vec!["edge-1".to_string(), "edge-2".to_string()]);
+        let listed = store.list_routes().expect("test setup");
+        assert_eq!(listed[0].node_selector, got.node_selector);
+
+        assert!(Route::route_applies_to_node(&got, "edge-1"));
+        assert!(Route::route_applies_to_node(&got, "edge-2"));
+        assert!(!Route::route_applies_to_node(&got, "edge-3"));
+
+        // An empty selector is fleet-wide.
+        let mut fleet_wide = got.clone();
+        fleet_wide.node_selector.clear();
+        store.update_route(&fleet_wide).expect("test setup");
+        let got = store
+            .get_route("r-selector")
+            .expect("test setup")
+            .expect("test setup");
+        assert!(got.node_selector.is_empty());
+        assert!(Route::route_applies_to_node(&got, "any-node"));
+
+        // The selector rides the replication payload.
+        store.update_route(&route).expect("test setup");
+        let blob = crate::canonical::canonical_bytes(&store).expect("encode");
+        let text = String::from_utf8(blob).expect("utf8");
+        assert!(text.contains("node_selector"));
+        assert!(text.contains("edge-1"));
+    }
+
+    #[test]
+    fn test_route_node_selector_validation_matches_the_group_name_alphabet() {
+        let mut route = make_route();
+        route.node_selector = vec!["edge-1".into(), "edge_2".into()];
+        assert!(route.validate_node_selector().is_ok());
+
+        route.node_selector = vec!["Edge 1".into()];
+        assert!(route.validate_node_selector().is_err());
+
+        route.node_selector = vec![String::new()];
+        assert!(route.validate_node_selector().is_err());
+
+        route.node_selector = (0..=NODE_SELECTOR_MAX_ENTRIES)
+            .map(|i| format!("edge-{i}"))
+            .collect();
+        assert!(route.validate_node_selector().is_err());
+    }
+
+    #[test]
+    fn test_cluster_applied_config_and_break_glass_round_trip() {
+        // Story 9.4 AC #7 / AC #11: both live in `cluster_replica`
+        // (migration 52) because `cluster_state.value` is INTEGER.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        assert_eq!(
+            store.cluster_applied_config().expect("read"),
+            (0, String::new()),
+            "a node that has never applied a replica reports generation 0"
+        );
+        assert!(store.cluster_break_glass_until().expect("read").is_none());
+
+        store
+            .set_cluster_applied_config(42, "abc123")
+            .expect("write applied config");
+        assert_eq!(
+            store.cluster_applied_config().expect("read"),
+            (42, "abc123".to_string())
+        );
+
+        let until = Utc::now() + chrono::Duration::minutes(30);
+        store
+            .set_cluster_break_glass_until(Some(until))
+            .expect("arm break-glass");
+        let read = store
+            .cluster_break_glass_until()
+            .expect("read")
+            .expect("armed");
+        assert_eq!(read.to_rfc3339(), until.to_rfc3339());
+
+        store
+            .set_cluster_break_glass_until(None)
+            .expect("disarm break-glass");
+        assert!(store.cluster_break_glass_until().expect("read").is_none());
     }
 
     #[test]
@@ -1182,14 +1279,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 51 is the current head of the tracked MIGRATIONS table (every
+        // 52 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            51
+            52
         );
     }
 
@@ -1207,7 +1304,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                51
+                52
             );
         }
     }
@@ -3812,12 +3909,22 @@ cert_critical_days = 3
         );
 
         store
-            .touch_cluster_node("n1", "192.0.2.10:5000", "1.7.0", 50, now)
+            .touch_cluster_node(&crate::store::LiveNodeFacts {
+                node_id: "n1".to_string(),
+                address: "192.0.2.10:5000".to_string(),
+                version: "1.7.0".to_string(),
+                schema_version: 50,
+                last_seen_at: now,
+                applied_config_generation: 7,
+                applied_config_hash: "cafebabe".to_string(),
+            })
             .expect("touch");
         let node = store.get_cluster_node("n1").expect("read").expect("row");
         assert_eq!(node.address, "192.0.2.10:5000");
         assert_eq!(node.schema_version, 50);
         assert!(node.last_seen_at.is_some());
+        assert_eq!(node.applied_config_generation, 7);
+        assert_eq!(node.applied_config_hash, "cafebabe");
 
         // A pending node cannot renew (AC #5); an active one can:
         // fp2 becomes current, fp1 stays resolvable.
@@ -3893,8 +4000,10 @@ cert_critical_days = 3
                     node_id: "n1".to_string(),
                     address: "192.0.2.10:5001".to_string(),
                     version: "1.7.1".to_string(),
-                    schema_version: 51,
+                    schema_version: 52,
                     last_seen_at: now,
+                    applied_config_generation: 9,
+                    applied_config_hash: "deadbeef".to_string(),
                 },
                 crate::store::LiveNodeFacts {
                     node_id: "ghost".to_string(),
@@ -3902,12 +4011,16 @@ cert_critical_days = 3
                     version: String::new(),
                     schema_version: 0,
                     last_seen_at: now,
+                    applied_config_generation: 0,
+                    applied_config_hash: String::new(),
                 },
             ])
             .expect("batch touch");
         let node = store.get_cluster_node("n1").expect("read").expect("row");
         assert_eq!(node.address, "192.0.2.10:5001");
         assert_eq!(node.version, "1.7.1");
+        assert_eq!(node.applied_config_generation, 9);
+        assert_eq!(node.applied_config_hash, "deadbeef");
     }
 
     #[test]

@@ -224,6 +224,56 @@ impl From<&GlobalSettings> for CanonicalGlobalSettings {
     }
 }
 
+impl CanonicalGlobalSettings {
+    /// Copy the fleet-policy fields onto a live [`GlobalSettings`],
+    /// leaving every node-local field untouched (Story 9.4 AC #1).
+    ///
+    /// The exact inverse of `From<&GlobalSettings>` above: a field
+    /// added to one and forgotten in the other fails to compile there,
+    /// and the `every_global_setting_is_explicitly_routed` test keeps
+    /// the split itself honest. Returns whether anything changed, which
+    /// is what [`crate::store::ReplicaOutcome::global_fields_changed`]
+    /// reports.
+    pub fn apply_to(&self, settings: &mut GlobalSettings) -> bool {
+        let before = CanonicalGlobalSettings::from(&*settings);
+        settings.default_health_check_interval_s = self.default_health_check_interval_s;
+        settings.cert_warning_days = self.cert_warning_days;
+        settings.cert_critical_days = self.cert_critical_days;
+        settings.max_active_probes = self.max_active_probes;
+        settings.health_max_concurrent_probes = self.health_max_concurrent_probes;
+        settings.loadtest_max_concurrency = self.loadtest_max_concurrency;
+        settings.loadtest_max_duration_s = self.loadtest_max_duration_s;
+        settings.loadtest_max_rps = self.loadtest_max_rps;
+        settings.ip_blocklist_enabled = self.ip_blocklist_enabled;
+        settings.max_global_connections = self.max_global_connections;
+        settings.flood_threshold_rps = self.flood_threshold_rps;
+        settings.flood_strict_rps = self.flood_strict_rps;
+        settings.header_timeout_s = self.header_timeout_s;
+        settings.waf_ban_threshold = self.waf_ban_threshold;
+        settings.waf_ban_duration_s = self.waf_ban_duration_s;
+        settings.custom_security_presets = self.custom_security_presets.clone();
+        settings.access_log_retention = self.access_log_retention;
+        settings.waf_event_retention = self.waf_event_retention;
+        settings.sla_purge_enabled = self.sla_purge_enabled;
+        settings.sla_purge_retention_days = self.sla_purge_retention_days;
+        settings.sla_purge_schedule = self.sla_purge_schedule.clone();
+        settings.waf_whitelist_ips = self.waf_whitelist_ips.clone();
+        settings.connection_deny_cidrs = self.connection_deny_cidrs.clone();
+        settings.connection_allow_cidrs = self.connection_allow_cidrs.clone();
+        settings.connection_limits_per_ip = self.connection_limits_per_ip;
+        settings.ai_bot_treat_spoofed_as = self.ai_bot_treat_spoofed_as;
+        settings.ai_bot_inject_headers = self.ai_bot_inject_headers;
+        settings.password_min_length = self.password_min_length;
+        settings.password_require_complexity = self.password_require_complexity;
+        settings.audit_log_retention_days = self.audit_log_retention_days;
+        settings.bot_stash_max_entries = self.bot_stash_max_entries;
+        settings.bot_stash_per_prefix_max = self.bot_stash_per_prefix_max;
+        settings.mirror_max_concurrent_per_route = self.mirror_max_concurrent_per_route;
+        settings.mirror_max_concurrent_global = self.mirror_max_concurrent_global;
+        before != *self
+    }
+}
+
 /// The canonical, byte-stable snapshot of everything the cluster
 /// replicates. Users and user preferences are deliberately absent
 /// (follower-local per the Epic 9 PRD), as are load tests, sessions,
@@ -288,8 +338,9 @@ fn sort_object_keys(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Lowercase-hex SHA-256 of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Lowercase-hex SHA-256 of `bytes`. Shared with the replica apply so
+/// the blob-integrity check and the encoder cannot drift apart.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
     digest
         .as_ref()
@@ -300,7 +351,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// `sha256:<hex>` stand-in for a secret in the canonical blob:
 /// byte-stable, moves when the secret changes, discloses nothing.
-fn secret_digest(secret: &str) -> String {
+/// The replica apply re-computes it over the key it already holds to
+/// decide whether the blob describes that same key (Story 9.4 D3).
+pub(crate) fn secret_digest(secret: &str) -> String {
     format!("sha256:{}", sha256_hex(secret.as_bytes()))
 }
 
@@ -546,6 +599,7 @@ mod tests {
             geoip: None,
             bot_protection: None,
             group_name: String::new(),
+            node_selector: Vec::new(),
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,

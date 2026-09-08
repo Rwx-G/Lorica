@@ -193,22 +193,16 @@ impl ConfigStore {
     }
 
     /// Persist live facts the session layer observed (address, build
-    /// version, schema version, last seen). Absent nodes are ignored.
-    pub fn touch_cluster_node(
-        &self,
-        node_id: &str,
-        address: &str,
-        version: &str,
-        schema_version: i64,
-        last_seen_at: DateTime<Utc>,
-    ) -> Result<()> {
-        self.touch_cluster_nodes(&[LiveNodeFacts {
-            node_id: node_id.to_string(),
-            address: address.to_string(),
-            version: version.to_string(),
-            schema_version,
-            last_seen_at,
-        }])
+    /// version, schema version, last seen, and the configuration
+    /// generation / hash the node reports having applied). Absent
+    /// nodes are ignored.
+    ///
+    /// The facts travel as a struct rather than as a parameter list:
+    /// Story 9.4 added the applied generation and hash, and seven
+    /// positional arguments of mostly-string type is exactly how a
+    /// caller ends up swapping two of them silently.
+    pub fn touch_cluster_node(&self, facts: &LiveNodeFacts) -> Result<()> {
+        self.touch_cluster_nodes(std::slice::from_ref(facts))
     }
 
     /// [`ConfigStore::touch_cluster_node`] for a whole snapshot in one
@@ -219,7 +213,8 @@ impl ConfigStore {
         {
             let mut update = tx.prepare(
                 "UPDATE cluster_nodes SET address = ?2, version = ?3, schema_version = ?4, \
-                 last_seen_at = ?5 WHERE node_id = ?1",
+                 last_seen_at = ?5, applied_config_generation = ?6, applied_config_hash = ?7 \
+                 WHERE node_id = ?1",
             )?;
             for f in facts {
                 update.execute(params![
@@ -227,7 +222,9 @@ impl ConfigStore {
                     f.address,
                     f.version,
                     f.schema_version,
-                    f.last_seen_at.to_rfc3339()
+                    f.last_seen_at.to_rfc3339(),
+                    f.applied_config_generation,
+                    f.applied_config_hash
                 ])?;
             }
         }
@@ -350,4 +347,11 @@ pub struct LiveNodeFacts {
     pub schema_version: i64,
     /// Last activity.
     pub last_seen_at: DateTime<Utc>,
+    /// Configuration generation the node reports having applied
+    /// (Story 9.4 AC #12). Persisted so drift survives a control-plane
+    /// restart instead of resetting the whole fleet to "unknown".
+    pub applied_config_generation: i64,
+    /// Canonical hash the node reports for that generation. Empty
+    /// until the node applies its first replica.
+    pub applied_config_hash: String,
 }

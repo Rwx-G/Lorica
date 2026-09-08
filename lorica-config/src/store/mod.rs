@@ -32,6 +32,7 @@ mod certs;
 mod cluster_ca;
 mod cluster_identity;
 mod cluster_nodes;
+mod cluster_replica;
 mod cluster_tokens;
 pub use cluster_nodes::LiveNodeFacts;
 mod dns_providers;
@@ -39,6 +40,8 @@ mod loadtest;
 mod notifications;
 mod preferences;
 mod probes;
+mod replica;
+pub use replica::{ReplicaError, ReplicaOutcome};
 mod routes;
 mod row_helpers;
 mod sessions;
@@ -166,6 +169,7 @@ const MIGRATIONS: &[Migration] = &[
     (49, migrate_cluster_ca),
     (50, migrate_cluster_registry),
     (51, migrate_cluster_revoked_serial_expiry),
+    (52, migrate_cluster_replication),
 ];
 
 /// Whether `column` already exists on `table`, via `pragma_table_info`.
@@ -644,6 +648,33 @@ fn migrate_cluster_revoked_serial_expiry(conn: &Connection) -> rusqlite::Result<
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_cluster_revoked_serials_expiry
             ON cluster_revoked_serials(expires_at);",
+    )
+}
+
+fn migrate_cluster_replication(conn: &Connection) -> rusqlite::Result<()> {
+    // Story 9.4: the follower's applied-replica state and the
+    // break-glass window, plus the route-level `node_selector`
+    // (D11 / AC #13).
+    //
+    // Its own migration rather than an edit of 50 or 51: a database
+    // created earlier in the v1.7.0 cycle already records 50 and 51 and
+    // would never re-run them, so a column or a row added there would
+    // silently never appear on those installations.
+    //
+    // The state does NOT live in `cluster_state`: migration 48 typed
+    // that table's `value` column as INTEGER, and the applied hash and
+    // the break-glass deadline are text. `cluster_replica` is the text
+    // sibling; both are single-row-per-key and read through
+    // `store/cluster_replica.rs`.
+    add_column_if_absent(conn, "routes", "node_selector", "TEXT NOT NULL DEFAULT '[]'")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cluster_replica (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO cluster_replica (key, value) VALUES ('applied_config_generation', '0');
+        INSERT OR IGNORE INTO cluster_replica (key, value) VALUES ('applied_config_hash', '');
+        INSERT OR IGNORE INTO cluster_replica (key, value) VALUES ('break_glass_until', '');",
     )
 }
 
@@ -1171,6 +1202,7 @@ mod migration_tests {
         "geoip",
         "serve_robots_txt",
         "group_name",
+        "node_selector",
     ];
 
     fn max_migration_version() -> i64 {

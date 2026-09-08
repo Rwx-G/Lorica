@@ -957,6 +957,7 @@ mod tests {
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
             group_name: String::new(),
+            node_selector: Vec::new(),
             created_at: now,
             updated_at: now,
         }

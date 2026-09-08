@@ -165,6 +165,64 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Fetch a single custom crawler by its UNIQUE `name`. The name is
+    /// the cross-node key (Story 9.4 D2: nothing references the
+    /// autoincrement id, so replication keys on the name).
+    pub fn get_custom_crawler_by_name(&self, name: &str) -> Result<Option<CustomCrawler>> {
+        self.conn
+            .query_row(
+                "SELECT id, name, user_agent_pattern, verification_kind, verification_data,
+                 enabled, created_at, updated_at
+                 FROM ai_crawlers_custom WHERE name = ?1",
+                params![name],
+                row_to_custom_crawler,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Delete a custom crawler row by its UNIQUE `name`. Absent names
+    /// are a no-op: the replica apply deletes by name and must stay
+    /// idempotent.
+    pub fn delete_custom_crawler_by_name(&self, name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM ai_crawlers_custom WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    /// Write a custom crawler row exactly as given, id and timestamps
+    /// included, replacing whatever row collides on the id OR on the
+    /// UNIQUE `name` (Story 9.4 replica apply).
+    ///
+    /// Unlike [`ConfigStore::create_custom_crawler`] it does not assign
+    /// a rowid or stamp `now`: a follower must reproduce the control
+    /// plane's row byte for byte, otherwise its canonical hash would
+    /// differ forever and every node would report permanent drift. It
+    /// also skips the row-count cap, which the control plane already
+    /// enforced when the row was created there.
+    pub fn replace_custom_crawler(&self, crawler: &CustomCrawler) -> Result<()> {
+        let (kind, data) = serialize_verification(&crawler.verification)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ai_crawlers_custom
+             (id, name, user_agent_pattern, verification_kind, verification_data,
+              enabled, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                crawler.id,
+                crawler.name,
+                crawler.user_agent_pattern,
+                kind,
+                data,
+                crawler.enabled as i32,
+                crawler.created_at.to_rfc3339(),
+                crawler.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Delete a custom crawler row by id.
     pub fn delete_custom_crawler(&self, id: i64) -> Result<()> {
         let changed = self

@@ -820,6 +820,16 @@ pub struct Route {
     /// digits + `-` / `_`, 1..=64 chars.
     #[serde(default)]
     pub group_name: String,
+    /// Node names (Story 9.3 `cluster_nodes.name`) this route applies
+    /// to. Empty means every node: a fleet-wide route. A follower
+    /// whose own name is absent from a non-empty selector does not
+    /// serve the route and deletes it on apply (Story 9.4 D11), and
+    /// the same predicate scopes certificate distribution in Story
+    /// 9.5. Same character rule as `group_name` per entry
+    /// (ASCII lowercase + digits + `-` / `_`, 1..=64 chars), at most
+    /// [`NODE_SELECTOR_MAX_ENTRIES`] entries.
+    #[serde(default)]
+    pub node_selector: Vec<String>,
     /// First-insert timestamp (DB-assigned).
     pub created_at: DateTime<Utc>,
     /// Last-write timestamp (refreshed on every UPDATE).
@@ -1050,7 +1060,69 @@ fn default_captcha_alphabet() -> String {
     "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ".to_string()
 }
 
+/// Hard cap on [`Route::node_selector`] length. A selector names the
+/// nodes a route is pinned to; a fleet large enough to need more than
+/// this is better served by leaving the selector empty (fleet-wide)
+/// and disabling the route where it must not run.
+pub const NODE_SELECTOR_MAX_ENTRIES: usize = 64;
+
 impl Route {
+    /// Whether `route` is served by the node called `node_name`
+    /// (Story 9.4 D11, AC #13): true when the selector is empty
+    /// (fleet-wide) or names the node.
+    ///
+    /// ```
+    /// use lorica_config::models::Route;
+    /// # fn demo(mut route: Route) {
+    /// route.node_selector = vec!["edge-1".to_string()];
+    /// assert!(Route::route_applies_to_node(&route, "edge-1"));
+    /// assert!(!Route::route_applies_to_node(&route, "edge-2"));
+    /// route.node_selector.clear();
+    /// assert!(Route::route_applies_to_node(&route, "edge-2"));
+    /// # }
+    /// ```
+    pub fn route_applies_to_node(route: &Route, node_name: &str) -> bool {
+        route.node_selector.is_empty() || route.node_selector.iter().any(|n| n == node_name)
+    }
+
+    /// Validate [`Route::node_selector`]: at most
+    /// [`NODE_SELECTOR_MAX_ENTRIES`] entries, each one a non-empty
+    /// node name over the same alphabet as `group_name` (ASCII
+    /// lowercase letters, digits, `-` and `_`, 1..=64 chars).
+    ///
+    /// Returns a human-readable message suitable for a `400 Bad
+    /// Request` body, the same shape as
+    /// `GlobalSettings::validate_cross_fields`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` describing the first violated rule.
+    pub fn validate_node_selector(&self) -> Result<(), String> {
+        if self.node_selector.len() > NODE_SELECTOR_MAX_ENTRIES {
+            return Err(format!(
+                "node_selector may not carry more than {NODE_SELECTOR_MAX_ENTRIES} node names"
+            ));
+        }
+        for name in &self.node_selector {
+            if name.is_empty() || name.len() > 64 {
+                return Err(
+                    "node_selector entries must be 1..=64 characters long".to_string()
+                );
+            }
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+            {
+                return Err(
+                    "node_selector entries may only contain ASCII lowercase letters, \
+                     digits, `-` and `_`"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Return a clone of this route with any `Some(_)` field of `rule`
     /// merged on top (cache, rate-limit, headers, redirect, return
     /// status). `None` fields on the rule leave the route unchanged.

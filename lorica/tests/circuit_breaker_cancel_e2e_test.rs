@@ -271,6 +271,7 @@ fn test_route() -> Route {
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         group_name: String::new(),
+        node_selector: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
