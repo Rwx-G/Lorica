@@ -249,6 +249,132 @@ credentials, the live connection state and the roster from
   node's address for the duration of the window and remove the rule
   once the token is burned (examples in the hardening guide).
 
+## Configuration Replication
+
+The control plane owns the fleet's configuration. An operator changes a
+route, a backend, a WAF rule or a fleet-policy setting once, on the
+control plane, and every active node serves it.
+
+### What replicates, and what never does
+
+The payload is one canonical blob: a byte-stable JSON encoding of the
+replicated tables, hashed with SHA-256. Node-local machine facts are
+excluded **by construction**, not by a filter: the canonical settings
+type simply has no field for the certificate-export directory, the
+ownership and mode it writes with, the management port and its
+certificate paths, the GeoIP and ASN database paths, the upgrade
+signing key, the scrape token, the bot HMAC secret or the log-sink
+endpoints. A compromised control plane therefore cannot turn
+replication into an arbitrary-path file write on every edge. Users,
+sessions and preferences are never touched either: operator accounts
+stay node-local.
+
+Secret material is never in the blob. Certificate private keys,
+notification-channel payloads and DNS-provider credentials are carried
+as a `sha256:` digest, which moves when the secret changes (so drift
+detection still covers it) and discloses nothing to a follower that
+holds the blob.
+
+Certificates replicate as **metadata only** in this story. A follower
+keeps its local private key when the digest matches; a certificate
+whose key it does not hold gets its row with an empty key, is skipped
+by the TLS resolver with a warning, and the routes bound to it serve
+under the default certificate until certificate distribution delivers
+the key over its own need-to-know path.
+
+Notification channels and DNS providers are in the blob for the drift
+hash but are never applied: they are control-plane concerns. A fleet
+that configures either of them centrally will see its nodes report
+drift permanently until each node carries its own.
+
+### The two phases, and what the guarantee actually is
+
+Every mutation increments a persisted generation, encodes the blob and
+its hash, and fans out a Prepare to every connected active node under a
+per-node ten-second deadline. A node that stages it answers prepared; a
+node that refuses the blob **semantically** (an unknown field, a
+version or hash mismatch) aborts the round fleet-wide and raises an
+alert on the follower that refused it. A node that fails Prepare on
+**transport** is evicted from the commit set and the commit proceeds
+without it: a wedged or hostile follower cannot veto every
+configuration change in the fleet. Three consecutive evictions
+quarantine a node, which then converges by pull instead of by push.
+
+The honest statement of the guarantee: **all-or-none holds on Prepare,
+best-effort on Commit, eventually consistent after.** There is no
+rollback once nodes have committed. A Commit that fails after others
+succeeded leaves the fleet split; that is counted, reported on the
+replication endpoint, and reconciled by the next heartbeat, not undone.
+
+Pending nodes never receive a blob (a node awaiting activation gets no
+configuration), and neither do quarantined nodes or nodes in a
+break-glass window.
+
+### Convergence
+
+A follower reports what it runs in its session opener and in every
+heartbeat; the control plane answers with its current version. A node
+that is behind pulls the current generation and applies it, so a missed
+commit converges within one heartbeat interval and a reconnect
+converges at the handshake. When the follower already holds the current
+hash the answer carries no blob at all.
+
+Applying a replica is one transaction: the fleet-policy settings are
+merged into the local settings (node-local fields untouched), the
+replicated tables are brought to the blob's state, then the generation
+and hash are recorded and the existing reload path swaps the running
+configuration. A failure rolls the whole thing back; the node keeps
+serving what it had.
+
+### Targeting a subset
+
+A route carries a `node_selector`: a list of node names, empty meaning
+fleet-wide. A follower whose name is absent does not serve that route
+and deletes it locally. This is the same predicate certificate
+distribution needs for need-to-know key delivery, so it is defined once
+on the entity it scopes.
+
+### Follower read-only, and break-glass
+
+On a follower, a configuration mutation through the management API
+answers `409 Conflict` naming the control plane. What stays reachable
+is what is follower-local by design: every read, authentication,
+operator accounts, the audit log, the cluster commands the node owns
+(leave, status, break-glass), the validation and connectivity test
+endpoints, configuration export and import preview, and load-test start
+and abort.
+
+`lorica cluster break-glass --duration <seconds>` (max 24 hours)
+re-enables local mutations on a follower. It exists because an attacker
+who takes the control plane down would otherwise freeze incident
+response on every edge at once: no route disable, no ban, no
+certificate replacement, no WAF change, anywhere. The window is audited
+locally, bannered in `cluster status` and in the dashboard, reported to
+the control plane in every heartbeat, and excludes the node from commit
+sets while it is open. It is persisted, so a restart in the middle of
+an incident does not silently reconcile the edits away, and
+`cluster status` reads it from the local database so the banner is
+legible with the management API down. When the window ends, the next
+heartbeat tells the follower it is behind, and it pulls the current
+generation and applies it wholesale: local edits are reconciled away.
+That is the documented meaning of the control plane owning the
+configuration, and the reason break-glass is a window and not a mode.
+
+### Watching it
+
+`GET /api/v1/cluster/replication` returns the last round (prepared,
+evicted, rejected, committed, split) and the generation in flight, so
+the dashboard can show the fleet outcome of a mutation without the
+mutation itself blocking on fleet latency. `GET /api/v1/cluster/drift`
+lists nodes whose applied generation or hash differs, with the age of
+the divergence. Drift alerts are suppressed per node by an exponential
+backoff, from one minute up to one hour, so a flapping node cannot
+consume the notification budget that genuine certificate-expiry and
+backend-down alerts share. Prometheus carries
+`lorica_cluster_config_generation{node_id}`,
+`lorica_cluster_config_apply_total{node_id, outcome}` and
+`lorica_cluster_drift_nodes`.
+
 ## Node Identity in Telemetry
 
 Log-sink events (RFC 5424 syslog and OTLP) carry the emitting node's

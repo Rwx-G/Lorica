@@ -1,7 +1,7 @@
 # Story 9.4: Configuration Replication
 
 **Epic:** 9 (v1.7.0)
-**Status:** InProgress
+**Status:** Review
 **Author:** Romain G.
 
 **Depends on:** Stories 9.1, 9.2, 9.3.
@@ -63,23 +63,23 @@ during an incident.
 
 ## Tasks / Subtasks
 
-- [ ] AC #1: enumerate the allowlist; wholesale-refusal path +
+- [x] AC #1: enumerate the allowlist; wholesale-refusal path +
       notification.
-- [ ] AC #2: replica-apply function covering the five tables the import
+- [x] AC #2: replica-apply function covering the five tables the import
       path misses.
-- [ ] AC #3: wire generation + canonical hash.
-- [ ] AC #4: payload-bearing Prepare/Commit/Abort messages.
-- [ ] AC #5: transport-timeout eviction, quarantine threshold, per-node
+- [x] AC #3: wire generation + canonical hash.
+- [x] AC #4: payload-bearing Prepare/Commit/Abort messages.
+- [x] AC #5: transport-timeout eviction, quarantine threshold, per-node
       deadline.
-- [ ] AC #6: split-fleet reconciliation on heartbeat + docs.
-- [ ] AC #7: reconnect convergence with hash-keyed delta.
-- [ ] AC #8: completion channel from the coordinator back to the handler.
-- [ ] AC #9: replica persist + arc-swap apply.
-- [ ] AC #10: read-only gate + allow-list; 409 bodies.
-- [ ] AC #11: break-glass command, banners, audit, reconciliation.
-- [ ] AC #12: drift endpoint, notification budget, suppression.
-- [ ] AC #13: `node_selector` plumbing.
-- [ ] AC #14: metrics.
+- [x] AC #6: split-fleet reconciliation on heartbeat + docs.
+- [x] AC #7: reconnect convergence with hash-keyed delta.
+- [x] AC #8: completion channel from the coordinator back to the handler.
+- [x] AC #9: replica persist + arc-swap apply.
+- [x] AC #10: read-only gate + allow-list; 409 bodies.
+- [x] AC #11: break-glass command, banners, audit, reconciliation.
+- [x] AC #12: drift endpoint, notification budget, suppression.
+- [x] AC #13: `node_selector` plumbing.
+- [x] AC #14: metrics.
 
 ## Dev Notes
 
@@ -208,6 +208,13 @@ possibly dropping a security-relevant setting.
   (`supervisor.rs::coordinate_config_reload`), the reload consumer in
   both startup modes (a `watch<u64>` that coalesces), the 26
   `notify_config_changed` call sites, and the store's per-table APIs.
+- 2026-09-08: Phase 2 implemented in three parallel streams against a
+  written type contract (transport, store, and everything above them),
+  then joined in the binary. Migration 52 adds `cluster_replica` and
+  `routes.node_selector`; the migration-head assertions in
+  `lorica-config/src/tests.rs` move with it. Three clippy gates green
+  (`lorica-cluster --all-targets`; the five product crates; `lorica
+  --all-targets --features otel`).
 
 ### Completion Notes
 
@@ -324,17 +331,97 @@ possibly dropping a security-relevant setting.
     `lorica_cluster_config_apply_total{node_id, outcome}`,
     `lorica_cluster_drift_nodes`.
 
+- **Phase 2 implementation notes** (2026-09-08), where the shipped
+  code departs from or sharpens the Phase 1 decisions:
+  - **D6 revised: the coordinator is its own task, not a tail call.**
+    Hanging `replicate_after_reload` off the end of each mode's reload
+    consumer would have duplicated it in `single.rs` and
+    `supervisor.rs` and tied fleet latency to the local swap. It is
+    instead `spawn_replication_watch`, one task inside the control
+    plane owning its own `watch` subscription. The store commits
+    before the reload signal fires, so the blob it encodes is the
+    configuration this node owns regardless of when its own data plane
+    finishes swapping, and several mutations arriving during a round
+    collapse into one round on the state they all committed to.
+  - **The version is published BEFORE the round, and at boot.** The
+    `HelloAck` and every `HeartbeatAck` read one `ArcSwap` shared with
+    the coordinator (`ControlPlane::config_version_handle`). It is
+    seeded from the store before the first session is admitted:
+    a follower connecting during startup must not be told the control
+    plane is at generation 0 and wipe itself.
+  - **Break-glass survives a restart.** The window is persisted
+    (`cluster_break_glass_until`) and restored into the follower's
+    watch at boot with a WARN banner, and `lorica cluster status`
+    reads it straight from the store so the banner is legible with the
+    management API down, which is the situation break-glass exists
+    for. `cluster status` on a follower now also reports the applied
+    generation and hash from `cluster_applied_config` instead of the
+    control plane's `cluster_config_generation`, which a follower
+    never increments.
+  - **A Prepare during break-glass is refused, not ignored.** The
+    control plane already skips break-glass nodes from the flag in the
+    last `Hello` or `Heartbeat`, so a push inside a window only
+    happens when the operator opened it in the last heartbeat
+    interval. Refusing aborts that one round fleet-wide and says why;
+    the next round skips the node. Staging it would wipe the edits the
+    window exists to allow. The refusal raises no alert (it is the
+    operator's own doing); every other refusal, pushed or pulled,
+    raises `cluster_config_refused` through one path.
+  - **The applied marker is written after the apply transaction, not
+    inside it.** A failure between the two leaves the node serving the
+    new generation while still reporting the old one, so it pulls and
+    re-applies; every write in `apply_replica` is an upsert keyed on
+    the blob's ids, so replaying converges instead of duplicating.
+  - **The follower's watches are written with `send_replace`, not
+    `send`.** A `watch` send is a no-op once every receiver is gone, so
+    the break-glass window and the leave flag (authoritative state the
+    API reads back, not only a wake-up) would have stopped updating if
+    the dialer task ever ended. Caught by the new API test, which
+    holds no receiver.
+  - **Drift evaluation is a 60 s task in the binary**, separate from
+    `drift_report`, which the API endpoint calls. The endpoint records
+    first-seen times but never fires: the alert decision and its
+    per-node backoff belong to the periodic task, so reading the
+    endpoint cannot consume a node's suppression budget.
+
 ## File List
 
-Anticipated:
+Created:
 
-- `lorica-cluster/src/replication.rs`, `allowlist.rs`
-- `lorica-config/src/store/replica.rs` (replica-apply)
-- `lorica-api/src/middleware/authorize.rs` (read-only gate + allow-list)
-- `lorica-api/src/server.rs` (completion channel)
-- `lorica/src/startup/supervisor.rs` (cluster generation threading)
-- `lorica/src/cli.rs` (`cluster break-glass`)
-- `lorica-api/openapi.yaml`, `docs/cluster.md`
+- `lorica-cluster/src/replication.rs` (payload/version types, the
+  two-phase `Replicator`, the report)
+- `lorica-cluster/tests/replication.rs`
+- `lorica-config/src/store/replica.rs` (`prepare_replica`,
+  `apply_replica`, `ReplicaError`, `ReplicaOutcome`)
+- `lorica-config/src/store/cluster_replica.rs` (applied generation and
+  hash, break-glass window)
+
+Modified:
+
+- `lorica-cluster/proto/cluster.proto`, `src/messages.rs`,
+  `src/bridge.rs`, `src/dialer.rs`, `src/enroll.rs`, `src/frame.rs`,
+  `src/handshake.rs`, `src/lib.rs`, `src/listener/operational.rs`,
+  `src/roster.rs`, `tests/cluster_plane.rs`, `tests/enrollment.rs`,
+  `tests/mtls_handshake.rs`
+- `lorica-config/src/canonical.rs`, `src/diff.rs`, `src/lib.rs`,
+  `src/models/mod.rs`, `src/models/route.rs`, `src/models/tests.rs`,
+  `src/store/ai_crawlers.rs`, `src/store/cluster_nodes.rs`,
+  `src/store/mod.rs` (migration 52), `src/store/routes.rs`,
+  `src/store/row_helpers.rs`, `src/tests.rs`
+- `lorica-api/src/cluster/mod.rs`, `src/cluster/runtime.rs`,
+  `src/metrics.rs`, `src/middleware/authorize.rs`, `src/server.rs`,
+  `src/ai_crawlers.rs`, `src/routes/crud.rs`, `src/tests.rs`,
+  `openapi.yaml`
+- `lorica-notify/src/events.rs`, `src/channels/slack.rs`
+- `lorica/src/cli.rs`, `src/cli_cluster.rs`, `src/main.rs`,
+  `src/mtls.rs`, `src/proxy_wiring/tests.rs`,
+  `src/proxy_wiring/cert_reload_commit_tests.rs`,
+  `src/startup/cluster_plane.rs`, `src/startup/cluster_follower.rs`,
+  `src/startup/mod.rs`, `src/startup/single.rs`,
+  `src/startup/supervisor.rs`, eleven `tests/*_test.rs` fixtures
+  (the new `Route.node_selector` field)
+- `lorica-bench/src/active_probes.rs`, `src/passive_sla/tests.rs`
+- `docs/cluster.md`
 
 ## Change Log
 
@@ -342,3 +429,4 @@ Anticipated:
 |------|---------|-------------|--------|
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Slow-node eviction replaces fleet-wide veto; replication allowlist replaces wholesale settings replication; break-glass added. Status Draft. | Romain G. |
 | 2026-09-06 | 0.2 | Phase 1 review: thirteen decisions recorded (canonical blob as payload, transactional replica-apply, certificate metadata in 9.4, tags 20-39 protocol with pull and heartbeat convergence, coordinator after the local reload, report-based completion, read-only gate, break-glass, drift with per-node suppression, node_selector on the route). Status InProgress. | Romain G. |
+| 2026-09-08 | 0.3 | Implementation complete across the four layers: transport (`replication.rs`, bidirectional dialer, tags 20-23), store (`replica.rs`, `cluster_replica.rs`, migration 52 with `routes.node_selector`), API (replication/drift/break-glass endpoints, follower read-only gate, three Prometheus families), binary (replication watch, drift watch, `ReplicaHandler`, `cluster break-glass`). Three clippy gates green. Status Review. | Romain G. |
