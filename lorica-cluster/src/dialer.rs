@@ -237,10 +237,11 @@ pub trait FollowerHandler: Send + Sync + 'static {
     /// Apply an operator-issued fleet-wide ban (Story 9.6 AC #10).
     ///
     /// `Ok(true)` means the ban is now live on this node. `Ok(false)`
-    /// means this node has no data-plane ban map to write to (an API
-    /// node with no proxy), which is a legitimate answer rather than a
-    /// failure. `Err` is a local failure, answered with the opaque
-    /// refusal, session kept.
+    /// means it could not be applied right now (in worker mode, no
+    /// worker is up to receive it), which is a legitimate answer
+    /// rather than a failure: a worker starting later picks the ban
+    /// up from the store. `Err` is a local failure, answered with the
+    /// opaque refusal, session kept.
     ///
     /// Only ever operator-issued: automatic per-node auto-ban is not
     /// replicated, because one node's reflex to its own traffic would

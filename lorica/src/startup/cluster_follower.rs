@@ -81,6 +81,76 @@ const PULL_TIMEOUT: Duration = Duration::from_secs(30);
 /// short-circuits on an empty result without touching the session.
 const KEY_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How this process reaches its data-plane ban map (Story 9.6 AC #10).
+///
+/// Two shapes because the two process modes genuinely differ, and both
+/// already exist for the local ban paths: single-process holds the
+/// shared map, supervisor mode broadcasts a `BanIp` command to every
+/// worker. Reusing the existing mechanisms means a fleet-wide ban and
+/// a local one land the same way and are visible in the same place.
+/// One type for both directions, because a mode that can apply a ban
+/// is exactly the mode that can read them back: splitting them into
+/// two enums produced two parallel matches that could disagree about
+/// which mode this process is in.
+#[derive(Clone)]
+pub(crate) enum BanApplier {
+    /// Single-process: the shared data-plane map, read and written
+    /// directly.
+    Direct(Arc<lorica_api::ban::BanMap>),
+    /// Supervisor mode: the map lives in each worker. Writes go out on
+    /// the same broadcast the local WAF auto-ban uses; reads come from
+    /// what the workers already report, which is the same source
+    /// `GET /api/v1/bans` uses, so the fleet view and the local view
+    /// cannot disagree.
+    Workers {
+        /// `(ip, duration_s, reason)` to every per-worker task.
+        broadcast: tokio::sync::broadcast::Sender<(String, u64, i32)>,
+        /// The per-worker reports, already merged.
+        reports: Arc<lorica_api::workers::AggregatedMetrics>,
+    },
+}
+
+impl BanApplier {
+    /// The bans live on this node right now, bounded, as the wire
+    /// wants them (Story 9.6 AC #10).
+    ///
+    /// Bans have no table (decision D3): they are an in-memory map
+    /// rebuilt from nothing on restart, so this is a snapshot for
+    /// visibility and is lossy across a restart by construction.
+    pub(crate) async fn snapshot(&self) -> Vec<lorica_cluster::TelemetryBan> {
+        match self {
+            Self::Direct(map) => map
+                .iter()
+                .filter_map(|entry| {
+                    let record = entry.value();
+                    let elapsed = record.banned_at.elapsed().as_secs();
+                    // An entry past its duration has not been reaped
+                    // yet; it is not a ban and must not show as one.
+                    (elapsed < record.duration_s).then(|| lorica_cluster::TelemetryBan {
+                        client_ip: entry.key().clone(),
+                        remaining_s: record.duration_s - elapsed,
+                        reason: record.reason.as_str().to_string(),
+                    })
+                })
+                .take(lorica_cluster::MAX_TELEMETRY_BANS)
+                .collect(),
+            Self::Workers { reports, .. } => reports
+                .merged_ban_list()
+                .await
+                .into_iter()
+                .map(
+                    |(client_ip, remaining_s, _duration, reason)| lorica_cluster::TelemetryBan {
+                        client_ip,
+                        remaining_s,
+                        reason: reason.as_str().to_string(),
+                    },
+                )
+                .take(lorica_cluster::MAX_TELEMETRY_BANS)
+                .collect(),
+        }
+    }
+}
+
 /// Inputs for [`spawn_follower`].
 pub(crate) struct FollowerOptions {
     /// Whether this process also runs a control plane (`--cluster-listen`).
@@ -93,6 +163,8 @@ pub(crate) struct FollowerOptions {
     pub config_reload: watch::Sender<u64>,
     /// The alert dispatcher (`ClusterConfigRefused`).
     pub alert_sender: AlertSender,
+    /// How to apply a fleet-wide ban locally (Story 9.6 AC #10).
+    pub bans: BanApplier,
 }
 
 /// Live handles for a running follower.
@@ -103,12 +175,35 @@ pub(crate) struct FollowerPlane {
     /// (both need to reach it after spawn).
     dialer: Arc<std::sync::Mutex<Option<DialerHandle>>>,
     tasks: Vec<JoinHandle<()>>,
+    /// Tasks adopted after construction; see [`FollowerPlane::watch`].
+    extra: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 impl FollowerPlane {
+    /// Adopt a task that must stop when this plane does.
+    ///
+    /// The telemetry drain is spawned after the plane exists (it
+    /// needs the runtime handle), so it cannot be in `tasks` at
+    /// construction; handing it over here keeps `shutdown` the single
+    /// place that stops everything.
+    pub fn watch(&self, task: JoinHandle<()>) {
+        self.extra
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(task);
+    }
+
     /// Stop dialing and the background tasks.
     pub fn shutdown(self) {
         for task in self.tasks {
+            task.abort();
+        }
+        for task in self
+            .extra
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+        {
             task.abort();
         }
         if let Some(dialer) = self
@@ -177,6 +272,8 @@ struct ReplicaHandler {
     /// request the control plane initiated, which is precisely the bug
     /// that made AC #8 conditional.
     connection: std::sync::OnceLock<lorica_cluster::ClusterConnection>,
+    /// How a fleet-wide ban reaches this node's data plane.
+    bans: BanApplier,
     /// `(generation, phase)` pairs already alerted on, so a generation
     /// this node cannot take raises one alert instead of one per
     /// heartbeat. Bounded by the number of generations this process
@@ -757,6 +854,57 @@ impl FollowerHandler for ReplicaHandler {
         })
     }
 
+    fn on_ban_push(
+        &self,
+        client_ip: String,
+        duration_s: u64,
+        reason: String,
+    ) -> BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async move {
+            // The reason travelled as text on the wire but the data
+            // plane stores an enum, so an unknown one lands as a
+            // manual ban rather than being mislabelled as an
+            // automatic one: this arrived from an operator, whatever
+            // string they used.
+            let reason_code = match reason.as_str() {
+                "rate_limit" => lorica_api::ban::BanReason::RateLimit,
+                "waf_flood" => lorica_api::ban::BanReason::WafFlood,
+                "waf_critical_rule" => lorica_api::ban::BanReason::WafCriticalRule,
+                _ => lorica_api::ban::BanReason::Manual,
+            };
+            match &self.bans {
+                BanApplier::Direct(map) => {
+                    map.insert(
+                        client_ip.clone(),
+                        lorica_api::ban::BanRecord {
+                            banned_at: std::time::Instant::now(),
+                            duration_s,
+                            reason: reason_code,
+                        },
+                    );
+                    info!(client_ip = %client_ip, duration_s, "applied a fleet-wide ban");
+                    Ok(true)
+                }
+                BanApplier::Workers { broadcast: tx, .. } => {
+                    // A send with no subscribers is not an error: it
+                    // means no worker is up right now, and a worker
+                    // that starts later picks the ban up from the
+                    // store on its next reload.
+                    let applied = tx
+                        .send((client_ip.clone(), duration_s, reason_code.as_i32()))
+                        .is_ok();
+                    info!(
+                        client_ip = %client_ip,
+                        duration_s,
+                        applied,
+                        "broadcast a fleet-wide ban to the workers"
+                    );
+                    Ok(applied)
+                }
+            }
+        })
+    }
+
     fn on_challenge_retract(&self, token: String) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             let removed = db_blocking(&self.store, move |store| {
@@ -842,6 +990,7 @@ pub(crate) async fn spawn_follower(
         config_reload: opts.config_reload,
         alert_sender: opts.alert_sender,
         staged: StdMutex::new(None),
+        bans: opts.bans,
         alerted: StdMutex::new(HashSet::new()),
         connection: std::sync::OnceLock::new(),
     });
@@ -986,6 +1135,7 @@ pub(crate) async fn spawn_follower(
         runtime,
         dialer,
         tasks: vec![leave_task, renewal_task, key_reconciler],
+        extra: StdMutex::new(Vec::new()),
     }))
 }
 

@@ -145,7 +145,7 @@ pub use messages::{
 pub use preauth::{source_key, AttemptWindow, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
 pub use telemetry::{
     storage_verdict, IngestQuota, IngestVerdict, DEFAULT_BYTES_PER_WINDOW,
-    DEFAULT_ROWS_PER_WINDOW, DEFAULT_STORAGE_FLOOR_BYTES, QUOTA_RETRY_AFTER_S, QUOTA_WINDOW,
+    DEFAULT_ROWS_PER_WINDOW, DEFAULT_STORAGE_CAP_BYTES, QUOTA_RETRY_AFTER_S, QUOTA_WINDOW,
 };
 pub use replication::{
     safe_reason, AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport,

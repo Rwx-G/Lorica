@@ -390,8 +390,12 @@ pub(crate) fn run_single_process(cli: Cli) {
                 log_store: log_store.clone(),
                 alert_sender: alert_sender.clone(),
                 config_reload: config_reload_tx.clone(),
+                data_dir: data_dir.clone(),
             },
             &store,
+            // Single-process: a fleet-wide ban writes the shared
+            // data-plane map the request path already reads.
+            startup::cluster_follower::BanApplier::Direct(Arc::clone(&proxy_ban_list)),
         )
         .await;
 

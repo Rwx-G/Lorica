@@ -465,7 +465,12 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // `lorica_ban_broadcast_lagged_total{worker_id}` Prometheus
         // counter and the ban is still persisted to SQLite, so the
         // next `ConfigReload` picks it up.
-        let (ban_bc_tx, _) = broadcast::channel::<(String, u64)>(1024);
+        // The reason rides with the ban (Story 9.6 AC #10): a
+        // fleet-wide operator ban and a local WAF auto-ban are
+        // different events, and a worker that labelled every ban as
+        // an auto-ban would make the two indistinguishable in
+        // `GET /api/v1/bans` and in the fleet view.
+        let (ban_bc_tx, _) = broadcast::channel::<(String, u64, i32)>(1024);
         // Clone for the API's watch-based reload signal
         let reload_bc_tx_clone = reload_bc_tx.clone();
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
@@ -818,7 +823,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
                                                             "global WAF auto-ban: IP banned for repeated violations"
                                                         );
                                                         // Broadcast BanIp to all workers
-                                                        let _ = ban_tx.send((event.client_ip.clone(), duration_s));
+                                                        let _ = ban_tx.send((
+                                                            event.client_ip.clone(),
+                                                            duration_s,
+                                                            lorica_api::ban::BanReason::WafCriticalRule.as_i32(),
+                                                        ));
                                                         // Dispatch ip_banned alert
                                                         alert_tx.send(
                                                             lorica_notify::AlertEvent::new(
@@ -1014,8 +1023,16 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 log_store: log_store.clone(),
                 alert_sender: alert_sender.clone(),
                 config_reload: config_reload_tx.clone(),
+                data_dir: PathBuf::from(&hu_cli.data_dir),
             },
             &store,
+            // Supervisor mode: the ban map lives in each worker, so a
+            // fleet-wide ban rides the same broadcast the local WAF
+            // auto-ban uses and lands as a `BanIp` command.
+            startup::cluster_follower::BanApplier::Workers {
+                broadcast: ban_bc_tx.clone(),
+                reports: Arc::clone(&aggregated_metrics),
+            },
         )
         .await;
 
@@ -1628,7 +1645,7 @@ fn spawn_worker_channel_task(
     worker_id: u32,
     worker_pid: i32,
     mut channel: lorica_command::CommandChannel,
-    mut ban_rx: tokio::sync::broadcast::Receiver<(String, u64)>,
+    mut ban_rx: tokio::sync::broadcast::Receiver<(String, u64, i32)>,
     mut reload_rx: tokio::sync::broadcast::Receiver<u64>,
     hb_seq: Arc<std::sync::atomic::AtomicU64>,
     hb_shutting_down: Arc<std::sync::atomic::AtomicBool>,
@@ -1648,14 +1665,9 @@ fn spawn_worker_channel_task(
                         // BanIp command from supervisor's global WAF counter
                         ban_result = ban_rx.recv() => {
                             match ban_result {
-                                Ok((ip, duration_s)) => {
+                                Ok((ip, duration_s, reason)) => {
                                     let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
-                                    let cmd = Command::ban_ip(
-                                        seq,
-                                        &ip,
-                                        duration_s,
-                                        lorica_api::ban::BanReason::WafCriticalRule.as_i32(),
-                                    );
+                                    let cmd = Command::ban_ip(seq, &ip, duration_s, reason);
                                     if let Err(e) = channel.send(&cmd).await {
                                         warn!(worker_id, error = %e, "BanIp send failed");
                                         continue;

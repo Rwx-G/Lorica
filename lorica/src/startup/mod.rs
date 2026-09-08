@@ -26,6 +26,7 @@ pub(crate) mod cluster_plane;
 pub(crate) mod hot_upgrade;
 pub(crate) mod single;
 pub(crate) mod supervisor;
+pub(crate) mod telemetry_drain;
 pub(crate) mod worker;
 
 use std::collections::VecDeque;
@@ -835,7 +836,10 @@ pub(crate) struct ClusterStartup {
 pub(crate) async fn spawn_cluster_runtime(
     opts: cluster_plane::ClusterPlaneOptions,
     store: &Arc<Mutex<ConfigStore>>,
+    bans: cluster_follower::BanApplier,
 ) -> ClusterStartup {
+    let drain_logs = opts.log_store.clone();
+    let bans_for_drain = bans.clone();
     // Both roles need these; `opts` is consumed by the control-plane
     // path, so take the copies the follower needs first.
     let follower_reload = opts.config_reload.clone();
@@ -862,6 +866,7 @@ pub(crate) async fn spawn_cluster_runtime(
             is_control_plane: plane.is_some(),
             config_reload: follower_reload,
             alert_sender: follower_alerts,
+            bans,
         },
         store,
     )
@@ -873,6 +878,20 @@ pub(crate) async fn spawn_cluster_runtime(
             std::process::exit(1);
         }
     };
+    // Story 9.6 AC #5/#7: the follower's telemetry drain. It rides
+    // the same connection the dialer owns and reads the shared log
+    // store by cursor, so it starts here, once the follower exists,
+    // and only on a node that actually has a control plane to report
+    // to.
+    if let Some(follower) = &follower {
+        let drain = telemetry_drain::spawn_telemetry_drain(
+            Arc::clone(&follower.runtime),
+            drain_logs,
+            Arc::clone(store),
+            bans_for_drain,
+        );
+        follower.watch(drain);
+    }
     let runtime = match (&plane, &follower) {
         (Some(plane), _) => {
             // One runtime handle shared by the API and the binary's

@@ -241,6 +241,57 @@ pub fn inc_cluster_config_apply(node_id: &str, outcome: &str) {
         .inc();
 }
 
+/// Telemetry rows the control plane refused to store, per node and
+/// reason (Story 9.6 AC #5/#8).
+///
+/// `reason` is `node_quota` (that node is over its own budget) or
+/// `storage_watermark` (the fan-in database is at its cap, so EVERY
+/// node is shed). The two need different operator responses: the
+/// first is one misbehaving node, the second is retention not keeping
+/// up fleet-wide.
+///
+/// Bounded cardinality: fleet size times two.
+static CLUSTER_TELEMETRY_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "lorica_cluster_telemetry_dropped_total",
+        "Telemetry rows the control plane did not store, by node and reason",
+        &["node_id", "reason"],
+    )
+});
+
+/// Count `rows` dropped for `node_id` with `reason` (AC #5/#8).
+pub fn inc_cluster_telemetry_dropped(node_id: &str, reason: &str, rows: u64) {
+    if rows == 0 {
+        return;
+    }
+    CLUSTER_TELEMETRY_DROPPED_TOTAL
+        .with_label_values(&[node_id, reason])
+        .inc_by(rows);
+}
+
+/// Telemetry rows the control plane stored, per node (Story 9.6).
+///
+/// The denominator for the drop counter: without it, a non-zero drop
+/// count says nothing about whether a node is mostly fine or mostly
+/// shed.
+static CLUSTER_TELEMETRY_INGESTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "lorica_cluster_telemetry_ingested_total",
+        "Telemetry rows the control plane stored, by node",
+        &["node_id"],
+    )
+});
+
+/// Count `rows` stored for `node_id`.
+pub fn inc_cluster_telemetry_ingested(node_id: &str, rows: u64) {
+    if rows == 0 {
+        return;
+    }
+    CLUSTER_TELEMETRY_INGESTED_TOTAL
+        .with_label_values(&[node_id])
+        .inc_by(rows);
+}
+
 /// Publish the number of drifted nodes (Story 9.4 AC #12).
 pub fn set_cluster_drift_nodes(count: usize) {
     CLUSTER_DRIFT_NODES.set(i64::try_from(count).unwrap_or(i64::MAX));

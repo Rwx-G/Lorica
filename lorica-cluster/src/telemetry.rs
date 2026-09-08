@@ -70,12 +70,21 @@ pub const DEFAULT_BYTES_PER_WINDOW: u64 = 64 * 1024 * 1024;
 /// What a node over its quota is told to wait, in seconds.
 pub const QUOTA_RETRY_AFTER_S: u32 = 30;
 
-/// Free bytes below which telemetry is shed entirely.
+/// How large the fan-in database may grow before telemetry is shed
+/// entirely.
 ///
-/// Not a percentage: what matters is the absolute room left for the
-/// configuration store, the audit chain and the WAL files, and that
-/// is a roughly fixed quantity rather than a share of the disk.
-pub const DEFAULT_STORAGE_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
+/// A cap on the telemetry database's OWN size rather than a free-disk
+/// floor, and that is the deliberate choice. The thing this protects
+/// against is the one thing fan-in can grow without bound; free disk
+/// moves for reasons that have nothing to do with the fleet, so a
+/// floor on it would shed telemetry because something else filled the
+/// volume, and would keep accepting telemetry on a huge volume long
+/// after the database had become unmanageable.
+///
+/// Bounding the database directly leaves the rest of the volume for
+/// the configuration store and the audit chain, which is what AC #8
+/// actually asks for, and it needs no syscall beyond a file stat.
+pub const DEFAULT_STORAGE_CAP_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// How much of one batch a node may store right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,21 +304,20 @@ impl IngestQuota {
 ///
 /// Separate from [`IngestQuota`] because it is a different question
 /// with a different answer: the quota is about fairness between
-/// nodes, this is about whether the disk can take anything. When this
+/// nodes, this is about whether there is room for anything. When this
 /// says no, EVERY node is shed, including one well inside its quota.
 ///
-/// Returns the verdict and the free byte count that produced it, so a
-/// caller can log the number rather than just the decision.
-pub fn storage_verdict(free_bytes: u64, floor_bytes: u64) -> (IngestVerdict, u64) {
-    if free_bytes < floor_bytes {
-        (
-            IngestVerdict::Shed {
-                retry_after_s: QUOTA_RETRY_AFTER_S,
-            },
-            free_bytes,
-        )
+/// `used_bytes` is the size of the fan-in database itself. Retention
+/// is what normally keeps it under the cap; reaching the cap means
+/// retention is not keeping up, and shedding is what stops the
+/// database from growing while an operator finds out why.
+pub fn storage_verdict(used_bytes: u64, cap_bytes: u64) -> IngestVerdict {
+    if used_bytes >= cap_bytes {
+        IngestVerdict::Shed {
+            retry_after_s: QUOTA_RETRY_AFTER_S,
+        }
     } else {
-        (IngestVerdict::Accept, free_bytes)
+        IngestVerdict::Accept
     }
 }
 
@@ -415,15 +423,21 @@ mod tests {
 
     #[test]
     fn the_watermark_sheds_every_node_at_once() {
-        // Not a per-node decision: when the disk is short, a node well
-        // inside its quota is shed too, because the question is
-        // whether there is room for the configuration and audit writes
-        // that must never fail.
-        let (verdict, free) = storage_verdict(100, DEFAULT_STORAGE_FLOOR_BYTES);
-        assert!(matches!(verdict, IngestVerdict::Shed { .. }));
-        assert_eq!(free, 100);
-        let (verdict, _) = storage_verdict(DEFAULT_STORAGE_FLOOR_BYTES + 1, DEFAULT_STORAGE_FLOOR_BYTES);
-        assert_eq!(verdict, IngestVerdict::Accept);
+        // Not a per-node decision: at the cap, a node well inside its
+        // quota is shed too, because the question is whether there is
+        // room for anything rather than whose turn it is.
+        assert!(matches!(
+            storage_verdict(DEFAULT_STORAGE_CAP_BYTES, DEFAULT_STORAGE_CAP_BYTES),
+            IngestVerdict::Shed { .. }
+        ));
+        assert!(matches!(
+            storage_verdict(DEFAULT_STORAGE_CAP_BYTES + 1, DEFAULT_STORAGE_CAP_BYTES),
+            IngestVerdict::Shed { .. }
+        ));
+        assert_eq!(
+            storage_verdict(DEFAULT_STORAGE_CAP_BYTES - 1, DEFAULT_STORAGE_CAP_BYTES),
+            IngestVerdict::Accept
+        );
     }
 
     #[test]

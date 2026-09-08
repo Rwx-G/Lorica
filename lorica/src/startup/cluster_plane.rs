@@ -60,11 +60,13 @@ use lorica_api::cluster::runtime::{publish_token_liveness, refresh_control_plane
 use lorica_api::cluster::ControlPlaneRuntime;
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
+use lorica_api::cluster_telemetry_store::ClusterTelemetryStore;
 use lorica_api::log_store::LogStore;
 use lorica_cluster::enroll::{
     BoxFuture, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, RenewGrant,
     RenewRequest, SessionHandler,
 };
+use lorica_cluster::IngestQuota;
 use lorica_cluster::{
     token, AppliedConfig, CertBundle, ClusterCa, ConfigPayload, ControlPlane, EnrollmentHandle,
     EnrollmentListener, EnrollmentStats, FleetHooks, HandshakeConfig, IssuedLeaf,
@@ -155,6 +157,9 @@ pub(crate) struct ClusterPlaneOptions {
     /// subscribes to it and replicates the new generation to the fleet
     /// after every local mutation (Story 9.4 AC #3).
     pub config_reload: watch::Sender<u64>,
+    /// The data directory, where the fan-in database is created
+    /// beside `lorica.db` and `access-log.db` (Story 9.6 AC #2).
+    pub data_dir: std::path::PathBuf,
 }
 
 /// Live handles for a running control-plane cluster plane. Dropping
@@ -463,6 +468,69 @@ pub(crate) async fn redeem_with_store(
 /// The binary's redemption and lifecycle hooks: the store, the CA
 /// (through the control-plane handle), the audit log and the alert
 /// dispatcher behind the transport crate's traits.
+/// Roughly what a batch will cost on disk, for the byte side of the
+/// ingest quota (Story 9.6 AC #8).
+///
+/// Estimated from the decoded payload rather than measured from the
+/// frame: the frame is gone by the time this runs, and what the quota
+/// is protecting is disk, not bandwidth. The fixed addend per row
+/// stands in for the row overhead SQLite adds on top of the strings.
+fn estimated_bytes(batch: &lorica_cluster::TelemetryPush) -> u64 {
+    const ROW_OVERHEAD: u64 = 64;
+    let access: u64 = batch
+        .access
+        .iter()
+        .map(|r| {
+            ROW_OVERHEAD
+                + (r.timestamp.len()
+                    + r.method.len()
+                    + r.path.len()
+                    + r.host.len()
+                    + r.backend.len()
+                    + r.error.len()
+                    + r.client_ip.len()
+                    + r.xff_proxy_ip.len()
+                    + r.source.len()
+                    + r.request_id.len()) as u64
+        })
+        .sum();
+    let waf: u64 = batch
+        .waf
+        .iter()
+        .map(|r| {
+            ROW_OVERHEAD
+                + (r.description.len()
+                    + r.category.len()
+                    + r.matched_field.len()
+                    + r.matched_value.len()
+                    + r.timestamp.len()
+                    + r.client_ip.len()
+                    + r.route_hostname.len()
+                    + r.action.len()) as u64
+        })
+        .sum();
+    access + waf
+}
+
+/// How large the fan-in database and its write-ahead log currently
+/// are, for the storage watermark (Story 9.6 AC #8).
+///
+/// The WAL counts: it is where recently ingested rows actually live
+/// until a checkpoint, so ignoring it would let the watermark read
+/// low exactly while ingest was at its heaviest.
+///
+/// Returns 0 when the files cannot be stated, which fails OPEN on
+/// purpose: an unreadable stat must not shed the fleet's telemetry.
+/// A genuine storage failure surfaces as a write error on the next
+/// ingest, which is refused and logged rather than guessed at here.
+fn telemetry_db_bytes(data_dir: &std::path::Path) -> u64 {
+    ["cluster-telemetry.db", "cluster-telemetry.db-wal"]
+        .iter()
+        .filter_map(|name| std::fs::metadata(data_dir.join(name)).ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 struct FleetHandlers {
     control: Arc<ControlPlane>,
     store: Arc<Mutex<ConfigStore>>,
@@ -470,6 +538,15 @@ struct FleetHandlers {
     alert_sender: AlertSender,
     /// Last renewal grant per node, for [`RENEWAL_COOLDOWN`].
     renewals: StdMutex<HashMap<String, Instant>>,
+    /// The fan-in database (Story 9.6 AC #2). `None` when it could
+    /// not be opened, in which case telemetry is refused rather than
+    /// silently dropped: a control plane that cannot store what its
+    /// fleet reports should say so.
+    telemetry: Option<Arc<ClusterTelemetryStore>>,
+    /// Per-node ingest budgets and the storage watermark (AC #8).
+    quota: IngestQuota,
+    /// Where the fan-in database lives, for the storage watermark.
+    data_dir: std::path::PathBuf,
 }
 
 impl FleetHandlers {
@@ -661,6 +738,110 @@ impl SessionHandler for FleetHandlers {
                 None,
             )
             .await;
+        })
+    }
+
+    fn on_telemetry_push(
+        &self,
+        node_id: &str,
+        batch: lorica_cluster::TelemetryPush,
+    ) -> BoxFuture<'_, Result<lorica_cluster::TelemetryPushAck, String>> {
+        let node_id = node_id.to_string();
+        Box::pin(async move {
+            let Some(telemetry) = self.telemetry.as_ref() else {
+                // Refused rather than silently accepted: a control
+                // plane that cannot store what its fleet reports must
+                // not tell the fleet it did.
+                return Err("the telemetry database is not open".to_string());
+            };
+
+            // The storage watermark first, because it overrides every
+            // per-node budget: when the disk is short, a node well
+            // inside its quota is shed too. Telemetry is the first
+            // thing dropped so configuration and audit writes are the
+            // last (AC #8).
+            let used = telemetry_db_bytes(&self.data_dir);
+            let storage =
+                lorica_cluster::storage_verdict(used, lorica_cluster::DEFAULT_STORAGE_CAP_BYTES);
+            if matches!(storage, lorica_cluster::IngestVerdict::Shed { .. }) {
+                warn!(
+                    node_id,
+                    used_bytes = used,
+                    cap_bytes = lorica_cluster::DEFAULT_STORAGE_CAP_BYTES,
+                    "shedding telemetry fleet-wide: the fan-in database is at its cap, which                      means retention is not keeping up. Configuration and audit writes keep                      the rest of the volume"
+                );
+                lorica_api::metrics::inc_cluster_telemetry_dropped(
+                    &node_id,
+                    "storage_watermark",
+                    (batch.access.len() + batch.waf.len()) as u64,
+                );
+                return Ok(lorica_cluster::TelemetryPushAck {
+                    retry_after_s: storage.retry_after_s(),
+                    ..Default::default()
+                });
+            }
+
+            // Bytes are estimated from the decoded payload rather than
+            // the frame, because the frame is gone by now and what
+            // matters is what this will cost on disk.
+            let bytes = estimated_bytes(&batch);
+            let verdict = self
+                .quota
+                .admit(&node_id, batch.access.len(), batch.waf.len(), bytes);
+            let take_access = verdict.access_allowance(batch.access.len());
+            let take_waf = verdict.waf_allowance(batch.waf.len());
+            let shed = (batch.access.len() - take_access) + (batch.waf.len() - take_waf);
+            if shed > 0 {
+                warn!(
+                    node_id,
+                    shed,
+                    offered = batch.access.len() + batch.waf.len(),
+                    "the node is over its telemetry ingest quota; the excess is dropped and                      counted"
+                );
+                lorica_api::metrics::inc_cluster_telemetry_dropped(
+                    &node_id,
+                    "node_quota",
+                    shed as u64,
+                );
+            }
+
+            // The ban snapshot is authoritative for the node that sent
+            // it: an address absent from it is no longer banned there
+            // (decision D3). Bans are low-volume and are never shed by
+            // the quota, which counts rows.
+            let telemetry_for_bans = Arc::clone(telemetry);
+            let bans = batch.bans.clone();
+            let ban_node = node_id.clone();
+            let ban_count = tokio::task::spawn_blocking(move || {
+                telemetry_for_bans.replace_ban_snapshot(&ban_node, &bans)
+            })
+            .await
+            .map_err(|e| format!("the ban snapshot task failed: {e}"))??;
+
+            let store = Arc::clone(telemetry);
+            let stamped = node_id.clone();
+            let access: Vec<_> = batch.access.into_iter().take(take_access).collect();
+            let waf: Vec<_> = batch.waf.into_iter().take(take_waf).collect();
+            let outcome = tokio::task::spawn_blocking(move || {
+                // `stamped` is the id the SESSION proved. Nothing in
+                // the batch names a node (decision D2).
+                store.ingest(&stamped, &access, &waf, &[])
+            })
+            .await
+            .map_err(|e| format!("the telemetry ingest task failed: {e}"))??;
+
+            lorica_api::metrics::inc_cluster_telemetry_ingested(
+                &node_id,
+                outcome.access + outcome.waf,
+            );
+            Ok(lorica_cluster::TelemetryPushAck {
+                accepted_access: outcome.access,
+                accepted_waf: outcome.waf,
+                accepted_bans: ban_count,
+                retry_after_s: verdict.retry_after_s(),
+                access_cursor: batch.access_cursor,
+                waf_cursor: batch.waf_cursor,
+            })
         })
     }
 
@@ -1316,6 +1497,15 @@ pub(crate) async fn spawn_cluster_plane(
         log_store: opts.log_store,
         alert_sender: opts.alert_sender,
         renewals: StdMutex::new(HashMap::new()),
+        telemetry: match ClusterTelemetryStore::open(&opts.data_dir) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                error!(error = %e, "could not open the cluster telemetry database;                        fan-in is refused until it opens");
+                None
+            }
+        },
+        quota: IngestQuota::new(),
+        data_dir: opts.data_dir.clone(),
     });
 
     let operational_stats = Arc::new(OperationalStats::default());
