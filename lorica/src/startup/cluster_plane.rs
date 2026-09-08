@@ -1482,7 +1482,7 @@ mod tests {
         let control = test_control(false);
         let (request, public_id) = {
             let s = store.lock().await;
-            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", None, None)
+            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", Some("edge-1"), None)
         };
         let replay = request.clone();
         let grant = redeem_with_store(&store, &control, request, Utc::now())
@@ -1507,7 +1507,7 @@ mod tests {
         let auto = test_control(true);
         let (request, _) = {
             let s = store.lock().await;
-            minted_request(&s, &auto, "192.0.2.11:5000", "edge-2", None, None)
+            minted_request(&s, &auto, "192.0.2.11:5000", "edge-2", Some("edge-2"), None)
         };
         let grant = redeem_with_store(&store, &auto, request, Utc::now())
             .await
@@ -1577,12 +1577,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_token_with_no_name_binding_is_refused_rather_than_accepting_any_name() {
+        // Story 9.5 D15. `bound_node_name` existed before this story
+        // and was optional, so an unbound token meant "any name the
+        // joiner picks". A route `node_selector` matches on that name
+        // and decides which private keys the node receives, so an
+        // unbound token is an entitlement the operator never granted.
+        // It now fails closed instead.
+        let store = store_with_key();
+        let control = test_control(false);
+        let (request, public_id) = {
+            let s = store.lock().await;
+            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", None, None)
+        };
+        assert!(
+            matches!(
+                redeem_with_store(&store, &control, request, Utc::now()).await,
+                Err(EnrollRefusal::Refused(_))
+            ),
+            "an unbound token must not enrol anything"
+        );
+        let s = store.lock().await;
+        assert!(
+            s.list_cluster_nodes().expect("list").is_empty(),
+            "nothing is enrolled by a refused redemption"
+        );
+        assert_eq!(
+            s.get_join_token(&public_id).expect("read").expect("row").state,
+            TokenState::Unused,
+            "the refusal happens before the burn, so a corrected mint is not needed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_that_does_not_match_the_binding_is_refused() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let (mut request, _) = {
+            let s = store.lock().await;
+            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", Some("edge-1"), None)
+        };
+        request.node_name = "edge-2".to_string();
+        assert!(matches!(
+            redeem_with_store(&store, &control, request, Utc::now()).await,
+            Err(EnrollRefusal::Refused(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn three_simultaneous_redemptions_of_one_token_enroll_one_node() {
         let store = store_with_key();
         let control = test_control(false);
         let (request, _) = {
             let s = store.lock().await;
-            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", None, None)
+            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", Some("edge-1"), None)
         };
         let (a, b, c) = tokio::join!(
             redeem_with_store(&store, &control, request.clone(), Utc::now()),

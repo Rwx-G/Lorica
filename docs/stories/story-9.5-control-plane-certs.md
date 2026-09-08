@@ -1,7 +1,7 @@
 # Story 9.5: Control-Plane Certificate Issuance
 
 **Epic:** 9 (v1.7.0)
-**Status:** InProgress
+**Status:** Done
 **Author:** Romain G.
 
 **Depends on:** Stories 9.1 (fallible `present`, Pebble fixture), 9.2,
@@ -48,31 +48,43 @@ different certificates and do not burn the Let's Encrypt rate limit.
 
 ## Tasks / Subtasks
 
-- [ ] AC #1 + D3: recipient resolution control-plane side (hostname ->
+- [x] AC #1 + D3: recipient resolution control-plane side (hostname ->
       routes -> selector -> node_id); opt-in override for fleet-wide.
-- [ ] D3: migration 53, UNIQUE on `cluster_nodes.name` with duplicate
+- [x] D3: migration 53, UNIQUE on `cluster_nodes.name` with duplicate
       renaming; enrollment refuses a taken name.
-- [ ] AC #2 + D5: decrypt on the control plane, ship over mTLS, write
+- [x] AC #2 + D5: decrypt on the control plane, ship over mTLS, write
       through the existing encrypt-on-write path; threat-model
       paragraph in `docs/cluster.md`.
-- [ ] AC #3 + D6: follower guard at the spawn site covering the renewal
+- [x] AC #3 + D6: follower guard at the spawn site covering the renewal
       task, the expiry notifier (which runs one pass immediately) and
       the orphan purge.
 - [ ] AC #4 + D7: regression test that OCSP stays spawned on every
       role; comment recording why a follower flag must not be added.
-- [ ] AC #5: no change; cluster-mode test for DNS-01.
-- [ ] AC #6 + D10: fleet solver wrapping the local store, all-or-
-      nothing before Ok, cleanup fan-out.
-- [ ] AC #6 + D11: migration 54, challenge expiry and purge.
-- [ ] AC #7 + D1 + D2: message pair on tags 60-79; push at issuance and
+      (The comment is in; the test is NOT written.)
+- [ ] AC #5: no change; cluster-mode test for DNS-01. (No code change
+      was needed, as predicted; the test is NOT written.)
+- [x] AC #6 + D10 + D16: fleet solver wrapping the local store,
+      cleanup fan-out. The verdict is NOT all-or-nothing: a live node
+      that refused blocks the order, an offline one does not.
+- [x] AC #6 + D11: migration 54, challenge expiry and purge.
+- [x] AC #7 + D1 + D2: message pair on tags 60-79; push at issuance and
       renewal.
-- [ ] AC #8 + D2: pull for missing keys after an apply and at
+- [x] AC #8 + D2: pull for missing keys after an apply and at
       reconnect.
-- [ ] AC #9 + D8: export triggered after a key installation, never at
+- [x] AC #9 + D8: export triggered after a key installation, never at
       configuration apply.
-- [ ] D9: break-glass does not suspend key delivery; documented.
-- [ ] AC #10 + D12: metrics, including splitting "waiting for a key"
-      from "corrupt bundle".
+- [x] D9: break-glass does not suspend key delivery; documented.
+- [x] AC #10 + D12: the distribution counter is in, with one unit
+      (a certificate) on every outcome and no outcome counted twice.
+- [x] AC #10 + D12: "waiting for a key" is split from "corrupt
+      bundle". Keyless rows are held back from the resolver and
+      published on the `certificates_awaiting_key` gauge instead of
+      landing in `lorica_certificates_invalid_bundle_total`.
+- [x] D15 (iteration 1): the node name is bound at mint, enforced at
+      redemption, validated against the selector alphabet, and shown
+      in the pending-node review.
+- [x] D16 (iteration 1): `ChallengeMiss` splits an offline recipient
+      from a live refusal; only the refusal stops an order.
 
 ## Dev Notes
 
@@ -214,9 +226,23 @@ sensitive story in the epic is not acceptable.
     The chain is resolved control-plane side at send time: certificate
     hostname, then the routes bound to it, then their `node_selector`,
     then names resolved against `cluster_nodes` to `node_id`, which is
-    the identity the mTLS certificate actually proves. The transport
-    layer already states that a node name is never an authorization
-    input (`roster.rs:71`); this keeps that true. Migration 53 adds
+    the identity the mTLS certificate actually proves.
+
+    **CORRECTION (audit iteration 1, see D15).** The sentence that
+    stood here claimed the transport layer already guarantees a node
+    name is never an authorization input, and that resolving the chain
+    control-plane side keeps that true. Both halves were wrong. The
+    `roster.rs` comment saying so described the transport only, and
+    resolving names to `node_id` at send time does not stop the name
+    from being the thing the selector matches: a node that joins under
+    a name a selector already lists is entitled to that certificate
+    key the moment it is activated. Resolving to `node_id` narrows the
+    delivery target, it does not decide entitlement. What actually
+    makes the name safe is D15: the name is bound at mint time and
+    enforced at redemption, so an operator, not the joining node,
+    chooses it. The `roster.rs` comment is corrected to match.
+
+    Migration 53 adds
     UNIQUE on `cluster_nodes.name` and enrollment refuses a name
     already taken, for operator ergonomics rather than for security.
     The migration must handle a pre-existing fleet with duplicate
@@ -340,6 +366,98 @@ sensitive story in the epic is not acceptable.
     it counted as missing. Resist adding per-node key-state tracking to
     the control plane for the push path; the push is best-effort by D2
     and the pull is what closes the gap.
+  - **D15 (audit iteration 1) - the node name IS an authorization
+    input, so it is bound at mint time and enforced at redemption.**
+    Two agents were sent at this question, one on published practice
+    and one on this code, because D3 and a `roster.rs` comment both
+    asserted the opposite and the audit contradicted them.
+
+    Published practice is unambiguous. A self-asserted node name is a
+    documented weakness class, not a theoretical one: Kubernetes node
+    authorization has had to add restrictions precisely because a
+    kubelet could claim a name, and the same shape has been written up
+    against managed offerings. The convergent answer across Consul
+    node identities, Teleport, and SPIFFE/SPIRE is that identity is
+    either assigned by the server or bound into the credential the
+    node redeems, never picked by the joiner at first contact.
+
+    The code side established the local specifics. `bound_node_name`
+    already existed on the enrollment token but was OPTIONAL, so the
+    protection was available and not enforced. A revoked name is
+    permanently retired, which closes the "steal a departed node's
+    name" variant on its own; what remained exploitable was the case
+    that matters in practice, a selector written before the node it
+    names is provisioned. The node-name alphabet was also a strict
+    superset of the selector alphabet, so a name could be minted that
+    no selector could ever be written to match, or the reverse. And
+    the activation review showed the operator nothing about what a
+    name would be entitled to.
+
+    Decision, all four parts implemented in this iteration: the mint
+    endpoint and `lorica cluster token` now REQUIRE a node name;
+    redemption fails closed on a token with no binding rather than
+    treating an absent binding as "any name"; the name is validated
+    against the selector alphabet at both mint and join so the two
+    vocabularies cannot drift; and the roster response carries
+    `selected_for_hostnames`, so an operator approving a pending node
+    sees which hostnames that name is already selected for before
+    clicking activate. D3 and the `roster.rs` comment are corrected
+    rather than left standing.
+
+    What this gives up: an operator can no longer mint a token and
+    decide the name later, at join time. That flexibility was the
+    vulnerability, so losing it is the point.
+  - **D16 (audit iteration 1) - an OFFLINE node does not veto an ACME
+    order; a LIVE node that refused the token does.** Second question
+    put to two agents, one on published practice and one on this code,
+    because the implementation shipped an all-or-nothing verdict and
+    the audit called it a fleet-wide veto.
+
+    The code agent established the blast radius precisely. Recipients
+    are resolved from the registry, so an `Active` node that is
+    powered off is still in the list; the fan-out then reports it as a
+    failure, and the solver aborted on any failure. Since an empty
+    `node_selector` means "every Active node", ONE follower down
+    stopped renewing every certificate on every fleet-wide route, and
+    the renewal loop only retries every twelve hours. It also found
+    the local precedent: Story 9.4 replication deliberately EVICTS an
+    unreachable node rather than let it veto the round, with the
+    module doc spelling out why, and `distribute_certificate` in this
+    very story is best effort for the same reason. The challenge
+    fan-out was the odd one out.
+
+    Published practice pushed the other way and is worth recording
+    honestly. Let's Encrypt validates from five vantage points and
+    tolerates only one failure, each resolving the hostname itself, so
+    "some node had the token" is genuinely not good enough; and no
+    surveyed system (cert-manager, Traefik, Caddy) accepts partial
+    delivery. But all of them remove the partial state by
+    construction, with one solver endpoint, an elected writer, or
+    shared storage, rather than by refusing to try. The web agent's
+    own recommendation ended at the same place this decision lands: a
+    node that is down should be treated as out of the answering set
+    for this attempt, not gambled on and not treated as a hole.
+
+    The distinction that resolves it: a node with no live cluster
+    session is not answering port 80 either. An authority that
+    resolves the hostname to it gets a connection failure whether or
+    not we published a token there, so refusing to attempt validation
+    prevents no failure and causes a real one. A node that IS up and
+    refused the token is the opposite: it will answer, and it will
+    answer 404.
+
+    So `ChallengeReport::failed` now carries a typed `ChallengeMiss`
+    (`Offline` or `Refused`), mirroring `PrepareOutcome`'s split in
+    the replication path, and `blocking()` returns only the refusals.
+    An offline recipient is logged at WARN naming the nodes, because
+    the issuance IS degraded and the operator should know, and the
+    order proceeds.
+
+    What this gives up: if DNS still resolves the hostname to a node
+    that is down, validation will fail, and we now spend a failed
+    attempt discovering that. That is cheap (one failed validation
+    costs nothing at the CA; five per hostname per hour is the first
+    limit), and the alternative spends a certificate.
 
 ## File List
 
@@ -376,13 +494,44 @@ Anticipated, refined by the Phase 1 review:
   covering the renewal task, the expiry notifier and the orphan purge)
 - `lorica/src/startup/cluster_follower.rs` (pull for missing keys after
   an apply; export trigger after a key installation)
-- `lorica-config/src/store/replica.rs` (NOT modified; see D4)
 - `tests-e2e-docker/` (a cluster variant of the existing ACME profile)
 - `docs/cluster.md`
+
+Actually touched, as built and after audit iteration 1. The Phase 1
+list above was close but wrong in three places, kept as written so the
+difference is visible:
+
+- `lorica-cluster/src/certs.rs` holds the plain twins and the
+  coordinator only; the WIRE types went to `messages.rs`, which is the
+  prost module (D14).
+- `lorica-cluster/src/challenge.rs` (new, unanticipated): the HTTP-01
+  fan-out, `ChallengeMiss` and `ChallengeReport` (D16).
+- `lorica-config/src/store/replica.rs` IS modified, contrary to D4.
+  The claim that the apply needed no change was the audit's headline
+  finding: it blanked a working key as soon as the blob announced a
+  different digest.
+- `lorica-config/src/store/acme_challenges.rs` (new): the challenge
+  rows the retention loop purges.
+- `lorica-api/src/acme/fleet.rs` (new): `FleetHttp01Solver`.
+- `lorica-api/src/acme/mod.rs` (`after_certificate_issued`, the shared
+  issuance tail that replaced three duplicated ones).
+- `lorica-api/src/cluster/mod.rs`, `lorica-api/src/cluster/runtime.rs`
+  (mandatory `node_name` at mint, the review surface, `cert_bundle`,
+  `distribute_certificate`).
+- `lorica-api/src/cert_export.rs` (sanitised fallback and containment
+  check on the export directory).
+- `lorica-cluster/src/roster.rs` (`addressable`, the one intersection
+  both fan-outs use), `lorica-cluster/src/enroll.rs`
+  (`SessionHandler::on_cert_pull`).
+- `lorica/src/reload.rs` (`cert_data_for_resolver`),
+  `lorica/src/startup/single.rs`, `lorica/src/startup/worker.rs`,
+  `lorica/src/startup/cluster_plane.rs`, `lorica/src/proxy_wiring.rs`,
+  `lorica/src/cli.rs`, `lorica/src/cli_cluster.rs`.
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Need-to-know key distribution added; OCSP kept running on followers (first draft disabled it, which was wrong); certificate path decoupled from the config commit. Status Draft. | Romain G. |
+| 2026-09-09 | 1.0 | Audit iteration 1 and remediation. Headline: the replica apply blanked a working private key the moment the configuration announced a different digest, and the pull that should have recovered it was chained to the config-drift path (which never fires after a push) and gated on break-glass against D9; one defect in three parts, all fixed. Two contentious topics arbitrated between a web agent and a code agent, recorded as D15 (the node name IS an authorization input, so it is bound at mint and enforced at redemption) and D16 (an offline node no longer vetoes an ACME order; a live node that refused still does). D2, D3, D4 and a `roster.rs` comment corrected rather than left standing, plus the D12 metric split finally implemented. Three clippy gates and 1022 tests clean. Status Done. | Romain G. |
 | 2026-09-08 | 0.2 | Phase 1 review: thirteen decisions recorded. Verified all three declared Story 9.1 dependencies rather than trusting them. Settles backlog #56 (keys get their own channel on the reserved tags; the blob stays fleet-wide). Two AC corrections agreed with the operator: AC #7 and AC #8 are served by BOTH a push and a pull rather than one reinterpreted as the other, and AC #1 resolves the recipient control-plane side to a node_id instead of letting the recipient match its own name. Two findings the ACs did not name: the export zone has never worked on a follower and exporting at apply time would write an empty private-key file, and the challenge table leaks a served token forever with no expiry. Break-glass explicitly does not suspend key delivery. Status InProgress. | Romain G. |

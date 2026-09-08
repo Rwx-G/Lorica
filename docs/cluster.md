@@ -140,9 +140,24 @@ usable token, and a redemption is exactly one lookup and one
 constant-time verification whether or not the id exists, so the
 enrollment path cannot be turned into a CPU or memory amplifier.
 
-Tokens live at most 24 hours (one hour by default) and can be bound at
-mint time to an expected node name and a source CIDR, both enforced at
-redemption. Minting opens the enrollment listener; the window closes
+Tokens live at most 24 hours (one hour by default). Every token is
+bound at mint time to the node name it may be redeemed under, and may
+additionally be bound to a source CIDR; both are enforced at
+redemption, and a token carrying no name binding is refused rather
+than treated as good for any name.
+
+The name is mandatory because it is an authorization input, not a
+label. A route's `node_selector` lists node names, and that list is
+what decides which certificate private keys a node is entitled to
+receive. If a joining node could choose its own name it could join
+under a name a selector already lists and be handed those keys the
+moment an operator activates it. Binding the name to the token moves
+that choice back to the operator who mints it. The name must use the
+same character set as a selector entry, so the two vocabularies
+cannot drift apart, and when an operator reviews a pending node the
+roster shows which hostnames that name is already selected for.
+
+Minting opens the enrollment listener; the window closes
 on its own when the last token is redeemed, withdrawn
 (`DELETE /api/v1/cluster/tokens/{public_id}`) or expires.
 
@@ -156,8 +171,10 @@ history, and is logged verbatim by CI and configuration-management
 ### Joining
 
 ```bash
-# On the control plane (or in the dashboard): mint a token.
-lorica cluster token --user admin --password-file <path-to-0600-file>
+# On the control plane (or in the dashboard): mint a token, naming
+# the node it is for. The name is mandatory and enforced at join.
+lorica cluster token --user admin --password-file <path-to-0600-file> \
+  --node-name edge-01
 
 # On the new node, with the service stopped:
 lorica cluster join --control-plane cp.example.com:9444 --token-stdin < token.txt
@@ -497,10 +514,26 @@ The certificate authority chooses which node it validates against, so
 an HTTP-01 token has to be present on every node that could answer for
 that hostname before validation is requested. The control plane
 distributes the token to those nodes and only then declares the
-challenge ready. A distribution that does not fully succeed aborts the
-order rather than racing the authority, which turns an opaque
-validation failure into a specific one naming the node that did not
-take the token.
+challenge ready.
+
+Two kinds of failure are told apart, because they are not the same
+situation. A node that is connected and refuses the token, or whose
+exchange times out, aborts the order: it is up, the authority will
+reach it, and it will answer 404. Aborting turns an opaque validation
+failure into a specific one naming that node. A node that has no live
+cluster session does NOT abort the order. It is answering nothing at
+all, so an authority that resolves the hostname to it gets a
+connection failure whether or not a token was published there;
+refusing to attempt validation would prevent no failure while stopping
+every renewal on a fleet-wide route for as long as one follower stays
+down. The attempt proceeds, and the skipped nodes are named in a
+warning.
+
+That warning is worth acting on. If DNS still points at a node that is
+down, validation will fail, and modern authorities validate from
+several vantage points that each resolve the name independently. A
+node that is out of the fleet for more than a moment should also be
+out of the hostname's DNS.
 
 Challenge entries carry their own deadline. Before that, an order that
 crashed between publishing a token and cleaning it up left a node

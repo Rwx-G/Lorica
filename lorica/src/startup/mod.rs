@@ -981,3 +981,65 @@ pub(crate) async fn shutdown_signal() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Story 9.5 AC #4 / D7 drift gate.
+    ///
+    /// OCSP stapling is a SERVING concern, not an issuance one: the
+    /// loop attaches staples to the resolver the node actually
+    /// terminates TLS from. Disabling it on followers would strip
+    /// stapling from exactly the nodes serving client traffic, with
+    /// no push path to replace it. AC #3 gates the renewal task and
+    /// the expiry notifier on `is_follower`; the risk this test
+    /// exists for is someone extending that guard by one line.
+    ///
+    /// The gate is deliberately a source scan rather than a runtime
+    /// assertion, because the two call sites are in DIFFERENT
+    /// PROCESSES (single-process boot, and each forked worker) and
+    /// `supervisor.rs` never calls it at all. There is no single
+    /// runtime in which both could be observed.
+    #[test]
+    fn ocsp_refresh_is_spawned_on_every_role_and_never_gated_on_being_a_follower() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/startup");
+        let mut call_sites = Vec::new();
+
+        for file in ["single.rs", "worker.rs"] {
+            let src = std::fs::read_to_string(root.join(file))
+                .unwrap_or_else(|e| panic!("test setup: {file} reads: {e}"));
+            let lines: Vec<&str> = src.lines().collect();
+            let calls: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    l.contains("spawn_ocsp_refresh_loop(") && !l.trim_start().starts_with("//")
+                })
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                calls.len(),
+                1,
+                "{file} must spawn the OCSP refresh loop exactly once; found {} call sites",
+                calls.len()
+            );
+
+            // Nothing in the enclosing run-up may make this call
+            // conditional on the node's cluster role. Twenty lines is
+            // well past the top of both call sites' blocks.
+            let call = calls[0];
+            let from = call.saturating_sub(20);
+            for (offset, line) in lines[from..call].iter().enumerate() {
+                assert!(
+                    !line.contains("is_follower"),
+                    "{file}:{}: the OCSP refresh loop must not be gated on the node being a \
+                     follower (Story 9.5 AC #4): stapling is a serving concern and a follower \
+                     is exactly the node terminating client TLS",
+                    from + offset + 1
+                );
+            }
+            call_sites.push(file);
+        }
+
+        assert_eq!(call_sites, vec!["single.rs", "worker.rs"]);
+    }
+}
