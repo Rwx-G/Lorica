@@ -358,7 +358,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// byte-stable, moves when the secret changes, discloses nothing.
 /// The replica apply re-computes it over the key it already holds to
 /// decide whether the blob describes that same key (Story 9.4 D3).
-pub(crate) fn secret_digest(secret: &str) -> String {
+///
+/// Public because it is the format the CONFIGURATION channel and the
+/// certificate-distribution channel must agree on byte for byte. Four
+/// hand-rolled copies of it across three crates would mean a silent
+/// drift refusing every key with a message that looks like a transport
+/// fault.
+pub fn secret_digest(secret: &str) -> String {
     format!("sha256:{}", sha256_hex(secret.as_bytes()))
 }
 

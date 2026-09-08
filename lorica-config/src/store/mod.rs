@@ -729,6 +729,7 @@ fn rename_duplicate_cluster_node_names(conn: &Connection) -> rusqlite::Result<()
 
     let mut taken: HashSet<String> = nodes.iter().map(|(_, name)| name.clone()).collect();
     let mut previous_name: Option<String> = None;
+    let mut renamed: Vec<String> = Vec::new();
     for (node_id, name) in &nodes {
         if previous_name.as_ref() != Some(name) {
             previous_name = Some(name.clone());
@@ -752,7 +753,24 @@ fn rename_duplicate_cluster_node_names(conn: &Connection) -> rusqlite::Result<()
             "duplicate cluster node name renamed by migration 53; \
              update any route node_selector that named it"
         );
+        renamed.push(candidate.clone());
         taken.insert(candidate);
+    }
+    // One summary at ERROR beside the per-node warnings. A rename here
+    // silently changes what a route `node_selector` matches, which
+    // changes which node is entitled to which private key: the
+    // operator has to reconcile the selectors by hand, and a line
+    // buried among per-node warnings at boot is not how they will find
+    // out.
+    if !renamed.is_empty() {
+        tracing::error!(
+            renamed = renamed.len(),
+            names = ?renamed,
+            "migration 53 renamed cluster nodes that shared a name; every route \
+             node_selector naming one of them now selects a DIFFERENT set of \
+             nodes, which changes certificate key entitlement. Review the \
+             selectors before trusting the fleet's key distribution."
+        );
     }
     Ok(())
 }

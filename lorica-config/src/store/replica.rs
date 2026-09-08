@@ -283,6 +283,27 @@ impl ConfigStore {
                 Some(held) if secret_digest(&held.key_pem) == cert.key_pem => {
                     row.key_pem = held.key_pem.clone();
                 }
+                // The blob announces a DIFFERENT key and this node
+                // holds a working pair for that row. Leave the row
+                // completely alone rather than writing the new chain
+                // with an empty key.
+                //
+                // Writing it would take the node from "serving the
+                // previous certificate, which is still valid" to
+                // "serving nothing for that hostname", because a chain
+                // without its key is skipped by the TLS resolver. The
+                // node would then be BETTER off having ignored the
+                // generation entirely. So the old pair keeps serving
+                // until the key channel delivers the new one, which is
+                // what turns a renewal from a self-inflicted outage
+                // into a no-op that resolves itself.
+                Some(held) if !held.key_pem.is_empty() => {
+                    without_key += 1;
+                    continue;
+                }
+                // No local row, or a local row that never had a key:
+                // there is nothing to preserve, so write the metadata
+                // and wait for the key.
                 _ => {
                     row.key_pem = String::new();
                     without_key += 1;

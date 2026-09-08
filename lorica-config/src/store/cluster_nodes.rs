@@ -547,20 +547,49 @@ impl ConfigStore {
         self.resolve_selector_union(&union)
     }
 
-    /// Shared body of [`ConfigStore::cert_key_recipients`] and
-    /// [`ConfigStore::challenge_recipients`]: run `selector_query`
-    /// bound to `key`, union the selectors of every route it returns,
-    /// and resolve those names to Active node ids.
+    /// The hostnames a node bearing `name` would serve, and therefore
+    /// the certificate private keys it would become entitled to, if it
+    /// were activated right now (Story 9.5 QA, decision D15).
     ///
-    /// One function rather than two near-identical ones because this is
-    /// the need-to-know predicate: two copies would let the key path
-    /// and the challenge path drift, and a drift here is a
-    /// confidentiality bug rather than a cosmetic one. The two callers
-    /// differ only in which column selects the routes.
+    /// This is the INVERSE of the entitlement resolvers: they answer
+    /// "who may hold this key", and an operator reviewing a node that
+    /// is waiting for approval needs the other direction, "what would
+    /// approving this name hand over". Without it, activation is a
+    /// button rather than a decision: a route selector may have been
+    /// written long before the node it names was provisioned, and
+    /// activating is the moment that selector starts handing out keys.
     ///
-    /// `selector_query` is a `&'static str` from this module, never
-    /// caller-supplied; `key` is the only value that reaches SQL, and
-    /// it is bound.
+    /// Empty selectors are deliberately NOT counted. A fleet-wide route
+    /// entitles every active node, so listing them here would bury the
+    /// entries an operator actually has to think about under the ones
+    /// that apply to everyone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a read failure. A route
+    /// whose selector does not parse is skipped rather than failing the
+    /// review: this is an advisory surface, and refusing to render it
+    /// would be worse than rendering it incompletely.
+    pub fn hostnames_selecting_node_name(&self, name: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(ROUTE_HOSTS_AND_SELECTORS)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(3)?))
+        })?;
+        let mut hostnames: Vec<String> = Vec::new();
+        for row in rows {
+            let (hostname, raw_selector) = row?;
+            let Ok(selector) = serde_json::from_str::<Vec<String>>(&raw_selector) else {
+                continue;
+            };
+            if selector.iter().any(|entry| entry == name) {
+                hostnames.push(hostname);
+            }
+        }
+        hostnames.sort();
+        hostnames.dedup();
+        Ok(hostnames)
+    }
+
     /// Turn a folded [`SelectorUnion`] into the Active node ids it
     /// names. The single place a selector becomes a set of recipients,
     /// shared by both public resolvers.
@@ -1155,6 +1184,49 @@ mod tests {
         assert!(
             store.cert_key_recipients("cert-1").is_err(),
             "an unreadable selector must not be read as fleet-wide"
+        );
+    }
+
+    #[test]
+    fn the_review_surface_shows_what_a_name_is_already_selected_for() {
+        // Story 9.5 D15: an operator approving a pending node must be
+        // able to see what that NAME is entitled to before clicking
+        // activate, because the selector may well have been written
+        // before the node was provisioned.
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-b"]);
+        bind_route(&store, "r2", "api.example.com", "cert-1", &["edge-b", "edge-c"]);
+        bind_route(&store, "r3", "www.example.com", "cert-1", &["edge-c"]);
+
+        assert_eq!(
+            store
+                .hostnames_selecting_node_name("edge-b")
+                .expect("selection resolves"),
+            vec!["api.example.com".to_string(), "shop.example.com".to_string()],
+            "sorted and deduplicated, so the review column is stable"
+        );
+        assert!(
+            store
+                .hostnames_selecting_node_name("edge-never-provisioned")
+                .expect("an unknown name is not an error")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_fleet_wide_route_is_not_reported_as_selecting_a_name() {
+        // A fleet-wide route entitles every active node, which is not
+        // information about THIS name and would drown the entries the
+        // operator actually has to think about.
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "everything.example.com", "cert-1", &[]);
+        bind_route(&store, "r2", "shop.example.com", "cert-1", &["edge-a"]);
+
+        assert_eq!(
+            store
+                .hostnames_selecting_node_name("edge-a")
+                .expect("selection resolves"),
+            vec!["shop.example.com".to_string()]
         );
     }
 }
