@@ -27,7 +27,7 @@ use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
 
-pub use runtime::{ClusterRuntime, FollowerRuntime};
+pub use runtime::{ClusterRuntime, ControlPlaneRuntime, FollowerRuntime};
 
 /// Default join-token lifetime.
 pub const DEFAULT_TOKEN_TTL_S: u64 = 3600;
@@ -39,11 +39,28 @@ pub const MAX_TOKEN_TTL_S: u64 = 24 * 3600;
 /// to acknowledge before wiping locally anyway.
 const LEAVE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn control_plane(state: &AppState) -> Result<Arc<ControlPlane>, ApiError> {
+/// The control plane's runtime handle, or 409 on any other role.
+fn control_plane_runtime(state: &AppState) -> Result<Arc<ControlPlaneRuntime>, ApiError> {
     match &state.cluster {
-        ClusterRuntime::ControlPlane(control) => Ok(Arc::clone(control)),
+        ClusterRuntime::ControlPlane(runtime) => Ok(Arc::clone(runtime)),
         _ => Err(ApiError::Conflict(
             "this node is not a cluster control plane".into(),
+        )),
+    }
+}
+
+/// The transport crate's fleet handle, for the endpoints that need
+/// only the roster, the sessions or the CA.
+fn control_plane(state: &AppState) -> Result<Arc<ControlPlane>, ApiError> {
+    Ok(Arc::clone(&control_plane_runtime(state)?.control))
+}
+
+/// The follower's runtime handle, or 409 on any other role.
+fn follower_runtime(state: &AppState) -> Result<Arc<FollowerRuntime>, ApiError> {
+    match &state.cluster {
+        ClusterRuntime::Follower(follower) => Ok(Arc::clone(follower)),
+        _ => Err(ApiError::Conflict(
+            "this node is not a cluster follower".into(),
         )),
     }
 }
@@ -423,8 +440,13 @@ pub struct ClusterStatusResponse {
     pub connection_state: Option<&'static str>,
     /// The live session's generation (follower).
     pub session_generation: Option<u64>,
-    /// Applied configuration generation (Story 9.4; 0 until then).
+    /// Applied configuration generation (Story 9.4).
     pub applied_config_generation: i64,
+    /// Canonical hash of the applied configuration (Story 9.4).
+    pub applied_config_hash: String,
+    /// End of the break-glass window on a follower, RFC 3339 (Story
+    /// 9.4 AC #11); `None` when closed. The dashboard banners it.
+    pub break_glass_until: Option<String>,
     /// The roster (control plane).
     pub fleet: Vec<FleetEntry>,
 }
@@ -434,13 +456,23 @@ pub async fn get_status(
     Extension(state): Extension<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let build_version = env!("CARGO_PKG_VERSION").to_string();
-    let applied_config_generation = db_blocking(&state.store, |store| {
-        store
+    // A control plane reports the generation it OWNS; a follower and a
+    // standalone node report what they last applied.
+    let (applied_config_generation, applied_config_hash) = db_blocking(&state.store, |store| {
+        let generation = store
             .cluster_config_generation()
             .map(|g| i64::try_from(g).unwrap_or(i64::MAX))
-            .map_err(|e| ApiError::Internal(e.to_string()))
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let (applied, hash) = store
+            .cluster_applied_config()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok::<_, ApiError>((generation, applied, hash))
     })
-    .await?;
+    .await
+    .map(|(generation, applied, hash)| match applied {
+        0 => (generation, hash),
+        applied => (i64::try_from(applied).unwrap_or(i64::MAX), hash),
+    })?;
     let response = match &state.cluster {
         ClusterRuntime::Standalone => ClusterStatusResponse {
             role: "standalone",
@@ -451,9 +483,12 @@ pub async fn get_status(
             connection_state: None,
             session_generation: None,
             applied_config_generation,
+            applied_config_hash,
+            break_glass_until: None,
             fleet: Vec::new(),
         },
-        ClusterRuntime::ControlPlane(control) => {
+        ClusterRuntime::ControlPlane(runtime) => {
+            let control = &runtime.control;
             let nodes = db_blocking(&state.store, |store| {
                 store
                     .list_cluster_nodes()
@@ -476,6 +511,7 @@ pub async fn get_status(
                     applied_config_generation: n.node.applied_config_generation,
                 })
                 .collect();
+            let version = control.config_version();
             ClusterStatusResponse {
                 role: "control_plane",
                 build_version,
@@ -484,7 +520,9 @@ pub async fn get_status(
                 control_plane: None,
                 connection_state: None,
                 session_generation: None,
-                applied_config_generation,
+                applied_config_generation: i64::try_from(version.generation).unwrap_or(i64::MAX),
+                applied_config_hash: version.hash,
+                break_glass_until: None,
                 fleet,
             }
         }
@@ -503,6 +541,8 @@ pub async fn get_status(
                 }),
                 session_generation: session.map(|s| s.generation),
                 applied_config_generation,
+                applied_config_hash,
+                break_glass_until: follower.break_glass_until().map(|t| t.to_rfc3339()),
                 fleet: Vec::new(),
             }
         }
@@ -566,7 +606,10 @@ pub async fn leave(
             .map_err(|e| ApiError::Internal(e.to_string()))
     })
     .await?;
-    let _ = follower.left.send(true);
+    // `send_replace`, not `send`: a watch send is a no-op once every
+    // receiver is gone, and the value here is authoritative state the
+    // API reads back, not only a wake-up for a listener.
+    follower.left.send_replace(true);
     tracing::warn!(
         node_id = %follower.node_id,
         control_plane_notified = notified,
@@ -590,4 +633,242 @@ pub async fn leave(
         node_id: follower.node_id.clone(),
         control_plane_notified: notified,
     }))
+}
+
+// ---- Configuration replication (Story 9.4) ----
+
+/// Payload of `GET /api/v1/cluster/replication` (AC #8): the last
+/// completed round plus the generation in flight, so the dashboard can
+/// poll the outcome of a mutation instead of the handler blocking on
+/// fleet latency.
+#[derive(Debug, Serialize)]
+pub struct ReplicationStatus {
+    /// The control plane's current configuration generation.
+    pub current_generation: u64,
+    /// Canonical hash of the current configuration.
+    pub current_hash: String,
+    /// The generation being replicated right now, if any.
+    pub in_flight: Option<u64>,
+    /// The last completed round, `None` before the first one.
+    pub last: Option<ReplicationRoundResponse>,
+}
+
+/// One completed replication round, as the API renders it.
+#[derive(Debug, Serialize)]
+pub struct ReplicationRoundResponse {
+    /// The generation the round replicated.
+    pub generation: u64,
+    /// Canonical hash of that generation.
+    pub hash: String,
+    /// Node ids the round addressed.
+    pub targets: Vec<String>,
+    /// Nodes that staged the generation.
+    pub prepared: Vec<String>,
+    /// Nodes evicted on a transport failure, with the reason: the
+    /// commit proceeded without them and they converge by pull (AC #5).
+    pub evicted: Vec<NodeOutcome>,
+    /// Nodes that refused the blob semantically; a single one aborts
+    /// the round fleet-wide (AC #5).
+    pub rejected: Vec<NodeOutcome>,
+    /// Nodes that applied the generation.
+    pub committed: Vec<String>,
+    /// Nodes whose Commit failed after others committed: the fleet is
+    /// split until the next heartbeat reconciles it (AC #6).
+    pub commit_failed: Vec<NodeOutcome>,
+    /// Nodes excluded because the coordinator quarantined them.
+    pub skipped_quarantined: Vec<String>,
+    /// Nodes excluded because they are in a break-glass window.
+    pub skipped_break_glass: Vec<String>,
+    /// Whether a semantic rejection aborted the round.
+    pub aborted: bool,
+    /// Whether some nodes committed and others did not (AC #6).
+    pub split_fleet: bool,
+}
+
+/// A per-node failure with its reason.
+#[derive(Debug, Serialize)]
+pub struct NodeOutcome {
+    /// The node id.
+    pub node_id: String,
+    /// Why it failed, for the operator's journal and the dashboard.
+    pub reason: String,
+}
+
+impl From<lorica_cluster::ReplicationReport> for ReplicationRoundResponse {
+    fn from(report: lorica_cluster::ReplicationReport) -> Self {
+        let outcomes = |pairs: Vec<(String, String)>| -> Vec<NodeOutcome> {
+            pairs
+                .into_iter()
+                .map(|(node_id, reason)| NodeOutcome { node_id, reason })
+                .collect()
+        };
+        Self {
+            split_fleet: !report.committed.is_empty() && !report.commit_failed.is_empty(),
+            generation: report.generation,
+            hash: report.hash,
+            targets: report.targets,
+            prepared: report.prepared,
+            evicted: outcomes(report.evicted),
+            rejected: outcomes(report.rejected),
+            committed: report.committed,
+            commit_failed: outcomes(report.commit_failed),
+            skipped_quarantined: report.skipped_quarantined,
+            skipped_break_glass: report.skipped_break_glass,
+            aborted: report.aborted,
+        }
+    }
+}
+
+/// GET /api/v1/cluster/replication - the last replication round and
+/// the generation in flight (Viewer+, control plane only).
+pub async fn get_replication(
+    Extension(state): Extension<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let control = control_plane(&state)?;
+    let version = control.config_version();
+    Ok(json_data(ReplicationStatus {
+        current_generation: version.generation,
+        current_hash: version.hash,
+        in_flight: control.replication.in_flight(),
+        last: control.replication.last_report().map(Into::into),
+    }))
+}
+
+/// GET /api/v1/cluster/drift - nodes whose applied configuration
+/// differs from the current one, with the age of the divergence
+/// (Viewer+, control plane only, AC #12).
+pub async fn get_drift(
+    Extension(state): Extension<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let runtime = control_plane_runtime(&state)?;
+    let report = runtime::drift_report(&runtime, &state.store).await?;
+    Ok(json_data(report))
+}
+
+/// Body of `POST /api/v1/cluster/break-glass`.
+#[derive(Debug, Deserialize)]
+pub struct BreakGlassRequest {
+    /// How long local mutations stay allowed, in seconds (max 24 h).
+    pub duration_s: u64,
+}
+
+/// Payload of every break-glass endpoint (AC #11).
+#[derive(Debug, Serialize)]
+pub struct BreakGlassResponse {
+    /// Whether a window is open right now.
+    pub active: bool,
+    /// When the window ends, RFC 3339; `None` when closed.
+    pub until: Option<String>,
+    /// Seconds remaining, `None` when closed.
+    pub remaining_s: Option<i64>,
+}
+
+fn break_glass_response(follower: &FollowerRuntime) -> BreakGlassResponse {
+    match follower.break_glass_until() {
+        Some(until) => BreakGlassResponse {
+            active: true,
+            until: Some(until.to_rfc3339()),
+            remaining_s: Some((until - Utc::now()).num_seconds().max(0)),
+        },
+        None => BreakGlassResponse {
+            active: false,
+            until: None,
+            remaining_s: None,
+        },
+    }
+}
+
+/// GET /api/v1/cluster/break-glass - the current window (SuperAdmin,
+/// follower only).
+pub async fn get_break_glass(
+    Extension(state): Extension<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let follower = follower_runtime(&state)?;
+    Ok(json_data(break_glass_response(&follower)))
+}
+
+/// POST /api/v1/cluster/break-glass - re-enable local mutations for a
+/// bounded window (SuperAdmin, follower only, AC #11). Loudly logged
+/// and audited: this is the lever that lets an operator act on an edge
+/// while the control plane is unreachable, and everything it changes
+/// is reconciled away when the window ends.
+pub async fn open_break_glass(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
+    Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+    Json(body): Json<BreakGlassRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let follower = follower_runtime(&state)?;
+    if body.duration_s == 0 || body.duration_s > runtime::MAX_BREAK_GLASS_SECS {
+        return Err(ApiError::BadRequest(format!(
+            "duration_s must be between 1 and {}",
+            runtime::MAX_BREAK_GLASS_SECS
+        )));
+    }
+    let until = Utc::now() + chrono::Duration::seconds(i64::try_from(body.duration_s).unwrap_or(0));
+    db_blocking(&state.store, move |store| {
+        store
+            .set_cluster_break_glass_until(Some(until))
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
+    follower.break_glass.send_replace(Some(until));
+    tracing::warn!(
+        node_id = %follower.node_id,
+        control_plane = %follower.control_plane,
+        until = %until.to_rfc3339(),
+        operator = %session.username,
+        "cluster break-glass OPEN: local configuration mutations are allowed on this follower \
+         until the window ends; the control plane reconciles them away afterwards"
+    );
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "cluster.break_glass.open",
+        ("cluster_node", &follower.node_id),
+        None,
+        Some(&serde_json::json!({
+            "until": until.to_rfc3339(),
+            "duration_s": body.duration_s,
+        })),
+    )
+    .await;
+    Ok(json_data(break_glass_response(&follower)))
+}
+
+/// DELETE /api/v1/cluster/break-glass - close the window now
+/// (SuperAdmin, follower only). The follower pulls the current
+/// generation and applies it, so local edits are reconciled away.
+pub async fn close_break_glass(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
+    Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+) -> Result<impl IntoResponse, ApiError> {
+    let follower = follower_runtime(&state)?;
+    db_blocking(&state.store, |store| {
+        store
+            .set_cluster_break_glass_until(None)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
+    follower.break_glass.send_replace(None);
+    tracing::warn!(
+        node_id = %follower.node_id,
+        operator = %session.username,
+        "cluster break-glass CLOSED; reconciling with the control plane"
+    );
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "cluster.break_glass.close",
+        ("cluster_node", &follower.node_id),
+        None,
+        None,
+    )
+    .await;
+    Ok(json_data(break_glass_response(&follower)))
 }

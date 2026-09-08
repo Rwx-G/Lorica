@@ -5910,7 +5910,7 @@ async fn test_settings_schema_bounds_match_validator() {
 /// handle and the token-liveness receiver the enrollment listener
 /// would watch.
 fn test_control_plane() -> (
-    std::sync::Arc<lorica_cluster::ControlPlane>,
+    std::sync::Arc<crate::cluster::ControlPlaneRuntime>,
     tokio::sync::watch::Receiver<u32>,
 ) {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
@@ -5933,7 +5933,10 @@ fn test_control_plane() -> (
         "cp.internal",
         "test",
     ));
-    (control, liveness_rx)
+    (
+        std::sync::Arc::new(crate::cluster::ControlPlaneRuntime::new(control)),
+        liveness_rx,
+    )
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -6045,7 +6048,7 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
     let parsed = lorica_cluster::token::parse(&token_value).expect("parse");
     assert_eq!(
         parsed.pin,
-        lorica_cluster::leaf_spki_sha256(&control.leaf_cert_pem).expect("pin")
+        lorica_cluster::leaf_spki_sha256(&control.control.leaf_cert_pem).expect("pin")
     );
 
     // Bad inputs are 400.
@@ -6169,7 +6172,7 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["data"]["status"], "active");
     assert_eq!(
-        control.roster.lookup(&"ab".repeat(32)).map(|n| n.state),
+        control.control.roster.lookup(&"ab".repeat(32)).map(|n| n.state),
         Some(lorica_cluster::NodeState::Active),
         "the roster is reloaded after activation"
     );
@@ -6197,7 +6200,7 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        control.roster.lookup(&"ab".repeat(32)).map(|n| n.state),
+        control.control.roster.lookup(&"ab".repeat(32)).map(|n| n.state),
         Some(lorica_cluster::NodeState::Revoked)
     );
     let resp = send(
@@ -6253,4 +6256,248 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
     let status = body_json(resp).await;
     assert_eq!(status["data"]["role"], "control_plane");
     assert_eq!(status["data"]["fleet"][0]["status"], "revoked");
+}
+
+// ---- Story 9.4: replication, drift, break-glass, follower read-only ----
+
+/// A follower runtime for the API tests, holding no live session: the
+/// state a node is in before its first connect and between reconnects.
+fn test_follower_runtime() -> std::sync::Arc<crate::cluster::FollowerRuntime> {
+    std::sync::Arc::new(crate::cluster::FollowerRuntime {
+        node_id: "11111111-2222-3333-4444-555555555555".to_string(),
+        node_name: "edge-01".to_string(),
+        control_plane: "cp.internal:7443".to_string(),
+        connection: lorica_cluster::ClusterConnection::disconnected(),
+        left: tokio::sync::watch::channel(false).0,
+        applied: std::sync::Arc::new(std::sync::Mutex::new(
+            lorica_cluster::AppliedConfig::default(),
+        )),
+        break_glass: tokio::sync::watch::channel(None).0,
+    })
+}
+
+/// A route body the CRUD handler accepts, so the read-only gate is
+/// what decides the outcome rather than validation.
+fn a_valid_route(hostname: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hostname": hostname,
+        "path_prefix": "/",
+        "load_balancing": "round_robin"
+    })
+}
+
+#[tokio::test]
+async fn test_replication_and_drift_are_control_plane_only() {
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    let (control, _liveness) = test_control_plane();
+    state.cluster = crate::cluster::ClusterRuntime::ControlPlane(std::sync::Arc::clone(&control));
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Before any round: the current version, nothing in flight, no
+    // last report. The endpoint must not invent one.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/replication",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["current_generation"], 0);
+    assert!(body["data"]["in_flight"].is_null());
+    assert!(body["data"]["last"].is_null());
+
+    // Drift on an empty fleet is empty, not an error.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/drift",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["drifted"].as_array().map(Vec::len), Some(0));
+    assert_eq!(body["data"]["in_sync"], 0);
+
+    // Break-glass is a follower lever; a control plane refuses it.
+    for method in ["GET", "POST", "DELETE"] {
+        let body = (method == "POST").then(|| serde_json::json!({"duration_s": 60}));
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            "/api/v1/cluster/break-glass",
+            &admin,
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{method} break-glass");
+    }
+}
+
+#[tokio::test]
+async fn test_follower_read_only_gate_and_break_glass_window() {
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    let follower = test_follower_runtime();
+    state.cluster = crate::cluster::ClusterRuntime::Follower(std::sync::Arc::clone(&follower));
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // A configuration mutation is refused with 409 NAMING the control
+    // plane, so the operator knows where to make the change.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(a_valid_route("refused.example.com")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cp.internal:7443"),
+        "the refusal must name the control plane: {body}"
+    );
+
+    // Reads are untouched.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/routes",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The window starts closed.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/break-glass",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["active"], false);
+
+    // The duration is bounded on both ends.
+    for duration in [0u64, crate::cluster::runtime::MAX_BREAK_GLASS_SECS + 1] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/cluster/break-glass",
+            &admin,
+            Some(serde_json::json!({ "duration_s": duration })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "duration {duration}");
+    }
+
+    // Open it: the response says so, and it is persisted so a restart
+    // does not silently reconcile the operator's edits away.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/cluster/break-glass",
+        &admin,
+        Some(serde_json::json!({"duration_s": 3600})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["active"], true);
+    assert!(body["data"]["remaining_s"].as_i64().unwrap_or(0) > 3500);
+    assert!(follower.break_glass_active());
+    assert!(state
+        .store
+        .lock()
+        .await
+        .cluster_break_glass_until()
+        .expect("test setup")
+        .is_some());
+
+    // The same mutation now goes through.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(a_valid_route("break-glass.example.com")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Close it: read-only comes straight back.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        "/api/v1/cluster/break-glass",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["active"], false);
+    assert!(!follower.break_glass_active());
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(a_valid_route("refused-again.example.com")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // An expired window is closed even though the row still holds a
+    // timestamp: the check is against now, not against presence.
+    follower
+        .break_glass
+        .send_replace(Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
+    assert!(!follower.break_glass_active());
+
+    // Replication and drift are control-plane levers.
+    for path in ["/api/v1/cluster/replication", "/api/v1/cluster/drift"] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            path,
+            &admin,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{path}");
+    }
 }

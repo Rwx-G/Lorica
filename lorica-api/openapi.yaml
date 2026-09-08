@@ -3721,6 +3721,153 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           description: This node is not a follower
+  /api/v1/cluster/replication:
+    get:
+      tags: [Cluster]
+      summary: Last configuration replication round (Viewer+, control plane)
+      description: >-
+        Story 9.4 AC #8. The completion channel is a report, not a blocking
+        response: a mutation answers as soon as it is committed locally, and
+        the fleet outcome lands here. `in_flight` names the generation being
+        replicated right now. In `last`, a node under `evicted` failed its
+        Prepare on transport and the commit proceeded without it (it converges
+        by pull); a node under `rejected` refused the blob semantically, which
+        aborts the round fleet-wide; `split_fleet` is true when some nodes
+        committed and others did not, which the next heartbeat reconciles.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Replication status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/ReplicationStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: This node is not a control plane
+  /api/v1/cluster/drift:
+    get:
+      tags: [Cluster]
+      summary: Nodes whose applied configuration differs (Viewer+, control plane)
+      description: >-
+        Story 9.4 AC #12. Every `active` node is compared to the control
+        plane's current generation and hash, using the live session's report
+        when connected and the persisted registry columns otherwise. `age_s`
+        is how long the divergence has been observed. Drift alerts are
+        suppressed per node by an exponential backoff (1 minute doubling to 1
+        hour) so a flapping node cannot consume the notification budget.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Drift report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/DriftReport"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: This node is not a control plane
+  /api/v1/cluster/break-glass:
+    get:
+      tags: [Cluster]
+      summary: The current break-glass window (SuperAdmin, follower only)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Break-glass state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/BreakGlass"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: This node is not a follower
+    post:
+      tags: [Cluster]
+      summary: Open a break-glass window (SuperAdmin, follower only)
+      description: >-
+        Story 9.4 AC #11. A follower normally answers `409` to every
+        configuration mutation: the control plane owns the configuration.
+        Break-glass re-enables local mutations for a bounded window (max
+        86400 seconds) so an operator can act on an edge while the control
+        plane is unreachable. It is audited locally, bannered in
+        `cluster status` and the dashboard, and reported to the control plane
+        in every heartbeat. When the window ends the follower pulls the
+        current generation and applies it, so local edits are reconciled
+        away.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [duration_s]
+              properties:
+                duration_s:
+                  type: integer
+                  minimum: 1
+                  maximum: 86400
+      responses:
+        "200":
+          description: Window open
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/BreakGlass"
+        "400":
+          description: duration_s out of range
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: This node is not a follower
+    delete:
+      tags: [Cluster]
+      summary: Close the break-glass window now (SuperAdmin, follower only)
+      description: >-
+        Ends the window immediately; the follower reconciles with the control
+        plane's current generation.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Window closed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/BreakGlass"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: This node is not a follower
 
 components:
   securitySchemes:
@@ -3850,6 +3997,14 @@ components:
           nullable: true
         applied_config_generation:
           type: integer
+        applied_config_hash:
+          type: string
+          description: Canonical hash of the applied configuration (Story 9.4).
+        break_glass_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: End of the follower's break-glass window (Story 9.4 AC #11); null when closed.
         fleet:
           type: array
           items:
@@ -3872,6 +4027,135 @@ components:
                 type: string
               applied_config_generation:
                 type: integer
+    NodeOutcome:
+      type: object
+      description: A per-node replication failure with its reason (Story 9.4).
+      properties:
+        node_id:
+          type: string
+        reason:
+          type: string
+    ReplicationRound:
+      type: object
+      description: One completed configuration replication round (Story 9.4 AC #5/#6/#8).
+      properties:
+        generation:
+          type: integer
+        hash:
+          type: string
+        targets:
+          type: array
+          items:
+            type: string
+        prepared:
+          type: array
+          items:
+            type: string
+        evicted:
+          type: array
+          description: Transport failure on Prepare; the commit proceeded without these nodes.
+          items:
+            $ref: "#/components/schemas/NodeOutcome"
+        rejected:
+          type: array
+          description: Semantic rejection; a single one aborts the round fleet-wide.
+          items:
+            $ref: "#/components/schemas/NodeOutcome"
+        committed:
+          type: array
+          items:
+            type: string
+        commit_failed:
+          type: array
+          items:
+            $ref: "#/components/schemas/NodeOutcome"
+        skipped_quarantined:
+          type: array
+          items:
+            type: string
+        skipped_break_glass:
+          type: array
+          items:
+            type: string
+        aborted:
+          type: boolean
+        split_fleet:
+          type: boolean
+          description: Some nodes committed and others did not; reconciled by the next heartbeat.
+    ReplicationStatus:
+      type: object
+      description: Payload of `GET /api/v1/cluster/replication` (Story 9.4 AC #8).
+      properties:
+        current_generation:
+          type: integer
+        current_hash:
+          type: string
+        in_flight:
+          type: integer
+          nullable: true
+        last:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/ReplicationRound"
+    DriftEntry:
+      type: object
+      description: One node whose applied configuration differs (Story 9.4 AC #12).
+      properties:
+        node_id:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+          enum: [pending, active, revoked]
+        connected:
+          type: boolean
+        applied_generation:
+          type: integer
+        applied_hash:
+          type: string
+        break_glass:
+          type: boolean
+        quarantined:
+          type: boolean
+        since:
+          type: string
+          format: date-time
+          nullable: true
+        age_s:
+          type: integer
+          nullable: true
+    DriftReport:
+      type: object
+      description: Payload of `GET /api/v1/cluster/drift` (Story 9.4 AC #12).
+      properties:
+        current_generation:
+          type: integer
+        current_hash:
+          type: string
+        drifted:
+          type: array
+          items:
+            $ref: "#/components/schemas/DriftEntry"
+        in_sync:
+          type: integer
+        quarantined:
+          type: array
+          items:
+            type: string
+    BreakGlass:
+      type: object
+      description: A follower's break-glass window (Story 9.4 AC #11).
+      properties:
+        active:
+          type: boolean
+        until:
+          type: string
+          format: date-time
+          nullable: true
+        remaining_s:
+          type: integer
+          nullable: true
     User:
       type: object
       description: A dashboard / API user account (password hash never serialized).
@@ -4344,7 +4628,7 @@ components:
           type: array
           items:
             type: string
-          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`, `cluster_node_left`).
+          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`, `cluster_node_left`, `cluster_config_refused`, `cluster_drift`).
 
     CreateNotificationRequest:
       type: object

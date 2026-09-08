@@ -552,6 +552,20 @@ pub fn build_router(
             "/api/v1/cluster/leave",
             post(crate::cluster::leave).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
         )
+        // Configuration replication (Story 9.4): the last round's
+        // report, the drift view, and the follower's break-glass window.
+        .route(
+            "/api/v1/cluster/replication",
+            get(crate::cluster::get_replication),
+        )
+        .route("/api/v1/cluster/drift", get(crate::cluster::get_drift))
+        .route(
+            "/api/v1/cluster/break-glass",
+            get(crate::cluster::get_break_glass)
+                .post(crate::cluster::open_break_glass)
+                .delete(crate::cluster::close_break_glass)
+                .layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
         .route("/api/v1/routes", get(crate::routes::list_routes))
         .route(
             "/api/v1/routes",
@@ -1123,7 +1137,12 @@ pub fn build_router(
         )
         // Layer order (outermost runs first): require_auth
         // authenticates and injects the Session extension, then
-        // authorize enforces the role floor (Story 8.3 AC #6).
+        // authorize enforces the role floor (Story 8.3 AC #6), then
+        // the follower read-only gate refuses configuration mutations
+        // owned by the control plane (Story 9.4 AC #10).
+        .layer(middleware::from_fn(
+            crate::middleware::authorize::follower_read_only,
+        ))
         .layer(middleware::from_fn(crate::middleware::authorize::authorize))
         .layer(middleware::from_fn(require_auth));
 

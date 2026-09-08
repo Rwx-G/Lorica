@@ -24,7 +24,7 @@ use lorica_metrics::REGISTRY;
 use once_cell::sync::Lazy;
 use lorica_metrics::prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    TextEncoder,
+    IntGaugeVec, TextEncoder,
 };
 
 use crate::server::AppState;
@@ -178,6 +178,105 @@ static CLUSTER_ENROLLMENT_LISTENER_OPEN: Lazy<IntGauge> = Lazy::new(|| {
         "1 while the enrollment listener is bound (a join token is live), else 0",
     )
 });
+
+/// Configuration generation each connected node reports applying
+/// (Story 9.4 AC #14). Labels: node_id (bounded by the fleet; a series
+/// disappears when the node's session ends, so a disconnected node
+/// never reports a stale generation).
+static CLUSTER_CONFIG_GENERATION: Lazy<IntGaugeVec> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge_vec(
+        "lorica_cluster_config_generation",
+        "Configuration generation applied by each connected cluster node",
+        &["node_id"],
+    )
+});
+
+/// Replication outcomes per node (Story 9.4 AC #14). Labels: node_id,
+/// outcome (`committed | evicted | rejected | commit_failed | pulled |
+/// pull_failed | refused`).
+static CLUSTER_CONFIG_APPLY_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "lorica_cluster_config_apply_total",
+        "Configuration replication outcomes per cluster node",
+        &["node_id", "outcome"],
+    )
+});
+
+/// Nodes whose applied configuration differs from the control plane's
+/// current one (Story 9.4 AC #12/#14), refreshed by the drift
+/// evaluation task.
+static CLUSTER_DRIFT_NODES: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "lorica_cluster_drift_nodes",
+        "Cluster nodes whose applied configuration differs from the current one",
+    )
+});
+
+/// The session registry the generation gauge is read from at scrape
+/// time; set once on the control plane.
+static CLUSTER_REGISTRY: std::sync::OnceLock<std::sync::Arc<lorica_cluster::SessionRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Node ids the generation gauge carried at the previous scrape, so a
+/// node whose session ended has its series removed instead of
+/// freezing at its last value.
+static CLUSTER_GENERATION_SERIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Hand the control plane's session registry to the Prometheus bridge
+/// (Story 9.4 AC #14): `lorica_cluster_config_generation{node_id}` is
+/// read from the live sessions at every scrape. A second call is
+/// ignored (the plane starts once).
+pub fn install_cluster_registry(registry: std::sync::Arc<lorica_cluster::SessionRegistry>) {
+    Lazy::force(&CLUSTER_CONFIG_GENERATION);
+    Lazy::force(&CLUSTER_CONFIG_APPLY_TOTAL);
+    Lazy::force(&CLUSTER_DRIFT_NODES);
+    let _ = CLUSTER_REGISTRY.set(registry);
+}
+
+/// Count one replication outcome for a node (Story 9.4 AC #14).
+pub fn inc_cluster_config_apply(node_id: &str, outcome: &str) {
+    CLUSTER_CONFIG_APPLY_TOTAL
+        .with_label_values(&[node_id, outcome])
+        .inc();
+}
+
+/// Publish the number of drifted nodes (Story 9.4 AC #12).
+pub fn set_cluster_drift_nodes(count: usize) {
+    Lazy::force(&CLUSTER_CONFIG_GENERATION);
+    CLUSTER_DRIFT_NODES.set(i64::try_from(count).unwrap_or(i64::MAX));
+}
+
+/// Publish this node's own applied generation (a follower reports
+/// itself under its node id; the control plane reports its current
+/// generation under `control_plane`).
+pub fn set_cluster_config_generation(node_id: &str, generation: u64) {
+    CLUSTER_CONFIG_GENERATION
+        .with_label_values(&[node_id])
+        .set(i64::try_from(generation).unwrap_or(i64::MAX));
+}
+
+/// Refresh the per-node generation gauge from the live sessions.
+fn sync_cluster_generation_gauge() {
+    let Some(registry) = CLUSTER_REGISTRY.get() else {
+        return;
+    };
+    let snapshot = registry.snapshot();
+    let mut previous = CLUSTER_GENERATION_SERIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for node_id in previous.iter() {
+        if !snapshot.iter().any(|s| &s.node_id == node_id) {
+            let _ = CLUSTER_CONFIG_GENERATION.remove_label_values(&[node_id]);
+        }
+    }
+    previous.clear();
+    for session in snapshot {
+        CLUSTER_CONFIG_GENERATION
+            .with_label_values(&[&session.node_id])
+            .set(i64::try_from(session.applied.generation).unwrap_or(i64::MAX));
+        previous.push(session.node_id);
+    }
+}
 
 /// The fixed `lorica_cluster_rpc_total` label triples the operational
 /// listener feeds, one per `OperationalStats` counter.
@@ -551,6 +650,7 @@ fn sync_cluster_plane_metrics() {
 
     let open = en.lifecycle_opens.load(Relaxed) > en.lifecycle_closes.load(Relaxed);
     CLUSTER_ENROLLMENT_LISTENER_OPEN.set(i64::from(open));
+    sync_cluster_generation_gauge();
 }
 
 /// WAF events counter. Labels: category, action (detected/blocked).

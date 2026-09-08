@@ -10,14 +10,17 @@
 //! rebuilt" without parsing a message.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use lorica_cluster::{
-    ClusterConnection, ClusterTlsError, ControlPlane, NodeIdentity, NodeState, RevokedEntry,
+    AppliedConfig, ClusterConnection, ClusterTlsError, ConfigVersion, ControlPlane, NodeIdentity,
+    NodeState, RevokedEntry,
 };
 use lorica_config::models::{ClusterNode, NodeStatus};
 use lorica_config::{ConfigError, ConfigStore};
+use serde::Serialize;
 use tokio::sync::{watch, Mutex};
 
 use crate::error::ApiError;
@@ -70,9 +73,30 @@ pub enum ClusterRuntime {
     /// No cluster role (the default install).
     Standalone,
     /// This process serves the cluster plane.
-    ControlPlane(Arc<ControlPlane>),
+    ControlPlane(Arc<ControlPlaneRuntime>),
     /// This process dials a control plane.
     Follower(Arc<FollowerRuntime>),
+}
+
+/// The control-plane side's live handles: the transport crate's
+/// [`ControlPlane`] plus what only the API and the binary track
+/// (drift first-seen times and the per-node alert backoff, Story 9.4
+/// AC #12).
+pub struct ControlPlaneRuntime {
+    /// The fleet runtime shared with the listeners.
+    pub control: Arc<ControlPlane>,
+    /// Drift bookkeeping.
+    pub drift: DriftTracker,
+}
+
+impl ControlPlaneRuntime {
+    /// Bundle a control plane with fresh drift bookkeeping.
+    pub fn new(control: Arc<ControlPlane>) -> Self {
+        Self {
+            control,
+            drift: DriftTracker::default(),
+        }
+    }
 }
 
 /// The follower side's live handles.
@@ -88,6 +112,213 @@ pub struct FollowerRuntime {
     /// Flipped to `true` by `POST /api/v1/cluster/leave`; the follower
     /// runtime stops dialing when it sees it.
     pub left: watch::Sender<bool>,
+    /// What this node currently runs (generation, hash, break-glass),
+    /// shared with the replica handler that updates it.
+    pub applied: Arc<StdMutex<AppliedConfig>>,
+    /// The break-glass window's end (Story 9.4 AC #11), `None` when
+    /// closed; the follower runtime watches it to reconcile when it
+    /// closes.
+    pub break_glass: watch::Sender<Option<DateTime<Utc>>>,
+}
+
+impl FollowerRuntime {
+    /// The break-glass window's end, when one is open now.
+    pub fn break_glass_until(&self) -> Option<DateTime<Utc>> {
+        (*self.break_glass.borrow()).filter(|until| *until > Utc::now())
+    }
+
+    /// Whether local mutations are allowed right now (AC #10/#11).
+    pub fn break_glass_active(&self) -> bool {
+        self.break_glass_until().is_some()
+    }
+
+    /// What this node currently runs.
+    pub fn applied(&self) -> AppliedConfig {
+        self.applied
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+/// Longest break-glass window an operator may open (AC #11).
+pub const MAX_BREAK_GLASS_SECS: u64 = 24 * 3600;
+
+/// First suppression interval after a drift alert fires for a node;
+/// doubles on every further alert up to [`DRIFT_BACKOFF_MAX`].
+pub const DRIFT_BACKOFF_MIN: Duration = Duration::from_secs(60);
+/// Cap on the per-node drift alert suppression.
+pub const DRIFT_BACKOFF_MAX: Duration = Duration::from_secs(3600);
+
+/// Per-node drift bookkeeping (AC #12): when a divergence was first
+/// observed (its age in the report) and the exponential backoff that
+/// keeps a flapping node from consuming the dispatcher's global
+/// per-channel budget.
+#[derive(Default)]
+pub struct DriftTracker {
+    first_seen: StdMutex<HashMap<String, DateTime<Utc>>>,
+    backoff: StdMutex<HashMap<String, (Instant, Duration)>>,
+}
+
+impl DriftTracker {
+    /// Record the set of drifted node ids observed now. Returns the
+    /// ids whose alert is due (first observation, or the backoff
+    /// expired); nodes back in sync are forgotten so their next drift
+    /// starts from the shortest interval again.
+    pub fn observe(&self, drifted: &[String], now: DateTime<Utc>) -> Vec<String> {
+        let mut first_seen = self.first_seen.lock().unwrap_or_else(|p| p.into_inner());
+        let mut backoff = self.backoff.lock().unwrap_or_else(|p| p.into_inner());
+        first_seen.retain(|id, _| drifted.contains(id));
+        backoff.retain(|id, _| drifted.contains(id));
+        let instant_now = Instant::now();
+        let mut due = Vec::new();
+        for id in drifted {
+            first_seen.entry(id.clone()).or_insert(now);
+            let fire = match backoff.get(id) {
+                Some((next_allowed, _)) => instant_now >= *next_allowed,
+                None => true,
+            };
+            if fire {
+                let interval = backoff
+                    .get(id)
+                    .map(|(_, last)| (*last * 2).min(DRIFT_BACKOFF_MAX))
+                    .unwrap_or(DRIFT_BACKOFF_MIN);
+                backoff.insert(id.clone(), (instant_now + interval, interval));
+                due.push(id.clone());
+            }
+        }
+        due
+    }
+
+    /// Record first-seen times for `drifted` (and forget nodes that
+    /// are back in sync) without touching the alert backoff.
+    pub fn record_first_seen(&self, drifted: &[String], now: DateTime<Utc>) {
+        let mut first_seen = self.first_seen.lock().unwrap_or_else(|p| p.into_inner());
+        first_seen.retain(|id, _| drifted.contains(id));
+        for id in drifted {
+            first_seen.entry(id.clone()).or_insert(now);
+        }
+    }
+
+    /// When `node_id`'s current divergence was first observed.
+    pub fn since(&self, node_id: &str) -> Option<DateTime<Utc>> {
+        self.first_seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(node_id)
+            .copied()
+    }
+}
+
+/// One drifted node in [`DriftReport`].
+#[derive(Debug, Clone, Serialize)]
+pub struct DriftEntry {
+    /// The node id.
+    pub node_id: String,
+    /// Display name.
+    pub name: String,
+    /// Lifecycle state.
+    pub status: NodeStatus,
+    /// Whether the node holds a session right now.
+    pub connected: bool,
+    /// The generation the node last reported applying.
+    pub applied_generation: u64,
+    /// The hash the node last reported applying.
+    pub applied_hash: String,
+    /// Whether the node is in a break-glass window (local edits).
+    pub break_glass: bool,
+    /// Whether the coordinator quarantined the node (slow Prepare).
+    pub quarantined: bool,
+    /// When the divergence was first observed, RFC 3339.
+    pub since: Option<String>,
+    /// Age of the divergence in seconds.
+    pub age_s: Option<i64>,
+}
+
+/// Payload of `GET /api/v1/cluster/drift` (AC #12).
+#[derive(Debug, Clone, Serialize)]
+pub struct DriftReport {
+    /// The control plane's current generation.
+    pub current_generation: u64,
+    /// The control plane's current canonical hash.
+    pub current_hash: String,
+    /// Active nodes whose applied generation or hash differs.
+    pub drifted: Vec<DriftEntry>,
+    /// Active nodes in sync.
+    pub in_sync: usize,
+    /// Nodes the coordinator excludes from commit sets.
+    pub quarantined: Vec<String>,
+}
+
+/// Compute the drift view (AC #12): every `Active` node compared to
+/// the current version, the live session's report when the node is
+/// connected, the registry row's persisted `applied_config_*` columns
+/// otherwise. Records first-seen times in the tracker.
+pub async fn drift_report(
+    runtime: &ControlPlaneRuntime,
+    store: &Arc<Mutex<ConfigStore>>,
+) -> Result<DriftReport, ClusterRuntimeError> {
+    let nodes = store_op(store, |store| store.list_cluster_nodes()).await?;
+    let current: ConfigVersion = runtime.control.config_version();
+    let live: HashMap<String, (AppliedConfig, bool)> = runtime
+        .control
+        .sessions
+        .snapshot()
+        .into_iter()
+        .map(|s| (s.node_id, (s.applied, true)))
+        .collect();
+    let quarantined = runtime.control.replication.quarantined();
+    let mut drifted = Vec::new();
+    let mut in_sync = 0usize;
+    for node in nodes.into_iter().filter(|n| n.status == NodeStatus::Active) {
+        let (applied, connected) = live.get(&node.node_id).cloned().unwrap_or_else(|| {
+            (
+                AppliedConfig {
+                    generation: u64::try_from(node.applied_config_generation).unwrap_or(0),
+                    hash: node.applied_config_hash.clone(),
+                    break_glass: false,
+                },
+                false,
+            )
+        });
+        if applied.generation == current.generation && applied.hash == current.hash {
+            in_sync += 1;
+            continue;
+        }
+        drifted.push(DriftEntry {
+            quarantined: quarantined.contains(&node.node_id),
+            node_id: node.node_id,
+            name: node.name,
+            status: node.status,
+            connected,
+            applied_generation: applied.generation,
+            applied_hash: applied.hash,
+            break_glass: applied.break_glass,
+            since: None,
+            age_s: None,
+        });
+    }
+    let now = Utc::now();
+    let ids: Vec<String> = drifted.iter().map(|d| d.node_id.clone()).collect();
+    // Observe without firing: the alert decision belongs to the
+    // periodic evaluation in the binary, which calls `observe` itself
+    // and honours its return value. Here only the first-seen times
+    // are needed, and `since` is read back after recording.
+    runtime.drift.record_first_seen(&ids, now);
+    for entry in &mut drifted {
+        entry.since = runtime.drift.since(&entry.node_id).map(|t| t.to_rfc3339());
+        entry.age_s = runtime
+            .drift
+            .since(&entry.node_id)
+            .map(|t| (now - t).num_seconds().max(0));
+    }
+    Ok(DriftReport {
+        current_generation: current.generation,
+        current_hash: current.hash,
+        drifted,
+        in_sync,
+        quarantined,
+    })
 }
 
 impl ClusterRuntime {
@@ -286,6 +517,32 @@ mod tests {
         assert!(roster["fp-b-old"].via_previous_certificate);
         assert_eq!(roster["fp-b-old"].node_id, "b");
         assert_eq!(roster["fp-c"].state, NodeState::Revoked);
+    }
+
+    #[test]
+    fn drift_alerts_back_off_per_node_and_reset_when_in_sync() {
+        let tracker = DriftTracker::default();
+        let now = Utc::now();
+        let a = vec!["a".to_string()];
+        // First observation fires.
+        assert_eq!(tracker.observe(&a, now), a);
+        // Inside the backoff nothing fires, the first-seen time holds.
+        assert!(tracker.observe(&a, now).is_empty());
+        assert_eq!(tracker.since("a"), Some(now));
+        // Back in sync: forgotten, the next drift fires again at once.
+        assert!(tracker.observe(&[], now).is_empty());
+        assert_eq!(tracker.since("a"), None);
+        let later = now + chrono::Duration::seconds(5);
+        assert_eq!(tracker.observe(&a, later), a);
+        assert_eq!(tracker.since("a"), Some(later));
+        // The interval doubles up to the cap.
+        {
+            let backoff = tracker.backoff.lock().expect("map");
+            assert_eq!(backoff["a"].1, DRIFT_BACKOFF_MIN);
+        }
+        tracker.backoff.lock().expect("map").get_mut("a").expect("entry").0 = Instant::now();
+        assert_eq!(tracker.observe(&a, later), a);
+        assert_eq!(tracker.backoff.lock().expect("map")["a"].1, DRIFT_BACKOFF_MIN * 2);
     }
 
     #[test]
