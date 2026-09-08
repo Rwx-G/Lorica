@@ -35,6 +35,7 @@
 //! Shared by both startup modes: the follower runtime lives in the
 //! supervisor (or the single process); workers never dial.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -157,6 +158,13 @@ struct ReplicaHandler {
     config_reload: watch::Sender<u64>,
     alert_sender: AlertSender,
     staged: StdMutex<Option<StagedConfig>>,
+    /// `(generation, phase)` pairs already alerted on, so a generation
+    /// this node cannot take raises one alert instead of one per
+    /// heartbeat. Bounded by the number of generations this process
+    /// refuses, which an operator fixing the configuration ends; a node
+    /// refusing thousands of distinct generations has a louder problem
+    /// than this map.
+    alerted: StdMutex<HashSet<(u64, String)>>,
 }
 
 impl ReplicaHandler {
@@ -185,6 +193,21 @@ impl ReplicaHandler {
             );
         }
         let generation = payload.generation;
+        // A generation strictly BELOW what this node runs is a
+        // rollback, and applying a replica deletes every row the blob
+        // omits. A control plane restored from an older backup would
+        // otherwise have the whole fleet delete the routes, backends,
+        // certificates and rules added since that backup, each node
+        // doing it to itself. Refusing is recoverable: the operator
+        // raises the generation past the fleet's maximum and changes
+        // the configuration again.
+        let applied_now = self.applied();
+        if generation < applied_now.generation {
+            return Err(format!(
+                "refusing to roll back from generation {} to {generation}",
+                applied_now.generation
+            ));
+        }
         let hash = payload.hash.clone();
         let staged_hash = hash.clone();
         // The inner `Result` is the SEMANTIC verdict the control plane
@@ -209,6 +232,15 @@ impl ReplicaHandler {
     /// Apply the staged generation in one transaction, persist what is
     /// now applied, and signal the local reload.
     async fn apply_staged(&self, generation: u64) -> Result<AppliedConfig, String> {
+        // Re-checked here, not only in `stage`: an operator can open a
+        // window in the gap between the Prepare and the Commit, and
+        // applying then would wipe the edits the window was opened to
+        // make.
+        if self.break_glass_active() {
+            return Err(
+                "a break-glass window opened after the configuration was staged".to_string(),
+            );
+        }
         let staged = self
             .staged
             .lock()
@@ -225,23 +257,32 @@ impl ReplicaHandler {
         let hash = staged.hash.clone();
         let applied_hash = staged.hash.clone();
         // The apply is one transaction; the marker write that follows
-        // is not part of it. A failure between the two leaves the node
-        // serving the new generation while still REPORTING the old
-        // one, so it pulls again and re-applies. Every write in the
-        // apply is an upsert keyed on the blob's ids, so replaying it
-        // converges instead of duplicating.
+        // is not part of it, so the two failures are reported
+        // differently. The apply failing means this node still serves
+        // the previous generation. The MARKER failing means it already
+        // serves the new one and merely under-reports, so calling that
+        // a refusal would tell an operator the opposite of what
+        // happened. Re-applying on the next pull is harmless: every
+        // write is an upsert keyed on the blob's ids.
         let outcome = db_blocking(&self.store, move |store| {
-            let applied = match store.apply_replica(&staged.config, &node_name) {
-                Ok(outcome) => store
-                    .set_cluster_applied_config(generation, &hash)
-                    .map(|()| outcome)
-                    .map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
+            let outcome = match store.apply_replica(&staged.config, &node_name) {
+                Ok(outcome) => outcome,
+                Err(e) => return Ok::<_, ApiError>(Err(e.to_string())),
             };
-            Ok::<_, ApiError>(applied)
+            let recorded = store.set_cluster_applied_config(generation, &hash);
+            Ok(Ok((outcome, recorded.err())))
         })
         .await
         .map_err(|e| e.to_string())??;
+        let (outcome, marker_error) = outcome;
+        if let Some(e) = marker_error {
+            warn!(
+                generation,
+                error = %e,
+                "the configuration was applied but the applied-generation marker could not be \
+                 written; this node serves the new generation and re-applies it on its next pull"
+            );
+        }
 
         let applied = AppliedConfig {
             generation,
@@ -332,7 +373,34 @@ impl ReplicaHandler {
     /// could not take, whether it was pushed or pulled.
     /// Operator-visible, because a follower stuck on an old
     /// configuration is a silent failure otherwise.
+    ///
+    /// At most one alert per `(generation, phase)`. Without that, a
+    /// node that cannot take the current generation refuses it again
+    /// on every heartbeat pull, forever, and the dispatcher's global
+    /// per-channel budget is shared with certificate-expiry and
+    /// backend-down alerts: the refusal would drown the alerts an
+    /// operator actually needs. The journal still records every
+    /// attempt.
     fn refused(&self, generation: u64, reason: &str, phase: &str) {
+        // Peer-supplied: this string reaches a journal line and a
+        // notification channel, so it is bounded and control
+        // characters are dropped, exactly as the control plane bounds
+        // what a follower tells IT.
+        let reason = &lorica_cluster::safe_reason(reason);
+        let first_time = self
+            .alerted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((generation, phase.to_string()));
+        if !first_time {
+            warn!(
+                generation,
+                phase,
+                %reason,
+                "refused a replicated configuration again; the alert is suppressed"
+            );
+            return;
+        }
         error!(
             generation,
             phase,
@@ -469,6 +537,7 @@ pub(crate) async fn spawn_follower(
         config_reload: opts.config_reload,
         alert_sender: opts.alert_sender,
         staged: StdMutex::new(None),
+        alerted: StdMutex::new(HashSet::new()),
     });
 
     let mut config = DialerConfig::new(

@@ -66,7 +66,7 @@ use lorica_cluster::enroll::{
     RenewRequest, SessionHandler,
 };
 use lorica_cluster::{
-    token, AppliedConfig, ClusterCa, ConfigPayload, ConfigVersion, ControlPlane, EnrollmentHandle,
+    token, AppliedConfig, ClusterCa, ConfigPayload, ControlPlane, EnrollmentHandle,
     EnrollmentListener, EnrollmentStats, FleetHooks, HandshakeConfig, IssuedLeaf,
     OperationalConfig, OperationalHandle, OperationalListener, OperationalStats, PreAuthBudgets,
     SwappableAcceptor,
@@ -647,14 +647,25 @@ impl SessionHandler for FleetHandlers {
     ) -> BoxFuture<'_, Result<Option<ConfigPayload>, String>> {
         let node_id = node_id.to_string();
         Box::pin(async move {
-            let current = self.control.config_version();
-            if !current.is_behind(&applied) {
+            let accepted = &self.control.accepted;
+            if !accepted.version().is_behind(&applied) {
+                // The node is where the fleet is. If it was quarantined
+                // for slow or refused Prepares, it has converged on its
+                // own and belongs back in the commit set, which is the
+                // release the documentation promises.
+                if self.control.replication.release(&node_id) {
+                    info!(node_id, "node released from replication quarantine: it converged");
+                }
                 return Ok(None);
             }
-            // Encode from the store rather than from a cached blob: a
-            // pull can arrive between two rounds, and the follower must
-            // converge on what the control plane runs NOW.
-            let payload = self.current_payload().await.map_err(|e| e.to_string())?;
+            // Served from the ACCEPTED payload, never re-encoded from
+            // the store. Two reasons: a pull must not be able to make
+            // the control plane walk every replicated table under the
+            // store lock, and it must never hand out a generation the
+            // fleet aborted.
+            let Some(payload) = accepted.payload() else {
+                return Err("no configuration has been accepted by the fleet yet".to_string());
+            };
             info!(
                 node_id,
                 from_generation = applied.generation,
@@ -662,30 +673,12 @@ impl SessionHandler for FleetHandlers {
                 "serving a configuration pull"
             );
             lorica_api::metrics::inc_cluster_config_apply(&node_id, "pulled");
-            Ok(Some(payload))
+            Ok(Some((*payload).clone()))
         })
     }
 }
 
 impl FleetHandlers {
-    /// The current configuration as a replicable payload: the Story
-    /// 9.1 canonical blob plus its hash, stamped with the persisted
-    /// generation. Encoding runs on the blocking pool because it walks
-    /// every replicated table.
-    async fn current_payload(&self) -> Result<ConfigPayload, ApiError> {
-        db_blocking(&self.store, |store| {
-            let generation = store.cluster_config_generation().map_err(internal)?;
-            let blob = lorica_config::canonical::canonical_bytes(store).map_err(internal)?;
-            let hash = lorica_config::canonical::canonical_hash(store).map_err(internal)?;
-            Ok::<_, ApiError>(ConfigPayload {
-                generation,
-                hash,
-                blob,
-            })
-        })
-        .await
-    }
-
     /// The renewal pipeline (AC #12): eligibility under a short lock,
     /// signing lock-free, persistence under a second short lock.
     ///
@@ -789,57 +782,53 @@ pub(crate) async fn replicate_after_reload(
     store: &Arc<Mutex<ConfigStore>>,
 ) {
     let control = &runtime.control;
-    // Encode BEFORE incrementing. The reload signal also fires for
+    // Encode and increment under ONE store lock. The pair
+    // (generation, hash) is treated as atomic by every consumer, so
+    // assembling it across two lock acquisitions would let a mutation
+    // landing between them publish generation N stamped with the hash
+    // of N-1.
+    //
+    // The encode comes first because the reload signal also fires for
     // changes that never replicate (an operator account, a session, a
-    // GeoIP database downloaded by the auto-updater), and the
-    // canonical hash is exactly the identity of what does replicate:
-    // an unchanged hash means there is nothing for the fleet to apply,
-    // so the generation does not move and no round runs.
-    let encoded = db_blocking(store, |store| {
+    // GeoIP database downloaded by the auto-updater), and the canonical
+    // hash is exactly the identity of what does replicate: an unchanged
+    // hash means there is nothing for the fleet to apply, so the
+    // generation does not move and no round runs.
+    let accepted_hash = control.accepted.version().hash;
+    let encoded = db_blocking(store, move |store| {
         let blob = lorica_config::canonical::canonical_bytes(store).map_err(internal)?;
-        let hash = lorica_config::canonical::canonical_hash(store).map_err(internal)?;
-        Ok::<_, ApiError>((blob, hash))
+        // From the bytes we already hold: `canonical_hash` would walk
+        // every replicated table and serialise it a second time.
+        let hash = lorica_config::canonical::sha256_hex(&blob);
+        if hash == accepted_hash {
+            return Ok::<_, ApiError>(None);
+        }
+        let generation = store
+            .increment_cluster_config_generation()
+            .map_err(internal)?;
+        Ok(Some(ConfigPayload {
+            generation,
+            hash,
+            blob,
+        }))
     })
     .await;
-    let (blob, hash) = match encoded {
-        Ok(encoded) => encoded,
+    let payload = match encoded {
+        Ok(Some(payload)) => payload,
+        Ok(None) => {
+            info!("configuration reload changed nothing the fleet replicates; no round");
+            return;
+        }
         Err(e) => {
             error!(error = %e, "cluster replication: could not encode the configuration");
             return;
         }
     };
-    if control.config_version().hash == hash {
-        info!("configuration reload changed nothing the fleet replicates; no round");
-        return;
-    }
-    let generation = match db_blocking(store, |store| {
-        store
-            .increment_cluster_config_generation()
-            .map_err(internal)
-    })
-    .await
-    {
-        Ok(generation) => generation,
-        Err(e) => {
-            error!(error = %e, "cluster replication: could not advance the generation");
-            return;
-        }
-    };
-    let payload = ConfigPayload {
-        generation,
-        hash,
-        blob,
-    };
-    // Publish BEFORE the round: a follower that connects or heartbeats
-    // mid-round must be told the truth about what the control plane
-    // owns, and converge by pull if the push does not reach it.
-    control.set_config_version(payload.version());
-    lorica_api::metrics::set_cluster_config_generation("control_plane", payload.generation);
 
-    let report = control
-        .replication
-        .replicate(&control.sessions, payload)
-        .await;
+    let generation = payload.generation;
+    // The round publishes the version itself, and only once Prepare
+    // has succeeded fleet-wide: see `AcceptedConfig`.
+    let report = control.replicate(payload).await;
     for node_id in &report.committed {
         lorica_api::metrics::inc_cluster_config_apply(node_id, "committed");
     }
@@ -854,22 +843,23 @@ pub(crate) async fn replicate_after_reload(
     }
     if report.aborted {
         warn!(
-            generation = report.generation,
+            generation,
             rejected = report.rejected.len(),
-            "cluster replication ABORTED: a follower refused the configuration semantically; \
-             the fleet stays on the previous generation and this node is ahead of it"
+            "cluster replication ABORTED: a follower refused the configuration semantically.              The generation was not published, so the fleet stays on the previous one and does              not pull this one; THIS node already serves it and is ahead of its own fleet.              Fix what the follower refused, or revoke it, then change the configuration again"
         );
-    } else if !report.commit_failed.is_empty() && !report.committed.is_empty() {
+        return;
+    }
+    lorica_api::metrics::set_cluster_config_generation("control_plane", generation);
+    if !report.commit_failed.is_empty() && !report.committed.is_empty() {
         warn!(
-            generation = report.generation,
+            generation,
             committed = report.committed.len(),
             commit_failed = report.commit_failed.len(),
-            "cluster replication SPLIT FLEET: some nodes committed and others did not; \
-             the stragglers reconcile on their next heartbeat"
+            "cluster replication SPLIT FLEET: some nodes committed and others did not;              the stragglers reconcile on their next heartbeat"
         );
     } else {
         info!(
-            generation = report.generation,
+            generation,
             committed = report.committed.len(),
             evicted = report.evicted.len(),
             skipped_break_glass = report.skipped_break_glass.len(),
@@ -1217,17 +1207,29 @@ pub(crate) async fn spawn_cluster_plane(
     refresh_control_plane(&control, store)
         .await
         .map_err(|e| format!("cluster plane: {e}"))?;
-    // Publish the version this process owns before the first session
-    // is admitted: a follower that connects during startup must not be
-    // told the control plane is at generation 0 and wipe itself.
+    // Seed the accepted configuration before the first session is
+    // admitted, for two reasons: a follower that connects during
+    // startup must not be told the control plane is at generation 0
+    // and wipe itself, and a convergence pull is answered from this
+    // payload rather than from the store, so it has to exist before
+    // anyone can ask.
+    //
+    // What the store holds at boot IS the accepted state: it is the
+    // configuration this process is about to serve, and the fleet
+    // either converged on it before the restart or converges on it now.
     {
         let s = store.lock().await;
         let generation = s
             .cluster_config_generation()
             .map_err(|e| format!("cluster plane: configuration generation: {e}"))?;
-        let hash = lorica_config::canonical::canonical_hash(&s)
-            .map_err(|e| format!("cluster plane: canonical hash: {e}"))?;
-        control.set_config_version(ConfigVersion { generation, hash });
+        let blob = lorica_config::canonical::canonical_bytes(&s)
+            .map_err(|e| format!("cluster plane: canonical encode: {e}"))?;
+        let hash = lorica_config::canonical::sha256_hex(&blob);
+        control.accepted.publish(ConfigPayload {
+            generation,
+            hash,
+            blob,
+        });
     }
     let runtime = Arc::new(ControlPlaneRuntime::new(Arc::clone(&control)));
     let drift_alerts = opts.alert_sender.clone();

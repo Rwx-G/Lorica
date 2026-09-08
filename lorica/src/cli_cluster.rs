@@ -483,29 +483,37 @@ pub(crate) fn run_cluster_status(
             // A follower never increments `cluster_config_generation`
             // (that counter belongs to the control plane); what it runs
             // is what the last applied replica recorded.
-            let (generation, hash) = store.cluster_applied_config().unwrap_or((0, String::new()));
-            println!("Applied configuration generation: {generation}");
-            if !hash.is_empty() {
-                println!("Applied configuration hash: {hash}");
+            // No `unwrap_or` on these reads. This command is what an
+            // operator trusts when the management API is down, so a
+            // confident wrong answer is the worst thing it can print.
+            match store.cluster_applied_config() {
+                Ok((generation, hash)) => {
+                    println!("Applied configuration generation: {generation}");
+                    if !hash.is_empty() {
+                        println!("Applied configuration hash: {hash}");
+                    }
+                }
+                Err(e) => println!("Applied configuration: UNKNOWN (store read failed: {e})"),
             }
             // Story 9.4 AC #11: the banner has to be readable with the
             // management API down, which is the situation break-glass
             // exists for.
-            match store.cluster_break_glass_until().unwrap_or(None) {
-                Some(until) if until > Utc::now() => println!(
+            match store.cluster_break_glass_until() {
+                Ok(Some(until)) if until > Utc::now() => println!(
                     "BREAK-GLASS OPEN until {}: local configuration changes are allowed and \
                      will be reconciled away when the window ends.",
                     until.to_rfc3339()
                 ),
-                _ => println!("Break-glass: closed (configuration is read-only on this node)"),
+                Ok(_) => println!("Break-glass: closed (configuration is read-only on this node)"),
+                Err(e) => println!("Break-glass: UNKNOWN (store read failed: {e})"),
             }
         }
         (None, true) => {
             println!("Role: control plane (cluster CA initialised)");
-            println!(
-                "Current configuration generation: {}",
-                store.cluster_config_generation().unwrap_or(0)
-            );
+            match store.cluster_config_generation() {
+                Ok(generation) => println!("Current configuration generation: {generation}"),
+                Err(e) => println!("Current configuration: UNKNOWN (store read failed: {e})"),
+            }
         }
         (None, false) => println!("Role: standalone"),
     }
