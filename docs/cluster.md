@@ -392,6 +392,135 @@ backend-down alerts share. Prometheus carries
 `lorica_cluster_config_apply_total{node_id, outcome}` and
 `lorica_cluster_drift_nodes`.
 
+## Certificate Issuance and Key Distribution
+
+Certificates are issued once, on the control plane, and the resulting
+key material is delivered to the nodes that need it. Three edges serving
+the same hostname produce one certificate, not three, and burn one
+issuance against the certificate authority's rate limit instead of
+three.
+
+### What runs where
+
+On a follower, certificate issuance, automatic renewal and the
+expiry notifier are all off. They are the control plane's job, and a
+follower running them would renew certificates the control plane
+already renewed and raise one duplicate fleet-wide expiry alert per
+node.
+
+Stapling is the exception, and deliberately so. The OCSP refresh loop
+runs on every node, because stapling is a serving concern and the
+followers are precisely the nodes terminating client TLS. Disabling it
+on followers would strip stapling from the whole data plane with
+nothing to replace it.
+
+### Need to know
+
+A follower receives the private key for a hostname only when it is
+selected to serve a route bound to that certificate. An edge in a
+low-trust network does not hold the key for a hostname it never
+answers for.
+
+The selection is resolved **on the control plane**, and this is the
+part that matters. A route carries a list of node names; the control
+plane resolves those names against its own registry into node ids, and
+a node id is what the mutual-TLS certificate on the session actually
+proves. The recipient is never asked to decide whether it is entitled
+to a key. A follower may ask for a certificate by id, and that list is
+treated as a hint about what it is missing, never as an authorization
+input: an id it is not selected for is answered with silence, which
+also means the answer does not reveal whether that certificate exists.
+
+Node names are unique from this version on, and enrollment refuses a
+name already taken. That is for the operator writing a route selector,
+not for the security model, which does not rest on names.
+
+### What distribution actually means
+
+Stated plainly, because it is a real trust decision and not an
+implementation detail: the control plane holds every distributed
+private key in usable form. It decrypts the key from its own store,
+ships it over the mutually-authenticated TLS session, and the follower
+writes it through the same path any local key takes, which encrypts it
+at rest under that node's own master key.
+
+So the mutual-TLS channel is the confidentiality boundary. There is no
+envelope encryption to a per-node public key, because no such key
+exists: enrollment presents a public key to prove possession during
+issuance, and the control plane does not keep it. A compromised control
+plane therefore yields the private keys of every hostname in the fleet.
+That is inherent to central issuance, it is why the control plane is
+the node to protect hardest, and it is why need-to-know exists at all:
+it bounds what a compromised *follower* yields, which is the far more
+likely event.
+
+Each key travels with the same digest the configuration blob carries
+for it. The receiving node recomputes that digest before writing
+anything, so a key that does not match the configuration announcing it
+is refused rather than installed.
+
+### Two channels, on purpose
+
+Key delivery does not ride the configuration commit. If it did, one
+slow follower could hold up renewals for the entire fleet until
+certificates expired, which is the same veto problem the configuration
+path was designed to avoid, with a worse outcome.
+
+The control plane pushes a key when it issues or renews one. That is
+the fast path and it is best effort: a node that is down, unreachable
+or not yet connected is simply not in that round, and nothing about the
+issuance fails because of it.
+
+The guarantee is the other direction. After a follower applies a
+configuration it knows exactly which certificates it holds no key for,
+because the apply just counted them, and it asks for those on the
+session it already has open. A node that was offline through an
+issuance therefore catches up at the first configuration it converges
+on, before it is asked to serve that hostname.
+
+A certificate whose key has not arrived yet is skipped by the TLS
+resolver with a warning, and routes bound to it serve under the default
+certificate until the key lands.
+
+### Break-glass does not stop keys
+
+Break-glass suspends configuration replication, but not key delivery.
+A private key overwrites no operator edit, so the reason the window
+exists does not apply to it, and freezing delivery for a window of up
+to a day could expire a certificate in the middle of the incident the
+window was opened for. This is the one control-plane-originated flow
+that a break-glass window does not suspend.
+
+### HTTP-01 across a fleet
+
+The certificate authority chooses which node it validates against, so
+an HTTP-01 token has to be present on every node that could answer for
+that hostname before validation is requested. The control plane
+distributes the token to those nodes and only then declares the
+challenge ready. A distribution that does not fully succeed aborts the
+order rather than racing the authority, which turns an opaque
+validation failure into a specific one naming the node that did not
+take the token.
+
+Challenge entries carry their own deadline. Before that, an order that
+crashed between publishing a token and cleaning it up left a node
+serving that key authorization indefinitely, because cleanup was the
+only thing that ever removed one.
+
+DNS-01 is unchanged. The control plane holds the provider credentials
+and completes the challenge itself; no follower is involved.
+
+### The export zone
+
+The filesystem export zone keeps working on every node. Its settings
+are node-local and never replicate: the directory, whether export is on
+at all, the ownership and the file modes belong to the machine. The
+per-pattern access rules do replicate, because they are fleet policy.
+
+On a follower the export runs when a key is installed, not when
+configuration is applied. Exporting at apply time would write an empty
+private-key file for every certificate whose key had not arrived yet.
+
 ## Node Identity in Telemetry
 
 Log-sink events (RFC 5424 syslog and OTLP) carry the emitting node's

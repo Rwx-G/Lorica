@@ -191,10 +191,21 @@ sensitive story in the epic is not acceptable.
     recipients. PULL after a replica apply and at reconnect, where the
     follower asks for exactly the certificates it just counted as
     missing. The pull path is the one that must be correct: it covers
-    AC #8, it covers any push that failed or landed while the node was
-    down, and it inherits the `NodeState::Active` gate the 9.4 QA added
-    to the pull dispatch (`listener/operational.rs:745-757`) for free.
+    AC #8 and any push that failed or landed while the node was down.
     The push is an optimisation on top, not the guarantee.
+
+    **CORRECTION, made during implementation.** This decision
+    originally said the certificate pull "inherits the
+    `NodeState::Active` gate the 9.4 QA added to the pull dispatch for
+    free". That was WRONG, and it was the most dangerous sentence in
+    this record: the certificate pull is its own dispatch arm and
+    inherits nothing. Anyone implementing D2 literally would have
+    shipped a key-distribution path with no activation check at all,
+    which is the exact defect the 9.4 QA found on the configuration
+    pull. The gate is written out explicitly on the new arm, with the
+    reasoning copied and strengthened, because a node awaiting operator
+    activation must not receive private keys either. Caught by the
+    implementer verifying the claim instead of trusting it.
   - **D3 - the recipient is resolved on the CONTROL PLANE, to a
     `node_id`.** AC #1 says to reuse the `node_selector` predicate from
     Story 9.4, which read literally lets the recipient select itself:
@@ -308,6 +319,19 @@ sensitive story in the epic is not acceptable.
     `lorica_certificates_invalid_bundle_total{source="reload"}`
     (`reload.rs:1075-1080`). A node waiting for a key and a node with a
     broken certificate need different operator responses.
+  - **D14 - three corrections the implementation forced, recorded so
+    the next reader does not repeat them.** The message pair cannot
+    live in `certs.rs` as the File List said: `messages.rs` is the
+    prost module, so the wire types live there and `certs.rs` holds the
+    plain twins and the coordinator, mirroring `ConfigPrepare` against
+    `ConfigPayload`. AC #1's fleet-wide opt-in cannot be implemented in
+    the transport at all: the distributor addresses exactly the ids it
+    is handed and never widens them, so the override belongs entirely
+    to the control-plane resolver, and nothing below will catch a
+    resolver that returns the whole fleet. And a new body tag needs TEN
+    lockstep edits, not the nine this record listed: `messages.rs`
+    carries a reserved-range test asserting the next free tags are
+    unknown, which moves every time the range is used.
   - **D13 - no new reporting channel is needed, and that is a
     consequence of D2.** The control plane cannot currently learn which
     certificates a node lacks: `ConfigCommitAck` carries only the
