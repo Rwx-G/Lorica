@@ -1,7 +1,7 @@
 # Story 9.3: Node Enrollment, Registry and Revocation
 
 **Epic:** 9 (v1.7.0)
-**Status:** Review
+**Status:** Done
 **Author:** Romain G.
 
 **Depends on:** Stories 9.1, 9.2.
@@ -417,6 +417,78 @@ with the control plane learning about it only through drift.
     `LiveSession` re-exported, doc wording, admission constants no
     longer duplicated in the binary, no-empty node name at the
     boundary.
+- **QA iteration 2 (2026-09-08)**: incremental re-audit of iteration 1
+  by the security and architecture auditors: 2 High, 13 Medium, ten
+  Lows; every High and Medium fixed, most Lows too:
+  - High (security): closing the enrollment window aborted every
+    in-flight connection, including the one that had just burned the
+    last token and was still writing its `EnrollAck` (the handler
+    publishes the liveness recount before it returns the grant), so
+    the last joiner of a window lost its certificate and its token.
+    The socket still closes at once; in-flight connections get a 5 s
+    drain before the abort (`CLOSE_DRAIN_GRACE`), and nothing new can
+    get through it because the post-TLS liveness re-check and the
+    conditional burn both refuse.
+  - High (architecture): `expires_at` on `cluster_revoked_serials`
+    had been added inside migration 50, which never re-runs on a
+    database already at 50 (every intra-cycle dev and QA database),
+    so the CRL rebuild failed there on every refresh. It is migration
+    51 now (`add_column_if_absent`, epoch default so pre-existing
+    rows are pruned at the next flush).
+  - Medium (security): the roster is now replaced even when the
+    acceptor rebuild fails (the revoked node then fails identity
+    resolution instead of TLS), and the error is still returned; the
+    credential-less `leave` no longer accepts a TLS alert received
+    DURING the handshake as proof (the peer is not authenticated yet),
+    only one read after `connect()` returned, and `UnknownCA` /
+    `CertificateExpired` are out of the accepted set; a node that
+    reconnects on the superseded certificate can ask for a renewal and
+    is re-issued without the "is it due" check
+    (`RenewRequest.via_previous_certificate`), so a lost grant is
+    recoverable; the session hook no longer writes to the store per
+    session (the periodic flush carries `last_seen_at`; the retire
+    runs only when the roster says a superseded certificate exists),
+    and the registry rate-limits sessions per node (10 per 60 s,
+    RETRY_LATER past it, counted under `sessions_retry_later`).
+  - Medium (architecture): a refresh failure after a revocation is
+    carried in `RevokeOutcome.refresh_error`, so the HTTP handler and
+    the leave hook audit and alert first and surface it after; the
+    refresh lock is private and the swaps take a `RefreshGuard`
+    (`ControlPlane::refresh_guard`), so the "read then swap under one
+    lock" invariant is a signature, not a comment; the runtime layer
+    returns `ClusterRuntimeError { Store, StoreTask, Acceptor }` with
+    `From<ClusterRuntimeError> for ApiError` (a store `NotFound` stays
+    a 404) and is a public module (`lorica_api::cluster::runtime`),
+    the `revoke_node_fully` alias is gone; renewal refusals in the
+    binary are a `RenewRefusal` enum, not HTTP statuses; `--password`
+    now beats `LORICA_ADMIN_PASSWORD` (explicit over ambient) and the
+    precedence test injects the variable instead of reading the
+    ambient one; `run_upgrade` uses the shared client and login, and
+    `unban` / `upgrade` gained the same three password sources;
+    `openapi.yaml` documents the idempotent revoke (404 only when
+    absent); the renewal timing constants live in one block in
+    `cluster_plane.rs` with a test tying accept window, lead, cooldown
+    and check interval together.
+  - Lows fixed: a renewal refusal no longer counts toward the
+    protocol-violation cap (grants do; refusals have their own cap of
+    8 per session that just drops the session) and a refused follower
+    waits an hour before asking again; `reconnect()` only notifies a
+    live session (a stored permit tore down the next session);
+    `rebuild_acceptor`'s outcome is logged; the CRL cache's soundness
+    condition (`INSERT OR IGNORE` on revoked serials) is documented
+    at the cache; `AttemptWindow`'s O(cap) eviction is documented;
+    `tracked_sources` is test-only and `public_id_is_valid` is
+    crate-private; the join token is CR/LF-trimmed like the password;
+    a password source without `--user` on `leave` / `status` is an
+    error instead of being ignored; the renewal cooldown is consumed
+    after the grant held, not before signing; the two startup-mode
+    comment blocks are one line each.
+  - Not fixed, logged: the temp file in the password test uses default
+    permissions (test-only, process-private name); the post-burn
+    signing failure, the post-sign registry-write failure and the
+    expired-token branch of the redemption pipeline are untested at
+    the unit level (covered by the integration suite's happy path
+    only).
 
 ## File List
 
@@ -442,10 +514,12 @@ with the control plane learning about it only through drift.
   IV2 revocation, IV3 identity, grace window, renew/leave.
 - `lorica-config/src/models/cluster.rs` (new),
   `store/cluster_nodes.rs`, `store/cluster_tokens.rs`,
-  `store/cluster_identity.rs` (new), `store/mod.rs` (migration 50,
-  rotation registry, `encrypt_bytes`), `models/mod.rs`, `tests.rs`.
-- `lorica-api/src/cluster.rs` (new): `ClusterRuntime`, token and node
-  endpoints, status, leave, roster/CRL refresh; `server.rs`,
+  `store/cluster_identity.rs` (new), `store/mod.rs` (migrations 50
+  and 51, rotation registry, `encrypt_bytes`), `models/mod.rs`,
+  `tests.rs`.
+- `lorica-api/src/cluster/mod.rs` (new): token and node endpoints,
+  status, leave; `cluster/runtime.rs` (new): `ClusterRuntime`,
+  `ClusterRuntimeError`, roster/CRL refresh, revocation; `server.rs`,
   `lib.rs`, `middleware/authorize.rs`, `audit.rs`
   (`record_with_store`), `metrics.rs`, `openapi.yaml`, `tests.rs`.
 - `lorica-notify/src/events.rs`, `channels/slack.rs`:
@@ -454,10 +528,13 @@ with the control plane learning about it only through drift.
   and lifecycle hooks, liveness publisher, session flush),
   `startup/cluster_follower.rs` (new), `startup/mod.rs`,
   `startup/single.rs`, `startup/supervisor.rs`, `cli.rs`
-  (`--cluster-auto-activate`, subcommands), `cli_cluster.rs` (new),
-  `lib.rs`, `main.rs`.
+  (`--cluster-auto-activate`, subcommands, password sources on
+  `unban` / `upgrade`), `cli_cluster.rs` (new), `cli_client.rs` (new,
+  the shared management-API client and password sources), `lib.rs`,
+  `main.rs`.
 - `docs/cluster.md`, `docs/security/threat-model.md`,
-  `docs/security/hardening-guide.md`.
+  `docs/security/hardening-guide.md`, `docs/hot-upgrade.md`,
+  `CHANGELOG.md` (password sources).
 
 ## Change Log
 
@@ -467,3 +544,4 @@ with the control plane learning about it only through drift.
 | 2026-09-06 | 0.2 | Phase 1 review: fifteen decisions recorded (token mint surface, two-segment token with embedded pin, redemption behind a trait, SPKI-pinning joiner verifier, in-memory roster, session kill switch, CRL rebuild, follower identity row, two-path leave). Status InProgress. | Romain G. |
 | 2026-09-06 | 0.3 | Implementation: token mint/parse/verify, pinned joiner, bare-key issuance + CRL, roster + session registry with kill switches, redemption/lifecycle hooks in the binary, registry endpoints + status + leave, `cluster join/leave/status/token`, follower runtime with renewal, docs. All ACs implemented; integration tests for IV1-IV3. Status Review. | Romain G. |
 | 2026-09-06 | 0.4 | QA iteration 1: store lock released around signing (Critical), renewal eligibility/cooldown/per-session cap, idempotent revocation with the kill before the error, serialized refresh, jittered renewals with immediate reconnect, RSA allowlist hardened, leave probe requires a certificate alert, password sources for the CLI, runtime layer split, shared startup helper, AC #11 sliding window. | Romain G. |
+| 2026-09-08 | 0.5 | QA iteration 2: enrollment window drains in-flight redemptions before the abort (High), `expires_at` moved to migration 51 (High), roster swapped even when the acceptor rebuild fails, handshake-phase alerts no longer prove deregistration, lost renewal grants recoverable, per-node session rate, no store write per session, typed `ClusterRuntimeError` and `RefreshGuard`, audit before the refresh error, password precedence and sources on `unban` / `upgrade`, renewal timing contract under test. Gates green (clippy, cluster/config/api/notify/bin tests, audit). Status Done. | Romain G. |
