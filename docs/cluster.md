@@ -330,9 +330,26 @@ serving what it had.
 
 A route carries a `node_selector`: a list of node names, empty meaning
 fleet-wide. A follower whose name is absent does not serve that route
-and deletes it locally. This is the same predicate certificate
-distribution needs for need-to-know key delivery, so it is defined once
-on the entity it scopes.
+and deletes it locally.
+
+**It scopes serving, not disclosure.** The blob is fleet-wide: every
+follower receives every route and filters on arrival. So a node that
+serves nothing still holds, in memory and on the wire, the definition of
+every other node's routes, including upstream addresses, IP allow and
+deny lists, mTLS configuration and Basic-auth password hashes. Compromise
+of the least-trusted edge therefore discloses the fleet's routing
+topology. Treat `node_selector` as a deployment filter and the blob as
+readable by any enrolled node.
+
+That is acceptable while the payload carries no secret material, which
+is the case here: private keys and channel credentials travel as digests
+only. It stops being acceptable the moment real keys are distributed,
+because a predicate the recipient evaluates on a payload it already holds
+is not need-to-know. Certificate distribution therefore has to filter on
+the CONTROL PLANE, per recipient, and match on the node id rather than
+the display name (a name is chosen by the joining node and is not
+unique). Each node then converges on its own payload, which is a real
+change to the single fleet-wide hash this chapter describes.
 
 ### Follower read-only, and break-glass
 
