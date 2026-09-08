@@ -90,6 +90,7 @@ pub mod preauth;
 pub mod replication;
 pub mod roster;
 pub mod session;
+pub mod telemetry;
 pub mod tls;
 pub mod token;
 pub mod version;
@@ -142,6 +143,10 @@ pub use messages::{
     MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
 };
 pub use preauth::{source_key, AttemptWindow, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
+pub use telemetry::{
+    storage_verdict, IngestQuota, IngestVerdict, DEFAULT_BYTES_PER_WINDOW,
+    DEFAULT_ROWS_PER_WINDOW, DEFAULT_STORAGE_FLOOR_BYTES, QUOTA_RETRY_AFTER_S, QUOTA_WINDOW,
+};
 pub use replication::{
     safe_reason, AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport,
     Replicator, DEFAULT_PER_NODE_DEADLINE, DEFAULT_QUARANTINE_THRESHOLD,
