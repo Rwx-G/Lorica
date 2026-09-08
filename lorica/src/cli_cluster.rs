@@ -468,7 +468,6 @@ pub(crate) fn run_cluster_status(
     let identity = store
         .get_cluster_identity()
         .unwrap_or_else(|e| fail(format!("failed to read the fleet identity: {e}")));
-    let generation = store.cluster_config_generation().unwrap_or(0);
     println!("Build version: {}", env!("CARGO_PKG_VERSION"));
     match (&identity, is_control_plane) {
         (Some(identity), _) => {
@@ -481,11 +480,35 @@ pub(crate) fn run_cluster_status(
                 "Certificate valid until: {}",
                 identity.cert_not_after.to_rfc3339()
             );
+            // A follower never increments `cluster_config_generation`
+            // (that counter belongs to the control plane); what it runs
+            // is what the last applied replica recorded.
+            let (generation, hash) = store.cluster_applied_config().unwrap_or((0, String::new()));
+            println!("Applied configuration generation: {generation}");
+            if !hash.is_empty() {
+                println!("Applied configuration hash: {hash}");
+            }
+            // Story 9.4 AC #11: the banner has to be readable with the
+            // management API down, which is the situation break-glass
+            // exists for.
+            match store.cluster_break_glass_until().unwrap_or(None) {
+                Some(until) if until > Utc::now() => println!(
+                    "BREAK-GLASS OPEN until {}: local configuration changes are allowed and \
+                     will be reconciled away when the window ends.",
+                    until.to_rfc3339()
+                ),
+                _ => println!("Break-glass: closed (configuration is read-only on this node)"),
+            }
         }
-        (None, true) => println!("Role: control plane (cluster CA initialised)"),
+        (None, true) => {
+            println!("Role: control plane (cluster CA initialised)");
+            println!(
+                "Current configuration generation: {}",
+                store.cluster_config_generation().unwrap_or(0)
+            );
+        }
         (None, false) => println!("Role: standalone"),
     }
-    println!("Applied configuration generation: {generation}");
 
     let (Some(user), Some(password)) = (user, password) else {
         println!("(Pass --user and a password source for the live connection state and the roster.)");
@@ -506,6 +529,52 @@ pub(crate) fn run_cluster_status(
             "{}",
             serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string())
         );
+    });
+}
+
+/// `lorica cluster break-glass` (Story 9.4 AC #11).
+pub(crate) fn run_cluster_break_glass(
+    management_port: u16,
+    duration_s: u64,
+    close: bool,
+    user: String,
+    password: String,
+) {
+    runtime().block_on(async {
+        let client = management_client();
+        management_login(&client, management_port, &user, &password).await;
+        let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/break-glass");
+        let request = if close {
+            client.delete(&url)
+        } else {
+            client
+                .post(&url)
+                .json(&serde_json::json!({ "duration_s": duration_s }))
+        };
+        let response = request
+            .send()
+            .await
+            .unwrap_or_else(|e| fail(format!("break-glass request failed: {e}")));
+        let data = management_data(response, "break-glass").await;
+        let active = data
+            .get("active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if active {
+            println!(
+                "BREAK-GLASS OPEN until {}. Local configuration changes are allowed on this \
+                 node until then.",
+                data.get("until").and_then(|v| v.as_str()).unwrap_or("?")
+            );
+            println!(
+                "The control plane owns the configuration: everything changed here is \
+                 reconciled away when the window ends. Close it early with \
+                 `lorica cluster break-glass --close`."
+            );
+        } else {
+            println!("Break-glass closed; this node follows the control plane again.");
+            println!("It pulls the current generation and applies it on its next heartbeat.");
+        }
     });
 }
 

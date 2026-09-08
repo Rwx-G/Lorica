@@ -1013,6 +1013,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 auto_activate: hu_cli.cluster_auto_activate,
                 log_store: log_store.clone(),
                 alert_sender: alert_sender.clone(),
+                config_reload: config_reload_tx.clone(),
             },
             &store,
         )

@@ -776,12 +776,19 @@ pub(crate) async fn spawn_cluster_runtime(
     opts: cluster_plane::ClusterPlaneOptions,
     store: &Arc<Mutex<ConfigStore>>,
 ) -> ClusterStartup {
+    // Both roles need these; `opts` is consumed by the control-plane
+    // path, so take the copies the follower needs first.
+    let follower_reload = opts.config_reload.clone();
+    let follower_alerts = opts.alert_sender.clone();
     let plane = match cluster_plane::spawn_cluster_plane(opts, store).await {
         Ok(Some(plane)) => {
             lorica_api::metrics::install_cluster_plane_stats(
                 Arc::clone(&plane.operational_stats),
                 Arc::clone(&plane.enrollment_stats),
             );
+            // Story 9.4 AC #14: the per-node applied generation is read
+            // from the live sessions at every scrape.
+            lorica_api::metrics::install_cluster_registry(Arc::clone(&plane.control.sessions));
             Some(plane)
         }
         Ok(None) => None,
@@ -793,6 +800,8 @@ pub(crate) async fn spawn_cluster_runtime(
     let follower = match cluster_follower::spawn_follower(
         cluster_follower::FollowerOptions {
             is_control_plane: plane.is_some(),
+            config_reload: follower_reload,
+            alert_sender: follower_alerts,
         },
         store,
     )
@@ -806,7 +815,10 @@ pub(crate) async fn spawn_cluster_runtime(
     };
     let runtime = match (&plane, &follower) {
         (Some(plane), _) => {
-            lorica_api::cluster::ClusterRuntime::ControlPlane(Arc::clone(&plane.control))
+            // One runtime handle shared by the API and the binary's
+            // replication tasks, so the drift bookkeeping the report
+            // reads is the same one the alert loop advances.
+            lorica_api::cluster::ClusterRuntime::ControlPlane(Arc::clone(&plane.runtime))
         }
         (None, Some(follower)) => {
             lorica_api::cluster::ClusterRuntime::Follower(Arc::clone(&follower.runtime))

@@ -389,6 +389,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 auto_activate: cluster_auto_activate,
                 log_store: log_store.clone(),
                 alert_sender: alert_sender.clone(),
+                config_reload: config_reload_tx.clone(),
             },
             &store,
         )

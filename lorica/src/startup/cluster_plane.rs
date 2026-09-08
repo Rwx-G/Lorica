@@ -57,6 +57,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use lorica_api::audit::{record_with_store, AuditContext};
 use lorica_api::cluster::runtime::{publish_token_liveness, refresh_control_plane, revoke_node};
+use lorica_api::cluster::ControlPlaneRuntime;
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
 use lorica_api::log_store::LogStore;
@@ -65,9 +66,10 @@ use lorica_cluster::enroll::{
     RenewRequest, SessionHandler,
 };
 use lorica_cluster::{
-    token, ClusterCa, ControlPlane, EnrollmentHandle, EnrollmentListener, EnrollmentStats,
-    FleetHooks, HandshakeConfig, IssuedLeaf, OperationalConfig, OperationalHandle,
-    OperationalListener, OperationalStats, PreAuthBudgets, SwappableAcceptor,
+    token, AppliedConfig, ClusterCa, ConfigPayload, ConfigVersion, ControlPlane, EnrollmentHandle,
+    EnrollmentListener, EnrollmentStats, FleetHooks, HandshakeConfig, IssuedLeaf,
+    OperationalConfig, OperationalHandle, OperationalListener, OperationalStats, PreAuthBudgets,
+    SwappableAcceptor,
 };
 use lorica_config::models::{ClusterNode, NodeStatus};
 use lorica_config::store::{ConfigStore, LiveNodeFacts};
@@ -147,8 +149,12 @@ pub(crate) struct ClusterPlaneOptions {
     /// The audit log the lifecycle hooks write to (`None` when the
     /// access-log store failed to open; events still reach the sinks).
     pub log_store: Option<Arc<LogStore>>,
-    /// The alert dispatcher (`ClusterNodeLeft`).
+    /// The alert dispatcher (`ClusterNodeLeft`, `ClusterDrift`).
     pub alert_sender: AlertSender,
+    /// The proxy's configuration-reload signal. The control plane
+    /// subscribes to it and replicates the new generation to the fleet
+    /// after every local mutation (Story 9.4 AC #3).
+    pub config_reload: watch::Sender<u64>,
 }
 
 /// Live handles for a running control-plane cluster plane. Dropping
@@ -158,8 +164,13 @@ pub(crate) struct ClusterPlane {
     pub operational: OperationalHandle,
     /// The token-gated enrollment listener.
     pub enrollment: EnrollmentHandle,
-    /// The fleet runtime shared with the management API.
+    /// The transport crate's fleet handle (roster, sessions, CA, the
+    /// replication coordinator).
     pub control: Arc<ControlPlane>,
+    /// The same handle plus the drift bookkeeping, shared with the
+    /// management API so the report an operator reads and the alert
+    /// loop that suppresses per node are one object (Story 9.4 AC #12).
+    pub runtime: Arc<ControlPlaneRuntime>,
     /// Operational-listener counters, bridged into Prometheus at
     /// scrape time.
     pub operational_stats: Arc<OperationalStats>,
@@ -625,9 +636,56 @@ impl SessionHandler for FleetHandlers {
             .await;
         })
     }
+
+    /// A follower asks for the current configuration (Story 9.4 AC #7).
+    /// `Ok(None)` means it already holds it and nothing transfers: the
+    /// "delta keyed on the applied hash" is the absence of a delta.
+    fn on_config_pull(
+        &self,
+        node_id: &str,
+        applied: AppliedConfig,
+    ) -> BoxFuture<'_, Result<Option<ConfigPayload>, String>> {
+        let node_id = node_id.to_string();
+        Box::pin(async move {
+            let current = self.control.config_version();
+            if !current.is_behind(&applied) {
+                return Ok(None);
+            }
+            // Encode from the store rather than from a cached blob: a
+            // pull can arrive between two rounds, and the follower must
+            // converge on what the control plane runs NOW.
+            let payload = self.current_payload().await.map_err(|e| e.to_string())?;
+            info!(
+                node_id,
+                from_generation = applied.generation,
+                to_generation = payload.generation,
+                "serving a configuration pull"
+            );
+            lorica_api::metrics::inc_cluster_config_apply(&node_id, "pulled");
+            Ok(Some(payload))
+        })
+    }
 }
 
 impl FleetHandlers {
+    /// The current configuration as a replicable payload: the Story
+    /// 9.1 canonical blob plus its hash, stamped with the persisted
+    /// generation. Encoding runs on the blocking pool because it walks
+    /// every replicated table.
+    async fn current_payload(&self) -> Result<ConfigPayload, ApiError> {
+        db_blocking(&self.store, |store| {
+            let generation = store.cluster_config_generation().map_err(internal)?;
+            let blob = lorica_config::canonical::canonical_bytes(store).map_err(internal)?;
+            let hash = lorica_config::canonical::canonical_hash(store).map_err(internal)?;
+            Ok::<_, ApiError>(ConfigPayload {
+                generation,
+                hash,
+                blob,
+            })
+        })
+        .await
+    }
+
     /// The renewal pipeline (AC #12): eligibility under a short lock,
     /// signing lock-free, persistence under a second short lock.
     ///
@@ -708,6 +766,200 @@ impl FleetHandlers {
     }
 }
 
+/// How often the drift evaluation runs on the control plane (Story
+/// 9.4 AC #12). Alerts are additionally suppressed per node by the
+/// runtime's exponential backoff, so this cadence bounds detection
+/// latency, not alert volume.
+const DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Replicate the configuration this process just reloaded to the
+/// fleet (Story 9.4 AC #3/#5/#6): increment the persisted generation,
+/// encode the canonical blob and its hash, publish the new version so
+/// every handshake and heartbeat advertises it, then run one
+/// Prepare/Commit round over the connected active sessions.
+///
+/// Driven by [`spawn_replication_watch`] off the same signal the
+/// local reload runs on. The store commits before that signal fires,
+/// so the blob encoded here is the configuration this node owns
+/// whether or not its own data plane has finished swapping. Failures
+/// are logged and counted; they never fail the mutation that triggered
+/// them, which is already committed locally.
+pub(crate) async fn replicate_after_reload(
+    runtime: &Arc<ControlPlaneRuntime>,
+    store: &Arc<Mutex<ConfigStore>>,
+) {
+    let control = &runtime.control;
+    // Encode BEFORE incrementing. The reload signal also fires for
+    // changes that never replicate (an operator account, a session, a
+    // GeoIP database downloaded by the auto-updater), and the
+    // canonical hash is exactly the identity of what does replicate:
+    // an unchanged hash means there is nothing for the fleet to apply,
+    // so the generation does not move and no round runs.
+    let encoded = db_blocking(store, |store| {
+        let blob = lorica_config::canonical::canonical_bytes(store).map_err(internal)?;
+        let hash = lorica_config::canonical::canonical_hash(store).map_err(internal)?;
+        Ok::<_, ApiError>((blob, hash))
+    })
+    .await;
+    let (blob, hash) = match encoded {
+        Ok(encoded) => encoded,
+        Err(e) => {
+            error!(error = %e, "cluster replication: could not encode the configuration");
+            return;
+        }
+    };
+    if control.config_version().hash == hash {
+        info!("configuration reload changed nothing the fleet replicates; no round");
+        return;
+    }
+    let generation = match db_blocking(store, |store| {
+        store
+            .increment_cluster_config_generation()
+            .map_err(internal)
+    })
+    .await
+    {
+        Ok(generation) => generation,
+        Err(e) => {
+            error!(error = %e, "cluster replication: could not advance the generation");
+            return;
+        }
+    };
+    let payload = ConfigPayload {
+        generation,
+        hash,
+        blob,
+    };
+    // Publish BEFORE the round: a follower that connects or heartbeats
+    // mid-round must be told the truth about what the control plane
+    // owns, and converge by pull if the push does not reach it.
+    control.set_config_version(payload.version());
+    lorica_api::metrics::set_cluster_config_generation("control_plane", payload.generation);
+
+    let report = control
+        .replication
+        .replicate(&control.sessions, payload)
+        .await;
+    for node_id in &report.committed {
+        lorica_api::metrics::inc_cluster_config_apply(node_id, "committed");
+    }
+    for (node_id, _) in &report.evicted {
+        lorica_api::metrics::inc_cluster_config_apply(node_id, "evicted");
+    }
+    for (node_id, _) in &report.rejected {
+        lorica_api::metrics::inc_cluster_config_apply(node_id, "rejected");
+    }
+    for (node_id, _) in &report.commit_failed {
+        lorica_api::metrics::inc_cluster_config_apply(node_id, "commit_failed");
+    }
+    if report.aborted {
+        warn!(
+            generation = report.generation,
+            rejected = report.rejected.len(),
+            "cluster replication ABORTED: a follower refused the configuration semantically; \
+             the fleet stays on the previous generation and this node is ahead of it"
+        );
+    } else if !report.commit_failed.is_empty() && !report.committed.is_empty() {
+        warn!(
+            generation = report.generation,
+            committed = report.committed.len(),
+            commit_failed = report.commit_failed.len(),
+            "cluster replication SPLIT FLEET: some nodes committed and others did not; \
+             the stragglers reconcile on their next heartbeat"
+        );
+    } else {
+        info!(
+            generation = report.generation,
+            committed = report.committed.len(),
+            evicted = report.evicted.len(),
+            skipped_break_glass = report.skipped_break_glass.len(),
+            skipped_quarantined = report.skipped_quarantined.len(),
+            "cluster configuration replicated"
+        );
+    }
+}
+
+/// Replicate to the fleet after every local configuration mutation
+/// (AC #3), driven by the same watch the local reload runs on.
+///
+/// The signal is a counter, not a queue: several mutations landing
+/// while a round is in flight collapse into one round on the state
+/// they all committed to, which is exactly the semantics wanted.
+fn spawn_replication_watch(
+    runtime: Arc<ControlPlaneRuntime>,
+    store: Arc<Mutex<ConfigStore>>,
+    mut reload: watch::Receiver<u64>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while reload.changed().await.is_ok() {
+            replicate_after_reload(&runtime, &store).await;
+        }
+    })
+}
+
+/// Evaluate fleet drift every [`DRIFT_CHECK_INTERVAL`] (AC #12):
+/// publish the drifted count as a gauge and raise one alert per node
+/// whose suppression backoff has expired.
+fn spawn_drift_watch(
+    runtime: Arc<ControlPlaneRuntime>,
+    store: Arc<Mutex<ConfigStore>>,
+    alert_sender: AlertSender,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(DRIFT_CHECK_INTERVAL).await;
+            let report = match lorica_api::cluster::runtime::drift_report(&runtime, &store).await {
+                Ok(report) => report,
+                Err(e) => {
+                    error!(error = %e, "cluster drift evaluation failed");
+                    continue;
+                }
+            };
+            lorica_api::metrics::set_cluster_drift_nodes(report.drifted.len());
+            let ids: Vec<String> = report.drifted.iter().map(|d| d.node_id.clone()).collect();
+            for node_id in runtime.drift.observe(&ids, Utc::now()) {
+                let Some(entry) = report.drifted.iter().find(|d| d.node_id == node_id) else {
+                    continue;
+                };
+                // A node in break-glass is drifted BY DESIGN: the
+                // operator opened the window. Say so instead of paging
+                // as if it were a fault.
+                let summary = if entry.break_glass {
+                    format!(
+                        "cluster node {} ({}) is in break-glass and diverges from generation {}",
+                        entry.name, node_id, report.current_generation
+                    )
+                } else {
+                    format!(
+                        "cluster node {} ({}) applied generation {} while the control plane is \
+                         at {}",
+                        entry.name, node_id, entry.applied_generation, report.current_generation
+                    )
+                };
+                alert_sender.send(
+                    AlertEvent::new(AlertType::ClusterDrift, summary)
+                        .with_detail("node_id", node_id.clone())
+                        .with_detail("node_name", entry.name.clone())
+                        .with_detail(
+                            "applied_generation",
+                            entry.applied_generation.to_string(),
+                        )
+                        .with_detail(
+                            "current_generation",
+                            report.current_generation.to_string(),
+                        )
+                        .with_detail("connected", entry.connected.to_string())
+                        .with_detail("break_glass", entry.break_glass.to_string())
+                        .with_detail(
+                            "age_s",
+                            entry.age_s.map(|a| a.to_string()).unwrap_or_default(),
+                        ),
+                );
+            }
+        }
+    })
+}
+
 /// Recount live tokens on every expiry edge (and at most every
 /// [`FLUSH_INTERVAL`]), so the enrollment listener closes the moment
 /// the last token expires even when no mutation happens.
@@ -766,6 +1018,13 @@ fn spawn_session_flush(
                     address: s.peer_addr.to_string(),
                     version: s.build_version,
                     schema_version: i64::from(s.schema_version),
+                    // Story 9.4: the generation each node reports is
+                    // persisted here too, so the drift view survives a
+                    // control-plane restart and a disconnected node
+                    // still has a last-known applied version.
+                    applied_config_generation: i64::try_from(s.applied.generation)
+                        .unwrap_or(i64::MAX),
+                    applied_config_hash: s.applied.hash,
                     last_seen_at: DateTime::<Utc>::from_timestamp(
                         i64::try_from(s.last_seen_unix).unwrap_or(0),
                         0,
@@ -958,6 +1217,21 @@ pub(crate) async fn spawn_cluster_plane(
     refresh_control_plane(&control, store)
         .await
         .map_err(|e| format!("cluster plane: {e}"))?;
+    // Publish the version this process owns before the first session
+    // is admitted: a follower that connects during startup must not be
+    // told the control plane is at generation 0 and wipe itself.
+    {
+        let s = store.lock().await;
+        let generation = s
+            .cluster_config_generation()
+            .map_err(|e| format!("cluster plane: configuration generation: {e}"))?;
+        let hash = lorica_config::canonical::canonical_hash(&s)
+            .map_err(|e| format!("cluster plane: canonical hash: {e}"))?;
+        control.set_config_version(ConfigVersion { generation, hash });
+    }
+    let runtime = Arc::new(ControlPlaneRuntime::new(Arc::clone(&control)));
+    let drift_alerts = opts.alert_sender.clone();
+    let replication_reload = opts.config_reload.subscribe();
     let handlers = Arc::new(FleetHandlers {
         control: Arc::clone(&control),
         store: Arc::clone(store),
@@ -976,6 +1250,11 @@ pub(crate) async fn spawn_cluster_plane(
     operational_config.fleet_size = fleet_size;
     operational_config.stats = Arc::clone(&operational_stats);
     operational_config.takeover_epoch = takeover_epoch;
+    // Story 9.4 AC #7: the HelloAck and every HeartbeatAck advertise
+    // the version below, so a follower that is behind pulls instead of
+    // drifting. One slot shared with the control-plane handle, swapped
+    // by the coordinator after each round.
+    operational_config.config_version = control.config_version_handle();
     operational_config.fleet = Some(FleetHooks {
         roster: Arc::clone(&control.roster),
         sessions: Arc::clone(&control.sessions),
@@ -996,6 +1275,8 @@ pub(crate) async fn spawn_cluster_plane(
     let tasks = vec![
         spawn_liveness_publisher(Arc::clone(&control), Arc::clone(store)),
         spawn_session_flush(Arc::clone(&control), Arc::clone(store)),
+        spawn_drift_watch(Arc::clone(&runtime), Arc::clone(store), drift_alerts),
+        spawn_replication_watch(Arc::clone(&runtime), Arc::clone(store), replication_reload),
     ];
 
     // WARN, not INFO (AC #11): exposing a fleet listener is the kind
@@ -1018,6 +1299,7 @@ pub(crate) async fn spawn_cluster_plane(
     Ok(Some(ClusterPlane {
         operational,
         enrollment,
+        runtime,
         control,
         operational_stats,
         enrollment_stats,

@@ -352,6 +352,38 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         password: Option<String>,
     },
+    /// Re-enable local configuration mutations on a follower for a
+    /// bounded window (Story 9.4 AC #11). A follower normally refuses
+    /// every configuration change: the control plane owns it. Use this
+    /// when the control plane is unreachable and an edge needs an
+    /// emergency change. Everything changed locally is reconciled away
+    /// when the window ends.
+    BreakGlass {
+        /// Window length in seconds (max 86400). Ignored with --close.
+        #[arg(long, default_value_t = 3600)]
+        duration: u64,
+
+        /// Close the window now instead of opening one.
+        #[arg(long)]
+        close: bool,
+
+        /// SuperAdmin username on the local management API.
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// Read the SuperAdmin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the SuperAdmin password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// SuperAdmin password on the command line (discouraged; see
+        /// `leave`).
+        #[arg(long)]
+        password: Option<String>,
+    },
     /// Mint a join token on this control plane through the local
     /// management API (SuperAdmin). The token is printed once, apart
     /// from the command that consumes it.

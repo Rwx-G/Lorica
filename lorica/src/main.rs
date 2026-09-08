@@ -131,6 +131,25 @@ fn main() {
                 );
                 cli_cluster::run_cluster_status(&cli.data_dir, cli.management_port, user, password);
             }
+            ClusterAction::BreakGlass {
+                duration,
+                close,
+                user,
+                password_file,
+                password_stdin,
+                password,
+            } => {
+                let password =
+                    cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
+                        .unwrap_or_else(|e| cli_client::fail(e));
+                cli_cluster::run_cluster_break_glass(
+                    cli.management_port,
+                    duration,
+                    close,
+                    user,
+                    password,
+                );
+            }
             ClusterAction::Token {
                 ttl_seconds,
                 node_name,
