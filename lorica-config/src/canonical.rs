@@ -340,7 +340,12 @@ fn sort_object_keys(value: serde_json::Value) -> serde_json::Value {
 
 /// Lowercase-hex SHA-256 of `bytes`. Shared with the replica apply so
 /// the blob-integrity check and the encoder cannot drift apart.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+///
+/// Public so a caller that already holds the output of
+/// [`canonical_bytes`] can hash it directly: [`canonical_hash`] re-runs
+/// the whole encoder, which walks every replicated table and serialises
+/// it a second time.
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
     digest
         .as_ref()

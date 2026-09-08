@@ -1066,6 +1066,46 @@ fn default_captcha_alphabet() -> String {
 /// and disabling the route where it must not run.
 pub const NODE_SELECTOR_MAX_ENTRIES: usize = 64;
 
+/// The ONE rule for a `node_selector` list: at most
+/// [`NODE_SELECTOR_MAX_ENTRIES`] entries, each a node name over the
+/// same alphabet as `group_name` (ASCII lowercase letters, digits, `-`
+/// and `_`, 1..=64 characters).
+///
+/// A free function rather than only a method, because the rule is
+/// enforced on both sides of the replication boundary: the management
+/// API validates what an operator submits, and the follower validates
+/// what arrives in a blob. Two copies would let the two drift, and a
+/// selector the control plane accepts but a follower refuses aborts
+/// the replication round for the entire fleet.
+///
+/// # Errors
+///
+/// Returns a human-readable message describing the first violated
+/// rule, suitable for a `400 Bad Request` body.
+pub fn validate_node_selector_names(names: &[String]) -> Result<(), String> {
+    if names.len() > NODE_SELECTOR_MAX_ENTRIES {
+        return Err(format!(
+            "node_selector may not carry more than {NODE_SELECTOR_MAX_ENTRIES} node names"
+        ));
+    }
+    for name in names {
+        if name.is_empty() || name.len() > 64 {
+            return Err("node_selector entries must be 1..=64 characters long".to_string());
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        {
+            return Err(
+                "node_selector entries may only contain ASCII lowercase letters, \
+                 digits, `-` and `_`"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Route {
     /// Whether `route` is served by the node called `node_name`
     /// (Story 9.4 D11, AC #13): true when the selector is empty
@@ -1098,29 +1138,7 @@ impl Route {
     ///
     /// Returns `Err` describing the first violated rule.
     pub fn validate_node_selector(&self) -> Result<(), String> {
-        if self.node_selector.len() > NODE_SELECTOR_MAX_ENTRIES {
-            return Err(format!(
-                "node_selector may not carry more than {NODE_SELECTOR_MAX_ENTRIES} node names"
-            ));
-        }
-        for name in &self.node_selector {
-            if name.is_empty() || name.len() > 64 {
-                return Err(
-                    "node_selector entries must be 1..=64 characters long".to_string()
-                );
-            }
-            if !name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-            {
-                return Err(
-                    "node_selector entries may only contain ASCII lowercase letters, \
-                     digits, `-` and `_`"
-                        .to_string(),
-                );
-            }
-        }
-        Ok(())
+        validate_node_selector_names(&self.node_selector)
     }
 
     /// Return a clone of this route with any `Some(_)` field of `rule`

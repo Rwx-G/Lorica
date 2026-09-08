@@ -14,7 +14,7 @@ use rusqlite::{params, OptionalExtension};
 
 use super::row_helpers::parse_datetime;
 use super::ConfigStore;
-use crate::error::Result;
+use crate::error::{ConfigError, Result};
 
 /// Read one `cluster_replica` value. Absent (a row a future migration
 /// adds but an older database has not seeded) reads as the empty
@@ -47,11 +47,18 @@ impl ConfigStore {
     /// has never applied one, which is what a fresh follower reports in
     /// its first heartbeat so the control plane sends a full blob.
     pub fn cluster_applied_config(&self) -> Result<(u64, String)> {
-        let generation: i64 = read_key(self, "applied_config_generation")?
-            .parse()
-            .unwrap_or(0);
+        let raw = read_key(self, "applied_config_generation")?;
+        // A row we wrote ourselves that will not parse means the store
+        // is corrupt. Reporting 0 would silently make this node claim
+        // it has applied nothing and re-apply from scratch, which hides
+        // the corruption behind a full reconciliation.
+        let generation: u64 = raw.parse().map_err(|_| {
+            ConfigError::Validation(
+                "cluster_replica.applied_config_generation is not a number".to_string(),
+            )
+        })?;
         let hash: String = read_key(self, "applied_config_hash")?;
-        Ok((generation.max(0) as u64, hash))
+        Ok((generation, hash))
     }
 
     /// Record the generation and canonical hash just applied (Story 9.4
