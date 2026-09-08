@@ -66,7 +66,7 @@ use lorica_cluster::enroll::{
     RenewRequest, SessionHandler,
 };
 use lorica_cluster::{
-    token, AppliedConfig, ClusterCa, ConfigPayload, ControlPlane, EnrollmentHandle,
+    token, AppliedConfig, CertBundle, ClusterCa, ConfigPayload, ControlPlane, EnrollmentHandle,
     EnrollmentListener, EnrollmentStats, FleetHooks, HandshakeConfig, IssuedLeaf,
     OperationalConfig, OperationalHandle, OperationalListener, OperationalStats, PreAuthBudgets,
     SwappableAcceptor,
@@ -357,6 +357,24 @@ pub(crate) async fn redeem_with_store(
                 return Ok(Err("source address is outside the token's CIDR binding"));
             }
         }
+        // Node names are UNIQUE since Story 9.5 migration 53, because
+        // the name is what an operator writes in a route's
+        // `node_selector`. Checked BEFORE the burn and answered as a
+        // refusal, so a colliding name costs the operator a retry with
+        // a different name rather than a burned token and a constraint
+        // error out of the store.
+        //
+        // The name is still not an authorization input: entitlement is
+        // resolved to a node id on the control plane (Story 9.5 D3).
+        // Uniqueness is for the operator, not for the security model.
+        let taken = store
+            .list_cluster_nodes()
+            .map_err(internal)?
+            .into_iter()
+            .any(|node| node.name == request.node_name);
+        if taken {
+            return Ok(Err("a node with this name is already enrolled"));
+        }
         // The key must be acceptable BEFORE the burn: a bad key must
         // not consume a good token.
         if lorica_cluster::ca::check_public_key_allowlist(&request.public_key_der).is_err() {
@@ -640,6 +658,50 @@ impl SessionHandler for FleetHandlers {
     /// A follower asks for the current configuration (Story 9.4 AC #7).
     /// `Ok(None)` means it already holds it and nothing transfers: the
     /// "delta keyed on the applied hash" is the absence of a delta.
+    fn on_cert_pull(
+        &self,
+        node_id: &str,
+        cert_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<Vec<CertBundle>, String>> {
+        let node_id = node_id.to_string();
+        Box::pin(async move {
+            let entitled_to = node_id.clone();
+            let bundles = db_blocking(&self.store, move |store| {
+                let mut out: Vec<CertBundle> = Vec::new();
+                for cert_id in cert_ids.iter().take(lorica_cluster::MAX_CERT_BUNDLES) {
+                    // Entitlement is resolved HERE, from the store, and
+                    // never from what the peer asked for (Story 9.5
+                    // D3). The id list is a hint about what the node is
+                    // missing, not an authorization input.
+                    let recipients = store.cert_key_recipients(cert_id).map_err(internal)?;
+                    if !recipients.iter().any(|id| id == &entitled_to) {
+                        continue;
+                    }
+                    let Some(cert) = store.get_certificate(cert_id).map_err(internal)? else {
+                        continue;
+                    };
+                    if cert.key_pem.is_empty() {
+                        continue;
+                    }
+                    out.push(lorica_api::cluster::runtime::cert_bundle(&cert));
+                }
+                Ok::<_, ApiError>(out)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            // A node asking for something it is not selected for gets
+            // silence on that id rather than a refusal: the answer must
+            // not tell it whether the certificate exists at all.
+            info!(
+                node_id,
+                sent = bundles.len(),
+                "answered a certificate pull"
+            );
+            lorica_api::metrics::inc_cluster_cert_push(&node_id, "pulled");
+            Ok(bundles)
+        })
+    }
+
     fn on_config_pull(
         &self,
         node_id: &str,

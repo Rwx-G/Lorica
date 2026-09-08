@@ -46,8 +46,8 @@ use lorica_api::error::ApiError;
 use lorica_cluster::enroll::BoxFuture;
 use lorica_cluster::messages::{cluster_response, ConfigPull, Renew};
 use lorica_cluster::{
-    AppliedConfig, ClusterRequest, ConfigPayload, ConfigVersion, Dialer, DialerConfig,
-    DialerHandle, FollowerHandler, SessionHandle,
+    AppliedConfig, CertBundle, CertInstallReport, ClusterRequest, ConfigPayload, ConfigVersion,
+    Dialer, DialerConfig, DialerHandle, FollowerHandler, SessionHandle, MAX_CERT_PULL_IDS,
 };
 use lorica_config::canonical::CanonicalConfig;
 use lorica_config::models::ClusterIdentity;
@@ -318,6 +318,10 @@ impl ReplicaHandler {
     /// One convergence pull (AC #7): ask for the current generation,
     /// then run the same stage/apply a push would.
     async fn pull_and_apply(&self, session: SessionHandle) {
+        // `session` is kept for the certificate pull at the end: the
+        // connection is already open and authenticated, so the keys
+        // ride the same round trip budget as the configuration.
+
         if self.break_glass_active() {
             return;
         }
@@ -366,7 +370,189 @@ impl ReplicaHandler {
         if self.on_prepare(payload).await.is_err() {
             return;
         }
-        let _ = self.on_commit(generation).await;
+        if self.on_commit(generation).await.is_err() {
+            return;
+        }
+        // The apply just wrote every certificate this node holds no key
+        // for. Asking now, on the session that is already open, is what
+        // makes AC #8 true: a node that was offline through an issuance
+        // catches up at the first configuration it converges on.
+        self.pull_missing_certs(&session).await;
+    }
+
+    /// Install certificate material the control plane sent (Story 9.5
+    /// AC #7/#8), verifying each key against the digest that travelled
+    /// with it before writing anything.
+    ///
+    /// A bundle whose certificate row does not exist yet is REFUSED
+    /// rather than created: the row is the configuration's business,
+    /// and a key without one means the push overtook the generation
+    /// that introduces it. That resolves itself, because the follower
+    /// asks again after its next apply, when the row exists and it can
+    /// see exactly what it still lacks.
+    async fn install_certs(&self, bundles: Vec<CertBundle>) -> CertInstallReport {
+        let mut report = CertInstallReport::default();
+        for bundle in bundles {
+            // The digest is the same shape the canonical blob carries,
+            // so this check is what ties the key to the configuration
+            // that announced it. A mismatch means the two channels
+            // disagree, and writing either one would be a guess.
+            let computed = format!(
+                "sha256:{}",
+                lorica_config::canonical::sha256_hex(bundle.key_pem.as_bytes())
+            );
+            if computed != bundle.key_digest {
+                report.refused.push((
+                    bundle.cert_id.clone(),
+                    "key does not match the digest it arrived with".to_string(),
+                ));
+                continue;
+            }
+            let cert_id = bundle.cert_id.clone();
+            let installed = db_blocking(&self.store, move |store| {
+                let existing = match store.get_certificate(&bundle.cert_id) {
+                    Ok(Some(existing)) => existing,
+                    Ok(None) => {
+                        return Ok::<_, ApiError>(Err(
+                            "no certificate row for this id yet".to_string()
+                        ))
+                    }
+                    Err(e) => return Ok(Err(e.to_string())),
+                };
+                let row = lorica_config::models::Certificate {
+                    cert_pem: bundle.cert_pem,
+                    key_pem: bundle.key_pem,
+                    ..existing
+                };
+                match store.update_certificate(&row) {
+                    // Encryption at rest happens on write, under THIS
+                    // node's master key, which is all AC #2 means by
+                    // re-encrypting under the follower's own key. There
+                    // is no second crypto path.
+                    Ok(()) => Ok(Ok(row)),
+                    Err(e) => Ok(Err(e.to_string())),
+                }
+            })
+            .await;
+            match installed {
+                Ok(Ok(row)) => {
+                    self.export_installed(row).await;
+                    report.installed.push(cert_id);
+                }
+                Ok(Err(reason)) => report.refused.push((cert_id, reason)),
+                Err(e) => report.refused.push((cert_id, e.to_string())),
+            }
+        }
+        if !report.installed.is_empty() {
+            info!(
+                installed = report.installed.len(),
+                refused = report.refused.len(),
+                "installed certificate keys from the control plane"
+            );
+            lorica_api::metrics::inc_cluster_cert_push(&self.node_id, "installed");
+            // The resolver reads keys at reload, and until now these
+            // certificates were being skipped for having none.
+            self.config_reload
+                .send_modify(|seq| *seq = seq.wrapping_add(1));
+        }
+        for (cert_id, reason) in &report.refused {
+            warn!(cert_id, %reason, "refused a certificate the control plane sent");
+            lorica_api::metrics::inc_cluster_cert_push(&self.node_id, "refused");
+        }
+        report
+    }
+
+    /// Write a newly-installed certificate to the filesystem export
+    /// zone (Story 9.5 AC #9, decision D8).
+    ///
+    /// Triggered HERE and not from the configuration apply, because at
+    /// apply time a certificate this node has no key for would export
+    /// an empty private-key file. By the time this runs the key is
+    /// present and verified. The zone itself is node-local settings,
+    /// which never replicate; only the ACL rows do.
+    async fn export_installed(&self, cert: lorica_config::models::Certificate) {
+        let inputs = db_blocking(&self.store, |store| {
+            Ok::<_, ApiError>(lorica_api::cert_export::snapshot_export_inputs(store))
+        })
+        .await;
+        if let Ok(Some((settings, acls))) = inputs {
+            lorica_api::cert_export::export_after_release(settings, acls, cert).await;
+        }
+    }
+
+    /// Ask the control plane for the keys this node is missing (AC #8).
+    ///
+    /// Called after an apply, which is exactly when the node knows what
+    /// it lacks: the apply just counted the certificates it wrote
+    /// without a key. This is the path that carries the guarantee; the
+    /// control plane's push is the latency optimisation on top of it
+    /// (decision D2).
+    async fn pull_missing_certs(&self, session: &SessionHandle) {
+        let missing = db_blocking(&self.store, |store| {
+            let ids: Vec<String> = store
+                .list_certificates()
+                .map_err(internal)?
+                .into_iter()
+                .filter(|c| c.key_pem.is_empty())
+                .map(|c| c.id)
+                .take(MAX_CERT_PULL_IDS)
+                .collect();
+            Ok::<_, ApiError>(ids)
+        })
+        .await;
+        let Ok(missing) = missing else {
+            return;
+        };
+        if missing.is_empty() {
+            return;
+        }
+        info!(
+            missing = missing.len(),
+            "asking the control plane for certificate keys this node lacks"
+        );
+        let response = tokio::time::timeout(
+            PULL_TIMEOUT,
+            session.endpoint.request(
+                ClusterRequest::cert_pull(lorica_cluster::messages::CertPull { cert_ids: missing }),
+                PULL_TIMEOUT,
+            ),
+        )
+        .await;
+        let bundles = match response {
+            Ok(Ok(response)) => match response.body {
+                Some(cluster_response::Body::CertPullAck(ack)) => ack.bundles,
+                _ => {
+                    warn!(
+                        status = ?response.cluster_status(),
+                        "control plane refused the certificate pull"
+                    );
+                    return;
+                }
+            },
+            Ok(Err(e)) => {
+                warn!(error = %e, "certificate pull failed; retrying after the next apply");
+                return;
+            }
+            Err(_) => {
+                warn!("certificate pull timed out; retrying after the next apply");
+                return;
+            }
+        };
+        if bundles.is_empty() {
+            // Entitlement is the control plane's call, so an empty
+            // answer is a legitimate "you are not selected for these",
+            // not a failure. Saying so once beats a silent no-op.
+            info!("control plane sent no keys: this node is selected for none of them");
+            return;
+        }
+        let bundles: Vec<CertBundle> = bundles.into_iter().map(CertBundle::from_material).collect();
+        let report = self.install_certs(bundles).await;
+        lorica_api::metrics::inc_cluster_cert_push(&self.node_id, "pulled");
+        info!(
+            installed = report.installed.len(),
+            refused = report.refused.len(),
+            "certificate pull complete"
+        );
     }
 
     /// Raise `ClusterConfigRefused` (AC #1): a generation this node
@@ -474,6 +660,67 @@ impl FollowerHandler for ReplicaHandler {
             );
             self.pull_and_apply(session).await;
         })
+    }
+
+    fn on_challenge_publish(
+        &self,
+        identifier: String,
+        token: String,
+        key_authorization: String,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            // The deadline is stamped HERE, from this node's own clock,
+            // which is why the message carries none: an absolute
+            // instant chosen by the control plane would make a token's
+            // validity depend on clock agreement between two machines,
+            // and produce either tokens already expired on arrival or
+            // tokens outliving their window.
+            let expires_at = Utc::now() + lorica_api::acme::CHALLENGE_TTL;
+            let written = db_blocking(&self.store, move |store| {
+                store
+                    .set_acme_challenge(&token, &key_authorization, expires_at)
+                    .map_err(internal)
+            })
+            .await;
+            match written {
+                Ok(()) => {
+                    info!(identifier, "published an HTTP-01 challenge for the control plane");
+                    Ok(())
+                }
+                Err(e) => {
+                    // Answering Err is what stops the order: the
+                    // control plane refuses rather than telling the
+                    // certificate authority to validate against a node
+                    // that will answer 404.
+                    error!(identifier, error = %e, "could not publish the HTTP-01 challenge");
+                    Err(e.to_string())
+                }
+            }
+        })
+    }
+
+    fn on_challenge_retract(&self, token: String) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let removed = db_blocking(&self.store, move |store| {
+                store.delete_acme_challenge(&token).map_err(internal)
+            })
+            .await;
+            if let Err(e) = removed {
+                // Infallible by contract, like the driver cleanup it
+                // mirrors. A miss now costs the entry its deadline
+                // rather than leaking it, which is what the expiry
+                // added by this story is for.
+                warn!(error = %e, "could not retract an HTTP-01 challenge; it expires on its own");
+            }
+        })
+    }
+
+    fn on_cert_push(&self, bundles: Vec<CertBundle>) -> BoxFuture<'_, CertInstallReport> {
+        // No break-glass check, deliberately (Story 9.5 D9): a private
+        // key overwrites no operator edit, and freezing delivery for a
+        // window of up to a day could expire a certificate during the
+        // very incident the window was opened for.
+        Box::pin(async move { self.install_certs(bundles).await })
     }
 }
 

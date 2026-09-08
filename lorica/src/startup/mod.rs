@@ -172,22 +172,48 @@ pub(crate) async fn run_api_server(
         .with_task_tracker(state.task_tracker.clone());
     let rate_limiter = RateLimiter::new();
 
-    // One-shot startup purge of superseded orphan ACME certs (fix
-    // 1.5.12). Shared by both modes here so single-process and
-    // supervisor cannot drift, exactly like the renewal spawn below.
-    purge_superseded_acme_orphans(&state.store).await;
+    // Issuance belongs to the control plane (Story 9.5 AC #3). A
+    // follower renews nothing and warns about nothing: the fleet's
+    // certificates are issued once, centrally, and pushed down.
+    //
+    // The guard sits HERE, at the spawn, not inside either task. The
+    // expiry notifier runs one check immediately before entering its
+    // loop, so a guard placed in the loop would still fire one
+    // duplicate fleet-wide alert per node at every boot. The orphan
+    // purge joins them because it DELETES certificates, which on a
+    // follower is both redundant with the replica apply's own delete
+    // pass and capable of racing it.
+    //
+    // OCSP refresh is deliberately NOT gated: stapling is a serving
+    // concern and followers are the nodes terminating client TLS (AC
+    // #4). See `spawn_ocsp_refresh_loop`.
+    let is_follower = matches!(
+        state.cluster,
+        lorica_api::cluster::ClusterRuntime::Follower(_)
+    );
+    if is_follower {
+        info!(
+            "follower mode: certificate issuance, renewal and expiry alerting are the control              plane's job; this node installs what it is sent and keeps stapling its own certs"
+        );
+    } else {
+        // One-shot startup purge of superseded orphan ACME certs (fix
+        // 1.5.12). Shared by both modes here so single-process and
+        // supervisor cannot drift, exactly like the renewal spawn
+        // below.
+        purge_superseded_acme_orphans(&state.store).await;
 
-    let _acme_renewal = lorica_api::acme::spawn_renewal_task(
-        state.clone(),
-        std::time::Duration::from_secs(12 * 3600),
-        30,
-        Some(alert_sender.clone()),
-    );
-    let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
-        state.clone(),
-        std::time::Duration::from_secs(12 * 3600),
-        alert_sender,
-    );
+        let _acme_renewal = lorica_api::acme::spawn_renewal_task(
+            state.clone(),
+            std::time::Duration::from_secs(12 * 3600),
+            30,
+            Some(alert_sender.clone()),
+        );
+        let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
+            state.clone(),
+            std::time::Duration::from_secs(12 * 3600),
+            alert_sender,
+        );
+    }
 
     if let Err(e) = lorica_api::server::start_server(
         management_port,
@@ -289,6 +315,24 @@ pub(crate) fn spawn_retention_loop(
             if retention > 0 {
                 if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
                     tracing::warn!(error = %e, "access log retention cleanup failed");
+                }
+            }
+            // Expired ACME challenges (Story 9.5 AC #6). Reclaiming the
+            // rows is housekeeping, so it rides this loop rather than
+            // the request path: the read side already refuses an
+            // expired entry, so a late purge costs storage, never
+            // correctness. Runs on every node, because every node can
+            // hold challenges it served.
+            {
+                let s = retention_config_store.lock().await;
+                match s.purge_expired_acme_challenges(chrono::Utc::now()) {
+                    Ok(0) => {}
+                    Ok(purged) => {
+                        tracing::info!(purged, "expired ACME challenges removed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ACME challenge purge failed");
+                    }
                 }
             }
             // Audit-log retention is day-based and chain-safe: the
