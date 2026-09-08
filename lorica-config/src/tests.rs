@@ -1279,14 +1279,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 52 is the current head of the tracked MIGRATIONS table (every
+        // 54 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            52
+            54
         );
     }
 
@@ -1304,7 +1304,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                52
+                54
             );
         }
     }
@@ -1328,7 +1328,10 @@ created_at = "2026-01-01T00:00:00Z"
         // Shape, not just existence: `IF NOT EXISTS` makes migration
         // v47 a no-op on databases where the retired ad-hoc DDL
         // already created the table, so the columns the Story 9.5
-        // network writer will bind must be asserted explicitly.
+        // network writer binds must be asserted explicitly.
+        // `expires_at` joined them in migration v54 (Story 9.5 AC #6),
+        // which is what stops a crashed order from leaving a key
+        // authorization served forever.
         let mut stmt = store
             .conn
             .prepare("SELECT name, type FROM pragma_table_info('acme_challenges') ORDER BY name")
@@ -1341,6 +1344,7 @@ created_at = "2026-01-01T00:00:00Z"
         assert_eq!(
             columns,
             vec![
+                ("expires_at".to_string(), "TEXT".to_string()),
                 ("key_auth".to_string(), "TEXT".to_string()),
                 ("token".to_string(), "TEXT".to_string()),
             ],

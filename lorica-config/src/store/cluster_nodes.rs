@@ -7,6 +7,8 @@
 //! is what the CRL is minted from: an operator revocation adds the
 //! node's serials, a completed renewal adds the superseded one.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -18,6 +20,112 @@ use crate::models::{ClusterNode, NodeStatus, RevokedSerial};
 const NODE_COLUMNS: &str = "node_id, name, cert_fingerprint, cert_serial, prev_cert_fingerprint, \
      prev_cert_serial, address, version, schema_version, status, enrolled_at, last_seen_at, \
      applied_config_generation, applied_config_hash, cert_not_after, revoked_at";
+
+/// The routes bound to one certificate, for
+/// [`ConfigStore::cert_key_recipients`].
+const ROUTE_SELECTORS_BY_CERTIFICATE: &str =
+    "SELECT id, node_selector FROM routes WHERE certificate_id = ?1";
+
+/// Every route's host keys and selector, for
+/// [`ConfigStore::challenge_recipients`].
+///
+/// No `WHERE` clause: a route answers on its `hostname` AND on every
+/// entry of `hostname_aliases`, and any of those keys may be a `*.`
+/// wildcard, so the match is [`route_serves_hostname`] rather than a
+/// SQL predicate. Expressing it in SQL would mean a `LIKE` whose
+/// pattern comes from the data, which is case-insensitive by default in
+/// SQLite and would treat a `%` or `_` in a stored hostname as a
+/// wildcard of its own. That is the wrong place to be clever about a
+/// predicate that decides who receives a challenge token. The route
+/// table is small and this runs once per ACME authorization, never per
+/// request.
+const ROUTE_HOSTS_AND_SELECTORS: &str =
+    "SELECT id, hostname, hostname_aliases, node_selector FROM routes";
+
+/// Whether a route answering on `route_hostname` plus `aliases` serves
+/// `hostname`.
+///
+/// Mirrors `ProxyConfig::find_route`
+/// (`lorica/src/proxy_wiring/config.rs:670-700`), which is the
+/// authoritative matcher: `from_store` indexes the route hostname and
+/// every alias into the same map, then moves every key starting with
+/// `*.` into the wildcard list. So both are host keys of equal standing
+/// and either may be a wildcard.
+///
+/// The catch-all key `_` is deliberately NOT honoured here even though
+/// `find_route` falls back to it: it would make every route in the
+/// fleet a recipient of every hostname's token, which is a fan-out
+/// decision an operator should make explicitly rather than inherit from
+/// a routing fallback.
+fn route_serves_hostname(route_hostname: &str, aliases: &[String], hostname: &str) -> bool {
+    std::iter::once(route_hostname)
+        .chain(aliases.iter().map(String::as_str))
+        .any(|pattern| host_pattern_matches(pattern, hostname))
+}
+
+/// One host key against one hostname, byte-for-byte as
+/// `ProxyConfig::find_route` does it.
+///
+/// A `*.` pattern matches any host ending in the pattern's dot-suffix
+/// and strictly longer than it. That is an ANY-DEPTH match, not a
+/// single-label one: the proxy accepts `deep.a.example.com` for
+/// `*.example.com`, so this accepts it too. Narrowing it here would
+/// deny a token to a node that really would answer the CA, which is the
+/// under-match this predicate exists to fix. The length test is what
+/// keeps the parent domain out: `example.com` does not end with
+/// `.example.com`, and even a host equal to the suffix is refused.
+///
+/// A pattern that starts with `*` but not `*.` is an exact key to the
+/// proxy (`from_store` filters on `starts_with("*.")`), so it is one
+/// here too. Comparison is case-sensitive, matching both the proxy,
+/// which compares the raw request host, and the lowercase-hostname
+/// invariant the route model documents.
+fn host_pattern_matches(pattern: &str, hostname: &str) -> bool {
+    if pattern.starts_with("*.") {
+        // "*.example.com" -> ".example.com", exactly `&pattern[1..]`
+        // in the proxy.
+        let suffix = &pattern[1..];
+        hostname.ends_with(suffix) && hostname.len() > suffix.len()
+    } else {
+        pattern == hostname
+    }
+}
+
+/// The running union of `node_selector` across a set of routes, plus
+/// whether any of them was fleet-wide.
+///
+/// Its own type so that both resolvers fold selectors through the same
+/// code: this is the need-to-know predicate, and two copies drifting is
+/// a confidentiality bug rather than a cosmetic one.
+#[derive(Default)]
+struct SelectorUnion {
+    /// Node NAMES named by at least one scoped route.
+    names: BTreeSet<String>,
+    /// At least one matched route had an empty selector.
+    fleet_wide: bool,
+}
+
+impl SelectorUnion {
+    /// Fold one route's stored selector in.
+    ///
+    /// Fails closed on a selector that will not parse. `row_to_route`
+    /// degrades an unreadable selector to `[]`, i.e. fleet-wide, so a
+    /// corrupt row still serves traffic; doing that here would hand key
+    /// material or a challenge token to every node in the fleet.
+    fn add(&mut self, route_id: &str, raw_selector: &str) -> Result<()> {
+        let names: Vec<String> = serde_json::from_str(raw_selector).map_err(|e| {
+            ConfigError::Validation(format!(
+                "node_selector of route {route_id} is not a JSON array of node names: {e}"
+            ))
+        })?;
+        if names.is_empty() {
+            self.fleet_wide = true;
+        } else {
+            self.names.extend(names);
+        }
+        Ok(())
+    }
+}
 
 /// Record one serial on the revocation list (idempotent).
 fn insert_revoked_serial(
@@ -322,6 +430,195 @@ impl ConfigStore {
         Ok(out)
     }
 
+    /// The node ids entitled to the private key of `cert_id` (Story 9.5
+    /// AC #1, decision D3).
+    ///
+    /// Resolved control-plane side and never by the recipient: the chain
+    /// is certificate, then the routes whose `certificate_id` names it,
+    /// then the union of those routes' `node_selector`, then those node
+    /// NAMES resolved against `cluster_nodes` to node IDS, which is the
+    /// identity the mutual-TLS certificate actually proves. A selector
+    /// that is empty means the route is fleet-wide, so every Active node
+    /// is entitled.
+    ///
+    /// Only `Active` nodes are ever returned: a node awaiting operator
+    /// activation receives no key material.
+    ///
+    /// `Route::certificate_id` is a soft reference, so a certificate no
+    /// route names simply entitles nobody, and a selector entry that
+    /// matches no node is skipped rather than raising. The result is
+    /// sorted and deduplicated.
+    ///
+    /// A disabled route still entitles its selected nodes, matching
+    /// `Route::route_applies_to_node`, which the replica apply uses and
+    /// which ignores `enabled` too. Narrowing on `enabled` here would
+    /// make re-enabling a route race key delivery, and the route row
+    /// itself already replicates to the same nodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a read failure, and
+    /// [`ConfigError::Validation`] when a stored `node_selector` is not
+    /// a JSON array of strings. That case fails closed on purpose:
+    /// `row_to_route` degrades an unreadable selector to "fleet-wide"
+    /// so a corrupt row still serves traffic, but doing the same here
+    /// would hand a private key to every node in the fleet.
+    pub fn cert_key_recipients(&self, cert_id: &str) -> Result<Vec<String>> {
+        let mut union = SelectorUnion::default();
+        {
+            let mut stmt = self.conn.prepare(ROUTE_SELECTORS_BY_CERTIFICATE)?;
+            let rows = stmt.query_map(params![cert_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (route_id, raw_selector) = row?;
+                union.add(&route_id, &raw_selector)?;
+            }
+        }
+        self.resolve_selector_union(&union)
+    }
+
+    /// The node ids that plausibly serve `hostname`, for HTTP-01
+    /// challenge distribution (Story 9.5 AC #6).
+    ///
+    /// Same control-plane-side resolution as
+    /// [`ConfigStore::cert_key_recipients`] and for the same reason:
+    /// routes that answer for the hostname, then the union of their
+    /// `node_selector`, then names resolved to node ids against
+    /// `cluster_nodes`, Active only. An empty selector means
+    /// fleet-wide.
+    ///
+    /// "Plausibly" is the honest word: the CA picks which node it
+    /// validates against, so the token has to be present on every node
+    /// that could answer for that hostname.
+    ///
+    /// A route answers for the hostname when its `hostname` OR any
+    /// entry of its `hostname_aliases` matches, exactly or as a `*.`
+    /// wildcard, per [`route_serves_hostname`], which mirrors the
+    /// proxy's own matcher. Matching the primary hostname alone would
+    /// under-match: a node whose route answers on `www.example.com` as
+    /// an alias really does serve that hostname, and refusing it a
+    /// token aborts a legitimate issuance. The same holds for a
+    /// wildcard alias.
+    ///
+    /// A hostname no route serves resolves to nobody. **An empty
+    /// result is not a satisfied all-or-nothing**: distributing to zero
+    /// nodes and then calling `set_ready()` tells the CA to validate a
+    /// token nothing serves. The caller must treat the empty case as a
+    /// refusal, not as a vacuous success.
+    ///
+    /// Matching is case-sensitive, as the proxy's is. Route hostnames
+    /// are stored lowercase and ACME identifiers are lowercase, so the
+    /// two agree; a row that broke that invariant resolves to nobody,
+    /// which the paragraph above turns into a refusal rather than a
+    /// silent mis-issuance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a read failure, and
+    /// [`ConfigError::Validation`] when a stored `node_selector` is not
+    /// a JSON array of strings, failing closed for the same reason
+    /// [`ConfigStore::cert_key_recipients`] does.
+    pub fn challenge_recipients(&self, hostname: &str) -> Result<Vec<String>> {
+        let mut union = SelectorUnion::default();
+        {
+            let mut stmt = self.conn.prepare(ROUTE_HOSTS_AND_SELECTORS)?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (route_id, route_hostname, raw_aliases, raw_selector) = row?;
+                let aliases: Vec<String> = serde_json::from_str(&raw_aliases).map_err(|e| {
+                    ConfigError::Validation(format!(
+                        "hostname_aliases of route {route_id} is not a JSON array of \
+                         hostnames: {e}"
+                    ))
+                })?;
+                if route_serves_hostname(&route_hostname, &aliases, hostname) {
+                    union.add(&route_id, &raw_selector)?;
+                }
+            }
+        }
+        self.resolve_selector_union(&union)
+    }
+
+    /// Shared body of [`ConfigStore::cert_key_recipients`] and
+    /// [`ConfigStore::challenge_recipients`]: run `selector_query`
+    /// bound to `key`, union the selectors of every route it returns,
+    /// and resolve those names to Active node ids.
+    ///
+    /// One function rather than two near-identical ones because this is
+    /// the need-to-know predicate: two copies would let the key path
+    /// and the challenge path drift, and a drift here is a
+    /// confidentiality bug rather than a cosmetic one. The two callers
+    /// differ only in which column selects the routes.
+    ///
+    /// `selector_query` is a `&'static str` from this module, never
+    /// caller-supplied; `key` is the only value that reaches SQL, and
+    /// it is bound.
+    /// Turn a folded [`SelectorUnion`] into the Active node ids it
+    /// names. The single place a selector becomes a set of recipients,
+    /// shared by both public resolvers.
+    fn resolve_selector_union(&self, union: &SelectorUnion) -> Result<Vec<String>> {
+        // One fleet-wide route in the match makes the union
+        // fleet-wide: every Active node serves that route, so every
+        // Active node needs what the route implies.
+        if union.fleet_wide {
+            return self.active_cluster_node_ids();
+        }
+        if union.names.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut by_name: BTreeMap<String, String> = BTreeMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT name, node_id FROM cluster_nodes WHERE status = ?1")?;
+            let rows = stmt.query_map(params![NodeStatus::Active.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (name, node_id) = row?;
+                by_name.insert(name, node_id);
+            }
+        }
+
+        let recipients: BTreeSet<String> = union
+            .names
+            .iter()
+            .filter_map(|name| by_name.get(name).cloned())
+            .collect();
+        Ok(recipients.into_iter().collect())
+    }
+
+    /// Every Active node id, for the fleet-wide opt-in override.
+    ///
+    /// Sorted, so a caller comparing two resolutions compares two
+    /// stable lists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a read failure.
+    pub fn active_cluster_node_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT node_id FROM cluster_nodes WHERE status = ?1 ORDER BY node_id")?;
+        let rows = stmt.query_map(params![NodeStatus::Active.as_str()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
     /// Drop revoked serials whose certificate expired before `now`
     /// (the CRL stays bounded by the number of live certificates).
     /// Returns how many were pruned.
@@ -354,4 +651,510 @@ pub struct LiveNodeFacts {
     /// Canonical hash the node reports for that generation. Empty
     /// until the node applies its first replica.
     pub applied_config_hash: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Certificate;
+
+    fn at(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .expect("test setup: valid timestamp")
+            .with_timezone(&Utc)
+    }
+
+    fn enrol(store: &ConfigStore, node_id: &str, name: &str, status: NodeStatus) {
+        let node = ClusterNode {
+            node_id: node_id.to_string(),
+            name: name.to_string(),
+            cert_fingerprint: format!("fp-{node_id}"),
+            cert_serial: format!("sn-{node_id}"),
+            prev_cert_fingerprint: None,
+            prev_cert_serial: None,
+            address: "192.0.2.10:5001".to_string(),
+            version: "1.7.0".to_string(),
+            schema_version: 54,
+            status,
+            enrolled_at: at("2026-09-08T00:00:00Z"),
+            last_seen_at: None,
+            applied_config_generation: 0,
+            applied_config_hash: String::new(),
+            cert_not_after: at("2027-09-08T00:00:00Z"),
+            revoked_at: None,
+        };
+        store
+            .create_cluster_node(&node)
+            .expect("test setup: node enrols");
+    }
+
+    fn issue_certificate(store: &ConfigStore, cert_id: &str, domain: &str) {
+        let cert = Certificate {
+            id: cert_id.to_string(),
+            domain: domain.to_string(),
+            san_domains: Vec::new(),
+            fingerprint: format!("fp-{cert_id}"),
+            cert_pem: "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----".to_string(),
+            key_pem: "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----".to_string(),
+            issuer: "Test CA".to_string(),
+            not_before: at("2026-09-01T00:00:00Z"),
+            not_after: at("2026-12-01T00:00:00Z"),
+            is_acme: true,
+            acme_auto_renew: true,
+            created_at: at("2026-09-01T00:00:00Z"),
+            acme_method: Some("http01".to_string()),
+            acme_dns_provider_id: None,
+        };
+        store
+            .create_certificate(&cert)
+            .expect("test setup: certificate issues");
+    }
+
+    /// Bind a route to a certificate with the given selector. Written
+    /// through SQL rather than `create_route`: the predicate under test
+    /// reads two columns, and a seventy-field `Route` literal would
+    /// bury them.
+    fn bind_route(
+        store: &ConfigStore,
+        route_id: &str,
+        hostname: &str,
+        cert_id: &str,
+        selector: &[&str],
+    ) {
+        bind_route_under(store, route_id, hostname, "/", cert_id, selector);
+    }
+
+    /// [`bind_route`] with an explicit path prefix, so two routes can
+    /// legitimately share a hostname.
+    fn bind_route_under(
+        store: &ConfigStore,
+        route_id: &str,
+        hostname: &str,
+        path_prefix: &str,
+        cert_id: &str,
+        selector: &[&str],
+    ) {
+        bind_route_with_aliases(store, route_id, hostname, &[], path_prefix, cert_id, selector);
+    }
+
+    /// [`bind_route`] with `hostname_aliases`, the extra host keys the
+    /// route also answers on.
+    fn bind_route_with_aliases(
+        store: &ConfigStore,
+        route_id: &str,
+        hostname: &str,
+        aliases: &[&str],
+        path_prefix: &str,
+        cert_id: &str,
+        selector: &[&str],
+    ) {
+        let aliases_json = serde_json::to_string(aliases).expect("test setup: aliases serialize");
+        let selector_json =
+            serde_json::to_string(selector).expect("test setup: selector serializes");
+        store
+            .conn
+            .execute(
+                "INSERT INTO routes \
+                 (id, hostname, hostname_aliases, path_prefix, certificate_id, node_selector) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    route_id,
+                    hostname,
+                    aliases_json,
+                    path_prefix,
+                    cert_id,
+                    selector_json
+                ],
+            )
+            .expect("test setup: route binds");
+    }
+
+    fn fleet_of_three() -> ConfigStore {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        enrol(&store, "node-a", "edge-a", NodeStatus::Active);
+        enrol(&store, "node-b", "edge-b", NodeStatus::Active);
+        enrol(&store, "node-c", "edge-c", NodeStatus::Active);
+        issue_certificate(&store, "cert-1", "shop.example.com");
+        store
+    }
+
+    #[test]
+    fn a_fleet_wide_route_entitles_every_active_node() {
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &[]);
+
+        assert_eq!(
+            store
+                .cert_key_recipients("cert-1")
+                .expect("recipients resolve"),
+            vec![
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_scoped_route_entitles_only_the_named_nodes() {
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-b"]);
+
+        assert_eq!(
+            store
+                .cert_key_recipients("cert-1")
+                .expect("recipients resolve"),
+            vec!["node-b".to_string()],
+            "a node that never serves the hostname gets no private key"
+        );
+    }
+
+    #[test]
+    fn a_pending_node_is_never_a_recipient_even_when_named() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        enrol(&store, "node-a", "edge-a", NodeStatus::Active);
+        enrol(&store, "node-p", "edge-p", NodeStatus::Pending);
+        enrol(&store, "node-r", "edge-r", NodeStatus::Revoked);
+        issue_certificate(&store, "cert-1", "shop.example.com");
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-a", "edge-p", "edge-r"]);
+
+        assert_eq!(
+            store
+                .cert_key_recipients("cert-1")
+                .expect("recipients resolve"),
+            vec!["node-a".to_string()],
+            "operator activation gates key material, not the selector"
+        );
+
+        // The fleet-wide path applies the same gate.
+        bind_route(&store, "r2", "www.example.com", "cert-1", &[]);
+        assert_eq!(
+            store
+                .cert_key_recipients("cert-1")
+                .expect("recipients resolve"),
+            vec!["node-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_selector_name_matching_no_node_is_skipped() {
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-a", "edge-gone"]);
+
+        assert_eq!(
+            store
+                .cert_key_recipients("cert-1")
+                .expect("a stale selector entry is not an error"),
+            vec!["node-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn two_routes_on_one_certificate_take_the_union() {
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-c"]);
+        bind_route(&store, "r2", "www.example.com", "cert-1", &["edge-a"]);
+
+        assert_eq!(
+            store
+                .cert_key_recipients("cert-1")
+                .expect("recipients resolve"),
+            vec!["node-a".to_string(), "node-c".to_string()],
+            "sorted and deduplicated, so two resolutions compare"
+        );
+    }
+
+    #[test]
+    fn a_certificate_no_route_references_entitles_nobody() {
+        let store = fleet_of_three();
+        issue_certificate(&store, "cert-orphan", "old.example.com");
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &[]);
+
+        assert!(
+            store
+                .cert_key_recipients("cert-orphan")
+                .expect("recipients resolve")
+                .is_empty(),
+            "an unbound certificate is distributed to no one"
+        );
+        assert!(
+            store
+                .cert_key_recipients("cert-never-issued")
+                .expect("an unknown certificate id is not an error")
+                .is_empty(),
+            "certificate_id is a soft reference on both sides"
+        );
+    }
+
+    #[test]
+    fn active_node_ids_are_sorted_and_exclude_every_other_state() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        enrol(&store, "node-c", "edge-c", NodeStatus::Active);
+        enrol(&store, "node-a", "edge-a", NodeStatus::Active);
+        enrol(&store, "node-p", "edge-p", NodeStatus::Pending);
+        enrol(&store, "node-r", "edge-r", NodeStatus::Revoked);
+
+        assert_eq!(
+            store.active_cluster_node_ids().expect("active ids resolve"),
+            vec!["node-a".to_string(), "node-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_fleet_wide_route_puts_the_challenge_on_every_active_node() {
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &[]);
+
+        assert_eq!(
+            store
+                .challenge_recipients("shop.example.com")
+                .expect("recipients resolve"),
+            vec![
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_scoped_route_puts_the_challenge_only_on_the_named_nodes() {
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-b"]);
+        // A different hostname on the same certificate must not widen
+        // the challenge fan-out: the CA validates one identifier.
+        bind_route(&store, "r2", "www.example.com", "cert-1", &["edge-c"]);
+
+        assert_eq!(
+            store
+                .challenge_recipients("shop.example.com")
+                .expect("recipients resolve"),
+            vec!["node-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_pending_node_never_receives_a_challenge() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        enrol(&store, "node-a", "edge-a", NodeStatus::Active);
+        enrol(&store, "node-p", "edge-p", NodeStatus::Pending);
+        issue_certificate(&store, "cert-1", "shop.example.com");
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-a", "edge-p"]);
+
+        assert_eq!(
+            store
+                .challenge_recipients("shop.example.com")
+                .expect("recipients resolve"),
+            vec!["node-a".to_string()],
+            "a node that receives no configuration cannot serve a token"
+        );
+    }
+
+    #[test]
+    fn a_hostname_no_route_serves_resolves_to_nobody() {
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &[]);
+
+        assert!(
+            store
+                .challenge_recipients("unknown.example.com")
+                .expect("an unserved hostname is not an error")
+                .is_empty()
+        );
+        assert!(
+            store
+                .challenge_recipients("SHOP.EXAMPLE.COM")
+                .expect("recipients resolve")
+                .is_empty(),
+            "hostname is matched exactly, as stored"
+        );
+    }
+
+    #[test]
+    fn two_routes_on_one_hostname_take_the_union() {
+        let store = fleet_of_three();
+        bind_route_under(&store, "r1", "shop.example.com", "/", "cert-1", &["edge-c"]);
+        bind_route_under(&store, "r2", "shop.example.com", "/api", "cert-1", &["edge-a"]);
+
+        assert_eq!(
+            store
+                .challenge_recipients("shop.example.com")
+                .expect("recipients resolve"),
+            vec!["node-a".to_string(), "node-c".to_string()],
+            "every node that could answer for the hostname gets the token"
+        );
+    }
+
+    #[test]
+    fn an_exact_alias_entitles_the_node_serving_it() {
+        let store = fleet_of_three();
+        bind_route_with_aliases(
+            &store,
+            "r1",
+            "shop.example.com",
+            &["www.example.com"],
+            "/",
+            "cert-1",
+            &["edge-b"],
+        );
+
+        assert_eq!(
+            store
+                .challenge_recipients("www.example.com")
+                .expect("recipients resolve"),
+            vec!["node-b".to_string()],
+            "a node whose route answers on the alias does serve that hostname"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_alias_entitles_for_a_subdomain() {
+        let store = fleet_of_three();
+        bind_route_with_aliases(
+            &store,
+            "r1",
+            "shop.example.com",
+            &["*.example.com"],
+            "/",
+            "cert-1",
+            &["edge-c"],
+        );
+
+        assert_eq!(
+            store
+                .challenge_recipients("a.example.com")
+                .expect("recipients resolve"),
+            vec!["node-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_wildcard_alias_does_not_entitle_for_the_parent_domain() {
+        let store = fleet_of_three();
+        bind_route_with_aliases(
+            &store,
+            "r1",
+            "shop.example.com",
+            &["*.example.com"],
+            "/",
+            "cert-1",
+            &["edge-c"],
+        );
+
+        assert!(
+            store
+                .challenge_recipients("example.com")
+                .expect("recipients resolve")
+                .is_empty(),
+            "`example.com` does not end with `.example.com`, so the proxy \
+             would not route it here either"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_alias_entitles_at_any_depth_because_the_proxy_does() {
+        // Not a single-label match: `ProxyConfig::find_route` tests
+        // `host.ends_with(\".example.com\")` with no label counting, so
+        // the proxy really would answer `deep.a.example.com` here.
+        // Narrowing this would deny a token to a node that serves the
+        // CA's request.
+        let store = fleet_of_three();
+        bind_route_with_aliases(
+            &store,
+            "r1",
+            "shop.example.com",
+            &["*.example.com"],
+            "/",
+            "cert-1",
+            &["edge-c"],
+        );
+
+        assert_eq!(
+            store
+                .challenge_recipients("deep.a.example.com")
+                .expect("recipients resolve"),
+            vec!["node-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_wildcard_primary_hostname_matches_like_a_wildcard_alias() {
+        // `from_store` indexes `route.hostname` and every alias into
+        // the same map before splitting the `*.` keys out, so a
+        // wildcard in the primary hostname is a wildcard to the proxy.
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "*.example.com", "cert-1", &["edge-a"]);
+
+        assert_eq!(
+            store
+                .challenge_recipients("a.example.com")
+                .expect("recipients resolve"),
+            vec!["node-a".to_string()]
+        );
+        assert!(
+            store
+                .challenge_recipients("example.com")
+                .expect("recipients resolve")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_host_pattern_matcher_mirrors_the_proxy() {
+        // The table the proxy's own matcher satisfies
+        // (`lorica/src/proxy_wiring/config.rs:670-700`). Kept as a
+        // direct unit test so a change to either side shows up as a
+        // failing assertion rather than as a silent divergence in who
+        // receives a token.
+        assert!(host_pattern_matches("shop.example.com", "shop.example.com"));
+        assert!(!host_pattern_matches("shop.example.com", "other.example.com"));
+        assert!(host_pattern_matches("*.example.com", "a.example.com"));
+        assert!(host_pattern_matches("*.example.com", "deep.a.example.com"));
+        assert!(!host_pattern_matches("*.example.com", "example.com"));
+        assert!(!host_pattern_matches("*.example.com", ".example.com"));
+        assert!(!host_pattern_matches("*.example.com", "notexample.com"));
+        // A `*` that is not followed by a dot is an exact key to the
+        // proxy, which filters on `starts_with("*.")`.
+        assert!(host_pattern_matches("*example.com", "*example.com"));
+        assert!(!host_pattern_matches("*example.com", "a.example.com"));
+        // The catch-all routing key is not a challenge fan-out rule.
+        assert!(!host_pattern_matches("_", "shop.example.com"));
+    }
+
+    #[test]
+    fn a_malformed_alias_list_fails_closed() {
+        let store = fleet_of_three();
+        store
+            .conn
+            .execute(
+                "INSERT INTO routes \
+                 (id, hostname, hostname_aliases, certificate_id, node_selector) \
+                 VALUES ('r1', 'shop.example.com', 'not json', 'cert-1', '[\"edge-a\"]')",
+                [],
+            )
+            .expect("test setup: corrupt route inserts");
+
+        assert!(
+            store.challenge_recipients("shop.example.com").is_err(),
+            "an unreadable alias list must not silently under-match"
+        );
+    }
+
+    #[test]
+    fn a_malformed_selector_fails_closed_rather_than_going_fleet_wide() {
+        let store = fleet_of_three();
+        store
+            .conn
+            .execute(
+                "INSERT INTO routes (id, hostname, certificate_id, node_selector) \
+                 VALUES ('r1', 'shop.example.com', 'cert-1', 'not json')",
+                [],
+            )
+            .expect("test setup: corrupt route inserts");
+
+        assert!(
+            store.cert_key_recipients("cert-1").is_err(),
+            "an unreadable selector must not be read as fleet-wide"
+        );
+    }
 }

@@ -15,6 +15,7 @@
 //! `open_in_memory`), the migration runner and the encryption helpers
 //! shared by every submodule.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use base64::Engine;
@@ -24,6 +25,7 @@ use uuid::Uuid;
 use crate::crypto::EncryptionKey;
 use crate::error::{ConfigError, Result};
 
+mod acme_challenges;
 mod ai_crawlers;
 mod backends;
 pub mod bot_stash;
@@ -170,6 +172,8 @@ const MIGRATIONS: &[Migration] = &[
     (50, migrate_cluster_registry),
     (51, migrate_cluster_revoked_serial_expiry),
     (52, migrate_cluster_replication),
+    (53, migrate_cluster_node_name_unique),
+    (54, migrate_acme_challenge_expiry),
 ];
 
 /// Whether `column` already exists on `table`, via `pragma_table_info`.
@@ -675,6 +679,124 @@ fn migrate_cluster_replication(conn: &Connection) -> rusqlite::Result<()> {
         INSERT OR IGNORE INTO cluster_replica (key, value) VALUES ('applied_config_generation', '0');
         INSERT OR IGNORE INTO cluster_replica (key, value) VALUES ('applied_config_hash', '');
         INSERT OR IGNORE INTO cluster_replica (key, value) VALUES ('break_glass_until', '');",
+    )
+}
+
+/// `base` truncated so that `base` followed by `suffix` still fits the
+/// 64-character node-name rule enforced by
+/// [`crate::models::validate_node_selector_names`], so a renamed node
+/// stays nameable in a selector. Truncation counts characters, never
+/// bytes: a name written before any validation existed is not
+/// guaranteed to be ASCII.
+fn name_with_suffix(base: &str, suffix: &str) -> String {
+    const MAX_NAME_CHARS: usize = 64;
+    let keep = MAX_NAME_CHARS.saturating_sub(suffix.chars().count());
+    let mut out: String = base.chars().take(keep).collect();
+    out.push_str(suffix);
+    out
+}
+
+/// Give every `cluster_nodes.name` a distinct value, so migration 53
+/// can put a UNIQUE index on the column.
+///
+/// The name has been proposed by the joining node since Story 9.3 with
+/// no constraint at all, so a fleet already in the field can hold
+/// duplicates. Creating the index on such a database would abort the
+/// migration and take the control plane's boot down with it, which is a
+/// far worse outcome than a renamed node.
+///
+/// The oldest enrollment keeps the name; ties break on `node_id` so the
+/// outcome does not depend on SQLite's row order. Every later holder
+/// becomes `<name>-<first 8 of node_id>`, with a numeric disambiguator
+/// on the vanishingly unlikely event that the result is itself taken.
+///
+/// Each rename is logged at WARN because it is operator-visible: a
+/// route's `node_selector` matches on the name, so a renamed node stops
+/// serving its selected routes until one side or the other is fixed.
+fn rename_duplicate_cluster_node_names(conn: &Connection) -> rusqlite::Result<()> {
+    let mut nodes: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT node_id, name FROM cluster_nodes ORDER BY name, enrolled_at, node_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            nodes.push(row?);
+        }
+    }
+
+    let mut taken: HashSet<String> = nodes.iter().map(|(_, name)| name.clone()).collect();
+    let mut previous_name: Option<String> = None;
+    for (node_id, name) in &nodes {
+        if previous_name.as_ref() != Some(name) {
+            previous_name = Some(name.clone());
+            continue;
+        }
+        let short_id: String = node_id.chars().take(8).collect();
+        let mut candidate = name_with_suffix(name, &format!("-{short_id}"));
+        let mut disambiguator: u32 = 1;
+        while taken.contains(&candidate) {
+            candidate = name_with_suffix(name, &format!("-{short_id}-{disambiguator}"));
+            disambiguator += 1;
+        }
+        conn.execute(
+            "UPDATE cluster_nodes SET name = ?2 WHERE node_id = ?1",
+            params![node_id, candidate],
+        )?;
+        tracing::warn!(
+            node_id = %node_id,
+            previous_name = %name,
+            new_name = %candidate,
+            "duplicate cluster node name renamed by migration 53; \
+             update any route node_selector that named it"
+        );
+        taken.insert(candidate);
+    }
+    Ok(())
+}
+
+fn migrate_cluster_node_name_unique(conn: &Connection) -> rusqlite::Result<()> {
+    // Story 9.5 D3: certificate recipients are resolved by matching a
+    // route's `node_selector` against `cluster_nodes.name`, then
+    // translating the name to the `node_id` the mutual-TLS certificate
+    // proves. Two nodes sharing a name would each be entitled to the
+    // other's private keys, so the name must designate exactly one
+    // node. The index also lets enrollment refuse a taken name instead
+    // of silently creating the ambiguity.
+    //
+    // Duplicates are renamed first: without that pass, a database
+    // enrolled before this migration fails the CREATE UNIQUE INDEX and
+    // the control plane never boots.
+    rename_duplicate_cluster_node_names(conn)?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_nodes_name ON cluster_nodes(name);",
+    )
+}
+
+fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {
+    // Story 9.5 AC #6 / D11: `acme_challenges` carried no timestamp, no
+    // index and no purge, so an order that died between the write and
+    // the driver's cleanup left the node serving a key authorization
+    // forever (lorica-api's store already warns about that case on a
+    // failed DELETE). The column turns expiry into a read-time
+    // predicate instead of a hope, and the index keeps the purge from
+    // scanning the table.
+    //
+    // The epoch default deliberately expires every row a pre-migration
+    // database still holds. A challenge is valid for minutes, so a row
+    // that survived the upgrade is a leaked token by definition:
+    // nothing legitimate is lost by refusing to serve it.
+    add_column_if_absent(
+        conn,
+        "acme_challenges",
+        "expires_at",
+        "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_acme_challenges_expiry
+            ON acme_challenges(expires_at);",
     )
 }
 
@@ -1349,6 +1471,185 @@ mod migration_tests {
             second.schema_version().expect("version read"),
             version_after_first,
             "a second run must not advance or regress the version"
+        );
+    }
+
+    // ---- Migration 53: unique cluster node names ----
+
+    /// Enrol a node with only the columns `cluster_nodes` has no
+    /// default for. The rename pass reads three of them and nothing
+    /// else, so a full `ClusterNode` would only obscure what the test
+    /// is about.
+    fn enrol(conn: &Connection, node_id: &str, name: &str, enrolled_at: &str) {
+        conn.execute(
+            "INSERT INTO cluster_nodes \
+             (node_id, name, cert_fingerprint, cert_serial, status, enrolled_at, cert_not_after) \
+             VALUES (?1, ?2, ?1, ?1, 'active', ?3, '2027-01-01T00:00:00+00:00')",
+            params![node_id, name, enrolled_at],
+        )
+        .expect("test setup: node inserts");
+    }
+
+    fn name_of(conn: &Connection, node_id: &str) -> String {
+        conn.query_row(
+            "SELECT name FROM cluster_nodes WHERE node_id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        )
+        .expect("test setup: name reads")
+    }
+
+    /// A store at the current head with the migration-53 index removed,
+    /// which is the shape of a fleet enrolled before that migration
+    /// existed: names are free to collide.
+    fn store_without_the_name_index() -> ConfigStore {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        store
+            .conn
+            .execute_batch("DROP INDEX IF EXISTS idx_cluster_nodes_name;")
+            .expect("test setup: index drops");
+        store
+    }
+
+    #[test]
+    fn migration_53_renames_duplicate_names_keeping_the_oldest_enrollment() {
+        let store = store_without_the_name_index();
+        // Inserted out of enrollment order on purpose: the winner is
+        // the oldest `enrolled_at`, not the first row SQLite hands back.
+        enrol(&store.conn, "33333333-new", "edge", "2026-03-01T00:00:00+00:00");
+        enrol(&store.conn, "11111111-old", "edge", "2026-01-01T00:00:00+00:00");
+        enrol(&store.conn, "22222222-mid", "edge", "2026-02-01T00:00:00+00:00");
+        enrol(&store.conn, "44444444-solo", "edge-solo", "2026-01-15T00:00:00+00:00");
+
+        migrate_cluster_node_name_unique(&store.conn)
+            .expect("a fleet with duplicate names must still boot");
+
+        assert_eq!(name_of(&store.conn, "11111111-old"), "edge");
+        assert_eq!(name_of(&store.conn, "22222222-mid"), "edge-22222222");
+        assert_eq!(name_of(&store.conn, "33333333-new"), "edge-33333333");
+        assert_eq!(
+            name_of(&store.conn, "44444444-solo"),
+            "edge-solo",
+            "a name held by one node is never touched"
+        );
+
+        // The index the whole migration exists for is now in place and
+        // enforcing.
+        let duplicate = store.conn.execute(
+            "INSERT INTO cluster_nodes \
+             (node_id, name, cert_fingerprint, cert_serial, status, enrolled_at, cert_not_after) \
+             VALUES ('55555555-late', 'edge', 'fp', 'sn', 'pending', \
+             '2026-04-01T00:00:00+00:00', '2027-01-01T00:00:00+00:00')",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "the UNIQUE index must refuse a second node called edge"
+        );
+    }
+
+    #[test]
+    fn migration_53_is_idempotent_on_a_second_run() {
+        let store = store_without_the_name_index();
+        enrol(&store.conn, "11111111-old", "edge", "2026-01-01T00:00:00+00:00");
+        enrol(&store.conn, "22222222-mid", "edge", "2026-02-01T00:00:00+00:00");
+
+        migrate_cluster_node_name_unique(&store.conn).expect("first run renames");
+        let after_first = name_of(&store.conn, "22222222-mid");
+        migrate_cluster_node_name_unique(&store.conn).expect("second run is a no-op");
+
+        assert_eq!(name_of(&store.conn, "11111111-old"), "edge");
+        assert_eq!(
+            name_of(&store.conn, "22222222-mid"),
+            after_first,
+            "a second pass must not suffix an already unique name again"
+        );
+    }
+
+    #[test]
+    fn migration_53_disambiguates_when_the_suffixed_name_is_itself_taken() {
+        let store = store_without_the_name_index();
+        enrol(&store.conn, "11111111-old", "edge", "2026-01-01T00:00:00+00:00");
+        enrol(&store.conn, "22222222-mid", "edge", "2026-02-01T00:00:00+00:00");
+        // An operator who already named a node exactly what the rename
+        // would produce. Colliding again would fail the index and take
+        // the boot down, which is the one outcome the pass must avoid.
+        enrol(&store.conn, "99999999-squat", "edge-22222222", "2026-01-05T00:00:00+00:00");
+
+        migrate_cluster_node_name_unique(&store.conn)
+            .expect("a squatted rename target must not fail the boot");
+
+        assert_eq!(name_of(&store.conn, "11111111-old"), "edge");
+        assert_eq!(name_of(&store.conn, "99999999-squat"), "edge-22222222");
+        assert_eq!(name_of(&store.conn, "22222222-mid"), "edge-22222222-1");
+    }
+
+    #[test]
+    fn a_renamed_node_still_fits_the_node_name_length_rule() {
+        // A selector entry is capped at 64 characters, so a rename that
+        // overflowed would produce a node no route could ever name.
+        let long_name = "e".repeat(64);
+        let store = store_without_the_name_index();
+        enrol(&store.conn, "11111111-old", &long_name, "2026-01-01T00:00:00+00:00");
+        enrol(&store.conn, "22222222-mid", &long_name, "2026-02-01T00:00:00+00:00");
+
+        migrate_cluster_node_name_unique(&store.conn).expect("rename succeeds");
+
+        let renamed = name_of(&store.conn, "22222222-mid");
+        assert_eq!(renamed.chars().count(), 64);
+        assert!(renamed.ends_with("-22222222"), "renamed to {renamed}");
+        assert!(crate::models::validate_node_selector_names(&[renamed]).is_ok());
+    }
+
+    // ---- Migration 54: ACME challenge expiry ----
+
+    #[test]
+    fn migration_54_gives_acme_challenges_an_expiry_and_an_index() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        assert_eq!(
+            column_count(&store.conn, "acme_challenges", "expires_at"),
+            1,
+            "acme_challenges.expires_at must exist exactly once"
+        );
+        let index_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_acme_challenges_expiry'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("test setup: sqlite_master query");
+        assert_eq!(index_count, 1, "the purge must not table-scan");
+    }
+
+    #[test]
+    fn migration_54_expires_rows_written_before_it_existed() {
+        // A row a pre-migration database still holds is a leaked token:
+        // challenges live for minutes, so the epoch default is the
+        // right answer, not a lossy one.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        store
+            .conn
+            .execute(
+                "INSERT INTO acme_challenges (token, key_auth) VALUES ('legacy', 'auth')",
+                [],
+            )
+            .expect("test setup: legacy row inserts");
+
+        let now = chrono::Utc::now();
+        assert_eq!(
+            store
+                .get_acme_challenge("legacy", now)
+                .expect("read succeeds"),
+            None,
+            "a token that survived the upgrade must not be served"
+        );
+        assert_eq!(
+            store
+                .purge_expired_acme_challenges(now)
+                .expect("purge succeeds"),
+            1
         );
     }
 }
