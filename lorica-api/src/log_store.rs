@@ -15,6 +15,73 @@ use crate::logs::{LogEntry, LogsQuery};
 /// where `by_category` is `(category, count)` pairs sorted high-to-low.
 pub type WafEventStats = (u64, u64, Vec<(String, u64)>);
 
+/// One access-log row on its way out to the cluster telemetry drain
+/// (Story 9.6).
+///
+/// Deliberately NOT `LogEntry`: that type is the dashboard's shape and
+/// carries what a dashboard needs. This one mirrors the wire message
+/// exactly, so the drain is a field-for-field move with no judgement
+/// in the middle, and a column added to one side fails to compile on
+/// the other.
+///
+/// No node identity: the control plane stamps that from the session
+/// (Story 9.6 decision D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessRowForFanIn {
+    /// RFC 3339, as recorded locally.
+    pub timestamp: String,
+    /// HTTP method.
+    pub method: String,
+    /// Request path.
+    pub path: String,
+    /// Request host.
+    pub host: String,
+    /// Response status.
+    pub status: u32,
+    /// End-to-end latency in milliseconds.
+    pub latency_ms: u64,
+    /// Backend that served it.
+    pub backend: String,
+    /// Error text, empty when there was none.
+    pub error: String,
+    /// Client address as resolved locally.
+    pub client_ip: String,
+    /// Whether `client_ip` came from a forwarded header.
+    pub is_xff: bool,
+    /// The proxy that supplied the forwarded header.
+    pub xff_proxy_ip: String,
+    /// Origin marker.
+    pub source: String,
+    /// Correlation id.
+    pub request_id: String,
+}
+
+/// One WAF event on its way out to the cluster telemetry drain
+/// (Story 9.6). See [`AccessRowForFanIn`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WafRowForFanIn {
+    /// Rule that matched.
+    pub rule_id: u32,
+    /// Human-readable rule description.
+    pub description: String,
+    /// Rule category.
+    pub category: String,
+    /// Rule severity.
+    pub severity: u32,
+    /// Which part of the request matched.
+    pub matched_field: String,
+    /// The matching value, already truncated when it was recorded.
+    pub matched_value: String,
+    /// RFC 3339, as recorded locally.
+    pub timestamp: String,
+    /// Client address.
+    pub client_ip: String,
+    /// Route hostname the event fired on.
+    pub route_hostname: String,
+    /// What the WAF did.
+    pub action: String,
+}
+
 /// Persistent log database wrapper. Cheaply cloneable through `Arc<LogStore>`.
 pub struct LogStore {
     conn: Mutex<Connection>,
@@ -669,6 +736,154 @@ impl LogStore {
         conn.execute("DELETE FROM waf_events", [])
             .map_err(|e| format!("failed to clear WAF events: {e}"))?;
         Ok(())
+    }
+
+    /// Read up to `limit` access-log rows with an id strictly above
+    /// `after_id`, oldest first, for the cluster telemetry drain
+    /// (Story 9.6 AC #5/#7).
+    ///
+    /// This is what makes the shared store the fan-in queue rather
+    /// than a second in-process ring buffer: the rows are already
+    /// here, already written off the hot path by the log writer,
+    /// already bounded by retention, and already visible to the
+    /// supervisor across every worker process under WAL. A drain that
+    /// reads them by cursor touches the request path not at all.
+    ///
+    /// Oldest first, unlike every other read on this store, because a
+    /// cursor has to advance monotonically through history.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read failure.
+    pub fn access_rows_after(
+        &self,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<Vec<(i64, AccessRowForFanIn)>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, timestamp, method, path, host, status, latency_ms, backend,
+                        error, client_ip, is_xff, xff_proxy_ip, source, request_id
+                 FROM access_logs WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+            )
+            .map_err(|e| format!("failed to prepare the access-log drain: {e}"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    i64::try_from(after_id).unwrap_or(i64::MAX),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        AccessRowForFanIn {
+                            timestamp: row.get(1)?,
+                            method: row.get(2)?,
+                            path: row.get(3)?,
+                            host: row.get(4)?,
+                            status: row.get::<_, i64>(5)? as u32,
+                            latency_ms: row.get::<_, i64>(6)? as u64,
+                            backend: row.get(7)?,
+                            error: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                            client_ip: row.get(9)?,
+                            is_xff: row.get::<_, i64>(10)? != 0,
+                            xff_proxy_ip: row.get(11)?,
+                            source: row.get(12)?,
+                            request_id: row.get(13)?,
+                        },
+                    ))
+                },
+            )
+            .map_err(|e| format!("failed to run the access-log drain: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("failed to read a drained access row: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// Read up to `limit` WAF events with an id strictly above
+    /// `after_id`, oldest first (Story 9.6 AC #5/#7). See
+    /// [`LogStore::access_rows_after`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read failure.
+    pub fn waf_rows_after(
+        &self,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<Vec<(i64, WafRowForFanIn)>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, rule_id, description, category, severity, matched_field,
+                        matched_value, timestamp, client_ip, route_hostname, action
+                 FROM waf_events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+            )
+            .map_err(|e| format!("failed to prepare the WAF drain: {e}"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    i64::try_from(after_id).unwrap_or(i64::MAX),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        WafRowForFanIn {
+                            rule_id: row.get::<_, i64>(1)? as u32,
+                            description: row.get(2)?,
+                            category: row.get(3)?,
+                            severity: row.get::<_, i64>(4)? as u32,
+                            matched_field: row.get(5)?,
+                            matched_value: row.get(6)?,
+                            timestamp: row.get(7)?,
+                            client_ip: row.get(8)?,
+                            route_hostname: row.get(9)?,
+                            action: row.get(10)?,
+                        },
+                    ))
+                },
+            )
+            .map_err(|e| format!("failed to run the WAF drain: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("failed to read a drained WAF row: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// The highest access-log rowid currently stored, so a node that
+    /// has never drained can start at the present instead of
+    /// replaying everything retention still holds.
+    ///
+    /// `MIN`/`MAX` on the rowid, never a count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read failure.
+    pub fn newest_access_id(&self) -> Result<u64, String> {
+        let conn = self.conn.lock();
+        let id: Option<i64> = conn
+            .query_row("SELECT MAX(id) FROM access_logs", [], |row| row.get(0))
+            .map_err(|e| format!("failed to read the newest access id: {e}"))?;
+        Ok(id.unwrap_or(0).max(0) as u64)
+    }
+
+    /// The highest WAF event rowid currently stored. See
+    /// [`LogStore::newest_access_id`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read failure.
+    pub fn newest_waf_id(&self) -> Result<u64, String> {
+        let conn = self.conn.lock();
+        let id: Option<i64> = conn
+            .query_row("SELECT MAX(id) FROM waf_events", [], |row| row.get(0))
+            .map_err(|e| format!("failed to read the newest WAF id: {e}"))?;
+        Ok(id.unwrap_or(0).max(0) as u64)
     }
 
     /// Purge old WAF events, keeping at most `max_entries`.

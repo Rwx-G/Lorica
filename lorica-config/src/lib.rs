@@ -40,4 +40,4 @@ pub use canonical::{
 pub use crypto::EncryptionKey;
 pub use error::{ConfigError, Result};
 pub use store::bot_stash::{BotStashEntry, BotStashInsertOutcome};
-pub use store::{ConfigStore, ReplicaError, ReplicaOutcome};
+pub use store::{ConfigStore, ReplicaError, ReplicaOutcome, TelemetryCursor};

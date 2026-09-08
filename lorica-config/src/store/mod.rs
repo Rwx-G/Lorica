@@ -176,6 +176,31 @@ const MIGRATIONS: &[Migration] = &[
     (54, migrate_acme_challenge_expiry),
 ];
 
+/// Which telemetry fan-in cursor a follower is reading or advancing
+/// (Story 9.6 AC #5).
+///
+/// An enum rather than a string because the value is a key in
+/// `cluster_state`: a typo in a caller-supplied key would silently
+/// create a second cursor that always reads 0, and the node would
+/// re-send its whole retained log on every drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryCursor {
+    /// Progress through the local `access_logs` table.
+    Access,
+    /// Progress through the local `waf_events` table.
+    Waf,
+}
+
+impl TelemetryCursor {
+    /// The `cluster_state` key, a compile-time constant of this module.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Access => "telemetry_access_cursor",
+            Self::Waf => "telemetry_waf_cursor",
+        }
+    }
+}
+
 /// Whether `column` already exists on `table`, via `pragma_table_info`.
 /// Returns `false` when the table itself is absent (the pragma yields
 /// no rows), matching the pre-refactor behaviour of the inline guards.
@@ -1239,6 +1264,52 @@ impl ConfigStore {
             |row| row.get(0),
         )?;
         Ok(value.max(0) as u64)
+    }
+
+    /// Read a follower's telemetry fan-in cursor (Story 9.6 AC #5).
+    ///
+    /// The highest local rowid this node has already delivered to its
+    /// control plane, per kind. Persisted rather than in-memory
+    /// because a restart would otherwise re-send everything the local
+    /// retention still holds, which is up to 100 000 rows per kind
+    /// arriving in one burst at exactly the moment a node is least
+    /// able to absorb it.
+    ///
+    /// Returns 0 on a node that has never pushed, which correctly
+    /// means "start from the oldest row still retained".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a read failure.
+    pub fn telemetry_cursor(&self, kind: TelemetryCursor) -> Result<u64> {
+        let value: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT value FROM cluster_state WHERE key = ?1",
+                params![kind.as_key()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Advance a telemetry cursor, never backwards.
+    ///
+    /// `MAX` rather than a plain write: two drains racing, or an
+    /// out-of-order acknowledgement, must not rewind the cursor and
+    /// re-send rows the control plane already stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a write failure.
+    pub fn advance_telemetry_cursor(&self, kind: TelemetryCursor, to: u64) -> Result<()> {
+        let to = i64::try_from(to).unwrap_or(i64::MAX);
+        self.conn.execute(
+            "INSERT INTO cluster_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)",
+            params![kind.as_key(), to],
+        )?;
+        Ok(())
     }
 
     /// Read the persisted supervisor takeover epoch (Story 9.1 AC #7).
