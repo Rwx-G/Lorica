@@ -128,6 +128,16 @@ const BIND_RETRY_MIN: Duration = Duration::from_secs(1);
 /// Cap on the bind-retry backoff.
 const BIND_RETRY_MAX: Duration = Duration::from_secs(30);
 
+/// How long the auto-close waits for in-flight connections after the
+/// last token died before aborting them. The connection that redeemed
+/// that last token is still writing its `EnrollAck` when the liveness
+/// count drops (the handler publishes the recount before it returns
+/// the grant), so an immediate abort would burn the token and deliver
+/// no certificate. Every other in-flight connection is refused at the
+/// post-TLS liveness re-check or by the store's conditional burn, so
+/// the grace admits nothing new.
+const CLOSE_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
 /// State shared by every connection of one open phase.
 struct EnrollmentShared {
     acceptor: Arc<SwappableAcceptor>,
@@ -142,8 +152,10 @@ pub struct EnrollmentListener;
 
 impl EnrollmentListener {
     /// Spawn the lifecycle task: bind `bind` while `liveness > 0`,
-    /// drop the socket (and abort every in-flight connection) when it
-    /// returns to zero, reopen on the next rise. A failed bind while a
+    /// drop the socket when it returns to zero (in-flight connections
+    /// get a bounded drain so the redemption that burned the last
+    /// token still delivers its certificate), reopen on the next
+    /// rise. A failed bind while a
     /// token is live is retried on a bounded backoff, not parked until
     /// the next liveness edge. Returns when the liveness sender is
     /// dropped. `handler` redeems the tokens.
@@ -283,9 +295,10 @@ impl EnrollmentListener {
                 }
 
                 // AC #2 auto-close: last token burned or expired. The
-                // socket AND every pre-authentication connection go.
+                // socket goes now; in-flight connections get a short
+                // drain (see CLOSE_DRAIN_GRACE), then they go too.
                 drop(listener);
-                conns.abort_all();
+                drain_or_abort(&mut conns, CLOSE_DRAIN_GRACE).await;
                 stats.lifecycle_closes.fetch_add(1, Ordering::Relaxed);
                 let _ = bound_tx.send(None);
                 tracing::warn!("enrollment listener CLOSED (no live join token)");
@@ -295,6 +308,22 @@ impl EnrollmentListener {
             bound: bound_rx,
             task,
         }
+    }
+}
+
+/// Let in-flight connections finish for at most `grace`, then abort
+/// whatever is left.
+async fn drain_or_abort(conns: &mut JoinSet<()>, grace: Duration) {
+    let drained = tokio::time::timeout(grace, async {
+        while conns.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            remaining = conns.len(),
+            "enrollment listener closed with connections still in flight; aborting them"
+        );
+        conns.abort_all();
     }
 }
 

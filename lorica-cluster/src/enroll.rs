@@ -125,6 +125,11 @@ pub struct RenewRequest {
     pub node_id: String,
     /// The session's peer address (the audit source).
     pub peer: SocketAddr,
+    /// Whether the session runs on the certificate a previous renewal
+    /// superseded: the node lost that grant (a crash between the
+    /// answer and its persistence), so the handler re-issues without
+    /// asking whether the current certificate is due.
+    pub via_previous_certificate: bool,
     /// The node's NEW bare public key, DER SPKI.
     pub public_key_der: Vec<u8>,
 }

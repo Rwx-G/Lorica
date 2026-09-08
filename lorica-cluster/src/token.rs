@@ -66,7 +66,7 @@ pub enum MintError {
 /// Whether `public_id` has the exact shape a minted token's lookup
 /// half has: [`PUBLIC_ID_LEN`] bytes as lowercase hex. Checked at the
 /// unauthenticated boundary before any store access.
-pub fn public_id_is_valid(public_id: &str) -> bool {
+pub(crate) fn public_id_is_valid(public_id: &str) -> bool {
     public_id.len() == PUBLIC_ID_LEN * 2
         && public_id
             .bytes()

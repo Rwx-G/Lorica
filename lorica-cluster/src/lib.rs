@@ -96,8 +96,8 @@ pub use messages::{
 };
 pub use preauth::{source_key, AttemptWindow, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
 pub use roster::{
-    ControlPlane, LiveSession, LiveSessionSnapshot, NodeIdentity, NodeState, Roster,
-    SessionGuard, SessionRegistry,
+    ControlPlane, LiveSession, LiveSessionSnapshot, NodeIdentity, NodeState, RefreshGuard, Roster,
+    SessionGuard, SessionRegistry, MAX_SESSIONS_PER_NODE_PER_WINDOW, SESSION_RATE_WINDOW,
 };
 pub use session::SessionContext;
 pub use tls::{
@@ -105,7 +105,7 @@ pub use tls::{
     negotiated_cluster_alpn, operational_server_config, operational_server_config_with_crl,
     peer_fingerprint, ClusterTlsError, SwappableAcceptor, CLUSTER_ALPN,
 };
-pub use token::{public_id_is_valid, MintError, MintedToken, ParsedToken, TokenFormatError};
+pub use token::{MintError, MintedToken, ParsedToken, TokenFormatError};
 pub use version::{negotiate, PROTOCOL_MIN_COMPATIBLE, PROTOCOL_VERSION};
 
 /// The TLS stack this crate's configs are built for, re-exported so

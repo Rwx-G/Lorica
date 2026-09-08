@@ -55,7 +55,9 @@ use crate::messages::{
     RenewAck,
 };
 use crate::preauth::{accept_error_pause, PreAuthBudgets, SourceGate, SourceSlot};
-use crate::roster::{NodeIdentity, NodeState, Roster, SessionGuard, SessionRegistry};
+use crate::roster::{
+    NodeIdentity, NodeState, Roster, SessionGuard, SessionRegistry, SESSION_RATE_WINDOW,
+};
 use crate::session::SessionContext;
 use crate::tls::{negotiated_cluster_alpn, peer_fingerprint, SwappableAcceptor};
 
@@ -81,12 +83,22 @@ pub const DEFAULT_ADMISSION_RETRY_AFTER_S: u32 = 5;
 /// writer task) drops.
 const REFUSAL_FLUSH_GRACE: Duration = Duration::from_secs(1);
 
-/// Renewals one session may request before it is treated as a
+/// Renewals one session may be GRANTED before it is treated as a
 /// protocol violation: a well-behaved follower renews once per
 /// session, twice at most across a retry; more is a peer abusing the
 /// signing path (each grant costs the control plane a signature and
 /// a CRL entry).
 const MAX_RENEWALS_PER_SESSION: u32 = 3;
+
+/// Renewal REFUSALS one session may accumulate before it is dropped
+/// (without the protocol-violation audit: a node stuck behind the
+/// control plane's cooldown is misconfigured or unlucky, not hostile,
+/// but each refused request still costs a store read).
+const MAX_RENEWAL_REFUSALS_PER_SESSION: u32 = 8;
+
+/// What a node past its per-node session rate is told to wait, in
+/// seconds (the sliding window itself).
+const SESSION_RATE_RETRY_AFTER_S: u32 = SESSION_RATE_WINDOW.as_secs() as u32;
 
 /// Operational-listener counters (bridged to Prometheus by the
 /// binary, AC #12). All monotonic.
@@ -121,7 +133,8 @@ pub struct OperationalStats {
     pub handshake_transport_failures: AtomicU64,
     /// Sessions admitted through the handshake.
     pub sessions_admitted: AtomicU64,
-    /// Sessions answered RETRY_LATER by the admission gate (AC #10).
+    /// Sessions answered RETRY_LATER by the admission gate (AC #10)
+    /// or by the per-node session rate limit.
     pub sessions_retry_later: AtomicU64,
     /// Sessions answered RETRY_LATER because `max_sessions` are
     /// already established.
@@ -461,6 +474,22 @@ async fn serve_operational_conn(
     };
     drop(hs_permit);
 
+    // Per-node session rate (Story 9.3): a node reconnecting at line
+    // rate is answered RETRY_LATER before it costs a queued admission
+    // slot, a registry write and a lifecycle hook.
+    if let (Some(fleet), Some(identity)) = (&shared.fleet, &node) {
+        if !fleet.sessions.admit_session(&identity.node_id) {
+            stats.sessions_retry_later.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                %peer,
+                node_id = %identity.node_id,
+                "node exceeded its session rate; answering RETRY_LATER"
+            );
+            reply_retry_later(opener, &mut incoming, SESSION_RATE_RETRY_AFTER_S).await;
+            return;
+        }
+    }
+
     // Admission (AC #10): bounded queued wait, RETRY_LATER on expiry.
     let permit = match shared.admission.admit().await {
         AdmissionDecision::Admitted(permit) => permit,
@@ -580,7 +609,7 @@ async fn serve_session(
     mut guard: Option<SessionGuard>,
 ) {
     let stats = &shared.stats;
-    let mut renewals: u32 = 0;
+    let mut renewals = RenewalTally::default();
     loop {
         let request = match &mut guard {
             Some(guard) => {
@@ -616,12 +645,19 @@ async fn serve_session(
     }
 }
 
+/// Renewal outcomes seen on one session, for the per-session caps.
+#[derive(Default)]
+struct RenewalTally {
+    granted: u32,
+    refused: u32,
+}
+
 /// Serve one inbound request; `Some` ends the session.
 async fn serve_request(
     request: IncomingRequest<ClusterFrame>,
     shared: &OperationalShared,
     ctx: &SessionContext,
-    renewals: &mut u32,
+    renewals: &mut RenewalTally,
 ) -> Option<SessionEnd> {
     let stats = &shared.stats;
     match translate_cluster_request(request.request()) {
@@ -649,8 +685,7 @@ async fn serve_request(
                     .err()
                     .map(|_| SessionEnd::Closed);
             };
-            *renewals += 1;
-            if *renewals > MAX_RENEWALS_PER_SESSION {
+            if renewals.granted >= MAX_RENEWALS_PER_SESSION {
                 stats.protocol_violations.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(peer = %ctx.peer_addr, node_id, "renewal flood; dropping the session");
                 fleet
@@ -663,16 +698,33 @@ async fn serve_request(
                 tokio::time::sleep(REFUSAL_FLUSH_GRACE).await;
                 return Some(SessionEnd::Closed);
             }
+            if renewals.refused >= MAX_RENEWAL_REFUSALS_PER_SESSION {
+                tracing::warn!(
+                    peer = %ctx.peer_addr,
+                    node_id,
+                    "too many refused renewals on one session; dropping it"
+                );
+                let _ = request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::Unspecified))
+                    .await;
+                tokio::time::sleep(REFUSAL_FLUSH_GRACE).await;
+                return Some(SessionEnd::Closed);
+            }
             let renewed = fleet
                 .handler
                 .on_renew(RenewRequest {
                     node_id: node_id.to_string(),
                     peer: ctx.peer_addr,
+                    via_previous_certificate: ctx
+                        .node
+                        .as_ref()
+                        .is_some_and(|n| n.via_previous_certificate),
                     public_key_der,
                 })
                 .await;
             let reply = match renewed {
                 Ok(grant) => {
+                    renewals.granted += 1;
                     stats.renewals_served.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(peer = %ctx.peer_addr, node_id, "node certificate renewed");
                     ClusterResponse::ok(cluster_response::Body::RenewAck(RenewAck {
@@ -681,6 +733,7 @@ async fn serve_request(
                     }))
                 }
                 Err(reason) => {
+                    renewals.refused += 1;
                     tracing::warn!(peer = %ctx.peer_addr, node_id, %reason, "node certificate renewal refused");
                     ClusterResponse::refusal(ClusterStatus::Unspecified)
                 }

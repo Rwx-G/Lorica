@@ -261,7 +261,14 @@ impl DialerHandle {
     /// certificate now and retires the superseded one, instead of
     /// whenever the old session happens to end.
     pub fn reconnect(&self) {
-        self.reconnect.notify_one();
+        // `notify_one` stores a permit when nobody is waiting, which
+        // would tear down the NEXT session for nothing: only a live
+        // session can be asked to reconnect. (A session ending between
+        // the check and the notify costs one spurious reconnect, which
+        // is the harmless direction.)
+        if self.connection.current().is_some() {
+            self.reconnect.notify_one();
+        }
     }
 
     /// Stop dialing and clear the connection slot.

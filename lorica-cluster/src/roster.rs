@@ -23,16 +23,27 @@
 //! a connection never touches SQLite and the transport crate never
 //! depends on it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use tokio::sync::watch;
 
 use crate::ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
 use crate::tls::{operational_server_config_with_crl, ClusterTlsError, SwappableAcceptor};
+
+/// Sliding window of the per-node session rate limit.
+pub const SESSION_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Sessions one node may establish per [`SESSION_RATE_WINDOW`]. A
+/// follower opens one session, one more after a renewal, and a
+/// handful across a flapping link; a node reconnecting at line rate
+/// is paying for a TLS handshake and a registry write each time, and
+/// is answered RETRY_LATER past this.
+pub const MAX_SESSIONS_PER_NODE_PER_WINDOW: usize = 10;
 
 /// Lifecycle state of a roster entry, mirroring the registry's
 /// `status` column without depending on the config crate.
@@ -95,6 +106,17 @@ impl Roster {
             .count()
     }
 
+    /// Whether a superseded certificate is still on record for
+    /// `node_id` (a renewal happened and the node has not yet
+    /// connected on the new one). Lock-free; the session layer asks
+    /// this before touching the store.
+    pub fn has_superseded_certificate(&self, node_id: &str) -> bool {
+        self.by_fingerprint
+            .load()
+            .values()
+            .any(|n| n.via_previous_certificate && n.node_id == node_id)
+    }
+
     /// Whether no node is enrolled.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -152,6 +174,10 @@ pub struct LiveSessionSnapshot {
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<String, Arc<LiveSession>>>,
     next_generation: AtomicU64,
+    /// Session-establishment timestamps per node inside
+    /// [`SESSION_RATE_WINDOW`] (entries vanish once their window
+    /// empties, so the map is bounded by the nodes seen in one window).
+    recent: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
 /// What a session task holds while registered: its kill receiver and
@@ -233,6 +259,33 @@ impl SessionRegistry {
         }
     }
 
+    /// Whether `node_id` may establish another session now (at most
+    /// [`MAX_SESSIONS_PER_NODE_PER_WINDOW`] per [`SESSION_RATE_WINDOW`]);
+    /// the attempt is recorded only when admitted, so a refused node
+    /// does not extend its own penalty.
+    pub fn admit_session(&self, node_id: &str) -> bool {
+        self.admit_session_at(node_id, Instant::now())
+    }
+
+    fn admit_session_at(&self, node_id: &str, now: Instant) -> bool {
+        let mut recent = self.recent.lock().unwrap_or_else(|p| p.into_inner());
+        recent.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|t| now.saturating_duration_since(*t) >= SESSION_RATE_WINDOW)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+        let times = recent.entry(node_id.to_string()).or_default();
+        if times.len() >= MAX_SESSIONS_PER_NODE_PER_WINDOW {
+            return false;
+        }
+        times.push_back(now);
+        true
+    }
+
     /// End the node's session synchronously (AC #7). `true` iff a
     /// session was live.
     pub fn kill(&self, node_id: &str) -> bool {
@@ -296,6 +349,13 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Proof that the control plane's refresh lock is held: the only way
+/// to swap the roster or the acceptor. Obtained from
+/// [`ControlPlane::refresh_guard`]; dropping it releases the lock.
+pub struct RefreshGuard<'a> {
+    _held: tokio::sync::MutexGuard<'a, ()>,
+}
+
 /// Everything the management API needs to act on the fleet, owned by
 /// the control-plane runtime and shared with `AppState`.
 pub struct ControlPlane {
@@ -312,12 +372,16 @@ pub struct ControlPlane {
     ca: ClusterCa,
     /// The serials the current acceptor's CRL covers, so a refresh
     /// that changes nothing revocation-related skips the mint and
-    /// the rustls rebuild.
+    /// the rustls rebuild. Comparing serials alone is sound only
+    /// because a revoked serial's `reason` and `revoked_at` never
+    /// change once written (the store inserts them with `OR IGNORE`),
+    /// so the same serial set always mints the same CRL.
     crl_serials: Mutex<Vec<String>>,
     /// Serializes "read the store, swap roster and acceptor" so two
     /// concurrent refreshes cannot land out of order and undo a
-    /// revocation. Held by the caller across the whole refresh.
-    pub refresh_lock: tokio::sync::Mutex<()>,
+    /// revocation. Private: the swaps take a [`RefreshGuard`], so a
+    /// caller cannot swap without holding it.
+    refresh_lock: tokio::sync::Mutex<()>,
     /// The control plane's own leaf, PEM (its SPKI is what tokens pin).
     pub leaf_cert_pem: String,
     /// The control plane's own leaf key, PEM (for the acceptor rebuild).
@@ -368,8 +432,18 @@ impl ControlPlane {
         }
     }
 
+    /// Take the refresh lock: the guard is the proof
+    /// [`ControlPlane::rebuild_acceptor`] and
+    /// [`ControlPlane::replace_roster`] require, and it must be held
+    /// from the store read to the last swap.
+    pub async fn refresh_guard(&self) -> RefreshGuard<'_> {
+        RefreshGuard {
+            _held: self.refresh_lock.lock().await,
+        }
+    }
+
     /// Replace the roster and refresh the fleet-size hint.
-    pub fn replace_roster(&self, entries: HashMap<String, NodeIdentity>) {
+    pub fn replace_roster(&self, _guard: &RefreshGuard<'_>, entries: HashMap<String, NodeIdentity>) {
         self.roster.replace(entries);
         let size = u32::try_from(self.roster.len()).unwrap_or(u32::MAX);
         self.fleet_size.store(size, Ordering::Relaxed);
@@ -393,7 +467,11 @@ impl ControlPlane {
     /// are handled separately by [`SessionRegistry::kill`]. A call
     /// whose serial set equals the one already served is a no-op
     /// (`Ok(false)`); `Ok(true)` means the acceptor was swapped.
-    pub fn rebuild_acceptor(&self, revoked: &[RevokedEntry]) -> Result<bool, ClusterTlsError> {
+    pub fn rebuild_acceptor(
+        &self,
+        _guard: &RefreshGuard<'_>,
+        revoked: &[RevokedEntry],
+    ) -> Result<bool, ClusterTlsError> {
         let mut serials: Vec<String> = revoked.iter().map(|r| r.serial_hex.clone()).collect();
         serials.sort();
         {
@@ -480,6 +558,48 @@ mod tests {
         assert_eq!(registry.len(), 1);
         drop(second);
         assert!(!registry.is_connected("node-a"));
+    }
+
+    #[test]
+    fn roster_knows_which_nodes_still_carry_a_superseded_certificate() {
+        let roster = Roster::new();
+        let mut map = HashMap::new();
+        map.insert("fp-a".to_string(), identity("a", NodeState::Active));
+        map.insert("fp-b".to_string(), identity("b", NodeState::Active));
+        map.insert(
+            "fp-b-old".to_string(),
+            NodeIdentity {
+                via_previous_certificate: true,
+                ..identity("b", NodeState::Active)
+            },
+        );
+        roster.replace(map);
+        assert!(!roster.has_superseded_certificate("a"));
+        assert!(roster.has_superseded_certificate("b"));
+        assert!(!roster.has_superseded_certificate("zzz"));
+    }
+
+    #[test]
+    fn per_node_session_rate_slides_and_frees_the_entry() {
+        let registry = SessionRegistry::new();
+        let t0 = Instant::now();
+        for i in 0..MAX_SESSIONS_PER_NODE_PER_WINDOW {
+            assert!(
+                registry.admit_session_at("node-a", t0 + Duration::from_secs(i as u64)),
+                "session {i} inside the budget"
+            );
+        }
+        assert!(!registry.admit_session_at("node-a", t0 + Duration::from_secs(30)));
+        // Another node is unaffected.
+        assert!(registry.admit_session_at("node-b", t0 + Duration::from_secs(30)));
+        // The oldest attempt slides out of the window and frees a slot.
+        assert!(registry.admit_session_at("node-a", t0 + SESSION_RATE_WINDOW));
+        // Past the window with no activity, the entry is gone.
+        assert!(registry.admit_session_at("node-c", t0 + SESSION_RATE_WINDOW * 3));
+        let recent = registry.recent.lock().expect("map");
+        assert!(!recent.contains_key("node-a"));
+        assert!(!recent.contains_key("node-b"));
+        assert_eq!(recent.len(), 1);
     }
 
     #[tokio::test]

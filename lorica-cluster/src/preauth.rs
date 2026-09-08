@@ -225,7 +225,11 @@ impl AttemptWindow {
         let mut attempts = self.attempts.lock().unwrap_or_else(|p| p.into_inner());
         let window = self.window;
         if !attempts.contains_key(&key) && attempts.len() >= self.max_entries {
-            // Evict the source whose latest attempt is the oldest.
+            // Evict the source whose latest attempt is the oldest: an
+            // O(max_entries) scan under the accept loop's mutex, paid
+            // only by a NEW source while the map sits at the cap
+            // (4096 by default, a few hundred microseconds). Worth a
+            // generation-bucketed map before the cap is ever raised.
             let victim = attempts
                 .iter()
                 .min_by_key(|(_, times)| times.back().copied().unwrap_or(now))
@@ -249,7 +253,8 @@ impl AttemptWindow {
     }
 
     /// Sources currently tracked (bounded by `max_entries`).
-    pub fn tracked_sources(&self) -> usize {
+    #[cfg(test)]
+    fn tracked_sources(&self) -> usize {
         self.attempts.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
