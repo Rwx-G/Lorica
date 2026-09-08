@@ -230,6 +230,7 @@ pub fn install_cluster_registry(registry: std::sync::Arc<lorica_cluster::Session
     Lazy::force(&CLUSTER_CONFIG_GENERATION);
     Lazy::force(&CLUSTER_CONFIG_APPLY_TOTAL);
     Lazy::force(&CLUSTER_DRIFT_NODES);
+    Lazy::force(&CLUSTER_CERT_PUSH_TOTAL);
     let _ = CLUSTER_REGISTRY.set(registry);
 }
 
@@ -243,6 +244,23 @@ pub fn inc_cluster_config_apply(node_id: &str, outcome: &str) {
 /// Publish the number of drifted nodes (Story 9.4 AC #12).
 pub fn set_cluster_drift_nodes(count: usize) {
     CLUSTER_DRIFT_NODES.set(i64::try_from(count).unwrap_or(i64::MAX));
+}
+
+/// Certificate distribution outcomes per node (Story 9.5 AC #10).
+/// `outcome` is `pushed`, `pulled`, `refused` or `failed`.
+static CLUSTER_CERT_PUSH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "lorica_cluster_cert_push_total",
+        "Certificate distribution outcomes per cluster node",
+        &["node_id", "outcome"],
+    )
+});
+
+/// Count one certificate-distribution outcome for a node (AC #10).
+pub fn inc_cluster_cert_push(node_id: &str, outcome: &str) {
+    CLUSTER_CERT_PUSH_TOTAL
+        .with_label_values(&[node_id, outcome])
+        .inc();
 }
 
 /// Publish this node's own applied generation (a follower reports

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use lorica_cluster::{
-    AppliedConfig, ClusterConnection, ClusterTlsError, ConfigVersion, ControlPlane, NodeIdentity,
-    NodeState, RevokedEntry,
+    AppliedConfig, CertBundle, ClusterConnection, ClusterTlsError, ConfigVersion, ControlPlane,
+    NodeIdentity, NodeState, RevokedEntry,
 };
 use lorica_config::models::{ClusterNode, NodeStatus};
 use lorica_config::{ConfigError, ConfigStore};
@@ -256,6 +256,78 @@ pub struct DriftReport {
     pub in_sync: usize,
     /// Nodes the coordinator excludes from commit sets.
     pub quarantined: Vec<String>,
+}
+
+/// Wrap a stored certificate for the wire (Story 9.5), stamping the
+/// same digest shape the canonical blob carries so a receiver can tie
+/// the key to the configuration that announced it.
+pub fn cert_bundle(cert: &lorica_config::models::Certificate) -> CertBundle {
+    CertBundle {
+        cert_id: cert.id.clone(),
+        domain: cert.domain.clone(),
+        cert_pem: cert.cert_pem.clone(),
+        key_pem: cert.key_pem.clone(),
+        key_digest: format!(
+            "sha256:{}",
+            lorica_config::canonical::sha256_hex(cert.key_pem.as_bytes())
+        ),
+    }
+}
+
+/// Push a certificate's key to the nodes entitled to it (Story 9.5
+/// AC #7).
+///
+/// Best effort by decision D2, and that is the whole design: this is
+/// the latency optimisation, not the guarantee. A node that is down,
+/// slow or not yet connected is simply absent from the round and asks
+/// for what it lacks after its next configuration apply. So every
+/// failure here is counted and logged, and none of them fails the
+/// issuance that triggered it.
+///
+/// Does nothing on a node that is not a control plane, which is what
+/// makes it safe to call unconditionally from the issuance paths.
+pub async fn distribute_certificate(
+    cluster: &ClusterRuntime,
+    store: &Arc<Mutex<ConfigStore>>,
+    cert_id: &str,
+) {
+    let ClusterRuntime::ControlPlane(runtime) = cluster else {
+        return;
+    };
+    let id = cert_id.to_string();
+    let resolved = store_op(store, move |store| {
+        let recipients = store.cert_key_recipients(&id)?;
+        let cert = store.get_certificate(&id)?;
+        Ok((recipients, cert))
+    })
+    .await;
+    let (recipients, cert) = match resolved {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            tracing::error!(cert_id, error = %e,
+                "could not resolve certificate recipients; the fleet converges by pull");
+            return;
+        }
+    };
+    let Some(cert) = cert else {
+        return;
+    };
+    if cert.key_pem.is_empty() || recipients.is_empty() {
+        return;
+    }
+    let report = runtime
+        .control
+        .distribute_certificates(&recipients, vec![cert_bundle(&cert)])
+        .await;
+    for (node_id, count) in &report.installed {
+        crate::metrics::inc_cluster_cert_push(node_id, "pushed");
+        tracing::info!(node_id, cert_id, installed = count, "certificate key pushed");
+    }
+    for (node_id, reason) in &report.failed {
+        crate::metrics::inc_cluster_cert_push(node_id, "failed");
+        tracing::warn!(node_id, cert_id, %reason,
+            "certificate push failed; the node asks for it after its next apply");
+    }
 }
 
 /// Compute the drift view (AC #12): every `Active` node compared to

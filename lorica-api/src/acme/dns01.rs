@@ -246,8 +246,7 @@ pub(super) async fn provision_with_acme_dns(
     if let Some((settings, acls)) = export_snapshot {
         crate::cert_export::export_after_release(settings, acls, cert).await;
     }
-    state.rotate_bot_hmac_on_cert_event().await;
-    state.notify_config_changed();
+    super::after_certificate_issued(state, &cert_id).await;
 
     Ok(cert_id)
 }

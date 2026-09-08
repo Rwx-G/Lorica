@@ -17,7 +17,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
+
+/// How long a published challenge stays servable (Story 9.5 AC #6).
+///
+/// A CA validates within seconds to a couple of minutes, so half an
+/// hour is generous. The bound exists for the failure case, not the
+/// happy one: before it, a crashed or abandoned order left a node
+/// serving a key authorization forever, because the only caller of
+/// `remove` is the driver cleanup that the crash skipped.
+pub const CHALLENGE_TTL: chrono::Duration = chrono::Duration::minutes(30);
+
+/// A published key authorization and the instant past which it stops
+/// being served, held together so no read path can consult one without
+/// the other.
+type PendingChallenge = (String, DateTime<Utc>);
 
 /// SQLite-backed store for pending ACME HTTP-01 challenges.
 /// Maps token -> key_authorization for /.well-known/acme-challenge/{token}.
@@ -48,7 +63,9 @@ use tokio::sync::RwLock;
 #[derive(Debug, Clone)]
 pub struct AcmeChallengeStore {
     /// In-memory cache for fast lookups in the supervisor process.
-    challenges: Arc<RwLock<HashMap<String, String>>>,
+    /// Carries the same deadline as the row, so the cache cannot serve
+    /// a challenge SQLite would already refuse.
+    challenges: Arc<RwLock<HashMap<String, PendingChallenge>>>,
     /// Long-lived SQLite connection shared across all calls in this
     /// process. `None` only if the initial open failed (e.g. a test
     /// pointed at an unwritable path) - in that case we degrade to
@@ -120,10 +137,11 @@ impl AcmeChallengeStore {
     /// degraded mode) still returns `Ok`: the in-memory copy is what
     /// that topology serves from.
     pub async fn set(&self, token: String, key_authorization: String) -> Result<(), String> {
+        let expires_at = Utc::now() + CHALLENGE_TTL;
         self.challenges
             .write()
             .await
-            .insert(token.clone(), key_authorization.clone());
+            .insert(token.clone(), (key_authorization.clone(), expires_at));
         let Some(ref conn) = self.conn else {
             return Ok(());
         };
@@ -133,9 +151,16 @@ impl AcmeChallengeStore {
         let persist = tokio::task::spawn_blocking(move || {
             let guard = conn.lock();
             guard
+                // The column set is owned by `lorica-config` migration
+                // 54 and mirrored here rather than shared, because this
+                // module deliberately holds its OWN connection so a
+                // worker can serve the challenge endpoint without
+                // taking the configuration store mutex on the request
+                // path. `ConfigStore::set_acme_challenge` is the same
+                // statement for the housekeeping side.
                 .execute(
-                    "INSERT OR REPLACE INTO acme_challenges (token, key_auth) VALUES (?1, ?2)",
-                    rusqlite::params![token, key_authorization],
+                    "INSERT OR REPLACE INTO acme_challenges                      (token, key_auth, expires_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![token, key_authorization, expires_at.to_rfc3339()],
                 )
                 .map_err(|e| e.to_string())
         })
@@ -167,10 +192,17 @@ impl AcmeChallengeStore {
 
     /// Look up the key authorization for `token`, falling back to SQLite if not in the local cache.
     pub async fn get(&self, token: &str) -> Option<String> {
-        // Try in-memory first (supervisor process)
-        if let Some(val) = self.challenges.read().await.get(token).cloned() {
-            tracing::info!(token = token, "ACME challenge found in memory");
-            return Some(val);
+        let now = Utc::now();
+        // Try in-memory first (supervisor process). An entry past its
+        // deadline is treated as absent rather than removed here: the
+        // read path takes a read lock, and the purge that actually
+        // reclaims it runs on the retention loop.
+        if let Some((val, expires_at)) = self.challenges.read().await.get(token).cloned() {
+            if expires_at > now {
+                tracing::info!(token = token, "ACME challenge found in memory");
+                return Some(val);
+            }
+            tracing::info!(token = token, "ACME challenge in memory but expired");
         }
         // Fall back to SQLite (worker processes)
         let conn = self.conn.as_ref()?.clone();
@@ -180,8 +212,8 @@ impl AcmeChallengeStore {
             let guard = conn.lock();
             guard
                 .query_row(
-                    "SELECT key_auth FROM acme_challenges WHERE token = ?1",
-                    rusqlite::params![token_owned],
+                    "SELECT key_auth FROM acme_challenges                      WHERE token = ?1 AND expires_at > ?2",
+                    rusqlite::params![token_owned, now.to_rfc3339()],
                     |row| row.get::<_, String>(0),
                 )
                 .ok()
@@ -206,10 +238,10 @@ impl AcmeChallengeStore {
             let token = token.to_string();
             let _ = tokio::task::spawn_blocking(move || {
                 let guard = conn.lock();
-                // Cleanup stays infallible for the driver, but a
-                // failed DELETE means workers keep serving this token
-                // from SQLite across restarts (no expiry exists yet) -
-                // that deserves a journal line, never key_auth.
+                // Cleanup stays infallible for the driver. A failed
+                // DELETE now only delays reclamation to the TTL rather
+                // than leaking the token forever, but it still deserves
+                // a journal line, and never `key_auth`.
                 if let Err(e) = guard.execute(
                     "DELETE FROM acme_challenges WHERE token = ?1",
                     rusqlite::params![token],

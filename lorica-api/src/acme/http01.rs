@@ -172,12 +172,22 @@ pub(super) async fn provision_with_acme(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let primary_domain = &domains[0];
 
-    // Drive the pure ACME protocol via `lorica-acme`. The challenge tokens
-    // are published through `AcmeChallengeStore` (the `Http01ChallengeSolver`
-    // impl); a process without a store falls back to a no-op solver, matching
+    // Drive the pure ACME protocol via `lorica-acme`. Tokens are
+    // published through the challenge store, wrapped since Story 9.5 so
+    // that on a control plane they also reach every follower that could
+    // answer for the hostname being validated (AC #6). On a standalone
+    // node or a follower the wrapper is a passthrough, and a process
+    // without a store still falls back to the no-op solver, matching
     // the pre-extraction behaviour.
     let issued = match &state.acme_challenge_store {
-        Some(store) => lorica_acme::issue_http01(config, domains, store).await?,
+        Some(store) => {
+            let solver = super::FleetHttp01Solver::new(
+                store.clone(),
+                state.cluster.clone(),
+                std::sync::Arc::clone(&state.store),
+            );
+            lorica_acme::issue_http01(config, domains, &solver).await?
+        }
         None => lorica_acme::issue_http01(config, domains, &NoopHttp01Solver).await?,
     };
     let cert_pem = issued.cert_pem;
@@ -232,8 +242,7 @@ pub(super) async fn provision_with_acme(
     if let Some((settings, acls)) = export_snapshot {
         crate::cert_export::export_after_release(settings, acls, cert).await;
     }
-    state.rotate_bot_hmac_on_cert_event().await;
-    state.notify_config_changed();
+    super::after_certificate_issued(state, &cert_id).await;
 
     Ok(cert_id)
 }

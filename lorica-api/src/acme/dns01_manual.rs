@@ -394,8 +394,7 @@ pub async fn provision_dns_manual_confirm(
     if let Some((settings, acls)) = export_snapshot {
         crate::cert_export::export_after_release(settings, acls, cert).await;
     }
-    state.rotate_bot_hmac_on_cert_event().await;
-    state.notify_config_changed();
+    super::after_certificate_issued(&state, &cert_id).await;
 
     // Only remove the pending challenge after successful provisioning
     state.pending_dns_challenges.remove(&body.domain);
