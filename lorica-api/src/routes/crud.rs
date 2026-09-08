@@ -423,29 +423,12 @@ fn validate_node_selector(raw: &[String]) -> Result<Vec<String>, ApiError> {
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())
         .collect();
-    if names.len() > lorica_config::models::NODE_SELECTOR_MAX_ENTRIES {
-        return Err(ApiError::BadRequest(format!(
-            "node_selector may not carry more than {} node names",
-            lorica_config::models::NODE_SELECTOR_MAX_ENTRIES
-        )));
-    }
-    for name in &names {
-        if name.len() > 64 {
-            return Err(ApiError::BadRequest(
-                "node_selector entries must be <= 64 characters".into(),
-            ));
-        }
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-        {
-            return Err(ApiError::BadRequest(
-                "node_selector entries may only contain ASCII lowercase letters, \
-                 digits, `-` and `_`"
-                    .into(),
-            ));
-        }
-    }
+    // Normalise here, then delegate to the ONE rule. A second copy of
+    // the predicate on this side of the replication boundary is a
+    // drift trap: loosen it and the control plane accepts a selector
+    // the follower's `prepare_replica` refuses, which aborts the round
+    // for the whole fleet.
+    lorica_config::models::validate_node_selector_names(&names).map_err(ApiError::BadRequest)?;
     Ok(names)
 }
 

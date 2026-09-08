@@ -242,7 +242,6 @@ pub fn inc_cluster_config_apply(node_id: &str, outcome: &str) {
 
 /// Publish the number of drifted nodes (Story 9.4 AC #12).
 pub fn set_cluster_drift_nodes(count: usize) {
-    Lazy::force(&CLUSTER_CONFIG_GENERATION);
     CLUSTER_DRIFT_NODES.set(i64::try_from(count).unwrap_or(i64::MAX));
 }
 

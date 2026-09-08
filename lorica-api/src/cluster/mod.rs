@@ -807,12 +807,34 @@ pub async fn open_break_glass(
         )));
     }
     let until = Utc::now() + chrono::Duration::seconds(i64::try_from(body.duration_s).unwrap_or(0));
+    // Opening the window INVALIDATES what this node reports as applied.
+    //
+    // Local edits made inside a window never touch the applied marker
+    // (only a replica apply writes it), so without this the node would
+    // still report the generation it last replicated, the control
+    // plane's "is this node behind" check would say no, and the
+    // divergent configuration would stand forever while the drift view
+    // reported the node in sync. Clearing the hash makes the node
+    // unconditionally behind, so the first heartbeat after the window
+    // closes pulls the fleet's configuration and reconciles the edits
+    // away, which is what AC #11 promises.
     db_blocking(&state.store, move |store| {
         store
             .set_cluster_break_glass_until(Some(until))
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        store
+            .set_cluster_applied_config(0, "")
             .map_err(|e| ApiError::Internal(e.to_string()))
     })
     .await?;
+    {
+        let mut applied = follower
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        applied.generation = 0;
+        applied.hash = String::new();
+    }
     follower.break_glass.send_replace(Some(until));
     tracing::warn!(
         node_id = %follower.node_id,

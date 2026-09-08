@@ -169,8 +169,16 @@ impl DriftTracker {
         let mut first_seen = self.first_seen.lock().unwrap_or_else(|p| p.into_inner());
         let mut backoff = self.backoff.lock().unwrap_or_else(|p| p.into_inner());
         first_seen.retain(|id, _| drifted.contains(id));
-        backoff.retain(|id, _| drifted.contains(id));
+        // The suppression interval is kept, not dropped, when a node
+        // returns to sync: a node that alternates in and out of sync
+        // would otherwise restart at the shortest interval every time
+        // and produce one alert per cycle forever. It expires on its
+        // own once the node has been quiet longer than its current
+        // interval, which is what "back to normal" should mean.
         let instant_now = Instant::now();
+        backoff.retain(|id, (next_allowed, _)| {
+            drifted.contains(id) || instant_now < *next_allowed
+        });
         let mut due = Vec::new();
         for id in drifted {
             first_seen.entry(id.clone()).or_insert(now);
@@ -520,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_alerts_back_off_per_node_and_reset_when_in_sync() {
+    fn drift_alerts_back_off_per_node_and_a_flapping_node_cannot_reset_its_own_suppression() {
         let tracker = DriftTracker::default();
         let now = Utc::now();
         let a = vec!["a".to_string()];
@@ -529,20 +537,35 @@ mod tests {
         // Inside the backoff nothing fires, the first-seen time holds.
         assert!(tracker.observe(&a, now).is_empty());
         assert_eq!(tracker.since("a"), Some(now));
-        // Back in sync: forgotten, the next drift fires again at once.
+        // Back in sync: the divergence AGE is forgotten, because the
+        // next one is a new divergence. The suppression interval is
+        // not, or a node alternating in and out of sync would restart
+        // at the shortest interval every cycle and alert forever.
         assert!(tracker.observe(&[], now).is_empty());
         assert_eq!(tracker.since("a"), None);
         let later = now + chrono::Duration::seconds(5);
-        assert_eq!(tracker.observe(&a, later), a);
+        assert!(
+            tracker.observe(&a, later).is_empty(),
+            "a node that flaps back into drift is still suppressed"
+        );
         assert_eq!(tracker.since("a"), Some(later));
-        // The interval doubles up to the cap.
-        {
-            let backoff = tracker.backoff.lock().expect("map");
-            assert_eq!(backoff["a"].1, DRIFT_BACKOFF_MIN);
-        }
-        tracker.backoff.lock().expect("map").get_mut("a").expect("entry").0 = Instant::now();
+        // Once the interval has genuinely elapsed, it fires again and
+        // the interval doubles, up to the cap.
+        let elapse = |tracker: &DriftTracker| {
+            tracker.backoff.lock().expect("map").get_mut("a").expect("entry").0 = Instant::now();
+        };
+        elapse(&tracker);
         assert_eq!(tracker.observe(&a, later), a);
-        assert_eq!(tracker.backoff.lock().expect("map")["a"].1, DRIFT_BACKOFF_MIN * 2);
+        assert_eq!(
+            tracker.backoff.lock().expect("map")["a"].1,
+            DRIFT_BACKOFF_MIN * 2
+        );
+        elapse(&tracker);
+        assert_eq!(tracker.observe(&a, later), a);
+        assert_eq!(
+            tracker.backoff.lock().expect("map")["a"].1,
+            DRIFT_BACKOFF_MIN * 4
+        );
     }
 
     #[test]

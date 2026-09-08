@@ -156,11 +156,21 @@ pub fn follower_local_request(method: &http::Method, path: &str) -> bool {
         "/api/v1/loadtest/abort",
         "/api/v1/acme/provision-dns-manual/check",
     ];
-    // `.../test` covers the settings sink probes (`otel`, `syslog`,
-    // `otlp-logs`) and the notification and DNS-provider probes.
-    PREFIXES.iter().any(|p| path.starts_with(p))
-        || EXACT.contains(&path)
-        || path.ends_with("/test")
+    // The connectivity probes, spelled out rather than matched by a
+    // `/test` suffix. This gate must fail closed by default, and an
+    // open-ended suffix silently exempts any future endpoint that
+    // happens to end the same way, with no test failing. `{id}` paths
+    // are matched as prefix plus suffix because the id is opaque.
+    const PROBE_EXACT: &[&str] = &[
+        "/api/v1/settings/otel/test",
+        "/api/v1/settings/syslog/test",
+        "/api/v1/settings/otlp-logs/test",
+    ];
+    const PROBE_SCOPED: &[&str] = &["/api/v1/notifications/", "/api/v1/dns-providers/"];
+    let is_probe = PROBE_EXACT.contains(&path)
+        || (path.ends_with("/test")
+            && PROBE_SCOPED.iter().any(|prefix| path.starts_with(prefix)));
+    PREFIXES.iter().any(|p| path.starts_with(p)) || EXACT.contains(&path) || is_probe
 }
 
 /// Axum middleware for the follower read-only gate (Story 9.4 AC #10):
@@ -169,18 +179,23 @@ pub fn follower_local_request(method: &http::Method, path: &str) -> bool {
 /// after `authorize`, so an unauthorised caller still gets 401/403
 /// first and learns nothing about the fleet role.
 pub async fn follower_read_only(req: Request, next: Next) -> Result<Response, ApiError> {
-    if let Some(state) = req.extensions().get::<AppState>() {
-        if let ClusterRuntime::Follower(follower) = &state.cluster {
-            if !follower.break_glass_active()
-                && !follower_local_request(req.method(), req.uri().path())
-            {
-                return Err(ApiError::Conflict(format!(
-                    "this node is a follower of {}: configuration is owned by the control \
-                     plane; change it there, or open a break-glass window \
-                     (POST /api/v1/cluster/break-glass) for local emergency changes",
-                    follower.control_plane
-                )));
-            }
+    // Fails CLOSED on a missing extension, like `authorize` above. The
+    // router installs it outside this layer today, so the branch is
+    // unreachable; treating it as "not a follower" would make a
+    // re-layering silently disable the whole gate, with no error and
+    // no test failure.
+    let state = req.extensions().get::<AppState>().ok_or_else(|| {
+        ApiError::Internal("application state missing in the follower read-only middleware".into())
+    })?;
+    if let ClusterRuntime::Follower(follower) = &state.cluster {
+        if !follower.break_glass_active() && !follower_local_request(req.method(), req.uri().path())
+        {
+            return Err(ApiError::Conflict(format!(
+                "this node is a follower of {}: configuration is owned by the control \
+                 plane; change it there, or open a break-glass window \
+                 (POST /api/v1/cluster/break-glass) for local emergency changes",
+                follower.control_plane
+            )));
         }
     }
     Ok(next.run(req).await)
