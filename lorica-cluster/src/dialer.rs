@@ -25,6 +25,18 @@
 //! reach its control plane is the epic's most common support case and
 //! must be debuggable from its own journal.
 //!
+//! # The connection is bidirectional (Story 9.4)
+//!
+//! Story 9.2 dropped the endpoint's incoming half: nothing was
+//! server-initiated. Since Story 9.4 the control plane PUSHES
+//! configuration down this same connection, so the dialer serves that
+//! half for the life of the session: every inbound request goes through
+//! [`translate_control_plane_request`], the three configuration pushes
+//! reach the [`FollowerHandler`], an unknown method is refused without
+//! dropping the session, and anything else is a protocol violation that
+//! ends it. A node without a [`FollowerHandler`] answers every push
+//! `UNSUPPORTED_METHOD`, which keeps the transport-only tests honest.
+//!
 //! # The dial target is a NAME, resolved on every attempt
 //!
 //! `control_plane` is kept as an unresolved `host:port` and resolved
@@ -54,7 +66,7 @@
 //! a follower in a one-second full-mTLS reconnect loop either.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,16 +75,25 @@ use tokio::task::JoinHandle;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
-use lorica_command::RpcEndpoint;
+use lorica_command::{IncomingRequest, IncomingRequests, RpcEndpoint};
 
+use crate::bridge::{translate_control_plane_request, FollowerAction, FollowerBridgeOutcome};
+use crate::enroll::BoxFuture;
 use crate::handshake::{client_handshake, HandshakeConfig, HandshakeError};
 use crate::limits::cluster_rpc_limits;
-use crate::messages::{cluster_response, ClusterFrame, ClusterRequest, ClusterStatus, Heartbeat};
+use crate::messages::{
+    cluster_response, config_hash_is_valid, ClusterFrame, ClusterRequest, ClusterResponse,
+    ClusterStatus, ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, Heartbeat, HelloAck,
+};
+use crate::replication::{AppliedConfig, ConfigPayload, ConfigVersion};
 use crate::tls::{client_config, negotiated_cluster_alpn, ClusterTlsError};
 
 /// Hard ceiling on every reconnect delay: the scaled backoff cap AND
 /// a server-provided `retry_after_s`.
 pub const BACKOFF_CAP_CEILING: Duration = Duration::from_secs(300);
+
+/// Grace period for a refusal to flush before the session is dropped.
+const REFUSAL_FLUSH_GRACE: Duration = Duration::from_secs(1);
 
 /// Why a dialer could not be spawned.
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +126,48 @@ pub struct DialerStats {
     pub heartbeat_failures: AtomicU64,
     /// Times an established connection was lost.
     pub disconnects: AtomicU64,
+    /// `ConfigPrepare` requests served on the incoming half (Story 9.4).
+    pub config_prepares: AtomicU64,
+    /// `ConfigCommit` requests served.
+    pub config_commits: AtomicU64,
+    /// `ConfigAbort` requests served.
+    pub config_aborts: AtomicU64,
+    /// Times an ack revealed the control plane is on another
+    /// configuration version and a pull was started (AC #7).
+    pub behind_detected: AtomicU64,
+    /// Control-plane requests refused by the follower whitelist; each
+    /// one also dropped the session.
+    pub protocol_violations: AtomicU64,
+}
+
+/// The follower runtime the dialer serves configuration pushes to
+/// (Story 9.4 D5).
+///
+/// Implemented by the binary over the configuration store and the
+/// reload trigger; a node without one (the transport-only tests)
+/// answers every push `UNSUPPORTED_METHOD`. Boxed futures keep
+/// `async-trait` out of the dependency set, like the Story 9.3 hooks.
+pub trait FollowerHandler: Send + Sync + 'static {
+    /// What this node runs, for the `Hello` and every `Heartbeat`.
+    fn applied_config(&self) -> AppliedConfig;
+
+    /// A `ConfigPrepare` arrived: validate and stage it, do not apply
+    /// it. `Err` is the SEMANTIC rejection the control plane aborts the
+    /// whole round on (AC #5), so its reason must name the cause
+    /// without echoing configuration values.
+    fn on_prepare(&self, payload: ConfigPayload) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Apply the staged generation and report what is now applied.
+    fn on_commit(&self, generation: u64) -> BoxFuture<'_, Result<AppliedConfig, String>>;
+
+    /// Drop the staged generation (another follower rejected it).
+    fn on_abort(&self, generation: u64) -> BoxFuture<'_, ()>;
+
+    /// The control plane's version differs from what this node applied
+    /// (learned from a `HelloAck` or a `HeartbeatAck`): pull over
+    /// `session` and apply (AC #7). At most one call is in flight per
+    /// session; the dialer skips the check while a previous pull runs.
+    fn on_behind(&self, session: SessionHandle, current: ConfigVersion) -> BoxFuture<'_, ()>;
 }
 
 /// Inputs for [`Dialer::spawn`]. Construct with [`DialerConfig::new`];
@@ -142,6 +205,11 @@ pub struct DialerConfig {
     /// Backoff cap before any fleet-size hint arrives; also the floor
     /// of the scaled cap (see the module doc). Default 60 s.
     pub default_backoff_cap: Duration,
+    /// The follower runtime that serves configuration pushes on the
+    /// incoming half (Story 9.4 D5). Default `None`: Prepare, Commit
+    /// and Abort are answered `UNSUPPORTED_METHOD`, which is the
+    /// transport-only mode the 9.2 tests exercise.
+    pub follower: Option<Arc<dyn FollowerHandler>>,
 }
 
 impl DialerConfig {
@@ -168,6 +236,7 @@ impl DialerConfig {
             connect_timeout: Duration::from_secs(10),
             base_backoff: Duration::from_secs(1),
             default_backoff_cap: Duration::from_secs(60),
+            follower: None,
         }
     }
 
@@ -176,6 +245,22 @@ impl DialerConfig {
         self.node_name = node_name.to_string();
         self
     }
+
+    /// Install the follower runtime that serves configuration pushes.
+    pub fn with_follower(mut self, follower: Arc<dyn FollowerHandler>) -> Self {
+        self.follower = Some(follower);
+        self
+    }
+}
+
+/// What this node runs, or the empty state when no follower runtime is
+/// installed.
+fn applied_config(config: &DialerConfig) -> AppliedConfig {
+    config
+        .follower
+        .as_ref()
+        .map(|follower| follower.applied_config())
+        .unwrap_or_default()
 }
 
 /// Split a `host:port` into its parts, refusing a bare host, a bare
@@ -216,6 +301,18 @@ pub struct ClusterConnection {
 }
 
 impl ClusterConnection {
+    /// A slot holding no session: what a follower's consumers see
+    /// before the first connect and between reconnects.
+    ///
+    /// [`Dialer::spawn`] creates and drives its own; this constructor
+    /// is for a caller that must name the state before a dialer
+    /// exists.
+    pub fn disconnected() -> Self {
+        Self {
+            slot: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+
     /// The live session, if one is currently established.
     pub fn current(&self) -> Option<SessionHandle> {
         self.slot.load_full().map(|s| (*s).clone())
@@ -354,30 +451,52 @@ async fn dial_loop(
         // the next connection.
         let current_connector = connector.load_full();
         match connect_once(&config, &current_connector, &server_name).await {
-            Ok((endpoint, ack_hint, negotiated_version, addr)) => {
+            Ok((endpoint, mut incoming, ack, addr)) => {
                 stats.handshakes_ok.fetch_add(1, Ordering::Relaxed);
                 failures = 0;
                 server_delay = None;
                 sticky_refusal = None;
-                fleet_hint = ack_hint;
+                fleet_hint = ack.fleet_size_hint;
                 generation += 1;
                 was_connected = true;
                 tracing::info!(
                     control_plane = %config.control_plane,
                     resolved = %addr,
                     generation,
-                    protocol = negotiated_version,
+                    protocol = ack.negotiated_version,
                     fleet_size_hint = fleet_hint,
+                    current_generation = ack.current_generation,
                     "cluster session established with the control plane"
                 );
-                let endpoint = Arc::new(endpoint);
-                slot.store(Some(Arc::new(SessionHandle {
+                let session = SessionHandle {
                     generation,
-                    endpoint: Arc::clone(&endpoint),
-                })));
+                    endpoint: Arc::new(endpoint),
+                };
+                slot.store(Some(Arc::new(session.clone())));
+
+                // One convergence pull at a time per session, so a
+                // slow apply cannot stack pulls behind every heartbeat.
+                let pull_in_flight = Arc::new(AtomicBool::new(false));
+                // AC #7's handshake half: converge at reconnect rather
+                // than waiting for the first heartbeat.
+                start_pull_if_behind(
+                    &config,
+                    &session,
+                    &stats,
+                    &pull_in_flight,
+                    ConfigVersion {
+                        generation: ack.current_generation,
+                        hash: ack.current_hash.clone(),
+                    },
+                );
 
                 let (hint, requested) = tokio::select! {
-                    hint = heartbeat_until_dead(&config, &endpoint, fleet_hint, &stats) => (hint, false),
+                    hint = heartbeat_until_dead(&config, &session, fleet_hint, &stats, &pull_in_flight) => (hint, false),
+                    // The incoming half: the control plane's
+                    // configuration pushes. It returns when the peer
+                    // hangs up or commits a protocol violation, and
+                    // either way the session is over.
+                    _ = serve_control_plane(&config, &mut incoming, &stats) => (fleet_hint, false),
                     _ = reconnect.notified() => (fleet_hint, true),
                 };
                 fleet_hint = hint;
@@ -494,11 +613,18 @@ pub async fn resolve_and_connect(
     Err(last_error)
 }
 
+type Connected = (
+    RpcEndpoint<ClusterFrame>,
+    IncomingRequests<ClusterFrame>,
+    HelloAck,
+    SocketAddr,
+);
+
 async fn connect_once(
     config: &DialerConfig,
     connector: &TlsConnector,
     server_name: &ServerName<'static>,
-) -> Result<(RpcEndpoint<ClusterFrame>, u32, u32, SocketAddr), DialFailure> {
+) -> Result<Connected, DialFailure> {
     // Resolution + TCP + TLS under one budget: a peer that answers TCP
     // and then stalls (route hijack, stale address) must not wedge the
     // loop.
@@ -519,19 +645,19 @@ async fn connect_once(
             "server did not negotiate the cluster ALPN".to_string(),
         ));
     }
-    // The incoming half is dropped: no server-initiated requests exist
-    // in Story 9.2 (Story 9.4 must keep it for pushes).
-    let (endpoint, _incoming) =
-        RpcEndpoint::<ClusterFrame>::with_limits(tls, cluster_rpc_limits());
+    // The incoming half is KEPT: since Story 9.4 the control plane
+    // initiates configuration pushes down this connection.
+    let (endpoint, incoming) = RpcEndpoint::<ClusterFrame>::with_limits(tls, cluster_rpc_limits());
     match client_handshake(
         &endpoint,
         &config.handshake,
         &config.node_name,
+        &applied_config(config),
         config.request_timeout,
     )
     .await
     {
-        Ok(ack) => Ok((endpoint, ack.fleet_size_hint, ack.negotiated_version, addr)),
+        Ok(ack) => Ok((endpoint, incoming, ack, addr)),
         Err(HandshakeError::RetryLater { retry_after_s }) => {
             Err(DialFailure::RetryLater(retry_after_s))
         }
@@ -547,26 +673,45 @@ async fn connect_once(
 
 /// Heartbeat until the session dies; returns the freshest fleet-size
 /// hint so the next backoff cap reflects roster growth.
+///
+/// Every probe carries what this node runs, and every ack is checked
+/// against it: a follower that missed a commit converges within one
+/// interval (AC #6/#7).
 async fn heartbeat_until_dead(
     config: &DialerConfig,
-    endpoint: &Arc<RpcEndpoint<ClusterFrame>>,
+    session: &SessionHandle,
     mut fleet_hint: u32,
     stats: &DialerStats,
+    pull_in_flight: &Arc<AtomicBool>,
 ) -> u32 {
     loop {
         tokio::time::sleep(config.heartbeat_interval).await;
-        if endpoint.is_closed() {
+        if session.endpoint.is_closed() {
             tracing::debug!("cluster session endpoint closed");
             return fleet_hint;
         }
+        let applied = applied_config(config);
         let probe = ClusterRequest::heartbeat(Heartbeat {
             timestamp_ms: unix_millis(),
+            applied_generation: applied.generation,
+            applied_hash: applied.hash.clone(),
+            break_glass: applied.break_glass,
         });
-        match endpoint.request(probe, config.request_timeout).await {
+        match session.endpoint.request(probe, config.request_timeout).await {
             Ok(resp) => match resp.body {
                 Some(cluster_response::Body::HeartbeatAck(ack)) => {
                     stats.heartbeats_ok.fetch_add(1, Ordering::Relaxed);
                     fleet_hint = ack.fleet_size_hint;
+                    start_pull_if_behind(
+                        config,
+                        session,
+                        stats,
+                        pull_in_flight,
+                        ConfigVersion {
+                            generation: ack.current_generation,
+                            hash: ack.current_hash,
+                        },
+                    );
                 }
                 _ => {
                     stats.heartbeat_failures.fetch_add(1, Ordering::Relaxed);
@@ -581,6 +726,179 @@ async fn heartbeat_until_dead(
             }
         }
     }
+}
+
+/// Compare the control plane's version with what this node applied and,
+/// when they differ, hand the session to the follower runtime so it can
+/// pull and apply (AC #7).
+///
+/// Skipped entirely in break-glass (AC #11: local mutations stand until
+/// the window ends) and while a previous pull is still running, so a
+/// slow apply cannot stack one pull per heartbeat.
+fn start_pull_if_behind(
+    config: &DialerConfig,
+    session: &SessionHandle,
+    stats: &DialerStats,
+    pull_in_flight: &Arc<AtomicBool>,
+    current: ConfigVersion,
+) {
+    let Some(handler) = config.follower.as_ref() else {
+        return;
+    };
+    let applied = handler.applied_config();
+    if applied.break_glass {
+        return;
+    }
+    // Peer-supplied, so bounded before it can reach a log line or the
+    // follower's store.
+    if !config_hash_is_valid(&current.hash) {
+        tracing::warn!("control plane advertised a malformed configuration hash; ignored");
+        return;
+    }
+    if !current.is_behind(&applied) {
+        return;
+    }
+    if pull_in_flight.swap(true, Ordering::AcqRel) {
+        tracing::debug!(
+            current_generation = current.generation,
+            "a convergence pull is already running; skipping this one"
+        );
+        return;
+    }
+    stats.behind_detected.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        applied_generation = applied.generation,
+        current_generation = current.generation,
+        "this node is behind the control plane's configuration; pulling"
+    );
+    let handler = Arc::clone(handler);
+    let session = session.clone();
+    let gate = Arc::clone(pull_in_flight);
+    tokio::spawn(async move {
+        handler.on_behind(session, current).await;
+        gate.store(false, Ordering::Release);
+    });
+}
+
+/// Serve the incoming half of an established session: the control
+/// plane's configuration pushes (Story 9.4 D5).
+///
+/// Returns when the peer hangs up or commits a protocol violation; the
+/// caller ends the session either way.
+async fn serve_control_plane(
+    config: &DialerConfig,
+    incoming: &mut IncomingRequests<ClusterFrame>,
+    stats: &DialerStats,
+) {
+    while let Some(request) = incoming.recv().await {
+        match translate_control_plane_request(request.request()) {
+            FollowerBridgeOutcome::Serve(action) => {
+                if !serve_follower_action(config, stats, request, action).await {
+                    return;
+                }
+            }
+            FollowerBridgeOutcome::Unsupported { body_kind } => {
+                tracing::info!(
+                    body_kind,
+                    "control plane asked for a method this build does not implement; refused, \
+                     session kept"
+                );
+                if request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::UnsupportedMethod))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            FollowerBridgeOutcome::ProtocolViolation => {
+                stats.protocol_violations.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    control_plane = %config.control_plane,
+                    "the control plane sent a request no control plane may send; dropping the \
+                     session"
+                );
+                let _ = request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::ProtocolViolation))
+                    .await;
+                // Let the refusal flush before the session is torn down.
+                tokio::time::sleep(REFUSAL_FLUSH_GRACE).await;
+                return;
+            }
+        }
+    }
+}
+
+/// Serve one whitelisted configuration push. `false` means the reply
+/// could not be sent and the session is over.
+async fn serve_follower_action(
+    config: &DialerConfig,
+    stats: &DialerStats,
+    request: IncomingRequest<ClusterFrame>,
+    action: FollowerAction,
+) -> bool {
+    let Some(handler) = config.follower.as_ref() else {
+        // The method exists but this node has no runtime to serve it.
+        return request
+            .reply_frame(ClusterResponse::refusal(ClusterStatus::UnsupportedMethod))
+            .await
+            .is_ok();
+    };
+    let reply = match action {
+        FollowerAction::Prepare(payload) => {
+            stats.config_prepares.fetch_add(1, Ordering::Relaxed);
+            let generation = payload.generation;
+            match handler.on_prepare(payload).await {
+                Ok(()) => ClusterResponse::ok(cluster_response::Body::ConfigPrepareAck(
+                    ConfigPrepareAck {
+                        accepted: true,
+                        reason: String::new(),
+                    },
+                )),
+                Err(reason) => {
+                    tracing::warn!(
+                        generation,
+                        %reason,
+                        "refusing to stage the pushed configuration; the round aborts fleet-wide"
+                    );
+                    ClusterResponse::ok(cluster_response::Body::ConfigPrepareAck(
+                        ConfigPrepareAck {
+                            accepted: false,
+                            reason,
+                        },
+                    ))
+                }
+            }
+        }
+        FollowerAction::Commit { generation } => {
+            stats.config_commits.fetch_add(1, Ordering::Relaxed);
+            match handler.on_commit(generation).await {
+                Ok(applied) => {
+                    tracing::info!(generation = applied.generation, "applied a pushed configuration");
+                    ClusterResponse::ok(cluster_response::Body::ConfigCommitAck(ConfigCommitAck {
+                        applied_generation: applied.generation,
+                        applied_hash: applied.hash,
+                    }))
+                }
+                Err(reason) => {
+                    tracing::error!(
+                        generation,
+                        %reason,
+                        "could not apply the staged configuration; this node is now out of step \
+                         with the fleet and converges on its next pull"
+                    );
+                    ClusterResponse::refusal(ClusterStatus::Unspecified)
+                }
+            }
+        }
+        FollowerAction::Abort { generation } => {
+            stats.config_aborts.fetch_add(1, Ordering::Relaxed);
+            handler.on_abort(generation).await;
+            tracing::info!(generation, "dropped a staged configuration on the control plane's abort");
+            ClusterResponse::ok(cluster_response::Body::ConfigAbortAck(ConfigAbortAck {}))
+        }
+    };
+    request.reply_frame(reply).await.is_ok()
 }
 
 /// The scaled backoff cap (see the module doc formula). An operator

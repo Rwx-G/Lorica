@@ -91,6 +91,9 @@ mod tests {
             schema_version: 49,
             node_name: "edge-node".to_string(),
             build_version: String::new(),
+            applied_generation: 0,
+            applied_hash: String::new(),
+            break_glass: false,
         });
         req.sequence = 42;
         ClusterFrame::from_request(req)

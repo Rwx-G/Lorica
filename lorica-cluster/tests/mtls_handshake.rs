@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lorica_cluster::handshake::{client_handshake, serve_hello, HandshakeConfig};
+use lorica_cluster::replication::{AppliedConfig, ConfigVersion};
 use lorica_cluster::messages::ClusterFrame;
 use lorica_cluster::{
     client_config, operational_server_config, ClusterCa, ClusterStatus, HandshakeError,
@@ -84,7 +85,7 @@ async fn one_shot_server(
         .recv()
         .await
         .ok_or_else(|| "no opener".to_string())?;
-    let outcome = serve_hello(first, &server_cfg, fleet_size_hint)
+    let outcome = serve_hello(first, &server_cfg, fleet_size_hint, &ConfigVersion::default())
         .await
         .map_err(|e| e.to_string())?
         .map(|(ack, _hello)| ack);
@@ -126,7 +127,13 @@ async fn full_mtls_session_handshake_round_trips() {
 
     let tls = connect_client(addr, &p).await.expect("mTLS connect");
     let (endpoint, incoming) = RpcEndpoint::<ClusterFrame>::from_stream(tls);
-    let ack = client_handshake(&endpoint, &local_cfg(49), "node-a", Duration::from_secs(5))
+    let ack = client_handshake(
+        &endpoint,
+        &local_cfg(49),
+        "node-a",
+        &AppliedConfig::default(),
+        Duration::from_secs(5),
+    )
         .await
         .expect("handshake admitted");
     assert_eq!(ack.negotiated_version, PROTOCOL_VERSION);
@@ -255,7 +262,13 @@ async fn schema_and_version_refusals_reach_the_dialer_distinctly() {
     let server = tokio::spawn(one_shot_server(listener, acceptor, local_cfg(50), 1));
     let tls = connect_client(addr, &p).await.expect("mTLS connect");
     let (endpoint, incoming) = RpcEndpoint::<ClusterFrame>::from_stream(tls);
-    let err = client_handshake(&endpoint, &local_cfg(49), "node-a", Duration::from_secs(5))
+    let err = client_handshake(
+        &endpoint,
+        &local_cfg(49),
+        "node-a",
+        &AppliedConfig::default(),
+        Duration::from_secs(5),
+    )
         .await
         .expect_err("must be refused");
     assert!(

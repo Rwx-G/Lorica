@@ -38,6 +38,7 @@ use crate::messages::{
     cluster_frame, cluster_request, cluster_response, ClusterFrame, ClusterRequest,
     ClusterStatus, Enroll,
 };
+use crate::replication::{AppliedConfig, ConfigPayload};
 use crate::tls::{join_client_config, negotiated_cluster_alpn, ClusterTlsError};
 use crate::token::ParsedToken;
 
@@ -177,6 +178,20 @@ pub trait SessionHandler: Send + Sync + 'static {
     /// An enrolled node spoke out of plane or out of phase (Story 9.2
     /// AC #6): audit it.
     fn on_protocol_violation(&self, node_id: &str, peer: SocketAddr) -> BoxFuture<'_, ()>;
+
+    /// A follower asks for the current configuration because what it
+    /// runs may be stale (Story 9.4 AC #7).
+    ///
+    /// `Ok(Some(payload))` transfers that generation; `Ok(None)` means
+    /// the follower already holds the current one and nothing needs to
+    /// transfer (the "delta keyed on the applied hash"); `Err` is a
+    /// local failure (the blob could not be built) and is answered with
+    /// the opaque refusal, session kept.
+    fn on_config_pull(
+        &self,
+        node_id: &str,
+        applied: AppliedConfig,
+    ) -> BoxFuture<'_, Result<Option<ConfigPayload>, String>>;
 }
 
 /// A session handler that records nothing and refuses renewals and
@@ -214,6 +229,16 @@ impl SessionHandler for NoopSessionHandler {
 
     fn on_protocol_violation(&self, _node_id: &str, _peer: SocketAddr) -> BoxFuture<'_, ()> {
         Box::pin(async {})
+    }
+
+    fn on_config_pull(
+        &self,
+        _node_id: &str,
+        _applied: AppliedConfig,
+    ) -> BoxFuture<'_, Result<Option<ConfigPayload>, String>> {
+        // No configuration source: the follower is told it is already
+        // up to date rather than being handed an empty generation.
+        Box::pin(async { Ok(None) })
     }
 }
 

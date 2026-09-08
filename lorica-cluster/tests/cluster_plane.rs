@@ -37,6 +37,7 @@ use lorica_cluster::listener::{
     OperationalStats, PreAuthBudgets,
 };
 use lorica_cluster::messages::{cluster_request, ClusterFrame, ClusterRequest, Heartbeat};
+use lorica_cluster::replication::AppliedConfig;
 use lorica_cluster::{
     client_config, enrollment_server_config, operational_server_config, AdmissionGate, ClusterCa,
     ClusterStatus, Dialer, DialerConfig, HandshakeError, RefuseAllEnrollments, SwappableAcceptor,
@@ -78,6 +79,16 @@ fn pki() -> Pki {
 
 fn cfg(schema: u32) -> HandshakeConfig {
     HandshakeConfig::new(schema)
+}
+
+/// A liveness probe from a node that has applied no configuration.
+fn probe(timestamp_ms: u64) -> Heartbeat {
+    Heartbeat {
+        timestamp_ms,
+        applied_generation: 0,
+        applied_hash: String::new(),
+        break_glass: false,
+    }
 }
 
 fn roots(p: &Pki) -> RootCertStore {
@@ -354,7 +365,7 @@ async fn session_cap_answers_retry_later_end_to_end() {
     let (ep1, _in1) = RpcEndpoint::<ClusterFrame>::from_stream(tls1);
     tokio::time::timeout(
         WAIT,
-        client_handshake(&ep1, &cfg(49), "node-a", Duration::from_secs(5)),
+        client_handshake(&ep1, &cfg(49), "node-a", &AppliedConfig::default(), Duration::from_secs(5)),
     )
     .await
     .expect("handshake 1 in time")
@@ -365,7 +376,7 @@ async fn session_cap_answers_retry_later_end_to_end() {
     let (ep2, in2) = RpcEndpoint::<ClusterFrame>::from_stream(tls2);
     let err = tokio::time::timeout(
         WAIT,
-        client_handshake(&ep2, &cfg(49), "node-b", Duration::from_secs(5)),
+        client_handshake(&ep2, &cfg(49), "node-b", &AppliedConfig::default(), Duration::from_secs(5)),
     )
     .await
     .expect("handshake answered in time")
@@ -427,7 +438,7 @@ async fn silent_authenticated_peer_is_counted_and_holds_no_session_slot() {
     let (ep, _inc) = RpcEndpoint::<ClusterFrame>::from_stream(tls);
     tokio::time::timeout(
         WAIT,
-        client_handshake(&ep, &cfg(49), "node-a", Duration::from_secs(5)),
+        client_handshake(&ep, &cfg(49), "node-a", &AppliedConfig::default(), Duration::from_secs(5)),
     )
     .await
     .expect("handshake in time")
@@ -471,7 +482,7 @@ async fn unsupported_method_is_refused_and_the_session_kept() {
     let (ep, _inc) = RpcEndpoint::<ClusterFrame>::from_stream(tls);
     tokio::time::timeout(
         WAIT,
-        client_handshake(&ep, &cfg(49), "node-a", Duration::from_secs(5)),
+        client_handshake(&ep, &cfg(49), "node-a", &AppliedConfig::default(), Duration::from_secs(5)),
     )
     .await
     .expect("handshake in time")
@@ -490,7 +501,7 @@ async fn unsupported_method_is_refused_and_the_session_kept() {
     assert_eq!(resp.cluster_status(), ClusterStatus::UnsupportedMethod);
 
     // The session is intact: a heartbeat still flows.
-    let hb = ClusterRequest::heartbeat(Heartbeat { timestamp_ms: 42 });
+    let hb = ClusterRequest::heartbeat(probe(42));
     let resp = tokio::time::timeout(WAIT, ep.request(hb, Duration::from_secs(5)))
         .await
         .expect("answered in time")
@@ -504,9 +515,7 @@ async fn unsupported_method_is_refused_and_the_session_kept() {
     let forged = ClusterRequest {
         sequence: 0,
         body_kind: BODY_KIND_HELLO,
-        body: Some(cluster_request::Body::Heartbeat(Heartbeat {
-            timestamp_ms: 1,
-        })),
+        body: Some(cluster_request::Body::Heartbeat(probe(1))),
     };
     let resp = tokio::time::timeout(WAIT, ep.request(forged, Duration::from_secs(5)))
         .await
@@ -521,7 +530,7 @@ async fn unsupported_method_is_refused_and_the_session_kept() {
     // The connection is gone: the next request cannot be served (the
     // endpoint learns of the drop the way the dialer does, by failing
     // a request, not by polling).
-    let hb = ClusterRequest::heartbeat(Heartbeat { timestamp_ms: 43 });
+    let hb = ClusterRequest::heartbeat(probe(43));
     assert!(
         ep.request(hb, Duration::from_secs(2)).await.is_err(),
         "a request after the violation must fail"

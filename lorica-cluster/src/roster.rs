@@ -32,7 +32,11 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use tokio::sync::watch;
 
+use lorica_command::RpcEndpoint;
+
 use crate::ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
+use crate::messages::ClusterFrame;
+use crate::replication::{AppliedConfig, ConfigVersion, Replicator};
 use crate::tls::{operational_server_config_with_crl, ClusterTlsError, SwappableAcceptor};
 
 /// Sliding window of the per-node session rate limit.
@@ -125,7 +129,6 @@ impl Roster {
 
 /// Live facts about one established session, updated by the session
 /// layer and read by the API and the persistence flush.
-#[derive(Debug)]
 pub struct LiveSession {
     /// Monotonic per control plane; a newer session for the same node
     /// supersedes the older one.
@@ -138,15 +141,56 @@ pub struct LiveSession {
     pub build_version: String,
     /// The node's reported schema version.
     pub schema_version: u32,
+    /// The roster state the node held when the session was admitted.
+    /// The replication coordinator addresses [`NodeState::Active`]
+    /// sessions only: a `Pending` node is visible and alive but no
+    /// configuration flows to it (Story 9.3 AC #5).
+    pub state: NodeState,
+    /// A clone of the session's RPC endpoint, so the control plane can
+    /// PUSH configuration down an established session (Story 9.4 D5)
+    /// instead of waiting to be asked.
+    pub endpoint: RpcEndpoint<ClusterFrame>,
+    /// What the node reports as applied, refreshed by every heartbeat
+    /// and by every commit acknowledgement.
+    applied: Mutex<AppliedConfig>,
     /// Flipped to `true` to end the session synchronously (revocation,
     /// supersession).
     kill: watch::Sender<bool>,
+}
+
+/// Everything but the endpoint, which has no useful debug shape and
+/// whose inner channels are not worth printing.
+impl std::fmt::Debug for LiveSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveSession")
+            .field("generation", &self.generation)
+            .field("peer_addr", &self.peer_addr)
+            .field("last_seen_unix", &self.last_seen_unix)
+            .field("build_version", &self.build_version)
+            .field("schema_version", &self.schema_version)
+            .field("state", &self.state)
+            .field("applied", &self.applied())
+            .finish_non_exhaustive()
+    }
 }
 
 impl LiveSession {
     /// Record activity now.
     pub fn touch(&self) {
         self.last_seen_unix.store(unix_now(), Ordering::Relaxed);
+    }
+
+    /// Replace what this node is known to run.
+    pub fn record_applied(&self, applied: AppliedConfig) {
+        *self.applied.lock().unwrap_or_else(|p| p.into_inner()) = applied;
+    }
+
+    /// What this node is known to run.
+    pub fn applied(&self) -> AppliedConfig {
+        self.applied
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
@@ -165,6 +209,11 @@ pub struct LiveSessionSnapshot {
     pub build_version: String,
     /// Reported schema version.
     pub schema_version: u32,
+    /// The roster state the session was admitted under.
+    pub state: NodeState,
+    /// What the node reports as applied (Story 9.4 AC #12's drift
+    /// input).
+    pub applied: AppliedConfig,
 }
 
 /// Node id -> live session, with per-session kill switches so a
@@ -223,16 +272,22 @@ impl SessionRegistry {
         Arc::new(Self::default())
     }
 
-    /// Register a session for `node_id`, superseding (and killing) any
+    /// Register a session for `identity`, superseding (and killing) any
     /// older one for the same node: a node has exactly one operational
     /// session, and the newest connection wins (a reconnect after a
     /// network blip must not lose to its own zombie).
+    ///
+    /// `endpoint` is a clone of the session's RPC endpoint: it is what
+    /// the replication coordinator pushes configuration down (Story 9.4
+    /// D6). `applied` is what the node reported in its `Hello`.
     pub fn register(
         self: &Arc<Self>,
-        node_id: &str,
+        identity: &NodeIdentity,
         peer_addr: SocketAddr,
+        endpoint: RpcEndpoint<ClusterFrame>,
         build_version: &str,
         schema_version: u32,
+        applied: AppliedConfig,
     ) -> SessionGuard {
         let (kill_tx, kill_rx) = watch::channel(false);
         let entry = Arc::new(LiveSession {
@@ -241,22 +296,75 @@ impl SessionRegistry {
             last_seen_unix: AtomicU64::new(unix_now()),
             build_version: build_version.to_string(),
             schema_version,
+            state: identity.state,
+            endpoint,
+            applied: Mutex::new(applied),
             kill: kill_tx,
         });
         let previous = self
             .sessions
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(node_id.to_string(), Arc::clone(&entry));
+            .insert(identity.node_id.clone(), Arc::clone(&entry));
         if let Some(old) = previous {
             let _ = old.kill.send(true);
         }
         SessionGuard {
             registry: Arc::clone(self),
-            node_id: node_id.to_string(),
+            node_id: identity.node_id.clone(),
             entry,
             killed: kill_rx,
         }
+    }
+
+    /// Every Active session's `(node_id, endpoint clone, applied)`, the
+    /// input to one replication round (Story 9.4 D6).
+    ///
+    /// `Pending` sessions are excluded by construction: a node that has
+    /// not been activated is visible and alive but never receives a
+    /// configuration blob (Story 9.3 AC #5).
+    pub fn active_sessions(&self) -> Vec<(String, RpcEndpoint<ClusterFrame>, AppliedConfig)> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, session)| session.state == NodeState::Active)
+            .map(|(node_id, session)| {
+                (
+                    node_id.clone(),
+                    session.endpoint.clone(),
+                    session.applied(),
+                )
+            })
+            .collect()
+    }
+
+    /// Record what a node reports as applied. `true` iff it has a live
+    /// session (a node that disconnected mid-round simply keeps the
+    /// stale value in the store until it reconnects).
+    pub fn record_applied(&self, node_id: &str, applied: AppliedConfig) -> bool {
+        match self
+            .sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(node_id)
+        {
+            Some(session) => {
+                session.record_applied(applied);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// What a live node reports as applied, or `None` when it has no
+    /// session.
+    pub fn applied(&self, node_id: &str) -> Option<AppliedConfig> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(node_id)
+            .map(|session| session.applied())
     }
 
     /// Whether `node_id` may establish another session now (at most
@@ -324,6 +432,8 @@ impl SessionRegistry {
                 last_seen_unix: s.last_seen_unix.load(Ordering::Relaxed),
                 build_version: s.build_version.clone(),
                 schema_version: s.schema_version,
+                state: s.state,
+                applied: s.applied(),
             })
             .collect()
     }
@@ -398,6 +508,14 @@ pub struct ControlPlane {
     /// This control plane's build version (reported in `cluster
     /// status`).
     pub build_version: String,
+    /// The configuration version the fleet must converge on (Story 9.4
+    /// AC #3). Shared with the operational listener through
+    /// [`ControlPlane::config_version_handle`], so a `HelloAck` and
+    /// every `HeartbeatAck` carry the current value without a lock.
+    config_version: Arc<ArcSwap<ConfigVersion>>,
+    /// The replication coordinator (Story 9.4 D6): one round at a time,
+    /// with the eviction and quarantine bookkeeping that survives it.
+    pub replication: Replicator,
 }
 
 impl ControlPlane {
@@ -429,7 +547,28 @@ impl ControlPlane {
             auto_activate,
             advertise_host: advertise_host.to_string(),
             build_version: build_version.to_string(),
+            config_version: Arc::new(ArcSwap::from_pointee(ConfigVersion::default())),
+            replication: Replicator::new(),
         }
+    }
+
+    /// The configuration version the fleet must converge on.
+    pub fn config_version(&self) -> ConfigVersion {
+        (**self.config_version.load()).clone()
+    }
+
+    /// Publish a new configuration version, after the mutation is
+    /// persisted and the local reload ran (Story 9.4 D6).
+    pub fn set_config_version(&self, version: ConfigVersion) {
+        self.config_version.store(Arc::new(version));
+    }
+
+    /// The shared version slot, handed to
+    /// [`crate::listener::OperationalConfig::config_version`] so the
+    /// handshake and the heartbeat answer the current value with no
+    /// lock and no back-reference to this handle.
+    pub fn config_version_handle(&self) -> Arc<ArcSwap<ConfigVersion>> {
+        Arc::clone(&self.config_version)
     }
 
     /// Take the refresh lock: the guard is the proof
@@ -509,6 +648,7 @@ impl ControlPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::cluster_rpc_limits;
 
     fn identity(id: &str, state: NodeState) -> NodeIdentity {
         NodeIdentity {
@@ -517,6 +657,25 @@ mod tests {
             state,
             via_previous_certificate: false,
         }
+    }
+
+    /// An endpoint over an in-process duplex: the registry only ever
+    /// clones and stores it, so the far half is never driven here.
+    fn endpoint() -> RpcEndpoint<ClusterFrame> {
+        let (near, _far) = tokio::io::duplex(1024);
+        let (endpoint, _incoming) =
+            RpcEndpoint::<ClusterFrame>::with_limits(near, cluster_rpc_limits());
+        endpoint
+    }
+
+    fn register(
+        registry: &Arc<SessionRegistry>,
+        id: &str,
+        state: NodeState,
+        applied: AppliedConfig,
+    ) -> SessionGuard {
+        let peer: SocketAddr = "192.0.2.10:4000".parse().expect("addr");
+        registry.register(&identity(id, state), peer, endpoint(), "1.7.0", 50, applied)
     }
 
     #[test]
@@ -543,10 +702,19 @@ mod tests {
     #[tokio::test]
     async fn a_newer_session_supersedes_and_kills_the_older_one() {
         let registry = SessionRegistry::new();
-        let peer: SocketAddr = "192.0.2.10:4000".parse().expect("addr");
-        let mut first = registry.register("node-a", peer, "1.7.0", 50);
+        let mut first = register(
+            &registry,
+            "node-a",
+            NodeState::Active,
+            AppliedConfig::default(),
+        );
         assert!(registry.is_connected("node-a"));
-        let second = registry.register("node-a", peer, "1.7.0", 50);
+        let second = register(
+            &registry,
+            "node-a",
+            NodeState::Active,
+            AppliedConfig::default(),
+        );
         assert!(second.entry().generation > first.entry().generation);
         tokio::time::timeout(std::time::Duration::from_secs(1), first.killed())
             .await
@@ -605,13 +773,117 @@ mod tests {
     #[tokio::test]
     async fn kill_ends_a_live_session_synchronously() {
         let registry = SessionRegistry::new();
-        let peer: SocketAddr = "192.0.2.10:4000".parse().expect("addr");
-        let mut guard = registry.register("node-a", peer, "1.7.0", 50);
+        let mut guard = register(
+            &registry,
+            "node-a",
+            NodeState::Active,
+            AppliedConfig::default(),
+        );
         assert!(registry.kill("node-a"));
         tokio::time::timeout(std::time::Duration::from_secs(1), guard.killed())
             .await
             .expect("killed resolves");
         assert!(!registry.kill("node-a"), "nothing left to kill");
         assert!(registry.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_active_sessions_are_replication_targets_and_applied_state_round_trips() {
+        let registry = SessionRegistry::new();
+        let active = register(
+            &registry,
+            "node-a",
+            NodeState::Active,
+            AppliedConfig {
+                generation: 3,
+                hash: "abcd".to_string(),
+                break_glass: false,
+            },
+        );
+        // A pending node is visible and alive but never a target
+        // (Story 9.3 AC #5).
+        let pending = register(
+            &registry,
+            "node-b",
+            NodeState::Pending,
+            AppliedConfig::default(),
+        );
+
+        let targets: Vec<String> = registry
+            .active_sessions()
+            .into_iter()
+            .map(|(node_id, _, _)| node_id)
+            .collect();
+        assert_eq!(targets, vec!["node-a".to_string()]);
+        assert_eq!(
+            registry.applied("node-a").map(|a| a.generation),
+            Some(3),
+            "the Hello's applied state is registered with the session"
+        );
+
+        let updated = AppliedConfig {
+            generation: 4,
+            hash: "beef".to_string(),
+            break_glass: true,
+        };
+        assert!(registry.record_applied("node-a", updated.clone()));
+        assert!(!registry.record_applied("node-zzz", updated.clone()));
+        assert_eq!(registry.applied("node-a"), Some(updated.clone()));
+        assert!(registry.applied("node-zzz").is_none());
+
+        let snapshot = registry.snapshot();
+        let a = snapshot
+            .iter()
+            .find(|s| s.node_id == "node-a")
+            .expect("node-a is live");
+        assert_eq!(a.state, NodeState::Active);
+        assert_eq!(a.applied, updated);
+        // Break-glass now excludes it from a round without changing
+        // its state.
+        assert_eq!(registry.active_sessions().len(), 1);
+        drop((active, pending));
+    }
+
+    #[test]
+    fn the_control_plane_publishes_and_shares_one_configuration_version() {
+        // Building an acceptor needs the crate's pinned rustls
+        // provider; installing it twice in one process is a no-op.
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let ca = ClusterCa::generate("Lorica Cluster CA").expect("ca");
+        let (server_cert, server_key) = ca.issue_server_leaf("cp.example.com").expect("leaf");
+        let tls = operational_server_config_with_crl(
+            ca.cert_pem(),
+            &server_cert,
+            &server_key,
+            None,
+        )
+        .expect("server config");
+        let acceptor = Arc::new(SwappableAcceptor::new(Arc::new(tls)));
+        let (token_liveness, _rx) = watch::channel(0u32);
+        let control_plane = ControlPlane::new(
+            ca,
+            &server_cert,
+            &server_key,
+            acceptor,
+            Arc::new(AtomicU32::new(0)),
+            token_liveness,
+            false,
+            "cp.example.com",
+            "1.7.0",
+        );
+        assert_eq!(control_plane.config_version(), ConfigVersion::default());
+        let shared = control_plane.config_version_handle();
+        let next = ConfigVersion {
+            generation: 12,
+            hash: "abcd".to_string(),
+        };
+        control_plane.set_config_version(next.clone());
+        assert_eq!(control_plane.config_version(), next);
+        assert_eq!(
+            **shared.load(),
+            next,
+            "the listener's handle sees the same value"
+        );
+        assert_eq!(control_plane.replication.in_flight(), None);
     }
 }

@@ -24,9 +24,16 @@
 //! - EVERY inbound cluster request routes through
 //!   [`translate_cluster_request`]; there is no other dispatch path.
 //! - The whitelist below is the complete set of things the cluster
-//!   plane may do. In Story 9.2 it contains ONLY in-plane session
-//!   traffic; Stories 9.4/9.6 add explicit entries for configuration
-//!   apply and telemetry fan-in.
+//!   plane may do. In Story 9.2 it contained ONLY in-plane session
+//!   traffic; Story 9.4 adds the convergence pull, and Story 9.6 will
+//!   add telemetry fan-in.
+//! - Story 9.4 makes the plane BIDIRECTIONAL: the control plane pushes
+//!   configuration to a follower, so the follower has a whitelist of
+//!   its own, [`translate_control_plane_request`]. The two tables are
+//!   disjoint by construction. A follower that sends a `ConfigPrepare`
+//!   to the control plane is trying to push configuration UPWARDS and
+//!   is a violation; a control plane that sends a `Renew` or a
+//!   `ConfigPull` DOWNWARDS is equally out of role.
 //! - Nothing here ever passes a peer-supplied `CommandType` (or any
 //!   other worker-plane value) through to `lorica-command`. A future
 //!   entry that needs a worker-plane effect must CONSTRUCT the worker
@@ -42,16 +49,26 @@
 //!   a [`BridgeOutcome::ProtocolViolation`]: the caller drops the
 //!   connection and increments its violation counter.
 
-use crate::messages::{cluster_request, ClusterRequest};
+use crate::messages::{cluster_request, config_hash_is_valid, ClusterRequest};
+use crate::replication::{AppliedConfig, ConfigPayload};
 
-/// The in-plane actions the whitelist admits (Story 9.2 session
-/// traffic, Story 9.3 lifecycle).
+/// The in-plane actions the control-plane whitelist admits (Story 9.2
+/// session traffic, Story 9.3 lifecycle, Story 9.4 convergence).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InPlaneAction {
-    /// A liveness probe carrying the sender's clock (unix ms).
+    /// A liveness probe carrying the sender's clock (unix ms) and what
+    /// the follower currently runs (Story 9.4 AC #6/#7).
     Heartbeat {
         /// The probe's `timestamp_ms`, echoed in the ack.
         timestamp_ms: u64,
+        /// The configuration the follower reports as applied.
+        applied: AppliedConfig,
+    },
+    /// The follower asks for the current generation because what it
+    /// runs may be stale (Story 9.4 AC #7).
+    ConfigPull {
+        /// The configuration the follower reports as applied.
+        applied: AppliedConfig,
     },
     /// The node asks for a new certificate on a new public key
     /// (Story 9.3 AC #12). Identity comes from the session, never
@@ -81,14 +98,54 @@ pub enum BridgeOutcome {
     ProtocolViolation,
 }
 
-/// Route one inbound cluster request through the whitelist.
+/// The actions a FOLLOWER accepts from its control plane (Story 9.4
+/// D5). All three are configuration pushes; nothing else exists in
+/// this direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FollowerAction {
+    /// Stage this generation without applying it.
+    Prepare(ConfigPayload),
+    /// Apply the staged generation.
+    Commit {
+        /// The generation to apply; it must match the staged one.
+        generation: u64,
+    },
+    /// Drop the staged generation (another follower rejected it).
+    Abort {
+        /// The staged generation to drop.
+        generation: u64,
+    },
+}
+
+/// Outcome of routing one control-plane-initiated request through the
+/// follower's whitelist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FollowerBridgeOutcome {
+    /// The request is on the follower's whitelist; serve it.
+    Serve(FollowerAction),
+    /// Well-formed request for a method this build does not know (a
+    /// NEWER control plane): refuse with `UNSUPPORTED_METHOD`, keep the
+    /// session.
+    Unsupported {
+        /// The control plane's `body_kind`, for the diagnostic.
+        body_kind: u32,
+    },
+    /// The control plane sent something no control plane may send:
+    /// drop the session.
+    ProtocolViolation,
+}
+
+/// Route one inbound cluster request through the CONTROL PLANE's
+/// whitelist.
 ///
-/// This is the single dispatch point for established sessions. A
-/// [`Hello`] here is a violation too: the opener is consumed by the
-/// handshake before a session reaches steady state, so a second one
-/// is a peer speaking out of phase. A `body_kind` that names one of
-/// OUR methods while the body is missing is malformed, not "newer",
-/// and is a violation as well.
+/// This is the single dispatch point for established sessions on the
+/// control plane. A [`Hello`] here is a violation too: the opener is
+/// consumed by the handshake before a session reaches steady state, so
+/// a second one is a peer speaking out of phase. A `body_kind` that
+/// names one of OUR methods while the body is missing is malformed, not
+/// "newer", and is a violation as well. A configuration PUSH
+/// (`ConfigPrepare` / `ConfigCommit` / `ConfigAbort`) arriving here is a
+/// follower trying to configure its control plane: a violation.
 ///
 /// [`Hello`]: crate::messages::Hello
 pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
@@ -100,11 +157,34 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
     }
     match &request.body {
         // ---- The whitelist. Every entry is a reviewed decision. ----
-        Some(cluster_request::Body::Heartbeat(hb)) => BridgeOutcome::InPlane(
-            InPlaneAction::Heartbeat {
+        Some(cluster_request::Body::Heartbeat(hb)) => {
+            // The hash rides straight into a log line, a registry entry
+            // and a drift comparison: bound its shape here, at the
+            // decode boundary, or nowhere.
+            if !config_hash_is_valid(&hb.applied_hash) {
+                return BridgeOutcome::ProtocolViolation;
+            }
+            BridgeOutcome::InPlane(InPlaneAction::Heartbeat {
                 timestamp_ms: hb.timestamp_ms,
-            },
-        ),
+                applied: AppliedConfig {
+                    generation: hb.applied_generation,
+                    hash: hb.applied_hash.clone(),
+                    break_glass: hb.break_glass,
+                },
+            })
+        }
+        Some(cluster_request::Body::ConfigPull(pull)) => {
+            if !config_hash_is_valid(&pull.applied_hash) {
+                return BridgeOutcome::ProtocolViolation;
+            }
+            BridgeOutcome::InPlane(InPlaneAction::ConfigPull {
+                applied: AppliedConfig {
+                    generation: pull.applied_generation,
+                    hash: pull.applied_hash.clone(),
+                    break_glass: false,
+                },
+            })
+        }
         Some(cluster_request::Body::Renew(renew)) => BridgeOutcome::InPlane(InPlaneAction::Renew {
             public_key_der: renew.public_key_der.clone(),
         }),
@@ -118,10 +198,68 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
             }
         }
         // ---- Everything else is a violation. An Enroll on the
-        // ---- operational plane is a peer using the wrong listener.
+        // ---- operational plane is a peer using the wrong listener;
+        // ---- a configuration push is a follower acting as if it
+        // ---- owned the fleet's configuration.
         Some(cluster_request::Body::Hello(_))
         | Some(cluster_request::Body::Enroll(_))
+        | Some(cluster_request::Body::ConfigPrepare(_))
+        | Some(cluster_request::Body::ConfigCommit(_))
+        | Some(cluster_request::Body::ConfigAbort(_))
         | None => BridgeOutcome::ProtocolViolation,
+    }
+}
+
+/// Route one control-plane-initiated request through the FOLLOWER's
+/// whitelist (Story 9.4 D5).
+///
+/// The follower serves exactly three methods, all configuration pushes.
+/// Every other body is a control plane out of role: a `Hello` or a
+/// `Heartbeat` (the follower is the one that opens and probes), an
+/// `Enroll` (wrong listener entirely), a `Renew` or a `Leave` (those
+/// travel upwards), or a `ConfigPull` (the follower is the puller). An
+/// unknown `body_kind` means the control plane is NEWER: refused
+/// without dropping the session, so a control-plane upgrade never
+/// disconnects the fleet.
+pub fn translate_control_plane_request(request: &ClusterRequest) -> FollowerBridgeOutcome {
+    if !request.body_kind_matches() {
+        return FollowerBridgeOutcome::ProtocolViolation;
+    }
+    match &request.body {
+        Some(cluster_request::Body::ConfigPrepare(prepare)) => {
+            if !config_hash_is_valid(&prepare.hash) {
+                return FollowerBridgeOutcome::ProtocolViolation;
+            }
+            FollowerBridgeOutcome::Serve(FollowerAction::Prepare(ConfigPayload {
+                generation: prepare.generation,
+                hash: prepare.hash.clone(),
+                blob: prepare.blob.clone(),
+            }))
+        }
+        Some(cluster_request::Body::ConfigCommit(commit)) => {
+            FollowerBridgeOutcome::Serve(FollowerAction::Commit {
+                generation: commit.generation,
+            })
+        }
+        Some(cluster_request::Body::ConfigAbort(abort)) => {
+            FollowerBridgeOutcome::Serve(FollowerAction::Abort {
+                generation: abort.generation,
+            })
+        }
+        None if request.body_kind != 0
+            && !ClusterRequest::is_known_body_kind(request.body_kind) =>
+        {
+            FollowerBridgeOutcome::Unsupported {
+                body_kind: request.body_kind,
+            }
+        }
+        Some(cluster_request::Body::Hello(_))
+        | Some(cluster_request::Body::Heartbeat(_))
+        | Some(cluster_request::Body::Enroll(_))
+        | Some(cluster_request::Body::Renew(_))
+        | Some(cluster_request::Body::Leave(_))
+        | Some(cluster_request::Body::ConfigPull(_))
+        | None => FollowerBridgeOutcome::ProtocolViolation,
     }
 }
 
@@ -131,12 +269,23 @@ mod tests {
     use prost::Message;
 
     use super::*;
-    use crate::messages::{ClusterFrame, Heartbeat, Hello, BODY_KIND_HELLO};
+    use crate::messages::{
+        ClusterFrame, ConfigPrepare, ConfigPull, Heartbeat, Hello, BODY_KIND_HELLO,
+    };
     use lorica_command::{Frame, FrameKind};
+
+    fn heartbeat(timestamp_ms: u64) -> Heartbeat {
+        Heartbeat {
+            timestamp_ms,
+            applied_generation: 0,
+            applied_hash: String::new(),
+            break_glass: false,
+        }
+    }
 
     #[test]
     fn mismatched_body_kind_is_a_violation_even_for_whitelisted_bodies() {
-        let mut req = ClusterRequest::heartbeat(Heartbeat { timestamp_ms: 1 });
+        let mut req = ClusterRequest::heartbeat(heartbeat(1));
         req.body_kind = 25;
         assert_eq!(
             translate_cluster_request(&req),
@@ -172,11 +321,182 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_is_whitelisted() {
-        let req = ClusterRequest::heartbeat(Heartbeat { timestamp_ms: 123 });
+    fn heartbeat_is_whitelisted_and_carries_the_applied_configuration() {
+        let req = ClusterRequest::heartbeat(Heartbeat {
+            timestamp_ms: 123,
+            applied_generation: 4,
+            applied_hash: "abcdef".to_string(),
+            break_glass: true,
+        });
         assert_eq!(
             translate_cluster_request(&req),
-            BridgeOutcome::InPlane(InPlaneAction::Heartbeat { timestamp_ms: 123 })
+            BridgeOutcome::InPlane(InPlaneAction::Heartbeat {
+                timestamp_ms: 123,
+                applied: AppliedConfig {
+                    generation: 4,
+                    hash: "abcdef".to_string(),
+                    break_glass: true,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_convergence_pull_is_whitelisted_on_the_control_plane() {
+        let req = ClusterRequest::config_pull(ConfigPull {
+            applied_generation: 2,
+            applied_hash: "beef".to_string(),
+        });
+        assert_eq!(
+            translate_cluster_request(&req),
+            BridgeOutcome::InPlane(InPlaneAction::ConfigPull {
+                applied: AppliedConfig {
+                    generation: 2,
+                    hash: "beef".to_string(),
+                    break_glass: false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_malformed_hash_is_refused_at_the_decode_boundary_in_both_directions() {
+        // Uppercase, non-hex and over-long hashes never reach a log
+        // line, a registry entry or a comparison.
+        let too_long = "a".repeat(65);
+        for hash in ["ZZ", "AB", too_long.as_str()] {
+            let heartbeat = ClusterRequest::heartbeat(Heartbeat {
+                timestamp_ms: 1,
+                applied_generation: 1,
+                applied_hash: hash.to_string(),
+                break_glass: false,
+            });
+            assert_eq!(
+                translate_cluster_request(&heartbeat),
+                BridgeOutcome::ProtocolViolation,
+                "heartbeat hash {hash}"
+            );
+            let pull = ClusterRequest::config_pull(ConfigPull {
+                applied_generation: 1,
+                applied_hash: hash.to_string(),
+            });
+            assert_eq!(
+                translate_cluster_request(&pull),
+                BridgeOutcome::ProtocolViolation,
+                "pull hash {hash}"
+            );
+            let prepare = ClusterRequest::config_prepare(ConfigPrepare {
+                generation: 1,
+                hash: hash.to_string(),
+                blob: vec![1],
+            });
+            assert_eq!(
+                translate_control_plane_request(&prepare),
+                FollowerBridgeOutcome::ProtocolViolation,
+                "prepare hash {hash}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_follower_cannot_push_configuration_to_the_control_plane() {
+        // The whole point of two tables: a Prepare travels DOWNWARDS
+        // only. An enrolled follower that sends one is trying to
+        // configure the fleet from a leaf.
+        for pushed in [
+            ClusterRequest::config_prepare(ConfigPrepare {
+                generation: 9,
+                hash: "ab".to_string(),
+                blob: vec![1, 2, 3],
+            }),
+            ClusterRequest::config_commit(9),
+            ClusterRequest::config_abort(9),
+        ] {
+            assert_eq!(
+                translate_cluster_request(&pushed),
+                BridgeOutcome::ProtocolViolation
+            );
+        }
+    }
+
+    #[test]
+    fn the_follower_serves_only_the_three_configuration_pushes() {
+        let prepare = ClusterRequest::config_prepare(ConfigPrepare {
+            generation: 9,
+            hash: "ab".to_string(),
+            blob: vec![1, 2, 3],
+        });
+        assert_eq!(
+            translate_control_plane_request(&prepare),
+            FollowerBridgeOutcome::Serve(FollowerAction::Prepare(ConfigPayload {
+                generation: 9,
+                hash: "ab".to_string(),
+                blob: vec![1, 2, 3],
+            }))
+        );
+        assert_eq!(
+            translate_control_plane_request(&ClusterRequest::config_commit(9)),
+            FollowerBridgeOutcome::Serve(FollowerAction::Commit { generation: 9 })
+        );
+        assert_eq!(
+            translate_control_plane_request(&ClusterRequest::config_abort(9)),
+            FollowerBridgeOutcome::Serve(FollowerAction::Abort { generation: 9 })
+        );
+    }
+
+    #[test]
+    fn the_control_plane_cannot_send_lifecycle_or_session_traffic_to_a_follower() {
+        for out_of_role in [
+            ClusterRequest::hello(Hello::default()),
+            ClusterRequest::heartbeat(heartbeat(1)),
+            ClusterRequest::enroll(crate::messages::Enroll::default()),
+            ClusterRequest::renew(crate::messages::Renew {
+                public_key_der: vec![1, 2, 3],
+            }),
+            ClusterRequest::leave(),
+            ClusterRequest::config_pull(ConfigPull::default()),
+            ClusterRequest::default(),
+        ] {
+            assert_eq!(
+                translate_control_plane_request(&out_of_role),
+                FollowerBridgeOutcome::ProtocolViolation,
+                "body_kind {}",
+                out_of_role.body_kind
+            );
+        }
+        // A forged discriminator is a violation on this side too.
+        let mut forged = ClusterRequest::config_commit(1);
+        forged.body_kind = BODY_KIND_HELLO;
+        assert_eq!(
+            translate_control_plane_request(&forged),
+            FollowerBridgeOutcome::ProtocolViolation
+        );
+    }
+
+    #[test]
+    fn a_newer_control_plane_is_unsupported_not_hostile() {
+        // Body tag 30 is inside the reserved 24-39 range: a control
+        // plane from a later release. Refuse the method, keep the
+        // session, so a control-plane upgrade never disconnects the
+        // fleet.
+        let newer = ClusterRequest {
+            sequence: 3,
+            body_kind: 30,
+            body: None,
+        };
+        assert_eq!(
+            translate_control_plane_request(&newer),
+            FollowerBridgeOutcome::Unsupported { body_kind: 30 }
+        );
+        // One of OUR kinds with no body is malformed, not newer.
+        let malformed = ClusterRequest {
+            sequence: 4,
+            body_kind: crate::messages::BODY_KIND_CONFIG_COMMIT,
+            body: None,
+        };
+        assert_eq!(
+            translate_control_plane_request(&malformed),
+            FollowerBridgeOutcome::ProtocolViolation
         );
     }
 

@@ -36,7 +36,10 @@ message ClusterFrame {
 //   10-19  session control (Story 9.2) and lifecycle (Story 9.3:
 //          enroll on the enrollment listener, renew and leave on an
 //          established session)
-//   20-39  RESERVED for configuration replication (Story 9.4)
+//   20-39  configuration replication (Story 9.4: 20-23 in use, the
+//          rest reserved). 20-22 are CONTROL-PLANE-INITIATED and are
+//          the only frames a follower accepts on its incoming half;
+//          23 is the follower's convergence pull.
 //   40-59  RESERVED for telemetry fan-in (Story 9.6)
 //   60-79  RESERVED for certificate distribution (Story 9.5)
 //
@@ -55,6 +58,10 @@ message ClusterRequest {
     Enroll enroll = 12;
     Renew renew = 13;
     Leave leave = 14;
+    ConfigPrepare config_prepare = 20;
+    ConfigCommit config_commit = 21;
+    ConfigAbort config_abort = 22;
+    ConfigPull config_pull = 23;
   }
 }
 
@@ -71,6 +78,10 @@ message ClusterResponse {
     EnrollAck enroll_ack = 12;
     RenewAck renew_ack = 13;
     LeaveAck leave_ack = 14;
+    ConfigPrepareAck config_prepare_ack = 20;
+    ConfigCommitAck config_commit_ack = 21;
+    ConfigAbortAck config_abort_ack = 22;
+    ConfigPullAck config_pull_ack = 23;
   }
 }
 
@@ -92,6 +103,14 @@ message Hello {
   // The sender's build version, display only (Story 9.3 AC #9's
   // `version` column). Bounded like node_name.
   string build_version = 5;
+  // Story 9.4 AC #7: what the follower runs, so a reconnect converges
+  // at the handshake. `applied_hash` is at most 64 lowercase hex
+  // characters; anything else is a PROTOCOL_VIOLATION.
+  uint64 applied_generation = 6;
+  string applied_hash = 7;
+  // Story 9.4 AC #11: the follower is in a break-glass window and is
+  // excluded from commit sets until it ends.
+  bool break_glass = 8;
 }
 
 // Token redemption (Story 9.3 AC #1/#3), the ONLY frame the
@@ -136,6 +155,69 @@ message Leave {}
 
 message LeaveAck {}
 
+// ---- Configuration replication (Story 9.4), tags 20-23 ----
+//
+// Prepare/Commit/Abort are CONTROL-PLANE-INITIATED and travel on the
+// follower's incoming half; a follower sending one to the control
+// plane is a PROTOCOL_VIOLATION (a follower never pushes
+// configuration). ConfigPull is the reverse: follower to control
+// plane, and a control plane sending one is equally a violation.
+//
+// The payload is the Story 9.1 canonical blob: byte-stable, strictly
+// decoded on the follower (`deny_unknown_fields`), with secret
+// material replaced by `sha256:` digests. `hash` is its SHA-256 in
+// lowercase hex, and the follower verifies it before decoding. Blob
+// size is bounded by the 4 MiB frame cap.
+
+// Phase one: stage this generation, do not apply it yet (AC #4).
+message ConfigPrepare {
+  uint64 generation = 1;
+  string hash = 2;
+  bytes blob = 3;
+}
+
+// The follower's verdict. `accepted = false` is the SEMANTIC
+// rejection that aborts the round fleet-wide (AC #5); `reason` names
+// the cause without echoing configuration values. A transport
+// timeout is NOT this: it evicts the node and the commit proceeds.
+message ConfigPrepareAck {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+// Phase two: apply the staged generation.
+message ConfigCommit {
+  uint64 generation = 1;
+}
+
+message ConfigCommitAck {
+  uint64 applied_generation = 1;
+  string applied_hash = 2;
+}
+
+// Drop a staged generation (another follower rejected it).
+message ConfigAbort {
+  uint64 generation = 1;
+}
+
+message ConfigAbortAck {}
+
+// Convergence pull (AC #7), follower to control plane: "this is what
+// I run; send me the current generation if it differs".
+message ConfigPull {
+  uint64 applied_generation = 1;
+  string applied_hash = 2;
+}
+
+// A matching hash answers with `up_to_date = true` and no blob: the
+// "delta keyed on the applied hash" is "nothing to transfer".
+message ConfigPullAck {
+  uint64 generation = 1;
+  string hash = 2;
+  bytes blob = 3;
+  bool up_to_date = 4;
+}
+
 // Control-plane answer to Hello when the session is admitted.
 message HelloAck {
   uint32 negotiated_version = 1;   // Highest common protocol version
@@ -143,16 +225,27 @@ message HelloAck {
   // Approximate fleet size, so the follower can scale its reconnect
   // backoff cap (Story 9.2 AC #9) without knowing the roster.
   uint32 fleet_size_hint = 3;
+  // Story 9.4 AC #7: the control plane's current configuration; a
+  // follower behind it pulls immediately after the handshake.
+  uint64 current_generation = 4;
+  string current_hash = 5;
 }
 
-// Liveness probe, either direction.
+// Liveness probe, either direction. Story 9.4 AC #6/#7: the follower
+// reports what it runs on every beat, so a missed commit converges
+// within one heartbeat interval.
 message Heartbeat {
   uint64 timestamp_ms = 1;
+  uint64 applied_generation = 2;
+  string applied_hash = 3;
+  bool break_glass = 4;
 }
 
 message HeartbeatAck {
   uint64 timestamp_ms = 1;         // Echo of the probe's timestamp
   uint32 fleet_size_hint = 2;      // Refreshed backoff-cap input
+  uint64 current_generation = 3;   // Story 9.4: current version
+  string current_hash = 4;
 }
 
 // Response status. UNSPECIFIED doubles as the OPAQUE refusal the

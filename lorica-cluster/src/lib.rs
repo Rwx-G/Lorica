@@ -37,6 +37,13 @@
 //! and CRL minting in [`ca`], and the SPKI-pinning joiner config in
 //! [`tls`].
 //!
+//! Story 9.4 makes the plane BIDIRECTIONAL and adds configuration
+//! [`replication`]: the two-phase Prepare/Commit/Abort messages and the
+//! convergence pull in [`messages`], a second whitelist in [`bridge`]
+//! for what a control plane may ask of a follower, the
+//! [`Replicator`] that runs one round over the live sessions, and a
+//! [`dialer`] that now SERVES its incoming half instead of dropping it.
+//!
 //! # API stability rule
 //!
 //! `#[non_exhaustive]` marks types that evolve WITH THE WIRE and are
@@ -62,6 +69,7 @@ pub mod limits;
 pub mod listener;
 pub mod messages;
 pub mod preauth;
+pub mod replication;
 pub mod roster;
 pub mod session;
 pub mod tls;
@@ -69,7 +77,10 @@ pub mod token;
 pub mod version;
 
 pub use admission::{AdmissionDecision, AdmissionGate, AdmissionPermit, DEFAULT_QUEUE_WAIT};
-pub use bridge::{translate_cluster_request, BridgeOutcome, InPlaneAction};
+pub use bridge::{
+    translate_cluster_request, translate_control_plane_request, BridgeOutcome, FollowerAction,
+    FollowerBridgeOutcome, InPlaneAction,
+};
 pub use ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
 pub use enroll::{
     join, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, JoinError, JoinParams,
@@ -77,7 +88,7 @@ pub use enroll::{
 };
 pub use dialer::{
     resolve_and_connect, split_host_port, ClusterConnection, Dialer, DialerConfig, DialerError,
-    DialerHandle, DialerStats, SessionHandle, BACKOFF_CAP_CEILING,
+    DialerHandle, DialerStats, FollowerHandler, SessionHandle, BACKOFF_CAP_CEILING,
 };
 pub use handshake::{
     client_handshake, display_field_is_valid, evaluate_hello, node_name_is_valid, serve_hello,
@@ -90,11 +101,18 @@ pub use listener::{
     DEFAULT_MAX_SESSIONS, DEFAULT_OPENER_TIMEOUT,
 };
 pub use messages::{
-    ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus, Enroll, EnrollAck, Heartbeat,
-    HeartbeatAck, Hello, HelloAck, Leave, LeaveAck, Renew, RenewAck, BODY_KIND_ENROLL,
-    BODY_KIND_HEARTBEAT, BODY_KIND_HELLO, BODY_KIND_LEAVE, BODY_KIND_RENEW,
+    config_hash_is_valid, ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus,
+    ConfigAbort, ConfigAbortAck, ConfigCommit, ConfigCommitAck, ConfigPrepare, ConfigPrepareAck,
+    ConfigPull, ConfigPullAck, Enroll, EnrollAck, Heartbeat, HeartbeatAck, Hello, HelloAck, Leave,
+    LeaveAck, Renew, RenewAck, BODY_KIND_CONFIG_ABORT, BODY_KIND_CONFIG_COMMIT,
+    BODY_KIND_CONFIG_PREPARE, BODY_KIND_CONFIG_PULL, BODY_KIND_ENROLL, BODY_KIND_HEARTBEAT,
+    BODY_KIND_HELLO, BODY_KIND_LEAVE, BODY_KIND_RENEW, MAX_CONFIG_HASH_BYTES,
 };
 pub use preauth::{source_key, AttemptWindow, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
+pub use replication::{
+    AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
+    DEFAULT_PER_NODE_DEADLINE, DEFAULT_QUARANTINE_THRESHOLD, MAX_REJECTION_REASON_BYTES,
+};
 pub use roster::{
     ControlPlane, LiveSession, LiveSessionSnapshot, NodeIdentity, NodeState, RefreshGuard, Roster,
     SessionGuard, SessionRegistry, MAX_SESSIONS_PER_NODE_PER_WINDOW, SESSION_RATE_WINDOW,
@@ -112,3 +130,10 @@ pub use version::{negotiate, PROTOCOL_MIN_COMPATIBLE, PROTOCOL_VERSION};
 /// callers build connectors and acceptors against the same rustls
 /// without pinning it themselves.
 pub use tokio_rustls;
+
+/// Re-exported for the same reason as [`tokio_rustls`]: the shared
+/// configuration-version slot
+/// ([`listener::OperationalConfig::config_version`]) is an
+/// `Arc<ArcSwap<ConfigVersion>>`, and a caller must be able to name
+/// that type without pinning `arc-swap` itself.
+pub use arc_swap;

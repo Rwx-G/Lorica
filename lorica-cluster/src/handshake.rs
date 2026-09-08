@@ -29,9 +29,10 @@ use std::time::Duration;
 use lorica_command::{ChannelError, IncomingRequest, RpcEndpoint};
 
 use crate::messages::{
-    cluster_request, cluster_response, ClusterFrame, ClusterRequest, ClusterResponse,
-    ClusterStatus, Hello, HelloAck,
+    cluster_request, cluster_response, config_hash_is_valid, ClusterFrame, ClusterRequest,
+    ClusterResponse, ClusterStatus, Hello, HelloAck,
 };
+use crate::replication::{AppliedConfig, ConfigVersion};
 use crate::version::{negotiate, PROTOCOL_MIN_COMPATIBLE, PROTOCOL_VERSION};
 
 /// Longest `node_name` a [`Hello`] may carry. The field is display
@@ -117,13 +118,24 @@ pub fn node_name_is_valid(node_name: &str) -> bool {
 /// Returns the [`HelloAck`] to send, or the DISTINCT refusal status
 /// for the operational path (enrollment callers map it through
 /// [`ClusterStatus::opaque`] before the wire). An oversized or
-/// control-character `node_name` is a protocol violation.
+/// control-character `node_name` is a protocol violation, and so is a
+/// malformed `applied_hash`.
+///
+/// `current` is the control plane's configuration version (Story 9.4
+/// AC #7): the ack carries it so a follower that is behind pulls at the
+/// handshake rather than waiting for its first heartbeat.
 pub fn evaluate_hello(
     local: &HandshakeConfig,
     fleet_size_hint: u32,
+    current: &ConfigVersion,
     hello: &Hello,
 ) -> Result<HelloAck, ClusterStatus> {
     if !node_name_is_valid(&hello.node_name) || !display_field_is_valid(&hello.build_version) {
+        return Err(ClusterStatus::ProtocolViolation);
+    }
+    // Bounded at the decode boundary, before the value can reach a log
+    // line, the session registry or a drift comparison.
+    if !config_hash_is_valid(&hello.applied_hash) {
         return Err(ClusterStatus::ProtocolViolation);
     }
     let Some(negotiated_version) = negotiate(
@@ -146,6 +158,8 @@ pub fn evaluate_hello(
         negotiated_version,
         schema_version: local.schema_version,
         fleet_size_hint,
+        current_generation: current.generation,
+        current_hash: current.hash.clone(),
     })
 }
 
@@ -162,6 +176,7 @@ pub async fn serve_hello(
     incoming: IncomingRequest<ClusterFrame>,
     local: &HandshakeConfig,
     fleet_size_hint: u32,
+    current: &ConfigVersion,
 ) -> Result<Result<(HelloAck, Hello), ClusterStatus>, ChannelError> {
     let hello = match &incoming.request().body {
         Some(cluster_request::Body::Hello(hello)) if incoming.request().body_kind_matches() => {
@@ -175,7 +190,7 @@ pub async fn serve_hello(
         }
     };
 
-    match evaluate_hello(local, fleet_size_hint, &hello) {
+    match evaluate_hello(local, fleet_size_hint, current, &hello) {
         Ok(ack) => {
             incoming
                 .reply_frame(ClusterResponse::ok(cluster_response::Body::HelloAck(
@@ -194,10 +209,16 @@ pub async fn serve_hello(
 /// Client (dialer) side: send [`Hello`] and await the ack.
 ///
 /// `node_name` is display-only (identity is the client certificate).
+/// `applied` is what this node currently runs (Story 9.4 AC #7); the
+/// returned ack carries the control plane's version, so a follower
+/// that is behind can pull immediately instead of waiting a heartbeat.
+/// A node with no follower runtime (the transport-only path) passes
+/// `&AppliedConfig::default()`.
 pub async fn client_handshake(
     endpoint: &RpcEndpoint<ClusterFrame>,
     local: &HandshakeConfig,
     node_name: &str,
+    applied: &AppliedConfig,
     timeout: Duration,
 ) -> Result<HelloAck, HandshakeError> {
     let request = ClusterRequest::hello(Hello {
@@ -206,6 +227,9 @@ pub async fn client_handshake(
         schema_version: local.schema_version,
         node_name: node_name.to_string(),
         build_version: local.build_version.clone(),
+        applied_generation: applied.generation,
+        applied_hash: applied.hash.clone(),
+        break_glass: applied.break_glass,
     });
     let response = endpoint.request(request, timeout).await?;
     match response.cluster_status() {
@@ -235,7 +259,14 @@ mod tests {
             schema_version: schema,
             node_name: "node".to_string(),
             build_version: "1.7.0".to_string(),
+            applied_generation: 0,
+            applied_hash: String::new(),
+            break_glass: false,
         }
+    }
+
+    fn nothing_applied() -> ConfigVersion {
+        ConfigVersion::default()
     }
 
     #[test]
@@ -243,7 +274,7 @@ mod tests {
         let mut long = hello(1, 1, 49);
         long.build_version = "v".repeat(MAX_NODE_NAME_BYTES + 1);
         assert_eq!(
-            evaluate_hello(&local(), 0, &long),
+            evaluate_hello(&local(), 0, &nothing_applied(), &long),
             Err(ClusterStatus::ProtocolViolation)
         );
         assert_eq!(
@@ -254,23 +285,53 @@ mod tests {
 
     #[test]
     fn matching_peer_is_admitted() {
-        let ack = evaluate_hello(&local(), 5, &hello(1, 1, 49)).expect("admitted");
+        let ack =
+            evaluate_hello(&local(), 5, &nothing_applied(), &hello(1, 1, 49)).expect("admitted");
         assert_eq!(ack.negotiated_version, 1);
         assert_eq!(ack.schema_version, 49);
         assert_eq!(ack.fleet_size_hint, 5);
     }
 
     #[test]
+    fn the_ack_carries_the_control_planes_configuration_version() {
+        let current = ConfigVersion {
+            generation: 12,
+            hash: "abcdef".to_string(),
+        };
+        let ack = evaluate_hello(&local(), 0, &current, &hello(1, 1, 49)).expect("admitted");
+        assert_eq!(ack.current_generation, 12);
+        assert_eq!(ack.current_hash, "abcdef");
+    }
+
+    #[test]
+    fn a_malformed_applied_hash_in_the_opener_is_a_violation() {
+        for bad in ["ZZ", "AB", "ab cd"] {
+            let mut forged = hello(1, 1, 49);
+            forged.applied_generation = 3;
+            forged.applied_hash = bad.to_string();
+            assert_eq!(
+                evaluate_hello(&local(), 0, &nothing_applied(), &forged),
+                Err(ClusterStatus::ProtocolViolation),
+                "{bad}"
+            );
+        }
+        let mut good = hello(1, 1, 49);
+        good.applied_generation = 3;
+        good.applied_hash = "0123456789abcdef".to_string();
+        assert!(evaluate_hello(&local(), 0, &nothing_applied(), &good).is_ok());
+    }
+
+    #[test]
     fn newer_follower_schema_is_admitted() {
         // Rolling upgrade order: followers upgrade first, so a
         // follower one schema AHEAD must be admitted.
-        assert!(evaluate_hello(&local(), 0, &hello(1, 1, 50)).is_ok());
+        assert!(evaluate_hello(&local(), 0, &nothing_applied(), &hello(1, 1, 50)).is_ok());
     }
 
     #[test]
     fn older_follower_schema_gets_the_distinct_diagnostic() {
         assert_eq!(
-            evaluate_hello(&local(), 0, &hello(1, 1, 48)),
+            evaluate_hello(&local(), 0, &nothing_applied(), &hello(1, 1, 48)),
             Err(ClusterStatus::SchemaTooOld)
         );
     }
@@ -278,7 +339,7 @@ mod tests {
     #[test]
     fn disjoint_protocol_ranges_are_refused() {
         assert_eq!(
-            evaluate_hello(&local(), 0, &hello(7, 9, 49)),
+            evaluate_hello(&local(), 0, &nothing_applied(), &hello(7, 9, 49)),
             Err(ClusterStatus::IncompatibleVersion)
         );
     }
@@ -288,21 +349,21 @@ mod tests {
         let mut long = hello(1, 1, 49);
         long.node_name = "n".repeat(MAX_NODE_NAME_BYTES + 1);
         assert_eq!(
-            evaluate_hello(&local(), 0, &long),
+            evaluate_hello(&local(), 0, &nothing_applied(), &long),
             Err(ClusterStatus::ProtocolViolation)
         );
         let mut injected = hello(1, 1, 49);
         injected.node_name = "edge\n[forged log line]".to_string();
         assert_eq!(
-            evaluate_hello(&local(), 0, &injected),
+            evaluate_hello(&local(), 0, &nothing_applied(), &injected),
             Err(ClusterStatus::ProtocolViolation)
         );
         // Exactly at the bound is fine, and so is an empty name.
         let mut max = hello(1, 1, 49);
         max.node_name = "n".repeat(MAX_NODE_NAME_BYTES);
-        assert!(evaluate_hello(&local(), 0, &max).is_ok());
+        assert!(evaluate_hello(&local(), 0, &nothing_applied(), &max).is_ok());
         let mut empty = hello(1, 1, 49);
         empty.node_name.clear();
-        assert!(evaluate_hello(&local(), 0, &empty).is_ok());
+        assert!(evaluate_hello(&local(), 0, &nothing_applied(), &empty).is_ok());
     }
 }

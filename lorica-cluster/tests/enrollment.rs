@@ -38,6 +38,7 @@ use lorica_cluster::listener::{
     OperationalStats, PreAuthBudgets,
 };
 use lorica_cluster::messages::{cluster_response, Renew};
+use lorica_cluster::replication::{AppliedConfig, ConfigPayload};
 use lorica_cluster::{
     client_config, enrollment_server_config, join, leaf_spki_sha256, operational_server_config,
     operational_server_config_with_crl, token, ClusterCa, ClusterFrame, ClusterRequest,
@@ -309,6 +310,16 @@ impl SessionHandler for RecordingSessionHandler {
             self.violations.fetch_add(1, Ordering::SeqCst);
         })
     }
+
+    fn on_config_pull(
+        &self,
+        _node_id: &str,
+        _applied: AppliedConfig,
+    ) -> BoxFuture<'_, Result<Option<ConfigPayload>, String>> {
+        // Story 9.3's tests hold no configuration; replication has its
+        // own suite in tests/replication.rs.
+        Box::pin(async { Ok(None) })
+    }
 }
 
 struct Fleet {
@@ -391,7 +402,13 @@ async fn open_session(
     let (endpoint, _incoming) = RpcEndpoint::<ClusterFrame>::from_stream(tls);
     tokio::time::timeout(
         WAIT,
-        client_handshake(&endpoint, &HandshakeConfig::new(50), &node.node_id, WAIT),
+        client_handshake(
+            &endpoint,
+            &HandshakeConfig::new(50),
+            &node.node_id,
+            &AppliedConfig::default(),
+            WAIT,
+        ),
     )
     .await
     .map_err(|_| "handshake timeout".to_string())?
@@ -554,8 +571,14 @@ async fn revoked_node_is_refused_at_tls_and_its_session_ends_synchronously() {
         fleet.stats.sessions_killed.load(Ordering::Relaxed) == 1
     })
     .await;
+    let probe = ClusterRequest::heartbeat(lorica_cluster::Heartbeat {
+        timestamp_ms: 1,
+        applied_generation: 0,
+        applied_hash: String::new(),
+        break_glass: false,
+    });
     assert!(session_a
-        .request(ClusterRequest::heartbeat(lorica_cluster::Heartbeat { timestamp_ms: 1 }), Duration::from_secs(2))
+        .request(probe, Duration::from_secs(2))
         .await
         .is_err());
     assert!(!fleet.sessions.is_connected("node-a"));

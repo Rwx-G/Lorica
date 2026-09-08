@@ -31,12 +31,19 @@
 //! registry's kill switch ends the session synchronously on
 //! revocation), and the steady-state loop with every inbound request
 //! routed through the bridge whitelist (AC #6).
+//!
+//! Story 9.4 adds two things to that sequence: the registered session
+//! carries a CLONE of its RPC endpoint, so the replication coordinator
+//! can push configuration down it, and the `HelloAck` plus every
+//! `HeartbeatAck` advertise the control plane's configuration version,
+//! so a follower that is behind pulls (AC #7) instead of drifting.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
@@ -51,10 +58,11 @@ use crate::enroll::{RenewRequest, SessionHandler};
 use crate::handshake::{serve_hello, HandshakeConfig};
 use crate::limits::cluster_rpc_limits;
 use crate::messages::{
-    cluster_response, ClusterFrame, ClusterResponse, ClusterStatus, HeartbeatAck, LeaveAck,
-    RenewAck,
+    cluster_response, ClusterFrame, ClusterResponse, ClusterStatus, ConfigPullAck, HeartbeatAck,
+    LeaveAck, RenewAck,
 };
 use crate::preauth::{accept_error_pause, PreAuthBudgets, SourceGate, SourceSlot};
+use crate::replication::{AppliedConfig, ConfigVersion};
 use crate::roster::{
     NodeIdentity, NodeState, Roster, SessionGuard, SessionRegistry, SESSION_RATE_WINDOW,
 };
@@ -149,6 +157,12 @@ pub struct OperationalStats {
     pub unsupported_methods: AtomicU64,
     /// Heartbeats served in-plane.
     pub heartbeats_served: AtomicU64,
+    /// Convergence pulls served (Story 9.4 AC #7), whether or not a
+    /// blob was transferred.
+    pub config_pulls_served: AtomicU64,
+    /// Convergence pulls the handler could not answer (the blob could
+    /// not be built): refused opaquely, session kept.
+    pub config_pull_refusals: AtomicU64,
     /// Certificate renewals issued over a session (Story 9.3 AC #12).
     pub renewals_served: AtomicU64,
     /// Nodes that left the fleet over their session (Story 9.3
@@ -188,6 +202,13 @@ pub struct OperationalConfig {
     /// Fleet-size hint handed to peers (loaded per handshake and
     /// heartbeat so it tracks roster growth). Default 0.
     pub fleet_size: Arc<AtomicU32>,
+    /// The configuration version every `HelloAck` and `HeartbeatAck`
+    /// advertises (Story 9.4 AC #7), read per answer so a follower
+    /// converges within one heartbeat of a commit it missed. Default:
+    /// generation 0 with an empty hash, which is what a transport-only
+    /// listener (no fleet layer) reports. A control plane shares its
+    /// own slot through [`crate::roster::ControlPlane::config_version_handle`].
+    pub config_version: Arc<ArcSwap<ConfigVersion>>,
     /// Convergence admission control (AC #10). Default: the
     /// `DEFAULT_ADMISSION_*` constants.
     pub admission: Arc<AdmissionGate>,
@@ -225,6 +246,7 @@ impl OperationalConfig {
             acceptor,
             handshake,
             fleet_size: Arc::new(AtomicU32::new(0)),
+            config_version: Arc::new(ArcSwap::from_pointee(ConfigVersion::default())),
             admission: Arc::new(AdmissionGate::new(
                 DEFAULT_ADMISSION_MAX_CONCURRENT,
                 DEFAULT_ADMISSION_QUEUE_DEPTH,
@@ -258,6 +280,7 @@ struct OperationalShared {
     acceptor: Arc<SwappableAcceptor>,
     handshake: HandshakeConfig,
     fleet_size: Arc<AtomicU32>,
+    config_version: Arc<ArcSwap<ConfigVersion>>,
     admission: Arc<AdmissionGate>,
     stats: Arc<OperationalStats>,
     budgets: PreAuthBudgets,
@@ -279,6 +302,7 @@ impl OperationalListener {
             acceptor,
             handshake,
             fleet_size,
+            config_version,
             admission,
             stats,
             budgets,
@@ -293,6 +317,7 @@ impl OperationalListener {
             acceptor,
             handshake,
             fleet_size,
+            config_version,
             admission,
             stats,
             budgets,
@@ -442,9 +467,11 @@ async fn serve_operational_conn(
 
     // The endpoint is bounded by the handshake permit (still held)
     // and the per-source slot until the peer earns a session slot.
-    // `_endpoint` stays alive for the whole session: dropping it
-    // closes the writer that replies ride on.
-    let (_endpoint, mut incoming) =
+    // It stays alive for the whole session: dropping it closes the
+    // writer that replies ride on. A clone also goes into the session
+    // registry, which is what the replication coordinator pushes
+    // configuration down (Story 9.4 D6).
+    let (endpoint, mut incoming) =
         RpcEndpoint::<ClusterFrame>::with_limits(tls, cluster_rpc_limits());
 
     let opener = match tokio::time::timeout(shared.opener_timeout, incoming.recv()).await {
@@ -501,7 +528,8 @@ async fn serve_operational_conn(
     };
 
     let hint = shared.fleet_size.load(Ordering::Relaxed);
-    let (ack, hello) = match serve_hello(opener, &shared.handshake, hint).await {
+    let current = (**shared.config_version.load()).clone();
+    let (ack, hello) = match serve_hello(opener, &shared.handshake, hint, &current).await {
         Ok(Ok(admitted)) => admitted,
         Ok(Err(status)) => {
             stats.handshake_refusals.fetch_add(1, Ordering::Relaxed);
@@ -519,8 +547,11 @@ async fn serve_operational_conn(
         }
     };
     stats.sessions_admitted.fetch_add(1, Ordering::Relaxed);
-    // Convergence is over once the handshake completed (Story 9.4
-    // will extend the hold across the initial config pull).
+    // Convergence is over once the handshake completed. The Story 9.4
+    // pull that follows a behind-detection is a normal in-session
+    // request, deliberately NOT held under the admission permit: a
+    // fleet-wide generation change would otherwise queue every node's
+    // pull behind the gate's concurrency limit.
     drop(permit);
 
     let ctx = SessionContext {
@@ -542,13 +573,20 @@ async fn serve_operational_conn(
     // Register in the fleet layer: supersede the node's older
     // session, tell the binary (it retires a superseded certificate
     // on the first session over the new one), hold the kill switch.
+    let applied = AppliedConfig {
+        generation: hello.applied_generation,
+        hash: hello.applied_hash.clone(),
+        break_glass: hello.break_glass,
+    };
     let guard: Option<SessionGuard> = match (&shared.fleet, &node) {
         (Some(fleet), Some(identity)) => {
             let guard = fleet.sessions.register(
-                &identity.node_id,
+                identity,
                 peer,
+                endpoint.clone(),
                 &hello.build_version,
                 hello.schema_version,
+                applied,
             );
             fleet
                 .handler
@@ -637,7 +675,7 @@ async fn serve_session(
         if let Some(guard) = &guard {
             guard.entry().touch();
         }
-        match serve_request(request, shared, ctx, &mut renewals).await {
+        match serve_request(request, shared, ctx, guard.as_ref(), &mut renewals).await {
             Some(SessionEnd::Closed) => return,
             Some(SessionEnd::Killed) => return,
             None => {}
@@ -657,20 +695,82 @@ async fn serve_request(
     request: IncomingRequest<ClusterFrame>,
     shared: &OperationalShared,
     ctx: &SessionContext,
+    guard: Option<&SessionGuard>,
     renewals: &mut RenewalTally,
 ) -> Option<SessionEnd> {
     let stats = &shared.stats;
     match translate_cluster_request(request.request()) {
-        BridgeOutcome::InPlane(InPlaneAction::Heartbeat { timestamp_ms }) => {
+        BridgeOutcome::InPlane(InPlaneAction::Heartbeat {
+            timestamp_ms,
+            applied,
+        }) => {
             stats.heartbeats_served.fetch_add(1, Ordering::Relaxed);
+            // What the node runs, refreshed every interval: the drift
+            // input (AC #12) and what makes a missed commit converge
+            // within one heartbeat (AC #6).
+            if let Some(guard) = guard {
+                guard.entry().record_applied(applied);
+            }
+            let current = shared.config_version.load();
             let ack = HeartbeatAck {
                 timestamp_ms,
                 fleet_size_hint: shared.fleet_size.load(Ordering::Relaxed),
+                current_generation: current.generation,
+                current_hash: current.hash.clone(),
             };
             request
                 .reply_frame(ClusterResponse::ok(cluster_response::Body::HeartbeatAck(
                     ack,
                 )))
+                .await
+                .err()
+                .map(|_| SessionEnd::Closed)
+        }
+        BridgeOutcome::InPlane(InPlaneAction::ConfigPull { applied }) => {
+            let (Some(fleet), Some(node_id)) = (&shared.fleet, ctx.node_id()) else {
+                return request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::UnsupportedMethod))
+                    .await
+                    .err()
+                    .map(|_| SessionEnd::Closed);
+            };
+            if let Some(guard) = guard {
+                guard.entry().record_applied(applied.clone());
+            }
+            let reply = match fleet.handler.on_config_pull(node_id, applied).await {
+                Ok(Some(payload)) => {
+                    stats.config_pulls_served.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        peer = %ctx.peer_addr,
+                        node_id,
+                        generation = payload.generation,
+                        "convergence pull served with a configuration blob"
+                    );
+                    ClusterResponse::ok(cluster_response::Body::ConfigPullAck(ConfigPullAck {
+                        generation: payload.generation,
+                        hash: payload.hash,
+                        blob: payload.blob,
+                        up_to_date: false,
+                    }))
+                }
+                Ok(None) => {
+                    stats.config_pulls_served.fetch_add(1, Ordering::Relaxed);
+                    let current = shared.config_version.load();
+                    ClusterResponse::ok(cluster_response::Body::ConfigPullAck(ConfigPullAck {
+                        generation: current.generation,
+                        hash: current.hash.clone(),
+                        blob: Vec::new(),
+                        up_to_date: true,
+                    }))
+                }
+                Err(reason) => {
+                    stats.config_pull_refusals.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(peer = %ctx.peer_addr, node_id, %reason, "convergence pull refused");
+                    ClusterResponse::refusal(ClusterStatus::Unspecified)
+                }
+            };
+            request
+                .reply_frame(reply)
                 .await
                 .err()
                 .map(|_| SessionEnd::Closed)

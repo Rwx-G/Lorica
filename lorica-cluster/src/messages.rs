@@ -101,6 +101,18 @@ pub struct Hello {
     /// bounded like `node_name`.
     #[prost(string, tag = "5")]
     pub build_version: ::prost::alloc::string::String,
+    /// The configuration generation the follower runs (Story 9.4
+    /// AC #7); `0` when nothing was ever applied.
+    #[prost(uint64, tag = "6")]
+    pub applied_generation: u64,
+    /// Canonical hash of the applied configuration (lowercase hex,
+    /// bounded by [`MAX_CONFIG_HASH_BYTES`]); empty with generation 0.
+    #[prost(string, tag = "7")]
+    pub applied_hash: ::prost::alloc::string::String,
+    /// Whether the follower is in break-glass (Story 9.4 AC #11): it
+    /// is excluded from commit sets until the window ends.
+    #[prost(bool, tag = "8")]
+    pub break_glass: bool,
 }
 
 /// Control-plane answer to a [`Hello`] when the session is admitted.
@@ -116,6 +128,13 @@ pub struct HelloAck {
     /// backoff cap (AC #9) without knowing the roster.
     #[prost(uint32, tag = "3")]
     pub fleet_size_hint: u32,
+    /// The control plane's current configuration generation (Story 9.4
+    /// AC #7): a follower behind it pulls at the handshake.
+    #[prost(uint64, tag = "4")]
+    pub current_generation: u64,
+    /// Canonical hash of the current configuration (lowercase hex).
+    #[prost(string, tag = "5")]
+    pub current_hash: ::prost::alloc::string::String,
 }
 
 /// Liveness probe, either direction.
@@ -124,6 +143,16 @@ pub struct Heartbeat {
     /// Sender's clock, unix milliseconds.
     #[prost(uint64, tag = "1")]
     pub timestamp_ms: u64,
+    /// The configuration generation the follower runs (Story 9.4
+    /// AC #6/#7: a missed commit converges within one interval).
+    #[prost(uint64, tag = "2")]
+    pub applied_generation: u64,
+    /// Canonical hash of the applied configuration (lowercase hex).
+    #[prost(string, tag = "3")]
+    pub applied_hash: ::prost::alloc::string::String,
+    /// Whether the follower is in break-glass (Story 9.4 AC #11).
+    #[prost(bool, tag = "4")]
+    pub break_glass: bool,
 }
 
 /// Answer to a [`Heartbeat`].
@@ -135,6 +164,12 @@ pub struct HeartbeatAck {
     /// Refreshed backoff-cap input (AC #9).
     #[prost(uint32, tag = "2")]
     pub fleet_size_hint: u32,
+    /// The control plane's current configuration generation.
+    #[prost(uint64, tag = "3")]
+    pub current_generation: u64,
+    /// Canonical hash of the current configuration (lowercase hex).
+    #[prost(string, tag = "4")]
+    pub current_hash: ::prost::alloc::string::String,
 }
 
 /// Token redemption (Story 9.3 AC #1/#3): the only frame the
@@ -212,6 +247,97 @@ pub struct Leave {}
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct LeaveAck {}
 
+/// Phase one of a configuration push (Story 9.4 AC #4), control plane
+/// to follower: stage this generation, do not apply it yet.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConfigPrepare {
+    /// The generation being replicated.
+    #[prost(uint64, tag = "1")]
+    pub generation: u64,
+    /// Canonical SHA-256 of `blob`, lowercase hex.
+    #[prost(string, tag = "2")]
+    pub hash: ::prost::alloc::string::String,
+    /// The canonical configuration blob (bounded by the 4 MiB frame
+    /// cap).
+    #[prost(bytes = "vec", tag = "3")]
+    pub blob: ::prost::alloc::vec::Vec<u8>,
+}
+
+/// Answer to a [`ConfigPrepare`]. A refusal here is SEMANTIC (the
+/// follower could not stage the blob: unknown field, hash mismatch,
+/// store failure) and aborts the round fleet-wide (AC #5).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConfigPrepareAck {
+    /// Whether the generation is staged and can be committed.
+    #[prost(bool, tag = "1")]
+    pub accepted: bool,
+    /// Empty when accepted; otherwise names the cause without embedding
+    /// configuration values.
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+
+/// Phase two: apply the staged generation.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConfigCommit {
+    /// The generation to apply (must match the staged one).
+    #[prost(uint64, tag = "1")]
+    pub generation: u64,
+}
+
+/// The follower applied a generation.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConfigCommitAck {
+    /// What the follower now runs.
+    #[prost(uint64, tag = "1")]
+    pub applied_generation: u64,
+    /// Canonical hash of what the follower now runs.
+    #[prost(string, tag = "2")]
+    pub applied_hash: ::prost::alloc::string::String,
+}
+
+/// Drop a staged generation (another follower rejected it).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConfigAbort {
+    /// The staged generation to drop.
+    #[prost(uint64, tag = "1")]
+    pub generation: u64,
+}
+
+/// Abort acknowledged.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConfigAbortAck {}
+
+/// Convergence pull (AC #7), follower to control plane: "this is what
+/// I run; send me the current generation if it differs".
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConfigPull {
+    /// The generation the follower runs.
+    #[prost(uint64, tag = "1")]
+    pub applied_generation: u64,
+    /// Canonical hash of what the follower runs.
+    #[prost(string, tag = "2")]
+    pub applied_hash: ::prost::alloc::string::String,
+}
+
+/// Answer to a [`ConfigPull`].
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConfigPullAck {
+    /// The control plane's current generation.
+    #[prost(uint64, tag = "1")]
+    pub generation: u64,
+    /// Canonical hash of the current generation.
+    #[prost(string, tag = "2")]
+    pub hash: ::prost::alloc::string::String,
+    /// The canonical blob; empty when `up_to_date`.
+    #[prost(bytes = "vec", tag = "3")]
+    pub blob: ::prost::alloc::vec::Vec<u8>,
+    /// `true` when the follower already holds the current generation
+    /// and nothing needs to transfer.
+    #[prost(bool, tag = "4")]
+    pub up_to_date: bool,
+}
+
 /// `body_kind` value of a [`Hello`] request (its oneof tag).
 pub const BODY_KIND_HELLO: u32 = 10;
 /// `body_kind` value of a [`Heartbeat`] request (its oneof tag).
@@ -222,12 +348,37 @@ pub const BODY_KIND_ENROLL: u32 = 12;
 pub const BODY_KIND_RENEW: u32 = 13;
 /// `body_kind` value of a [`Leave`] request (its oneof tag).
 pub const BODY_KIND_LEAVE: u32 = 14;
+/// `body_kind` value of a [`ConfigPrepare`] request (its oneof tag).
+pub const BODY_KIND_CONFIG_PREPARE: u32 = 20;
+/// `body_kind` value of a [`ConfigCommit`] request (its oneof tag).
+pub const BODY_KIND_CONFIG_COMMIT: u32 = 21;
+/// `body_kind` value of a [`ConfigAbort`] request (its oneof tag).
+pub const BODY_KIND_CONFIG_ABORT: u32 = 22;
+/// `body_kind` value of a [`ConfigPull`] request (its oneof tag).
+pub const BODY_KIND_CONFIG_PULL: u32 = 23;
+
+/// Longest configuration hash any message may carry: a SHA-256 in
+/// lowercase hex.
+pub const MAX_CONFIG_HASH_BYTES: usize = 64;
+
+/// Whether a peer-supplied configuration hash has the expected shape:
+/// at most [`MAX_CONFIG_HASH_BYTES`] lowercase hexadecimal characters.
+/// The empty string is valid (generation 0, nothing applied). Checked
+/// at every decode boundary before the value can reach a log line, a
+/// registry entry or a comparison.
+pub fn config_hash_is_valid(hash: &str) -> bool {
+    hash.len() <= MAX_CONFIG_HASH_BYTES
+        && hash
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// A request from either side of the cluster plane.
 ///
-/// Body tags: 10-19 session control (this story), 20-39 RESERVED for
-/// configuration replication (Story 9.4), 40-59 RESERVED for telemetry
-/// fan-in (Story 9.6), 60-79 RESERVED for certificate distribution
+/// Body tags: 10-19 session control (Story 9.2) and lifecycle
+/// (Story 9.3), 20-39 configuration replication (Story 9.4: 20-23 in
+/// use, 24-39 reserved), 40-59 RESERVED for telemetry fan-in
+/// (Story 9.6), 60-79 RESERVED for certificate distribution
 /// (Story 9.5).
 ///
 /// `body_kind` duplicates the body's oneof tag as a scalar so a
@@ -257,13 +408,19 @@ pub struct ClusterRequest {
     #[prost(uint32, tag = "3")]
     pub body_kind: u32,
     /// Typed request body.
-    #[prost(oneof = "cluster_request::Body", tags = "10, 11, 12, 13, 14")]
+    #[prost(
+        oneof = "cluster_request::Body",
+        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23"
+    )]
     pub body: ::core::option::Option<cluster_request::Body>,
 }
 
 /// Typed body variants for [`ClusterRequest`].
 pub mod cluster_request {
-    use super::{Enroll, Heartbeat, Hello, Leave, Renew};
+    use super::{
+        ConfigAbort, ConfigCommit, ConfigPrepare, ConfigPull, Enroll, Heartbeat, Hello, Leave,
+        Renew,
+    };
 
     /// Request payloads (see the tag-range note on `ClusterRequest`).
     #[derive(Clone, PartialEq, ::prost::Oneof)]
@@ -283,6 +440,19 @@ pub mod cluster_request {
         /// Leaving the fleet (established session).
         #[prost(message, tag = "14")]
         Leave(Leave),
+        /// Stage a configuration generation (control plane to
+        /// follower, Story 9.4).
+        #[prost(message, tag = "20")]
+        ConfigPrepare(ConfigPrepare),
+        /// Apply the staged generation.
+        #[prost(message, tag = "21")]
+        ConfigCommit(ConfigCommit),
+        /// Drop the staged generation.
+        #[prost(message, tag = "22")]
+        ConfigAbort(ConfigAbort),
+        /// Convergence pull (follower to control plane).
+        #[prost(message, tag = "23")]
+        ConfigPull(ConfigPull),
     }
 
     impl Body {
@@ -294,6 +464,10 @@ pub mod cluster_request {
                 Body::Enroll(_) => super::BODY_KIND_ENROLL,
                 Body::Renew(_) => super::BODY_KIND_RENEW,
                 Body::Leave(_) => super::BODY_KIND_LEAVE,
+                Body::ConfigPrepare(_) => super::BODY_KIND_CONFIG_PREPARE,
+                Body::ConfigCommit(_) => super::BODY_KIND_CONFIG_COMMIT,
+                Body::ConfigAbort(_) => super::BODY_KIND_CONFIG_ABORT,
+                Body::ConfigPull(_) => super::BODY_KIND_CONFIG_PULL,
             }
         }
     }
@@ -335,11 +509,41 @@ impl ClusterRequest {
         Self::with_body(cluster_request::Body::Leave(Leave {}))
     }
 
+    /// Phase one of a configuration push (Story 9.4).
+    pub fn config_prepare(prepare: ConfigPrepare) -> Self {
+        Self::with_body(cluster_request::Body::ConfigPrepare(prepare))
+    }
+
+    /// Phase two: apply the staged generation.
+    pub fn config_commit(generation: u64) -> Self {
+        Self::with_body(cluster_request::Body::ConfigCommit(ConfigCommit {
+            generation,
+        }))
+    }
+
+    /// Drop a staged generation.
+    pub fn config_abort(generation: u64) -> Self {
+        Self::with_body(cluster_request::Body::ConfigAbort(ConfigAbort { generation }))
+    }
+
+    /// A convergence pull from a follower.
+    pub fn config_pull(pull: ConfigPull) -> Self {
+        Self::with_body(cluster_request::Body::ConfigPull(pull))
+    }
+
     /// Whether `body_kind` names a method THIS build implements.
     pub fn is_known_body_kind(body_kind: u32) -> bool {
         matches!(
             body_kind,
-            BODY_KIND_HELLO | BODY_KIND_HEARTBEAT | BODY_KIND_ENROLL | BODY_KIND_RENEW | BODY_KIND_LEAVE
+            BODY_KIND_HELLO
+                | BODY_KIND_HEARTBEAT
+                | BODY_KIND_ENROLL
+                | BODY_KIND_RENEW
+                | BODY_KIND_LEAVE
+                | BODY_KIND_CONFIG_PREPARE
+                | BODY_KIND_CONFIG_COMMIT
+                | BODY_KIND_CONFIG_ABORT
+                | BODY_KIND_CONFIG_PULL
         )
     }
 
@@ -368,13 +572,19 @@ pub struct ClusterResponse {
     #[prost(uint32, tag = "3")]
     pub retry_after_s: u32,
     /// Typed response body; `None` on refusals.
-    #[prost(oneof = "cluster_response::Body", tags = "10, 11, 12, 13, 14")]
+    #[prost(
+        oneof = "cluster_response::Body",
+        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23"
+    )]
     pub body: ::core::option::Option<cluster_response::Body>,
 }
 
 /// Typed body variants for [`ClusterResponse`].
 pub mod cluster_response {
-    use super::{EnrollAck, HeartbeatAck, HelloAck, LeaveAck, RenewAck};
+    use super::{
+        ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, ConfigPullAck, EnrollAck, HeartbeatAck,
+        HelloAck, LeaveAck, RenewAck,
+    };
 
     /// Response payloads (tag ranges mirror `cluster_request::Body`).
     #[derive(Clone, PartialEq, ::prost::Oneof)]
@@ -394,6 +604,18 @@ pub mod cluster_response {
         /// Leave acknowledged.
         #[prost(message, tag = "14")]
         LeaveAck(LeaveAck),
+        /// Prepare verdict (Story 9.4).
+        #[prost(message, tag = "20")]
+        ConfigPrepareAck(ConfigPrepareAck),
+        /// Commit outcome.
+        #[prost(message, tag = "21")]
+        ConfigCommitAck(ConfigCommitAck),
+        /// Abort acknowledged.
+        #[prost(message, tag = "22")]
+        ConfigAbortAck(ConfigAbortAck),
+        /// Pull answer.
+        #[prost(message, tag = "23")]
+        ConfigPullAck(ConfigPullAck),
     }
 }
 
@@ -575,6 +797,9 @@ mod tests {
             schema_version: 1,
             node_name: "n".to_string(),
             build_version: "v".to_string(),
+            applied_generation: 1,
+            applied_hash: "ab".to_string(),
+            break_glass: true,
         };
         assert_eq!(
             field_numbers(&hello.encode_to_vec()),
@@ -584,6 +809,9 @@ mod tests {
                 tag("Hello", "schema_version"),
                 tag("Hello", "node_name"),
                 tag("Hello", "build_version"),
+                tag("Hello", "applied_generation"),
+                tag("Hello", "applied_hash"),
+                tag("Hello", "break_glass"),
             ]
         );
         let enroll = Enroll {
@@ -671,6 +899,8 @@ mod tests {
             negotiated_version: 1,
             schema_version: 1,
             fleet_size_hint: 1,
+            current_generation: 1,
+            current_hash: "ab".to_string(),
         };
         assert_eq!(
             field_numbers(&ack.encode_to_vec()),
@@ -678,25 +908,181 @@ mod tests {
                 tag("HelloAck", "negotiated_version"),
                 tag("HelloAck", "schema_version"),
                 tag("HelloAck", "fleet_size_hint"),
+                tag("HelloAck", "current_generation"),
+                tag("HelloAck", "current_hash"),
             ]
         );
         assert_eq!(
-            field_numbers(&Heartbeat { timestamp_ms: 1 }.encode_to_vec()),
-            vec![tag("Heartbeat", "timestamp_ms")]
+            field_numbers(
+                &Heartbeat {
+                    timestamp_ms: 1,
+                    applied_generation: 1,
+                    applied_hash: "ab".to_string(),
+                    break_glass: true,
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("Heartbeat", "timestamp_ms"),
+                tag("Heartbeat", "applied_generation"),
+                tag("Heartbeat", "applied_hash"),
+                tag("Heartbeat", "break_glass"),
+            ]
         );
         assert_eq!(
             field_numbers(
                 &HeartbeatAck {
                     timestamp_ms: 1,
-                    fleet_size_hint: 1
+                    fleet_size_hint: 1,
+                    current_generation: 1,
+                    current_hash: "ab".to_string(),
                 }
                 .encode_to_vec()
             ),
             vec![
                 tag("HeartbeatAck", "timestamp_ms"),
                 tag("HeartbeatAck", "fleet_size_hint"),
+                tag("HeartbeatAck", "current_generation"),
+                tag("HeartbeatAck", "current_hash"),
             ]
         );
+
+        // Story 9.4 replication bodies.
+        assert_eq!(
+            field_numbers(
+                &ConfigPrepare {
+                    generation: 1,
+                    hash: "ab".to_string(),
+                    blob: vec![1],
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("ConfigPrepare", "generation"),
+                tag("ConfigPrepare", "hash"),
+                tag("ConfigPrepare", "blob"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(
+                &ConfigPrepareAck {
+                    accepted: true,
+                    reason: "r".to_string(),
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("ConfigPrepareAck", "accepted"),
+                tag("ConfigPrepareAck", "reason"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(&ConfigCommit { generation: 1 }.encode_to_vec()),
+            vec![tag("ConfigCommit", "generation")]
+        );
+        assert_eq!(
+            field_numbers(
+                &ConfigCommitAck {
+                    applied_generation: 1,
+                    applied_hash: "ab".to_string(),
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("ConfigCommitAck", "applied_generation"),
+                tag("ConfigCommitAck", "applied_hash"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(&ConfigAbort { generation: 1 }.encode_to_vec()),
+            vec![tag("ConfigAbort", "generation")]
+        );
+        assert_eq!(
+            field_numbers(
+                &ConfigPull {
+                    applied_generation: 1,
+                    applied_hash: "ab".to_string(),
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("ConfigPull", "applied_generation"),
+                tag("ConfigPull", "applied_hash"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(
+                &ConfigPullAck {
+                    generation: 1,
+                    hash: "ab".to_string(),
+                    blob: vec![1],
+                    up_to_date: true,
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("ConfigPullAck", "generation"),
+                tag("ConfigPullAck", "hash"),
+                tag("ConfigPullAck", "blob"),
+                tag("ConfigPullAck", "up_to_date"),
+            ]
+        );
+        for (request, block_field) in [
+            (
+                ClusterRequest::config_prepare(ConfigPrepare::default()),
+                "config_prepare",
+            ),
+            (ClusterRequest::config_commit(0), "config_commit"),
+            (ClusterRequest::config_abort(0), "config_abort"),
+            (
+                ClusterRequest::config_pull(ConfigPull::default()),
+                "config_pull",
+            ),
+        ] {
+            let mut request = request;
+            request.sequence = 1;
+            assert_eq!(
+                *field_numbers(&request.encode_to_vec()).last().expect("body"),
+                tag("ClusterRequest", block_field),
+                "{block_field}"
+            );
+            assert_eq!(request.body_kind, tag("ClusterRequest", block_field));
+        }
+        for (body, block_field) in [
+            (
+                cluster_response::Body::ConfigPrepareAck(ConfigPrepareAck::default()),
+                "config_prepare_ack",
+            ),
+            (
+                cluster_response::Body::ConfigCommitAck(ConfigCommitAck::default()),
+                "config_commit_ack",
+            ),
+            (
+                cluster_response::Body::ConfigAbortAck(ConfigAbortAck::default()),
+                "config_abort_ack",
+            ),
+            (
+                cluster_response::Body::ConfigPullAck(ConfigPullAck::default()),
+                "config_pull_ack",
+            ),
+        ] {
+            let response = ClusterResponse::ok(body);
+            assert_eq!(
+                *field_numbers(&response.encode_to_vec()).last().expect("body"),
+                tag("ClusterResponse", block_field),
+                "{block_field}"
+            );
+        }
+        assert_eq!(
+            BODY_KIND_CONFIG_PREPARE,
+            tag("ClusterRequest", "config_prepare")
+        );
+        assert_eq!(
+            BODY_KIND_CONFIG_COMMIT,
+            tag("ClusterRequest", "config_commit")
+        );
+        assert_eq!(BODY_KIND_CONFIG_ABORT, tag("ClusterRequest", "config_abort"));
+        assert_eq!(BODY_KIND_CONFIG_PULL, tag("ClusterRequest", "config_pull"));
 
         let mut request = ClusterRequest::hello(Hello::default());
         request.sequence = 1;
@@ -798,12 +1184,34 @@ mod tests {
         let mut forged = ClusterRequest::heartbeat(Heartbeat::default());
         forged.body_kind = BODY_KIND_HELLO;
         assert!(!forged.body_kind_matches());
-        // Reserved ranges are unknown to this build.
-        for kind in [0, 15, 19, 20, 39, 40, 59, 60, 79] {
+        // Reserved ranges are unknown to this build. 20-23 are Story
+        // 9.4's and now known; 24-39 stay reserved.
+        for kind in [0, 15, 19, 24, 39, 40, 59, 60, 79] {
             assert!(!ClusterRequest::is_known_body_kind(kind), "{kind}");
         }
-        for kind in [BODY_KIND_ENROLL, BODY_KIND_RENEW, BODY_KIND_LEAVE] {
+        for kind in [
+            BODY_KIND_ENROLL,
+            BODY_KIND_RENEW,
+            BODY_KIND_LEAVE,
+            BODY_KIND_CONFIG_PREPARE,
+            BODY_KIND_CONFIG_COMMIT,
+            BODY_KIND_CONFIG_ABORT,
+            BODY_KIND_CONFIG_PULL,
+        ] {
             assert!(ClusterRequest::is_known_body_kind(kind), "{kind}");
         }
+    }
+
+    #[test]
+    fn config_hash_shape_is_checked_at_the_decode_boundary() {
+        assert!(config_hash_is_valid(""));
+        assert!(config_hash_is_valid(&"a".repeat(MAX_CONFIG_HASH_BYTES)));
+        assert!(config_hash_is_valid("0123456789abcdef"));
+        // Too long, uppercase, or non-hex: refused before the value can
+        // reach a log line or a comparison.
+        assert!(!config_hash_is_valid(&"a".repeat(MAX_CONFIG_HASH_BYTES + 1)));
+        assert!(!config_hash_is_valid("ABCDEF"));
+        assert!(!config_hash_is_valid("zz"));
+        assert!(!config_hash_is_valid("ab cd"));
     }
 }
