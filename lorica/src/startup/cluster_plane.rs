@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use lorica_api::audit::{record_with_store, AuditContext};
-use lorica_api::cluster::{publish_token_liveness, refresh_control_plane, revoke_node_fully};
+use lorica_api::cluster::runtime::{publish_token_liveness, refresh_control_plane, revoke_node};
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
 use lorica_api::log_store::LogStore;
@@ -83,18 +83,45 @@ use crate::startup::hot_upgrade::ClusterListenerRole;
 /// How often live-session facts (last seen, address, version) are
 /// persisted to `cluster_nodes` and expired revoked serials are
 /// pruned, and the longest the liveness publisher sleeps between
-/// recounts.
+/// recounts. A session's `last_seen_at` is therefore at most this
+/// stale in the registry; the session hook does not write per session.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
+// ---- The renewal timing contract (Story 9.3 AC #12) ----
+//
+// Both sides of a renewal live here so their relation is checked by
+// one test rather than remembered across two modules: the follower
+// asks between RENEWAL_LEAD_MIN_DAYS and RENEWAL_LEAD_MAX_DAYS before
+// expiry, checking every RENEWAL_CHECK_INTERVAL; the control plane
+// serves only inside RENEWAL_ACCEPT_WINDOW and at most once per
+// RENEWAL_COOLDOWN per node. Invariants: ACCEPT_WINDOW > LEAD_MAX (a
+// due follower is never refused as "not due"), and a refused follower
+// waits RENEWAL_RETRY_AFTER_REFUSAL >= COOLDOWN before asking again.
+
+/// How often the follower's renewal task checks the certificate's
+/// remaining lifetime.
+pub(crate) const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Lower bound of the follower's jittered renewal lead, in days
+/// before expiry (a third of the 90-day lifetime at most).
+pub(crate) const RENEWAL_LEAD_MIN_DAYS: i64 = 25;
+
+/// Upper bound of the follower's jittered renewal lead, in days.
+pub(crate) const RENEWAL_LEAD_MAX_DAYS: i64 = 30;
+
 /// A renewal is served only when this much (or less) of the
-/// certificate's lifetime is left: the follower asks at 30 days
-/// (with jitter down to 25), so anything asking earlier is not a
-/// renewal (Story 9.3 AC #12).
+/// certificate's lifetime is left; anything asking earlier is not a
+/// renewal.
 const RENEWAL_ACCEPT_WINDOW: chrono::Duration = chrono::Duration::days(35);
 
 /// One renewal grant per node per this interval; a second request
 /// inside it is refused (a grant costs a signature and a CRL entry).
 const RENEWAL_COOLDOWN: Duration = Duration::from_secs(3600);
+
+/// How long a follower waits after a refused renewal before asking
+/// again, so a node behind the cooldown does not burn its per-session
+/// refusal budget on the control plane.
+pub(crate) const RENEWAL_RETRY_AFTER_REFUSAL: Duration = Duration::from_secs(3600);
 
 /// Inputs for [`spawn_cluster_plane`], lifted from the CLI and the
 /// process.
@@ -209,6 +236,42 @@ fn plane_audit_ctx(peer: SocketAddr) -> AuditContext {
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(e.to_string())
+}
+
+/// Why a renewal request over a session was refused. No HTTP is
+/// involved on this path (the peer gets the opaque status); the
+/// variant is what the journal line carries.
+#[derive(Debug)]
+enum RenewRefusal {
+    /// No registry row for the session's node id.
+    NotRegistered,
+    /// The node is not `Active` (AC #5: a pending or revoked node
+    /// receives no certificate).
+    NotActive(&'static str),
+    /// The current certificate has more than the accept window left.
+    NotDue(DateTime<Utc>),
+    /// A grant was issued inside the cooldown.
+    Cooldown,
+    /// The store or the CA failed.
+    Internal(String),
+}
+
+impl std::fmt::Display for RenewRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRegistered => write!(f, "node not registered"),
+            Self::NotActive(status) => {
+                write!(f, "node is {status}; only an active node renews (AC #5)")
+            }
+            Self::NotDue(not_after) => write!(
+                f,
+                "certificate is valid until {}; renewal is not due",
+                not_after.to_rfc3339()
+            ),
+            Self::Cooldown => write!(f, "renewal cooldown: one grant per hour per node"),
+            Self::Internal(reason) => write!(f, "{reason}"),
+        }
+    }
 }
 
 /// What phase one of a redemption decided under the store lock.
@@ -396,19 +459,24 @@ impl FleetHandlers {
         .await;
     }
 
-    /// Whether `node_id` may be granted a renewal now (and record
-    /// that it was).
+    /// Whether `node_id` may be granted a renewal now. The grant is
+    /// recorded by [`Self::record_renewal_grant`] once it actually
+    /// held, so a signing or store failure does not lock the node out
+    /// for the cooldown.
     fn renewal_allowed(&self, node_id: &str) -> bool {
         let mut renewals = self.renewals.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         // Keep the map bounded by the fleet: drop entries past the
         // cooldown while we are here.
         renewals.retain(|_, granted| now.duration_since(*granted) < RENEWAL_COOLDOWN);
-        if renewals.contains_key(node_id) {
-            return false;
-        }
-        renewals.insert(node_id.to_string(), now);
-        true
+        !renewals.contains_key(node_id)
+    }
+
+    fn record_renewal_grant(&self, node_id: &str) {
+        self.renewals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(node_id.to_string(), Instant::now());
     }
 }
 
@@ -445,29 +513,24 @@ impl SessionHandler for FleetHandlers {
         &self,
         node_id: &str,
         via_previous_certificate: bool,
-        peer: SocketAddr,
-        build_version: &str,
-        schema_version: u32,
+        _peer: SocketAddr,
+        _build_version: &str,
+        _schema_version: u32,
     ) -> BoxFuture<'_, ()> {
         let node_id = node_id.to_string();
-        let build_version = build_version.to_string();
         Box::pin(async move {
+            // The store is touched only when there is something to
+            // retire: the first session on a renewed certificate closes
+            // the grace window on the superseded one (AC #12). Live
+            // facts (address, version, last seen) reach the registry
+            // through the periodic flush, so an ordinary session, or a
+            // node reconnecting in a loop, never takes the store lock.
+            if via_previous_certificate || !self.control.roster.has_superseded_certificate(&node_id)
+            {
+                return;
+            }
             let id = node_id.clone();
             let retired = db_blocking(&self.store, move |store| {
-                store
-                    .touch_cluster_node(
-                        &id,
-                        &peer.to_string(),
-                        &build_version,
-                        i64::from(schema_version),
-                        Utc::now(),
-                    )
-                    .map_err(internal)?;
-                if via_previous_certificate {
-                    return Ok::<_, ApiError>(None);
-                }
-                // First session on a renewed certificate: the grace
-                // window on the superseded one closes (AC #12).
                 store
                     .retire_previous_cluster_certificate(&id, Utc::now())
                     .map_err(internal)
@@ -479,87 +542,28 @@ impl SessionHandler for FleetHandlers {
                     self.refresh().await;
                 }
                 Ok(None) => {}
-                Err(e) => error!(node_id, error = %e, "session bookkeeping failed"),
+                Err(e) => error!(node_id, error = %e, "retiring the superseded certificate failed"),
             }
         })
     }
 
     fn on_renew(&self, request: RenewRequest) -> BoxFuture<'_, Result<RenewGrant, String>> {
         Box::pin(async move {
-            let node_id = request.node_id.clone();
-            let peer = request.peer;
-            // Eligibility first (Active, inside the renewal window,
-            // outside the cooldown), under a short lock; then sign
-            // lock-free; then persist.
-            let id = node_id.clone();
-            let now = Utc::now();
-            db_blocking(&self.store, move |store| {
-                let node = store
-                    .get_cluster_node(&id)
-                    .map_err(internal)?
-                    .ok_or_else(|| ApiError::NotFound("node not registered".into()))?;
-                if node.status != NodeStatus::Active {
-                    return Err(ApiError::Forbidden(format!(
-                        "node is {}; only an active node renews (AC #5)",
-                        node.status.as_str()
-                    )));
-                }
-                if node.cert_not_after - now > RENEWAL_ACCEPT_WINDOW {
-                    return Err(ApiError::Conflict(format!(
-                        "certificate is valid until {}; renewal is not due",
-                        node.cert_not_after.to_rfc3339()
-                    )));
-                }
-                Ok::<_, ApiError>(())
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-            if !self.renewal_allowed(&node_id) {
-                return Err("renewal cooldown: one grant per hour per node".to_string());
-            }
-            let issued = sign_node_leaf(&self.control, &node_id, request.public_key_der).await?;
-            let id = node_id.clone();
-            let persisted = issued.clone();
-            let recorded = db_blocking(&self.store, move |store| {
-                store
-                    .record_cluster_node_renewal(
-                        &id,
-                        &persisted.fingerprint_sha256,
-                        &persisted.serial_hex,
-                        persisted.not_after,
-                        Utc::now(),
-                    )
-                    .map_err(internal)
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-            if !recorded {
-                return Err("node is no longer active".to_string());
-            }
-            self.refresh().await;
-            self.audit(
-                peer,
-                "cluster.node.renew",
-                ("cluster_node", &node_id),
-                Some(serde_json::json!({
-                    "cert_fingerprint": issued.fingerprint_sha256,
-                    "cert_not_after": issued.not_after.to_rfc3339(),
-                })),
-            )
-            .await;
-            Ok(RenewGrant {
-                cert_pem: issued.cert_pem,
-                cert_not_after: issued.not_after.to_rfc3339(),
-            })
+            self.renew(request).await.map_err(|refusal| refusal.to_string())
         })
     }
 
     fn on_leave(&self, node_id: &str, peer: SocketAddr) -> BoxFuture<'_, Result<(), String>> {
         let node_id = node_id.to_string();
         Box::pin(async move {
-            let outcome = revoke_node_fully(&self.control, &self.store, &node_id, Utc::now())
-                .await?
+            let outcome = revoke_node(&self.control, &self.store, &node_id, Utc::now())
+                .await
+                .map_err(|e| e.to_string())?
                 .ok_or_else(|| "node not registered".to_string())?;
+            // The row flipped and the session is gone: alert and audit
+            // that BEFORE surfacing a refresh failure (AC #13 says both
+            // sides audit, and a revocation with no trail is worse than
+            // a refused leave).
             warn!(node_id, name = %outcome.node.name, %peer, "node left the fleet; revoked");
             self.alert_sender.send(
                 AlertEvent::new(
@@ -577,10 +581,17 @@ impl SessionHandler for FleetHandlers {
                 peer,
                 "cluster.node.leave",
                 ("cluster_node", &node_id),
-                Some(serde_json::json!({ "name": outcome.node.name, "status": "revoked" })),
+                Some(serde_json::json!({
+                    "name": outcome.node.name,
+                    "status": "revoked",
+                    "refresh_error": outcome.refresh_error.as_ref().map(|e| e.to_string()),
+                })),
             )
             .await;
-            Ok(())
+            match outcome.refresh_error {
+                Some(e) => Err(e.to_string()),
+                None => Ok(()),
+            }
         })
     }
 
@@ -612,6 +623,87 @@ impl SessionHandler for FleetHandlers {
                 None,
             )
             .await;
+        })
+    }
+}
+
+impl FleetHandlers {
+    /// The renewal pipeline (AC #12): eligibility under a short lock,
+    /// signing lock-free, persistence under a second short lock.
+    ///
+    /// A session on the superseded certificate skips the "is it due"
+    /// check: the node holds a grant it never persisted (crash between
+    /// the answer and the write), and re-issuing is the only way for it
+    /// to leave the grace window on its own. The cooldown still applies.
+    async fn renew(&self, request: RenewRequest) -> Result<RenewGrant, RenewRefusal> {
+        let node_id = request.node_id.clone();
+        let peer = request.peer;
+        let id = node_id.clone();
+        let now = Utc::now();
+        let lost_grant = request.via_previous_certificate;
+        // `Ok(Err(refusal))` is the eligibility verdict; the outer
+        // error is the store failing.
+        db_blocking(&self.store, move |store| {
+            let Some(node) = store.get_cluster_node(&id).map_err(internal)? else {
+                return Ok::<_, ApiError>(Err(RenewRefusal::NotRegistered));
+            };
+            if node.status != NodeStatus::Active {
+                return Ok(Err(RenewRefusal::NotActive(node.status.as_str())));
+            }
+            if !lost_grant && node.cert_not_after - now > RENEWAL_ACCEPT_WINDOW {
+                return Ok(Err(RenewRefusal::NotDue(node.cert_not_after)));
+            }
+            Ok(Ok(()))
+        })
+        .await
+        .map_err(|e| RenewRefusal::Internal(e.to_string()))??;
+        if !self.renewal_allowed(&node_id) {
+            return Err(RenewRefusal::Cooldown);
+        }
+        if lost_grant {
+            warn!(
+                node_id,
+                %peer,
+                "renewal requested over the superseded certificate: re-issuing the lost grant"
+            );
+        }
+        let issued = sign_node_leaf(&self.control, &node_id, request.public_key_der)
+            .await
+            .map_err(RenewRefusal::Internal)?;
+        let id = node_id.clone();
+        let persisted = issued.clone();
+        let recorded = db_blocking(&self.store, move |store| {
+            store
+                .record_cluster_node_renewal(
+                    &id,
+                    &persisted.fingerprint_sha256,
+                    &persisted.serial_hex,
+                    persisted.not_after,
+                    Utc::now(),
+                )
+                .map_err(internal)
+        })
+        .await
+        .map_err(|e| RenewRefusal::Internal(e.to_string()))?;
+        if !recorded {
+            return Err(RenewRefusal::NotActive("no longer active"));
+        }
+        self.record_renewal_grant(&node_id);
+        self.refresh().await;
+        self.audit(
+            peer,
+            "cluster.node.renew",
+            ("cluster_node", &node_id),
+            Some(serde_json::json!({
+                "cert_fingerprint": issued.fingerprint_sha256,
+                "cert_not_after": issued.not_after.to_rfc3339(),
+                "via_previous_certificate": lost_grant,
+            })),
+        )
+        .await;
+        Ok(RenewGrant {
+            cert_pem: issued.cert_pem,
+            cert_not_after: issued.not_after.to_rfc3339(),
         })
     }
 }
@@ -1004,6 +1096,17 @@ mod tests {
             },
             minted.public_id,
         )
+    }
+
+    #[test]
+    fn renewal_timing_contract_holds_across_both_sides() {
+        // A follower asking at its latest lead must land inside the
+        // control plane's accept window, and a refused follower must
+        // wait at least the cooldown before asking again.
+        assert!(RENEWAL_ACCEPT_WINDOW > chrono::Duration::days(RENEWAL_LEAD_MAX_DAYS));
+        assert!(chrono::Duration::days(RENEWAL_LEAD_MIN_DAYS) < chrono::Duration::days(RENEWAL_LEAD_MAX_DAYS));
+        assert!(RENEWAL_RETRY_AFTER_REFUSAL >= RENEWAL_COOLDOWN);
+        assert!(RENEWAL_CHECK_INTERVAL < RENEWAL_COOLDOWN);
     }
 
     fn store_with_key() -> Arc<Mutex<ConfigStore>> {

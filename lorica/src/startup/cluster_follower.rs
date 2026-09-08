@@ -44,15 +44,10 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-/// How often the renewal task checks the certificate's remaining
-/// lifetime.
-const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(600);
-
-/// The renewal lead is drawn in `[RENEWAL_LEAD_MIN_DAYS,
-/// RENEWAL_LEAD_MAX_DAYS]` before expiry: a third of the 90-day
-/// lifetime at most (AC #12's "two thirds of lifetime"), jittered.
-const RENEWAL_LEAD_MIN_DAYS: i64 = 25;
-const RENEWAL_LEAD_MAX_DAYS: i64 = 30;
+use crate::startup::cluster_plane::{
+    RENEWAL_CHECK_INTERVAL, RENEWAL_LEAD_MAX_DAYS, RENEWAL_LEAD_MIN_DAYS,
+    RENEWAL_RETRY_AFTER_REFUSAL,
+};
 
 /// Bound on one renewal exchange.
 const RENEWAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -180,8 +175,16 @@ pub(crate) async fn spawn_follower(
     let renew_store = Arc::clone(store);
     let renew_connection = connection;
     let renewal_task = tokio::spawn(async move {
+        let mut hold_until: Option<tokio::time::Instant> = None;
         loop {
             tokio::time::sleep(RENEWAL_CHECK_INTERVAL).await;
+            // A refused renewal (the control plane's cooldown, or a
+            // node no longer active) is not retried every check: that
+            // would burn the per-session refusal budget on the control
+            // plane for nothing.
+            if hold_until.is_some_and(|until| tokio::time::Instant::now() < until) {
+                continue;
+            }
             let current = db_blocking(&renew_store, |store| {
                 store.get_cluster_identity().map_err(internal)
             })
@@ -212,7 +215,14 @@ pub(crate) async fn spawn_follower(
                         None => {}
                     }
                 }
-                Err(e) => warn!(error = %e, "follower: certificate renewal failed; will retry"),
+                Err(e) => {
+                    hold_until = Some(tokio::time::Instant::now() + RENEWAL_RETRY_AFTER_REFUSAL);
+                    warn!(
+                        error = %e,
+                        retry_in_s = RENEWAL_RETRY_AFTER_REFUSAL.as_secs(),
+                        "follower: certificate renewal failed; will retry"
+                    );
+                }
             }
         }
     });

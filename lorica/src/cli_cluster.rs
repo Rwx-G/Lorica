@@ -111,8 +111,12 @@ pub(crate) fn run_cluster_init(data_dir: &str, common_name: &str) {
 /// The join token from the documented paths (AC #6): `--token-file`,
 /// then `--token-stdin`, then `LORICA_JOIN_TOKEN`. Never from argv.
 fn read_join_token(token_file: Option<&Path>, token_stdin: bool) -> Result<String, String> {
+    // Trailing CR/LF stripped from every source, like the admin
+    // password (`echo` and heredocs add one; the parser would refuse it).
+    let trimmed = |s: String| s.trim_end_matches(['\r', '\n']).to_string();
     if let Some(path) = token_file {
         return std::fs::read_to_string(path)
+            .map(trimmed)
             .map_err(|e| format!("cannot read the token file {}: {e}", path.display()));
     }
     if token_stdin {
@@ -120,12 +124,14 @@ fn read_join_token(token_file: Option<&Path>, token_stdin: bool) -> Result<Strin
         std::io::stdin()
             .read_to_string(&mut buffer)
             .map_err(|e| format!("cannot read the token from standard input: {e}"))?;
-        return Ok(buffer);
+        return Ok(trimmed(buffer));
     }
-    if let Ok(from_env) = std::env::var("LORICA_JOIN_TOKEN") {
-        if !from_env.trim().is_empty() {
-            return Ok(from_env);
-        }
+    if let Some(from_env) = std::env::var("LORICA_JOIN_TOKEN")
+        .ok()
+        .map(trimmed)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(from_env);
     }
     Err("no join token: pass --token-file <path>, --token-stdin, or set LORICA_JOIN_TOKEN. \
          A token is never accepted on the command line (argv is readable through /proc and \
@@ -269,7 +275,9 @@ enum Probe {
 /// OUR certificate. Only these alerts prove deregistration; a reset,
 /// an EOF or an unrelated alert proves nothing (an attacker who can
 /// disturb the connection must not be able to trigger an identity
-/// wipe).
+/// wipe). `UnknownCA` and `CertificateExpired` are deliberately not
+/// in the list: they describe a certificate the control plane cannot
+/// evaluate, not one it deregistered.
 fn certificate_alert(error: &std::io::Error) -> Option<AlertDescription> {
     let tls = error
         .get_ref()
@@ -278,8 +286,6 @@ fn certificate_alert(error: &std::io::Error) -> Option<AlertDescription> {
         TlsError::AlertReceived(
             alert @ (AlertDescription::CertificateRevoked
             | AlertDescription::CertificateUnknown
-            | AlertDescription::CertificateExpired
-            | AlertDescription::UnknownCA
             | AlertDescription::AccessDenied
             | AlertDescription::BadCertificate),
         ) => Some(*alert),
@@ -304,21 +310,26 @@ async fn probe_registration(identity: &ClusterIdentity) -> Probe {
         Ok(Err(e)) => return Probe::Unreachable(e),
         Err(_) => return Probe::Unreachable("tcp connect timed out".to_string()),
     };
+    // A verdict counts only once the peer is authenticated: an alert
+    // that arrives while the handshake is still running comes from
+    // whoever answered the connection, not necessarily from the
+    // control plane, so it proves nothing.
     let mut tls = match tokio::time::timeout(PROBE_TIMEOUT, connector.connect(server_name, tcp))
         .await
     {
         Ok(Ok(tls)) => tls,
         Ok(Err(e)) => {
-            return match certificate_alert(&e) {
-                Some(alert) => Probe::Deregistered(format!("TLS alert {alert:?}")),
-                None => Probe::Unreachable(format!("TLS handshake failed without a certificate alert: {e}")),
-            }
+            return Probe::Unreachable(format!(
+                "TLS handshake failed before the control plane was authenticated: {e}"
+            ))
         }
         Err(_) => return Probe::Unreachable("TLS handshake timed out".to_string()),
     };
     // TLS 1.3: the server verifies the client certificate after our
-    // Finished and answers with an alert on the first read. Silence
-    // means it admitted the certificate and waits for the opener.
+    // Finished and answers with an alert on the first read, over a
+    // channel whose other end is now the authenticated control plane.
+    // Silence means it admitted the certificate and waits for the
+    // opener.
     let mut byte = [0u8; 1];
     match tokio::time::timeout(PROBE_VERDICT_WINDOW, tls.read(&mut byte)).await {
         Ok(Err(e)) => match certificate_alert(&e) {

@@ -968,16 +968,9 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // Capacity 1: a second upgrade while one is in flight is shed.
         let (upgrade_tx, mut upgrade_rx) =
             tokio::sync::mpsc::channel::<lorica_api::upgrade::StagedBinary>(1);
-        // Cluster plane (Stories 9.2/9.3): the fleet role, shared by
-        // both startup modes (see `startup::spawn_cluster_runtime`);
-        // spawned BEFORE the API so AppState carries it.
-        // fleet registry, opt-in via --cluster-listen; or the follower
-        // dialer when this node holds a fleet identity. Spawned BEFORE
-        // the API so AppState carries the fleet role. A bad bind, a
-        // missing CA, or a node that is both is fatal - the operator
-        // asked for a role, running without it is the wrong failure
-        // mode. Handles stay alive for the process lifetime; the stats
-        // feed the Prometheus bridge.
+        // The fleet role (control plane, follower or standalone), shared
+        // by both startup modes: see `startup::spawn_cluster_runtime`.
+        // Spawned BEFORE the API so AppState carries it.
         // On a hot upgrade the operational cluster SOCKET is adopted
         // from the outgoing supervisor (Story 9.1's FD slot) so there
         // is no rebind gap; its sessions reconnect once, to this

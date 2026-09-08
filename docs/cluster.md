@@ -57,7 +57,14 @@ Two distinct listeners live behind that surface:
   locally only. The operational listener applies the same handshake,
   concurrency and per-source bounds to every connection before and
   during its TLS handshake, so a handful of silent sockets cannot lock
-  legitimate followers out.
+  legitimate followers out; past the handshake, an authenticated node
+  may open at most ten sessions per minute (a reconnect loop is
+  answered `RETRY_LATER` instead of costing a registry write each
+  time). When the last token dies, the enrollment socket closes at
+  once and the connections still in flight get five seconds to finish:
+  the one that just burned that token is still writing its
+  certificate, and everything else is refused by the post-handshake
+  liveness check.
 
 During a hot binary upgrade the operational socket is handed to the
 new process so there is no rebind gap; established follower sessions
@@ -194,7 +201,11 @@ issues the replacement only to an `Active` node whose certificate is
 actually due, at most once an hour. The node then reconnects on the
 new certificate at once; the previous one stays valid until that first
 session, then goes on the revocation list as superseded, so a crash
-between issuance and persistence cannot lock a node out.
+between issuance and persistence cannot lock a node out: a node that
+comes back on the superseded certificate is re-issued a grant on
+request, without the "is it due" check, and leaves the grace window on
+its own. A refused renewal is retried an hour later, not at the next
+check.
 
 Revocation (`DELETE /api/v1/cluster/nodes/{id}`, or the dashboard) is
 enforced at the TLS handshake: the node's serials go on a CRL signed

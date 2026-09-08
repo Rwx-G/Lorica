@@ -365,16 +365,9 @@ pub(crate) fn run_single_process(cli: Cli) {
         // shutdown drain path.
         let api_task_tracker = single_task_tracker.clone();
         let shutdown_task_tracker = single_task_tracker.clone();
-        // Cluster plane (Stories 9.2/9.3): the fleet role, shared by
-        // both startup modes (see `startup::spawn_cluster_runtime`);
-        // spawned BEFORE the API so AppState carries it.
-        // fleet registry, opt-in via --cluster-listen; or the follower
-        // dialer when this node holds a fleet identity. Spawned BEFORE
-        // the API so AppState carries the fleet role. A bad bind, a
-        // missing CA, or a node that is both is fatal - the operator
-        // asked for a role, running without it is the wrong failure
-        // mode. Handles stay alive for the process lifetime; the stats
-        // feed the Prometheus bridge.
+        // The fleet role (control plane, follower or standalone), shared
+        // by both startup modes: see `startup::spawn_cluster_runtime`.
+        // Spawned BEFORE the API so AppState carries it.
         let startup::ClusterStartup {
             plane: mut cluster_plane,
             follower: mut follower_plane,
