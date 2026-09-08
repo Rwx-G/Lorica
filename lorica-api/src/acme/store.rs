@@ -51,9 +51,23 @@ type PendingChallenge = (String, DateTime<Utc>);
 /// challenge endpoint seconds-to-minutes later, so the ~tens-of-ms
 /// write window is harmless in practice.
 ///
-/// **Deletes:** challenges are short-lived (ACME validates within
-/// seconds). Entries that outlive their useful life are purged on the
-/// provisioning path after the CA confirms success.
+/// **Deletes:** the provisioning path removes a challenge once the CA
+/// confirms, but that is the happy path only. Since Story 9.5 every
+/// entry also carries a deadline ([`CHALLENGE_TTL`]) that both read
+/// paths honour, and the hourly retention loop reclaims expired rows,
+/// so an abandoned or crashed order stops being served on its own
+/// rather than leaving a key authorization live forever.
+///
+/// **Reads are unauthenticated.** `get()` is reached from
+/// `/.well-known/acme-challenge/{token}` on port 80, so the token is
+/// validated for shape before any lock or query, and no line is
+/// logged per lookup.
+///
+/// **Fleet:** this store is one node's view. On a control plane the
+/// ACME driver wraps it in `FleetHttp01Solver`, which additionally
+/// publishes the token to the followers that answer for the hostname
+/// being validated (Story 9.5 AC #6); the wrapper is a passthrough
+/// everywhere else.
 ///
 /// **Worker visibility:** workers serve the HTTP-01 endpoint from the
 /// proxy data plane (port 80); their `request_filter` calls `get()`
@@ -191,7 +205,17 @@ impl AcmeChallengeStore {
     }
 
     /// Look up the key authorization for `token`, falling back to SQLite if not in the local cache.
+    ///
+    /// The token arrives from an unauthenticated caller: it is the
+    /// last path segment of `/.well-known/acme-challenge/{token}` on
+    /// port 80. It is validated for shape before anything is read, so
+    /// an arbitrary path segment cannot reach a lock, a query or a log
+    /// line. Nothing is logged per lookup either: this runs once per
+    /// request on a public path, and the caller controls the text.
     pub async fn get(&self, token: &str) -> Option<String> {
+        if !lorica_cluster::messages::challenge_token_is_valid(token) {
+            return None;
+        }
         let now = Utc::now();
         // Try in-memory first (supervisor process). An entry past its
         // deadline is treated as absent rather than removed here: the
@@ -199,15 +223,12 @@ impl AcmeChallengeStore {
         // reclaims it runs on the retention loop.
         if let Some((val, expires_at)) = self.challenges.read().await.get(token).cloned() {
             if expires_at > now {
-                tracing::info!(token = token, "ACME challenge found in memory");
                 return Some(val);
             }
-            tracing::info!(token = token, "ACME challenge in memory but expired");
         }
         // Fall back to SQLite (worker processes)
         let conn = self.conn.as_ref()?.clone();
         let token_owned = token.to_string();
-        let db_log = self.db_path.clone();
         let result = tokio::task::spawn_blocking(move || {
             let guard = conn.lock();
             guard
@@ -221,12 +242,6 @@ impl AcmeChallengeStore {
         .await
         .ok()
         .flatten();
-        if result.is_some() {
-            tracing::info!(token = token, "ACME challenge found in SQLite");
-        } else {
-            tracing::info!(token = token, db = %db_log.display(),
-                "ACME challenge not found in memory or SQLite");
-        }
         result
     }
 
@@ -276,5 +291,68 @@ impl lorica_acme::Http01ChallengeSolver for AcmeChallengeStore {
 
     async fn cleanup(&self, token: &str) {
         self.remove(token).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store with no SQLite behind it: enough for the read-path
+    /// guards, which run before anything touches the database.
+    fn memory_only_store() -> AcmeChallengeStore {
+        AcmeChallengeStore {
+            challenges: Arc::new(RwLock::new(HashMap::new())),
+            conn: None,
+            db_path: std::path::PathBuf::from("/nonexistent/test.db"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_that_is_not_a_token_is_refused_before_any_lookup() {
+        let store = memory_only_store();
+        store
+            .set("valid-token".to_string(), "valid.keyauth".to_string())
+            .await
+            .expect("a memory-only store still accepts a publication");
+        assert_eq!(
+            store.get("valid-token").await,
+            Some("valid.keyauth".to_string())
+        );
+
+        // This path is reached from an unauthenticated request on port
+        // 80, with the token taken verbatim from the URL, so the shape
+        // is checked before a lock is taken or a row is read.
+        for hostile in [
+            "",
+            "../../../secret.key",
+            "valid-token/..",
+            "token with spaces",
+            "token\nInjected: header",
+        ] {
+            assert_eq!(
+                store.get(hostile).await,
+                None,
+                "a path segment that is not a base64url token must never reach the store"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_entry_is_absent_rather_than_served() {
+        let store = memory_only_store();
+        store.challenges.write().await.insert(
+            "stale".to_string(),
+            (
+                "keyauth".to_string(),
+                Utc::now() - chrono::Duration::seconds(1),
+            ),
+        );
+
+        assert_eq!(
+            store.get("stale").await,
+            None,
+            "the deadline is honoured on the read path, not only by the purge"
+        );
     }
 }

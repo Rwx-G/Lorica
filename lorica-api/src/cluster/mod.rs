@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use lorica_cluster::{display_field_is_valid, leaf_spki_sha256, token, ClusterRequest, ControlPlane};
+use lorica_cluster::{leaf_spki_sha256, token, ClusterRequest, ControlPlane};
 use lorica_config::models::{ClusterNode, JoinToken, NodeStatus, TokenState};
 use serde::{Deserialize, Serialize};
 
@@ -108,12 +108,33 @@ pub async fn mint_token(
             "ttl_seconds must be between 1 and {MAX_TOKEN_TTL_S}"
         )));
     }
-    if let Some(name) = &body.node_name {
-        if name.is_empty() || !display_field_is_valid(name) {
-            return Err(ApiError::BadRequest(
-                "node_name must be 1-64 bytes without control characters".into(),
-            ));
-        }
+    // The name binding is MANDATORY (Story 9.5 QA, decision D15).
+    //
+    // A route's `node_selector` names nodes, and that name decides who
+    // receives a private key. The name is written at enrollment from a
+    // value the JOINING node supplies, so an unbound token lets its
+    // holder claim any name no node currently holds, including one a
+    // route already names because the operator wrote the routing
+    // before provisioning the machine. Binding the token is what makes
+    // the claim the operator's decision rather than the joiner's.
+    //
+    // This is Consul's node identity: the token, not the agent, decides
+    // which name may be registered. It costs the operator one argument
+    // and removes a whole class of impersonation.
+    let Some(name) = &body.node_name else {
+        return Err(ApiError::BadRequest(
+            "node_name is required: a join token must name the node it may enrol, because that              name is what route selectors resolve against"
+                .into(),
+        ));
+    };
+    // The same alphabet a `node_selector` entry must satisfy. These
+    // used to differ, so a node could register a name no selector could
+    // ever reference (uppercase, spaces, homoglyphs), which made the
+    // two sides of one string disagree.
+    if let Err(reason) = lorica_config::models::validate_node_selector_names(
+        std::slice::from_ref(name),
+    ) {
+        return Err(ApiError::BadRequest(format!("node_name: {reason}")));
     }
     if let Some(cidr) = &body.source_cidr {
         cidr.parse::<ipnet::IpNet>()
@@ -252,9 +273,24 @@ pub struct NodeResponse {
     pub session_peer: Option<String>,
     /// Unix seconds of the live session's last activity.
     pub session_last_seen_unix: Option<u64>,
+    /// Hostnames whose routes name this node in their selector, and
+    /// whose certificate private keys it therefore receives (Story 9.5
+    /// QA, decision D15).
+    ///
+    /// Present so activating a node is a decision rather than a
+    /// button: the name is chosen by the joining machine, so an
+    /// operator approving a `pending` node has to be able to see that
+    /// a route is already waiting for that name with a private key
+    /// attached. Fleet-wide routes are excluded; they apply to every
+    /// node and would bury the entries that need thought.
+    pub selected_for_hostnames: Vec<String>,
 }
 
-fn node_responses(control: &ControlPlane, nodes: Vec<ClusterNode>) -> Vec<NodeResponse> {
+fn node_responses(
+    control: &ControlPlane,
+    nodes: Vec<ClusterNode>,
+    selected: &HashMap<String, Vec<String>>,
+) -> Vec<NodeResponse> {
     let live: HashMap<String, (String, u64)> = control
         .sessions
         .snapshot()
@@ -269,10 +305,34 @@ fn node_responses(control: &ControlPlane, nodes: Vec<ClusterNode>) -> Vec<NodeRe
                 connected: session.is_some(),
                 session_peer: session.as_ref().map(|(peer, _)| peer.clone()),
                 session_last_seen_unix: session.map(|(_, seen)| seen),
+                selected_for_hostnames: selected.get(&node.name).cloned().unwrap_or_default(),
                 node,
             }
         })
         .collect()
+}
+
+/// Which hostnames each of these node NAMES is selected for, resolved
+/// in one store pass rather than one per node.
+fn selected_hostnames(
+    store: &lorica_config::ConfigStore,
+    nodes: &[ClusterNode],
+) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    for node in nodes {
+        if out.contains_key(&node.name) {
+            continue;
+        }
+        // A read failure here degrades the review to "no entries
+        // known" rather than failing the roster: an operator who
+        // cannot list the fleet is worse off than one whose advisory
+        // column is empty.
+        let hostnames = store
+            .hostnames_selecting_node_name(&node.name)
+            .unwrap_or_default();
+        out.insert(node.name.clone(), hostnames);
+    }
+    out
 }
 
 /// GET /api/v1/cluster/nodes - the fleet roster (Viewer+).
@@ -280,13 +340,15 @@ pub async fn list_nodes(
     Extension(state): Extension<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
-    let nodes = db_blocking(&state.store, |store| {
-        store
+    let (nodes, selected) = db_blocking(&state.store, |store| {
+        let nodes = store
             .list_cluster_nodes()
-            .map_err(|e| ApiError::Internal(e.to_string()))
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let selected = selected_hostnames(store, &nodes);
+        Ok::<_, ApiError>((nodes, selected))
     })
     .await?;
-    Ok(json_data(node_responses(&control, nodes)))
+    Ok(json_data(node_responses(&control, nodes, &selected)))
 }
 
 /// GET /api/v1/cluster/nodes/{id} - one node (Viewer+).
@@ -295,14 +357,16 @@ pub async fn get_node(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
-    let node = db_blocking(&state.store, move |store| {
-        store
+    let (node, selected) = db_blocking(&state.store, move |store| {
+        let node = store
             .get_cluster_node(&id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::NotFound("node not found".into()))
+            .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
+        let selected = selected_hostnames(store, std::slice::from_ref(&node));
+        Ok::<_, ApiError>((node, selected))
     })
     .await?;
-    let mut responses = node_responses(&control, vec![node]);
+    let mut responses = node_responses(&control, vec![node], &selected);
     Ok(json_data(responses.remove(0)))
 }
 
@@ -317,7 +381,7 @@ pub async fn activate_node(
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
     let node_id = id.clone();
-    let node = db_blocking(&state.store, move |store| {
+    let (node, selected) = db_blocking(&state.store, move |store| {
         let before = store
             .get_cluster_node(&node_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
@@ -331,10 +395,12 @@ pub async fn activate_node(
         store
             .activate_cluster_node(&node_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        store
+        let node = store
             .get_cluster_node(&node_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::NotFound("node not found".into()))
+            .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
+        let selected = selected_hostnames(store, std::slice::from_ref(&node));
+        Ok::<_, ApiError>((node, selected))
     })
     .await?;
     runtime::refresh_control_plane(&control, &state.store).await?;
@@ -348,7 +414,7 @@ pub async fn activate_node(
         Some(&serde_json::json!({ "status": "active", "name": node.name })),
     )
     .await;
-    let mut responses = node_responses(&control, vec![node]);
+    let mut responses = node_responses(&control, vec![node], &selected);
     Ok(json_data(responses.remove(0)))
 }
 
@@ -495,7 +561,9 @@ pub async fn get_status(
                     .map_err(|e| ApiError::Internal(e.to_string()))
             })
             .await?;
-            let fleet = node_responses(control, nodes)
+            // `FleetEntry` carries no selector column, so the status
+            // summary skips the per-node store pass the roster does.
+            let fleet = node_responses(control, nodes, &HashMap::new())
                 .into_iter()
                 .map(|n| FleetEntry {
                     node_id: n.node.node_id,

@@ -247,11 +247,27 @@ pub fn set_cluster_drift_nodes(count: usize) {
 }
 
 /// Certificate distribution outcomes per node (Story 9.5 AC #10).
-/// `outcome` is `pushed`, `pulled`, `refused` or `failed`.
+///
+/// One unit is one CERTIFICATE, on every outcome, so the series can
+/// be compared with each other. `node_id` always names the FOLLOWER
+/// the certificate was for, whichever side incremented it.
+///
+/// Control-plane side, what was sent:
+/// - `pushed`: handed to that node at issuance and acknowledged installed.
+/// - `push_failed`: the push round failed for that node (it converges by pull).
+/// - `served`: handed to that node in answer to its own pull.
+///
+/// Follower side, what was applied:
+/// - `installed`: written to the local store, whether pushed or pulled.
+/// - `refused`: rejected locally (defective bundle, store error).
+///
+/// The two sides count different events on purpose: `pushed + served`
+/// against `installed + refused` is the delivery gap. Nothing counts
+/// the same certificate twice under the same outcome.
 static CLUSTER_CERT_PUSH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
         "lorica_cluster_cert_push_total",
-        "Certificate distribution outcomes per cluster node",
+        "Certificate distribution outcomes per cluster node, counted per certificate",
         &["node_id", "outcome"],
     )
 });
@@ -261,6 +277,17 @@ pub fn inc_cluster_cert_push(node_id: &str, outcome: &str) {
     CLUSTER_CERT_PUSH_TOTAL
         .with_label_values(&[node_id, outcome])
         .inc();
+}
+
+/// Count `n` certificates at once for a node (AC #10), for the paths
+/// that resolve a batch rather than one certificate.
+pub fn inc_cluster_cert_push_by(node_id: &str, outcome: &str, n: usize) {
+    if n == 0 {
+        return;
+    }
+    CLUSTER_CERT_PUSH_TOTAL
+        .with_label_values(&[node_id, outcome])
+        .inc_by(n as u64);
 }
 
 /// Publish this node's own applied generation (a follower reports
@@ -1615,6 +1642,30 @@ pub fn inc_certificates_invalid_bundle_by(source: &str, count: u64) {
     CERTIFICATES_INVALID_BUNDLE_TOTAL
         .with_label_values(&[source])
         .inc_by(count);
+}
+
+/// Gauge: certificate rows this node holds with a chain but no
+/// private key (Story 9.5 decision D12).
+///
+/// This is the state a follower is in between receiving a
+/// configuration that announces a certificate and receiving the key
+/// itself, so it is expected to be non-zero briefly and expected to
+/// return to zero. It exists because before it, such a row was
+/// indistinguishable from a corrupt bundle: both landed in
+/// `certificates_invalid_bundle_total{source="reload"}`, and the two
+/// need opposite operator responses. A row that stays here is a
+/// distribution failure to chase on the control plane; an invalid
+/// bundle is a broken certificate to replace.
+static CERTIFICATES_AWAITING_KEY: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "certificates_awaiting_key",
+        "Certificate rows held with a chain but no private key, awaiting distribution",
+    )
+});
+
+/// Publish how many certificate rows are waiting for their key (D12).
+pub fn set_certificates_awaiting_key(count: usize) {
+    CERTIFICATES_AWAITING_KEY.set(i64::try_from(count).unwrap_or(i64::MAX));
 }
 
 /// Counter: audit-log row inserts that failed (DB error or task panic).

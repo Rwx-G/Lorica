@@ -150,10 +150,12 @@ pub async fn serve_challenge(
         .as_ref()
         .ok_or_else(|| ApiError::NotFound("ACME not initialized".into()))?;
 
+    // The token is not echoed back: this endpoint is unauthenticated
+    // and the value comes straight from the request path.
     challenge_store
         .get(&token)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("challenge token {token} not found")))
+        .ok_or_else(|| ApiError::NotFound("challenge token not found".into()))
 }
 
 /// Internal ACME provisioning: drives issuance via `lorica_acme::issue_http01`

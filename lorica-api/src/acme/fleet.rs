@@ -24,13 +24,33 @@
 //! # The verdict has to be all-or-nothing, and this is why
 //!
 //! A certificate authority chooses which node it validates against; we
-//! do not. So the token has to be present on every node that could
-//! answer for that hostname BEFORE the order is declared ready.
-//! Declaring readiness while one node has nothing asks the authority
-//! to validate against a machine that will answer 404, and what comes
-//! back is an opaque "not ready" with no indication of which node
-//! broke. Story 9.1 made `present` fallible precisely so this failure
-//! can be named instead of guessed at.
+//! do not, and since it validates from several vantage points that each
+//! resolve the name themselves, "some node had the token" is not good
+//! enough. So the token has to be present on every node that could
+//! ANSWER for that hostname before the order is declared ready.
+//! Declaring readiness while one such node has nothing asks the
+//! authority to validate against a machine that will answer 404, and
+//! what comes back is an opaque "not ready" with no indication of which
+//! node broke. Story 9.1 made `present` fallible precisely so this
+//! failure can be named instead of guessed at.
+//!
+//! # Which failures block, and which do not (decision D16)
+//!
+//! "Could answer" is the operative word. A node with no live cluster
+//! session is not answering anything, port 80 included: an authority
+//! that resolves the hostname to it gets a connection failure whether
+//! or not a token was published there. Refusing to attempt validation
+//! because of it prevents no failure and causes a real one, since with
+//! one follower down an all-or-nothing verdict stops renewing every
+//! certificate on a fleet-wide route until it returns, and the renewal
+//! loop only retries every twelve hours.
+//!
+//! So only a node that IS up and refused the token blocks the order.
+//! An offline recipient is logged at WARN and the order proceeds. This
+//! matches what the two-phase configuration replication already does
+//! with an unreachable node (it evicts rather than lets one wedged
+//! node veto the fleet) and what certificate distribution does on the
+//! push side of this very story.
 //!
 //! # Why an empty recipient set is NOT a refusal
 //!
@@ -145,7 +165,15 @@ impl Http01ChallengeSolver for FleetHttp01Solver {
             .control
             .publish_challenge(&recipients, identifier, &token, &key_authorization)
             .await;
-        if !report.failed.is_empty() {
+        // Decision D16: a LIVE node that refused blocks the order,
+        // because it will answer the authority with a 404. A node with
+        // no live session does not, because it is answering nothing at
+        // all: the authority that resolves to it gets a connection
+        // failure whether or not we published there, and refusing to
+        // try would stop renewing every certificate on a fleet-wide
+        // route for as long as one follower stays down.
+        let blocking = report.blocking();
+        if !blocking.is_empty() {
             // Retract what did land before giving up, so a retried
             // order does not race tokens left behind by this one. The
             // driver also calls `cleanup`, but only for tokens it
@@ -155,13 +183,29 @@ impl Http01ChallengeSolver for FleetHttp01Solver {
                 .retract_challenge(&report.delivered, &token)
                 .await;
             self.local.remove(&token).await;
-            let (node_id, reason) = &report.failed[0];
+            let (node_id, reason) = blocking[0];
             return Err(AcmeError::Solver(format!(
-                "{} of {} nodes did not take the challenge for {identifier}; first failure on \
+                "{} of {} nodes refused the challenge for {identifier}; first refusal on \
                  node {node_id}: {reason}",
-                report.failed.len(),
+                blocking.len(),
                 recipients.len()
             )));
+        }
+        let offline = report.offline();
+        if !offline.is_empty() {
+            // Loud, because it IS a degraded issuance: if the
+            // authority's DNS still resolves to one of these nodes it
+            // will fail to connect, and multi-perspective validation
+            // needs most of its vantage points to succeed.
+            tracing::warn!(
+                identifier,
+                offline = offline.len(),
+                nodes = ?offline,
+                "publishing the HTTP-01 challenge without these nodes: they have no live cluster \
+                 session. Validation proceeds, because a node that answers nothing on the cluster \
+                 plane answers nothing on port 80 either, but it will fail if the authority still \
+                 resolves the hostname to one of them"
+            );
         }
         tracing::info!(
             identifier,

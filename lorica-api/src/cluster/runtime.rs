@@ -267,10 +267,9 @@ pub fn cert_bundle(cert: &lorica_config::models::Certificate) -> CertBundle {
         domain: cert.domain.clone(),
         cert_pem: cert.cert_pem.clone(),
         key_pem: cert.key_pem.clone(),
-        key_digest: format!(
-            "sha256:{}",
-            lorica_config::canonical::sha256_hex(cert.key_pem.as_bytes())
-        ),
+        // The ONE function that owns this format, shared with the
+        // canonical blob. A second expression of it here would drift.
+        key_digest: lorica_config::canonical::secret_digest(&cert.key_pem),
     }
 }
 
@@ -309,10 +308,20 @@ pub async fn distribute_certificate(
             return;
         }
     };
+    // Three ways to have nothing to push, told apart because they mean
+    // very different things to an operator watching an issuance.
     let Some(cert) = cert else {
+        tracing::warn!(cert_id, "certificate vanished between issuance and distribution");
         return;
     };
-    if cert.key_pem.is_empty() || recipients.is_empty() {
+    if cert.key_pem.is_empty() {
+        tracing::error!(cert_id,
+            "certificate carries no private key; nothing to distribute");
+        return;
+    }
+    if recipients.is_empty() {
+        tracing::info!(cert_id, domain = %cert.domain,
+            "no node is selected for this certificate; nothing to distribute");
         return;
     }
     let report = runtime
@@ -320,11 +329,13 @@ pub async fn distribute_certificate(
         .distribute_certificates(&recipients, vec![cert_bundle(&cert)])
         .await;
     for (node_id, count) in &report.installed {
-        crate::metrics::inc_cluster_cert_push(node_id, "pushed");
+        crate::metrics::inc_cluster_cert_push_by(node_id, "pushed", *count);
         tracing::info!(node_id, cert_id, installed = count, "certificate key pushed");
     }
     for (node_id, reason) in &report.failed {
-        crate::metrics::inc_cluster_cert_push(node_id, "failed");
+        // One certificate went into this round, so one certificate is
+        // what failed to reach the node.
+        crate::metrics::inc_cluster_cert_push(node_id, "push_failed");
         tracing::warn!(node_id, cert_id, %reason,
             "certificate push failed; the node asks for it after its next apply");
     }
