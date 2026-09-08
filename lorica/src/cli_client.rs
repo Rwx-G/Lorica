@@ -76,19 +76,35 @@ pub(crate) async fn management_data(response: reqwest::Response, what: &str) -> 
         .unwrap_or_else(|| fail(format!("{what}: unexpected answer: {body}")))
 }
 
-/// The management password from its documented sources, in order:
-/// `--password-file`, `--password-stdin`, `LORICA_ADMIN_PASSWORD`,
-/// then `--password` (accepted with a warning: argv is readable
-/// through `/proc`, lands in shell history and is logged verbatim by
-/// CI and configuration-management `command` modules).
+/// The environment variable the management password is read from
+/// when no explicit source is given.
+pub(crate) const ADMIN_PASSWORD_ENV: &str = "LORICA_ADMIN_PASSWORD";
+
+/// The management password from its documented sources. Explicit
+/// arguments win over the ambient environment, in this order:
+/// `--password-file`, `--password-stdin`, `--password` (accepted with
+/// a warning: argv is readable through `/proc`, lands in shell history
+/// and is logged verbatim by CI and configuration-management `command`
+/// modules), then `LORICA_ADMIN_PASSWORD`. A trailing newline is
+/// stripped from every source (`echo` and heredocs add one).
 pub(crate) fn read_admin_password(
     literal: Option<String>,
     file: Option<&Path>,
     from_stdin: bool,
 ) -> Result<String, String> {
+    read_admin_password_with_env(literal, file, from_stdin, std::env::var(ADMIN_PASSWORD_ENV).ok())
+}
+
+fn read_admin_password_with_env(
+    literal: Option<String>,
+    file: Option<&Path>,
+    from_stdin: bool,
+    from_env: Option<String>,
+) -> Result<String, String> {
+    let trimmed = |s: String| s.trim_end_matches(['\r', '\n']).to_string();
     if let Some(path) = file {
         return std::fs::read_to_string(path)
-            .map(|s| s.trim_end_matches(['\r', '\n']).to_string())
+            .map(trimmed)
             .map_err(|e| format!("cannot read the password file {}: {e}", path.display()));
     }
     if from_stdin {
@@ -96,24 +112,43 @@ pub(crate) fn read_admin_password(
         std::io::stdin()
             .read_to_string(&mut buffer)
             .map_err(|e| format!("cannot read the password from standard input: {e}"))?;
-        return Ok(buffer.trim_end_matches(['\r', '\n']).to_string());
-    }
-    if let Ok(from_env) = std::env::var("LORICA_ADMIN_PASSWORD") {
-        if !from_env.is_empty() {
-            return Ok(from_env);
-        }
+        return Ok(trimmed(buffer));
     }
     if let Some(literal) = literal {
         eprintln!(
             "warning: --password on the command line is visible to every local process and \
              lands in shell history; prefer --password-file, --password-stdin or \
-             LORICA_ADMIN_PASSWORD"
+             {ADMIN_PASSWORD_ENV}"
         );
         return Ok(literal);
     }
-    Err("no password: pass --password-file <path>, --password-stdin, set LORICA_ADMIN_PASSWORD, \
+    if let Some(from_env) = from_env.map(trimmed).filter(|s| !s.is_empty()) {
+        return Ok(from_env);
+    }
+    Err(format!(
+        "no password: pass --password-file <path>, --password-stdin, set {ADMIN_PASSWORD_ENV}, \
          or (discouraged) --password"
-        .to_string())
+    ))
+}
+
+/// The password for a command whose credentials are optional
+/// (`cluster leave`, `cluster status`): `None` when no `--user` is
+/// given AND no explicit password source was passed; a password
+/// source without `--user` is a mistake worth naming rather than
+/// silently ignoring (the command would then run credential-less).
+pub(crate) fn optional_admin_password(
+    user: Option<&str>,
+    literal: Option<String>,
+    file: Option<&Path>,
+    from_stdin: bool,
+) -> Option<String> {
+    if user.is_none() {
+        if literal.is_some() || file.is_some() || from_stdin {
+            fail("a password source was given without --user; pass --user <name> as well");
+        }
+        return None;
+    }
+    Some(read_admin_password(literal, file, from_stdin).unwrap_or_else(|e| fail(e)))
 }
 
 #[cfg(test)]
@@ -124,17 +159,34 @@ mod tests {
     fn password_sources_follow_the_documented_precedence() {
         let file = std::env::temp_dir().join(format!("lorica-pw-{}", std::process::id()));
         std::fs::write(&file, "from-file\n").expect("write");
+        let env = Some("from-env\n".to_string());
+        // File beats everything.
         assert_eq!(
-            read_admin_password(Some("literal".into()), Some(&file), false).expect("file"),
+            read_admin_password_with_env(Some("literal".into()), Some(&file), false, env.clone())
+                .expect("file"),
             "from-file"
         );
+        // An explicit --password beats the ambient variable.
         assert_eq!(
-            read_admin_password(Some("literal".into()), None, false).expect("literal"),
+            read_admin_password_with_env(Some("literal".into()), None, false, env.clone())
+                .expect("literal"),
             "literal"
         );
-        assert!(read_admin_password(None, None, false).is_err()
-            || std::env::var("LORICA_ADMIN_PASSWORD").is_ok());
-        assert!(read_admin_password(None, Some(Path::new("/nonexistent/pw")), false).is_err());
+        // The variable is the fallback, trimmed.
+        assert_eq!(
+            read_admin_password_with_env(None, None, false, env).expect("env"),
+            "from-env"
+        );
+        // An empty variable is no source.
+        assert!(read_admin_password_with_env(None, None, false, Some(String::new())).is_err());
+        assert!(read_admin_password_with_env(None, None, false, None).is_err());
+        assert!(read_admin_password_with_env(
+            None,
+            Some(Path::new("/nonexistent/pw")),
+            false,
+            None
+        )
+        .is_err());
         let _ = std::fs::remove_file(&file);
     }
 }

@@ -56,15 +56,29 @@ fn main() {
         Some(Commands::RotateKey { new_key_file }) => {
             run_rotate_key(&cli.data_dir, &new_key_file);
         }
-        Some(Commands::Unban { ip, user, password }) => {
+        Some(Commands::Unban {
+            ip,
+            user,
+            password_file,
+            password_stdin,
+            password,
+        }) => {
+            let password =
+                cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
+                    .unwrap_or_else(|e| cli_client::fail(e));
             run_unban(cli.management_port, ip, user, password);
         }
         Some(Commands::Upgrade {
             binary,
             signature,
             user,
+            password_file,
+            password_stdin,
             password,
         }) => {
+            let password =
+                cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
+                    .unwrap_or_else(|e| cli_client::fail(e));
             run_upgrade(cli.management_port, binary, signature, user, password);
         }
         Some(Commands::Cluster { action }) => match action {
@@ -95,10 +109,12 @@ fn main() {
                 password_stdin,
                 password,
             } => {
-                let password = user.as_ref().map(|_| {
-                    cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
-                        .unwrap_or_else(|e| cli_client::fail(e))
-                });
+                let password = cli_client::optional_admin_password(
+                    user.as_deref(),
+                    password,
+                    password_file.as_deref(),
+                    password_stdin,
+                );
                 cli_cluster::run_cluster_leave(&cli.data_dir, cli.management_port, user, password);
             }
             ClusterAction::Status {
@@ -107,10 +123,12 @@ fn main() {
                 password_stdin,
                 password,
             } => {
-                let password = user.as_ref().map(|_| {
-                    cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
-                        .unwrap_or_else(|e| cli_client::fail(e))
-                });
+                let password = cli_client::optional_admin_password(
+                    user.as_deref(),
+                    password,
+                    password_file.as_deref(),
+                    password_stdin,
+                );
                 cli_cluster::run_cluster_status(&cli.data_dir, cli.management_port, user, password);
             }
             ClusterAction::Token {

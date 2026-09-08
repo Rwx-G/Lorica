@@ -214,9 +214,19 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "admin")]
         user: String,
 
-        /// Admin password
+        /// Read the admin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the admin password from standard input.
         #[arg(long)]
-        password: String,
+        password_stdin: bool,
+
+        /// Admin password on the command line (discouraged: argv is
+        /// visible to every local process and lands in shell history;
+        /// `LORICA_ADMIN_PASSWORD` is also read).
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Upload a new signed `lorica` binary to the running instance and
     /// trigger a zero-downtime hot upgrade (Story 8.4).
@@ -234,9 +244,17 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "admin")]
         user: String,
 
-        /// Admin password
+        /// Read the admin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the admin password from standard input.
         #[arg(long)]
-        password: String,
+        password_stdin: bool,
+
+        /// Admin password on the command line (discouraged; see `unban`).
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Cluster-plane management commands (Story 9.2).
     Cluster {
@@ -767,8 +785,9 @@ pub(crate) fn run_unban(port: u16, ip: String, user: String, password: String) {
 ///
 /// The multipart body is assembled by hand rather than via reqwest's
 /// `multipart` feature so no extra cargo feature (and its transitive
-/// deps) is pulled in just for one upload. Mirrors `run_unban`'s
-/// login-then-call flow against the localhost management API.
+/// deps) is pulled in just for one upload. The client and the login
+/// are the shared `cli_client` ones (one loopback trust decision, one
+/// login contract for every CLI command).
 pub(crate) fn run_upgrade(
     port: u16,
     binary: String,
@@ -795,33 +814,9 @@ pub(crate) fn run_upgrade(
             }
         };
 
-        // Same localhost-only TLS management API as `run_unban` (Story
-        // 8.8 AC #1): accept the self-signed cert since the target is
-        // always `127.0.0.1`.
-        let client = reqwest::Client::builder()
-            .cookie_store(true)
-            .danger_accept_invalid_certs(true)
-            .build()
-            .expect("HTTP client");
-
         // Login (the upgrade endpoint is behind require_auth).
-        let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
-        match client
-            .post(&login_url)
-            .json(&serde_json::json!({ "username": user, "password": password }))
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => {}
-            Ok(r) => {
-                eprintln!("Login failed ({}). Check credentials.", r.status());
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("Cannot connect to management API on port {port}: {e}");
-                std::process::exit(1);
-            }
-        }
+        let client = crate::cli_client::management_client();
+        crate::cli_client::management_login(&client, port, &user, &password).await;
 
         // Hand-rolled multipart/form-data body: `binary` (raw bytes) +
         // `signature` (hex text), matching the axum Multipart extractor.

@@ -29,7 +29,9 @@ but no live swap happens: the API response's `handoff` field reports
      the binary and its signature, review the verification result and the
      current-vs-uploaded version, then Start upgrade. A confirmation
      dialog warns that traffic drains over up to 30s.
-   - CLI: `lorica upgrade --binary <path> --signature <path>`.
+   - CLI: `lorica upgrade --binary <path> --signature <path>` (the admin
+     password comes from `--password-file`, `--password-stdin` or
+     `LORICA_ADMIN_PASSWORD`).
    Both post a `multipart/form-data` body to
    `POST /api/v1/system/upgrade` (the `binary` part is the raw executable,
    the `signature` part is the 128-hex-char detached signature).
