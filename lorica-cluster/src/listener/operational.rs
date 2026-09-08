@@ -178,6 +178,12 @@ pub struct OperationalStats {
     /// Convergence pulls the handler could not answer (the blob could
     /// not be built): refused opaquely, session kept.
     pub config_pull_refusals: AtomicU64,
+    /// Telemetry batches accepted (Story 9.6 AC #5), whatever the
+    /// per-node quota let through.
+    pub telemetry_pushes_served: AtomicU64,
+    /// Telemetry batches refused: the node is not Active, or the
+    /// handler could not write. Opaque refusal, session kept.
+    pub telemetry_push_refusals: AtomicU64,
     /// Certificate pulls served (Story 9.5 AC #8), whatever number of
     /// bundles the node turned out to be entitled to.
     pub cert_pulls_served: AtomicU64,
@@ -811,6 +817,50 @@ async fn serve_request(
                 Err(reason) => {
                     stats.config_pull_refusals.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(peer = %ctx.peer_addr, node_id, %reason, "convergence pull refused");
+                    ClusterResponse::refusal(ClusterStatus::Unspecified)
+                }
+            };
+            request
+                .reply_frame(reply)
+                .await
+                .err()
+                .map(|_| SessionEnd::Closed)
+        }
+        BridgeOutcome::InPlane(InPlaneAction::TelemetryPush { batch }) => {
+            let (Some(fleet), Some(node_id)) = (&shared.fleet, ctx.node_id()) else {
+                return request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::UnsupportedMethod))
+                    .await
+                    .err()
+                    .map(|_| SessionEnd::Closed);
+            };
+            // The same gate the configuration and certificate pulls
+            // apply. A node awaiting activation is visible and alive,
+            // but nothing it says belongs in the fleet's record of
+            // what happened.
+            if ctx.node.as_ref().map(|n| n.state) != Some(NodeState::Active) {
+                stats.telemetry_push_refusals.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    peer = %ctx.peer_addr,
+                    node_id,
+                    "telemetry push refused: the node is not active"
+                );
+                return request
+                    .reply_frame(ClusterResponse::refusal(ClusterStatus::Unspecified))
+                    .await
+                    .err()
+                    .map(|_| SessionEnd::Closed);
+            }
+            let reply = match fleet.handler.on_telemetry_push(node_id, *batch).await {
+                Ok(ack) => {
+                    stats.telemetry_pushes_served.fetch_add(1, Ordering::Relaxed);
+                    ClusterResponse::ok(cluster_response::Body::TelemetryPushAck(ack))
+                }
+                Err(reason) => {
+                    // A control plane that cannot store telemetry must
+                    // not drop the session that carries configuration.
+                    stats.telemetry_push_refusals.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(peer = %ctx.peer_addr, node_id, %reason, "telemetry push refused");
                     ClusterResponse::refusal(ClusterStatus::Unspecified)
                 }
             };

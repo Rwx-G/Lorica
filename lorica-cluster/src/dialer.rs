@@ -85,9 +85,9 @@ use crate::enroll::BoxFuture;
 use crate::handshake::{client_handshake, HandshakeConfig, HandshakeError};
 use crate::limits::cluster_rpc_limits;
 use crate::messages::{
-    cluster_response, config_hash_is_valid, CertPushAck, CertRefusal, ChallengePublishAck,
-    ChallengeRetractAck, ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus,
-    ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, Heartbeat, HelloAck,
+    cluster_response, config_hash_is_valid, BanPushAck, CertPushAck, CertRefusal,
+    ChallengePublishAck, ChallengeRetractAck, ClusterFrame, ClusterRequest, ClusterResponse,
+    ClusterStatus, ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, Heartbeat, HelloAck,
 };
 use crate::replication::{AppliedConfig, ConfigPayload, ConfigVersion};
 use crate::tls::{client_config, negotiated_cluster_alpn, ClusterTlsError};
@@ -152,6 +152,8 @@ pub struct DialerStats {
     pub challenge_publish_failures: AtomicU64,
     /// HTTP-01 challenge tokens this node was asked to stop serving.
     pub challenges_retracted: AtomicU64,
+    /// Fleet-wide bans applied on this node (Story 9.6 AC #10).
+    pub bans_applied: AtomicU64,
     /// Times an ack revealed the control plane is on another
     /// configuration version and a pull was started (AC #7).
     pub behind_detected: AtomicU64,
@@ -231,6 +233,24 @@ pub trait FollowerHandler: Send + Sync + 'static {
     /// path of an order, has nothing useful to report, and the entry's
     /// own deadline removes it anyway.
     fn on_challenge_retract(&self, token: String) -> BoxFuture<'_, ()>;
+
+    /// Apply an operator-issued fleet-wide ban (Story 9.6 AC #10).
+    ///
+    /// `Ok(true)` means the ban is now live on this node. `Ok(false)`
+    /// means this node has no data-plane ban map to write to (an API
+    /// node with no proxy), which is a legitimate answer rather than a
+    /// failure. `Err` is a local failure, answered with the opaque
+    /// refusal, session kept.
+    ///
+    /// Only ever operator-issued: automatic per-node auto-ban is not
+    /// replicated, because one node's reflex to its own traffic would
+    /// otherwise become a fleet-wide outage for that client.
+    fn on_ban_push(
+        &self,
+        client_ip: String,
+        duration_s: u64,
+        reason: String,
+    ) -> BoxFuture<'_, Result<bool, String>>;
 }
 
 /// Inputs for [`Dialer::spawn`]. Construct with [`DialerConfig::new`];
@@ -1038,6 +1058,22 @@ async fn serve_follower_action(
             ClusterResponse::ok(cluster_response::Body::ChallengeRetractAck(
                 ChallengeRetractAck {},
             ))
+        }
+        FollowerAction::ApplyBan {
+            client_ip,
+            duration_s,
+            reason,
+        } => {
+            stats.bans_applied.fetch_add(1, Ordering::Relaxed);
+            match handler.on_ban_push(client_ip, duration_s, reason).await {
+                Ok(applied) => {
+                    ClusterResponse::ok(cluster_response::Body::BanPushAck(BanPushAck { applied }))
+                }
+                Err(reason) => {
+                    tracing::warn!(%reason, "could not apply a fleet-wide ban");
+                    ClusterResponse::refusal(ClusterStatus::Unspecified)
+                }
+            }
         }
     };
     request.reply_frame(reply).await.is_ok()

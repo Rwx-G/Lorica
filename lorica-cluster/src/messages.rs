@@ -371,6 +371,203 @@ pub struct CertMaterial {
     pub key_digest: ::prost::alloc::string::String,
 }
 
+/// Longest a telemetry batch may be in either row list.
+///
+/// A follower drains its shared store on a timer, so a batch is one
+/// interval of traffic, not a backlog. The cap bounds the frame well
+/// under the transport limit and bounds what a peer can make the
+/// control plane allocate before its quota (AC #8) even runs.
+pub const MAX_TELEMETRY_ROWS: usize = 512;
+
+/// Longest a ban snapshot may be.
+///
+/// Bans are an in-memory map on each node (decision D3), and a node
+/// with more live bans than this has a problem the fleet view is not
+/// going to help with.
+pub const MAX_TELEMETRY_BANS: usize = 256;
+
+/// One access-log row on its way to the control plane (Story 9.6).
+///
+/// Mirrors the local `access_logs` columns minus the rowid, which is
+/// meaningless on another machine, and minus any node identity: the
+/// control plane stamps that from the session (decision D2).
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct TelemetryAccessRow {
+    /// RFC 3339 timestamp as the origin node recorded it.
+    #[prost(string, tag = "1")]
+    pub timestamp: ::prost::alloc::string::String,
+    /// HTTP method.
+    #[prost(string, tag = "2")]
+    pub method: ::prost::alloc::string::String,
+    /// Request path.
+    #[prost(string, tag = "3")]
+    pub path: ::prost::alloc::string::String,
+    /// Request host.
+    #[prost(string, tag = "4")]
+    pub host: ::prost::alloc::string::String,
+    /// Response status.
+    #[prost(uint32, tag = "5")]
+    pub status: u32,
+    /// End-to-end latency in milliseconds.
+    #[prost(uint64, tag = "6")]
+    pub latency_ms: u64,
+    /// Backend that served it.
+    #[prost(string, tag = "7")]
+    pub backend: ::prost::alloc::string::String,
+    /// Error text, empty when there was none.
+    #[prost(string, tag = "8")]
+    pub error: ::prost::alloc::string::String,
+    /// Client address as the origin node resolved it.
+    #[prost(string, tag = "9")]
+    pub client_ip: ::prost::alloc::string::String,
+    /// Whether `client_ip` came from a forwarded header.
+    #[prost(bool, tag = "10")]
+    pub is_xff: bool,
+    /// The proxy that supplied the forwarded header.
+    #[prost(string, tag = "11")]
+    pub xff_proxy_ip: ::prost::alloc::string::String,
+    /// Origin marker the local row carries.
+    #[prost(string, tag = "12")]
+    pub source: ::prost::alloc::string::String,
+    /// Correlation id, matching the trace when tracing is on.
+    #[prost(string, tag = "13")]
+    pub request_id: ::prost::alloc::string::String,
+}
+
+/// One WAF event on its way to the control plane (Story 9.6).
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct TelemetryWafRow {
+    /// Rule that matched.
+    #[prost(uint32, tag = "1")]
+    pub rule_id: u32,
+    /// Human-readable rule description.
+    #[prost(string, tag = "2")]
+    pub description: ::prost::alloc::string::String,
+    /// Rule category.
+    #[prost(string, tag = "3")]
+    pub category: ::prost::alloc::string::String,
+    /// Rule severity.
+    #[prost(uint32, tag = "4")]
+    pub severity: u32,
+    /// Which part of the request matched.
+    #[prost(string, tag = "5")]
+    pub matched_field: ::prost::alloc::string::String,
+    /// The matching value, already truncated by the origin node.
+    #[prost(string, tag = "6")]
+    pub matched_value: ::prost::alloc::string::String,
+    /// RFC 3339 timestamp as the origin node recorded it.
+    #[prost(string, tag = "7")]
+    pub timestamp: ::prost::alloc::string::String,
+    /// Client address.
+    #[prost(string, tag = "8")]
+    pub client_ip: ::prost::alloc::string::String,
+    /// Route hostname the event fired on.
+    #[prost(string, tag = "9")]
+    pub route_hostname: ::prost::alloc::string::String,
+    /// What the WAF did.
+    #[prost(string, tag = "10")]
+    pub action: ::prost::alloc::string::String,
+}
+
+/// One live ban, as a snapshot (Story 9.6 AC #10, decision D3).
+///
+/// Bans have no table: they are an in-memory map rebuilt from nothing
+/// on restart, so this is a periodic snapshot for visibility and is
+/// lossy across a restart by construction.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct TelemetryBan {
+    /// The banned client address.
+    #[prost(string, tag = "1")]
+    pub client_ip: ::prost::alloc::string::String,
+    /// Seconds left on the ban when the snapshot was taken.
+    #[prost(uint64, tag = "2")]
+    pub remaining_s: u64,
+    /// Why it was banned (`BanReason::as_str`).
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+
+/// A batch of telemetry (Story 9.6 AC #5), follower to control plane.
+///
+/// Upwards only: a control plane sending one is inverting the fan-in
+/// and is a `PROTOCOL_VIOLATION`.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct TelemetryPush {
+    /// Access-log rows, at most [`MAX_TELEMETRY_ROWS`].
+    #[prost(message, repeated, tag = "1")]
+    pub access: ::prost::alloc::vec::Vec<TelemetryAccessRow>,
+    /// WAF events, at most [`MAX_TELEMETRY_ROWS`].
+    #[prost(message, repeated, tag = "2")]
+    pub waf: ::prost::alloc::vec::Vec<TelemetryWafRow>,
+    /// Live bans, at most [`MAX_TELEMETRY_BANS`].
+    #[prost(message, repeated, tag = "3")]
+    pub bans: ::prost::alloc::vec::Vec<TelemetryBan>,
+    /// The sender's own rowid for the last access row in this batch.
+    /// Opaque to the control plane, which only echoes it back.
+    #[prost(uint64, tag = "4")]
+    pub access_cursor: u64,
+    /// The same for the last WAF event.
+    #[prost(uint64, tag = "5")]
+    pub waf_cursor: u64,
+    /// Rows the follower dropped since its last push, for the gauge.
+    #[prost(uint64, tag = "6")]
+    pub dropped_since_last: u64,
+}
+
+/// What the control plane stored (Story 9.6).
+///
+/// `accepted_*` may be lower than what was sent when a quota shed
+/// part of the batch; a non-zero `retry_after_s` tells the node to
+/// back off (AC #8).
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct TelemetryPushAck {
+    /// Access rows written.
+    #[prost(uint64, tag = "1")]
+    pub accepted_access: u64,
+    /// WAF events written.
+    #[prost(uint64, tag = "2")]
+    pub accepted_waf: u64,
+    /// Bans recorded.
+    #[prost(uint64, tag = "3")]
+    pub accepted_bans: u64,
+    /// Seconds to wait before pushing again; `0` means carry on.
+    #[prost(uint32, tag = "4")]
+    pub retry_after_s: u32,
+    /// The access cursor from the request, echoed unmodified.
+    #[prost(uint64, tag = "5")]
+    pub access_cursor: u64,
+    /// The WAF cursor from the request, echoed unmodified.
+    #[prost(uint64, tag = "6")]
+    pub waf_cursor: u64,
+}
+
+/// A fleet-wide ban (Story 9.6 AC #10), control plane to follower.
+///
+/// Operator-issued only. Automatic per-node auto-ban is NOT
+/// replicated: it is a local reflex to local traffic, and replicating
+/// it would turn one node's false positive into a fleet-wide outage
+/// for that client.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct BanPush {
+    /// Address to ban.
+    #[prost(string, tag = "1")]
+    pub client_ip: ::prost::alloc::string::String,
+    /// How long the ban lasts, in seconds.
+    #[prost(uint64, tag = "2")]
+    pub duration_s: u64,
+    /// Reason recorded on the node.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+
+/// Whether the node applied the fleet-wide ban.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct BanPushAck {
+    /// `true` when the ban is now live on this node.
+    #[prost(bool, tag = "1")]
+    pub applied: bool,
+}
+
 /// Certificate distribution (Story 9.5 AC #7), control plane to
 /// follower: install this material now, independently of any
 /// configuration commit.
@@ -505,6 +702,10 @@ pub const BODY_KIND_CONFIG_COMMIT: u32 = 21;
 pub const BODY_KIND_CONFIG_ABORT: u32 = 22;
 /// `body_kind` value of a [`ConfigPull`] request (its oneof tag).
 pub const BODY_KIND_CONFIG_PULL: u32 = 23;
+/// `body_kind` value of a [`TelemetryPush`] request (its oneof tag).
+pub const BODY_KIND_TELEMETRY_PUSH: u32 = 40;
+/// `body_kind` value of a [`BanPush`] request (its oneof tag).
+pub const BODY_KIND_BAN_PUSH: u32 = 41;
 /// `body_kind` value of a [`CertPush`] request (its oneof tag).
 pub const BODY_KIND_CERT_PUSH: u32 = 60;
 /// `body_kind` value of a [`CertPull`] request (its oneof tag).
@@ -592,6 +793,36 @@ fn is_base64url(b: u8) -> bool {
     matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_')
 }
 
+/// Longest a ban target may be: an IPv6 address with a zone id has
+/// room here, and nothing legitimate is longer.
+pub const MAX_BAN_TARGET_BYTES: usize = 64;
+
+/// Longest a ban reason may be.
+pub const MAX_BAN_REASON_BYTES: usize = 64;
+
+/// Whether a peer-supplied ban target is acceptable (Story 9.6).
+///
+/// The value becomes a key in the data-plane ban map, which the
+/// request path consults on every request, and reaches the `/bans`
+/// API. It must parse as an IP address: a ban on something that is
+/// not an address can never match a client and would sit in the map
+/// forever, and accepting arbitrary text here would let a control
+/// plane write log lines through a follower.
+pub fn ban_target_is_valid(client_ip: &str) -> bool {
+    !client_ip.is_empty()
+        && client_ip.len() <= MAX_BAN_TARGET_BYTES
+        && client_ip.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Whether a peer-supplied ban reason is acceptable (Story 9.6):
+/// non-empty, bounded, and free of control characters, since it
+/// reaches a log line and a JSON response.
+pub fn ban_reason_is_valid(reason: &str) -> bool {
+    !reason.is_empty()
+        && reason.len() <= MAX_BAN_REASON_BYTES
+        && !reason.chars().any(char::is_control)
+}
+
 /// Whether a peer-supplied challenge token is acceptable: non-empty,
 /// at most [`MAX_CHALLENGE_TOKEN_BYTES`], base64url alphabet only.
 ///
@@ -627,8 +858,8 @@ pub fn challenge_key_authorization_is_valid(key_authorization: &str) -> bool {
 ///
 /// Body tags: 10-19 session control (Story 9.2) and lifecycle
 /// (Story 9.3), 20-39 configuration replication (Story 9.4: 20-23 in
-/// use, 24-39 reserved), 40-59 RESERVED for telemetry fan-in
-/// (Story 9.6), 60-79 certificate distribution and HTTP-01 challenge
+/// use, 24-39 reserved), 40-59 telemetry fan-in (Story 9.6: 40-41 in
+/// use, 42-59 reserved), 60-79 certificate distribution and HTTP-01 challenge
 /// fan-out (Story 9.5: 60-63 in use, 64-79 reserved).
 ///
 /// `body_kind` duplicates the body's oneof tag as a scalar so a
@@ -660,7 +891,7 @@ pub struct ClusterRequest {
     /// Typed request body.
     #[prost(
         oneof = "cluster_request::Body",
-        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23, 60, 61, 62, 63"
+        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23, 40, 41, 60, 61, 62, 63"
     )]
     pub body: ::core::option::Option<cluster_request::Body>,
 }
@@ -668,8 +899,8 @@ pub struct ClusterRequest {
 /// Typed body variants for [`ClusterRequest`].
 pub mod cluster_request {
     use super::{
-        CertPull, CertPush, ChallengePublish, ChallengeRetract, ConfigAbort, ConfigCommit,
-        ConfigPrepare, ConfigPull, Enroll, Heartbeat, Hello, Leave, Renew,
+        BanPush, CertPull, CertPush, ChallengePublish, ChallengeRetract, ConfigAbort, ConfigCommit,
+        ConfigPrepare, ConfigPull, Enroll, Heartbeat, Hello, Leave, Renew, TelemetryPush,
     };
 
     /// Request payloads (see the tag-range note on `ClusterRequest`).
@@ -703,6 +934,16 @@ pub mod cluster_request {
         /// Convergence pull (follower to control plane).
         #[prost(message, tag = "23")]
         ConfigPull(ConfigPull),
+        /// A batch of telemetry (follower to control plane,
+        /// Story 9.6). Upwards only: a control plane pushing
+        /// telemetry at a follower is inverting the fan-in.
+        #[prost(message, tag = "40")]
+        TelemetryPush(TelemetryPush),
+        /// A fleet-wide ban (control plane to follower, Story 9.6).
+        /// Downwards only, and only ever operator-issued: automatic
+        /// per-node auto-ban stays local.
+        #[prost(message, tag = "41")]
+        BanPush(BanPush),
         /// Certificate material (control plane to follower,
         /// Story 9.5). It travels DOWNWARDS only: a follower sending
         /// one is pushing private keys at its control plane.
@@ -737,6 +978,8 @@ pub mod cluster_request {
                 Body::ConfigCommit(_) => super::BODY_KIND_CONFIG_COMMIT,
                 Body::ConfigAbort(_) => super::BODY_KIND_CONFIG_ABORT,
                 Body::ConfigPull(_) => super::BODY_KIND_CONFIG_PULL,
+                Body::TelemetryPush(_) => super::BODY_KIND_TELEMETRY_PUSH,
+                Body::BanPush(_) => super::BODY_KIND_BAN_PUSH,
                 Body::CertPush(_) => super::BODY_KIND_CERT_PUSH,
                 Body::CertPull(_) => super::BODY_KIND_CERT_PULL,
                 Body::ChallengePublish(_) => super::BODY_KIND_CHALLENGE_PUBLISH,
@@ -804,6 +1047,16 @@ impl ClusterRequest {
         Self::with_body(cluster_request::Body::ConfigPull(pull))
     }
 
+    /// A telemetry batch (Story 9.6), follower to control plane.
+    pub fn telemetry_push(push: TelemetryPush) -> Self {
+        Self::with_body(cluster_request::Body::TelemetryPush(push))
+    }
+
+    /// A fleet-wide ban (Story 9.6), control plane to follower.
+    pub fn ban_push(push: BanPush) -> Self {
+        Self::with_body(cluster_request::Body::BanPush(push))
+    }
+
     /// A certificate push (Story 9.5), control plane to follower.
     pub fn cert_push(push: CertPush) -> Self {
         Self::with_body(cluster_request::Body::CertPush(push))
@@ -841,6 +1094,8 @@ impl ClusterRequest {
                 | BODY_KIND_CONFIG_COMMIT
                 | BODY_KIND_CONFIG_ABORT
                 | BODY_KIND_CONFIG_PULL
+                | BODY_KIND_TELEMETRY_PUSH
+                | BODY_KIND_BAN_PUSH
                 | BODY_KIND_CERT_PUSH
                 | BODY_KIND_CERT_PULL
                 | BODY_KIND_CHALLENGE_PUBLISH
@@ -875,7 +1130,7 @@ pub struct ClusterResponse {
     /// Typed response body; `None` on refusals.
     #[prost(
         oneof = "cluster_response::Body",
-        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23, 60, 61, 62, 63"
+        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23, 40, 41, 60, 61, 62, 63"
     )]
     pub body: ::core::option::Option<cluster_response::Body>,
 }
@@ -883,9 +1138,9 @@ pub struct ClusterResponse {
 /// Typed body variants for [`ClusterResponse`].
 pub mod cluster_response {
     use super::{
-        CertPullAck, CertPushAck, ChallengePublishAck, ChallengeRetractAck, ConfigAbortAck,
-        ConfigCommitAck, ConfigPrepareAck, ConfigPullAck, EnrollAck, HeartbeatAck, HelloAck,
-        LeaveAck, RenewAck,
+        BanPushAck, CertPullAck, CertPushAck, ChallengePublishAck, ChallengeRetractAck,
+        ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, ConfigPullAck, EnrollAck, HeartbeatAck,
+        HelloAck, LeaveAck, RenewAck, TelemetryPushAck,
     };
 
     /// Response payloads (tag ranges mirror `cluster_request::Body`).
@@ -918,6 +1173,13 @@ pub mod cluster_response {
         /// Pull answer.
         #[prost(message, tag = "23")]
         ConfigPullAck(ConfigPullAck),
+        /// What the control plane stored of a telemetry batch, and
+        /// whether the node should back off (Story 9.6).
+        #[prost(message, tag = "40")]
+        TelemetryPushAck(TelemetryPushAck),
+        /// Whether the fleet-wide ban was applied (Story 9.6).
+        #[prost(message, tag = "41")]
+        BanPushAck(BanPushAck),
         /// What the follower did with a pushed batch (Story 9.5).
         #[prost(message, tag = "60")]
         CertPushAck(CertPushAck),
@@ -1471,6 +1733,11 @@ mod tests {
         for (request, block_field) in [
             (ClusterRequest::cert_push(CertPush::default()), "cert_push"),
             (ClusterRequest::cert_pull(CertPull::default()), "cert_pull"),
+            (
+                ClusterRequest::telemetry_push(TelemetryPush::default()),
+                "telemetry_push",
+            ),
+            (ClusterRequest::ban_push(BanPush::default()), "ban_push"),
         ] {
             let mut request = request;
             request.sequence = 1;
@@ -1490,6 +1757,14 @@ mod tests {
                 cluster_response::Body::CertPullAck(CertPullAck::default()),
                 "cert_pull_ack",
             ),
+            (
+                cluster_response::Body::TelemetryPushAck(TelemetryPushAck::default()),
+                "telemetry_push_ack",
+            ),
+            (
+                cluster_response::Body::BanPushAck(BanPushAck::default()),
+                "ban_push_ack",
+            ),
         ] {
             let response = ClusterResponse::ok(body);
             assert_eq!(
@@ -1498,6 +1773,11 @@ mod tests {
                 "{block_field}"
             );
         }
+        assert_eq!(
+            BODY_KIND_TELEMETRY_PUSH,
+            tag("ClusterRequest", "telemetry_push")
+        );
+        assert_eq!(BODY_KIND_BAN_PUSH, tag("ClusterRequest", "ban_push"));
         assert_eq!(BODY_KIND_CERT_PUSH, tag("ClusterRequest", "cert_push"));
         assert_eq!(BODY_KIND_CERT_PULL, tag("ClusterRequest", "cert_pull"));
 
@@ -1679,9 +1959,9 @@ mod tests {
         forged.body_kind = BODY_KIND_HELLO;
         assert!(!forged.body_kind_matches());
         // Reserved ranges are unknown to this build. 20-23 are Story
-        // 9.4's and 60-63 Story 9.5's, both now known; 24-39, 40-59 and
-        // 64-79 stay reserved.
-        for kind in [0, 15, 19, 24, 39, 40, 59, 64, 79] {
+        // 9.4's, 40-41 Story 9.6's and 60-63 Story 9.5's, all now
+        // known; 24-39, 42-59 and 64-79 stay reserved.
+        for kind in [0, 15, 19, 24, 39, 42, 59, 64, 79] {
             assert!(!ClusterRequest::is_known_body_kind(kind), "{kind}");
         }
         for kind in [
@@ -1692,6 +1972,8 @@ mod tests {
             BODY_KIND_CONFIG_COMMIT,
             BODY_KIND_CONFIG_ABORT,
             BODY_KIND_CONFIG_PULL,
+            BODY_KIND_TELEMETRY_PUSH,
+            BODY_KIND_BAN_PUSH,
             BODY_KIND_CERT_PUSH,
             BODY_KIND_CERT_PULL,
             BODY_KIND_CHALLENGE_PUBLISH,

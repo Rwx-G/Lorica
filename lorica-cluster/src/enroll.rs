@@ -36,8 +36,8 @@ use tokio_rustls::TlsConnector;
 use crate::certs::CertBundle;
 use crate::dialer::{resolve_and_connect, split_host_port};
 use crate::messages::{
-    cluster_frame, cluster_request, cluster_response, ClusterFrame, ClusterRequest,
-    ClusterStatus, Enroll,
+    cluster_frame, cluster_request, cluster_response, ClusterFrame, ClusterRequest, ClusterStatus,
+    Enroll, TelemetryPush, TelemetryPushAck,
 };
 use crate::replication::{AppliedConfig, ConfigPayload};
 use crate::tls::{join_client_config, negotiated_cluster_alpn, ClusterTlsError};
@@ -211,6 +211,25 @@ pub trait SessionHandler: Send + Sync + 'static {
         node_id: &str,
         cert_ids: Vec<String>,
     ) -> BoxFuture<'_, Result<Vec<CertBundle>, String>>;
+
+    /// A follower delivers a batch of telemetry (Story 9.6 AC #5).
+    ///
+    /// `node_id` comes from the SESSION and is what every stored row
+    /// is stamped with; the batch carries no identity of its own
+    /// (decision D2). The implementation applies the per-node ingest
+    /// quota and the storage watermark (AC #8), so it may accept
+    /// fewer rows than were sent, or none, and say so in the ack
+    /// rather than failing.
+    ///
+    /// `Err` is a local failure (the telemetry store could not be
+    /// written) and is answered with the opaque refusal, session
+    /// kept: a control plane that cannot store telemetry must not
+    /// drop the session that carries configuration.
+    fn on_telemetry_push(
+        &self,
+        node_id: &str,
+        batch: TelemetryPush,
+    ) -> BoxFuture<'_, Result<TelemetryPushAck, String>>;
 }
 
 /// A session handler that records nothing and refuses renewals and
@@ -258,6 +277,16 @@ impl SessionHandler for NoopSessionHandler {
         // No configuration source: the follower is told it is already
         // up to date rather than being handed an empty generation.
         Box::pin(async { Ok(None) })
+    }
+
+    fn on_telemetry_push(
+        &self,
+        _node_id: &str,
+        _batch: TelemetryPush,
+    ) -> BoxFuture<'_, Result<TelemetryPushAck, String>> {
+        // No telemetry store: nothing was accepted, which is a valid
+        // answer rather than a failure.
+        Box::pin(async { Ok(TelemetryPushAck::default()) })
     }
 
     fn on_cert_pull(

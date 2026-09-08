@@ -53,7 +53,8 @@ use lorica_cluster::listener::{
     FleetHooks, OperationalConfig, OperationalHandle, OperationalListener, OperationalStats,
 };
 use lorica_cluster::messages::{
-    cluster_response, CertMaterial, CertPull, CertPush, MAX_CONFIG_HASH_BYTES,
+    cluster_response, CertMaterial, CertPull, CertPush, TelemetryPush, TelemetryPushAck,
+    MAX_CONFIG_HASH_BYTES,
 };
 use lorica_cluster::replication::{
     AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
@@ -168,6 +169,13 @@ struct ControlPlaneHooks {
     /// The ids the last certificate pull carried, so a test can assert
     /// what actually crossed the wire.
     cert_pull_ids: Mutex<Vec<String>>,
+    /// Story 9.6.
+    telemetry_pushes: AtomicUsize,
+    /// The last batch that crossed the wire.
+    telemetry_seen: Mutex<Option<TelemetryPush>>,
+    /// The node id the control plane WOULD stamp rows with: taken from
+    /// the session, never from the batch (D2).
+    telemetry_node: Mutex<Option<String>>,
 }
 
 impl SessionHandler for ControlPlaneHooks {
@@ -223,6 +231,30 @@ impl SessionHandler for ControlPlaneHooks {
             self.cert_pulls.fetch_add(1, Ordering::SeqCst);
             *self.cert_pull_ids.lock().expect("lock") = cert_ids;
             Ok(self.certs_available.lock().expect("lock").clone())
+        })
+    }
+
+    fn on_telemetry_push(
+        &self,
+        node_id: &str,
+        batch: TelemetryPush,
+    ) -> BoxFuture<'_, Result<TelemetryPushAck, String>> {
+        let node_id = node_id.to_string();
+        Box::pin(async move {
+            self.telemetry_pushes.fetch_add(1, Ordering::SeqCst);
+            // The identity a stored row would be stamped with comes
+            // from the session, never from the batch (Story 9.6 D2).
+            *self.telemetry_node.lock().expect("lock") = Some(node_id);
+            let ack = TelemetryPushAck {
+                accepted_access: batch.access.len() as u64,
+                accepted_waf: batch.waf.len() as u64,
+                accepted_bans: batch.bans.len() as u64,
+                retry_after_s: 0,
+                access_cursor: batch.access_cursor,
+                waf_cursor: batch.waf_cursor,
+            };
+            *self.telemetry_seen.lock().expect("lock") = Some(batch);
+            Ok(ack)
         })
     }
 }
@@ -358,6 +390,8 @@ struct TestFollower {
     served: Mutex<Vec<(String, String, String)>>,
     challenge_publishes: AtomicUsize,
     challenge_retractions: AtomicUsize,
+    /// Story 9.6: fleet-wide bans this node was told to apply.
+    bans_applied: Mutex<Vec<(String, u64, String)>>,
 }
 
 /// What a test follower does on the Story 9.5 push paths.
@@ -402,6 +436,7 @@ impl TestFollower {
             served: Mutex::new(Vec::new()),
             challenge_publishes: AtomicUsize::new(0),
             challenge_retractions: AtomicUsize::new(0),
+            bans_applied: Mutex::new(Vec::new()),
         })
     }
 
@@ -508,6 +543,21 @@ impl FollowerHandler for TestFollower {
         Box::pin(async move {
             self.challenge_retractions.fetch_add(1, Ordering::SeqCst);
             self.served.lock().expect("lock").retain(|(_, t, _)| t != &token);
+        })
+    }
+
+    fn on_ban_push(
+        &self,
+        client_ip: String,
+        duration_s: u64,
+        reason: String,
+    ) -> BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async move {
+            self.bans_applied
+                .lock()
+                .expect("lock")
+                .push((client_ip, duration_s, reason));
+            Ok(true)
         })
     }
 

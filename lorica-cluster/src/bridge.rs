@@ -66,8 +66,9 @@
 use crate::certs::{cert_bundle_defect, CertBundle, MAX_CERT_BUNDLES, MAX_CERT_PULL_IDS};
 use crate::challenge::challenge_defect;
 use crate::messages::{
-    cert_id_is_valid, challenge_token_is_valid, cluster_request, config_hash_is_valid,
-    ClusterRequest,
+    ban_reason_is_valid, ban_target_is_valid, cert_id_is_valid, challenge_token_is_valid,
+    cluster_request, config_hash_is_valid, ClusterRequest, TelemetryPush, MAX_TELEMETRY_BANS,
+    MAX_TELEMETRY_ROWS,
 };
 use crate::replication::{AppliedConfig, ConfigPayload};
 
@@ -98,6 +99,17 @@ pub enum InPlaneAction {
     },
     /// The node is leaving the fleet (Story 9.3 AC #13).
     Leave,
+    /// A batch of telemetry the follower drained from its own store
+    /// (Story 9.6 AC #5).
+    ///
+    /// Carries no node identity: the control plane stamps every row
+    /// with the `node_id` the session proves (decision D2). A
+    /// `node_id` in the payload would let a compromised follower file
+    /// rows under another node's name.
+    TelemetryPush {
+        /// The batch, already length-checked at this boundary.
+        batch: Box<TelemetryPush>,
+    },
     /// The follower asks for certificate material it counted as
     /// missing (Story 9.5 AC #8).
     CertPull {
@@ -162,6 +174,19 @@ pub enum FollowerAction {
     RetractChallenge {
         /// The token to stop serving.
         token: String,
+    },
+    /// Apply an operator-issued fleet-wide ban (Story 9.6 AC #10).
+    ///
+    /// Only ever operator-issued: automatic per-node auto-ban is not
+    /// replicated, because one node's reflex to its own traffic would
+    /// become a fleet-wide outage for that client.
+    ApplyBan {
+        /// The address to ban.
+        client_ip: String,
+        /// How long the ban lasts, in seconds.
+        duration_s: u64,
+        /// Reason recorded on this node.
+        reason: String,
     },
 }
 
@@ -243,6 +268,21 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
             public_key_der: renew.public_key_der.clone(),
         }),
         Some(cluster_request::Body::Leave(_)) => BridgeOutcome::InPlane(InPlaneAction::Leave),
+        Some(cluster_request::Body::TelemetryPush(push)) => {
+            // Peer-supplied and unbounded on the wire: bound the row
+            // counts here so a follower cannot make the control plane
+            // allocate a batch before its ingest quota (AC #8) even
+            // gets a chance to shed it.
+            if push.access.len() > MAX_TELEMETRY_ROWS
+                || push.waf.len() > MAX_TELEMETRY_ROWS
+                || push.bans.len() > MAX_TELEMETRY_BANS
+            {
+                return BridgeOutcome::ProtocolViolation;
+            }
+            BridgeOutcome::InPlane(InPlaneAction::TelemetryPush {
+                batch: Box::new(push.clone()),
+            })
+        }
         Some(cluster_request::Body::CertPull(pull)) => {
             // The list is peer-supplied: bound its length and every id
             // in it here, or a follower could make the control plane
@@ -276,6 +316,7 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
         | Some(cluster_request::Body::CertPush(_))
         | Some(cluster_request::Body::ChallengePublish(_))
         | Some(cluster_request::Body::ChallengeRetract(_))
+        | Some(cluster_request::Body::BanPush(_))
         | None => BridgeOutcome::ProtocolViolation,
     }
 }
@@ -359,6 +400,19 @@ pub fn translate_control_plane_request(request: &ClusterRequest) -> FollowerBrid
                 token: retract.token.clone(),
             })
         }
+        Some(cluster_request::Body::BanPush(ban)) => {
+            // The address becomes a key in the data-plane ban map and
+            // the reason reaches a log line and the API: bound both
+            // here rather than trusting a control plane to be sane.
+            if !ban_target_is_valid(&ban.client_ip) || !ban_reason_is_valid(&ban.reason) {
+                return FollowerBridgeOutcome::ProtocolViolation;
+            }
+            FollowerBridgeOutcome::Serve(FollowerAction::ApplyBan {
+                client_ip: ban.client_ip.clone(),
+                duration_s: ban.duration_s,
+                reason: ban.reason.clone(),
+            })
+        }
         None if request.body_kind != 0
             && !ClusterRequest::is_known_body_kind(request.body_kind) =>
         {
@@ -373,6 +427,7 @@ pub fn translate_control_plane_request(request: &ClusterRequest) -> FollowerBrid
         | Some(cluster_request::Body::Leave(_))
         | Some(cluster_request::Body::ConfigPull(_))
         | Some(cluster_request::Body::CertPull(_))
+        | Some(cluster_request::Body::TelemetryPush(_))
         | None => FollowerBridgeOutcome::ProtocolViolation,
     }
 }

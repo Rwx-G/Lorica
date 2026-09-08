@@ -29,6 +29,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
 use lorica_cluster::certs::CertBundle;
+use lorica_cluster::messages::{TelemetryPush, TelemetryPushAck};
 use lorica_cluster::enroll::{
     BoxFuture, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, RenewGrant,
     RenewRequest, SessionHandler,
@@ -330,6 +331,16 @@ impl SessionHandler for RecordingSessionHandler {
         // Same: certificate distribution has its own coverage in
         // tests/replication.rs, over the same real-mTLS harness.
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn on_telemetry_push(
+        &self,
+        _node_id: &str,
+        _batch: TelemetryPush,
+    ) -> BoxFuture<'_, Result<TelemetryPushAck, String>> {
+        // Telemetry fan-in has its own coverage in
+        // tests/replication.rs, over the same real-mTLS harness.
+        Box::pin(async { Ok(TelemetryPushAck::default()) })
     }
 }
 

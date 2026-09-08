@@ -40,7 +40,10 @@ message ClusterFrame {
 //          rest reserved). 20-22 are CONTROL-PLANE-INITIATED and are
 //          the only frames a follower accepts on its incoming half;
 //          23 is the follower's convergence pull.
-//   40-59  RESERVED for telemetry fan-in (Story 9.6)
+//   40-59  telemetry fan-in (Story 9.6: 40-41 in use, the rest
+//          reserved). 40 is the follower's telemetry push, 41 is
+//          the control plane's fleet-wide ban; each is a
+//          PROTOCOL_VIOLATION in the opposite direction.
 //   60-79  certificate distribution and HTTP-01 challenge fan-out
 //          (Story 9.5: 60-63 in use, the rest reserved). 60, 62 and
 //          63 are CONTROL-PLANE-INITIATED, 61 is the follower's
@@ -66,6 +69,8 @@ message ClusterRequest {
     ConfigCommit config_commit = 21;
     ConfigAbort config_abort = 22;
     ConfigPull config_pull = 23;
+    TelemetryPush telemetry_push = 40;
+    BanPush ban_push = 41;
     CertPush cert_push = 60;
     CertPull cert_pull = 61;
     ChallengePublish challenge_publish = 62;
@@ -90,6 +95,8 @@ message ClusterResponse {
     ConfigCommitAck config_commit_ack = 21;
     ConfigAbortAck config_abort_ack = 22;
     ConfigPullAck config_pull_ack = 23;
+    TelemetryPushAck telemetry_push_ack = 40;
+    BanPushAck ban_push_ack = 41;
     CertPushAck cert_push_ack = 60;
     CertPullAck cert_pull_ack = 61;
     ChallengePublishAck challenge_publish_ack = 62;
@@ -287,6 +294,110 @@ message CertPull {
 
 message CertPullAck {
   repeated CertMaterial bundles = 1;
+}
+
+// ---- Telemetry fan-in (Story 9.6), tags 40-41 ----
+//
+// TelemetryPush is FOLLOWER-INITIATED and is the only frame in this
+// range a control plane accepts; a control plane sending one is a
+// PROTOCOL_VIOLATION. BanPush is the reverse.
+//
+// NOTHING here carries a node id, and that is deliberate (decision
+// D2). The control plane stamps every row it accepts with the node_id
+// the mutual-TLS session already proves. A node_id in the payload
+// would be a node-supplied identity, and a compromised follower could
+// file rows under another node's name, which is exactly the confusion
+// an incident-correlation view must not have. It is the same rule
+// Story 9.5 D15 arrived at for node names.
+//
+// Batches are bounded and the control plane quotas them per node
+// (AC #8): the follower-side bound protects the follower, not the
+// control plane.
+
+// One access-log row. Mirrors the local `access_logs` columns minus
+// the local rowid, which is meaningless on another machine.
+message TelemetryAccessRow {
+  string timestamp = 1;      // RFC 3339
+  string method = 2;
+  string path = 3;
+  string host = 4;
+  uint32 status = 5;
+  uint64 latency_ms = 6;
+  string backend = 7;
+  string error = 8;
+  string client_ip = 9;
+  bool is_xff = 10;
+  string xff_proxy_ip = 11;
+  string source = 12;
+  string request_id = 13;
+}
+
+// One WAF event.
+message TelemetryWafRow {
+  uint32 rule_id = 1;
+  string description = 2;
+  string category = 3;
+  uint32 severity = 4;
+  string matched_field = 5;
+  string matched_value = 6;
+  string timestamp = 7;
+  string client_ip = 8;
+  string route_hostname = 9;
+  string action = 10;
+}
+
+// One live ban. Bans have no table on a node: they are an in-memory
+// map rebuilt from nothing on restart (decision D3), so this is a
+// snapshot for visibility and is lossy across a restart by
+// construction.
+message TelemetryBan {
+  string client_ip = 1;
+  uint64 remaining_s = 2;
+  string reason = 3;        // BanReason::as_str
+}
+
+// A batch of telemetry. At most 512 access rows and 512 WAF events
+// per push; a longer batch is a PROTOCOL_VIOLATION.
+//
+// The cursors are the sender's local rowids for the last row in each
+// list. The control plane echoes them back so the follower knows what
+// to advance past; it never interprets them as anything but opaque
+// progress markers belonging to that node.
+message TelemetryPush {
+  repeated TelemetryAccessRow access = 1;
+  repeated TelemetryWafRow waf = 2;
+  repeated TelemetryBan bans = 3;
+  uint64 access_cursor = 4;
+  uint64 waf_cursor = 5;
+  uint64 dropped_since_last = 6;  // Follower-side overflow, for the gauge
+}
+
+// What the control plane stored. `accepted_*` may be lower than what
+// was sent when a quota shed part of the batch; `retry_after_s` is
+// non-zero when the node should back off (AC #8).
+message TelemetryPushAck {
+  uint64 accepted_access = 1;
+  uint64 accepted_waf = 2;
+  uint64 accepted_bans = 3;
+  uint32 retry_after_s = 4;
+  uint64 access_cursor = 5;   // Echoed back, unmodified
+  uint64 waf_cursor = 6;
+}
+
+// A fleet-wide ban issued by an operator on the control plane
+// (AC #10). CONTROL-PLANE-INITIATED. Automatic per-node auto-ban is
+// NOT replicated: it is a local reflex to local traffic, and
+// replicating it would let one node's view of one client ban that
+// client everywhere, turning a local false positive into a fleet-wide
+// outage for that client.
+message BanPush {
+  string client_ip = 1;
+  uint64 duration_s = 2;
+  string reason = 3;
+}
+
+message BanPushAck {
+  bool applied = 1;
 }
 
 // ---- HTTP-01 challenge fan-out (Story 9.5), tags 62-63 ----
