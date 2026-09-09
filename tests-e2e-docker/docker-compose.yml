@@ -1064,6 +1064,7 @@ services:
       - CP_API=https://lorica-cp:9443
       - EDGE_A_API=https://lorica-edge-a:9443
       - EDGE_A_PROXY=http://lorica-edge-a:8080
+      - EDGE_B_API=https://lorica-edge-b:9443
       - EDGE_B_PROXY=http://lorica-edge-b:8080
       - BACKEND1_ADDR=backend1:80
       - CHALLTESTSRV=http://challtestsrv:8055

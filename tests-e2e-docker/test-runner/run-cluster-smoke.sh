@@ -26,6 +26,9 @@
 #   9.9  audit rows fan in with their chain intact, and every chain
 #        verifies separately
 #   9.4  break-glass opens a follower to local edits and closes again
+#   9.6  AC #4 (backlog #64): both followers under a sustained load from
+#        their own load-test engine; the fan-in keeps up with zero quota
+#        drops and the measured throughput is printed
 #   9.3  revocation ends the session, and names the keys it cannot
 #        take back
 #
@@ -40,7 +43,11 @@ source "$SCRIPT_DIR/helpers.sh"
 CP_API="${CP_API:?CP_API is required}"
 EDGE_A_API="${EDGE_A_API:?EDGE_A_API is required}"
 EDGE_A_PROXY="${EDGE_A_PROXY:?EDGE_A_PROXY is required}"
+EDGE_B_API="${EDGE_B_API:?EDGE_B_API is required}"
 EDGE_B_PROXY="${EDGE_B_PROXY:?EDGE_B_PROXY is required}"
+# The load phase (backlog #64): per follower, sustained for this long.
+LOAD_RPS="${LOAD_RPS:-300}"
+LOAD_DURATION_S="${LOAD_DURATION_S:-60}"
 BACKEND1="${BACKEND1_ADDR:-backend1:80}"
 SHARED="${SHARED_DIR:-/shared}"
 CHALLTESTSRV="${CHALLTESTSRV:-http://challtestsrv:8055}"
@@ -434,6 +441,123 @@ fi
 
 GLASS=$(api_get /api/v1/cluster/break-glass)
 assert_json "$GLASS" '.data.active' 'false' "edge-a reports its window closed"
+
+# ---------------------------------------------------------------------
+# Story 9.6 AC #4 / backlog #64: the fan-in envelope, measured.
+#
+# Each follower drives its OWN proxy with the built-in load-test
+# engine (the config is a mutation, so it is created inside a short
+# break-glass window; starting a test is follower-local). The control
+# plane's ingest counter is then compared with each follower's local
+# access-log growth: the drain must close the gap and the quota must
+# drop nothing at this rate.
+# ---------------------------------------------------------------------
+log "=== 9.6/#64: fan-in under load (${LOAD_RPS} rps per follower, ${LOAD_DURATION_S}s) ==="
+
+API="$CP_API"
+SESSION="$CP_SESSION"
+EDGE_B_ID=$(api_get /api/v1/cluster/nodes | jq -r '.data[] | select(.name == "edge-b") | .node_id')
+
+ingested_for() {
+    curl -sk -b "$CP_SESSION" "$CP_API/metrics" 2>/dev/null \
+        | grep "^lorica_cluster_telemetry_ingested_total{node_id=\"$1\"}" \
+        | awk '{print $2}' | head -1
+}
+dropped_quota_for() {
+    curl -sk -b "$CP_SESSION" "$CP_API/metrics" 2>/dev/null \
+        | grep "^lorica_cluster_telemetry_dropped_total{node_id=\"$1\",reason=\"node_quota\"}" \
+        | awk '{print $2}' | head -1
+}
+local_total() {
+    # $1 = API, $2 = session
+    curl -sk -b "$2" "$1/api/v1/logs?limit=1" 2>/dev/null | jq -r '.data.total // 0'
+}
+start_load_on() {
+    # $1 = node name, $2 = API. Opens a window, creates the config,
+    # starts it, closes the window. The session is the follower's.
+    API="$2"
+    login "$(cat "$SHARED/$1_admin_password")"
+    api_post /api/v1/cluster/break-glass '{"duration_s":120}' > /dev/null
+    CFG=$(api_post /api/v1/loadtest/configs "{\"name\":\"fan-in-$1\",\"target_url\":\"http://127.0.0.1:8080/\",\"headers\":{\"Host\":\"${FLEET_HOST}\"},\"concurrency\":20,\"requests_per_second\":${LOAD_RPS},\"duration_s\":${LOAD_DURATION_S},\"error_threshold_pct\":100}")
+    CFG_ID=$(echo "$CFG" | jq -r '.data.id // empty')
+    if [ -z "$CFG_ID" ]; then
+        fail "$1: load-test config not created: $(echo "$CFG" | head -c 300)"
+        return
+    fi
+    START=$(api_post "/api/v1/loadtest/start/$CFG_ID" '{}')
+    if [ "$(echo "$START" | jq -r '.data.status')" = "requires_confirmation" ]; then
+        START=$(api_post "/api/v1/loadtest/start/$CFG_ID/confirm" '{}')
+    fi
+    assert_json "$START" '.data.status' 'started' "$1: load test started"
+    curl -sk -b "$SESSION" -o /dev/null -X DELETE "$API/api/v1/cluster/break-glass"
+}
+wait_load_done() {
+    # $1 = API, $2 = session. The engine reports active=false once done.
+    for i in $(seq 1 $((LOAD_DURATION_S + 60))); do
+        ACTIVE=$(curl -sk -b "$2" "$1/api/v1/loadtest/status" 2>/dev/null | jq -r '.data.active // false')
+        [ "$ACTIVE" != "true" ] && return 0
+        sleep 2
+    done
+    return 1
+}
+
+# Baselines: this node's local rows and what the control plane holds.
+API="$EDGE_A_API"; login "$(cat "$SHARED/edge-a_admin_password")"; SESSION_A="$SESSION"
+API="$EDGE_B_API"; login "$(cat "$SHARED/edge-b_admin_password")"; SESSION_B="$SESSION"
+A0_LOCAL=$(local_total "$EDGE_A_API" "$SESSION_A")
+B0_LOCAL=$(local_total "$EDGE_B_API" "$SESSION_B")
+A0_IN=$(ingested_for "$EDGE_A_ID"); A0_IN=${A0_IN:-0}
+B0_IN=$(ingested_for "$EDGE_B_ID"); B0_IN=${B0_IN:-0}
+
+start_load_on edge-a "$EDGE_A_API"
+start_load_on edge-b "$EDGE_B_API"
+LOAD_T0=$(date +%s)
+wait_load_done "$EDGE_A_API" "$SESSION_A" || fail "edge-a's load test did not finish"
+wait_load_done "$EDGE_B_API" "$SESSION_B" || fail "edge-b's load test did not finish"
+LOAD_T1=$(date +%s)
+
+A1_LOCAL=$(local_total "$EDGE_A_API" "$SESSION_A")
+B1_LOCAL=$(local_total "$EDGE_B_API" "$SESSION_B")
+A_ROWS=$((A1_LOCAL - A0_LOCAL)); B_ROWS=$((B1_LOCAL - B0_LOCAL))
+ELAPSED=$((LOAD_T1 - LOAD_T0)); [ "$ELAPSED" -gt 0 ] || ELAPSED=1
+log "edge-a wrote $A_ROWS rows, edge-b wrote $B_ROWS rows in ${ELAPSED}s ($(( (A_ROWS + B_ROWS) / ELAPSED )) rows/s across the fleet)"
+assert_json_gt "{\"n\":$A_ROWS}" '.n' $((LOAD_RPS * LOAD_DURATION_S / 2)) "edge-a served at least half the requested load locally"
+assert_json_gt "{\"n\":$B_ROWS}" '.n' $((LOAD_RPS * LOAD_DURATION_S / 2)) "edge-b (workers) served at least half the requested load locally"
+
+# The drain must close the gap: ingested delta within 5% of the local
+# delta, given time to catch up.
+DRAIN_T0=$(date +%s)
+for i in $(seq 1 90); do
+    A_IN=$(ingested_for "$EDGE_A_ID"); A_IN=${A_IN:-0}
+    B_IN=$(ingested_for "$EDGE_B_ID"); B_IN=${B_IN:-0}
+    A_GOT=$(( ${A_IN%.*} - ${A0_IN%.*} )); B_GOT=$(( ${B_IN%.*} - ${B0_IN%.*} ))
+    [ "$A_GOT" -ge $((A_ROWS * 95 / 100)) ] && [ "$B_GOT" -ge $((B_ROWS * 95 / 100)) ] && break
+    sleep 2
+done
+DRAIN_T1=$(date +%s)
+log "control plane ingested $A_GOT of edge-a's rows and $B_GOT of edge-b's rows, caught up $((DRAIN_T1 - DRAIN_T0))s after the load ended"
+if [ "$A_GOT" -ge $((A_ROWS * 95 / 100)) ]; then
+    ok "the drain kept up with edge-a ($A_GOT/$A_ROWS rows fanned in)"
+else
+    fail "the drain fell behind edge-a ($A_GOT/$A_ROWS rows fanned in)"
+fi
+if [ "$B_GOT" -ge $((B_ROWS * 95 / 100)) ]; then
+    ok "the drain kept up with edge-b ($B_GOT/$B_ROWS rows fanned in)"
+else
+    fail "the drain fell behind edge-b ($B_GOT/$B_ROWS rows fanned in)"
+fi
+A_DROP=$(dropped_quota_for "$EDGE_A_ID"); B_DROP=$(dropped_quota_for "$EDGE_B_ID")
+if [ "${A_DROP:-0}" = "0" ] || [ -z "$A_DROP" ]; then
+    ok "edge-a: no row shed by the per-node quota at ${LOAD_RPS} rps"
+else
+    fail "edge-a: $A_DROP rows shed by the per-node quota at ${LOAD_RPS} rps"
+fi
+if [ "${B_DROP:-0}" = "0" ] || [ -z "$B_DROP" ]; then
+    ok "edge-b: no row shed by the per-node quota at ${LOAD_RPS} rps"
+else
+    fail "edge-b: $B_DROP rows shed by the per-node quota at ${LOAD_RPS} rps"
+fi
+echo "FAN_IN_MEASUREMENT rps_per_node=${LOAD_RPS} nodes=2 rows_a=${A_ROWS} rows_b=${B_ROWS} elapsed_s=${ELAPSED} caught_up_s=$((DRAIN_T1 - DRAIN_T0))"
 
 API="$CP_API"
 SESSION="$CP_SESSION"
