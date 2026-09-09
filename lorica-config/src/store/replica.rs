@@ -61,7 +61,9 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::params;
 
 use super::ConfigStore;
-use crate::canonical::{decode_canonical, secret_digest, sha256_hex, CanonicalConfig};
+use crate::canonical::{
+    decode_canonical, key_material_digest, secret_digest, sha256_hex, CanonicalConfig,
+};
 use crate::error::{ConfigError, Result};
 use crate::models::{Certificate, Route};
 
@@ -304,7 +306,17 @@ impl ConfigStore {
             match existing {
                 // The digest in the blob matches the key this node
                 // already holds: keep the key, refresh the metadata.
-                Some(held) if secret_digest(&held.key_pem) == cert.key_pem => {
+                //
+                // By material first (backlog #60), because the two sides
+                // hold their own PEM text and a line ending must not read
+                // as a different key. The raw-text form is still accepted:
+                // a 1.7.0 control plane announces that one, and a
+                // followers-first upgrade would otherwise see every
+                // certificate as changed for the length of the rollout.
+                Some(held)
+                    if key_material_digest(&held.key_pem) == cert.key_pem
+                        || secret_digest(&held.key_pem) == cert.key_pem =>
+                {
                     row.key_pem = held.key_pem.clone();
                 }
                 // The blob announces a DIFFERENT key and this node

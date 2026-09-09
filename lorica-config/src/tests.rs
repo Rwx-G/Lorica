@@ -4303,4 +4303,48 @@ cert_critical_days = 3
             .is_empty());
     }
 
+    #[test]
+    fn a_key_digest_follows_the_material_not_the_pem_formatting() {
+        // Backlog #60: the control plane announces a digest over its copy of
+        // a private key and a follower compares it against the copy the key
+        // channel wrote. Byte-exact PEM equality made a trailing newline or
+        // a CRLF line ending read as a different key, and the replica apply
+        // dropped a working key on a path that runs on every config change.
+        use crate::canonical::{key_material_digest, secret_digest};
+
+        let base = "-----BEGIN PRIVATE KEY-----\nTUlJQ2R3SUJBREFOQmdrcQ==\n-----END PRIVATE KEY-----\n";
+        let crlf = base.replace('\n', "\r\n");
+        let no_trailing_newline = base.trim_end().to_string();
+        let rewrapped = "-----BEGIN PRIVATE KEY-----\nTUlJQ2R3SU\nJBREFOQmdrcQ==\n-----END PRIVATE KEY-----\n";
+
+        let want = key_material_digest(base);
+        assert!(want.starts_with("sha256:"));
+        for (label, variant) in [
+            ("CRLF line endings", crlf.as_str()),
+            ("no trailing newline", no_trailing_newline.as_str()),
+            ("different line wrapping", rewrapped),
+        ] {
+            assert_eq!(
+                key_material_digest(variant),
+                want,
+                "{label} must not read as a different key"
+            );
+            // The old rule is what made this a defect.
+            assert_ne!(secret_digest(variant), secret_digest(base), "{label}");
+        }
+
+        // A different key is still a different digest.
+        let other = "-----BEGIN PRIVATE KEY-----\nQkJCQkJCQkJCQkJCQkJCQg==\n-----END PRIVATE KEY-----\n";
+        assert_ne!(key_material_digest(other), want);
+
+        // Anything that is not PEM falls back to the text digest, so a value
+        // already replaced by a digest keeps comparing as it always did.
+        let already_a_digest = secret_digest("");
+        assert_eq!(
+            key_material_digest(&already_a_digest),
+            secret_digest(&already_a_digest)
+        );
+        assert_eq!(key_material_digest(""), secret_digest(""));
+    }
+
 }
