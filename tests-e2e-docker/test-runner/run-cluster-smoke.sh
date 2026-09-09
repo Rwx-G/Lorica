@@ -544,7 +544,10 @@ A_ROWS=$((A1_LOCAL - A0_LOCAL)); B_ROWS=$((B1_LOCAL - B0_LOCAL))
 ELAPSED=$((LOAD_T1 - LOAD_T0)); [ "$ELAPSED" -gt 0 ] || ELAPSED=1
 log "edge-a wrote $A_ROWS rows, edge-b wrote $B_ROWS rows in ${ELAPSED}s ($(( (A_ROWS + B_ROWS) / ELAPSED )) rows/s across the fleet)"
 assert_json_gt "{\"n\":$A_ROWS}" '.n' $((LOAD_RPS * LOAD_DURATION_S / 2)) "edge-a served at least half the requested load locally"
-assert_json_gt "{\"n\":$B_ROWS}" '.n' $((LOAD_RPS * LOAD_DURATION_S / 2)) "edge-b (workers) served at least half the requested load locally"
+# edge-b holds no route for this hostname (the selector names edge-a),
+# so its rows are 404s: still access rows, still fanned in, which is
+# what this phase measures.
+assert_json_gt "{\"n\":$B_ROWS}" '.n' $((LOAD_RPS * LOAD_DURATION_S / 2)) "edge-b (workers) logged at least half the requested load locally (404s by selector)"
 
 # The drain must close the gap: ingested delta within 5% of the local
 # delta, given time to catch up.
@@ -603,25 +606,24 @@ for attempt in $(seq 1 75); do
     SLA_A=$(api_get "/api/v1/sla/overview?node=$EDGE_A_ID")
     SLA_B=$(api_get "/api/v1/sla/overview?node=$EDGE_B_ID")
     NA=$(echo "$SLA_A" | jq '[(.data // [])[] | select(.total_requests > 0)] | length')
-    NB=$(echo "$SLA_B" | jq '[(.data // [])[] | select(.route_id == "'"$ROUTE_ID"'")] | length')
+    NB=$(echo "$SLA_B" | jq -r 'if (.data | type) == "array" then "1" else "0" end' 2>/dev/null)
     [ "${NA:-0}" != "0" ] && [ "${NB:-0}" != "0" ] && break
     sleep 2
 done
 assert_json_gt "$SLA_A" '[.data[] | select(.total_requests > 0)] | length' 0 \
     "edge-a's SLA overview, computed on edge-a, served by the control plane"
-# edge-b runs workers, where passive SLA is last-writer-wins across
-# the workers' collectors (backlog #68, pre-existing): 30 requests
-# persisted as 6 in a probe, and a minute under load can read as 0.
-# What this asserts on edge-b is therefore the READ PATH (the route's
-# summaries come back through the control plane); the figure is
-# logged, not asserted, until #68 is fixed.
-assert_json_gt "$SLA_B" '[.data[] | select(.route_id == "'"$ROUTE_ID"'")] | length' 0 \
-    "edge-b's SLA overview (workers mode) is served through the control plane"
-# The body, so a refusal (no session, a follower error) is readable
-# in the run log rather than folded into a zero.
-log "edge-b proxied overview: $(echo "$SLA_B" | head -c 240)"
-log "edge-b reports $(echo "$SLA_B" | jq '[(.data // [])[] | select(.window == "1h") | .total_requests] | add // 0') requests over 1h for the route (backlog #68: undercounted in workers mode)"
-log "edge-b roster row: $(api_get /api/v1/cluster/nodes | jq -c --arg id "$EDGE_B_ID" '.data[] | select(.node_id == $id) | {status, connected, applied_config_generation}')"
+# edge-b holds no route: the selector names edge-a only, so the apply
+# excluded it there and its load-test requests were 404s. Its overview
+# through the control plane is therefore EMPTY, and that is the
+# correct answer, served from edge-b over the plane rather than
+# invented on the control plane. (The first version of this check
+# expected a figure and blamed backlog #68; the selector was the
+# reason.)
+if echo "$SLA_B" | jq -e '.data | type == "array" and length == 0' >/dev/null 2>&1; then
+    ok "edge-b's SLA overview (workers mode, no route selected for it) is empty, served through the control plane"
+else
+    fail "edge-b's proxied SLA overview should be an empty list, got: $(echo "$SLA_B" | head -c 240)"
+fi
 ROUTE_SLA=$(api_get "/api/v1/sla/routes/$ROUTE_ID?node=$EDGE_A_ID")
 assert_json_gt "$ROUTE_SLA" '[.data[] | select(.window == "1h" and .total_requests > 0)] | length' 0 \
     "one route's windows for one node"
