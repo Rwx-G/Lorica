@@ -1780,6 +1780,18 @@ pub(crate) async fn spawn_cluster_plane(
         "cluster plane enabled: operational listener bound (mTLS mandatory); \
          enrollment listener opens only while a join token is live"
     );
+    // Backlog #58: eviction streaks, quarantine and the last round live
+    // in this process. A restart or a hot upgrade therefore releases every
+    // quarantined node and forgets a fleet that converged weeks ago. That
+    // is the intended circuit-breaker behaviour, a restart being a fair
+    // reason to re-probe, but an operator who quarantined a node yesterday
+    // must not have to infer the release from silence.
+    warn!(
+        enrolled_nodes = control.roster.len(),
+        "cluster plane: replication policy state starts empty (eviction \
+         streaks, quarantine, last round). Any node quarantined before \
+         this restart is released and will be probed again"
+    );
     if opts.auto_activate {
         warn!("cluster plane: --cluster-auto-activate is set; enrolled nodes become Active without operator review");
     }

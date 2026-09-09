@@ -4492,6 +4492,15 @@ components:
         in_flight:
           type: integer
           nullable: true
+        policy_state_reset_by_restart:
+          type: boolean
+          description: >-
+            True when `last` is null only because this control-plane
+            process has not run a round yet. Replication policy state
+            (eviction streaks, quarantine, the last report) is a
+            within-process circuit breaker and is not persisted, so a
+            restart releases every quarantined node and forgets a fleet
+            that converged weeks ago.
         last:
           nullable: true
           allOf:
