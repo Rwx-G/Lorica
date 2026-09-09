@@ -6712,3 +6712,766 @@ async fn test_api_v1_metrics_is_the_metrics_document_behind_the_session() {
         "expected a Prometheus exposition, got: {text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SLA and active-probe handlers (`sla.rs`, `probes.rs`). Until the 1.7.0
+// coverage pass these two files were exercised by the Docker e2e suite only.
+// ---------------------------------------------------------------------------
+
+/// One request against a fresh router; returns the status and the parsed body
+/// (`Value::Null` when the body is not JSON, e.g. a CSV export).
+async fn sla_call(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value, http::HeaderMap) {
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Cookie", cookie);
+    let body = match body {
+        Some(json) => {
+            builder = builder.header("Content-Type", "application/json");
+            Body::from(serde_json::to_string(&json).expect("test setup"))
+        }
+        None => Body::empty(),
+    };
+    let response = router
+        .oneshot(builder.body(body).expect("test setup"))
+        .await
+        .expect("test setup");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json, headers)
+}
+
+async fn sla_create_route(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    hostname: &str,
+) -> String {
+    let (status, json, _) = sla_call(
+        state,
+        session_store,
+        rate_limiter,
+        cookie,
+        "POST",
+        "/api/v1/routes",
+        Some(serde_json::json!({ "hostname": hostname })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    json["data"]["id"].as_str().expect("route id").to_string()
+}
+
+fn sla_bucket(route_id: &str, source: &str, minutes_ago: i64) -> lorica_config::models::SlaBucket {
+    lorica_config::models::SlaBucket {
+        id: None,
+        route_id: route_id.to_string(),
+        bucket_start: chrono::Utc::now() - chrono::Duration::minutes(minutes_ago),
+        request_count: 90,
+        success_count: 81,
+        error_count: 9,
+        latency_sum_ms: 9_000,
+        latency_min_ms: 20,
+        latency_max_ms: 700,
+        latency_p50_ms: 90,
+        latency_p95_ms: 400,
+        latency_p99_ms: 650,
+        source: source.to_string(),
+        cfg_max_latency_ms: 1_000,
+        cfg_status_min: 200,
+        cfg_status_max: 399,
+        cfg_target_pct: 99.0,
+    }
+}
+
+#[tokio::test]
+async fn sla_reads_report_the_inserted_buckets_per_window_and_source() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "sla-reads.example.com",
+    )
+    .await;
+    {
+        let store = state.store.lock().await;
+        store
+            .insert_sla_bucket(&sla_bucket(&route_id, "passive", 10))
+            .expect("passive bucket");
+        store
+            .insert_sla_bucket(&sla_bucket(&route_id, "active", 10))
+            .expect("active bucket");
+    }
+
+    // Overview: two windows (1h, 24h) per route, passive figures only.
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/sla/overview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let rows = json["data"].as_array().expect("overview array");
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row["route_id"], route_id);
+        assert_eq!(row["total_requests"], 90);
+        assert_eq!(row["successful_requests"], 81);
+    }
+    assert_eq!(rows[0]["window"], "1h");
+    assert_eq!(rows[1]["window"], "24h");
+
+    // Per-route passive windows, then the active-probe windows.
+    for (path, expected_total) in [
+        (format!("/api/v1/sla/routes/{route_id}"), 90),
+        (format!("/api/v1/sla/routes/{route_id}/active"), 90),
+    ] {
+        let (status, json, _) = sla_call(
+            &state,
+            &session_store,
+            &rate_limiter,
+            &cookie,
+            "GET",
+            &path,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {json}");
+        let windows = json["data"].as_array().expect("windows array");
+        assert!(!windows.is_empty(), "{path}");
+        assert!(
+            windows
+                .iter()
+                .any(|w| w["total_requests"] == expected_total),
+            "{path}: {json}"
+        );
+    }
+
+    // Raw buckets: default source is passive, `source=active` selects the other
+    // one, a window that ends before the bucket is empty.
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/sla/routes/{route_id}/buckets"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let buckets = json["data"].as_array().expect("buckets");
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0]["source"], "passive");
+    assert_eq!(buckets[0]["latency_p99_ms"], 650);
+
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/sla/routes/{route_id}/buckets?source=active"),
+        None,
+    )
+    .await;
+    assert_eq!(json["data"].as_array().expect("buckets").len(), 1);
+    assert_eq!(json["data"][0]["source"], "active");
+
+    // `Z`, not `+00:00`: a bare `+` in a query string decodes as a space.
+    let to = (chrono::Utc::now() - chrono::Duration::hours(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/sla/routes/{route_id}/buckets?to={to}"),
+        None,
+    )
+    .await;
+    assert_eq!(json["data"].as_array().expect("buckets").len(), 0);
+
+    // Unknown route: 404 on every per-route read.
+    for path in [
+        "/api/v1/sla/routes/no-such-route",
+        "/api/v1/sla/routes/no-such-route/buckets",
+        "/api/v1/sla/routes/no-such-route/active",
+        "/api/v1/sla/routes/no-such-route/config",
+        "/api/v1/sla/routes/no-such-route/export",
+    ] {
+        let (status, _, _) = sla_call(
+            &state,
+            &session_store,
+            &rate_limiter,
+            &cookie,
+            "GET",
+            path,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn sla_config_round_trips_and_rejects_out_of_range_values() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "sla-config.example.com",
+    )
+    .await;
+    let config_path = format!("/api/v1/sla/routes/{route_id}/config");
+
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &config_path,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["route_id"], route_id);
+    let default_target = json["data"]["target_pct"].as_f64().expect("target_pct");
+    assert!((0.0..=100.0).contains(&default_target));
+
+    for bad in [
+        serde_json::json!({ "target_pct": 150.0 }),
+        serde_json::json!({ "target_pct": -1.0 }),
+        serde_json::json!({ "max_latency_ms": 0 }),
+    ] {
+        let (status, json, _) = sla_call(
+            &state,
+            &session_store,
+            &rate_limiter,
+            &cookie,
+            "PUT",
+            &config_path,
+            Some(bad.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {json}");
+    }
+
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "PUT",
+        &config_path,
+        Some(serde_json::json!({
+            "target_pct": 95.5,
+            "max_latency_ms": 800,
+            "success_status_min": 200,
+            "success_status_max": 399
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["target_pct"], 95.5);
+    assert_eq!(json["data"]["max_latency_ms"], 800);
+    assert_eq!(json["data"]["success_status_max"], 399);
+
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &config_path,
+        None,
+    )
+    .await;
+    assert_eq!(json["data"]["target_pct"], 95.5);
+    assert_eq!(json["data"]["success_status_min"], 200);
+
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "PUT",
+        "/api/v1/sla/routes/no-such-route/config",
+        Some(serde_json::json!({ "target_pct": 90.0 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sla_export_serves_json_and_csv_and_clear_empties_the_route() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "sla-export.example.com",
+    )
+    .await;
+    {
+        let store = state.store.lock().await;
+        store
+            .insert_sla_bucket(&sla_bucket(&route_id, "passive", 30))
+            .expect("bucket");
+    }
+
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/sla/routes/{route_id}/export"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["route_id"], route_id);
+    assert!(json["data"]["config"].is_object());
+    assert_eq!(
+        json["data"]["buckets"].as_array().expect("buckets").len(),
+        1
+    );
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/sla/routes/{route_id}/export?format=csv"))
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"].to_str().expect("header"),
+        "text/csv"
+    );
+    assert!(response.headers()["content-disposition"]
+        .to_str()
+        .expect("header")
+        .contains(&format!("sla-{route_id}.csv")));
+    let csv = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let csv = String::from_utf8(csv.to_vec()).expect("utf-8");
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines.len(), 2, "{csv}");
+    assert!(lines[0].starts_with("bucket_start,request_count,success_count,error_count"));
+    assert!(
+        lines[1].contains(",90,81,9,9000,20,700,90,400,650"),
+        "{csv}"
+    );
+
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "DELETE",
+        &format!("/api/v1/sla/routes/{route_id}/data"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["deleted_buckets"], 1);
+
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/sla/routes/{route_id}/buckets"),
+        None,
+    )
+    .await;
+    assert_eq!(json["data"].as_array().expect("buckets").len(), 0);
+
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "DELETE",
+        "/api/v1/sla/routes/no-such-route/data",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sla_reads_with_a_node_selector_are_refused_off_a_control_plane() {
+    // Story 9.7 AC #5: `?node=` is a fleet read served through the control
+    // plane. A single node has none, so the honest answer is 409, not an
+    // empty chart. An empty selector means "this node" and is served.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "sla-node.example.com",
+    )
+    .await;
+    for path in [
+        "/api/v1/sla/overview?node=edge-b".to_string(),
+        format!("/api/v1/sla/routes/{route_id}?node=edge-b"),
+        format!("/api/v1/sla/routes/{route_id}/buckets?node=edge-b"),
+        format!("/api/v1/sla/routes/{route_id}/active?node=edge-b"),
+    ] {
+        let (status, json, _) = sla_call(
+            &state,
+            &session_store,
+            &rate_limiter,
+            &cookie,
+            "GET",
+            &path,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}: {json}");
+    }
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/sla/overview?node=",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn answer_sla_pull_serves_what_a_follower_measures_and_round_trips_the_wire() {
+    use crate::sla::{answer_sla_pull, bucket_from_wire, bucket_to_wire};
+    use lorica_cluster::messages::SlaPull;
+
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "sla-pull.example.com",
+    )
+    .await;
+    let bucket = sla_bucket(&route_id, "passive", 15);
+    let store = state.store.lock().await;
+    store.insert_sla_bucket(&bucket).expect("bucket");
+
+    // No route id: the overview, two windows per route.
+    let ack = answer_sla_pull(
+        &store,
+        &SlaPull {
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        },
+    )
+    .expect("overview");
+    assert_eq!(ack.summaries.len(), 2);
+    assert!(ack.buckets.is_empty());
+    assert_eq!(ack.summaries[0].total_requests, 90);
+
+    // One route, windows only.
+    let ack = answer_sla_pull(
+        &store,
+        &SlaPull {
+            route_id: route_id.clone(),
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        },
+    )
+    .expect("route windows");
+    assert!(!ack.summaries.is_empty());
+    assert!(ack.buckets.is_empty());
+
+    // One route, raw buckets over the default 24 h window.
+    let ack = answer_sla_pull(
+        &store,
+        &SlaPull {
+            route_id: route_id.clone(),
+            source: "passive".to_string(),
+            buckets: true,
+            ..SlaPull::default()
+        },
+    )
+    .expect("route buckets");
+    assert_eq!(ack.buckets.len(), 1);
+    assert!(ack.summaries.is_empty());
+
+    // A route this node does not hold is an error, not an empty answer.
+    let err = answer_sla_pull(
+        &store,
+        &SlaPull {
+            route_id: "no-such-route".to_string(),
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        },
+    )
+    .expect_err("unknown route");
+    assert!(err.contains("not found"), "{err}");
+
+    // Wire round trip keeps every figure; the row id is not carried.
+    let back = bucket_from_wire(bucket_to_wire(&bucket)).expect("from wire");
+    assert_eq!(back.id, None);
+    assert_eq!(back.route_id, bucket.route_id);
+    assert_eq!(back.bucket_start, bucket.bucket_start);
+    assert_eq!(back.request_count, 90);
+    assert_eq!(back.latency_p99_ms, 650);
+    assert_eq!(back.cfg_target_pct, 99.0);
+    let mut broken = bucket_to_wire(&bucket);
+    broken.bucket_start = "yesterday".to_string();
+    assert!(bucket_from_wire(broken).is_err());
+}
+
+#[tokio::test]
+async fn probe_crud_history_and_validation() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "probes.example.com",
+    )
+    .await;
+
+    // Defaults on create.
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "POST",
+        "/api/v1/probes",
+        Some(serde_json::json!({ "route_id": route_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    let probe_id = json["data"]["id"].as_str().expect("probe id").to_string();
+    assert_eq!(json["data"]["method"], "GET");
+    assert_eq!(json["data"]["path"], "/");
+    assert_eq!(json["data"]["expected_status"], 200);
+    assert_eq!(json["data"]["interval_s"], 30);
+    assert_eq!(json["data"]["timeout_ms"], 5000);
+    assert_eq!(json["data"]["enabled"], true);
+
+    // Validation and unknown route.
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "POST",
+        "/api/v1/probes",
+        Some(serde_json::json!({ "route_id": route_id, "interval_s": 2 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "POST",
+        "/api/v1/probes",
+        Some(serde_json::json!({ "route_id": "no-such-route" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Listings.
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/probes",
+        None,
+    )
+    .await;
+    assert_eq!(json["data"].as_array().expect("probes").len(), 1);
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/probes/route/{route_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(json["data"][0]["id"], probe_id);
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/probes/route/no-such-route",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Update, its validation, and an unknown probe.
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "PUT",
+        &format!("/api/v1/probes/{probe_id}"),
+        Some(serde_json::json!({
+            "method": "HEAD",
+            "path": "/health",
+            "expected_status": 204,
+            "interval_s": 60,
+            "timeout_ms": 1500,
+            "enabled": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["method"], "HEAD");
+    assert_eq!(json["data"]["path"], "/health");
+    assert_eq!(json["data"]["expected_status"], 204);
+    assert_eq!(json["data"]["interval_s"], 60);
+    assert_eq!(json["data"]["timeout_ms"], 1500);
+    assert_eq!(json["data"]["enabled"], false);
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "PUT",
+        &format!("/api/v1/probes/{probe_id}"),
+        Some(serde_json::json!({ "interval_s": 1 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "PUT",
+        "/api/v1/probes/no-such-probe",
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // History: newest first, capped by `limit`, 404 for an unknown probe.
+    {
+        let store = state.store.lock().await;
+        for (code, ok) in [(200u16, true), (503u16, false), (200u16, true)] {
+            store
+                .insert_probe_result(&probe_id, &route_id, code, 12, ok, None)
+                .expect("probe result");
+        }
+    }
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/probes/{probe_id}/history?limit=2"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["total"], 2);
+    assert_eq!(
+        json["data"]["results"].as_array().expect("results").len(),
+        2
+    );
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/probes/{probe_id}/history"),
+        None,
+    )
+    .await;
+    assert_eq!(json["data"]["total"], 3);
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/probes/no-such-probe/history",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Delete, then the listing is empty.
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "DELETE",
+        &format!("/api/v1/probes/{probe_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["deleted"], probe_id);
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/probes",
+        None,
+    )
+    .await;
+    assert_eq!(json["data"].as_array().expect("probes").len(), 0);
+}
