@@ -107,6 +107,23 @@ export function fleetQuery(params: FleetQueryParams): string {
   return s ? `?${s}` : '';
 }
 
+/** A follower's break-glass window (Story 9.4 AC #11). */
+export interface BreakGlassState {
+  active: boolean;
+  until: string | null;
+  remaining_s: number | null;
+}
+
+/** What `POST /api/v1/cluster/leave` reports. */
+export interface LeaveFleetResult {
+  node_id: string;
+  /**
+   * `false` when the control plane could not be told. The node has
+   * still left; the operator must revoke it on the control plane.
+   */
+  control_plane_notified: boolean;
+}
+
 /** The token, shown once and never recoverable. */
 export interface MintedTokenResponse {
   token: string;
@@ -1241,6 +1258,27 @@ export const api = {
   /** The fleet's WAF events (Story 9.6 AC #9). */
   getFleetWafEvents: (params: FleetQueryParams) =>
     request<FleetPage<FleetWafRow>>('GET', `/cluster/waf-events${fleetQuery(params)}`),
+
+  /**
+   * The follower's break-glass window (Story 9.4 AC #11).
+   *
+   * These three plus `leaveCluster` are the only cluster mutations a
+   * follower serves, and they are why `isSuperAdminRole` exists: they
+   * are how an operator gets out of read-only mode, so gating them on
+   * read-only mode would lock the door from the inside.
+   */
+  getBreakGlass: () =>
+    request<BreakGlassState>('GET', '/cluster/break-glass'),
+
+  openBreakGlass: (duration_s: number) =>
+    request<BreakGlassState>('POST', '/cluster/break-glass', { duration_s }),
+
+  closeBreakGlass: () =>
+    request<BreakGlassState>('DELETE', '/cluster/break-glass'),
+
+  /** Leave the fleet (SuperAdmin, follower only, Story 9.3 AC #13). */
+  leaveCluster: () =>
+    request<LeaveFleetResult>('POST', '/cluster/leave'),
 
   /** Every node's live bans, as last reported (Story 9.6 AC #10). */
   getFleetBans: (node?: string) =>

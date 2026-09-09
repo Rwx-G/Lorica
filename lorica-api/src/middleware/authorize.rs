@@ -153,15 +153,22 @@ pub fn follower_local_request(method: &http::Method, path: &str) -> bool {
     if method == http::Method::GET || method == http::Method::HEAD {
         return true;
     }
+    // `/api/v1/users` and `/api/v1/audit` are spelled with and
+    // without the trailing slash rather than as bare prefixes: a bare
+    // `starts_with` would also admit a future `/api/v1/users-export`
+    // or `/api/v1/audit-archive`, which is the open-ended matching the
+    // probe list below already refuses to rely on.
     const PREFIXES: &[&str] = &[
         "/api/v1/auth/",
-        "/api/v1/users",
-        "/api/v1/audit",
+        "/api/v1/users/",
+        "/api/v1/audit/",
         "/api/v1/cluster/",
         "/api/v1/validate/",
         "/api/v1/loadtest/start/",
     ];
     const EXACT: &[&str] = &[
+        "/api/v1/users",
+        "/api/v1/audit",
         "/api/v1/config/export",
         "/api/v1/config/import/preview",
         "/api/v1/loadtest/abort",
@@ -246,6 +253,47 @@ mod tests {
             (Method::POST, "/api/v1/certificates"),
         ] {
             assert!(!follower_local_request(&method, path), "{method} {path}");
+        }
+    }
+
+    /// The dashboard hides a control on a follower unless this
+    /// function admits its path (Story 9.7 D19). Those two facts live
+    /// in different languages with nothing between them, and one
+    /// manual review pass across the dashboard found four controls
+    /// hidden from a follower that this list admits, so the seam does
+    /// not hold on review alone.
+    ///
+    /// This pins the direction that fails silently: the list is
+    /// narrowed, the dashboard keeps offering the control, and an
+    /// operator presses a button that answers 409 during an incident.
+    ///
+    /// It does NOT catch the reverse, a `.svelte` file switching from
+    /// `canWriteRole` to `canWrite`. Catching that needs the allow-list
+    /// served as data, which is not worth building for six paths.
+    #[test]
+    fn every_path_the_dashboard_offers_on_a_follower_is_still_admitted() {
+        for (method, path, offered_by) in [
+            // routes/LoadTest.svelte, `$canWriteRole` on Run
+            (Method::POST, "/api/v1/loadtest/start/c1", "LoadTest.svelte"),
+            // routes/LoadTest.svelte, `$canWriteRole` on Abort
+            (Method::POST, "/api/v1/loadtest/abort", "LoadTest.svelte"),
+            // components/settings-tabs/ExportImportTab.svelte,
+            // `$canWriteRole` on Download TOML
+            (Method::POST, "/api/v1/config/export", "ExportImportTab.svelte"),
+            // routes/Security.svelte, `$isSuperAdminRole` on Verify
+            (Method::POST, "/api/v1/audit/verify", "Security.svelte"),
+            // routes/Settings.svelte, `$isSuperAdminRole` on the tab
+            (Method::POST, "/api/v1/users", "Settings.svelte"),
+            // routes/Cluster.svelte, `superAdminRole` on the two ways
+            // out of read-only mode
+            (Method::POST, "/api/v1/cluster/break-glass", "Cluster.svelte"),
+            (Method::DELETE, "/api/v1/cluster/break-glass", "Cluster.svelte"),
+            (Method::POST, "/api/v1/cluster/leave", "Cluster.svelte"),
+        ] {
+            assert!(
+                follower_local_request(&method, path),
+                "{offered_by} offers {method} {path} on a follower, but this                  gate now refuses it: either restore the path or change that                  control to `canWrite` / `isSuperAdmin`"
+            );
         }
     }
 

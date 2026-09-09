@@ -4,7 +4,7 @@
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { api } from '../lib/api';
   import type { CertificateResponse, MintedTokenResponse } from '../lib/api';
-  import { isSuperAdmin } from '../lib/auth';
+  import { isSuperAdmin, isSuperAdminRole } from '../lib/auth';
   import {
     clusterStatus,
     breakGlassActive,
@@ -12,7 +12,6 @@
     joinCommand,
     secondsUntil,
     type ClusterNodeResponse,
-    type ClusterStatus,
     type FleetBanRow,
     type FleetWafRow,
   } from '../lib/cluster';
@@ -22,7 +21,6 @@
   const REFRESH_MS = 10_000;
 
   let nodes = $state<ClusterNodeResponse[]>([]);
-  let status = $state<ClusterStatus | null>(null);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -37,20 +35,38 @@
   const DRAWER_EVENTS = 10;
   let drawerWaf = $state<FleetWafRow[]>([]);
   let drawerBans = $state<FleetBanRow[]>([]);
+  let drawerError = $state<string | null>(null);
+  /**
+   * The fleet's certificates, fetched once per page mount rather than
+   * per drawer: the set is fleet-wide and identical whichever node is
+   * open, so refetching it on every node switch is work nobody asked
+   * for.
+   */
   let certificates = $state<CertificateResponse[]>([]);
   /** The node id `loadDrawer` last ran for, so a roster poll that
       replaces the `selected` object does not refetch everything. */
   let drawerLoadedFor: string | null = null;
 
   async function loadDrawer(nodeId: string) {
-    const [waf, bans, certs] = await Promise.all([
+    const [waf, bans] = await Promise.all([
       api.getFleetWafEvents({ node: nodeId, limit: DRAWER_EVENTS }),
       api.getFleetBans(nodeId),
-      api.listCertificates(),
     ]);
+    // Two nodes opened in quick succession race here. Without this
+    // guard the slower response wins and the drawer shows one node's
+    // WAF events under another node's name, which in the incident this
+    // drawer exists for is worse than showing nothing.
+    if (drawerLoadedFor !== nodeId) return;
+    // A failed read must not read as "this node reported nothing".
+    // That is the sentence an operator would act on.
+    drawerError = waf.error?.message ?? bans.error?.message ?? null;
     drawerWaf = waf.data?.rows ?? [];
     drawerBans = bans.data ?? [];
-    certificates = certs.data?.certificates ?? [];
+  }
+
+  async function loadCertificates() {
+    const res = await api.listCertificates();
+    if (res.data) certificates = res.data.certificates;
   }
 
   $effect(() => {
@@ -63,25 +79,24 @@
     drawerLoadedFor = id;
     drawerWaf = [];
     drawerBans = [];
+    drawerError = null;
     void loadDrawer(id);
   });
 
   /**
    * The certificates whose private keys this node receives.
    *
-   * Derived rather than reported: nothing records what was pushed to
-   * whom. A route selector naming the node is what makes the control
-   * plane send that hostname's key (Story 9.5 D15), so intersecting
-   * the node's selecting hostnames with each certificate's subject
-   * names reproduces the same rule the push path applies. A node that
-   * is still `pending` matches hostnames it has not been sent yet,
-   * which is the point of showing this before activating it.
+   * Reported by the control plane, not derived here. The first version
+   * of this intersected `selected_for_hostnames` with each
+   * certificate's subject names and claimed to reproduce the push
+   * path's rule. It did not: that field deliberately omits fleet-wide
+   * routes, which entitle every Active node, so a node holding every
+   * fleet-wide certificate was shown as holding none, on the page
+   * built to answer exactly that question.
    */
   function certificatesFor(node: ClusterNodeResponse): CertificateResponse[] {
-    const wanted = new Set(node.selected_for_hostnames);
-    return certificates.filter(
-      (c) => wanted.has(c.domain) || c.san_domains.some((d) => wanted.has(d)),
-    );
+    const entitled = new Set(node.certificate_ids);
+    return certificates.filter((c) => entitled.has(c.id));
   }
 
   function daysUntil(iso: string): number {
@@ -108,17 +123,75 @@
   let minting = $state(false);
   let minted = $state<MintedTokenResponse | null>(null);
 
+  const status = $derived($clusterStatus);
   const superAdmin = $derived($isSuperAdmin);
+  /**
+   * Role alone, ignoring read-only mode. Break-glass and leave are the
+   * two ways out of read-only mode, so gating them on it would lock
+   * the door from the inside: an operator on an edge whose control
+   * plane is unreachable would have no way to act on that node.
+   */
+  const superAdminRole = $derived($isSuperAdminRole);
+
+  // Break-glass and leave (Story 9.4 AC #11, 9.3 AC #13). Follower
+  // only; the control plane owns the configuration and has nothing to
+  // break out of.
+  let glassDuration = $state(900);
+  let glassBusy = $state(false);
+  let leaving = $state(false);
+  let confirmLeave = $state(false);
+
+  async function openGlass() {
+    glassBusy = true;
+    const res = await api.openBreakGlass(glassDuration);
+    glassBusy = false;
+    if (res.error) {
+      showToast(res.error.message, 'error');
+      return;
+    }
+    showToast('Break-glass open; local edits are allowed until it closes');
+    await load();
+  }
+
+  async function closeGlass() {
+    glassBusy = true;
+    const res = await api.closeBreakGlass();
+    glassBusy = false;
+    if (res.error) {
+      showToast(res.error.message, 'error');
+      return;
+    }
+    showToast('Break-glass closed; this node will reconcile with the control plane');
+    await load();
+  }
+
+  async function leaveFleet() {
+    confirmLeave = false;
+    leaving = true;
+    const res = await api.leaveCluster();
+    leaving = false;
+    if (res.error) {
+      showToast(res.error.message, 'error');
+      return;
+    }
+    // A node that left is no longer a follower, so the whole cluster
+    // surface should disappear. Reload rather than patch the store:
+    // every derived predicate on the page depends on the role.
+    showToast(
+      res.data?.control_plane_notified === false
+        ? 'Left the fleet, but the control plane could not be told: revoke this node there'
+        : 'Left the fleet',
+    );
+    await load();
+  }
 
   async function load() {
-    const [statusRes, nodesRes] = await Promise.all([
-      api.getClusterStatus(),
-      api.listClusterNodes(),
-    ]);
-    if (statusRes.data) {
-      status = statusRes.data;
-      clusterStatus.set(statusRes.data);
-    }
+    // The status is polled once, by `Dashboard.svelte`, which owns the
+    // store; this page reads it. Two writers on one store meant two
+    // requests per cycle and a window where the slower of two
+    // overlapping responses landed last, briefly re-enabling or
+    // hiding the mutation controls that derive from it.
+    const nodesRes = await api.listClusterNodes();
     if (nodesRes.error) {
       loadError = nodesRes.error.message;
     } else {
@@ -135,6 +208,7 @@
 
   onMount(() => {
     void load();
+    void loadCertificates();
     timer = setInterval(() => void load(), REFRESH_MS);
   });
 
@@ -366,7 +440,14 @@
         <div class="gauge">
           <span class="gauge-label">CPU</span>
           <div class="gauge-track">
-            <div class="gauge-fill" style="width: {res.cpu_percent}%"></div>
+            <!--
+              Bounded here as well as at the wire decode boundary. The
+              other two gauges go through `gaugePercent`, which caps;
+              leaving this one to depend on a `.min(100)` in another
+              crate means a regression there widens an element on the
+              operator's page.
+            -->
+            <div class="gauge-fill" style="width: {gaugePercent(res.cpu_percent, 100) ?? 0}%"></div>
           </div>
           <span class="gauge-value">{res.cpu_percent}%</span>
         </div>
@@ -433,6 +514,12 @@
         </table>
       {/if}
     </section>
+
+    {#if drawerError}
+      <p class="error-text">
+        Could not read this node's recent activity: {drawerError}
+      </p>
+    {/if}
 
     <section class="drawer-section">
       <h3>Recent WAF events</h3>
@@ -585,6 +672,65 @@
   </div>
 {/if}
 
+{#if status?.role === 'follower' && superAdminRole}
+  <!--
+    Gated on the role alone, never on read-only mode. These are the two
+    ways out of read-only mode, so gating them on it would lock the door
+    from the inside: an operator on an edge whose control plane is
+    unreachable would see a banner explaining that edits are refused and
+    no way to act.
+  -->
+  <section class="follower-actions">
+    <h2>This node</h2>
+    {#if breakGlassActive(status)}
+      <p class="muted">
+        A break-glass window is open. Closing it now makes this node pull the
+        control plane's current configuration and discard local edits.
+      </p>
+      <button class="btn-secondary" disabled={glassBusy} onclick={() => void closeGlass()}>
+        Close break-glass
+      </button>
+    {:else}
+      <p class="muted">
+        Configuration is owned by {status.control_plane}. Break-glass allows
+        local edits for a bounded window, for use when the control plane
+        cannot be reached. Edits are reconciled away when it closes, and the
+        window is audited here and reported in every heartbeat.
+      </p>
+      <label for="glass-duration">Window (seconds)</label>
+      <input
+        id="glass-duration"
+        type="number"
+        bind:value={glassDuration}
+        min="1"
+        max="86400"
+      />
+      <button class="btn-secondary" disabled={glassBusy} onclick={() => void openGlass()}>
+        Open break-glass
+      </button>
+    {/if}
+
+    <p class="muted">
+      Leaving tells the control plane over the live session, then wipes this
+      node's fleet identity. If the control plane cannot be reached the node
+      still leaves and must be revoked there by hand.
+    </p>
+    <button class="btn-danger" disabled={leaving} onclick={() => (confirmLeave = true)}>
+      Leave the fleet
+    </button>
+  </section>
+{/if}
+
+{#if confirmLeave}
+  <ConfirmDialog
+    title="Leave the fleet?"
+    message="This node stops receiving configuration and certificate keys from the control plane and keeps only what it already has. Its fleet identity is wiped, so rejoining needs a new join token."
+    confirmLabel="Leave"
+    onconfirm={() => void leaveFleet()}
+    oncancel={() => (confirmLeave = false)}
+  />
+{/if}
+
 <style>
   .drawer-section {
     border-top: 1px solid var(--color-border);
@@ -643,6 +789,21 @@
   }
   .gauge-value {
     font-variant-numeric: tabular-nums;
+  }
+  .follower-actions {
+    margin: 1rem 0;
+    padding: 1rem;
+    border: 1px solid var(--color-border);
+    border-radius: 0.5rem;
+    max-width: 40rem;
+  }
+  .follower-actions h2 {
+    font-size: 0.95rem;
+    margin: 0 0 0.5rem;
+  }
+  .follower-actions input {
+    display: block;
+    margin-bottom: 0.5rem;
   }
   .page {
     padding: 1.5rem;
