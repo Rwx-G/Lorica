@@ -103,6 +103,14 @@ pub const RL_USERS: u32 = 20;
 /// Cluster registry mutations (token mint/revoke, activate, revoke,
 /// leave) per window: operator-driven, a few per incident at most.
 pub const RL_CLUSTER: u32 = 30;
+/// Cluster reads (status, roster, replication, drift, fan-in queries)
+/// per window: a separate, larger bucket. The dashboard polls the
+/// roster every ten seconds and the status more often, and the
+/// `cluster` e2e smoke polls between assertions, so sharing the
+/// mutation bucket answered 429 to the fleet view within a minute.
+/// Ten a second is far above any dashboard and still a ceiling on a
+/// Viewer paging the fleet's rows against the ingest writer.
+pub const RL_CLUSTER_READ: u32 = 600;
 
 /// Type-erased metrics refresher closure (WPAR-7 pull-on-scrape).
 ///
@@ -527,13 +535,14 @@ pub fn build_router(
         // Cluster registry (Story 9.3). Role floors live in the
         // authorize middleware: tokens and every mutation are
         // SuperAdmin, reads are Viewer+.
-        // The reads carry the limiter too (Epic 9 close, security
+        // The reads carry a limiter too (Epic 9 close, security
         // audit): the two fan-in queries take the telemetry store's
         // one connection away from ingest for the duration, and every
-        // one of these is at the Viewer floor.
+        // one of these is at the Viewer floor. Their own bucket, not
+        // the mutations': see `RL_CLUSTER_READ`.
         .route(
             "/api/v1/cluster/status",
-            get(crate::cluster::get_status).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+            get(crate::cluster::get_status).layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/cluster/tokens",
@@ -547,7 +556,7 @@ pub fn build_router(
         )
         .route(
             "/api/v1/cluster/nodes",
-            get(crate::cluster::list_nodes).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+            get(crate::cluster::list_nodes).layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/cluster/nodes/{id}",
@@ -567,11 +576,12 @@ pub fn build_router(
         // report, the drift view, and the follower's break-glass window.
         .route(
             "/api/v1/cluster/replication",
-            get(crate::cluster::get_replication).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+            get(crate::cluster::get_replication)
+                .layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/cluster/drift",
-            get(crate::cluster::get_drift).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+            get(crate::cluster::get_drift).layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
         )
         // Telemetry fan-in (Story 9.6 AC #9). Cursor-paginated with no
         // total: a COUNT(*) per page on an aggregated table is a full
@@ -584,11 +594,12 @@ pub fn build_router(
         )
         .route(
             "/api/v1/cluster/logs",
-            get(crate::cluster::fleet_logs).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+            get(crate::cluster::fleet_logs).layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/cluster/waf-events",
-            get(crate::cluster::fleet_waf_events).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+            get(crate::cluster::fleet_waf_events)
+                .layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/cluster/break-glass",
