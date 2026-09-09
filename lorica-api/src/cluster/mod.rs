@@ -914,6 +914,95 @@ fn next_cursor(returned: usize, requested: Option<u32>, last_id: Option<i64>) ->
     (returned as u32 >= page).then_some(last_id).flatten()
 }
 
+/// Body of `POST /api/v1/cluster/bans`.
+#[derive(Debug, Deserialize)]
+pub struct FleetBanRequest {
+    /// The client address to ban across the fleet.
+    pub client_ip: String,
+    /// How long the ban lasts, in seconds.
+    pub duration_s: u64,
+}
+
+/// Which nodes took a fleet-wide ban.
+#[derive(Debug, Serialize)]
+pub struct FleetBanResponse {
+    /// Nodes now enforcing it.
+    pub applied: Vec<String>,
+    /// Nodes that did not answer. They do NOT receive it later: a ban
+    /// has no convergence path, unlike configuration and keys.
+    pub unreachable: Vec<String>,
+}
+
+/// Longest a fleet-wide ban may last: a day.
+///
+/// Past that it is a routing or firewall decision, not an incident
+/// response, and an operator who wants it permanent should say so
+/// somewhere that survives a restart. The data-plane ban map does
+/// not.
+pub const MAX_FLEET_BAN_DURATION_S: u64 = 24 * 3600;
+
+/// POST /api/v1/cluster/bans - ban a client across the fleet
+/// (SuperAdmin, Story 9.6 AC #10).
+///
+/// Fleet-wide by definition and NOT need-to-know: the operator
+/// decided this client should reach nothing, so it goes to every
+/// active node rather than to a resolved subset.
+///
+/// Automatic per-node auto-ban is deliberately not replicated. It is
+/// a local reflex to local traffic, and replicating it would turn one
+/// node's false positive into a fleet-wide outage for that client.
+pub async fn fleet_ban(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
+    Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+    Json(body): Json<FleetBanRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let control = control_plane(&state)?;
+    // The address becomes a key in every node's data-plane ban map,
+    // which the request path consults on every request. A ban on
+    // something that is not an address could never match a client and
+    // would sit there until it expired.
+    if body.client_ip.parse::<std::net::IpAddr>().is_err() {
+        return Err(ApiError::BadRequest(
+            "client_ip must be an IP address".into(),
+        ));
+    }
+    if body.duration_s == 0 || body.duration_s > MAX_FLEET_BAN_DURATION_S {
+        return Err(ApiError::BadRequest(format!(
+            "duration_s must be between 1 and {MAX_FLEET_BAN_DURATION_S}"
+        )));
+    }
+    let (applied, unreachable) = control
+        .push_ban(&body.client_ip, body.duration_s, "manual")
+        .await;
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "cluster.ban.fleet",
+        ("cluster_ban", &body.client_ip),
+        None,
+        Some(&serde_json::json!({
+            "duration_s": body.duration_s,
+            "applied": applied,
+            "unreachable": unreachable,
+        })),
+    )
+    .await;
+    tracing::warn!(
+        client_ip = %body.client_ip,
+        duration_s = body.duration_s,
+        applied = applied.len(),
+        unreachable = unreachable.len(),
+        "fleet-wide ban issued"
+    );
+    Ok(json_data(FleetBanResponse {
+        applied,
+        unreachable,
+    }))
+}
+
 /// Body of `POST /api/v1/cluster/break-glass`.
 #[derive(Debug, Deserialize)]
 pub struct BreakGlassRequest {

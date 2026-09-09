@@ -69,6 +69,12 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
     if path == "/api/v1/cluster/break-glass" {
         return Role::SuperAdmin;
     }
+    // A fleet-wide ban takes a client off every node at once
+    // (Story 9.6 AC #10): the same floor as the other fleet-wide
+    // actions, not the Operator floor the local ban endpoints use.
+    if path == "/api/v1/cluster/bans" {
+        return Role::SuperAdmin;
+    }
     if path.starts_with("/api/v1/cluster/nodes")
         && method != http::Method::GET
         && method != http::Method::HEAD

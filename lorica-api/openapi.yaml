@@ -3777,6 +3777,151 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "409":
           description: This node is not a control plane
+  /api/v1/cluster/bans:
+    post:
+      tags: [Cluster]
+      summary: Ban a client across the whole fleet (SuperAdmin, control plane)
+      description: >-
+        Story 9.6 AC #10. Fleet-wide by definition and NOT need-to-know: the
+        operator decided this client should reach nothing, so the ban goes to
+        every active node rather than to a resolved subset. Best effort, like
+        every push on this plane: a node that was down when the ban was issued
+        does NOT receive it later, because a ban has no convergence path the
+        way configuration and certificate keys do. Automatic per-node auto-ban
+        is deliberately not replicated, since one node's reflex to its own
+        traffic would otherwise become a fleet-wide outage for that client.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [client_ip, duration_s]
+              properties:
+                client_ip:
+                  type: string
+                  description: The client address; must parse as an IP address.
+                  example: "192.0.2.10"
+                duration_s:
+                  type: integer
+                  description: How long the ban lasts, 1 to 86400 seconds.
+                  example: 3600
+      responses:
+        "200":
+          description: Which nodes took the ban
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/FleetBanResult"
+        "400":
+          description: client_ip is not an address, or duration_s is out of range
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: This node is not a control plane
+  /api/v1/cluster/logs:
+    get:
+      tags: [Cluster]
+      summary: The fleet's access logs (Viewer+, control plane)
+      description: >-
+        Story 9.6 AC #9. Rows fanned in from every node, newest first, each
+        stamped with the `node_id` the mutual-TLS session proved rather than
+        any identity the payload carried. Paginated by CURSOR with no total:
+        a `COUNT(*)` per page on an aggregated table is a full scan under the
+        store lock, which would stall the ingest writer. Pass the previous
+        page's `next_cursor` as `before_id`; a `null` `next_cursor` means the
+        last page.
+      security:
+        - sessionCookie: []
+      parameters:
+        - in: query
+          name: node
+          schema: { type: string }
+          description: Restrict to one node id.
+        - in: query
+          name: route
+          schema: { type: string }
+          description: Substring match on the request host.
+        - in: query
+          name: from
+          schema: { type: string }
+          description: Inclusive lower bound on the origin timestamp, RFC 3339.
+        - in: query
+          name: to
+          schema: { type: string }
+          description: Inclusive upper bound on the origin timestamp, RFC 3339.
+        - in: query
+          name: before_id
+          schema: { type: integer }
+          description: Cursor; return rows with an id strictly below this one.
+        - in: query
+          name: limit
+          schema: { type: integer }
+          description: Rows per page (default 100, max 1000).
+      responses:
+        "200":
+          description: One page of fanned-in access rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/FleetLogPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: This node is not a control plane
+  /api/v1/cluster/waf-events:
+    get:
+      tags: [Cluster]
+      summary: The fleet's WAF events (Viewer+, control plane)
+      description: >-
+        Story 9.6 AC #9. The WAF counterpart of `/api/v1/cluster/logs`, with
+        the same cursor pagination and the same rule that `node_id` comes from
+        the session. `route` matches the event's route hostname.
+      security:
+        - sessionCookie: []
+      parameters:
+        - in: query
+          name: node
+          schema: { type: string }
+        - in: query
+          name: route
+          schema: { type: string }
+        - in: query
+          name: from
+          schema: { type: string }
+        - in: query
+          name: to
+          schema: { type: string }
+        - in: query
+          name: before_id
+          schema: { type: integer }
+        - in: query
+          name: limit
+          schema: { type: integer }
+      responses:
+        "200":
+          description: One page of fanned-in WAF events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/FleetWafPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: This node is not a control plane
   /api/v1/cluster/break-glass:
     get:
       tags: [Cluster]
@@ -4123,6 +4268,83 @@ components:
           format: date-time
           nullable: true
         age_s:
+          type: integer
+          nullable: true
+    FleetBanResult:
+      type: object
+      description: Payload of `POST /api/v1/cluster/bans` (Story 9.6 AC #10).
+      properties:
+        applied:
+          type: array
+          description: Node ids now enforcing the ban.
+          items: { type: string }
+        unreachable:
+          type: array
+          description: >-
+            Node ids that did not answer. They do NOT receive the ban later.
+          items: { type: string }
+    FleetAccessRow:
+      type: object
+      description: One fanned-in access-log row (Story 9.6).
+      properties:
+        id:
+          type: integer
+          description: Cursor for pagination; the fan-in store's own rowid.
+        node_id:
+          type: string
+          description: >-
+            The node the row came from, stamped by the control plane from the
+            mutual-TLS session, never taken from the payload.
+        timestamp: { type: string }
+        method: { type: string }
+        path: { type: string }
+        host: { type: string }
+        status: { type: integer }
+        latency_ms: { type: integer }
+        backend: { type: string }
+        error: { type: string }
+        client_ip: { type: string }
+        request_id: { type: string }
+    FleetWafRow:
+      type: object
+      description: One fanned-in WAF event (Story 9.6).
+      properties:
+        id: { type: integer }
+        node_id: { type: string }
+        rule_id: { type: integer }
+        description: { type: string }
+        category: { type: string }
+        severity: { type: integer }
+        matched_field: { type: string }
+        matched_value: { type: string }
+        timestamp: { type: string }
+        client_ip: { type: string }
+        route_hostname: { type: string }
+        action: { type: string }
+    FleetLogPage:
+      type: object
+      description: >-
+        One page of fanned-in access rows. There is no total, deliberately:
+        a `COUNT(*)` per page on an aggregated table is a full scan under the
+        store lock.
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/FleetAccessRow"
+        next_cursor:
+          type: integer
+          nullable: true
+          description: Pass as `before_id`; `null` on the last page.
+    FleetWafPage:
+      type: object
+      description: One page of fanned-in WAF events.
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/FleetWafRow"
+        next_cursor:
           type: integer
           nullable: true
     DriftReport:

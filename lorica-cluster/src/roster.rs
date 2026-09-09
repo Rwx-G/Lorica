@@ -639,6 +639,59 @@ impl ControlPlane {
             .await
     }
 
+    /// Push an operator-issued ban to every Active session
+    /// (Story 9.6 AC #10).
+    ///
+    /// Fleet-wide by definition: unlike a certificate key or an
+    /// HTTP-01 token, a ban is not need-to-know. The operator decided
+    /// this client should reach nothing, so it goes to every node
+    /// that could serve it, and there is no selector to resolve.
+    ///
+    /// Returns `(applied, unreachable)` node ids. Best effort, like
+    /// every other push on this plane: a node that was down when the
+    /// ban was issued does NOT get it later, and that is stated in
+    /// `docs/cluster.md` rather than papered over, because a ban has
+    /// no convergence path the way configuration and keys do.
+    pub async fn push_ban(
+        &self,
+        client_ip: &str,
+        duration_s: u64,
+        reason: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let targets: Vec<(String, RpcEndpoint<ClusterFrame>)> = self
+            .sessions
+            .active_sessions()
+            .into_iter()
+            .map(|(node_id, endpoint, _)| (node_id, endpoint))
+            .collect();
+        let mut applied = Vec::new();
+        let mut unreachable = Vec::new();
+        for (node_id, endpoint) in targets {
+            let request = crate::messages::ClusterRequest::ban_push(crate::messages::BanPush {
+                client_ip: client_ip.to_string(),
+                duration_s,
+                reason: reason.to_string(),
+            });
+            match endpoint
+                .request(request, crate::replication::DEFAULT_PER_NODE_DEADLINE)
+                .await
+            {
+                Ok(response) => match response.body {
+                    Some(crate::messages::cluster_response::Body::BanPushAck(ack))
+                        if ack.applied =>
+                    {
+                        applied.push(node_id);
+                    }
+                    _ => unreachable.push(node_id),
+                },
+                Err(_) => unreachable.push(node_id),
+            }
+        }
+        applied.sort();
+        unreachable.sort();
+        (applied, unreachable)
+    }
+
     /// Publish an HTTP-01 challenge token to the nodes `recipients`
     /// names, and report PER NODE (Story 9.5 AC #6).
     ///

@@ -562,6 +562,10 @@ pub fn build_router(
         // Telemetry fan-in (Story 9.6 AC #9). Cursor-paginated with no
         // total: a COUNT(*) per page on an aggregated table is a full
         // scan under the store lock, which would stall ingest.
+        .route(
+            "/api/v1/cluster/bans",
+            post(crate::cluster::fleet_ban).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
         .route("/api/v1/cluster/logs", get(crate::cluster::fleet_logs))
         .route(
             "/api/v1/cluster/waf-events",
