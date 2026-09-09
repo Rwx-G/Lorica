@@ -1043,6 +1043,27 @@ services:
     networks:
       - e2e
 
+  # The restart phase (backlog #77): the same image and the same
+  # fleet, run after the main smoke once run.sh has restarted a
+  # container. The phase name is the command argument.
+  cluster-restart-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["cluster"]
+    user: "0:0"
+    entrypoint: ["bash", "run-cluster-restart-smoke.sh"]
+    depends_on:
+      - lorica-cp
+      - lorica-edge-a
+    volumes:
+      - shared-cluster:/shared:ro
+    environment:
+      - CP_API=https://lorica-cp:9443
+      - EDGE_A_API=https://lorica-edge-a:9443
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
   cluster-smoke:
     build:
       context: ./test-runner
