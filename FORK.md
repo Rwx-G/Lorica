@@ -115,7 +115,7 @@ commit; the `[1.7.0]` CHANGELOG entries describe the user-visible effect.
 
 | Cycle | Upstream range | Ported | Not ported (deliberate) |
 |-------|----------------|--------|-------------------------|
-| 1.7.0 (2026-09-09) | fork baseline to `09696b51` (2026-08-25) | `aece9932`, `6e2158d5` (re-implemented on the `RwLock` pool), `d5ade3a2`, `e21646be`, `f486cd84`, `b8aacad8`, `28c18e6b` + `ca23f166` (source, not the integration tests), `ff6693b7`, `d248583f` (source), `0c081493`, `7166d81e`, `6dcc236a`, `5bec4059`, `915590a9`, `3e657e2f` + `3dd51643` | proxy task API family `8683056e`, `7142ad46`, `17325ff4`, `b90d4203` (backlog #83); feature commits `21140569`, `4a9a34c5`, `600c5c0d`, `402acae5` |
+| 1.7.0 (2026-09-09) | fork baseline to `09696b51` (2026-08-25) | `aece9932`, `6e2158d5` (re-implemented on the `RwLock` pool), `d5ade3a2`, `e21646be`, `f486cd84`, `b8aacad8`, `28c18e6b` + `ca23f166` (source, not the integration tests), `ff6693b7`, `d248583f` (source), `0c081493`, `7166d81e`, `6dcc236a`, `5bec4059`, `915590a9`, `3e657e2f` + `3dd51643` | proxy task API family `d7728cac`, `5a822047`, `8683056e`, `7142ad46`, `9c16af9c`, `17325ff4`, `b90d4203` and the six April feature commits it sits on (backlog #83); feature commits `21140569`, `4a9a34c5`, `600c5c0d`, `402acae5` |
 | 1.5.8 (2026-06-05) | `0.8.1` | bounded HTTP/2 server limits (`default_h2_options`) | - |
 
 How a commit is ported: `git format-patch -1 <sha>`, rename the paths and
