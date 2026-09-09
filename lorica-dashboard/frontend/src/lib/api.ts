@@ -69,6 +69,8 @@ export interface MintTokenRequest {
 export interface FleetQueryParams {
   node?: string;
   route?: string;
+  /** Exact WAF rule category. Ignored by the access-log endpoint. */
+  category?: string;
   from?: string;
   to?: string;
   before_id?: number;
@@ -84,11 +86,19 @@ export interface FleetPage<T> {
   next_cursor: number | null;
 }
 
-/** Build the query string, omitting every unset filter. */
-function fleetQuery(params: FleetQueryParams): string {
+/**
+ * Build the query string, omitting every unset filter.
+ *
+ * Exported for its unit tests: an omitted filter and a filter set to
+ * the empty string must produce the same URL, because the backend
+ * treats a present-but-empty `node` as "match the node whose id is the
+ * empty string" and would return nothing.
+ */
+export function fleetQuery(params: FleetQueryParams): string {
   const q = new URLSearchParams();
   if (params.node) q.set('node', params.node);
   if (params.route) q.set('route', params.route);
+  if (params.category) q.set('category', params.category);
   if (params.from) q.set('from', params.from);
   if (params.to) q.set('to', params.to);
   if (params.before_id !== undefined) q.set('before_id', String(params.before_id));

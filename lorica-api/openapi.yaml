@@ -3928,6 +3928,13 @@ paths:
           name: route
           schema: { type: string }
         - in: query
+          name: category
+          schema: { type: string }
+          description: >-
+            Exact WAF rule category, matching the values the single-node
+            `/api/v1/waf/events` endpoint accepts. WAF-only: the access-log
+            endpoint has no such column and ignores it.
+        - in: query
           name: from
           schema: { type: string }
         - in: query

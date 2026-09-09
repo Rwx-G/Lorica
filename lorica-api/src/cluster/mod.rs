@@ -821,6 +821,9 @@ pub struct FleetLogsQuery {
     pub node: Option<String>,
     /// Substring match on the host (logs) or route hostname (WAF).
     pub route: Option<String>,
+    /// Exact WAF rule category. Ignored by the access-log endpoint,
+    /// which has no such column.
+    pub category: Option<String>,
     /// Inclusive lower bound on the origin timestamp, RFC 3339.
     pub from: Option<String>,
     /// Inclusive upper bound on the origin timestamp, RFC 3339.
@@ -837,6 +840,7 @@ impl FleetLogsQuery {
         FleetQuery {
             node_id: self.node.clone(),
             route: self.route.clone(),
+            category: self.category.clone(),
             from: self.from.clone(),
             to: self.to.clone(),
             before_id: self.before_id,

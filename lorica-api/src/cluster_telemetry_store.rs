@@ -171,6 +171,11 @@ pub struct FleetQuery {
     pub from: Option<String>,
     /// Inclusive upper bound on `timestamp`, RFC 3339.
     pub to: Option<String>,
+    /// Exact WAF rule category. WAF queries only: the access table
+    /// has no such column, so [`FleetQuery::build_where`] takes the
+    /// column name from the caller rather than reading this field
+    /// unconditionally.
+    pub category: Option<String>,
     /// Return rows with an id strictly BELOW this one. Rows come back
     /// newest first, so this walks backwards through the table.
     pub before_id: Option<i64>,
@@ -630,7 +635,7 @@ impl ClusterTelemetryStore {
     ///
     /// Returns the SQLite error text on a read failure.
     pub fn query_access(&self, params: &FleetQuery) -> Result<Vec<FleetAccessRow>, String> {
-        let (where_clause, binds) = params.build_where("host");
+        let (where_clause, binds) = params.build_where("host", None);
         let sql = format!(
             "SELECT id, node_id, timestamp, method, path, host, status, latency_ms,
                     backend, error, client_ip, request_id
@@ -674,7 +679,7 @@ impl ClusterTelemetryStore {
     ///
     /// Returns the SQLite error text on a read failure.
     pub fn query_waf(&self, params: &FleetQuery) -> Result<Vec<FleetWafRow>, String> {
-        let (where_clause, binds) = params.build_where("route_hostname");
+        let (where_clause, binds) = params.build_where("route_hostname", Some("category"));
         let sql = format!(
             "SELECT id, node_id, rule_id, description, category, severity, matched_field,
                     matched_value, timestamp, client_ip, route_hostname, action
@@ -757,9 +762,15 @@ impl TelemetryTable {
 
 impl FleetQuery {
     /// Build the shared `WHERE` clause. `route_column` differs between
-    /// the two tables; everything else is identical, and every value
-    /// is bound rather than interpolated.
-    fn build_where(&self, route_column: &str) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    /// the two tables and `category_column` exists only on the WAF one;
+    /// everything else is identical, and every value is bound rather
+    /// than interpolated. Both column names come from this module, not
+    /// from a request, which is why interpolating them is safe.
+    fn build_where(
+        &self,
+        route_column: &str,
+        category_column: Option<&str>,
+    ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
         let mut conditions: Vec<String> = Vec::new();
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(node_id) = &self.node_id {
@@ -769,6 +780,10 @@ impl FleetQuery {
         if let Some(route) = &self.route {
             conditions.push(format!("{route_column} LIKE ?"));
             binds.push(Box::new(format!("%{route}%")));
+        }
+        if let (Some(column), Some(category)) = (category_column, &self.category) {
+            conditions.push(format!("{column} = ?"));
+            binds.push(Box::new(category.clone()));
         }
         if let Some(from) = &self.from {
             conditions.push("timestamp >= ?".to_string());
@@ -1136,6 +1151,61 @@ mod tests {
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].route_hostname, "shop.example.com");
         assert_eq!(scoped[0].node_id, "node-a");
+    }
+
+    #[test]
+    fn the_category_filter_reaches_the_waf_table_and_nothing_else() {
+        let (store, _dir) = store();
+        let mut xss = waf_row("shop.example.com", "2026-09-09T10:00:02Z");
+        xss.category = "xss".to_string();
+        store
+            .ingest(
+                "node-a",
+                &[access_row("shop.example.com", "2026-09-09T10:00:00Z")],
+                &[waf_row("shop.example.com", "2026-09-09T10:00:01Z"), xss],
+                &[],
+            )
+            .expect("ingest");
+
+        let sqli = store
+            .query_waf(&FleetQuery {
+                category: Some("sqli".to_string()),
+                ..Default::default()
+            })
+            .expect("query");
+        assert_eq!(sqli.len(), 1);
+        assert_eq!(sqli[0].category, "sqli");
+
+        // The access table has no `category` column, so setting the
+        // filter must be ignored there rather than producing SQL that
+        // names a column the table does not have.
+        let access = store
+            .query_access(&FleetQuery {
+                category: Some("sqli".to_string()),
+                ..Default::default()
+            })
+            .expect("the access query ignores a WAF-only filter");
+        assert_eq!(access.len(), 1);
+    }
+
+    #[test]
+    fn a_hostile_category_is_bound_not_interpolated() {
+        let (store, _dir) = store();
+        store
+            .ingest(
+                "node-a",
+                &[],
+                &[waf_row("shop.example.com", "2026-09-09T10:00:00Z")],
+                &[],
+            )
+            .expect("ingest");
+        let hostile = store
+            .query_waf(&FleetQuery {
+                category: Some("' OR 1=1 --".to_string()),
+                ..Default::default()
+            })
+            .expect("a hostile filter is a filter, not an error");
+        assert!(hostile.is_empty());
     }
 
     #[test]
