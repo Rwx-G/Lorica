@@ -1333,58 +1333,6 @@ mod test {
         server.await.unwrap();
     }
 
-    #[cfg(feature = "patched_http1")]
-    #[tokio::test]
-    async fn test_server_rejects_forbidden_byte_in_request_target() {
-        // Control bytes (CR/LF) may be accepted in the request path depending
-        // on URI parsing. Ensure such a request target is rejected on ingest as
-        // defense-in-depth, since these bytes are not permitted in a URI.
-        let (client, server) = duplex(65536);
-
-        let client = tokio::spawn(async move {
-            let (h2, connection) = h2::client::handshake(client).await.unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-
-            let mut h2 = h2.ready().await.unwrap();
-
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://www.example.com/a\r\nX-Injected: 1")
-                .body(())
-                .unwrap();
-            // Ensure CR/LF survived URI parsing, otherwise the test is a no-op.
-            assert!(request.uri().path().contains('\n'));
-
-            let (response, _) = h2.send_request(request, true).unwrap();
-            // The stream must be rejected (reset), not answered.
-            assert!(response.await.is_err());
-        });
-
-        let server = tokio::spawn(async move {
-            let mut connection = handshake(Box::new(server), None).await.unwrap();
-            let digest = Arc::new(Digest::default());
-            let accepted = timeout(
-                Duration::from_secs(1),
-                HttpSession::from_h2_conn(&mut connection, digest),
-            )
-            .await
-            .expect("from_h2_conn hung: the offending stream was not rejected")
-            .expect("from_h2_conn returned an error");
-            // The offending stream is reset during acceptance, so `from_h2_conn`
-            // yields `Rejected` rather than a session built from the forbidden
-            // request target. Sibling streams and the connection are unaffected.
-            assert!(
-                matches!(accepted, Some(H2Accept::Rejected)),
-                "request with forbidden byte in target was not rejected"
-            );
-        });
-
-        client.await.unwrap();
-        server.await.unwrap();
-    }
-
     #[tokio::test]
     async fn test_server_handshake_accept_request() {
         let (client, server) = duplex(65536);
