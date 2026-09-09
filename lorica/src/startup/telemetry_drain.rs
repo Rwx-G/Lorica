@@ -317,7 +317,14 @@ async fn drain_once(
         audit: audit
             .into_iter()
             .map(|(_, row)| TelemetryAuditRow {
-                origin_id: u64::try_from(row.origin_id).unwrap_or(0),
+                // `0` is the local-row sentinel elsewhere in this
+                // feature, so it is the one value this must never
+                // silently fall back to. The ids come from a SQLite
+                // `AUTOINCREMENT` rowid and are always positive, which
+                // is why this saturates rather than erroring: a
+                // negative id here would mean the row did not come from
+                // that column at all.
+                origin_id: u64::try_from(row.origin_id).unwrap_or(u64::MAX),
                 timestamp: row.timestamp,
                 operator_username: row.operator_username,
                 operator_role: row.operator_role,

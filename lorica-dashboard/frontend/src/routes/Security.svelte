@@ -363,8 +363,17 @@
    * local marker.
    */
   function fleetNodeName(nodeId: string): string {
-    if (nodeId === '') return 'This node';
+    // A node's display name is chosen at enrolment and validated only
+    // for length and control characters, so a follower can call itself
+    // "This node". The local marker therefore has to be something a
+    // name cannot forge: the caller renders it as a badge, and this
+    // returns the node's own name unchanged.
     return auditNodeNames[nodeId] ?? nodeId;
+  }
+
+  /** Whether a chain is this node's own, which no display name can claim. */
+  function isLocalChain(nodeId: string): boolean {
+    return nodeId === '';
   }
 
   async function loadAuditNodes() {
@@ -379,7 +388,7 @@
 
   async function verifyAuditChain() {
     auditVerifying = true;
-    const res = await api.verifyAudit();
+    const res = await api.verifyAudit(auditNode);
     if (res.error) {
       showToast(res.error.message, 'error');
     } else if (res.data) {
@@ -901,7 +910,7 @@
             }}
           >
             <option value="__all__">All nodes</option>
-            <option value="">This node</option>
+            <option value="">This node (local chain)</option>
             {#each auditNodeIds.filter((n) => n !== '') as id (id)}
               <option value={id}>{fleetNodeName(id)}</option>
             {/each}
@@ -930,11 +939,19 @@
         {#each auditVerifyResult.nodes as chain (chain.node_id)}
           {#if chain.verified}
             <div class="audit-verify audit-verify-ok" role="status">
-              {fleetNodeName(chain.node_id)}: chain verified, {chain.total_rows} rows
+              {#if isLocalChain(chain.node_id)}
+                <span class="local-chain">this node</span>
+              {:else}
+                {fleetNodeName(chain.node_id)}
+              {/if}: chain verified, {chain.total_rows} rows
             </div>
           {:else}
             <div class="audit-verify audit-verify-broken" role="alert">
-              {fleetNodeName(chain.node_id)}: chain BROKEN at row
+              {#if isLocalChain(chain.node_id)}
+                <span class="local-chain">this node</span>
+              {:else}
+                {fleetNodeName(chain.node_id)}
+              {/if}: chain BROKEN at row
               {chain.first_break_id}: {chain.first_break_reason}
             </div>
           {/if}
@@ -967,7 +984,13 @@
               {#each auditEntries as record (record.id)}
                 <tr>
                   {#if fleetView}
-                    <td class="mono">{fleetNodeName(record.node_id)}</td>
+                    <td class="mono">
+                      {#if isLocalChain(record.node_id)}
+                        <span class="local-chain">this node</span>
+                      {:else}
+                        {fleetNodeName(record.node_id)}
+                      {/if}
+                    </td>
                   {/if}
                   <td class="mono">{formatTime(record.timestamp)}</td>
                   <td>
@@ -1405,6 +1428,19 @@
   .audit-verify-broken {
     background: var(--color-red-subtle);
     color: var(--color-red);
+  }
+
+  /* The local chain is marked by a badge, not by a name: a node's
+     display name is chosen at enrolment, so a follower could otherwise
+     call itself "This node" and have its rows read as the control
+     plane's own. */
+  .local-chain {
+    display: inline-block;
+    padding: 0 0.35rem;
+    border-radius: 0.25rem;
+    background: var(--color-border);
+    color: var(--color-text-muted);
+    font-style: italic;
   }
 
   .audit-footer {

@@ -422,6 +422,72 @@ pub const MAX_TELEMETRY_ROWS: usize = 512;
 /// going to help with.
 pub const MAX_TELEMETRY_BANS: usize = 256;
 
+/// Longest display field a fanned-in audit row may carry.
+///
+/// The local writer bounds nothing, because a local row's fields come
+/// from this node's own session and request. A fanned-in row's come
+/// from another machine, and every other peer-supplied string in this
+/// crate is bounded where it is decoded.
+pub const MAX_AUDIT_FIELD_BYTES: usize = 512;
+
+/// Whether a fanned-in audit row is malformed, and how
+/// (Story 9.9, the decode boundary).
+///
+/// Applied at the bridge like `config_hash_is_valid` and
+/// `challenge_defect`, and for the same reason: these eleven strings
+/// ride from another machine into a table an operator reads and a
+/// retention pass deletes by. Unbounded, they are a disk-growth vector
+/// that no quota can price; unvalidated, the two chain hashes are the
+/// one field whose shape is exactly known and worth refusing.
+///
+/// Returns `None` when the row is acceptable.
+#[must_use]
+pub fn telemetry_audit_row_defect(row: &TelemetryAuditRow) -> Option<&'static str> {
+    // The origin's own rowid. Zero is the LOCAL-row marker on the
+    // receiving side, so a fanned-in row claiming it would be filed as
+    // one of the control plane's own.
+    if row.origin_id == 0 {
+        return Some("origin_id is zero, which marks a local row");
+    }
+    if i64::try_from(row.origin_id).is_err() {
+        return Some("origin_id does not fit the column");
+    }
+    for hash in [&row.prev_chain_hash, &row.chain_hash] {
+        if !config_hash_is_valid(hash) {
+            return Some("a chain hash is not 64 lowercase hex characters");
+        }
+    }
+    // The payload hashes are empty when absent, hex otherwise.
+    for hash in [&row.before_payload_hash, &row.after_payload_hash] {
+        if !hash.is_empty() && !config_hash_is_valid(hash) {
+            return Some("a payload hash is neither empty nor 64 lowercase hex characters");
+        }
+    }
+    for field in [
+        &row.timestamp,
+        &row.operator_username,
+        &row.operator_role,
+        &row.action,
+        &row.target_type,
+        &row.target_id,
+        &row.ip,
+        &row.user_agent,
+    ] {
+        if field.len() > MAX_AUDIT_FIELD_BYTES {
+            return Some("an audit field is over its length bound");
+        }
+        // Control characters reach a table an operator reads and, one
+        // careless `warn!` away, a log line.
+        if field.chars().any(char::is_control) {
+            return Some("an audit field carries a control character");
+        }
+    }
+    if row.timestamp.is_empty() {
+        return Some("an audit row carries no timestamp");
+    }
+    None
+}
+
 /// Audit rows one [`TelemetryPush`] may carry (Story 9.9 AC #2).
 ///
 /// Smaller than [`MAX_TELEMETRY_ROWS`] because audit rows are orders

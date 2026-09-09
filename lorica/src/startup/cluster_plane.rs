@@ -475,6 +475,33 @@ pub(crate) async fn redeem_with_store(
 /// frame: the frame is gone by the time this runs, and what the quota
 /// is protecting is disk, not bandwidth. The fixed addend per row
 /// stands in for the row overhead SQLite adds on top of the strings.
+/// What a batch's audit rows will cost on disk (Story 9.9).
+///
+/// Separate from [`estimated_bytes`] because the audit rows are taken
+/// out of the batch before the quota is computed: they are exempt from
+/// the shedding verdict, not from the accounting, and a node that
+/// pushes only audit rows must still be charged for the work.
+fn audit_bytes(rows: &[lorica_cluster::TelemetryAuditRow]) -> u64 {
+    const ROW_OVERHEAD: u64 = 64;
+    rows.iter()
+        .map(|r| {
+            ROW_OVERHEAD
+                + (r.timestamp.len()
+                    + r.operator_username.len()
+                    + r.operator_role.len()
+                    + r.action.len()
+                    + r.target_type.len()
+                    + r.target_id.len()
+                    + r.before_payload_hash.len()
+                    + r.after_payload_hash.len()
+                    + r.ip.len()
+                    + r.user_agent.len()
+                    + r.prev_chain_hash.len()
+                    + r.chain_hash.len()) as u64
+        })
+        .sum()
+}
+
 fn estimated_bytes(batch: &lorica_cluster::TelemetryPush) -> u64 {
     const ROW_OVERHEAD: u64 = 64;
     // Bans are counted too. They replace rather than append, so they
@@ -785,6 +812,16 @@ impl SessionHandler for FleetHandlers {
             //
             // Bounded on the wire by `MAX_TELEMETRY_AUDIT`, so exempt
             // from shedding is not the same as unbounded.
+            // Measured BEFORE the take, because the quota is computed
+            // from what remains in the batch. Without this the node
+            // pays nothing for audit rows, which is not what the doc,
+            // the proto comment and this story all say: they are
+            // counted against the quota and exempt from its VERDICT,
+            // which are different things. Charging them is what makes a
+            // node flooding audit get a `retry_after_s` even though its
+            // rows are stored.
+            let audit_charge = audit_bytes(&batch.audit);
+            let audit_count = batch.audit.len();
             let audit_rows = std::mem::take(&mut batch.audit);
             let accepted_audit = if audit_rows.is_empty() {
                 0
@@ -797,10 +834,23 @@ impl SessionHandler for FleetHandlers {
                     return Err("the audit log is not open on this node".to_string());
                 };
                 let stamped = node_id.clone();
+                // Refused rather than clamped. A row id that does not
+                // fit is a peer sending something the schema cannot
+                // hold, and clamping it to `i64::MAX` would insert a
+                // row whose position in the chain is a lie, breaking
+                // the ordering `verify` depends on with no diagnostic
+                // pointing at the cause. Unreachable today, since the
+                // sender's ids are positive rowids; the point is that
+                // the next thing to touch this field cannot make it
+                // silent.
                 let rows: Vec<lorica_api::audit::FannedInAuditRow> = audit_rows
                     .into_iter()
-                    .map(|r| lorica_api::audit::FannedInAuditRow {
-                        origin_id: i64::try_from(r.origin_id).unwrap_or(i64::MAX),
+                    .map(|r| {
+                        let origin_id = i64::try_from(r.origin_id).map_err(|_| {
+                            "a fanned-in audit row carries an out-of-range origin id".to_string()
+                        })?;
+                        Ok(lorica_api::audit::FannedInAuditRow {
+                        origin_id,
                         timestamp: r.timestamp,
                         operator_username: r.operator_username,
                         operator_role: r.operator_role,
@@ -813,8 +863,9 @@ impl SessionHandler for FleetHandlers {
                         user_agent: r.user_agent,
                         prev_chain_hash: r.prev_chain_hash,
                         chain_hash: r.chain_hash,
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, String>>()?;
                 tokio::task::spawn_blocking(move || {
                     // `stamped` is the id the SESSION proved, like
                     // every other fanned-in row.
@@ -868,13 +919,13 @@ impl SessionHandler for FleetHandlers {
             // Bytes are estimated from the decoded payload rather than
             // the frame, because the frame is gone by now and what
             // matters is what this will cost on disk.
-            let bytes = estimated_bytes(&batch);
+            let bytes = estimated_bytes(&batch) + audit_charge;
             // Bans are part of what the node offered, so they are
             // part of what it is charged for.
             let verdict = self.quota.admit(
                 &node_id,
                 batch.access.len(),
-                batch.waf.len() + batch.bans.len(),
+                batch.waf.len() + batch.bans.len() + audit_count,
                 bytes,
             );
             let take_access = verdict.access_allowance(batch.access.len());

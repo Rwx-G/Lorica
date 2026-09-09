@@ -118,11 +118,30 @@ impl ConfigStore {
 
     /// Wipe this node's fleet identity (`lorica cluster leave`).
     /// `true` iff a row existed.
+    ///
+    /// The telemetry cursors go with it (Story 9.9). A node id is
+    /// fresh per enrolment, so a rejoined node that kept its cursors
+    /// would resume shipping from where the OLD identity stopped under
+    /// a NEW node id: the control plane's first row for the new chain
+    /// would name a predecessor filed under the old one, giving a
+    /// chain that can never verify and rows an operator cannot
+    /// attribute. Re-seeding costs the pre-rejoin rows, which stay on
+    /// this node and stay verifiable here.
     pub fn delete_cluster_identity(&self) -> Result<bool> {
-        let changed = self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "DELETE FROM cluster_identity WHERE id = ?1",
             params![IDENTITY_ROW_ID],
         )?;
+        tx.execute(
+            "DELETE FROM cluster_state WHERE key IN (?1, ?2, ?3)",
+            params![
+                crate::TelemetryCursor::Access.as_key(),
+                crate::TelemetryCursor::Waf.as_key(),
+                crate::TelemetryCursor::Audit.as_key(),
+            ],
+        )?;
+        tx.commit()?;
         Ok(changed == 1)
     }
 

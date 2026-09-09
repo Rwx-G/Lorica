@@ -1201,6 +1201,26 @@ impl LogStore {
         Self::audit_seal_for(conn, "")
     }
 
+    /// How one chain is ordered, ascending and descending.
+    ///
+    /// The local chain is ordered by arrival, which for its own rows is
+    /// also the order it wrote them. A fanned-in chain is ordered by
+    /// the origin's own id: the aggregated `id` reflects the order rows
+    /// ARRIVED in, and two reconnecting followers interleave that
+    /// arbitrarily.
+    ///
+    /// One function rather than the same conditional in each caller,
+    /// because the retention seal is only correct if it is taken in the
+    /// order verify will walk. Three copies of that rule were three
+    /// places for it to drift.
+    fn chain_order(node_id: &str) -> (&'static str, &'static str) {
+        if node_id.is_empty() {
+            ("id ASC", "id DESC")
+        } else {
+            ("origin_id ASC", "origin_id DESC")
+        }
+    }
+
     /// Append one audit row. `prev_chain_hash` and `chain_hash` are
     /// computed HERE, inside the connection lock: two concurrent
     /// mutations cannot fork the chain. The previous hash comes from
@@ -1286,7 +1306,14 @@ impl LogStore {
     /// batch after a lost acknowledgement must not duplicate rows, and
     /// a duplicate would break the partitioned verify's ordering.
     ///
-    /// Returns how many rows were newly stored.
+    /// Returns how many rows the store DURABLY HOLDS for this batch,
+    /// which is all of them once the transaction commits, not how many
+    /// were newly written. The difference is load-bearing: the drain
+    /// advances its cursor only when the acknowledgement matches what
+    /// it sent, so returning the newly-written count would make every
+    /// re-send answer zero and freeze that node's cursors for the life
+    /// of the process. Deduplication is how idempotency is
+    /// implemented; it is not an acceptance signal.
     ///
     /// # Errors
     ///
@@ -1306,6 +1333,48 @@ impl LogStore {
             return Ok(0);
         }
         let mut conn = self.conn.lock();
+        // The arrival genesis for a chain this store has not seen
+        // (Story 9.9). Fan-in starts at the node's present, not at its
+        // history, so the first row to arrive carries a
+        // `prev_chain_hash` naming a row this store will never hold.
+        // Without a seal, verify falls back to genesis and reports
+        // `prev_hash_mismatch` on that first row forever: the feature
+        // whose purpose is tamper evidence would cry tamper on every
+        // healthy fleet, and an operator who sees "broken" as the
+        // normal state stops reading it.
+        //
+        // The seal is node-supplied, like every other field in the
+        // chain, so it concedes nothing the threat model has not
+        // already conceded: this proves internal consistency of what
+        // the node sent, never authenticity.
+        let seal_key = Self::seal_key(node_id);
+        let known: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log_meta WHERE key = ?1",
+                params![seal_key],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("failed to read the audit arrival seal: {e}"))?;
+        if known == 0 {
+            let existing: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_log WHERE node_id = ?1",
+                    params![node_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("failed to count a node's audit rows: {e}"))?;
+            if existing == 0 {
+                let first = rows
+                    .iter()
+                    .min_by_key(|r| r.origin_id)
+                    .expect("the batch is not empty");
+                conn.execute(
+                    "INSERT OR REPLACE INTO audit_log_meta (key, value) VALUES (?1, ?2)",
+                    params![seal_key, first.prev_chain_hash],
+                )
+                .map_err(|e| format!("failed to write the audit arrival seal: {e}"))?;
+            }
+        }
         let tx = conn
             .transaction()
             .map_err(|e| format!("failed to open the audit fan-in transaction: {e}"))?;
@@ -1344,7 +1413,19 @@ impl LogStore {
         }
         tx.commit()
             .map_err(|e| format!("failed to commit the audit fan-in: {e}"))?;
-        Ok(stored)
+        if stored != rows.len() as u64 {
+            // Not an error: the drain re-offers a batch whenever a push
+            // was not fully accepted, so a duplicate is the idempotency
+            // working. Worth a line because a persistent gap means the
+            // cursor is not advancing.
+            tracing::debug!(
+                node_id,
+                offered = rows.len(),
+                newly_stored = stored,
+                "some fanned-in audit rows were already held"
+            );
+        }
+        Ok(rows.len() as u64)
     }
 
     fn row_to_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::audit::AuditRecord> {
@@ -1486,11 +1567,7 @@ impl LogStore {
         let mut expected: String = Self::audit_seal_for(&conn, node_id)?
             .unwrap_or_else(|| crate::audit::GENESIS_HASH.to_string());
 
-        let order = if node_id.is_empty() {
-            "id ASC"
-        } else {
-            "origin_id ASC"
-        };
+        let (order, _) = Self::chain_order(node_id);
         let sql = format!(
             "SELECT {} FROM audit_log WHERE node_id = ?1 ORDER BY {order}",
             Self::AUDIT_COLUMNS
@@ -1577,6 +1654,10 @@ impl LogStore {
         if doomed == 0 {
             return Ok(0);
         }
+        // The returned count can exceed `doomed`: a chain is cut as a
+        // prefix, so a row younger than the cutoff that sits BEFORE an
+        // expired row in that chain's own order goes with it. Keeping
+        // it would leave a hole, and a hole reads as tampering.
 
         // One seal per chain, not one for the table (Story 9.9 AC #3).
         // A truncation crosses every node's rows at once, so sealing
@@ -1597,38 +1678,59 @@ impl LogStore {
             out
         };
 
+        let mut deleted: usize = 0;
         for node_id in &nodes {
-            // Ordered the way that chain is verified: arrival order for
-            // the local one, the origin's own order for a fanned-in
-            // one. Sealing with the wrong row's `prev` would hand
-            // verify a genesis that does not match its first row.
-            let order = if node_id.is_empty() {
-                "id ASC"
-            } else {
-                "origin_id ASC"
-            };
-            let survivor_prev: Option<String> = conn
+            // Truncation is a PREFIX of the verify order, never a
+            // timestamp predicate applied across the chain.
+            //
+            // The two orders are not the same thing. A fanned-in
+            // chain's order is the origin's `origin_id`; its
+            // `timestamp` is a string that node chose. Deleting
+            // `WHERE timestamp < cutoff` across the table would take
+            // rows out of the MIDDLE of such a chain whenever that
+            // node's clock stepped, leaving neighbours whose hashes no
+            // longer meet, and verify would then report a tamper alarm
+            // caused by nothing but a retention pass.
+            //
+            // So each chain is cut at the position of its LAST expired
+            // row: that row and everything before it in chain order
+            // goes, and what survives is a suffix whose first row is
+            // the one the seal is taken from.
+            let (order, tail_order) = Self::chain_order(node_id);
+            let position = if node_id.is_empty() { "id" } else { "origin_id" };
+
+            let cut: Option<i64> = conn
                 .query_row(
                     &format!(
-                        "SELECT prev_chain_hash FROM audit_log                          WHERE node_id = ?1 AND timestamp >= ?2 ORDER BY {order} LIMIT 1"
+                        "SELECT MAX({position}) FROM audit_log WHERE node_id = ?1 AND timestamp < ?2"
                     ),
                     params![node_id, cutoff_timestamp],
                     |row| row.get(0),
                 )
                 .optional()
+                .map_err(|e| format!("failed to find the audit retention cut: {e}"))?
+                .flatten();
+            let Some(cut) = cut else {
+                continue;
+            };
+
+            let survivor_prev: Option<String> = conn
+                .query_row(
+                    &format!(
+                        "SELECT prev_chain_hash FROM audit_log WHERE node_id = ?1 AND {position} > ?2 ORDER BY {order} LIMIT 1"
+                    ),
+                    params![node_id, cut],
+                    |row| row.get(0),
+                )
+                .optional()
                 .map_err(|e| format!("failed to read earliest surviving audit row: {e}"))?;
 
-            let tail_order = if node_id.is_empty() {
-                "id DESC"
-            } else {
-                "origin_id DESC"
-            };
             let seal: Option<String> = match survivor_prev {
                 Some(prev) => Some(prev),
                 None => conn
                     .query_row(
                         &format!(
-                            "SELECT chain_hash FROM audit_log WHERE node_id = ?1                              ORDER BY {tail_order} LIMIT 1"
+                            "SELECT chain_hash FROM audit_log WHERE node_id = ?1 ORDER BY {tail_order} LIMIT 1"
                         ),
                         params![node_id],
                         |row| row.get(0),
@@ -1644,14 +1746,14 @@ impl LogStore {
                 )
                 .map_err(|e| format!("failed to write audit retention seal: {e}"))?;
             }
-        }
 
-        let deleted = conn
-            .execute(
-                "DELETE FROM audit_log WHERE timestamp < ?1",
-                params![cutoff_timestamp],
-            )
-            .map_err(|e| format!("failed to enforce audit retention: {e}"))?;
+            deleted += conn
+                .execute(
+                    &format!("DELETE FROM audit_log WHERE node_id = ?1 AND {position} <= ?2"),
+                    params![node_id, cut],
+                )
+                .map_err(|e| format!("failed to enforce audit retention: {e}"))?;
+        }
 
         Ok(deleted as u64)
     }
@@ -1885,6 +1987,61 @@ mod fleet_audit_tests {
         out
     }
 
+    /// Recompute a chain's hashes after editing its rows, so a
+    /// fixture stays something a real origin node could have produced.
+    fn rechain(rows: Vec<FannedInAuditRow>) -> Vec<FannedInAuditRow> {
+        let mut prev = crate::audit::GENESIS_HASH.to_string();
+        let mut out = Vec::new();
+        for mut row in rows {
+            row.prev_chain_hash = prev.clone();
+            let entry = NewAuditEntry {
+                timestamp: row.timestamp.clone(),
+                operator_username: row.operator_username.clone(),
+                operator_role: row.operator_role.clone(),
+                action: row.action.clone(),
+                target_type: row.target_type.clone(),
+                target_id: row.target_id.clone(),
+                before_payload_hash: row.before_payload_hash.clone(),
+                after_payload_hash: row.after_payload_hash.clone(),
+                ip: row.ip.clone(),
+                user_agent: row.user_agent.clone(),
+            };
+            row.chain_hash =
+                crate::audit::compute_chain_hash(&prev, &crate::audit::ChainInput::from(&entry));
+            prev = row.chain_hash.clone();
+            out.push(row);
+        }
+        out
+    }
+
+    #[test]
+    fn retention_cuts_a_chain_as_a_prefix_of_its_own_order() {
+        // A fanned-in chain is ordered by the origin's id; its
+        // timestamps are that node's own. When the two disagree,
+        // deleting by timestamp alone takes a row out of the MIDDLE and
+        // verify then reports tampering caused by a retention pass.
+        let (store, _dir) = store();
+        let mut rows = origin_chain(&["a.one", "a.two", "a.three"]);
+        // That node's clock stepped: the SECOND row is the old one.
+        rows[1].timestamp = "2026-01-01T00:00:00Z".to_string();
+        let rebuilt = rechain(rows);
+        store.insert_fanned_in_audit("node-a", &rebuilt).expect("fan-in");
+
+        store
+            .enforce_audit_retention("2026-06-01T00:00:00Z")
+            .expect("retention");
+
+        let result = store.verify_audit_chain_for("node-a").expect("verify");
+        assert!(
+            result.verified,
+            "retention left a hole in the chain: {result:?}"
+        );
+        assert_eq!(
+            result.total_rows, 1,
+            "the cut takes the expired row and everything before it in chain order"
+        );
+    }
+
     #[test]
     fn a_fanned_in_row_never_joins_this_node_s_chain() {
         // The reason AC #2 demands a separate insert path. If fan-in
@@ -1939,10 +2096,13 @@ mod fleet_audit_tests {
     }
 
     #[test]
-    fn a_re_sent_batch_stores_nothing_twice() {
-        // The drain leaves its cursor put when a push is not fully
-        // accepted, so the same rows are offered again. Duplicates
-        // would break the partitioned verify's ordering.
+    fn a_re_sent_batch_is_acknowledged_in_full_and_stored_once() {
+        // Two properties in one test because they are two halves of the
+        // same requirement. The table must not gain a duplicate, and
+        // the caller must be told the rows are held: the drain advances
+        // its cursor only on a full acknowledgement, so answering with
+        // the newly-written count would freeze that node's cursors
+        // permanently the first time a push was not fully accepted.
         let (store, _dir) = store();
         let rows = origin_chain(&["a.one", "a.two"]);
         assert_eq!(
@@ -1951,10 +2111,62 @@ mod fleet_audit_tests {
         );
         assert_eq!(
             store.insert_fanned_in_audit("node-a", &rows).expect("second"),
-            0,
-            "the second delivery of the same rows stores nothing"
+            2,
+            "a re-sent batch is acknowledged in full, or the cursor never moves again"
         );
+
+        let (all, _) = store
+            .query_audit(&crate::audit::AuditQuery {
+                limit: 100,
+                node_id: Some("node-a".to_string()),
+                ..Default::default()
+            })
+            .expect("query");
+        assert_eq!(all.len(), 2, "the second delivery stored no duplicate");
         assert!(store.verify_audit_chain_for("node-a").expect("verify").verified);
+    }
+
+    #[test]
+    fn a_chain_that_arrives_mid_history_verifies_from_where_fan_in_started() {
+        // Fan-in starts at a node's present, not its history: a node
+        // that joins an existing fleet ships what it records from then
+        // on. So the first row to arrive names a predecessor this store
+        // will never hold, and without an arrival seal verify would
+        // report `prev_hash_mismatch` on it forever, on every healthy
+        // fleet.
+        let (store, _dir) = store();
+        let full = origin_chain(&["a.one", "a.two", "a.three"]);
+        let tail = &full[1..];
+        assert_eq!(
+            store.insert_fanned_in_audit("node-a", tail).expect("fan-in"),
+            2
+        );
+
+        let result = store.verify_audit_chain_for("node-a").expect("verify");
+        assert!(
+            result.verified,
+            "a chain that starts mid-history still verifies: {result:?}"
+        );
+        assert_eq!(result.total_rows, 2);
+    }
+
+    #[test]
+    fn the_arrival_seal_is_written_once_and_not_moved_by_later_batches() {
+        // A later batch must not reseal the chain: doing so would let a
+        // node that skipped rows hide the gap by resealing over it.
+        let (store, _dir) = store();
+        let full = origin_chain(&["a.one", "a.two", "a.three", "a.four"]);
+        store
+            .insert_fanned_in_audit("node-a", &full[0..2])
+            .expect("first batch");
+        // A batch that skips `a.three` entirely.
+        store
+            .insert_fanned_in_audit("node-a", &full[3..4])
+            .expect("second batch");
+
+        let result = store.verify_audit_chain_for("node-a").expect("verify");
+        assert!(!result.verified, "the gap is reported rather than resealed");
+        assert_eq!(result.first_break_reason.as_deref(), Some("prev_hash_mismatch"));
     }
 
     #[test]
@@ -1997,33 +2209,7 @@ mod fleet_audit_tests {
 
         let mut rows = origin_chain(&["a.one", "a.two"]);
         rows[0].timestamp = "2026-01-01T00:00:00Z".to_string();
-        // Rebuild the chain so the backdated row still hashes right.
-        let rebuilt = {
-            let mut prev = crate::audit::GENESIS_HASH.to_string();
-            let mut out = Vec::new();
-            for mut row in rows {
-                row.prev_chain_hash = prev.clone();
-                let entry = NewAuditEntry {
-                    timestamp: row.timestamp.clone(),
-                    operator_username: row.operator_username.clone(),
-                    operator_role: row.operator_role.clone(),
-                    action: row.action.clone(),
-                    target_type: row.target_type.clone(),
-                    target_id: row.target_id.clone(),
-                    before_payload_hash: row.before_payload_hash.clone(),
-                    after_payload_hash: row.after_payload_hash.clone(),
-                    ip: row.ip.clone(),
-                    user_agent: row.user_agent.clone(),
-                };
-                row.chain_hash = crate::audit::compute_chain_hash(
-                    &prev,
-                    &crate::audit::ChainInput::from(&entry),
-                );
-                prev = row.chain_hash.clone();
-                out.push(row);
-            }
-            out
-        };
+        let rebuilt = rechain(rows);
         store.insert_fanned_in_audit("node-a", &rebuilt).expect("fan-in");
 
         let deleted = store

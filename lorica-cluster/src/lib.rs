@@ -127,6 +127,7 @@ pub use listener::{
 pub use messages::{
     cert_digest_is_valid, cert_domain_is_valid, cert_id_is_valid,
     challenge_key_authorization_is_valid, challenge_token_is_valid, config_hash_is_valid,
+    telemetry_audit_row_defect,
     BanPush, BanPushAck, CertMaterial, CertPull, CertPullAck, CertPush, CertPushAck, CertRefusal,
     ChallengePublish,
     ChallengePublishAck, ChallengeRetract, ChallengeRetractAck, ClusterFrame, ClusterRequest,
@@ -142,7 +143,7 @@ pub use messages::{
     BODY_KIND_HELLO, BODY_KIND_LEAVE, BODY_KIND_RENEW, BODY_KIND_TELEMETRY_PUSH,
     CERT_DIGEST_PREFIX, MAX_CERT_DOMAIN_BYTES, MAX_CERT_ID_BYTES,
     MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES, MAX_CHALLENGE_TOKEN_BYTES, MAX_CONFIG_HASH_BYTES,
-    MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
+    MAX_AUDIT_FIELD_BYTES, MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
 };
 pub use preauth::{source_key, AttemptWindow, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
 pub use telemetry::{

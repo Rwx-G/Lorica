@@ -68,8 +68,8 @@ use crate::challenge::challenge_defect;
 use crate::messages::{
     ban_duration_is_valid, ban_reason_is_valid, ban_target_is_valid, cert_id_is_valid,
     challenge_token_is_valid,
-    cluster_request, config_hash_is_valid, ClusterRequest, NodeResources, TelemetryPush,
-    MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
+    cluster_request, config_hash_is_valid, telemetry_audit_row_defect, ClusterRequest,
+    NodeResources, TelemetryPush, MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
 };
 use crate::replication::{AppliedConfig, ConfigPayload};
 
@@ -290,6 +290,13 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
                 || push.bans.len() > MAX_TELEMETRY_BANS
                 || push.audit.len() > MAX_TELEMETRY_AUDIT
             {
+                return BridgeOutcome::ProtocolViolation;
+            }
+            // Audit rows are exempt from load shedding, which makes
+            // bounding their CONTENT here the only thing standing
+            // between a follower and unbounded growth in a table
+            // retention deletes by a field that same follower chose.
+            if push.audit.iter().any(|r| telemetry_audit_row_defect(r).is_some()) {
                 return BridgeOutcome::ProtocolViolation;
             }
             BridgeOutcome::InPlane(InPlaneAction::TelemetryPush {
