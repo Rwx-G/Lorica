@@ -34,6 +34,36 @@ export interface ClusterStatus {
   fleet: FleetEntry[];
 }
 
+/**
+ * What a node last reported it is using (Story 9.7 AC #3).
+ *
+ * Session state on the control plane: absent from a node that has sent
+ * no reading on its current session, and re-learned within a heartbeat
+ * after a reconnect. A zero total is how a node says it could not read
+ * that figure, which `gaugePercent` renders as unknown rather than as
+ * a full disk.
+ */
+export interface NodeResources {
+  cpu_percent: number;
+  memory_used_bytes: number;
+  memory_total_bytes: number;
+  disk_used_bytes: number;
+  disk_total_bytes: number;
+}
+
+/**
+ * A used-over-total ratio as a whole percent, or `null` when the total
+ * is missing.
+ *
+ * `null` rather than 0: a node that could not read its disk size has
+ * not got an empty disk, and a gauge at zero would say it has.
+ */
+export function gaugePercent(used: number, total: number): number | null {
+  if (!Number.isFinite(total) || total <= 0) return null;
+  if (!Number.isFinite(used) || used < 0) return null;
+  return Math.min(100, Math.round((used / total) * 100));
+}
+
 /** One node in the roster, as `GET /api/v1/cluster/nodes` reports it. */
 export interface ClusterNodeResponse {
   node: {
@@ -56,6 +86,8 @@ export interface ClusterNodeResponse {
    * activating is the moment those selectors start handing it keys.
    */
   selected_for_hostnames: string[];
+  /** Absent from a node that has sent no reading on this session. */
+  resources: NodeResources | null;
 }
 
 /**

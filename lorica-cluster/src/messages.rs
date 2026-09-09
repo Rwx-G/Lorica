@@ -137,6 +137,37 @@ pub struct HelloAck {
     pub current_hash: ::prost::alloc::string::String,
 }
 
+/// Current resource usage, sampled by the sender at heartbeat time
+/// (Story 9.7 AC #3).
+///
+/// Current values, never a series: a gauge on a node drawer needs one
+/// number, and anything with history belongs on the telemetry fan-in
+/// channel instead.
+///
+/// Carried as an optional message rather than as scalar fields on
+/// [`Heartbeat`] so that absence is representable. A node whose
+/// runtime installs no sampler omits it and the dashboard shows a
+/// dash; scalars would report zero, which reads as an idle node
+/// rather than an unknown one.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct NodeResources {
+    /// Whole percent, 0 to 100, rounded by the sender.
+    #[prost(uint32, tag = "1")]
+    pub cpu_percent: u32,
+    /// Resident memory in use, bytes.
+    #[prost(uint64, tag = "2")]
+    pub memory_used_bytes: u64,
+    /// Total memory, bytes. Zero when the sender could not read it.
+    #[prost(uint64, tag = "3")]
+    pub memory_total_bytes: u64,
+    /// Bytes used on the filesystem holding the data directory.
+    #[prost(uint64, tag = "4")]
+    pub disk_used_bytes: u64,
+    /// Total bytes on that filesystem. Zero when unreadable.
+    #[prost(uint64, tag = "5")]
+    pub disk_total_bytes: u64,
+}
+
 /// Liveness probe, either direction.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Heartbeat {
@@ -153,6 +184,11 @@ pub struct Heartbeat {
     /// Whether the follower is in break-glass (Story 9.4 AC #11).
     #[prost(bool, tag = "4")]
     pub break_glass: bool,
+    /// What the node is currently using (Story 9.7 AC #3). `None` from
+    /// a node whose runtime installs no sampler, which the dashboard
+    /// must render as unknown rather than as zero.
+    #[prost(message, optional, tag = "5")]
+    pub resources: Option<NodeResources>,
 }
 
 /// Answer to a [`Heartbeat`].
@@ -1509,6 +1545,54 @@ mod tests {
                     applied_generation: 1,
                     applied_hash: "ab".to_string(),
                     break_glass: true,
+                    resources: Some(NodeResources {
+                        cpu_percent: 1,
+                        memory_used_bytes: 1,
+                        memory_total_bytes: 1,
+                        disk_used_bytes: 1,
+                        disk_total_bytes: 1,
+                    }),
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("Heartbeat", "timestamp_ms"),
+                tag("Heartbeat", "applied_generation"),
+                tag("Heartbeat", "applied_hash"),
+                tag("Heartbeat", "break_glass"),
+                tag("Heartbeat", "resources"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(
+                &NodeResources {
+                    cpu_percent: 1,
+                    memory_used_bytes: 1,
+                    memory_total_bytes: 1,
+                    disk_used_bytes: 1,
+                    disk_total_bytes: 1,
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("NodeResources", "cpu_percent"),
+                tag("NodeResources", "memory_used_bytes"),
+                tag("NodeResources", "memory_total_bytes"),
+                tag("NodeResources", "disk_used_bytes"),
+                tag("NodeResources", "disk_total_bytes"),
+            ]
+        );
+        // An absent sampler must encode as an absent field, not as a
+        // present message full of zeros: the dashboard distinguishes
+        // "unknown" from "idle" on exactly this.
+        assert_eq!(
+            field_numbers(
+                &Heartbeat {
+                    timestamp_ms: 1,
+                    applied_generation: 1,
+                    applied_hash: "ab".to_string(),
+                    break_glass: true,
+                    resources: None,
                 }
                 .encode_to_vec()
             ),

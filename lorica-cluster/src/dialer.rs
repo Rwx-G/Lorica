@@ -88,6 +88,7 @@ use crate::messages::{
     cluster_response, config_hash_is_valid, BanPushAck, CertPushAck, CertRefusal,
     ChallengePublishAck, ChallengeRetractAck, ClusterFrame, ClusterRequest, ClusterResponse,
     ClusterStatus, ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, Heartbeat, HelloAck,
+    NodeResources,
 };
 use crate::replication::{AppliedConfig, ConfigPayload, ConfigVersion};
 use crate::tls::{client_config, negotiated_cluster_alpn, ClusterTlsError};
@@ -172,6 +173,19 @@ pub struct DialerStats {
 pub trait FollowerHandler: Send + Sync + 'static {
     /// What this node runs, for the `Hello` and every `Heartbeat`.
     fn applied_config(&self) -> AppliedConfig;
+
+    /// What this node is currently using, for the control plane's node
+    /// drawer (Story 9.7 AC #3).
+    ///
+    /// Defaulted, unlike the push handlers, and the asymmetry is
+    /// deliberate. A missing push handler would silently drop work the
+    /// control plane believes was done, so those have no default; a
+    /// missing sampler reports `None`, the dashboard renders a dash,
+    /// and nothing downstream is misled. The transport-only tests want
+    /// exactly that.
+    fn resources(&self) -> Option<NodeResources> {
+        None
+    }
 
     /// A `ConfigPrepare` arrived: validate and stage it, do not apply
     /// it. `Err` is the SEMANTIC rejection the control plane aborts the
@@ -335,6 +349,12 @@ impl DialerConfig {
         self.follower = Some(follower);
         self
     }
+}
+
+/// What this node is using, or `None` when no follower runtime is
+/// installed to sample it.
+fn node_resources(config: &DialerConfig) -> Option<NodeResources> {
+    config.follower.as_ref().and_then(|f| f.resources())
 }
 
 /// What this node runs, or the empty state when no follower runtime is
@@ -780,6 +800,7 @@ async fn heartbeat_until_dead(
             applied_generation: applied.generation,
             applied_hash: applied.hash.clone(),
             break_glass: applied.break_glass,
+            resources: node_resources(config),
         });
         match session.endpoint.request(probe, config.request_timeout).await {
             Ok(resp) => match resp.body {

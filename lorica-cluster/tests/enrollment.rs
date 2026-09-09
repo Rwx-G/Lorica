@@ -598,6 +598,7 @@ async fn revoked_node_is_refused_at_tls_and_its_session_ends_synchronously() {
         applied_generation: 0,
         applied_hash: String::new(),
         break_glass: false,
+        resources: None,
     });
     assert!(session_a
         .request(probe, Duration::from_secs(2))
@@ -660,5 +661,71 @@ async fn a_superseded_certificate_is_accepted_until_the_new_one_connects() {
     .await;
     assert_eq!(fleet.handler.established.load(Ordering::SeqCst), 2);
     drop(via_new);
+    fleet.handle.shutdown();
+}
+
+/// Story 9.7 AC #3: a gauge reading rides the heartbeat and lands on
+/// the session the API reads, and a heartbeat without one leaves the
+/// last reading in place rather than blanking the drawer.
+#[tokio::test]
+async fn a_heartbeat_carries_the_node_s_resource_reading_onto_its_session() {
+    install_ring();
+    let pki = control_plane_pki();
+    let node = issue_node(&pki, "node-a");
+    let fleet = spawn_fleet(&pki, HashMap::from([identity(&node, NodeState::Active)])).await;
+    let endpoint = open_session(&pki, &node, fleet.addr)
+        .await
+        .expect("active node admitted");
+    eventually("session to register", || fleet.sessions.is_connected("node-a")).await;
+
+    let reading = lorica_cluster::NodeResources {
+        cpu_percent: 37,
+        memory_used_bytes: 512,
+        memory_total_bytes: 2048,
+        disk_used_bytes: 10,
+        disk_total_bytes: 100,
+    };
+    let probe = ClusterRequest::heartbeat(lorica_cluster::Heartbeat {
+        timestamp_ms: 1,
+        applied_generation: 0,
+        applied_hash: String::new(),
+        break_glass: false,
+        resources: Some(reading.clone()),
+    });
+    endpoint
+        .request(probe, Duration::from_secs(2))
+        .await
+        .expect("heartbeat served");
+    eventually("the reading to reach the session", || {
+        fleet
+            .sessions
+            .snapshot()
+            .into_iter()
+            .any(|s| s.resources.as_ref() == Some(&reading))
+    })
+    .await;
+
+    // A node that stops sampling has not become idle. The staleness an
+    // operator needs is on `last_seen`, so the last reading stays.
+    let silent = ClusterRequest::heartbeat(lorica_cluster::Heartbeat {
+        timestamp_ms: 2,
+        applied_generation: 0,
+        applied_hash: String::new(),
+        break_glass: false,
+        resources: None,
+    });
+    endpoint
+        .request(silent, Duration::from_secs(2))
+        .await
+        .expect("heartbeat served");
+    let held = fleet
+        .sessions
+        .snapshot()
+        .into_iter()
+        .find(|s| s.node_id == "node-a")
+        .expect("the session is still there");
+    assert_eq!(held.resources.as_ref(), Some(&reading));
+
+    drop(endpoint);
     fleet.handle.shutdown();
 }

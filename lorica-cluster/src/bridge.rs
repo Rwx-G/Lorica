@@ -68,8 +68,8 @@ use crate::challenge::challenge_defect;
 use crate::messages::{
     ban_duration_is_valid, ban_reason_is_valid, ban_target_is_valid, cert_id_is_valid,
     challenge_token_is_valid,
-    cluster_request, config_hash_is_valid, ClusterRequest, TelemetryPush, MAX_TELEMETRY_BANS,
-    MAX_TELEMETRY_ROWS,
+    cluster_request, config_hash_is_valid, ClusterRequest, NodeResources, TelemetryPush,
+    MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
 };
 use crate::replication::{AppliedConfig, ConfigPayload};
 
@@ -84,6 +84,9 @@ pub enum InPlaneAction {
         timestamp_ms: u64,
         /// The configuration the follower reports as applied.
         applied: AppliedConfig,
+        /// What the node reports it is using (Story 9.7 AC #3), or
+        /// `None` from a node that installs no sampler.
+        resources: Option<NodeResources>,
     },
     /// The follower asks for the current generation because what it
     /// runs may be stale (Story 9.4 AC #7).
@@ -251,6 +254,14 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
                     hash: hb.applied_hash.clone(),
                     break_glass: hb.break_glass,
                 },
+                // Clamped rather than refused: a gauge reading past
+                // 100 is a wrong number on a dashboard, not a protocol
+                // violation, and dropping the session over it would
+                // let a buggy peer take itself offline.
+                resources: hb.resources.clone().map(|r| NodeResources {
+                    cpu_percent: r.cpu_percent.min(100),
+                    ..r
+                }),
             })
         }
         Some(cluster_request::Body::ConfigPull(pull)) => {
@@ -478,6 +489,7 @@ mod tests {
             applied_generation: 0,
             applied_hash: String::new(),
             break_glass: false,
+            resources: None,
         }
     }
 
@@ -525,6 +537,7 @@ mod tests {
             applied_generation: 4,
             applied_hash: "abcdef".to_string(),
             break_glass: true,
+            resources: None,
         });
         assert_eq!(
             translate_cluster_request(&req),
@@ -535,8 +548,34 @@ mod tests {
                     hash: "abcdef".to_string(),
                     break_glass: true,
                 },
+                resources: None,
             })
         );
+    }
+
+    #[test]
+    fn an_out_of_range_cpu_reading_is_clamped_rather_than_refused() {
+        let req = ClusterRequest::heartbeat(Heartbeat {
+            timestamp_ms: 1,
+            applied_generation: 0,
+            applied_hash: String::new(),
+            break_glass: false,
+            resources: Some(NodeResources {
+                cpu_percent: 4_000_000,
+                memory_used_bytes: 7,
+                memory_total_bytes: 9,
+                disk_used_bytes: 1,
+                disk_total_bytes: 2,
+            }),
+        });
+        let BridgeOutcome::InPlane(InPlaneAction::Heartbeat { resources, .. }) =
+            translate_cluster_request(&req)
+        else {
+            panic!("a heartbeat is whitelisted whatever its gauges say");
+        };
+        let resources = resources.expect("the reading is kept, not dropped");
+        assert_eq!(resources.cpu_percent, 100);
+        assert_eq!(resources.memory_used_bytes, 7, "the rest passes through");
     }
 
     #[test]
@@ -566,6 +605,7 @@ mod tests {
             let heartbeat = ClusterRequest::heartbeat(Heartbeat {
                 timestamp_ms: 1,
                 applied_generation: 1,
+                resources: None,
                 applied_hash: hash.to_string(),
                 break_glass: false,
             });

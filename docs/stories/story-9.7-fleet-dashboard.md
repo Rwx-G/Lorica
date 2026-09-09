@@ -45,7 +45,19 @@ without curl.
 - [ ] AC #1: Cluster page + `routeLoaders` entry + node table.
 - [ ] AC #2: token dialog with `--token-stdin` command and separate
       secret field.
-- [ ] AC #3: node detail drawer with activate and revoke.
+- [x] AC #3: node detail drawer. Health, applied hash, activate behind
+      the `selected_for_hostnames` review panel, revoke behind the
+      existing `ConfirmDialog`. Certificate inventory is derived from
+      the selecting hostnames rather than reported, because nothing
+      records what was pushed to whom, and that derivation is the same
+      rule the push path applies. Recent WAF events and bans come from
+      the 9.6 fan-in endpoints, scoped to the node.
+
+      Resource gauges needed a protocol change: nothing in the cluster
+      wire format carried a resource figure. `Heartbeat` gains an
+      OPTIONAL `NodeResources` message (D18), so absence stays
+      representable and a node with no sampler renders as unknown
+      rather than as an idle node at 0%.
 - [x] AC #4: `auth.ts` derives `canWrite` / `isSuperAdmin` over
       `[auth, clusterStatus]`; `isSuperAdminRole` keeps the role-only
       view for break-glass and leave, the two controls that must stay
@@ -232,6 +244,58 @@ short by one page, deliberately, and this is the item to put in front
 of the user: either AC #5 narrows to two pages, or a fleet SLA fan-in
 becomes its own story with the closed-bucket watermark, the upsert
 ingest and backlog #68 fixed first.
+
+**D18: resource gauges ride the heartbeat, as an optional message.**
+
+AC #3 lists resource gauges and the cluster protocol carried no
+resource figure at all: `Heartbeat` had four fields, none of them about
+the machine, and the roster row has none either. So the choice was a
+new telemetry kind or a change to something that already flows.
+
+The heartbeat, for three reasons. The data is a current value, not a
+series, and the heartbeat already carries exactly that kind of field
+(`applied_generation`, `applied_hash`, `break_glass`). Its cadence is
+already the refresh rate a gauge wants. And the fan-in channel is built
+for append-only rows with a cursor and a quota, all of which would be
+dead weight for five scalars that are replaced on every beat.
+
+Carried as an optional nested `NodeResources` message rather than as
+five scalar fields on `Heartbeat`, and that is the load-bearing choice.
+Proto3 scalars have no presence: a node whose runtime installs no
+sampler would report zeros, and zero CPU with zero memory reads as an
+idle node, not an unknown one. A message field has presence, so absence
+survives the wire, `Option<NodeResources>` survives the API, and
+`gaugePercent` returns `null` rather than 0 for a total it does not
+know. The same rule covers a disk whose size could not be read: a gauge
+at zero would say the disk is empty.
+
+Three smaller decisions inside it:
+
+- `FollowerHandler::resources` has a default returning `None`, unlike
+  the push handlers Story 9.6 deliberately left without one. The
+  asymmetry is the point: a missing push handler silently drops work
+  the control plane believes was done, while a missing sampler reports
+  nothing and misleads no one.
+- The reading is clamped at the decode boundary, not refused. A CPU
+  figure above 100 is a wrong number on a dashboard, not a protocol
+  violation, and dropping the session over it would let a buggy peer
+  take itself offline.
+- It lives on the session, not in the store, and a heartbeat that
+  carries no reading leaves the previous one in place. A node that
+  stops sampling has not become idle, and the staleness an operator
+  needs is already on `last_seen`. On reconnect it is re-learned within
+  one interval; a figure from before a restart would look live while
+  describing a process that no longer runs.
+
+The follower samples through `lorica-api`'s existing `SystemCache` and
+`disk_usage_statvfs`, so no new dependency and no second implementation
+of the reserved-blocks correction that makes the disk figure match
+`df`. The sampler is owned by the follower rather than shared with the
+management API's cache, which is refreshed by operator requests that on
+a follower may never come.
+
+The disk gauge reports the data directory's filesystem, not the root
+one: what fills up on a proxy is where its logs and databases live.
 
 ### Completion Notes
 

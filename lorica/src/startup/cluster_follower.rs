@@ -165,6 +165,10 @@ pub(crate) struct FollowerOptions {
     pub alert_sender: AlertSender,
     /// How to apply a fleet-wide ban locally (Story 9.6 AC #10).
     pub bans: BanApplier,
+    /// The data directory, whose filesystem is the one the heartbeat
+    /// reports on (Story 9.7 AC #3). Not the root filesystem: what
+    /// fills up on a proxy is where its logs and databases live.
+    pub data_dir: std::path::PathBuf,
 }
 
 /// Live handles for a running follower.
@@ -281,6 +285,16 @@ struct ReplicaHandler {
     /// refusing thousands of distinct generations has a louder problem
     /// than this map.
     alerted: StdMutex<HashSet<(u64, String)>>,
+    /// The sampler behind the heartbeat's gauges (Story 9.7 AC #3).
+    ///
+    /// Owned here rather than shared with the management API's cache:
+    /// that one is refreshed by operator requests, which on a follower
+    /// may never come, and a gauge nobody refreshes is worse than no
+    /// gauge. Refreshing it costs a few milliseconds once per
+    /// heartbeat interval.
+    sampler: StdMutex<lorica_api::system::SystemCache>,
+    /// The filesystem the disk gauge reports on.
+    data_dir: std::path::PathBuf,
 }
 
 impl ReplicaHandler {
@@ -766,6 +780,26 @@ impl FollowerHandler for ReplicaHandler {
         applied
     }
 
+    fn resources(&self) -> Option<lorica_cluster::NodeResources> {
+        let mut sampler = self.sampler.lock().unwrap_or_else(|p| p.into_inner());
+        sampler.refresh();
+        // `disk_usage_statvfs` returns `None` on a path it cannot
+        // stat, which is a reason to report zero for the disk pair
+        // rather than to withhold the CPU and memory readings that
+        // did work: the dashboard renders a zero total as unknown.
+        let disk = lorica_api::system::disk_usage_statvfs(&self.data_dir, "data");
+        Some(lorica_cluster::NodeResources {
+            // Rounded to whole percent on the sender, so the wire
+            // carries the same figure the gauge shows and nothing
+            // downstream has to decide how to round it.
+            cpu_percent: sampler.cpu_usage_percent().round().clamp(0.0, 100.0) as u32,
+            memory_used_bytes: sampler.memory_used_bytes(),
+            memory_total_bytes: sampler.memory_total_bytes(),
+            disk_used_bytes: disk.as_ref().map(|d| d.used_bytes).unwrap_or(0),
+            disk_total_bytes: disk.as_ref().map(|d| d.total_bytes).unwrap_or(0),
+        })
+    }
+
     fn on_prepare(&self, payload: ConfigPayload) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             let generation = payload.generation;
@@ -993,6 +1027,8 @@ pub(crate) async fn spawn_follower(
         bans: opts.bans,
         alerted: StdMutex::new(HashSet::new()),
         connection: std::sync::OnceLock::new(),
+        sampler: StdMutex::new(lorica_api::system::SystemCache::new()),
+        data_dir: opts.data_dir,
     });
 
     let mut config = DialerConfig::new(

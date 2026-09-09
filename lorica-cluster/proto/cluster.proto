@@ -464,11 +464,29 @@ message HelloAck {
 // Liveness probe, either direction. Story 9.4 AC #6/#7: the follower
 // reports what it runs on every beat, so a missed commit converges
 // within one heartbeat interval.
+// Current resource usage, sampled by the sender at heartbeat time
+// (Story 9.7 AC #3). Current values, never a series: a gauge on a
+// node drawer needs one number, and the fan-in channel is the place
+// for anything with history.
+//
+// A message rather than five scalars on Heartbeat, so absence is
+// representable. A node whose runtime has no sampler omits it, and
+// the dashboard shows a dash; scalar fields would report zero, which
+// reads as an idle node rather than an unknown one.
+message NodeResources {
+  uint32 cpu_percent = 1;         // Whole percent, 0-100, rounded
+  uint64 memory_used_bytes = 2;
+  uint64 memory_total_bytes = 3;
+  uint64 disk_used_bytes = 4;     // The data directory's filesystem
+  uint64 disk_total_bytes = 5;
+}
+
 message Heartbeat {
   uint64 timestamp_ms = 1;
   uint64 applied_generation = 2;
   string applied_hash = 3;
   bool break_glass = 4;
+  NodeResources resources = 5;    // Absent when the node has no sampler
 }
 
 message HeartbeatAck {

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   breakGlassActive,
   fleetBadge,
+  gaugePercent,
   isClustered,
   isReadOnlyNode,
   joinCommand,
@@ -173,5 +174,30 @@ describe('secondsUntil', () => {
 
   it('treats an unparseable expiry as already expired', () => {
     expect(secondsUntil('nonsense', NOW)).toBe(0);
+  });
+});
+
+describe('gaugePercent', () => {
+  it('rounds a ratio to whole percent', () => {
+    expect(gaugePercent(1, 3)).toBe(33);
+    expect(gaugePercent(2, 3)).toBe(67);
+  });
+
+  it('returns null rather than 0 when the total is missing', () => {
+    // A node that could not read its disk size has not got an empty
+    // disk. A gauge at zero would say it has, which is the reading an
+    // operator would act on at 03:00.
+    expect(gaugePercent(0, 0)).toBeNull();
+    expect(gaugePercent(500, 0)).toBeNull();
+  });
+
+  it('caps at 100 rather than overflowing the bar', () => {
+    expect(gaugePercent(3, 2)).toBe(100);
+  });
+
+  it('rejects a negative or non-finite reading', () => {
+    expect(gaugePercent(-1, 100)).toBeNull();
+    expect(gaugePercent(Number.NaN, 100)).toBeNull();
+    expect(gaugePercent(1, Number.NaN)).toBeNull();
   });
 });

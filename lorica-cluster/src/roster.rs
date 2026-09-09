@@ -37,7 +37,7 @@ use lorica_command::RpcEndpoint;
 use crate::ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
 use crate::certs::{CertBundle, CertDistributor, CertPushReport};
 use crate::challenge::{ChallengeFanout, ChallengeReport};
-use crate::messages::ClusterFrame;
+use crate::messages::{ClusterFrame, NodeResources};
 use crate::replication::{
     AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
 };
@@ -163,6 +163,14 @@ pub struct LiveSession {
     /// What the node reports as applied, refreshed by every heartbeat
     /// and by every commit acknowledgement.
     applied: Mutex<AppliedConfig>,
+    /// The node's last reported resource reading (Story 9.7 AC #3).
+    ///
+    /// Session state, not roster state, and deliberately not
+    /// persisted: it is a current value whose only meaning is "right
+    /// now". A restart re-learns it within one heartbeat, and showing
+    /// a figure from before the restart would be worse than showing
+    /// none.
+    resources: Mutex<Option<NodeResources>>,
     /// Flipped to `true` to end the session synchronously (revocation,
     /// supersession).
     kill: watch::Sender<bool>,
@@ -195,6 +203,26 @@ impl LiveSession {
         *self.applied.lock().unwrap_or_else(|p| p.into_inner()) = applied;
     }
 
+    /// Replace the node's last reported resource reading.
+    ///
+    /// A heartbeat carrying no reading leaves the previous one in
+    /// place rather than clearing it: a node that stops sampling has
+    /// not become idle, and the staleness an operator needs is already
+    /// on `last_seen`.
+    pub fn record_resources(&self, resources: Option<NodeResources>) {
+        if let Some(resources) = resources {
+            *self.resources.lock().unwrap_or_else(|p| p.into_inner()) = Some(resources);
+        }
+    }
+
+    /// The node's last reported resource reading, if it ever sent one.
+    pub fn resources(&self) -> Option<NodeResources> {
+        self.resources
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     /// What this node is known to run.
     pub fn applied(&self) -> AppliedConfig {
         self.applied
@@ -224,6 +252,9 @@ pub struct LiveSessionSnapshot {
     /// What the node reports as applied (Story 9.4 AC #12's drift
     /// input).
     pub applied: AppliedConfig,
+    /// The node's last reported resource reading, or `None` from a
+    /// node that has not sent one this session (Story 9.7 AC #3).
+    pub resources: Option<NodeResources>,
 }
 
 /// Node id -> live session, with per-session kill switches so a
@@ -309,6 +340,7 @@ impl SessionRegistry {
             state: identity.state,
             endpoint,
             applied: Mutex::new(applied),
+            resources: Mutex::new(None),
             kill: kill_tx,
         });
         let previous = self
@@ -465,6 +497,7 @@ impl SessionRegistry {
                 schema_version: s.schema_version,
                 state: s.state,
                 applied: s.applied(),
+                resources: s.resources(),
             })
             .collect()
     }

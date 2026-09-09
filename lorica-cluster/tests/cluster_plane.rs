@@ -88,6 +88,7 @@ fn probe(timestamp_ms: u64) -> Heartbeat {
         applied_generation: 0,
         applied_hash: String::new(),
         break_glass: false,
+        resources: None,
     }
 }
 

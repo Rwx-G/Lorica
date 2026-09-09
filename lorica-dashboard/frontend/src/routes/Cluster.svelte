@@ -8,6 +8,7 @@
   import {
     clusterStatus,
     breakGlassActive,
+    gaugePercent,
     joinCommand,
     secondsUntil,
     type ClusterNodeResponse,
@@ -85,6 +86,18 @@
 
   function daysUntil(iso: string): number {
     return Math.floor((Date.parse(iso) - Date.now()) / 86_400_000);
+  }
+
+  /** Bytes as the nearest sensible unit, for a gauge caption. */
+  function bytes(n: number): string {
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let value = n;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
   }
 
   // Token dialog.
@@ -339,6 +352,58 @@
     {/if}
 
     <section class="drawer-section">
+      <h3>Resources</h3>
+      {#if !node.resources}
+        <p class="muted">
+          {node.connected
+            ? 'This node has not reported a reading yet.'
+            : 'Not connected: readings are session state and are re-learned on reconnect.'}
+        </p>
+      {:else}
+        {@const res = node.resources}
+        {@const mem = gaugePercent(res.memory_used_bytes, res.memory_total_bytes)}
+        {@const disk = gaugePercent(res.disk_used_bytes, res.disk_total_bytes)}
+        <div class="gauge">
+          <span class="gauge-label">CPU</span>
+          <div class="gauge-track">
+            <div class="gauge-fill" style="width: {res.cpu_percent}%"></div>
+          </div>
+          <span class="gauge-value">{res.cpu_percent}%</span>
+        </div>
+        <div class="gauge">
+          <span class="gauge-label">Memory</span>
+          <div class="gauge-track">
+            <div class="gauge-fill" style="width: {mem ?? 0}%"></div>
+          </div>
+          <span class="gauge-value">
+            {#if mem === null}
+              unknown
+            {:else}
+              {mem}% of {bytes(res.memory_total_bytes)}
+            {/if}
+          </span>
+        </div>
+        <div class="gauge">
+          <span class="gauge-label">Disk</span>
+          <div class="gauge-track">
+            <div class="gauge-fill" style="width: {disk ?? 0}%"></div>
+          </div>
+          <span class="gauge-value">
+            {#if disk === null}
+              unknown
+            {:else}
+              {disk}% of {bytes(res.disk_total_bytes)}
+            {/if}
+          </span>
+        </div>
+        <p class="muted">
+          The data directory's filesystem, not the root one: what fills up on
+          a proxy is where its logs and databases live.
+        </p>
+      {/if}
+    </section>
+
+    <section class="drawer-section">
       <h3>Certificates</h3>
       {#if certificatesFor(node).length === 0}
         <p class="muted">
@@ -554,6 +619,30 @@
   .expiry-crit {
     color: var(--color-red);
     font-weight: 600;
+  }
+  .gauge {
+    display: grid;
+    grid-template-columns: 4.5rem 1fr auto;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+    margin-bottom: 0.35rem;
+  }
+  .gauge-label {
+    color: var(--color-text-muted);
+  }
+  .gauge-track {
+    height: 0.5rem;
+    border-radius: 0.25rem;
+    background: var(--color-border);
+    overflow: hidden;
+  }
+  .gauge-fill {
+    height: 100%;
+    background: var(--color-orange);
+  }
+  .gauge-value {
+    font-variant-numeric: tabular-nums;
   }
   .page {
     padding: 1.5rem;

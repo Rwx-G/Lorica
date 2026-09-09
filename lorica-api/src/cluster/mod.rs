@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use lorica_cluster::{leaf_spki_sha256, token, ClusterRequest, ControlPlane};
+use lorica_cluster::{leaf_spki_sha256, token, ClusterRequest, ControlPlane, LiveSessionSnapshot};
 use lorica_config::models::{ClusterNode, JoinToken, NodeStatus, TokenState};
 use serde::{Deserialize, Serialize};
 
@@ -261,6 +261,41 @@ pub async fn revoke_token(
 
 // ---- Nodes ----
 
+/// What a node last reported it is using (Story 9.7 AC #3).
+///
+/// Used and total rather than a percentage, for both memory and disk:
+/// "83% of what" is the question an operator asks next, and sending
+/// both means the dashboard never has to guess the denominator. A zero
+/// total is how a node says it could not read that figure, and the
+/// dashboard renders it as unknown rather than as a full disk.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeResourcesResponse {
+    /// Whole percent, 0 to 100, as the node rounded it.
+    pub cpu_percent: u32,
+    /// Memory in use, bytes.
+    pub memory_used_bytes: u64,
+    /// Total memory, bytes. Zero when the node could not read it.
+    pub memory_total_bytes: u64,
+    /// Bytes used on the filesystem holding the node's data directory,
+    /// not on its root filesystem: what fills up on a proxy is where
+    /// its logs and databases live.
+    pub disk_used_bytes: u64,
+    /// Total bytes on that filesystem. Zero when unreadable.
+    pub disk_total_bytes: u64,
+}
+
+impl From<&lorica_cluster::NodeResources> for NodeResourcesResponse {
+    fn from(r: &lorica_cluster::NodeResources) -> Self {
+        Self {
+            cpu_percent: r.cpu_percent,
+            memory_used_bytes: r.memory_used_bytes,
+            memory_total_bytes: r.memory_total_bytes,
+            disk_used_bytes: r.disk_used_bytes,
+            disk_total_bytes: r.disk_total_bytes,
+        }
+    }
+}
+
 /// JSON shape of a registered node: the registry row plus the live
 /// session facts.
 #[derive(Debug, Serialize)]
@@ -285,6 +320,14 @@ pub struct NodeResponse {
     /// attached. Fleet-wide routes are excluded; they apply to every
     /// node and would bury the entries that need thought.
     pub selected_for_hostnames: Vec<String>,
+    /// What the node last reported it is using, or `null` from a node
+    /// that has sent no reading on its current session.
+    ///
+    /// Session state, so it disappears when the node disconnects and
+    /// is re-learned within one heartbeat when it returns. A figure
+    /// from before a reconnect would be worse than none: the gauge
+    /// would look live while describing a process that no longer runs.
+    pub resources: Option<NodeResourcesResponse>,
 }
 
 fn node_responses(
@@ -292,20 +335,23 @@ fn node_responses(
     nodes: Vec<ClusterNode>,
     selected: &HashMap<String, Vec<String>>,
 ) -> Vec<NodeResponse> {
-    let live: HashMap<String, (String, u64)> = control
+    let live: HashMap<String, LiveSessionSnapshot> = control
         .sessions
         .snapshot()
         .into_iter()
-        .map(|s| (s.node_id, (s.peer_addr.to_string(), s.last_seen_unix)))
+        .map(|s| (s.node_id.clone(), s))
         .collect();
     nodes
         .into_iter()
         .map(|node| {
-            let session = live.get(&node.node_id).cloned();
+            let session = live.get(&node.node_id);
             NodeResponse {
                 connected: session.is_some(),
-                session_peer: session.as_ref().map(|(peer, _)| peer.clone()),
-                session_last_seen_unix: session.map(|(_, seen)| seen),
+                session_peer: session.map(|s| s.peer_addr.to_string()),
+                session_last_seen_unix: session.map(|s| s.last_seen_unix),
+                resources: session
+                    .and_then(|s| s.resources.as_ref())
+                    .map(NodeResourcesResponse::from),
                 selected_for_hostnames: selected.get(&node.name).cloned().unwrap_or_default(),
                 node,
             }

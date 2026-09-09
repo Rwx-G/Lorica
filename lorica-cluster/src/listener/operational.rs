@@ -733,13 +733,18 @@ async fn serve_request(
         BridgeOutcome::InPlane(InPlaneAction::Heartbeat {
             timestamp_ms,
             applied,
+            resources,
         }) => {
             stats.heartbeats_served.fetch_add(1, Ordering::Relaxed);
             // What the node runs, refreshed every interval: the drift
             // input (AC #12) and what makes a missed commit converge
-            // within one heartbeat (AC #6).
+            // within one heartbeat (AC #6). The gauges ride the same
+            // beat (Story 9.7 AC #3) and stay on the session: they are
+            // a current value, so they are re-learned on reconnect
+            // rather than restored from a store.
             if let Some(guard) = guard {
                 guard.entry().record_applied(applied);
+                guard.entry().record_resources(resources);
             }
             let current = shared.config_version.load();
             let ack = HeartbeatAck {

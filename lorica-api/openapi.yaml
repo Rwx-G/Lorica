@@ -4123,6 +4123,43 @@ components:
         session_last_seen_unix:
           type: integer
           nullable: true
+        selected_for_hostnames:
+          type: array
+          description: >-
+            Hostnames whose route selectors name this node, and whose
+            certificate private keys it therefore receives (Story 9.5 D15).
+            Fleet-wide routes are excluded: they apply to every node and
+            would bury the entries an approval decision turns on.
+          items:
+            type: string
+        resources:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/NodeResources"
+    NodeResources:
+      type: object
+      description: >-
+        What a node last reported it is using, sampled on its heartbeat
+        (Story 9.7 AC #3). Session state: it is absent from a node that has
+        sent no reading on its current session, and re-learned within one
+        interval after a reconnect rather than restored from a store, because
+        a figure from before a restart would look live while describing a
+        process that no longer runs. Used and total are both sent so the
+        dashboard never guesses a denominator; a zero total means the node
+        could not read that figure.
+      properties:
+        cpu_percent:
+          type: integer
+          description: Whole percent, 0 to 100, as the node rounded it.
+        memory_used_bytes:
+          type: integer
+        memory_total_bytes:
+          type: integer
+        disk_used_bytes:
+          type: integer
+          description: The filesystem holding the node's data directory, not its root.
+        disk_total_bytes:
+          type: integer
     JoinToken:
       type: object
       description: A join token's public facts. The secret half is never stored (only its HMAC), so it can never be listed.
