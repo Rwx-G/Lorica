@@ -546,6 +546,11 @@ pub struct RevokeOutcome {
     pub newly_revoked: bool,
     /// Whether a live session was ended.
     pub session_ended: bool,
+    /// Certificates whose private key the node was entitled to when
+    /// it was revoked, read BEFORE the row flipped (a revoked node is
+    /// entitled to nothing, so reading after would always say so).
+    /// Revocation cannot recall them; they must be re-issued.
+    pub certificates_to_reissue: Vec<String>,
     /// The roster/CRL refresh failure, if any: the revocation is
     /// recorded and the session is gone, but the acceptor may still
     /// admit the certificate until a retry succeeds.
@@ -572,11 +577,12 @@ pub async fn revoke_node(
         let Some(existing) = store.get_cluster_node(&id)? else {
             return Ok(None);
         };
+        let entitled = store.certificates_entitling_node(&id)?;
         let flipped = store.revoke_cluster_node(&id, now)?;
-        Ok(Some((existing, flipped.is_some())))
+        Ok(Some((existing, flipped.is_some(), entitled)))
     })
     .await?;
-    let Some((node, newly_revoked)) = before else {
+    let Some((node, newly_revoked, certificates_to_reissue)) = before else {
         return Ok(None);
     };
     let refresh_error = refresh_control_plane(control, store).await.err();
@@ -585,6 +591,7 @@ pub async fn revoke_node(
         node,
         newly_revoked,
         session_ended,
+        certificates_to_reissue,
         refresh_error,
     }))
 }

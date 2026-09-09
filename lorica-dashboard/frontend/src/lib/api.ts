@@ -46,6 +46,7 @@ import type {
   FleetAccessRow,
   FleetBanRow,
   FleetWafRow,
+  RevokeNodeResponse,
 } from './cluster';
 
 export interface ApiError {
@@ -1276,7 +1277,7 @@ export const api = {
     ),
 
   revokeClusterNode: (id: string) =>
-    request<{ message: string }>('DELETE', `/cluster/nodes/${encodeURIComponent(id)}`),
+    request<RevokeNodeResponse>('DELETE', `/cluster/nodes/${encodeURIComponent(id)}`),
 
   mintClusterToken: (body: MintTokenRequest) =>
     request<MintedTokenResponse>('POST', '/cluster/tokens', body),

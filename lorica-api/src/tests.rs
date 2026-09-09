@@ -6198,7 +6198,13 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
         None,
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["newly_revoked"], true);
+    assert!(
+        body["data"]["certificates_to_reissue"].is_array(),
+        "a revocation names the keys it cannot take back: {body}"
+    );
     assert_eq!(
         control.control.roster.lookup(&"ab".repeat(32)).map(|n| n.state),
         Some(lorica_cluster::NodeState::Revoked)
@@ -6227,9 +6233,11 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
     .await;
     assert_eq!(
         resp.status(),
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
         "revoking twice is idempotent (re-runs CRL rebuild and session kill)"
     );
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["newly_revoked"], false, "the row had already flipped");
     {
         let store = state.store.lock().await;
         let serials: Vec<String> = store

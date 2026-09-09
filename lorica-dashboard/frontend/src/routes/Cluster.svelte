@@ -14,6 +14,7 @@
     type ClusterNodeResponse,
     type FleetBanRow,
     type FleetWafRow,
+    type RevokeNodeResponse,
   } from '../lib/cluster';
   import { showToast } from '../lib/toast';
 
@@ -27,6 +28,13 @@
 
   let selected = $state<ClusterNodeResponse | null>(null);
   let revoking = $state<ClusterNodeResponse | null>(null);
+  /**
+   * The last revocation that left keys behind. A revoked node keeps
+   * the private keys it was entitled to, so the certificates named
+   * here must be re-issued; a toast would scroll away before an
+   * operator acted on it.
+   */
+  let reissue = $state<RevokeNodeResponse | null>(null);
 
   // Drawer contents (AC #3), loaded per node rather than with the
   // roster: the roster refreshes every ten seconds for every node, and
@@ -235,7 +243,16 @@
       showToast(res.error.message, 'error');
       return;
     }
-    showToast(`${node.name} revoked`);
+    const keys = res.data?.certificates_to_reissue ?? [];
+    if (keys.length > 0) {
+      reissue = res.data ?? null;
+      showToast(
+        `${node.name} revoked; it keeps ${keys.length} certificate key${keys.length === 1 ? '' : 's'} to re-issue`,
+        'error',
+      );
+    } else {
+      showToast(`${node.name} revoked`);
+    }
     if (selected?.node_id === node.node_id) selected = null;
     await load();
   }
@@ -309,6 +326,29 @@
       <button class="btn-primary" onclick={() => (showMint = true)}>Add node</button>
     {/if}
   </header>
+
+  {#if reissue}
+    <div class="reissue" role="alert">
+      <p>
+        <strong>{reissue.name}</strong> was revoked but keeps the private key of
+        {reissue.certificates_to_reissue.length} certificate{reissue.certificates_to_reissue.length === 1
+          ? ''
+          : 's'}. Revocation cannot take a key back: re-issue each one so the copy
+        that node holds stops matching what the fleet serves.
+      </p>
+      <ul>
+        {#each reissue.certificates_to_reissue as certId (certId)}
+          <li>
+            <code>{certId}</code>
+            {#if certificates.find((c) => c.id === certId)}
+              ({certificates.find((c) => c.id === certId)?.domain})
+            {/if}
+          </li>
+        {/each}
+      </ul>
+      <button class="btn-secondary" onclick={() => (reissue = null)}>Dismiss</button>
+    </div>
+  {/if}
 
   {#if loading}
     <p class="muted">Loading the fleet…</p>
@@ -826,6 +866,15 @@
   }
   .error-text {
     color: var(--danger, #dc2626);
+  }
+  .reissue {
+    border: 1px solid var(--danger, #dc2626);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+  }
+  .reissue ul {
+    margin: 0.5rem 0;
   }
   .warn-text {
     color: var(--warning, #b45309);

@@ -65,6 +65,19 @@ export function gaugePercent(used: number, total: number): number | null {
 }
 
 /**
+ * What `DELETE /api/v1/cluster/nodes/{id}` answers. Revocation cuts the
+ * node's access; it cannot take back the private keys the node already
+ * holds, so it names the certificates to re-issue.
+ */
+export interface RevokeNodeResponse {
+  node_id: string;
+  name: string;
+  newly_revoked: boolean;
+  session_ended: boolean;
+  certificates_to_reissue: string[];
+}
+
+/**
  * One node in the roster, as `GET /api/v1/cluster/nodes` reports it.
  *
  * FLAT, because the server's `NodeResponse` carries `#[serde(flatten)]`
@@ -262,12 +275,21 @@ export interface FleetBadge {
 }
 
 /**
- * How stale a node's last contact may be before the badge warns.
- *
- * Three heartbeat intervals: one missed beat is a hiccup, three is a
- * node that has stopped talking.
+ * The follower's heartbeat cadence (`lorica-cluster` dialer default,
+ * 15 s). Not negotiated on the wire, so this copy is the one the badge
+ * reasons with; retune both together.
  */
-export const STALE_AFTER_MS = 90_000;
+export const HEARTBEAT_INTERVAL_MS = 15_000;
+
+/**
+ * How stale a node's last contact may be before the badge warns: six
+ * heartbeat intervals. One missed beat is a hiccup and the dialer's own
+ * reconnect backoff spans a few, so the badge waits for a node that has
+ * stopped talking rather than one that is reconnecting. (An earlier
+ * comment here said "three intervals" over the same 90 s value; the
+ * number was right and the sentence was not.)
+ */
+export const STALE_AFTER_MS = 6 * HEARTBEAT_INTERVAL_MS;
 
 /**
  * Build the header badge (AC #6).
@@ -321,7 +343,7 @@ export function fleetBadge(
     return {
       tone: 'warning',
       label,
-      reason: `${stale.length} node${stale.length === 1 ? '' : 's'} last seen over 90s ago`,
+      reason: `${stale.length} node${stale.length === 1 ? '' : 's'} last seen over ${STALE_AFTER_MS / 1000}s ago`,
     };
   }
   if (breakGlassActive(status, now)) {

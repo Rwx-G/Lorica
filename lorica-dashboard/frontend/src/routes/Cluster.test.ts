@@ -185,6 +185,47 @@ describe('Cluster page, node drawer', () => {
   });
 });
 
+describe('Cluster page, revocation', () => {
+  it('keeps the certificates a revoked node walks off with on screen', async () => {
+    // Revocation cuts access, not possession: the node keeps the
+    // private keys it held. A toast scrolls away; the list stays
+    // until the operator dismisses it.
+    clusterStatus.set(status('control_plane'));
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [node('id-a', 'edge-a', ['cert-1'])],
+    });
+    vi.spyOn(api, 'getFleetWafEvents').mockResolvedValue({
+      data: { rows: [], next_cursor: null },
+    });
+    vi.mocked(api.listCertificates).mockResolvedValue({
+      data: { certificates: [certificate('cert-1', 'fleet.example.com')] },
+    });
+    vi.spyOn(api, 'revokeClusterNode').mockResolvedValue({
+      data: {
+        node_id: 'id-a',
+        name: 'edge-a',
+        newly_revoked: true,
+        session_ended: true,
+        certificates_to_reissue: ['cert-1'],
+      },
+    });
+
+    render(Cluster);
+    await waitFor(() => expect(screen.getByText('edge-a')).toBeInTheDocument());
+    (screen.getAllByText('edge-a')[0] as HTMLElement).click();
+    await waitFor(() => expect(screen.getByText('Revoke node')).toBeInTheDocument());
+    (screen.getByText('Revoke node') as HTMLElement).click();
+    await waitFor(() => expect(screen.getByText('Revoke')).toBeInTheDocument());
+    (screen.getByText('Revoke') as HTMLElement).click();
+
+    await waitFor(() =>
+      expect(screen.getByText(/keeps the private key of 1 certificate/)).toBeInTheDocument(),
+    );
+    expect(screen.getByText('cert-1')).toBeInTheDocument();
+    expect(screen.getByText(/fleet\.example\.com/)).toBeInTheDocument();
+  });
+});
+
 describe('Cluster page, follower controls', () => {
   it('offers break-glass and leave on a follower', async () => {
     // Story 9.7 AC #7 banners the read-only state; these two are the

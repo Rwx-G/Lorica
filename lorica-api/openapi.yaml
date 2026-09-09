@@ -3713,14 +3713,45 @@ paths:
         Story 9.3 AC #7. The node's certificate serials go on the CRL, the
         operational acceptor is rebuilt, and the node's live session is
         ended synchronously. The registry row stays, marked `revoked`.
-        Idempotent: revoking an already revoked node answers 204 and
+        Idempotent: revoking an already revoked node answers 200 and
         re-runs the CRL rebuild and the session kill, so a first attempt
         that failed half-way (500) can simply be retried.
+
+        Revocation cuts the node's access. It does not take back the
+        certificate private keys the node already holds (Story 9.5), so
+        the response names them in `certificates_to_reissue`: each must
+        be re-issued, because the revoked node keeps its copy. The same
+        list is in the `cluster.node.revoke` audit row. On a retry the
+        list is empty (a revoked node is entitled to nothing).
       security:
         - sessionCookie: []
       responses:
-        "204":
+        "200":
           description: Node revoked (or already revoked; the refresh ran again)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      node_id:
+                        type: string
+                      name:
+                        type: string
+                      newly_revoked:
+                        type: boolean
+                        description: False on a retry.
+                      session_ended:
+                        type: boolean
+                      certificates_to_reissue:
+                        type: array
+                        items:
+                          type: string
+                        description: >-
+                          Certificate ids whose private key the node was
+                          entitled to at the moment of revocation.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":

@@ -731,7 +731,15 @@ impl SessionHandler for FleetHandlers {
                 )
                 .with_detail("node_id", node_id.clone())
                 .with_detail("node_name", outcome.node.name.clone())
-                .with_detail("peer", peer.to_string()),
+                .with_detail("peer", peer.to_string())
+                // A cooperative leave wipes the node's copy of these
+                // keys (Story 9.3 AC #13), but the wipe is the node's
+                // word; the operator re-issues on the same evidence a
+                // revocation gives them.
+                .with_detail(
+                    "certificates_to_reissue",
+                    outcome.certificates_to_reissue.join(","),
+                ),
             );
             self.audit(
                 peer,
@@ -740,6 +748,7 @@ impl SessionHandler for FleetHandlers {
                 Some(serde_json::json!({
                     "name": outcome.node.name,
                     "status": "revoked",
+                    "certificates_to_reissue": outcome.certificates_to_reissue,
                     "refresh_error": outcome.refresh_error.as_ref().map(|e| e.to_string()),
                 })),
             )
@@ -936,7 +945,7 @@ impl SessionHandler for FleetHandlers {
                     node_id,
                     shed,
                     offered = batch.access.len() + batch.waf.len(),
-                    "the node is over its telemetry ingest quota; the excess is dropped and                      counted"
+                    "the node is over its telemetry ingest quota; the excess is dropped and counted"
                 );
                 lorica_api::metrics::inc_cluster_telemetry_dropped(
                     &node_id,
@@ -1250,7 +1259,7 @@ pub(crate) async fn replicate_after_reload(
         warn!(
             generation,
             rejected = report.rejected.len(),
-            "cluster replication ABORTED: a follower refused the configuration semantically.              The generation was not published, so the fleet stays on the previous one and does              not pull this one; THIS node already serves it and is ahead of its own fleet.              Fix what the follower refused, or revoke it, then change the configuration again"
+            "cluster replication ABORTED: a follower refused the configuration semantically. The generation was not published, so the fleet stays on the previous one and does not pull this one; THIS node already serves it and is ahead of its own fleet. Fix what the follower refused, or revoke it, then change the configuration again"
         );
         return;
     }
@@ -1260,7 +1269,7 @@ pub(crate) async fn replicate_after_reload(
             generation,
             committed = report.committed.len(),
             commit_failed = report.commit_failed.len(),
-            "cluster replication SPLIT FLEET: some nodes committed and others did not;              the stragglers reconcile on their next heartbeat"
+            "cluster replication SPLIT FLEET: some nodes committed and others did not; the stragglers reconcile on their next heartbeat"
         );
     } else {
         info!(
@@ -1639,7 +1648,7 @@ pub(crate) async fn spawn_cluster_plane(
     let telemetry = match ClusterTelemetryStore::open(&opts.data_dir) {
         Ok(store) => Some(Arc::new(store)),
         Err(e) => {
-            error!(error = %e, "could not open the cluster telemetry database; fan-in is                    refused and the fleet log endpoints report it");
+            error!(error = %e, "could not open the cluster telemetry database; fan-in is refused and the fleet log endpoints report it");
             None
         }
     };

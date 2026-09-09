@@ -124,7 +124,7 @@ pub async fn mint_token(
     // and removes a whole class of impersonation.
     let Some(name) = &body.node_name else {
         return Err(ApiError::BadRequest(
-            "node_name is required: a join token must name the node it may enrol, because that              name is what route selectors resolve against"
+            "node_name is required: a join token must name the node it may enrol, because that name is what route selectors resolve against"
                 .into(),
         ));
     };
@@ -383,26 +383,24 @@ fn node_responses(
 }
 
 /// Which hostnames each of these node NAMES is selected for, resolved
-/// in one store pass rather than one per node.
+/// in one store pass. This comment said "one pass" while the body
+/// walked the route table once per distinct name (Epic 9 close,
+/// performance audit); the store now answers for every name at once.
 fn selected_hostnames(
     store: &lorica_config::ConfigStore,
     nodes: &[ClusterNode],
 ) -> HashMap<String, Vec<String>> {
-    let mut out = HashMap::new();
-    for node in nodes {
-        if out.contains_key(&node.name) {
-            continue;
-        }
-        // A read failure here degrades the review to "no entries
-        // known" rather than failing the roster: an operator who
-        // cannot list the fleet is worse off than one whose advisory
-        // column is empty.
-        let hostnames = store
-            .hostnames_selecting_node_name(&node.name)
-            .unwrap_or_default();
-        out.insert(node.name.clone(), hostnames);
-    }
-    out
+    // A read failure here degrades the review to "no entries known"
+    // rather than failing the roster: an operator who cannot list the
+    // fleet is worse off than one whose advisory column is empty.
+    let mut by_name = store.hostnames_by_selected_name().unwrap_or_default();
+    nodes
+        .iter()
+        .map(|node| {
+            let hostnames = by_name.remove(&node.name).unwrap_or_default();
+            (node.name.clone(), hostnames)
+        })
+        .collect()
 }
 
 /// GET /api/v1/cluster/nodes - the fleet roster (Viewer+).
@@ -517,6 +515,31 @@ pub async fn activate_node(
     Ok(json_data(responses.remove(0)))
 }
 
+/// What `DELETE /api/v1/cluster/nodes/{id}` answers.
+///
+/// Revocation cuts the node's ACCESS: it cannot open a session again.
+/// It does not take back what the node already holds, and the one
+/// thing worth holding is the private keys Story 9.5 distributed to
+/// it. Those certificates are named here so the operator re-issues
+/// them; the audit row and the alert carry the same list (Epic 9
+/// close, security audit).
+#[derive(Debug, Serialize)]
+pub struct RevokeNodeResponse {
+    /// The revoked node's id.
+    pub node_id: String,
+    /// Its name, for the operator reading the response.
+    pub name: String,
+    /// Whether this call flipped the row (false on a retry).
+    pub newly_revoked: bool,
+    /// Whether a live session was ended.
+    pub session_ended: bool,
+    /// Certificates whose private key this node was entitled to at
+    /// the moment of revocation. Each must be re-issued: the node
+    /// keeps its copy. Empty on a retry, because a revoked node is
+    /// entitled to nothing; the first call's audit row has the list.
+    pub certificates_to_reissue: Vec<String>,
+}
+
 /// DELETE /api/v1/cluster/nodes/{id} - revoke (SuperAdmin, AC #7):
 /// the serials go on the CRL, the acceptor is rebuilt, the live
 /// session is ended synchronously. Idempotent: revoking an already
@@ -524,6 +547,10 @@ pub async fn activate_node(
 /// half-applied first attempt can be retried; only an absent node is
 /// 404. A refresh failure is audited (the row flip and the session
 /// kill happened) and then answered 500, so the operator retries.
+///
+/// Answers 200 with [`RevokeNodeResponse`] rather than 204, because
+/// the list of certificates to re-issue is the part of a revocation
+/// the operator cannot reconstruct afterwards.
 pub async fn revoke_node(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
@@ -540,6 +567,7 @@ pub async fn revoke_node(
         name = %outcome.node.name,
         newly_revoked = outcome.newly_revoked,
         session_ended = outcome.session_ended,
+        certificates_to_reissue = ?outcome.certificates_to_reissue,
         refresh_error = outcome.refresh_error.as_ref().map(|e| e.to_string()).as_deref().unwrap_or("-"),
         "cluster node revoked"
     );
@@ -557,6 +585,7 @@ pub async fn revoke_node(
             "status": "revoked",
             "newly_revoked": outcome.newly_revoked,
             "session_ended": outcome.session_ended,
+            "certificates_to_reissue": outcome.certificates_to_reissue,
             "refresh_error": outcome.refresh_error.as_ref().map(|e| e.to_string()),
         })),
     )
@@ -564,7 +593,13 @@ pub async fn revoke_node(
     if let Some(refresh_error) = outcome.refresh_error {
         return Err(refresh_error.into());
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(json_data(RevokeNodeResponse {
+        node_id: id,
+        name: outcome.node.name,
+        newly_revoked: outcome.newly_revoked,
+        session_ended: outcome.session_ended,
+        certificates_to_reissue: outcome.certificates_to_reissue,
+    }))
 }
 
 // ---- Status and leave ----
