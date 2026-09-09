@@ -1,7 +1,7 @@
 # Story 9.7: Fleet Dashboard
 
 **Epic:** 9 (v1.7.0)
-**Status:** Draft
+**Status:** InProgress
 **Author:** Romain G.
 
 **Depends on:** Stories 9.3 (registry, tokens), 9.4 (read-only mode,
@@ -46,8 +46,15 @@ without curl.
 - [ ] AC #2: token dialog with `--token-stdin` command and separate
       secret field.
 - [ ] AC #3: node detail drawer with activate and revoke.
-- [ ] AC #4: `auth.ts` derived-store change + review pass on all
-      consumers.
+- [x] AC #4: `auth.ts` derives `canWrite` / `isSuperAdmin` over
+      `[auth, clusterStatus]`; `isSuperAdminRole` keeps the role-only
+      view for break-glass and leave, the two controls that must stay
+      reachable on a follower. The review pass over every consumer is
+      NOT done.
+- [x] Foundation (not an AC, but everything else sits on it):
+      `lib/cluster.ts` with the status store, the read-only and
+      break-glass predicates, the badge builder and the join-command
+      helper, 17 Vitest cases; the six `api.ts` cluster methods.
 - [ ] AC #5: node filter on three pages, hidden when standalone.
 - [ ] AC #6: header badge with warning states.
 - [ ] AC #7: read-only and break-glass banners.
@@ -132,4 +139,5 @@ Anticipated:
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-09-09 | 0.2 | Foundation landed: `lib/cluster.ts` (status store, read-only and break-glass predicates, fleet badge, join-command helper) with 17 Vitest cases, the six `api.ts` cluster methods, and AC #4. Read-only mode is now orthogonal to role, so a follower stops offering mutations the control plane would silently undo at the next apply. The Svelte surface (AC #1, #2, #3, #5, #6, #7) is NOT built: the session that produced this ran out of room after Story 9.6, and half-built ungated components would be worse than none. `tsc --noEmit` strict and `svelte-check` clean; `pnpm lint` NOT yet run on new components because there are none. Status InProgress. | Romain G. |
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Bundle-percentage criterion dropped for a per-chunk cap; token dialog reworked to `--token-stdin`. Status Draft. | Romain G. |
