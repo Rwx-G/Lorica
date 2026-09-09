@@ -393,17 +393,17 @@ impl ReplicaHandler {
         }
         let hash = payload.hash.clone();
         let staged_hash = hash.clone();
-        // The inner `Result` is the SEMANTIC verdict the control plane
-        // aborts the round on; the outer one is the store failing.
-        let config = db_blocking(&self.store, move |store| {
-            Ok::<_, ApiError>(
-                store
-                    .prepare_replica(&payload.blob, &hash)
-                    .map_err(|e| e.to_string()),
-            )
+        // A pure decode and validation: it needs no store, so it runs
+        // on the blocking pool WITHOUT the store lock, which used to be
+        // held for the whole of it for no reason (backlog #61 i). The
+        // `Result` is the SEMANTIC verdict the control plane aborts the
+        // round on.
+        let config = tokio::task::spawn_blocking(move || {
+            lorica_config::ConfigStore::prepare_replica(&payload.blob, &hash)
+                .map_err(|e| e.to_string())
         })
         .await
-        .map_err(|e| e.to_string())??;
+        .map_err(|e| format!("the replica decode task failed: {e}"))??;
         *self.staged.lock().unwrap_or_else(|p| p.into_inner()) = Some(StagedConfig {
             generation,
             hash: staged_hash,

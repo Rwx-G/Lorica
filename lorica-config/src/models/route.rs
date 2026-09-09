@@ -1107,7 +1107,7 @@ pub fn validate_node_selector_names(names: &[String]) -> Result<(), String> {
 }
 
 impl Route {
-    /// Whether `route` is served by the node called `node_name`
+    /// Whether this route is served by the node called `node_name`
     /// (Story 9.4 D11, AC #13): true when the selector is empty
     /// (fleet-wide) or names the node.
     ///
@@ -1115,14 +1115,14 @@ impl Route {
     /// use lorica_config::models::Route;
     /// # fn demo(mut route: Route) {
     /// route.node_selector = vec!["edge-1".to_string()];
-    /// assert!(Route::route_applies_to_node(&route, "edge-1"));
-    /// assert!(!Route::route_applies_to_node(&route, "edge-2"));
+    /// assert!(route.applies_to_node("edge-1"));
+    /// assert!(!route.applies_to_node("edge-2"));
     /// route.node_selector.clear();
-    /// assert!(Route::route_applies_to_node(&route, "edge-2"));
+    /// assert!(route.applies_to_node("edge-2"));
     /// # }
     /// ```
-    pub fn route_applies_to_node(route: &Route, node_name: &str) -> bool {
-        route.node_selector.is_empty() || route.node_selector.iter().any(|n| n == node_name)
+    pub fn applies_to_node(&self, node_name: &str) -> bool {
+        self.node_selector.is_empty() || self.node_selector.iter().any(|n| n == node_name)
     }
 
     /// Validate [`Route::node_selector`]: at most

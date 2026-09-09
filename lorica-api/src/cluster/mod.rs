@@ -663,23 +663,27 @@ pub async fn get_status(
     Extension(state): Extension<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let build_version = env!("CARGO_PKG_VERSION").to_string();
-    // A control plane reports the generation it OWNS; a follower and a
-    // standalone node report what they last applied.
-    let (applied_config_generation, applied_config_hash) = db_blocking(&state.store, |store| {
-        let generation = store
-            .cluster_config_generation()
-            .map(|g| i64::try_from(g).unwrap_or(i64::MAX))
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let (applied, hash) = store
-            .cluster_applied_config()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok::<_, ApiError>((generation, applied, hash))
-    })
-    .await
-    .map(|(generation, applied, hash)| match applied {
-        0 => (generation, hash),
-        applied => (i64::try_from(applied).unwrap_or(i64::MAX), hash),
-    })?;
+    // A control plane reports the version it OWNS, generation and
+    // hash from the same object; a follower and a standalone node
+    // report what they last applied. The previous shape read both and
+    // could pair the control plane's generation with the applied
+    // marker's hash, two different quantities (backlog #61 e).
+    let (applied_config_generation, applied_config_hash) = match &state.cluster {
+        ClusterRuntime::ControlPlane(runtime) => {
+            let version = runtime.control.config_version();
+            (
+                i64::try_from(version.generation).unwrap_or(i64::MAX),
+                version.hash,
+            )
+        }
+        _ => db_blocking(&state.store, |store| {
+            let (applied, hash) = store
+                .cluster_applied_config()
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Ok::<_, ApiError>((i64::try_from(applied).unwrap_or(i64::MAX), hash))
+        })
+        .await?,
+    };
     let response = match &state.cluster {
         ClusterRuntime::Standalone => ClusterStatusResponse {
             role: "standalone",

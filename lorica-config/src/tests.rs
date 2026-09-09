@@ -327,9 +327,9 @@ mod tests {
         let listed = store.list_routes().expect("test setup");
         assert_eq!(listed[0].node_selector, got.node_selector);
 
-        assert!(Route::route_applies_to_node(&got, "edge-1"));
-        assert!(Route::route_applies_to_node(&got, "edge-2"));
-        assert!(!Route::route_applies_to_node(&got, "edge-3"));
+        assert!(got.applies_to_node("edge-1"));
+        assert!(got.applies_to_node("edge-2"));
+        assert!(!got.applies_to_node("edge-3"));
 
         // An empty selector is fleet-wide.
         let mut fleet_wide = got.clone();
@@ -340,7 +340,7 @@ mod tests {
             .expect("test setup")
             .expect("test setup");
         assert!(got.node_selector.is_empty());
-        assert!(Route::route_applies_to_node(&got, "any-node"));
+        assert!(got.applies_to_node("any-node"));
 
         // The selector rides the replication payload.
         store.update_route(&route).expect("test setup");

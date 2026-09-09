@@ -138,7 +138,6 @@ impl ConfigStore {
     /// version, malformed shape), and on a route whose
     /// `node_selector` breaks [`Route::validate_node_selector`].
     pub fn prepare_replica(
-        &self,
         blob: &[u8],
         expected_hash: &str,
     ) -> std::result::Result<CanonicalConfig, ReplicaError> {
@@ -226,7 +225,7 @@ impl ConfigStore {
         let kept: Vec<&Route> = config
             .routes
             .iter()
-            .filter(|r| Route::route_applies_to_node(r, local_node_name))
+            .filter(|r| r.applies_to_node(local_node_name))
             .collect();
         outcome.routes = kept.len();
         outcome.routes_skipped_by_selector = config.routes.len() - kept.len();
@@ -796,7 +795,7 @@ mod tests {
     ) -> std::result::Result<CanonicalConfig, ReplicaError> {
         let blob = canonical_bytes(source).expect("encode");
         let hash = canonical_hash(source).expect("hash");
-        target.prepare_replica(&blob, &hash)
+        ConfigStore::prepare_replica(&blob, &hash)
     }
 
     #[test]
@@ -917,8 +916,7 @@ mod tests {
         let blob = canonical_bytes(&source).expect("encode");
         let hash = canonical_hash(&source).expect("hash");
 
-        let err = target
-            .prepare_replica(&blob, &"0".repeat(64))
+        let err = ConfigStore::prepare_replica(&blob, &"0".repeat(64))
             .expect_err("a wrong hash must be refused");
         assert!(matches!(err, ReplicaError::Refused(ref m) if m.contains("hash")));
 
@@ -927,7 +925,7 @@ mod tests {
         tampered[last] = b' ';
         assert!(
             matches!(
-                target.prepare_replica(&tampered, &hash),
+                ConfigStore::prepare_replica(&tampered, &hash),
                 Err(ReplicaError::Refused(_))
             ),
             "a payload that does not hash to the announced value is refused"
@@ -942,7 +940,7 @@ mod tests {
         let newer = serde_json::to_vec(&root).expect("re-encode");
         let newer_hash = sha256_hex(&newer);
         assert!(matches!(
-            target.prepare_replica(&newer, &newer_hash),
+            ConfigStore::prepare_replica(&newer, &newer_hash),
             Err(ReplicaError::Refused(_))
         ));
     }
@@ -960,8 +958,7 @@ mod tests {
         let edited = serde_json::to_vec(&root).expect("re-encode");
         let hash = sha256_hex(&edited);
 
-        let err = target
-            .prepare_replica(&edited, &hash)
+        let err = ConfigStore::prepare_replica(&edited, &hash)
             .expect_err("an invalid selector must be refused");
         assert!(matches!(err, ReplicaError::Refused(_)));
     }

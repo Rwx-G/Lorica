@@ -459,7 +459,7 @@ impl ConfigStore {
     /// sorted and deduplicated.
     ///
     /// A disabled route still entitles its selected nodes, matching
-    /// `Route::route_applies_to_node`, which the replica apply uses and
+    /// `Route::applies_to_node`, which the replica apply uses and
     /// which ignores `enabled` too. Narrowing on `enabled` here would
     /// make re-enabling a route race key delivery, and the route row
     /// itself already replicates to the same nodes.
