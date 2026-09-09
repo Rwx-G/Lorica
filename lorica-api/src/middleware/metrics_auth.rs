@@ -6,8 +6,9 @@
 //! is a straight pass-through. Since v1.7.0 the default is `true`, and
 //! a scrape must present ONE of:
 //!
-//! - a valid dashboard session cookie (an operator viewing `/metrics`
-//!   in the browser), or
+//! - a valid dashboard session cookie sent explicitly by an API client
+//!   (the cookie is scoped `Path=/api`, so a browser does NOT send it
+//!   to `/metrics`; backlog #80 holds the question of widening it), or
 //! - the static bearer token in `prometheus_scrape_token` (or its
 //!   environment override `LORICA_PROMETHEUS_SCRAPE_TOKEN`), supplied
 //!   as `Authorization: Bearer <token>`.

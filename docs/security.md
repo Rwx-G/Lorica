@@ -177,7 +177,10 @@ which on a shared or multi-tenant host any local user could otherwise
 read. Since v1.7.0 the global setting `metrics_require_auth` defaults
 to `true` and every scrape must present ONE of:
 
-- a valid dashboard session cookie (an operator viewing `/metrics` in
+- a valid dashboard session cookie sent explicitly by an API client
+  (the cookie is scoped to `Path=/api`, so a browser does not send it to
+  `/metrics`; an operator scrapes with the bearer token, or with
+  `curl -H "Cookie: lorica_session=..."`), formerly described as an operator viewing `/metrics` in
   the browser), or
 - a static bearer token supplied as `Authorization: Bearer <token>`.
 
