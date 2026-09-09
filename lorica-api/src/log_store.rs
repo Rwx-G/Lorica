@@ -1237,8 +1237,18 @@ impl LogStore {
     /// mutations cannot fork the chain. The previous hash comes from
     /// the newest stored row, else the retention seal, else genesis.
     pub fn insert_audit(&self, entry: &crate::audit::NewAuditEntry) -> Result<(i64, String), String> {
-        use rusqlite::OptionalExtension;
-        let conn = self.conn.lock();
+        use rusqlite::{OptionalExtension, TransactionBehavior};
+        let mut guard = self.conn.lock();
+        // IMMEDIATE, so the tail read and the insert hold SQLite's
+        // write lock together across PROCESSES (backlog #74): the
+        // in-process mutex above serialises this daemon's writers, but
+        // `lorica cluster leave` opens its own store on the same file
+        // and used to be able to read the same tail as a concurrent
+        // API write, producing two rows with one `prev_chain_hash`,
+        // a fork the chain never recovers from.
+        let conn = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("failed to open the audit transaction: {e}"))?;
 
         // The LOCAL tail, not the table's. Story 9.9 makes this table
         // hold N interleaved chains, and reading the global tail would
@@ -1291,7 +1301,10 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to insert audit row: {e}"))?;
 
-        Ok((conn.last_insert_rowid(), chain_hash))
+        let id = conn.last_insert_rowid();
+        conn.commit()
+            .map_err(|e| format!("failed to commit the audit row: {e}"))?;
+        Ok((id, chain_hash))
     }
 
     /// Store audit rows fanned in from another node (Story 9.9 AC #2).
