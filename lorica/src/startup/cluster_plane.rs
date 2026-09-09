@@ -56,6 +56,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use lorica_api::audit::{record_with_store, AuditContext};
+use lorica_api::cluster::runtime::MAX_BREAK_GLASS_SECS;
 use lorica_api::cluster::runtime::{publish_token_liveness, refresh_control_plane, revoke_node};
 use lorica_api::cluster::ControlPlaneRuntime;
 use lorica_api::cluster_telemetry_store::ClusterTelemetryStore;
@@ -1183,6 +1184,11 @@ impl FleetHandlers {
 /// latency, not alert volume.
 const DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Slack added to the break-glass window when looking for the
+/// follower's own audit row: telemetry drains every ten seconds, so a
+/// freshly opened window can be real and not yet corroborated.
+const DRAIN_SLACK_SECS: i64 = 60;
+
 /// Replicate the configuration this process just reloaded to the
 /// fleet (Story 9.4 AC #3/#5/#6): increment the persisted generation,
 /// encode the canonical blob and its hash, publish the new version so
@@ -1308,9 +1314,41 @@ fn spawn_replication_watch(
 /// Evaluate fleet drift every [`DRIFT_CHECK_INTERVAL`] (AC #12):
 /// publish the drifted count as a gauge and raise one alert per node
 /// whose suppression backoff has expired.
+/// Whether the control plane holds a fanned-in `cluster.break_glass.open`
+/// row for `node_id` inside the window a break-glass claim could still be
+/// live ([`MAX_BREAK_GLASS_SECS`] plus one drain interval of slack).
+///
+/// A follower opens break-glass through its OWN management API, so the
+/// only record the control plane can ever hold is the audit row that
+/// follower fans in. A node that asserts the bit without ever sending the
+/// row is either lagging by a drain cycle or lying, and the drift alert
+/// says which of the two it cannot rule out (backlog #78).
+async fn break_glass_is_corroborated(log_store: &Option<Arc<LogStore>>, node_id: &str) -> bool {
+    let Some(log_store) = log_store.clone() else {
+        return false;
+    };
+    let node_id = node_id.to_string();
+    let from = (Utc::now()
+        - chrono::Duration::seconds(MAX_BREAK_GLASS_SECS as i64 + DRAIN_SLACK_SECS))
+    .to_rfc3339();
+    tokio::task::spawn_blocking(move || {
+        let query = lorica_api::audit::AuditQuery {
+            action_prefix: Some("cluster.break_glass.open".to_string()),
+            from: Some(from),
+            limit: 1,
+            node_id: Some(node_id),
+            ..Default::default()
+        };
+        matches!(log_store.query_audit(&query), Ok((rows, _)) if !rows.is_empty())
+    })
+    .await
+    .unwrap_or(false)
+}
+
 fn spawn_drift_watch(
     runtime: Arc<ControlPlaneRuntime>,
     store: Arc<Mutex<ConfigStore>>,
+    log_store: Option<Arc<LogStore>>,
     alert_sender: AlertSender,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1331,10 +1369,24 @@ fn spawn_drift_watch(
                 };
                 // A node in break-glass is drifted BY DESIGN: the
                 // operator opened the window. Say so instead of paging
-                // as if it were a fault.
-                let summary = if entry.break_glass {
+                // as if it were a fault, but only when the control plane
+                // holds the follower's own `cluster.break_glass.open`
+                // row: the bit rides the heartbeat and a compromised
+                // node could otherwise keep itself out of every commit
+                // round and have the drift paged as operator action
+                // (backlog #78).
+                let corroborated =
+                    entry.break_glass && break_glass_is_corroborated(&log_store, &node_id).await;
+                let summary = if entry.break_glass && corroborated {
                     format!(
                         "cluster node {} ({}) is in break-glass and diverges from generation {}",
+                        entry.name, node_id, report.current_generation
+                    )
+                } else if entry.break_glass {
+                    format!(
+                        "cluster node {} ({}) claims break-glass and diverges from generation \
+                         {}, and no break-glass audit row from that node has reached the control \
+                         plane: treat the claim as unverified",
                         entry.name, node_id, report.current_generation
                     )
                 } else {
@@ -1352,6 +1404,7 @@ fn spawn_drift_watch(
                         .with_detail("current_generation", report.current_generation.to_string())
                         .with_detail("connected", entry.connected.to_string())
                         .with_detail("break_glass", entry.break_glass.to_string())
+                        .with_detail("break_glass_corroborated", corroborated.to_string())
                         .with_detail(
                             "age_s",
                             entry.age_s.map(|a| a.to_string()).unwrap_or_default(),
@@ -1657,6 +1710,7 @@ pub(crate) async fn spawn_cluster_plane(
         telemetry.clone(),
     ));
     let drift_alerts = opts.alert_sender.clone();
+    let drift_log_store = opts.log_store.clone();
     let replication_reload = opts.config_reload.subscribe();
     let handlers = Arc::new(FleetHandlers {
         control: Arc::clone(&control),
@@ -1704,7 +1758,12 @@ pub(crate) async fn spawn_cluster_plane(
     let tasks = vec![
         spawn_liveness_publisher(Arc::clone(&control), Arc::clone(store)),
         spawn_session_flush(Arc::clone(&control), Arc::clone(store)),
-        spawn_drift_watch(Arc::clone(&runtime), Arc::clone(store), drift_alerts),
+        spawn_drift_watch(
+            Arc::clone(&runtime),
+            Arc::clone(store),
+            drift_log_store,
+            drift_alerts,
+        ),
         spawn_replication_watch(Arc::clone(&runtime), Arc::clone(store), replication_reload),
     ];
 
@@ -1720,6 +1779,18 @@ pub(crate) async fn spawn_cluster_plane(
         takeover_epoch,
         "cluster plane enabled: operational listener bound (mTLS mandatory); \
          enrollment listener opens only while a join token is live"
+    );
+    // Backlog #58: eviction streaks, quarantine and the last round live
+    // in this process. A restart or a hot upgrade therefore releases every
+    // quarantined node and forgets a fleet that converged weeks ago. That
+    // is the intended circuit-breaker behaviour, a restart being a fair
+    // reason to re-probe, but an operator who quarantined a node yesterday
+    // must not have to infer the release from silence.
+    warn!(
+        enrolled_nodes = control.roster.len(),
+        "cluster plane: replication policy state starts empty (eviction \
+         streaks, quarantine, last round). Any node quarantined before \
+         this restart is released and will be probed again"
     );
     if opts.auto_activate {
         warn!("cluster plane: --cluster-auto-activate is set; enrolled nodes become Active without operator review");
@@ -2025,5 +2096,64 @@ mod tests {
         assert_eq!(granted, 1);
         let s = store.lock().await;
         assert_eq!(s.list_cluster_nodes().expect("list").len(), 1);
+    }
+    /// One fanned-in audit row, for the break-glass corroboration test.
+    fn fanned_in_row(action: &str, origin_id: i64) -> lorica_api::audit::FannedInAuditRow {
+        lorica_api::audit::FannedInAuditRow {
+            origin_id,
+            timestamp: Utc::now().to_rfc3339(),
+            operator_username: "admin".into(),
+            operator_role: "super_admin".into(),
+            action: action.into(),
+            target_type: "cluster_node".into(),
+            target_id: "edge-01".into(),
+            before_payload_hash: String::new(),
+            after_payload_hash: String::new(),
+            ip: "192.0.2.10".into(),
+            user_agent: "e2e".into(),
+            prev_chain_hash: String::new(),
+            chain_hash: "0".repeat(64),
+        }
+    }
+
+    #[tokio::test]
+    async fn break_glass_is_corroborated_only_by_that_node_s_own_audit_row() {
+        // Backlog #78: the drift alert used to soften on the peer-supplied
+        // bit alone, so a compromised follower could keep itself out of every
+        // commit round and have the drift paged as operator action.
+        // A plain unique directory: `lorica` does not depend on tempfile.
+        let dir = std::env::temp_dir().join(format!(
+            "lorica-break-glass-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log_store = Arc::new(LogStore::open(&dir).expect("log store"));
+
+        // Nothing fanned in yet: a claim cannot be corroborated.
+        assert!(!break_glass_is_corroborated(&Some(Arc::clone(&log_store)), "node-a").await);
+        // No log store at all is not corroboration either.
+        assert!(!break_glass_is_corroborated(&None, "node-a").await);
+
+        // A different node's window says nothing about this one.
+        log_store
+            .insert_fanned_in_audit("node-b", &[fanned_in_row("cluster.break_glass.open", 1)])
+            .expect("insert node-b");
+        assert!(!break_glass_is_corroborated(&Some(Arc::clone(&log_store)), "node-a").await);
+
+        // A different action from this node says nothing either.
+        log_store
+            .insert_fanned_in_audit("node-a", &[fanned_in_row("cluster.leave", 1)])
+            .expect("insert wrong action");
+        assert!(!break_glass_is_corroborated(&Some(Arc::clone(&log_store)), "node-a").await);
+
+        // This node's own open row corroborates it.
+        log_store
+            .insert_fanned_in_audit("node-a", &[fanned_in_row("cluster.break_glass.open", 2)])
+            .expect("insert node-a");
+        assert!(break_glass_is_corroborated(&Some(Arc::clone(&log_store)), "node-a").await);
+
+        drop(log_store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

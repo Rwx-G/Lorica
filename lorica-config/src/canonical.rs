@@ -368,6 +368,67 @@ pub fn secret_digest(secret: &str) -> String {
     format!("sha256:{}", sha256_hex(secret.as_bytes()))
 }
 
+/// Digest a private key by its MATERIAL rather than by its PEM text.
+///
+/// [`secret_digest`] hashes the string it is given, which is right for an
+/// opaque secret that travels with its own digest. It is wrong for a key
+/// two different writers hold: the control plane announces a digest over
+/// its copy of the PEM and a follower compares it against the copy the key
+/// channel wrote, so a trailing newline or a CRLF line ending on either
+/// side made the same key look like a different one and the replica apply
+/// dropped a working private key (backlog #60).
+///
+/// Every PEM block in the input is base64-decoded and the DER bytes are
+/// digested in order, so line wrapping, line endings and surrounding text
+/// stop mattering. Anything that does not parse as PEM (an empty string, a
+/// value already replaced by a digest) falls back to [`secret_digest`], so
+/// no caller has to special-case it.
+pub fn key_material_digest(key_pem: &str) -> String {
+    match pem_blocks_der(key_pem) {
+        Some(der) => format!("sha256:{}", sha256_hex(&der)),
+        None => secret_digest(key_pem),
+    }
+}
+
+/// The DER bytes of every PEM block in `text`, concatenated in order, or
+/// `None` when the text holds no decodable block.
+fn pem_blocks_der(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+
+    let mut der = Vec::new();
+    let mut rest = text;
+    while let Some(begin) = rest.find("-----BEGIN ") {
+        let after_begin = match rest[begin..]
+            .find("-----\n")
+            .or_else(|| rest[begin..].find("-----\r\n"))
+        {
+            Some(offset) => begin + offset + "-----".len(),
+            None => return None,
+        };
+        let end = rest[after_begin..].find("-----END ")? + after_begin;
+        let body: String = rest[after_begin..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .ok()?;
+        der.extend_from_slice(&decoded);
+        let close = rest[end..]
+            .find("-----\n")
+            .map(|o| end + o + "-----\n".len());
+        rest = match close {
+            Some(next) => &rest[next..],
+            None => "",
+        };
+    }
+    if der.is_empty() {
+        None
+    } else {
+        Some(der)
+    }
+}
+
 /// Sort a collection by the canonical (key-sorted) JSON form of each
 /// element - a total order that needs no per-type key knowledge and
 /// cannot tie two logically distinct elements. The key must be the
@@ -425,7 +486,10 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
     // Replace secret material with digests BEFORE sorting so the
     // sort keys are computed on the bytes actually encoded.
     for cert in &mut cfg.certificates {
-        cert.key_pem = secret_digest(&cert.key_pem);
+        // By material, not by text: the follower comparing this digest
+        // holds a copy written by the key channel, not this byte string
+        // (backlog #60).
+        cert.key_pem = key_material_digest(&cert.key_pem);
     }
     for notification in &mut cfg.notification_configs {
         notification.config = secret_digest(&notification.config);

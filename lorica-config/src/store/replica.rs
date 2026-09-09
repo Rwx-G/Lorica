@@ -30,16 +30,16 @@
 //! load tests and all telemetry (`sla_buckets`, `probe_results`,
 //! access and WAF logs).
 //!
-//! Not written is not the same as not affected. `sla_buckets.route_id`
-//! is `REFERENCES routes(id) ON DELETE CASCADE` and `PRAGMA
-//! foreign_keys` is ON, so every route this path deletes takes that
-//! route's local SLA history with it. On a standalone install that is
-//! an operator deleting their own route; on a follower it also fires
-//! when a `node_selector` change de-selects the node, which destroys
-//! up to `sla_purge_retention_days` of that node's history without
-//! anyone touching that node, and re-selecting it later does not bring
-//! the history back. Tracked as backlog #67. `probe_results` carries
-//! no foreign key and is genuinely untouched. Notification channels and DNS providers DO
+//! Telemetry is genuinely untouched since 1.7.1. It was not before:
+//! `sla_buckets.route_id` was `REFERENCES routes(id) ON DELETE CASCADE`
+//! with `PRAGMA foreign_keys` ON, so a `node_selector` change that
+//! de-selected a node destroyed up to `sla_purge_retention_days` of
+//! that node's SLA history with nobody touching that node, and
+//! re-selecting it did not bring the history back. Schema migration 55
+//! rebuilt the table without the constraint, so SLA history now follows
+//! the rule `probe_results` always did: retained by time, removed by
+//! `prune_sla_buckets` and by nothing else (backlog #67).
+//! Notification channels and DNS providers DO
 //! ride the blob (their secret payload as a digest) because fleet
 //! drift detection must notice a changed credential, but they are
 //! control-plane concerns and are not applied here: a fleet that
@@ -61,7 +61,9 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::params;
 
 use super::ConfigStore;
-use crate::canonical::{decode_canonical, secret_digest, sha256_hex, CanonicalConfig};
+use crate::canonical::{
+    decode_canonical, key_material_digest, secret_digest, sha256_hex, CanonicalConfig,
+};
 use crate::error::{ConfigError, Result};
 use crate::models::{Certificate, Route};
 
@@ -304,7 +306,17 @@ impl ConfigStore {
             match existing {
                 // The digest in the blob matches the key this node
                 // already holds: keep the key, refresh the metadata.
-                Some(held) if secret_digest(&held.key_pem) == cert.key_pem => {
+                //
+                // By material first (backlog #60), because the two sides
+                // hold their own PEM text and a line ending must not read
+                // as a different key. The raw-text form is still accepted:
+                // a 1.7.0 control plane announces that one, and a
+                // followers-first upgrade would otherwise see every
+                // certificate as changed for the length of the rollout.
+                Some(held)
+                    if key_material_digest(&held.key_pem) == cert.key_pem
+                        || secret_digest(&held.key_pem) == cert.key_pem =>
+                {
                     row.key_pem = held.key_pem.clone();
                 }
                 // The blob announces a DIFFERENT key and this node

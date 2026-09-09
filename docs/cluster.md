@@ -471,6 +471,20 @@ generation and applies it wholesale: local edits are reconciled away.
 That is the documented meaning of the control plane owning the
 configuration, and the reason break-glass is a window and not a mode.
 
+The bit rides the heartbeat, so the control plane treats it as a claim
+and not as proof. A follower opens its window through its own
+management API, which means the only record the control plane can hold
+is the `cluster.break_glass.open` audit row that follower fans in. When
+a drifted node asserts break-glass and that row has arrived, the alert
+says the node is in break-glass and diverges, because an operator did
+that on purpose. When the row has not arrived, the alert says the node
+*claims* break-glass and carries `break_glass_corroborated: false`: a
+node that took itself out of every commit round without an operator
+opening a window looks exactly like a compromised one, and it is not
+the control plane's place to decide which it is. A window opened
+seconds ago can legitimately read uncorroborated for one telemetry
+drain (ten seconds).
+
 ### Watching it
 
 `GET /api/v1/cluster/replication` returns the last round (prepared,
@@ -757,7 +771,7 @@ of a global one.
 
 A global cap would make the fleet view shallower than each node's own
 local log, and would let one noisy edge evict every quiet edge's rows
-— exactly the incident-correlation case fan-in exists for. Retention
+- exactly the incident-correlation case fan-in exists for. Retention
 deletes in chunks and releases the database lock between them, so a
 large reclaim does not stall ingest.
 
@@ -792,6 +806,19 @@ one node over its budget (`node_quota`) from the watermark shedding
 everyone (`storage_watermark`), and
 `lorica_cluster_telemetry_ingested_total{node_id}` is the denominator
 without which a drop count says nothing.
+
+A third counter answers the question those two cannot. A follower cut
+off from its control plane keeps serving and keeps logging, and its
+OWN retention keeps trimming: rows the drain had not sent yet are
+deleted locally and will never reach the fleet view. Nothing is
+dropped at the control plane, so neither counter above moves, and a
+quiet edge reads exactly like a truncated one.
+`lorica_cluster_telemetry_lost_to_retention_total{kind}` (`access` or
+`waf`) is counted on the follower, where the delete happens, over
+exactly the rows retention took from above the drain cursor. A
+non-zero value means the fleet view has a hole for that node and the
+node's own log is the only place that period still exists. The
+retention pass also logs it at WARN.
 
 ### Reading it
 

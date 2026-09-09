@@ -1,6 +1,6 @@
 [package]
 name = "lorica-api"
-version = "1.7.0"
+version = "1.7.1"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -8,15 +8,15 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
-lorica-acme = { version = "1.7.0", path = "../lorica-acme" }
+lorica-acme = { version = "1.7.1", path = "../lorica-acme" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-config = { version = "1.7.0", path = "../lorica-config" }
-lorica-dashboard = { version = "1.7.0", path = "../lorica-dashboard" }
-lorica-metrics = { version = "1.7.0", path = "../lorica-metrics" }
-lorica-waf = { version = "1.7.0", path = "../lorica-waf" }
-lorica-notify = { version = "1.7.0", path = "../lorica-notify" }
-lorica-bench = { version = "1.7.0", path = "../lorica-bench" }
-lorica-cluster = { version = "1.7.0", path = "../lorica-cluster" }
+lorica-config = { version = "1.7.1", path = "../lorica-config" }
+lorica-dashboard = { version = "1.7.1", path = "../lorica-dashboard" }
+lorica-metrics = { version = "1.7.1", path = "../lorica-metrics" }
+lorica-waf = { version = "1.7.1", path = "../lorica-waf" }
+lorica-notify = { version = "1.7.1", path = "../lorica-notify" }
+lorica-bench = { version = "1.7.1", path = "../lorica-bench" }
+lorica-cluster = { version = "1.7.1", path = "../lorica-cluster" }
 # Used in `certificates.rs::validate_certificate_bundle` to gate
 # every cert upload (POST /certificates, PUT /certificates/{id},
 # POST /config/import) with the exact loader the worker uses :

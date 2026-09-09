@@ -15,6 +15,22 @@ use crate::logs::{LogEntry, LogsQuery};
 /// where `by_category` is `(category, count)` pairs sorted high-to-low.
 pub type WafEventStats = (u64, u64, Vec<(String, u64)>);
 
+/// What one retention pass removed, and how much of it the fan-in drain
+/// had not sent yet (backlog #76).
+///
+/// A follower keeps its own log and a cursor marking how far the drain
+/// has pushed rows to the control plane. Retention deletes the oldest
+/// rows whether or not the drain has reached them, so a partition longer
+/// than local retention silently shortens the fleet view. `undrained` is
+/// the part of `deleted` the control plane will now never see.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionOutcome {
+    /// Rows the pass deleted.
+    pub deleted: u64,
+    /// Of those, rows the drain cursor had not passed.
+    pub undrained: u64,
+}
+
 /// One access-log row on its way out to the cluster telemetry drain
 /// (Story 9.6).
 ///
@@ -550,7 +566,11 @@ impl LogStore {
     /// aggressively than strictly needed cannot violate the retention
     /// contract. The actual DELETE remains exact via the inner ORDER
     /// BY + LIMIT subquery.
-    pub fn enforce_retention(&self, max_entries: u64) -> Result<u64, String> {
+    pub fn enforce_retention(
+        &self,
+        max_entries: u64,
+        drain_cursor: Option<u64>,
+    ) -> Result<RetentionOutcome, String> {
         let conn = self.conn.lock();
         let bounds: Option<(i64, i64)> = conn
             .query_row("SELECT MIN(id), MAX(id) FROM access_logs", [], |row| {
@@ -566,10 +586,25 @@ impl LogStore {
         };
 
         if approx_count <= max_entries {
-            return Ok(0);
+            return Ok(RetentionOutcome::default());
         }
 
         let to_delete = (approx_count - max_entries) as i64;
+        // Counted under the same lock as the delete, over exactly the
+        // rows the delete targets, so the two figures cannot disagree.
+        let undrained = match drain_cursor {
+            Some(cursor) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM access_logs
+                     WHERE id > ?1
+                       AND id IN (SELECT id FROM access_logs ORDER BY id ASC LIMIT ?2)",
+                    params![cursor as i64, to_delete],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| format!("failed to count undrained access rows: {e}"))?
+                as u64,
+            None => 0,
+        };
         let deleted = conn
             .execute(
                 "DELETE FROM access_logs WHERE id IN (SELECT id FROM access_logs ORDER BY id ASC LIMIT ?1)",
@@ -577,7 +612,10 @@ impl LogStore {
             )
             .map_err(|e| format!("failed to enforce access log retention: {e}"))?;
 
-        Ok(deleted as u64)
+        Ok(RetentionOutcome {
+            deleted: deleted as u64,
+            undrained,
+        })
     }
 
     /// Clear all entries.
@@ -1029,9 +1067,13 @@ impl LogStore {
     /// # Errors
     ///
     /// Returns the SQLite error text on a read or delete failure.
-    pub fn enforce_waf_retention(&self, max_entries: u64) -> Result<u64, String> {
+    pub fn enforce_waf_retention(
+        &self,
+        max_entries: u64,
+        drain_cursor: Option<u64>,
+    ) -> Result<RetentionOutcome, String> {
         const CHUNK: i64 = 2_000;
-        let mut removed = 0u64;
+        let mut outcome = RetentionOutcome::default();
         loop {
             let deleted = {
                 let conn = self.conn.lock();
@@ -1041,13 +1083,27 @@ impl LogStore {
                     })
                     .map_err(|e| format!("failed to size WAF events: {e}"))?;
                 let (Some(min_id), Some(max_id)) = span else {
-                    return Ok(removed);
+                    return Ok(outcome);
                 };
                 let estimated = (max_id - min_id + 1).max(0);
                 if estimated <= max_entries as i64 {
-                    return Ok(removed);
+                    return Ok(outcome);
                 }
                 let take = (estimated - max_entries as i64).min(CHUNK);
+                // Counted under the same lock, over exactly the rows this
+                // chunk is about to delete (backlog #76).
+                if let Some(cursor) = drain_cursor {
+                    outcome.undrained += conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM waf_events
+                             WHERE id > ?1
+                               AND id IN (SELECT id FROM waf_events ORDER BY id ASC LIMIT ?2)",
+                            params![cursor as i64, take],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(|e| format!("failed to count undrained WAF rows: {e}"))?
+                        as u64;
+                }
                 conn.execute(
                     "DELETE FROM waf_events WHERE id IN (
                          SELECT id FROM waf_events ORDER BY id ASC LIMIT ?1
@@ -1057,9 +1113,9 @@ impl LogStore {
                 .map_err(|e| format!("failed to enforce WAF event retention: {e}"))?
             };
             if deleted == 0 {
-                return Ok(removed);
+                return Ok(outcome);
             }
-            removed += deleted as u64;
+            outcome.deleted += deleted as u64;
         }
     }
 
@@ -2608,5 +2664,70 @@ mod audit_tests {
             .expect("query");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].operator_username, "bob");
+    }
+}
+
+#[cfg(test)]
+mod retention_loss_tests {
+    use super::*;
+
+    fn tmp_store() -> (LogStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LogStore::open(dir.path()).expect("open store");
+        (store, dir)
+    }
+
+    fn access_entry(n: u64) -> crate::logs::LogEntry {
+        crate::logs::LogEntry {
+            id: n,
+            timestamp: format!("2026-09-09T12:00:{:02}+00:00", n % 60),
+            method: "GET".into(),
+            path: "/".into(),
+            host: "example.com".into(),
+            status: 200,
+            latency_ms: 3,
+            backend: "10.0.0.10:8080".into(),
+            error: None,
+            client_ip: "192.0.2.10".into(),
+            is_xff: false,
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: format!("req-{n}"),
+        }
+    }
+
+    #[test]
+    fn retention_reports_the_rows_it_took_before_the_drain_sent_them() {
+        // Backlog #76: a follower cut off from its control plane keeps
+        // logging while local retention keeps trimming. Rows above the drain
+        // cursor that retention deletes never reach the fleet view, and a
+        // quiet edge used to look exactly like a truncated one.
+        let (store, _dir) = tmp_store();
+        for n in 0..10 {
+            store.insert(&access_entry(n)).expect("insert access row");
+        }
+
+        // The drain has sent rows up to id 3; retention keeps four of the
+        // ten, so it deletes six, three of which the drain never sent.
+        let outcome = store
+            .enforce_retention(4, Some(3))
+            .expect("retention with a cursor");
+        assert_eq!(outcome.deleted, 6);
+        assert_eq!(outcome.undrained, 3);
+
+        // Without a cursor the pass reports deletions only: a standalone
+        // node has no fleet view to fall short of.
+        for n in 10..20 {
+            store.insert(&access_entry(n)).expect("insert access row");
+        }
+        let outcome = store.enforce_retention(4, None).expect("retention");
+        assert!(outcome.deleted > 0);
+        assert_eq!(outcome.undrained, 0);
+
+        // Nothing to delete is not a loss.
+        let outcome = store
+            .enforce_retention(1_000, Some(0))
+            .expect("retention under the cap");
+        assert_eq!(outcome, RetentionOutcome::default());
     }
 }

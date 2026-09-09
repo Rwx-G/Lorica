@@ -160,7 +160,10 @@ impl ProbeScheduler {
                     }
                 }
 
-                // Flush result as an "active" source bucket
+                // One probe is one slice of the open minute: `merge_sla_bucket`
+                // adds it to whatever that minute already holds, so a route
+                // probed every five seconds reports the twelve probes rather
+                // than the last one (backlog #68).
                 let bucket_start = {
                     let now = Utc::now();
                     now.with_nanosecond(0)
@@ -191,7 +194,7 @@ impl ProbeScheduler {
 
                 {
                     let s = store.lock().await;
-                    if let Err(e) = s.insert_sla_bucket(&bucket) {
+                    if let Err(e) = s.merge_sla_bucket(&bucket) {
                         warn!(error = %e, "failed to store probe result");
                     }
                 }

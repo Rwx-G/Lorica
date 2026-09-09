@@ -66,7 +66,7 @@ pub(super) fn flush(collector: &SlaCollector, store: &ConfigStore) -> usize {
             }
         }
 
-        if let Err(e) = store.insert_sla_bucket(&sla_bucket) {
+        if let Err(e) = store.merge_sla_bucket(&sla_bucket) {
             error!(route_id = %route_id, error = %e, "failed to flush SLA bucket");
         } else {
             debug!(

@@ -393,6 +393,35 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
     done
 
     docker compose --profile cluster run --rm cluster-smoke || EXIT_CODE=$?
+
+    # ---- Restart phase (backlog #77) ----
+    # Nothing in this profile ever crossed a process boundary, so
+    # nothing covered what survives one: a follower's session and its
+    # SLA history, the private key it holds, and the control plane's
+    # own in-memory replication policy state. Only run.sh can restart
+    # a container, so the assertions live in their own runner and this
+    # drives the restarts.
+    if [ "$EXIT_CODE" = "0" ]; then
+        echo ""
+        echo "=== Lorica E2E Tests (cluster restart phase) ==="
+        echo ""
+
+        docker compose --profile cluster restart lorica-edge-a
+        docker compose --profile cluster run --rm cluster-restart-smoke follower \
+            || EXIT_CODE=$?
+
+        if [ "$EXIT_CODE" = "0" ]; then
+            docker compose --profile cluster restart lorica-cp
+            docker compose --profile cluster run --rm cluster-restart-smoke control-plane \
+                || EXIT_CODE=$?
+        fi
+    fi
+
+    # ---- Revocation, last: it is terminal for a node, so everything
+    # that needs a live follower has already run.
+    if [ "$EXIT_CODE" = "0" ]; then
+        docker compose --profile cluster run --rm cluster-revocation-smoke || EXIT_CODE=$?
+    fi
 fi
 
 # Cleanup unless --keep

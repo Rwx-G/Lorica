@@ -38,6 +38,7 @@ use chrono::Datelike;
 use lorica_api::middleware::auth::SessionStore;
 use lorica_api::middleware::rate_limit::RateLimiter;
 use lorica_api::server::AppState;
+use lorica_config::store::TelemetryCursor;
 use lorica_config::ConfigStore;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -320,10 +321,39 @@ pub(crate) fn spawn_retention_loop(
                     })
                     .unwrap_or((100_000, 100_000, 90))
             };
+            // Backlog #76: retention trims the local log whether or not
+            // the fan-in drain has sent those rows. On a follower cut off
+            // from its control plane for longer than local retention, the
+            // difference is rows the fleet view will never hold, and a
+            // quiet edge and a truncated one look the same without a count.
+            let (access_cursor, waf_cursor) = {
+                let s = retention_config_store.lock().await;
+                (
+                    s.telemetry_cursor(TelemetryCursor::Access).ok(),
+                    s.telemetry_cursor(TelemetryCursor::Waf).ok(),
+                )
+            };
             if let Some(logs) = &retention_log_store {
                 if retention > 0 {
-                    if let Err(e) = logs.enforce_retention(retention as u64) {
-                        tracing::warn!(error = %e, "access log retention cleanup failed");
+                    match logs.enforce_retention(retention as u64, access_cursor) {
+                        Ok(outcome) => {
+                            if outcome.undrained > 0 {
+                                tracing::warn!(
+                                    rows = outcome.undrained,
+                                    deleted = outcome.deleted,
+                                    "access log retention removed rows the cluster \
+                                     drain had not sent; the fleet view is short by \
+                                     that many"
+                                );
+                                lorica_api::metrics::inc_cluster_telemetry_lost_to_retention(
+                                    "access",
+                                    outcome.undrained,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "access log retention cleanup failed");
+                        }
                     }
                 }
             }
@@ -454,8 +484,25 @@ pub(crate) fn spawn_retention_loop(
             }
             if let Some(logs) = &retention_log_store {
                 if waf_retention > 0 {
-                    if let Err(e) = logs.enforce_waf_retention(waf_retention as u64) {
-                        tracing::warn!(error = %e, "WAF event retention cleanup failed");
+                    match logs.enforce_waf_retention(waf_retention as u64, waf_cursor) {
+                        Ok(outcome) => {
+                            if outcome.undrained > 0 {
+                                tracing::warn!(
+                                    rows = outcome.undrained,
+                                    deleted = outcome.deleted,
+                                    "WAF event retention removed rows the cluster \
+                                     drain had not sent; the fleet view is short by \
+                                     that many"
+                                );
+                                lorica_api::metrics::inc_cluster_telemetry_lost_to_retention(
+                                    "waf",
+                                    outcome.undrained,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "WAF event retention cleanup failed");
+                        }
                     }
                 }
             }

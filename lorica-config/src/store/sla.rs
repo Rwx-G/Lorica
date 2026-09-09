@@ -116,15 +116,46 @@ impl ConfigStore {
 
     // ---- SLA Buckets ----
 
-    /// Insert an aggregated SLA bucket.
-    pub fn insert_sla_bucket(&self, bucket: &SlaBucket) -> Result<()> {
+    /// Merge one slice of a minute into its SLA bucket.
+    ///
+    /// A bucket is keyed by `(route_id, bucket_start, source)` and several
+    /// writers reach the same key: in worker mode every forked worker flushes
+    /// its own slice of the same minute into this one database, and an active
+    /// probe writes the currently open minute once per probe. This used to be
+    /// `INSERT OR REPLACE`, so the stored row was whichever writer wrote last:
+    /// an N-worker node under-reported its request volume by roughly N, and an
+    /// active bucket held a single probe instead of the minute (backlog #68).
+    ///
+    /// The counters and the latency sum add up, the minimum and the maximum
+    /// take the extreme of the two slices, and the configuration snapshot
+    /// follows the newest writer. **The three percentiles take the maximum**:
+    /// a percentile cannot be recomputed from per-slice percentiles without
+    /// the samples behind them, and a tail figure that can be averaged away by
+    /// a quiet worker is worse than one that reads slightly high. That is also
+    /// what [`Self::compute_sla_summary`] already does when it collapses a
+    /// window of buckets.
+    pub fn merge_sla_bucket(&self, bucket: &SlaBucket) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sla_buckets
+            "INSERT INTO sla_buckets
              (route_id, bucket_start, request_count, success_count, error_count,
               latency_sum_ms, latency_min_ms, latency_max_ms,
               latency_p50_ms, latency_p95_ms, latency_p99_ms, source,
               cfg_max_latency_ms, cfg_status_min, cfg_status_max, cfg_target_pct)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             ON CONFLICT(route_id, bucket_start, source) DO UPDATE SET
+              request_count  = sla_buckets.request_count  + excluded.request_count,
+              success_count  = sla_buckets.success_count  + excluded.success_count,
+              error_count    = sla_buckets.error_count    + excluded.error_count,
+              latency_sum_ms = sla_buckets.latency_sum_ms + excluded.latency_sum_ms,
+              latency_min_ms = MIN(sla_buckets.latency_min_ms, excluded.latency_min_ms),
+              latency_max_ms = MAX(sla_buckets.latency_max_ms, excluded.latency_max_ms),
+              latency_p50_ms = MAX(sla_buckets.latency_p50_ms, excluded.latency_p50_ms),
+              latency_p95_ms = MAX(sla_buckets.latency_p95_ms, excluded.latency_p95_ms),
+              latency_p99_ms = MAX(sla_buckets.latency_p99_ms, excluded.latency_p99_ms),
+              cfg_max_latency_ms = excluded.cfg_max_latency_ms,
+              cfg_status_min     = excluded.cfg_status_min,
+              cfg_status_max     = excluded.cfg_status_max,
+              cfg_target_pct     = excluded.cfg_target_pct",
             params![
                 bucket.route_id,
                 bucket.bucket_start.to_rfc3339(),

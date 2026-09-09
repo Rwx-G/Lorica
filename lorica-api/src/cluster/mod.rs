@@ -865,6 +865,16 @@ pub struct ReplicationStatus {
     pub in_flight: Option<u64>,
     /// The last completed round, `None` before the first one.
     pub last: Option<ReplicationRoundResponse>,
+    /// Whether `last` is `None` only because this control-plane process
+    /// has not run a round yet.
+    ///
+    /// Replication policy state (eviction streaks, quarantine, the last
+    /// report) is a within-process circuit breaker and is not persisted:
+    /// a restart is a legitimate reason to re-probe every node. Without
+    /// this flag a fleet converged for weeks reads exactly like a fleet
+    /// that never replicated, and the restart that released a quarantine
+    /// looks like nothing happened (backlog #58).
+    pub policy_state_reset_by_restart: bool,
 }
 
 /// One completed replication round, as the API renders it.
@@ -944,6 +954,7 @@ pub async fn get_replication(
         current_generation: version.generation,
         current_hash: version.hash,
         in_flight: control.replication.in_flight(),
+        policy_state_reset_by_restart: control.replication.last_report().is_none(),
         last: control.replication.last_report().map(Into::into),
     }))
 }

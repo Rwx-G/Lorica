@@ -48,11 +48,21 @@ if [ -n "${SSL_CERT_FILE:-}" ]; then
     fi
 fi
 
-say "initialising the cluster CA"
-if ! lorica --data-dir "$DATA_DIR" cluster init \
-        --common-name "Lorica E2E Cluster CA" 2>&1 | tee -a "$LOGFILE"; then
-    say "cluster init failed"
-    exit 1
+# Once per data volume: `cluster init` generates the fleet CA and
+# refuses to replace one, so a `docker compose restart` would die here
+# instead of exercising the restart the cluster e2e phase observes
+# (backlog #77). The marker lives in the data volume, like the CA.
+CA_MARKER="$DATA_DIR/.e2e-ca-initialised"
+if [ -f "$CA_MARKER" ]; then
+    say "the cluster CA already exists; starting (restart)"
+else
+    say "initialising the cluster CA"
+    if ! lorica --data-dir "$DATA_DIR" cluster init \
+            --common-name "Lorica E2E Cluster CA" 2>&1 | tee -a "$LOGFILE"; then
+        say "cluster init failed"
+        exit 1
+    fi
+    touch "$CA_MARKER"
 fi
 
 # Harness only: exposes the loopback management API to the runner and

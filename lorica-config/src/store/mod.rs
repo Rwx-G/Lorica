@@ -174,6 +174,7 @@ const MIGRATIONS: &[Migration] = &[
     (52, migrate_cluster_replication),
     (53, migrate_cluster_node_name_unique),
     (54, migrate_acme_challenge_expiry),
+    (55, migrate_sla_buckets_drop_route_cascade),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -869,6 +870,79 @@ fn migrate_cluster_node_name_unique(conn: &Connection) -> rusqlite::Result<()> {
     rename_duplicate_cluster_node_names(conn)?;
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_nodes_name ON cluster_nodes(name);",
+    )
+}
+
+/// Rebuild `sla_buckets` without the foreign key on `routes(id)`.
+///
+/// The column was `REFERENCES routes(id) ON DELETE CASCADE` and
+/// `PRAGMA foreign_keys=ON` is set on every connection, so every path
+/// that removes a route destroyed that route's whole SLA history. On a
+/// standalone node that is an operator deleting their own route, which
+/// is defensible. On a follower it is not: `apply_replica_routes`
+/// deletes every local route the blob no longer carries or a
+/// `node_selector` no longer selects, so narrowing a selector on the
+/// control plane silently erased up to `sla_purge_retention_days` of
+/// another machine's measurements, outside the replica outcome counters
+/// and unrecoverable by re-selecting the node (backlog #67).
+///
+/// SLA history is now retained by time only, through
+/// [`ConfigStore::prune_sla_buckets`], which is the same rule
+/// `probe_results` has always followed (it never had a foreign key).
+/// Rows for a route that no longer exists stay until the retention pass
+/// takes them; nothing reads them, because every query names a route.
+///
+/// SQLite cannot drop a constraint in place, so the table is rebuilt.
+/// `sla_configs` keeps its cascade on purpose: it is configuration for a
+/// route, not a record of what that route served.
+fn migrate_sla_buckets_drop_route_cascade(conn: &Connection) -> rusqlite::Result<()> {
+    let has_fk: bool = conn
+        .prepare("PRAGMA foreign_key_list(sla_buckets)")?
+        .query_map([], |_| Ok(()))?
+        .next()
+        .is_some();
+    if !has_fk {
+        return Ok(());
+    }
+    // Nothing references `sla_buckets`, so the rebuild needs no
+    // foreign-key pragma dance: dropping a child table cascades nothing.
+    conn.execute_batch(
+        "CREATE TABLE sla_buckets_rebuilt (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            route_id TEXT NOT NULL,
+            bucket_start TEXT NOT NULL,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            latency_sum_ms INTEGER NOT NULL DEFAULT 0,
+            latency_min_ms INTEGER NOT NULL DEFAULT 0,
+            latency_max_ms INTEGER NOT NULL DEFAULT 0,
+            latency_p50_ms INTEGER NOT NULL DEFAULT 0,
+            latency_p95_ms INTEGER NOT NULL DEFAULT 0,
+            latency_p99_ms INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'passive',
+            cfg_max_latency_ms INTEGER NOT NULL DEFAULT 500,
+            cfg_status_min INTEGER NOT NULL DEFAULT 200,
+            cfg_status_max INTEGER NOT NULL DEFAULT 399,
+            cfg_target_pct REAL NOT NULL DEFAULT 99.9,
+            UNIQUE(route_id, bucket_start, source)
+        );
+        INSERT INTO sla_buckets_rebuilt
+            (id, route_id, bucket_start, request_count, success_count, error_count,
+             latency_sum_ms, latency_min_ms, latency_max_ms,
+             latency_p50_ms, latency_p95_ms, latency_p99_ms, source,
+             cfg_max_latency_ms, cfg_status_min, cfg_status_max, cfg_target_pct)
+            SELECT id, route_id, bucket_start, request_count, success_count, error_count,
+                   latency_sum_ms, latency_min_ms, latency_max_ms,
+                   latency_p50_ms, latency_p95_ms, latency_p99_ms, source,
+                   cfg_max_latency_ms, cfg_status_min, cfg_status_max, cfg_target_pct
+            FROM sla_buckets;
+        DROP TABLE sla_buckets;
+        ALTER TABLE sla_buckets_rebuilt RENAME TO sla_buckets;
+        CREATE INDEX IF NOT EXISTS idx_sla_buckets_route_time
+            ON sla_buckets(route_id, bucket_start);
+        CREATE INDEX IF NOT EXISTS idx_sla_buckets_time
+            ON sla_buckets(bucket_start);",
     )
 }
 
