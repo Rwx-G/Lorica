@@ -755,6 +755,110 @@ the configuration, which does replicate.
 The same restart caveat applies to the fan-in view: it is a snapshot
 of live state, so it is lossy across a node restart by construction.
 
+## The Fleet's Audit Trail
+
+Every node keeps its own audit log, and a control plane also holds a
+copy of what its followers recorded. Both halves matter, and the second
+one is weaker than the first in a way worth stating before anyone
+leans on it.
+
+### What the aggregated copy proves, and what it does not
+
+The chain is an unkeyed SHA-256. Every row stores the previous row's
+`chain_hash` and its own, computed over the row's content, so editing a
+field or deleting a row breaks recomputation at the earliest affected
+row. That makes the log tamper-EVIDENT, not tamper-proof: the algorithm
+is public, so a principal with write access can recompute every hash
+forward and produce a self-consistent forged history that verify
+accepts.
+
+Fan-in does not improve that, and against the attacker who matters here
+it proves nothing at all. A compromised follower streams a
+self-consistent forged chain and the control plane's verify reports it
+clean. A principal with write access to the control plane can rewrite
+one node's rows and recompute that node's chain forward. **The control
+plane's aggregated copy is strictly weaker than each origin node's
+own.**
+
+What makes the copy worth keeping is the out-of-band anchor. Each node
+emits its committed `chain_hash` on the `lorica::audit` tracing target;
+shipped to a write-once sink (see the log sinks in the settings), that
+stream is what a wholesale rewrite cannot survive, because the
+persisted head can be compared against the externally captured one.
+That is why the fan-in stores both hashes **verbatim** and recomputes
+neither: an aggregated row that agreed with itself and with nothing the
+node published would be worth exactly nothing.
+
+Signed checkpoints, where each node signs its chain head with its
+cluster key so a retroactive rewrite shows as a fork, are the real fix.
+They are deliberately out of scope; this is the limitation documented
+rather than hidden.
+
+### One chain per node
+
+The aggregated table holds N interleaved chains, so everything that
+touches the chain is partitioned by node:
+
+- A row carries `node_id` and `origin_id`. An empty `node_id` is this
+  node's own row, on a standalone install and a clustered one alike, so
+  the column does not change meaning the day a node joins a fleet.
+  `origin_id` is the id the origin assigned, which reconstructs that
+  node's own order and matches an aggregated row against its copy.
+- Verification reports **per chain**. One verdict over the whole table
+  would chain one node's row to another's and break at the first
+  interleave. `GET /api/v1/audit/verify` returns one entry per node,
+  and the top-level `verified` is the conjunction.
+- Retention seals every chain, not just the local one. A truncation
+  crosses every node's rows at once, so one seal would leave each
+  fanned-in chain unverifiable from its new first surviving row.
+- A node's own next entry chains off its own tail, never off a row
+  that arrived from elsewhere.
+
+### Audit rows are never shed
+
+Telemetry has an ingest quota and a storage watermark, and both shed
+under pressure. Audit rows are counted against the quota and exempt
+from its verdict. Losing an access row costs a line of traffic; losing
+an audit row costs the record of an operator action, on the one table
+whose entire purpose is that the record exists. A compliance feature
+that drops rows silently under load is worse than one that does not
+exist, because it is believed.
+
+Exempt from shedding is not unbounded: the batch is bounded on the
+wire like every other kind, so a peer cannot make the control plane
+allocate arbitrarily.
+
+A node that joins an existing fleet ships what it records from then on,
+not its whole pre-cluster history. Those rows are still on the node and
+still verifiable there.
+
+### What is recorded
+
+Both sides of every cluster lifecycle operation, with the operator
+identity, role and source address where there is an operator, and a
+`cluster` / `node` identity where the actor is the plane itself:
+
+| Operation | Action | Recorded on |
+|---|---|---|
+| Join-token mint, revoke | `cluster.token.mint`, `.revoke` | control plane |
+| Enrolment, with its certificate | `cluster.node.enroll` | control plane |
+| Activation | `cluster.node.activate` | control plane |
+| Certificate renewal | `cluster.node.renew` | control plane |
+| Revocation | `cluster.node.revoke` | control plane |
+| Leaving the fleet | `cluster.node.leave` | both |
+| Break-glass open, close | `cluster.break_glass.open`, `.close` | follower |
+| Fleet-wide ban | `cluster.ban.fleet` | control plane |
+| Configuration apply | `cluster.config.apply` | follower |
+| Refused identity, protocol violation | `cluster.identity.refused`, `cluster.protocol.violation` | control plane |
+
+`cluster.config.apply` records BOTH outcomes. A refusal is the more
+interesting one: it is the case where a node is knowingly serving
+something other than what the fleet was told to serve, and a trail that
+recorded only successful applies would show a converged fleet on a node
+that never converged. Because it is the follower's own row, it fans
+back up on the next drain, which is what links an operator's single
+record of a fleet-wide mutation to each node's outcome.
+
 ## Fleet Metrics
 
 Per-node scrape or Prometheus federation, not a fleet-wide `/metrics`

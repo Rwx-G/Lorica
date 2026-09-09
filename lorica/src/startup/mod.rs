@@ -891,6 +891,7 @@ pub(crate) async fn spawn_cluster_runtime(
     let follower_reload = opts.config_reload.clone();
     let follower_alerts = opts.alert_sender.clone();
     let follower_data_dir = opts.data_dir.clone();
+    let follower_log_store = opts.log_store.clone();
     let plane = match cluster_plane::spawn_cluster_plane(opts, store).await {
         Ok(Some(plane)) => {
             lorica_api::metrics::install_cluster_plane_stats(
@@ -915,6 +916,7 @@ pub(crate) async fn spawn_cluster_runtime(
             alert_sender: follower_alerts,
             bans,
             data_dir: follower_data_dir,
+            log_store: follower_log_store,
         },
         store,
     )

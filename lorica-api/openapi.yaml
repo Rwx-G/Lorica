@@ -3410,8 +3410,46 @@ paths:
       description: |
         Returns the tamper-evident admin audit log (Story 8.9).
         Operator+ role floor, enforced by the authorize middleware.
+
+        On a control plane the table also holds the rows other nodes
+        fanned in (Story 9.9). Each row carries `node_id` and
+        `origin_id`; an empty `node_id` is this node's own row, and
+        `origin_id` is the id the origin node assigned, which is what
+        matches an aggregated row against that node's own copy.
       security:
         - sessionCookie: []
+      parameters:
+        - in: query
+          name: operator
+          schema: { type: string }
+          description: Exact operator-username match.
+        - in: query
+          name: action
+          schema: { type: string }
+          description: Action prefix, e.g. `cluster.` matches `cluster.node.enroll`.
+        - in: query
+          name: from
+          schema: { type: string }
+          description: Inclusive RFC 3339 lower bound.
+        - in: query
+          name: to
+          schema: { type: string }
+          description: Inclusive RFC 3339 upper bound.
+        - in: query
+          name: limit
+          schema: { type: integer }
+          description: Page size (default 100, capped at 1000).
+        - in: query
+          name: before_id
+          schema: { type: integer }
+          description: Cursor; rows with an id strictly below this one.
+        - in: query
+          name: node
+          schema: { type: string }
+          description: >-
+            Restrict to one node's rows (Story 9.9 AC #5). The EMPTY string
+            is a real filter and selects this node's own rows; omitting the
+            parameter returns every node's.
       responses:
         "200":
           description: Audit log entries
@@ -3435,11 +3473,39 @@ paths:
         Recomputes the audit-log hash chain and reports whether the
         trail is intact (Story 8.9). SuperAdmin-only, enforced by the
         authorize middleware.
+
+        Reports PER NODE (Story 9.9 AC #3). An aggregated table holds
+        one chain per node, so a single verdict over the whole table
+        would be meaningless: it would chain one node's row to
+        another's and break at the first interleave. The top-level
+        `verified` is the conjunction of every chain's, so a caller
+        reading only that field still gets a correct answer.
+
+        What this proves is the internal consistency of what each node
+        sent, and nothing about authenticity. The hash is unkeyed, so a
+        compromised follower can stream a self-consistent forged chain
+        and this reports it clean, and a principal with write access to
+        the control plane can rewrite one node's rows and recompute
+        that chain forward. The control plane's copy is strictly weaker
+        than each origin node's. The authoritative anchor is each
+        node's own `lorica::audit` tracing event shipped to a WORM sink
+        (Story 9.8): comparing the aggregated `chain_hash` against the
+        externally captured one is what a rewrite cannot survive, and
+        is why the fan-in stores both hashes verbatim rather than
+        recomputing them.
       security:
         - sessionCookie: []
+      parameters:
+        - in: query
+          name: node
+          schema: { type: string }
+          description: >-
+            Verify one chain. The EMPTY string is this node's own; omitting
+            the parameter verifies every chain in the table and reports each
+            separately.
       responses:
         "200":
-          description: Verification outcome
+          description: Verification outcome, one entry per chain
           content:
             application/json:
               schema:
@@ -3447,6 +3513,14 @@ paths:
                 properties:
                   data:
                     type: object
+                    properties:
+                      verified:
+                        type: boolean
+                        description: True only when every chain verified.
+                      nodes:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/NodeVerifyResult"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -4147,6 +4221,25 @@ components:
           nullable: true
           allOf:
             - $ref: "#/components/schemas/NodeResources"
+    NodeVerifyResult:
+      type: object
+      description: One audit chain's verdict (Story 9.9 AC #3).
+      properties:
+        node_id:
+          type: string
+          description: The chain's node; empty is this node's own.
+        verified:
+          type: boolean
+        total_rows:
+          type: integer
+        first_break_id:
+          type: integer
+          description: >-
+            The AGGREGATED row id of the earliest row that failed to
+            recompute, so an operator can find it. Absent when verified.
+        first_break_reason:
+          type: string
+          enum: [prev_hash_mismatch, chain_hash_mismatch]
     NodeResources:
       type: object
       description: >-

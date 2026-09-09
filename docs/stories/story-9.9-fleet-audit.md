@@ -1,7 +1,7 @@
 # Story 9.9: Fleet-Wide Audit Trail
 
 **Epic:** 9 (v1.7.0)
-**Status:** InProgress
+**Status:** Review
 **Author:** Romain G.
 
 **Depends on:** Stories 9.3 (node identity), 9.6 (fan-in transport,
@@ -45,15 +45,38 @@ is not misrepresented.
 
 ## Tasks / Subtasks
 
-- [ ] AC #1: wording pass across story, `docs/cluster.md` and dashboard
-      copy.
-- [ ] AC #2: separate fan-in insert path preserving chain fields.
-- [ ] AC #3: per-node seal keys + partitioned verify.
-- [ ] AC #4: audit emission on every cluster lifecycle operation, both
-      sides.
-- [ ] AC #5: node filter + node-selector verify.
-- [ ] AC #6: operator record linked to per-node outcomes.
-- [ ] AC #7: dashboard column, filter, per-node verify results.
+- [x] AC #1: `docs/cluster.md` gains "The Fleet's Audit Trail", which
+      states plainly that the aggregated copy is strictly weaker than
+      each origin node's, that fan-in proves nothing against a
+      compromised follower, and that the anchor is each node's own
+      `lorica::audit` stream shipped to a write-once sink. The same
+      statement is on `/api/v1/audit/verify` in `openapi.yaml` and in
+      the dashboard's audit tab, where an operator reads the result.
+- [x] AC #2: `insert_fanned_in_audit`, a separate path that writes both
+      chain hashes verbatim and recomputes nothing. `insert_audit` now
+      reads the LOCAL tail, which it did not: the tests written for the
+      separate path caught that the control plane's own chain would
+      otherwise have chained off a follower's row.
+- [x] AC #3: `retention_seal:<node_id>`, with the local chain keeping
+      the exact literal it always had so an upgraded single-node
+      database needs no migration. Retention seals every chain in one
+      pass. `verify_audit_chain_for` is partitioned and ordered by
+      `origin_id` for a fanned-in chain.
+- [x] AC #4: the enumeration in the Phase 1 review found nine tenths of
+      this already delivered by stories 9.3 to 9.7. The missing tenth,
+      the node-scoped apply, is now `cluster.config.apply` on the
+      follower, recorded on BOTH outcomes.
+- [x] AC #5: `node` on `GET /api/v1/audit` and on
+      `GET /api/v1/audit/verify`. The EMPTY string is a real filter
+      selecting this node's own rows, so both the store and the client
+      compare against `undefined` rather than for truthiness; folding
+      the two together would silently widen the query to the fleet.
+- [x] AC #6: `cluster.config.apply` is the follower's own row, so it
+      fans back up on the next drain. The operator's single record of
+      the mutation is on the control plane, and each node's outcome
+      arrives beside it, linked by generation and hash.
+- [x] AC #7: node column, node filter and per-chain verify results in
+      the dashboard's audit tab, all hidden on a standalone install.
 
 ## Dev Notes
 
@@ -232,7 +255,36 @@ out of scope by the PRD.
 
 ### Completion Notes
 
-(empty)
+**The test that mattered caught a defect in code I had just written.**
+The separate insert path was in place, the fan-in stored chain fields
+verbatim, and `insert_audit` still read the table's GLOBAL tail. So the
+control plane's own next audit entry would have chained off whichever
+follower row arrived last: its chain would have been verifiable by
+nothing but that exact aggregate, and would have broken the moment a
+fanned-in row was pruned. That is the defect AC #2 exists to prevent,
+arriving from the direction the AC does not mention, and the Phase 1
+review had named the mechanism without my carrying it through to the
+local path.
+
+**What is deliberately weaker than it sounds, and said so everywhere.**
+AC #1 is about not overstating, so: the aggregated copy proves the
+internal consistency of what a node sent, and nothing about
+authenticity. A compromised follower streams a self-consistent forged
+chain and verify reports it clean. The control plane's copy is strictly
+weaker than each origin's. That sentence is in `docs/cluster.md`, on
+the verify endpoint in `openapi.yaml`, and in the dashboard's audit tab
+where an operator actually reads the verdict.
+
+**Seven tests, each pinning one property rather than one function:** a
+fanned-in row never joins this node's chain; each chain verifies alone;
+a re-sent batch stores nothing twice; a row cannot claim to be local; a
+tampered row is reported rather than repaired; retention seals every
+chain; the drain ships only this node's own rows.
+
+**Not done, and stated rather than left to be discovered.** The
+`cluster` e2e profile still does not exist (backlog #66), so this
+story's Integration Verification has not run, exactly as 9.2 through
+9.7 have not. Nothing here has been exercised against two real nodes.
 
 ## File List
 
@@ -251,4 +303,5 @@ Anticipated:
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-09-09 | 1.0 | Implemented. Audit rows fan in over the Story 9.6 telemetry channel and the aggregated table holds one chain per node: separate insert path writing both hashes verbatim, per-node retention seals, partitioned verify reporting per chain, node filter on the list and the verify endpoints, node column and per-chain results in the dashboard. `insert_audit` was reading the global tail and now reads the local one, a defect the tests for the separate path caught. Audit rows are counted against the ingest quota and exempt from its shedding verdict, because a compliance feature that drops rows silently under load is worse than one that does not exist. AC #4 turned out to be nine tenths delivered by stories 9.3 to 9.7; the missing tenth is the node-scoped apply, now recorded on both outcomes. The security property is stated as it actually is, in the doc, the API contract and the dashboard: the aggregated copy is strictly weaker than each origin node's, and the anchor is each node's own audit stream. Status Review. | Romain G. |
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Security property restated accurately after the first draft overclaimed fan-in verification; separate insert path and per-node seals added. Status Draft. | Romain G. |

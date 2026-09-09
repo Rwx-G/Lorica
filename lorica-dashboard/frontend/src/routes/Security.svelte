@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry, type AuditRecord, type AuditVerifyResult, type AuditQuery } from '../lib/api';
+  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry, type AuditRecord, type AuditVerifyReport, type AuditQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
   import { showToast } from '../lib/toast';
@@ -61,7 +61,11 @@
   let auditFrom = $state('');
   let auditTo = $state('');
   let auditLimit = $state(250);
-  let auditVerifyResult: AuditVerifyResult | null = $state(null);
+  let auditVerifyResult: AuditVerifyReport | null = $state(null);
+  /** Audit node filter; `undefined` is every node (Story 9.9 AC #7). */
+  let auditNode: string | undefined = $state(undefined);
+  let auditNodeIds = $state<string[]>([]);
+  let auditNodeNames = $state<Record<string, string>>({});
   let auditVerifying = $state(false);
 
   // Custom rule form
@@ -322,6 +326,7 @@
     if (auditAction.trim()) params.action = auditAction.trim();
     if (auditFrom) params.from = new Date(auditFrom).toISOString();
     if (auditTo) params.to = new Date(auditTo).toISOString();
+    if (auditNode !== undefined) params.node = auditNode;
     return params;
   }
 
@@ -350,6 +355,26 @@
       auditTotal = res.data.total;
     }
     auditLoadingMore = false;
+  }
+
+  /**
+   * A node id as an operator reads it: the roster name when the
+   * roster is loaded, the id otherwise, and "This node" for the empty
+   * local marker.
+   */
+  function fleetNodeName(nodeId: string): string {
+    if (nodeId === '') return 'This node';
+    return auditNodeNames[nodeId] ?? nodeId;
+  }
+
+  async function loadAuditNodes() {
+    if (!fleetView) return;
+    const res = await api.listClusterNodes();
+    if (!res.data) return;
+    auditNodeNames = Object.fromEntries(
+      res.data.map((n) => [n.node.node_id, n.node.name]),
+    );
+    auditNodeIds = ['', ...res.data.map((n) => n.node.node_id)];
   }
 
   async function verifyAuditChain() {
@@ -430,7 +455,7 @@
         <span class="tab-badge-on">{bans.length}</span>
       {/if}
     </button>
-    <button class="tab" class:active={activeTab === 'audit'} onclick={() => { stopBansRefresh(); activeTab = 'audit'; loadAudit(); }}>Audit log</button>
+    <button class="tab" class:active={activeTab === 'audit'} onclick={() => { stopBansRefresh(); activeTab = 'audit'; loadAudit(); void loadAuditNodes(); }}>Audit log</button>
   </div>
 
   {#if activeTab === 'events'}
@@ -822,6 +847,15 @@
       <p class="text-muted">
         Tamper-evident record of every operator mutation. Hash-chained, newest first.
       </p>
+      {#if fleetView}
+        <p class="text-muted">
+          This node also holds the rows other nodes fanned in. Each chain is
+          verified separately. The hash is unkeyed, so this proves what a node
+          sent is internally consistent and nothing about authenticity: the
+          authoritative copy is each node's own, anchored by the audit stream
+          it ships to a write-once sink.
+        </p>
+      {/if}
 
       <div class="audit-filters">
         <input
@@ -852,6 +886,27 @@
           <option value={500}>500</option>
           <option value={1000}>1000</option>
         </select>
+        {#if fleetView}
+          <select
+            class="audit-select"
+            aria-label="Filter audit by node"
+            value={auditNode ?? ''}
+            onchange={(e) => {
+              const picked = (e.currentTarget as HTMLSelectElement).value;
+              // `''` is a real filter (this node's own rows) and the
+              // sentinel below is "no filter", so they cannot share a
+              // value.
+              auditNode = picked === '__all__' ? undefined : picked;
+              void loadAudit();
+            }}
+          >
+            <option value="__all__">All nodes</option>
+            <option value="">This node</option>
+            {#each auditNodeIds.filter((n) => n !== '') as id (id)}
+              <option value={id}>{fleetNodeName(id)}</option>
+            {/each}
+          </select>
+        {/if}
         <button class="btn btn-secondary" onclick={loadAudit}>Apply</button>
         <!--
           The audit log is node-local and `follower_local_request`
@@ -867,15 +922,23 @@
       </div>
 
       {#if auditVerifyResult}
-        {#if auditVerifyResult.verified}
-          <div class="audit-verify audit-verify-ok" role="status">
-            Chain verified - {auditVerifyResult.total_rows} rows
-          </div>
-        {:else}
-          <div class="audit-verify audit-verify-broken" role="alert">
-            Chain BROKEN at row {auditVerifyResult.first_break_id}: {auditVerifyResult.first_break_reason}
-          </div>
-        {/if}
+        <!--
+          One verdict per chain, never one for the table: an aggregated
+          table interleaves N chains, so a single walk would chain one
+          node's row to another's and break at the first interleave.
+        -->
+        {#each auditVerifyResult.nodes as chain (chain.node_id)}
+          {#if chain.verified}
+            <div class="audit-verify audit-verify-ok" role="status">
+              {fleetNodeName(chain.node_id)}: chain verified, {chain.total_rows} rows
+            </div>
+          {:else}
+            <div class="audit-verify audit-verify-broken" role="alert">
+              {fleetNodeName(chain.node_id)}: chain BROKEN at row
+              {chain.first_break_id}: {chain.first_break_reason}
+            </div>
+          {/if}
+        {/each}
       {/if}
 
       {#if auditLoading}
@@ -889,6 +952,9 @@
           <table>
             <thead>
               <tr>
+                {#if fleetView}
+                  <th>Node</th>
+                {/if}
                 <th>Timestamp</th>
                 <th>Operator</th>
                 <th>Action</th>
@@ -900,6 +966,9 @@
             <tbody>
               {#each auditEntries as record (record.id)}
                 <tr>
+                  {#if fleetView}
+                    <td class="mono">{fleetNodeName(record.node_id)}</td>
+                  {/if}
                   <td class="mono">{formatTime(record.timestamp)}</td>
                   <td>
                     {record.operator_username}

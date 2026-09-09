@@ -746,6 +746,17 @@ export interface AuditRecord {
   user_agent: string;
   prev_chain_hash: string;
   chain_hash: string;
+  /**
+   * The node this row was recorded on (Story 9.9 AC #2). Empty means
+   * this node, on every install.
+   */
+  node_id: string;
+  /**
+   * The row id the origin node assigned. Zero on a local row, where
+   * `id` already is that id; on a fanned-in row it is what matches
+   * this row against the origin's own copy.
+   */
+  origin_id: number;
 }
 
 export interface AuditQuery {
@@ -755,6 +766,12 @@ export interface AuditQuery {
   to?: string;
   limit?: number;
   before_id?: number;
+  /**
+   * Restrict to one node's rows (Story 9.9 AC #5). The empty string
+   * is a real filter selecting this node's own rows, so this is
+   * compared against undefined rather than for truthiness.
+   */
+  node?: string;
 }
 
 /// Result of the SuperAdmin-only chain integrity check. When
@@ -765,6 +782,25 @@ export interface AuditVerifyResult {
   total_rows: number;
   first_break_id?: number;
   first_break_reason?: string;
+}
+
+/** One chain's verdict (Story 9.9 AC #3). */
+export interface NodeVerifyResult extends AuditVerifyResult {
+  /** The chain's node; the empty string is this node's own. */
+  node_id: string;
+}
+
+/**
+ * `GET /api/v1/audit/verify`, which reports per chain.
+ *
+ * An aggregated table holds one chain per node, so a single verdict
+ * over the whole table would be meaningless: it would chain one node's
+ * row to another's and break at the first interleave. `verified` is
+ * the conjunction.
+ */
+export interface AuditVerifyReport {
+  verified: boolean;
+  nodes: NodeVerifyResult[];
 }
 
 export interface DiskUsage {
@@ -1414,12 +1450,20 @@ export const api = {
     if (params.to) query.set('to', params.to);
     if (params.limit !== undefined) query.set('limit', String(params.limit));
     if (params.before_id !== undefined) query.set('before_id', String(params.before_id));
+    // Compared against undefined, not for truthiness: the empty string
+    // is a real filter that selects this node's own rows, and dropping
+    // it would silently widen the query to the whole fleet.
+    if (params.node !== undefined) query.set('node', params.node);
     const qs = query.toString();
     return request<{ entries: AuditRecord[]; total: number }>('GET', `/audit${qs ? `?${qs}` : ''}`);
   },
 
-  verifyAudit: () =>
-    request<AuditVerifyResult>('GET', '/audit/verify'),
+  /** Verify the audit chains; one verdict per node (Story 9.9 AC #3). */
+  verifyAudit: (node?: string) =>
+    request<AuditVerifyReport>(
+      'GET',
+      `/audit/verify${node !== undefined ? `?node=${encodeURIComponent(node)}` : ''}`,
+    ),
 
   getSystem: () =>
     request<SystemResponse>('GET', '/system'),

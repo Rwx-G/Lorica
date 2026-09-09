@@ -176,6 +176,11 @@ pub(crate) struct FollowerOptions {
     /// reports on (Story 9.7 AC #3). Not the root filesystem: what
     /// fills up on a proxy is where its logs and databases live.
     pub data_dir: std::path::PathBuf,
+    /// The audit log this node records its own applies in
+    /// (Story 9.9 AC #4). `None` on a node whose process does not
+    /// serve the management API, where `record_with_store` is a no-op
+    /// and the apply goes unrecorded rather than failing.
+    pub log_store: Option<Arc<lorica_api::log_store::LogStore>>,
 }
 
 /// Live handles for a running follower.
@@ -292,6 +297,8 @@ struct ReplicaHandler {
     /// refusing thousands of distinct generations has a louder problem
     /// than this map.
     alerted: StdMutex<HashSet<(u64, String)>>,
+    /// Where this node's own audit entries go (Story 9.9 AC #4).
+    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
     /// The last reading a background task published (Story 9.7 AC #3).
     ///
     /// Published rather than sampled on demand, because `resources()`
@@ -309,6 +316,36 @@ struct ReplicaHandler {
 }
 
 impl ReplicaHandler {
+    /// Record one cluster event in this node's own audit log
+    /// (Story 9.9 AC #4).
+    ///
+    /// The actor is the control plane, not an operator: there is no
+    /// management session behind a replication apply. The identity
+    /// mirrors the one the control plane uses for events that arrive
+    /// on the cluster plane, so the two sides of the same operation
+    /// read alike when an operator compares them.
+    ///
+    /// These rows are this node's own, so they fan back UP to the
+    /// control plane on the next drain, which is what links the
+    /// operator's single record of a fleet-wide mutation to the
+    /// per-node outcome (AC #6).
+    async fn audit(&self, action: &str, after: serde_json::Value) {
+        lorica_api::audit::record_with_store(
+            self.log_store.clone(),
+            &lorica_api::audit::AuditContext {
+                username: "cluster".to_string(),
+                role: "node".to_string(),
+                ip: String::new(),
+                user_agent: String::new(),
+            },
+            action,
+            ("cluster_node", &self.node_id),
+            None,
+            Some(&after),
+        )
+        .await;
+    }
+
     /// Publish a fresh resource reading for the next heartbeat.
     fn publish_reading(&self, reading: lorica_cluster::NodeResources) {
         *self.reading.lock().unwrap_or_else(|p| p.into_inner()) = Some(reading);
@@ -822,8 +859,36 @@ impl FollowerHandler for ReplicaHandler {
     fn on_commit(&self, generation: u64) -> BoxFuture<'_, Result<AppliedConfig, String>> {
         Box::pin(async move {
             let applied = self.apply_staged(generation).await;
-            if let Err(reason) = &applied {
-                self.refused(generation, reason, "apply");
+            // Audited on BOTH outcomes (Story 9.9 AC #4). A refusal is
+            // the more interesting of the two: it is the case where
+            // this node is knowingly serving something other than what
+            // the fleet was told to serve, and an audit trail that
+            // records only successful applies would show a converged
+            // fleet on a node that never converged.
+            match &applied {
+                Ok(state) => {
+                    self.audit(
+                        "cluster.config.apply",
+                        serde_json::json!({
+                            "generation": state.generation,
+                            "hash": state.hash,
+                            "outcome": "applied",
+                        }),
+                    )
+                    .await;
+                }
+                Err(reason) => {
+                    self.refused(generation, reason, "apply");
+                    self.audit(
+                        "cluster.config.apply",
+                        serde_json::json!({
+                            "generation": generation,
+                            "outcome": "refused",
+                            "reason": lorica_cluster::safe_reason(reason),
+                        }),
+                    )
+                    .await;
+                }
             }
             applied
         })
@@ -1032,6 +1097,7 @@ pub(crate) async fn spawn_follower(
         alerted: StdMutex::new(HashSet::new()),
         connection: std::sync::OnceLock::new(),
         reading: StdMutex::new(None),
+        log_store: opts.log_store,
     });
 
     let mut config = DialerConfig::new(
