@@ -374,7 +374,11 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
     # not merely that a process is up.
     echo "Waiting for the fleet to form..."
     for i in $(seq 1 90); do
-        if docker compose --profile cluster exec -T lorica-cp test -f /shared/edge-b_ready >/dev/null 2>&1; then
+        # `sh -c` on purpose: a bare `/shared/...` argument is rewritten
+        # into a Windows path by Git Bash before docker sees it (MSYS
+        # path conversion), so the probe never succeeded on a Windows
+        # host and this phase always waited out its full budget.
+        if docker compose --profile cluster exec -T lorica-cp sh -c 'test -f /shared/edge-b_ready' >/dev/null 2>&1; then
             echo "Fleet is ready."
             break
         fi
