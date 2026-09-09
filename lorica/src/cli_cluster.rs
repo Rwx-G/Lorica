@@ -190,7 +190,7 @@ pub(crate) fn run_cluster_join(
         std::slice::from_ref(&node_name),
     ) {
         fail(format!(
-            "node name {node_name:?} is not usable in a route selector: {reason}.              Pass --name with a name over lowercase letters, digits, '-' and '_'."
+            "node name {node_name:?} is not usable in a route selector: {reason}. Pass --name with a name over lowercase letters, digits, '-' and '_'."
         ));
     }
     if node_name.is_empty() || !display_field_is_valid(&node_name) {

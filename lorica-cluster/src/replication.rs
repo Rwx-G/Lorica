@@ -457,7 +457,7 @@ impl Replicator {
                         tracing::warn!(
                             node_id = %node_id,
                             threshold = self.quarantine_threshold,
-                            "node quarantined from configuration replication after consecutive                              semantic rejections; it no longer aborts the fleet's rounds and                              converges by pull once it can take a generation"
+                            "node quarantined from configuration replication after consecutive semantic rejections; it no longer aborts the fleet's rounds and converges by pull once it can take a generation"
                         );
                     }
                     report.rejected.push((node_id, reason));
@@ -560,17 +560,45 @@ impl Replicator {
         tracing::warn!(
             node_id = %node_id,
             cap_s = MAX_HONOURED_BREAK_GLASS.as_secs(),
-            "node has claimed a break-glass window for longer than one can legitimately last;              it is being addressed by replication again"
+            "node has claimed a break-glass window for longer than one can legitimately last; it is being addressed by replication again"
         );
         false
     }
 
     /// Forget a node's break-glass claim once it stops making it.
+    ///
+    /// This is also where the honour clock resets, which is worth a
+    /// line: a node that stops claiming for one round and claims again
+    /// starts a fresh `MAX_HONOURED_BREAK_GLASS`, so the cap bounds one
+    /// continuous claim, not a node's lifetime out of replication. The
+    /// round it did not claim in made it a target, and a refusal there
+    /// counts toward quarantine, so the escape is not free; it is
+    /// logged so an operator reading the drift alert can tell a
+    /// legitimate close from a node cycling its claim (Epic 9 close,
+    /// security audit).
     fn clear_break_glass_claim(&self, node_id: &str) {
-        self.break_glass_since
+        let removed = self
+            .break_glass_since
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(node_id);
+        if let Some(since) = removed {
+            let claimed_s = since.elapsed().as_secs();
+            if since.elapsed() > MAX_HONOURED_BREAK_GLASS / 2 {
+                tracing::warn!(
+                    node_id = %node_id,
+                    claimed_s,
+                    "node stopped claiming break-glass after most of the honoured window; \
+                     its next claim starts a fresh window"
+                );
+            } else {
+                tracing::info!(
+                    node_id = %node_id,
+                    claimed_s,
+                    "node stopped claiming break-glass; it is addressed by replication again"
+                );
+            }
+        }
     }
 
     /// Count one SEMANTIC rejection and quarantine the node past the

@@ -614,7 +614,7 @@ pub(crate) fn validate_cluster_listen(
             // look like someone appended a port".
             if name.parse::<std::net::IpAddr>().is_err() && name.contains(':') {
                 return Err(format!(
-                    "--cluster-advertise `{name}`: expected a host, without a port.                      This value becomes the control-plane certificate's SAN and is                      matched against the host a joining node dials"
+                    "--cluster-advertise `{name}`: expected a host, without a port. This value becomes the control-plane certificate's SAN and is matched against the host a joining node dials"
                 ));
             }
             name.to_string()

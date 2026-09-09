@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(
             report.blocking().len(),
             1,
-            "node-b is UP and refused, so it will answer the authority with a 404: this one              blocks the order"
+            "node-b is UP and refused, so it will answer the authority with a 404: this one blocks the order"
         );
         assert_eq!(good.publishes.load(Ordering::SeqCst), 1);
         assert_eq!(bad.publishes.load(Ordering::SeqCst), 1);
@@ -628,7 +628,7 @@ mod tests {
         assert!(!report.is_complete());
         assert!(
             report.blocking().is_empty(),
-            "an offline recipient must not stop an order: refusing here would stop renewing              every certificate on a fleet-wide route while one follower is down"
+            "an offline recipient must not stop an order: refusing here would stop renewing every certificate on a fleet-wide route while one follower is down"
         );
         assert_eq!(report.offline(), vec!["node-b"]);
         drop(connected);

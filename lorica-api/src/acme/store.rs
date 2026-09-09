@@ -173,7 +173,7 @@ impl AcmeChallengeStore {
                 // path. `ConfigStore::set_acme_challenge` is the same
                 // statement for the housekeeping side.
                 .execute(
-                    "INSERT OR REPLACE INTO acme_challenges                      (token, key_auth, expires_at) VALUES (?1, ?2, ?3)",
+                    "INSERT OR REPLACE INTO acme_challenges (token, key_auth, expires_at) VALUES (?1, ?2, ?3)",
                     rusqlite::params![token, key_authorization, expires_at.to_rfc3339()],
                 )
                 .map_err(|e| e.to_string())
@@ -233,7 +233,7 @@ impl AcmeChallengeStore {
             let guard = conn.lock();
             guard
                 .query_row(
-                    "SELECT key_auth FROM acme_challenges                      WHERE token = ?1 AND expires_at > ?2",
+                    "SELECT key_auth FROM acme_challenges WHERE token = ?1 AND expires_at > ?2",
                     rusqlite::params![token_owned, now.to_rfc3339()],
                     |row| row.get::<_, String>(0),
                 )
