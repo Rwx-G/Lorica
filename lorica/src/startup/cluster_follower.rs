@@ -81,6 +81,13 @@ const PULL_TIMEOUT: Duration = Duration::from_secs(30);
 /// short-circuits on an empty result without touching the session.
 const KEY_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often the follower samples its own CPU, memory and disk for the
+/// heartbeat's gauges (Story 9.7 AC #3).
+///
+/// The heartbeat interval, not something finer: a gauge refreshed
+/// faster than it is sent is work nobody sees.
+const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// How this process reaches its data-plane ban map (Story 9.6 AC #10).
 ///
 /// Two shapes because the two process modes genuinely differ, and both
@@ -285,19 +292,28 @@ struct ReplicaHandler {
     /// refusing thousands of distinct generations has a louder problem
     /// than this map.
     alerted: StdMutex<HashSet<(u64, String)>>,
-    /// The sampler behind the heartbeat's gauges (Story 9.7 AC #3).
+    /// The last reading a background task published (Story 9.7 AC #3).
     ///
-    /// Owned here rather than shared with the management API's cache:
-    /// that one is refreshed by operator requests, which on a follower
-    /// may never come, and a gauge nobody refreshes is worse than no
-    /// gauge. Refreshing it costs a few milliseconds once per
-    /// heartbeat interval.
-    sampler: StdMutex<lorica_api::system::SystemCache>,
-    /// The filesystem the disk gauge reports on.
-    data_dir: std::path::PathBuf,
+    /// Published rather than sampled on demand, because `resources()`
+    /// is called from the heartbeat's async task and sampling is
+    /// blocking work: `sysinfo` reads `/proc` and the disk figure is a
+    /// `statvfs(2)` on the data directory. On a stalled mount that
+    /// syscall blocks the runtime thread with no await point, which
+    /// can push the heartbeat past its own request timeout and make
+    /// the control plane drop a session over a slow disk. Reading a
+    /// published value is a lock and a copy.
+    ///
+    /// `None` until the first sample lands, which the wire and the
+    /// dashboard both render as unknown rather than as an idle node.
+    reading: StdMutex<Option<lorica_cluster::NodeResources>>,
 }
 
 impl ReplicaHandler {
+    /// Publish a fresh resource reading for the next heartbeat.
+    fn publish_reading(&self, reading: lorica_cluster::NodeResources) {
+        *self.reading.lock().unwrap_or_else(|p| p.into_inner()) = Some(reading);
+    }
+
     /// Whether an operator's break-glass window is open right now.
     fn break_glass_active(&self) -> bool {
         (*self.break_glass.borrow()).is_some_and(|until| until > Utc::now())
@@ -781,23 +797,10 @@ impl FollowerHandler for ReplicaHandler {
     }
 
     fn resources(&self) -> Option<lorica_cluster::NodeResources> {
-        let mut sampler = self.sampler.lock().unwrap_or_else(|p| p.into_inner());
-        sampler.refresh();
-        // `disk_usage_statvfs` returns `None` on a path it cannot
-        // stat, which is a reason to report zero for the disk pair
-        // rather than to withhold the CPU and memory readings that
-        // did work: the dashboard renders a zero total as unknown.
-        let disk = lorica_api::system::disk_usage_statvfs(&self.data_dir, "data");
-        Some(lorica_cluster::NodeResources {
-            // Rounded to whole percent on the sender, so the wire
-            // carries the same figure the gauge shows and nothing
-            // downstream has to decide how to round it.
-            cpu_percent: sampler.cpu_usage_percent().round().clamp(0.0, 100.0) as u32,
-            memory_used_bytes: sampler.memory_used_bytes(),
-            memory_total_bytes: sampler.memory_total_bytes(),
-            disk_used_bytes: disk.as_ref().map(|d| d.used_bytes).unwrap_or(0),
-            disk_total_bytes: disk.as_ref().map(|d| d.total_bytes).unwrap_or(0),
-        })
+        self.reading
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn on_prepare(&self, payload: ConfigPayload) -> BoxFuture<'_, Result<(), String>> {
@@ -1008,6 +1011,7 @@ pub(crate) async fn spawn_follower(
         );
     }
 
+    let opts_data_dir = opts.data_dir.clone();
     let (break_glass_tx, break_glass_rx) = watch::channel(break_glass_until);
     let applied = Arc::new(StdMutex::new(AppliedConfig {
         generation: applied_config.0,
@@ -1027,8 +1031,7 @@ pub(crate) async fn spawn_follower(
         bans: opts.bans,
         alerted: StdMutex::new(HashSet::new()),
         connection: std::sync::OnceLock::new(),
-        sampler: StdMutex::new(lorica_api::system::SystemCache::new()),
-        data_dir: opts.data_dir,
+        reading: StdMutex::new(None),
     });
 
     let mut config = DialerConfig::new(
@@ -1061,6 +1064,60 @@ pub(crate) async fn spawn_follower(
         break_glass: break_glass_tx,
     });
     let dialer = Arc::new(std::sync::Mutex::new(Some(dialer)));
+
+    // Resource sampler (AC #3). Off the heartbeat's task on purpose:
+    // `sysinfo` reads `/proc` and the disk figure is a `statvfs(2)`,
+    // and a stalled mount would block the runtime thread with no await
+    // point, which can push a heartbeat past its own timeout and cost
+    // the node its session. Here the sampling happens on a blocking
+    // thread and the heartbeat only ever reads what was published.
+    //
+    // The cadence matches the heartbeat's rather than being finer: a
+    // gauge refreshed faster than it is sent is work nobody sees.
+    let sampler_replica = Arc::clone(&replica);
+    let sampler_data_dir = opts_data_dir;
+    let sampler_task = tokio::spawn(async move {
+        let mut sampler = lorica_api::system::SystemCache::new();
+        let mut ticker = tokio::time::interval(RESOURCE_SAMPLE_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let dir = sampler_data_dir.clone();
+            let sampled = tokio::task::spawn_blocking(move || {
+                sampler.refresh();
+                // `disk_usage_statvfs` returns `None` on a path it
+                // cannot stat, which is a reason to report zero for the
+                // disk pair rather than to withhold the CPU and memory
+                // readings that did work: a zero total renders as
+                // unknown, a missing message would blank all three.
+                let disk = lorica_api::system::disk_usage_statvfs(&dir, "data");
+                let reading = lorica_cluster::NodeResources {
+                    // Rounded to whole percent on the sender, so the
+                    // wire carries the figure the gauge shows and
+                    // nothing downstream decides how to round it.
+                    cpu_percent: sampler.cpu_usage_percent().round().clamp(0.0, 100.0) as u32,
+                    memory_used_bytes: sampler.memory_used_bytes(),
+                    memory_total_bytes: sampler.memory_total_bytes(),
+                    disk_used_bytes: disk.as_ref().map(|d| d.used_bytes).unwrap_or(0),
+                    disk_total_bytes: disk.as_ref().map(|d| d.total_bytes).unwrap_or(0),
+                };
+                (sampler, reading)
+            })
+            .await;
+            match sampled {
+                Ok((returned, reading)) => {
+                    sampler = returned;
+                    sampler_replica.publish_reading(reading);
+                }
+                // The blocking pool refused or the task panicked. Keep
+                // the previous reading rather than blanking the gauge:
+                // a node that stopped sampling has not become idle.
+                Err(e) => {
+                    warn!(error = %e, "follower: resource sampling failed");
+                    return;
+                }
+            }
+        }
+    });
 
     // Leave watcher: the API wiped the identity; stop dialing so the
     // control plane sees the node go and no reconnect presents a
@@ -1170,7 +1227,7 @@ pub(crate) async fn spawn_follower(
     Ok(Some(FollowerPlane {
         runtime,
         dialer,
-        tasks: vec![leave_task, renewal_task, key_reconciler],
+        tasks: vec![sampler_task, leave_task, renewal_task, key_reconciler],
         extra: StdMutex::new(Vec::new()),
     }))
 }
