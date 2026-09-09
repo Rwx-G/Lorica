@@ -40,7 +40,13 @@ export function sanitizeFilenameFromHeader(
   return cleaned.length > 0 ? cleaned : fallback;
 }
 
-import type { ClusterNodeResponse, ClusterStatus } from './cluster';
+import type {
+  ClusterNodeResponse,
+  ClusterStatus,
+  FleetAccessRow,
+  FleetBanRow,
+  FleetWafRow,
+} from './cluster';
 
 export interface ApiError {
   code: string;
@@ -57,6 +63,38 @@ export interface MintTokenRequest {
    */
   node_name: string;
   source_cidr?: string;
+}
+
+/** Filters accepted by the two fleet fan-in endpoints. */
+export interface FleetQueryParams {
+  node?: string;
+  route?: string;
+  from?: string;
+  to?: string;
+  before_id?: number;
+  limit?: number;
+}
+
+/**
+ * One page of fan-in rows. `next_cursor` is `null` on the last page,
+ * and there is deliberately no total (Story 9.6 AC #9).
+ */
+export interface FleetPage<T> {
+  rows: T[];
+  next_cursor: number | null;
+}
+
+/** Build the query string, omitting every unset filter. */
+function fleetQuery(params: FleetQueryParams): string {
+  const q = new URLSearchParams();
+  if (params.node) q.set('node', params.node);
+  if (params.route) q.set('route', params.route);
+  if (params.from) q.set('from', params.from);
+  if (params.to) q.set('to', params.to);
+  if (params.before_id !== undefined) q.set('before_id', String(params.before_id));
+  if (params.limit !== undefined) q.set('limit', String(params.limit));
+  const s = q.toString();
+  return s ? `?${s}` : '';
 }
 
 /** The token, shown once and never recoverable. */
@@ -1179,6 +1217,27 @@ export const api = {
 
   mintClusterToken: (body: MintTokenRequest) =>
     request<MintedTokenResponse>('POST', '/cluster/tokens', body),
+
+  /**
+   * The fleet's access logs (Story 9.6 AC #9).
+   *
+   * Cursor-paginated with no total: on an aggregated table a
+   * `COUNT(*)` per page is a full scan under the store lock, which
+   * would stall the control plane's telemetry ingest.
+   */
+  getFleetLogs: (params: FleetQueryParams) =>
+    request<FleetPage<FleetAccessRow>>('GET', `/cluster/logs${fleetQuery(params)}`),
+
+  /** The fleet's WAF events (Story 9.6 AC #9). */
+  getFleetWafEvents: (params: FleetQueryParams) =>
+    request<FleetPage<FleetWafRow>>('GET', `/cluster/waf-events${fleetQuery(params)}`),
+
+  /** Every node's live bans, as last reported (Story 9.6 AC #10). */
+  getFleetBans: (node?: string) =>
+    request<FleetBanRow[]>(
+      'GET',
+      `/cluster/bans${node ? `?node=${encodeURIComponent(node)}` : ''}`,
+    ),
 
   listRoutes: () =>
     request<{ routes: RouteResponse[] }>('GET', '/routes'),
