@@ -2,7 +2,9 @@
 
 **Author:** Romain G.
 **Target version:** 1.7.0
-**Status:** Draft (revised 2026-08-23 after a five-pass verification of every "reuses the existing X" claim in the first draft)
+**Status:** Shipped in v1.7.0 (2026-09-09). Drafted 2026-08-22, revised 2026-08-23 after a five-pass verification of every "reuses the existing X" claim; all nine stories Done, QA record in `docs/qa/epic-9-report.md`, release notes in the `[1.7.0]` section of `CHANGELOG.md`.
+
+> **Departures from this text, decided at the close and recorded in the QA report and the stories:** Story 9.7 AC #5 (SLA on the fleet dashboard) is served one node at a time through the control plane (`?node=<node_id>` on the four SLA reads) rather than as a fleet aggregate, because a fleet percentile is not a function of per-node percentiles. Fleet reads sit at the Operator role, the aggregated audit trail at SuperAdmin, and the log-sink topology is hidden from Viewer (backlog #54, #69, #73). Fanned-in audit rows are retained by their arrival time on the control plane, and each node's chain verifies on its own. The `cluster` e2e profile runs one follower in workers mode instead of a separate workers run. Of the deferred list below, control-plane high availability is not scheduled for v1.8.0 (Epic 10 is conditional request capture and the CI automation API); signed audit checkpoints and cluster CA key protection are tracked as backlog #84 and #85.
 
 **Epic Goal:** Turn Lorica from a standalone edge into a fleet that is operated as one system. A designated control-plane node owns configuration, certificate issuance and the aggregated view; follower nodes dial out to it, replicate configuration locally, and fan their WAF events, health, bans and audit entries back in. Ships alongside two standalone observability sinks (syslog, OTLP logs) that are useful with or without a cluster. Answers [issue #26](https://github.com/Rwx-G/Lorica/issues/26).
 
