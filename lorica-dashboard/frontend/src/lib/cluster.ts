@@ -59,6 +59,70 @@ export interface ClusterNodeResponse {
 }
 
 /**
+ * One fanned-in access row, as `GET /api/v1/cluster/logs` returns it
+ * (`FleetAccessRow` in `lorica-api/src/cluster_telemetry_store.rs`).
+ *
+ * Narrower than the single-node `LogEntry`: the fan-in schema carries
+ * only the columns the fleet table shows, so `is_xff`, `xff_proxy_ip`
+ * and `source` are absent rather than empty.
+ */
+export interface FleetAccessRow {
+  /** Cursor for pagination: the control plane's own row id. */
+  id: number;
+  /** The node that produced the row. */
+  node_id: string;
+  timestamp: string;
+  method: string;
+  path: string;
+  host: string;
+  status: number;
+  latency_ms: number;
+  backend: string;
+  /** Empty when the request did not fail, never null. */
+  error: string;
+  client_ip: string;
+  request_id: string;
+}
+
+/**
+ * One fanned-in WAF event, as `GET /api/v1/cluster/waf-events` returns
+ * it (`FleetWafRow` in `lorica-api/src/cluster_telemetry_store.rs`).
+ */
+export interface FleetWafRow {
+  id: number;
+  node_id: string;
+  rule_id: number;
+  description: string;
+  category: string;
+  severity: number;
+  matched_field: string;
+  /** Already truncated by the origin node. */
+  matched_value: string;
+  timestamp: string;
+  client_ip: string;
+  route_hostname: string;
+  action: string;
+}
+
+/**
+ * One node's view of one banned client, as
+ * `GET /api/v1/cluster/bans` returns it.
+ *
+ * A snapshot, not a history: bans are in-memory state on each node,
+ * so this is lossy across a node restart by construction (9.6 D3).
+ * There is no row id, so this endpoint is not paginated.
+ */
+export interface FleetBanRow {
+  node_id: string;
+  client_ip: string;
+  /** Seconds left when the origin node took the snapshot. */
+  remaining_s: number;
+  reason: string;
+  /** When the control plane recorded the snapshot, RFC 3339. */
+  observed_at: string;
+}
+
+/**
  * The live cluster view, refreshed by the Cluster page and the header
  * badge. `null` until the first successful read, which is NOT the same
  * as standalone: a failed read must not make a follower look like a

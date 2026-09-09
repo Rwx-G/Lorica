@@ -329,10 +329,16 @@
           </button>
         </div>
       {:else}
-        <h2>Token for {minted.bound_node_name}</h2>
+        <!--
+          Bound once here rather than read through `minted` at each use:
+          the copy handler is a closure, and TypeScript cannot carry the
+          `{#if !minted}` narrowing into a callback that runs later.
+        -->
+        {@const token = minted}
+        <h2>Token for {token.bound_node_name}</h2>
         <p class="warn-text">
           This is shown once and is not recoverable. It expires in
-          {secondsUntil(minted.expires_at)} seconds.
+          {secondsUntil(token.expires_at)} seconds.
         </p>
 
         <label for="join-cmd">1. Run this on the new node</label>
@@ -348,8 +354,8 @@
 
         <label for="join-token">2. Paste the token into its stdin</label>
         <div class="copy-row">
-          <code id="join-token" class="mono block secret">{minted.token}</code>
-          <button class="btn-secondary" onclick={() => void copy(minted.token, 'Token')}>
+          <code id="join-token" class="mono block secret">{token.token}</code>
+          <button class="btn-secondary" onclick={() => void copy(token.token, 'Token')}>
             Copy
           </button>
         </div>

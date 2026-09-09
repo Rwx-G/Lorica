@@ -115,7 +115,38 @@ the activation gate becomes a support ticket.
 
 ### Debug Log
 
-(empty)
+**The typecheck gate was vacuous, and it let two broken files through.**
+
+The gate this story had been running was `npx tsc --noEmit` at
+`lorica-dashboard/frontend/`, which is what
+`.claude/rules/lorica-frontend.md` documented. The root `tsconfig.json`
+is `{"files": [], "references": [...]}`, so that invocation type-checks
+zero files and exits 0. It is a gate that passes on any input. Bare
+`npx svelte-check` has the same defect for `.ts` files: without
+`--tsconfig ./tsconfig.app.json` it loads the root project and reports
+only on `.svelte` files.
+
+Two commits had already landed on green from it:
+
+- `c516745d` shipped `api.ts` importing `FleetAccessRow`, `FleetWafRow`
+  and `FleetBanRow` from `./cluster`. None of the three had been
+  written. `tsc -p tsconfig.app.json --noEmit` reports three TS2305.
+- `c516745d` also shipped `Cluster.svelte:352`, where `minted.token` is
+  read inside a copy handler. The `{#if !minted}` narrowing does not
+  reach into a closure, so it is `'minted' is possibly null`.
+
+CI would have caught both: `.github/workflows/ci.yml:34` runs
+`npm run check`, which is `svelte-check --tsconfig ./tsconfig.app.json
+&& tsc -p tsconfig.node.json`. The hole was in the local recipe and in
+the rule file that described it, not in the pipeline. Both are
+corrected, and the rule now says why bare `tsc --noEmit` must never be
+used here.
+
+Worth stating plainly because it is the same failure this epic's audits
+keep finding: a check that reports success without having verified
+anything is worse than no check, because it is quoted as evidence.
+Every "gates green" line recorded in this story before 2026-09-09
+covered less than it claimed.
 
 ### Completion Notes
 
