@@ -107,9 +107,7 @@ impl WafEngine {
         while i < bytes.len() {
             let b = bytes[i];
             if b == b'%' && i + 2 < bytes.len() {
-                if let (Some(d1), Some(d2)) =
-                    (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
-                {
+                if let (Some(d1), Some(d2)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
                     out.push((d1 << 4) | d2);
                     i += 3;
                     continue;
@@ -131,7 +129,8 @@ impl WafEngine {
         // (the common case): `from_utf8` reuses the buffer in place.
         // Only the invalid path (overlong forms, stray bytes) reallocates
         // through the lossy replacement, preserving the U+FFFD policy.
-        String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+        String::from_utf8(out)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
     }
 }
 

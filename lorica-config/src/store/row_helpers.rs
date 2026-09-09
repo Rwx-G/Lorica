@@ -222,10 +222,7 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             row.get::<_, Option<String>>(60).unwrap_or(None),
             "response_rewrite",
         )?,
-        mtls: parse_optional_json_field(
-            row.get::<_, Option<String>>(61).unwrap_or(None),
-            "mtls",
-        )?,
+        mtls: parse_optional_json_field(row.get::<_, Option<String>>(61).unwrap_or(None), "mtls")?,
         rate_limit: parse_optional_json_field(
             row.get::<_, Option<String>>(62).unwrap_or(None),
             "rate_limit",
@@ -274,6 +271,16 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             // (default, passthrough to backend), 1 = true (Lorica
             // intercepts and serves a registry-driven body).
             row.get::<_, i32>(68).unwrap_or(0) != 0
+        },
+        node_selector: {
+            // Column index 69 (Story 9.4 migration V52). JSON array of
+            // node names, `[]` = fleet-wide. Same tolerance as
+            // `group_name`: a pre-V52 row on a bisect build reads as
+            // fleet-wide, which is the pre-9.4 behaviour.
+            let json: String = row
+                .get::<_, String>(69)
+                .unwrap_or_else(|_| "[]".to_string());
+            serde_json::from_str(&json).unwrap_or_default()
         },
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,

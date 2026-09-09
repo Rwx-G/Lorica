@@ -1,0 +1,489 @@
+// Copyright 2026 Rwx-G (Lorica)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The token-gated enrollment listener (Story 9.2 AC #2/#3, Story 9.3
+//! AC #1/#4): the only unauthenticated surface in the product.
+//!
+//! The socket exists only while a join token is live. Every accepted
+//! connection takes a handshake permit and a per-source slot before a
+//! task exists for it, completes TLS under the handshake budget, must
+//! negotiate the cluster ALPN, is re-checked against token liveness,
+//! and then enters the (smaller) enrollment-exchange pool, at which
+//! point the handshake permit is released (see the permit rule in
+//! [`crate::preauth`]). The exchange is one bounded frame in, one
+//! frame out: the frame is handed to the [`EnrollmentHandler`] (the
+//! binary's redemption over the store and the CA), and whatever the
+//! outcome, a refusal goes out as the OPAQUE status with the reason in
+//! the local journal only.
+
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use prost::Message;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_rustls::TlsAcceptor;
+
+use crate::enroll::{decode_enroll_frame, EnrollRequest, EnrollmentHandler};
+use crate::handshake::display_field_is_valid;
+use crate::listener::TokenLiveness;
+use crate::messages::{
+    cluster_frame, cluster_response, ClusterFrame, ClusterResponse, ClusterStatus, EnrollAck,
+};
+use crate::preauth::{accept_error_pause, AttemptWindow, PreAuthBudgets, SourceGate, SourceSlot};
+use crate::tls::{negotiated_cluster_alpn, SwappableAcceptor};
+use crate::token::{public_id_is_valid, SECRET_LEN};
+
+/// Largest DER SubjectPublicKeyInfo accepted from a joiner (an RSA-4096
+/// SPKI is under 600 bytes).
+const MAX_PUBLIC_KEY_DER: usize = 4096;
+
+/// Enrollment-listener counters, one atomic per budget plus lifecycle
+/// events, all monotonic; the binary exposes them as Prometheus
+/// counters (AC #3: "exceeding any drops the connection and
+/// increments a counter").
+#[derive(Debug, Default)]
+pub struct EnrollmentStats {
+    /// Connections accepted (before any budget ran).
+    pub connections_total: AtomicU64,
+    /// `accept()` calls that failed (descriptor exhaustion and the
+    /// like); each one pauses the loop instead of spinning it.
+    pub accept_errors: AtomicU64,
+    /// Dropped: the TLS handshake was rejected (bad ClientHello, no
+    /// overlap, garbage).
+    pub rejected_handshake_failed: AtomicU64,
+    /// Dropped: the TLS handshake exceeded `handshake_timeout`.
+    pub rejected_handshake_timeout: AtomicU64,
+    /// Dropped: the peer completed TLS without the cluster ALPN.
+    pub rejected_alpn: AtomicU64,
+    /// Dropped: `max_concurrent_handshakes` already in flight.
+    pub rejected_concurrent_handshakes: AtomicU64,
+    /// Dropped: the peer's source already holds `max_per_source`
+    /// pre-authentication connections.
+    pub rejected_per_source: AtomicU64,
+    /// Dropped: the peer's source exceeded `max_attempts_per_window`
+    /// in the sliding window (Story 9.3 AC #11).
+    pub rejected_attempt_window: AtomicU64,
+    /// Dropped: `max_inflight_enrollments` already in flight.
+    pub rejected_inflight_enrollments: AtomicU64,
+    /// Dropped: the peer announced or sent more than
+    /// `per_conn_max_bytes`.
+    pub rejected_byte_budget: AtomicU64,
+    /// Dropped: the connection outlived `per_conn_max_duration`.
+    pub rejected_time_budget: AtomicU64,
+    /// Dropped: the enrollment window closed (last token gone) between
+    /// the accept and the post-TLS liveness re-check.
+    pub rejected_window_closed: AtomicU64,
+    /// Redemptions the handler granted (a node was enrolled).
+    pub enrollments_granted: AtomicU64,
+    /// Redemptions refused (malformed frame, unknown or burned token,
+    /// wrong secret, binding mismatch, unacceptable key), each
+    /// answered with the opaque status.
+    pub enrollments_refused: AtomicU64,
+    /// Bind attempts that failed while a token was live (retried on a
+    /// bounded backoff).
+    pub bind_failures: AtomicU64,
+    /// Times the listener socket opened (liveness went above zero).
+    pub lifecycle_opens: AtomicU64,
+    /// Times the listener socket closed (liveness returned to zero).
+    pub lifecycle_closes: AtomicU64,
+}
+
+/// Handle to a running enrollment listener.
+pub struct EnrollmentHandle {
+    /// `Some(addr)` while the socket is bound and accepting, `None`
+    /// while the listener is closed (no live token). The binary logs
+    /// transitions; tests assert the lifecycle on it.
+    pub bound: watch::Receiver<Option<SocketAddr>>,
+    task: JoinHandle<()>,
+}
+
+impl EnrollmentHandle {
+    /// Stop the listener task. Any bound socket closes with it, and
+    /// so does every in-flight pre-authentication connection (they
+    /// live in a `JoinSet` owned by the task).
+    pub fn shutdown(self) {
+        self.task.abort();
+    }
+}
+
+/// First delay after a failed bind while a token is live; doubles up
+/// to [`BIND_RETRY_MAX`].
+const BIND_RETRY_MIN: Duration = Duration::from_secs(1);
+/// Cap on the bind-retry backoff.
+const BIND_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// How long the auto-close waits for in-flight connections after the
+/// last token died before aborting them. The connection that redeemed
+/// that last token is still writing its `EnrollAck` when the liveness
+/// count drops (the handler publishes the recount before it returns
+/// the grant), so an immediate abort would burn the token and deliver
+/// no certificate. Every other in-flight connection is refused at the
+/// post-TLS liveness re-check or by the store's conditional burn, so
+/// the grace admits nothing new.
+const CLOSE_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// State shared by every connection of one open phase.
+struct EnrollmentShared {
+    acceptor: Arc<SwappableAcceptor>,
+    budgets: PreAuthBudgets,
+    stats: Arc<EnrollmentStats>,
+    enrollments: Arc<Semaphore>,
+    handler: Arc<dyn EnrollmentHandler>,
+}
+
+/// The token-gated, budget-boxed enrollment listener (AC #2/#3).
+pub struct EnrollmentListener;
+
+impl EnrollmentListener {
+    /// Spawn the lifecycle task: bind `bind` while `liveness > 0`,
+    /// drop the socket when it returns to zero (in-flight connections
+    /// get a bounded drain so the redemption that burned the last
+    /// token still delivers its certificate), reopen on the next
+    /// rise. A failed bind while a
+    /// token is live is retried on a bounded backoff, not parked until
+    /// the next liveness edge. Returns when the liveness sender is
+    /// dropped. `handler` redeems the tokens.
+    pub fn spawn(
+        bind: SocketAddr,
+        acceptor: Arc<SwappableAcceptor>,
+        mut liveness: TokenLiveness,
+        budgets: PreAuthBudgets,
+        stats: Arc<EnrollmentStats>,
+        handler: Arc<dyn EnrollmentHandler>,
+    ) -> EnrollmentHandle {
+        let (bound_tx, bound_rx) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            loop {
+                // Closed phase: wait for at least one live token.
+                while *liveness.borrow() == 0 {
+                    if liveness.changed().await.is_err() {
+                        return; // sender gone: shut down for good
+                    }
+                }
+
+                // Bind, retrying on a bounded backoff while the token
+                // stays live (a single failure must not leave a live
+                // token with no listener until the count CHANGES).
+                let mut retry = BIND_RETRY_MIN;
+                let listener = loop {
+                    if *liveness.borrow() == 0 {
+                        break None;
+                    }
+                    match TcpListener::bind(bind).await {
+                        Ok(l) => break Some(l),
+                        Err(e) => {
+                            stats.bind_failures.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(
+                                %bind, error = %e, retry_in = ?retry,
+                                "enrollment listener bind failed while a join token is live"
+                            );
+                            tokio::select! {
+                                _ = tokio::time::sleep(retry) => {}
+                                changed = liveness.changed() => {
+                                    if changed.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            retry = (retry * 2).min(BIND_RETRY_MAX);
+                        }
+                    }
+                };
+                let Some(listener) = listener else {
+                    continue; // token gone while retrying: back to closed
+                };
+                let local = listener.local_addr().ok();
+                stats.lifecycle_opens.fetch_add(1, Ordering::Relaxed);
+                let _ = bound_tx.send(local);
+                tracing::warn!(
+                    addr = ?local,
+                    "enrollment listener OPEN (unauthenticated surface; closes with the last live token)"
+                );
+
+                let handshakes = Arc::new(Semaphore::new(budgets.max_concurrent_handshakes));
+                let sources = SourceGate::new(budgets.max_per_source);
+                let attempts = AttemptWindow::new(
+                    budgets.attempt_window,
+                    budgets.max_attempts_per_window,
+                    budgets.attempt_map_cap,
+                );
+                let shared = Arc::new(EnrollmentShared {
+                    acceptor: Arc::clone(&acceptor),
+                    budgets: budgets.clone(),
+                    stats: Arc::clone(&stats),
+                    enrollments: Arc::new(Semaphore::new(budgets.max_inflight_enrollments)),
+                    handler: Arc::clone(&handler),
+                });
+                // In-flight connections belong to the open phase:
+                // dropping the set (auto-close, or the whole task on
+                // shutdown) aborts them.
+                let mut conns: JoinSet<()> = JoinSet::new();
+                let mut accept_errors: u64 = 0;
+
+                // Open phase: accept until liveness returns to zero.
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (tcp, peer) = match accepted {
+                                Ok(accepted) => accepted,
+                                Err(e) => {
+                                    accept_errors += 1;
+                                    stats.accept_errors.fetch_add(1, Ordering::Relaxed);
+                                    accept_error_pause("enrollment", &e, accept_errors).await;
+                                    continue;
+                                }
+                            };
+                            stats.connections_total.fetch_add(1, Ordering::Relaxed);
+                            // Pre-TLS bounds: no task, no socket held,
+                            // no rustls state past the global cap or
+                            // the per-source cap.
+                            let Ok(hs_permit) =
+                                Arc::clone(&handshakes).try_acquire_owned()
+                            else {
+                                stats
+                                    .rejected_concurrent_handshakes
+                                    .fetch_add(1, Ordering::Relaxed);
+                                drop(tcp);
+                                continue;
+                            };
+                            let Some(source_slot) = sources.try_enter(peer.ip()) else {
+                                stats.rejected_per_source.fetch_add(1, Ordering::Relaxed);
+                                drop(tcp);
+                                continue;
+                            };
+                            if !attempts.allow(peer.ip()) {
+                                stats.rejected_attempt_window.fetch_add(1, Ordering::Relaxed);
+                                drop(tcp);
+                                continue;
+                            }
+                            let shared = Arc::clone(&shared);
+                            let liveness = liveness.clone();
+                            conns.spawn(async move {
+                                serve_enrollment_conn(
+                                    tcp, peer, shared, liveness, hs_permit, source_slot,
+                                )
+                                .await;
+                            });
+                        }
+                        Some(_) = conns.join_next(), if !conns.is_empty() => {}
+                        changed = liveness.changed() => {
+                            if changed.is_err() {
+                                let _ = bound_tx.send(None);
+                                return;
+                            }
+                            if *liveness.borrow() == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // AC #2 auto-close: last token burned or expired. The
+                // socket goes now; in-flight connections get a short
+                // drain (see CLOSE_DRAIN_GRACE), then they go too.
+                drop(listener);
+                drain_or_abort(&mut conns, CLOSE_DRAIN_GRACE).await;
+                stats.lifecycle_closes.fetch_add(1, Ordering::Relaxed);
+                let _ = bound_tx.send(None);
+                tracing::warn!("enrollment listener CLOSED (no live join token)");
+            }
+        });
+        EnrollmentHandle {
+            bound: bound_rx,
+            task,
+        }
+    }
+}
+
+/// Let in-flight connections finish for at most `grace`, then abort
+/// whatever is left.
+async fn drain_or_abort(conns: &mut JoinSet<()>, grace: Duration) {
+    let drained =
+        tokio::time::timeout(grace, async { while conns.join_next().await.is_some() {} }).await;
+    if drained.is_err() {
+        tracing::warn!(
+            remaining = conns.len(),
+            "enrollment listener closed with connections still in flight; aborting them"
+        );
+        conns.abort_all();
+    }
+}
+
+/// One enrollment connection, boxed in by every budget. Wire format
+/// mirrors `RpcEndpoint` (`[8 bytes LE length][prost ClusterFrame]`)
+/// but is read manually: an unauthenticated peer does not get reader
+/// and writer tasks spawned on its behalf, and byte accounting stays
+/// exact. `_source_slot` is held for the connection's whole life so
+/// the per-source cap covers every phase.
+async fn serve_enrollment_conn(
+    tcp: TcpStream,
+    peer: SocketAddr,
+    shared: Arc<EnrollmentShared>,
+    liveness: TokenLiveness,
+    hs_permit: OwnedSemaphorePermit,
+    _source_slot: SourceSlot,
+) {
+    let stats = &shared.stats;
+    let budgets = &shared.budgets;
+    let overall = tokio::time::timeout(budgets.per_conn_max_duration, async {
+        let tls_acceptor = TlsAcceptor::from(shared.acceptor.current());
+        let mut tls =
+            match tokio::time::timeout(budgets.handshake_timeout, tls_acceptor.accept(tcp)).await {
+                Ok(Ok(tls)) => tls,
+                Ok(Err(e)) => {
+                    tracing::debug!(%peer, error = %e, "enrollment TLS handshake failed");
+                    stats
+                        .rejected_handshake_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(_) => {
+                    stats
+                        .rejected_handshake_timeout
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+        if !negotiated_cluster_alpn(tls.get_ref().1) {
+            stats.rejected_alpn.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(%peer, "enrollment peer did not negotiate the cluster ALPN");
+            return;
+        }
+
+        // The window may have closed while this handshake ran: an
+        // enrollment must never proceed past the last token's death.
+        // (Point-in-time read; the burn itself is conditional on the
+        // token still being live inside the store.)
+        if *liveness.borrow() == 0 {
+            stats.rejected_window_closed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Post-TLS: the enrollment-exchange budget (distinct from the
+        // handshake budget so slow verifications cannot starve
+        // accepts). Once inside it, the handshake permit goes back to
+        // the pool - the permit rule in `preauth`.
+        let Ok(_enroll_permit) = Arc::clone(&shared.enrollments).try_acquire_owned() else {
+            stats
+                .rejected_inflight_enrollments
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        drop(hs_permit);
+
+        // Read exactly one length-prefixed frame within the byte budget.
+        let mut len_buf = [0u8; 8];
+        if tls.read_exact(&mut len_buf).await.is_err() {
+            return;
+        }
+        let len = u64::from_le_bytes(len_buf);
+        if len > budgets.per_conn_max_bytes {
+            stats.rejected_byte_budget.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut body = vec![0u8; len as usize];
+        if tls.read_exact(&mut body).await.is_err() {
+            return;
+        }
+
+        // Redeem. A pre-authentication peer learns nothing from
+        // refusal shapes (Story 9.2 AC #4): every refusal is the
+        // OPAQUE status, the diagnostic stays in the journal.
+        let (sequence, response) = match decode_enroll_frame(&body) {
+            Some((sequence, enroll)) => {
+                // Every field is shape-checked here, at the
+                // unauthenticated boundary, before the handler (and
+                // the store) sees any of it.
+                let shaped = public_id_is_valid(&enroll.public_id)
+                    && enroll.secret.len() == SECRET_LEN
+                    && enroll.public_key_der.len() <= MAX_PUBLIC_KEY_DER
+                    && !enroll.public_key_der.is_empty()
+                    && !enroll.node_name.is_empty()
+                    && display_field_is_valid(&enroll.node_name)
+                    && display_field_is_valid(&enroll.build_version);
+                if !shaped {
+                    tracing::warn!(%peer, "enrollment refused: malformed enrollment request");
+                    (sequence, None)
+                } else {
+                    let request = EnrollRequest {
+                        peer,
+                        public_id: enroll.public_id,
+                        secret: enroll.secret,
+                        public_key_der: enroll.public_key_der,
+                        node_name: enroll.node_name,
+                        build_version: enroll.build_version,
+                        schema_version: enroll.schema_version,
+                    };
+                    match shared.handler.redeem(request).await {
+                        Ok(grant) => {
+                            tracing::info!(
+                                %peer,
+                                node_id = %grant.node_id,
+                                status = %grant.status,
+                                "node enrolled"
+                            );
+                            (
+                                sequence,
+                                Some(EnrollAck {
+                                    node_id: grant.node_id,
+                                    cert_pem: grant.cert_pem,
+                                    ca_pem: grant.ca_pem,
+                                    status: grant.status,
+                                    cert_not_after: grant.cert_not_after,
+                                }),
+                            )
+                        }
+                        Err(refusal) => {
+                            tracing::warn!(%peer, %refusal, "enrollment refused");
+                            (sequence, None)
+                        }
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(%peer, "enrollment refused: not an enrollment frame");
+                (0, None)
+            }
+        };
+        let mut reply = match response {
+            Some(ack) => {
+                stats.enrollments_granted.fetch_add(1, Ordering::Relaxed);
+                ClusterResponse::ok(cluster_response::Body::EnrollAck(ack))
+            }
+            None => {
+                stats.enrollments_refused.fetch_add(1, Ordering::Relaxed);
+                ClusterResponse::refusal(ClusterStatus::opaque())
+            }
+        };
+        reply.sequence = sequence;
+        let frame = ClusterFrame {
+            kind: Some(cluster_frame::Kind::Response(reply)),
+        };
+        let encoded = frame.encode_to_vec();
+        let mut wire = Vec::with_capacity(8 + encoded.len());
+        wire.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        wire.extend_from_slice(&encoded);
+        let _ = tls.write_all(&wire).await;
+        let _ = tls.shutdown().await;
+    })
+    .await;
+    if overall.is_err() {
+        stats.rejected_time_budget.fetch_add(1, Ordering::Relaxed);
+    }
+}

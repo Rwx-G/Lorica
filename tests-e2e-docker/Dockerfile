@@ -38,6 +38,7 @@ COPY lorica-proxy/ lorica-proxy/
 COPY lorica-runtime/ lorica-runtime/
 COPY lorica-timeout/ lorica-timeout/
 COPY lorica-tls/ lorica-tls/
+COPY lorica-cluster/ lorica-cluster/
 COPY lorica-command/ lorica-command/
 COPY lorica-shmem/ lorica-shmem/
 COPY lorica-waf/ lorica-waf/
@@ -76,7 +77,11 @@ COPY tests-e2e-docker/entrypoint-otel.sh /entrypoint-otel.sh
 COPY tests-e2e-docker/entrypoint-otel-workers.sh /entrypoint-otel-workers.sh
 COPY tests-e2e-docker/entrypoint-rdns.sh /entrypoint-rdns.sh
 COPY tests-e2e-docker/entrypoint-hot-upgrade.sh /entrypoint-hot-upgrade.sh
-RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh /entrypoint-hot-upgrade.sh
+COPY tests-e2e-docker/entrypoint-log-sinks.sh /entrypoint-log-sinks.sh
+COPY tests-e2e-docker/entrypoint-acme.sh /entrypoint-acme.sh
+COPY tests-e2e-docker/entrypoint-cluster-cp.sh /entrypoint-cluster-cp.sh
+COPY tests-e2e-docker/entrypoint-cluster-follower.sh /entrypoint-cluster-follower.sh
+RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh /entrypoint-hot-upgrade.sh /entrypoint-log-sinks.sh /entrypoint-acme.sh /entrypoint-cluster-cp.sh /entrypoint-cluster-follower.sh
 
 # Pre-create the `/shared` mount point owned by the non-root lorica
 # user so the entrypoint can write `/shared/admin_password` after the

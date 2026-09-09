@@ -53,6 +53,7 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         log_store: None,
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        cluster: crate::cluster::ClusterRuntime::Standalone,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -461,7 +462,10 @@ async fn test_login_disabled_account_returns_401() {
         .await
         .expect("test setup");
     let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
-    assert_eq!(json["error"]["message"], "unauthorized: invalid credentials");
+    assert_eq!(
+        json["error"]["message"],
+        "unauthorized: invalid credentials"
+    );
 }
 
 #[tokio::test]
@@ -626,6 +630,97 @@ async fn send(
 }
 
 #[tokio::test]
+async fn test_viewer_reads_settings_without_the_log_pipeline_topology() {
+    // Backlog #54, decided at the Epic 9 close: where the SIEM and the
+    // collector are is reconnaissance for the least-trusted role.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    {
+        let store = state.store.lock().await;
+        let mut s = store.get_global_settings().expect("test setup");
+        s.syslog_endpoint = Some("siem.internal.example.org:6514".to_string());
+        s.syslog_extra_sd = Some("env=prod,dc=eu-west".to_string());
+        s.otlp_endpoint = Some("http://otel.internal.example.org:4318".to_string());
+        store.update_global_settings(&s).expect("test setup");
+    }
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "viewer-topo",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/settings",
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "the floor stays Viewer");
+    let body = body_json(resp).await;
+    assert!(body["data"]["syslog_endpoint"].is_null());
+    assert!(body["data"]["syslog_extra_sd"].is_null());
+    assert!(body["data"]["otlp_endpoint"].is_null());
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/settings",
+        &admin,
+        None,
+    )
+    .await;
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["data"]["syslog_endpoint"],
+        "siem.internal.example.org:6514"
+    );
+}
+
+#[tokio::test]
+async fn test_fleet_audit_trail_is_super_admin_and_the_local_chain_stays_operator() {
+    // Backlog #73, decided at the Epic 9 close, the narrow option.
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    let (control, _liveness) = test_control_plane();
+    state.cluster = crate::cluster::ClusterRuntime::ControlPlane(std::sync::Arc::clone(&control));
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "op-audit",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+
+    for (uri, expected) in [
+        ("/api/v1/audit", StatusCode::FORBIDDEN),
+        ("/api/v1/audit?node=some-other-node", StatusCode::FORBIDDEN),
+        ("/api/v1/audit?node=", StatusCode::OK),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            uri,
+            &operator,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), expected, "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn test_viewer_can_read_but_not_mutate() {
     let (state, session_store, rate_limiter) = test_state().await;
     let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
@@ -747,7 +842,10 @@ async fn test_users_crud_super_admin_flow() {
         .await
         .expect("test setup");
     let created: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
-    let ops_id = created["data"]["id"].as_str().expect("test setup").to_string();
+    let ops_id = created["data"]["id"]
+        .as_str()
+        .expect("test setup")
+        .to_string();
     assert_eq!(created["data"]["role"], "operator");
     assert!(created["data"].get("password_hash").is_none());
 
@@ -1591,7 +1689,9 @@ async fn test_certificate_update_cert_only_with_mismatched_keypair_returns_400()
         .expect("test setup")
         .to_lowercase();
     assert!(
-        msg.contains("matching") || msg.contains("mismatch") || msg.contains("subjectpublickeyinfo"),
+        msg.contains("matching")
+            || msg.contains("mismatch")
+            || msg.contains("subjectpublickeyinfo"),
         "expected SPKI-mismatch diagnostic, got: {msg}"
     );
 }
@@ -1860,24 +1960,22 @@ async fn test_logs_endpoint_with_entries() {
     // Push some log entries
     use crate::logs::LogEntry;
     for i in 1..=3 {
-        state
-            .log_buffer
-            .push(LogEntry {
-                id: 0,
-                timestamp: format!("2026-01-0{i}T00:00:00Z"),
-                method: "GET".into(),
-                path: format!("/path{i}"),
-                host: "example.com".into(),
-                status: 200,
-                latency_ms: 10,
-                backend: "10.0.0.1:8080".into(),
-                error: None,
-                client_ip: String::new(),
-                is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
-            });
+        state.log_buffer.push(LogEntry {
+            id: 0,
+            timestamp: format!("2026-01-0{i}T00:00:00Z"),
+            method: "GET".into(),
+            path: format!("/path{i}"),
+            host: "example.com".into(),
+            status: 200,
+            latency_ms: 10,
+            backend: "10.0.0.1:8080".into(),
+            error: None,
+            client_ip: String::new(),
+            is_xff: false,
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
+        });
     }
 
     let router = app(state, session_store, rate_limiter);
@@ -1911,42 +2009,38 @@ async fn test_logs_endpoint_filtering() {
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
-    state
-        .log_buffer
-        .push(LogEntry {
-            id: 0,
-            timestamp: "2026-01-01T00:00:00Z".into(),
-            method: "GET".into(),
-            path: "/ok".into(),
-            host: "example.com".into(),
-            status: 200,
-            latency_ms: 10,
-            backend: "10.0.0.1:8080".into(),
-            error: None,
-            client_ip: String::new(),
-            is_xff: false,
-            xff_proxy_ip: String::new(),
-            source: String::new(),
-            request_id: String::new(),
-        });
-    state
-        .log_buffer
-        .push(LogEntry {
-            id: 0,
-            timestamp: "2026-01-01T00:00:01Z".into(),
-            method: "POST".into(),
-            path: "/error".into(),
-            host: "other.com".into(),
-            status: 500,
-            latency_ms: 50,
-            backend: "10.0.0.2:8080".into(),
-            error: Some("internal error".into()),
-            client_ip: String::new(),
-            is_xff: false,
-            xff_proxy_ip: String::new(),
-            source: String::new(),
-            request_id: String::new(),
-        });
+    state.log_buffer.push(LogEntry {
+        id: 0,
+        timestamp: "2026-01-01T00:00:00Z".into(),
+        method: "GET".into(),
+        path: "/ok".into(),
+        host: "example.com".into(),
+        status: 200,
+        latency_ms: 10,
+        backend: "10.0.0.1:8080".into(),
+        error: None,
+        client_ip: String::new(),
+        is_xff: false,
+        xff_proxy_ip: String::new(),
+        source: String::new(),
+        request_id: String::new(),
+    });
+    state.log_buffer.push(LogEntry {
+        id: 0,
+        timestamp: "2026-01-01T00:00:01Z".into(),
+        method: "POST".into(),
+        path: "/error".into(),
+        host: "other.com".into(),
+        status: 500,
+        latency_ms: 50,
+        backend: "10.0.0.2:8080".into(),
+        error: Some("internal error".into()),
+        client_ip: String::new(),
+        is_xff: false,
+        xff_proxy_ip: String::new(),
+        source: String::new(),
+        request_id: String::new(),
+    });
 
     // Filter by route
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1988,24 +2082,22 @@ async fn test_clear_logs_endpoint() {
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
-    state
-        .log_buffer
-        .push(LogEntry {
-            id: 0,
-            timestamp: "2026-01-01T00:00:00Z".into(),
-            method: "GET".into(),
-            path: "/".into(),
-            host: "example.com".into(),
-            status: 200,
-            latency_ms: 5,
-            backend: "10.0.0.1:8080".into(),
-            error: None,
-            client_ip: String::new(),
-            is_xff: false,
-            xff_proxy_ip: String::new(),
-            source: String::new(),
-            request_id: String::new(),
-        });
+    state.log_buffer.push(LogEntry {
+        id: 0,
+        timestamp: "2026-01-01T00:00:00Z".into(),
+        method: "GET".into(),
+        path: "/".into(),
+        host: "example.com".into(),
+        status: 200,
+        latency_ms: 5,
+        backend: "10.0.0.1:8080".into(),
+        error: None,
+        client_ip: String::new(),
+        is_xff: false,
+        xff_proxy_ip: String::new(),
+        source: String::new(),
+        request_id: String::new(),
+    });
 
     // Clear logs
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -2043,24 +2135,22 @@ async fn test_logs_endpoint_status_range() {
 
     use crate::logs::LogEntry;
     for (status, path) in [(200, "/ok"), (301, "/redir"), (404, "/miss"), (500, "/err")] {
-        state
-            .log_buffer
-            .push(LogEntry {
-                id: 0,
-                timestamp: "2026-01-01T00:00:00Z".into(),
-                method: "GET".into(),
-                path: path.into(),
-                host: "test.com".into(),
-                status,
-                latency_ms: 5,
-                backend: "10.0.0.1:80".into(),
-                error: None,
-                client_ip: String::new(),
-                is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
-            });
+        state.log_buffer.push(LogEntry {
+            id: 0,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            method: "GET".into(),
+            path: path.into(),
+            host: "test.com".into(),
+            status,
+            latency_ms: 5,
+            backend: "10.0.0.1:80".into(),
+            error: None,
+            client_ip: String::new(),
+            is_xff: false,
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
+        });
     }
 
     // Filter 4xx-5xx
@@ -2086,42 +2176,38 @@ async fn test_logs_endpoint_time_range() {
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
-    state
-        .log_buffer
-        .push(LogEntry {
-            id: 0,
-            timestamp: "2026-01-01T10:00:00Z".into(),
-            method: "GET".into(),
-            path: "/old".into(),
-            host: "test.com".into(),
-            status: 200,
-            latency_ms: 5,
-            backend: "10.0.0.1:80".into(),
-            error: None,
-            client_ip: String::new(),
-            is_xff: false,
-            xff_proxy_ip: String::new(),
-            source: String::new(),
-            request_id: String::new(),
-        });
-    state
-        .log_buffer
-        .push(LogEntry {
-            id: 0,
-            timestamp: "2026-01-01T15:00:00Z".into(),
-            method: "GET".into(),
-            path: "/new".into(),
-            host: "test.com".into(),
-            status: 200,
-            latency_ms: 5,
-            backend: "10.0.0.1:80".into(),
-            error: None,
-            client_ip: String::new(),
-            is_xff: false,
-            xff_proxy_ip: String::new(),
-            source: String::new(),
-            request_id: String::new(),
-        });
+    state.log_buffer.push(LogEntry {
+        id: 0,
+        timestamp: "2026-01-01T10:00:00Z".into(),
+        method: "GET".into(),
+        path: "/old".into(),
+        host: "test.com".into(),
+        status: 200,
+        latency_ms: 5,
+        backend: "10.0.0.1:80".into(),
+        error: None,
+        client_ip: String::new(),
+        is_xff: false,
+        xff_proxy_ip: String::new(),
+        source: String::new(),
+        request_id: String::new(),
+    });
+    state.log_buffer.push(LogEntry {
+        id: 0,
+        timestamp: "2026-01-01T15:00:00Z".into(),
+        method: "GET".into(),
+        path: "/new".into(),
+        host: "test.com".into(),
+        status: 200,
+        latency_ms: 5,
+        backend: "10.0.0.1:80".into(),
+        error: None,
+        client_ip: String::new(),
+        is_xff: false,
+        xff_proxy_ip: String::new(),
+        source: String::new(),
+        request_id: String::new(),
+    });
 
     // Filter: only entries from 12:00 onwards
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -2148,24 +2234,22 @@ async fn test_logs_endpoint_limit_and_after_id() {
 
     use crate::logs::LogEntry;
     for i in 1..=10 {
-        state
-            .log_buffer
-            .push(LogEntry {
-                id: 0,
-                timestamp: format!("2026-01-01T00:00:{:02}Z", i),
-                method: "GET".into(),
-                path: format!("/p{i}"),
-                host: "test.com".into(),
-                status: 200,
-                latency_ms: 5,
-                backend: "10.0.0.1:80".into(),
-                error: None,
-                client_ip: String::new(),
-                is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
-            });
+        state.log_buffer.push(LogEntry {
+            id: 0,
+            timestamp: format!("2026-01-01T00:00:{:02}Z", i),
+            method: "GET".into(),
+            path: format!("/p{i}"),
+            host: "test.com".into(),
+            status: 200,
+            latency_ms: 5,
+            backend: "10.0.0.1:80".into(),
+            error: None,
+            client_ip: String::new(),
+            is_xff: false,
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
+        });
     }
 
     // Limit to 3
@@ -2355,11 +2439,73 @@ async fn test_get_settings_scrubs_bot_hmac_secret_hex_when_set() {
         "non-empty secret must surface the REDACTED sentinel"
     );
     assert!(
-        !body.windows(secret_hex.len()).any(|w| w == secret_hex.as_bytes()),
+        !body
+            .windows(secret_hex.len())
+            .any(|w| w == secret_hex.as_bytes()),
         "raw hex must not appear anywhere in the response body"
     );
     // Sanity : an unrelated field is still present.
     assert_eq!(json["data"]["management_port"], 9443);
+}
+
+#[tokio::test]
+async fn test_put_settings_response_masks_every_secret() {
+    // Story 9.8 QA (CWE-200): the PUT /api/v1/settings response used
+    // to return the merged row unmasked, handing back the raw bot
+    // HMAC secret, scrape token, syslog mTLS client key and OTLP auth
+    // header on every save. The response must mask all four exactly
+    // like GET does, and none of the raw bytes may appear anywhere in
+    // the body.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let secret_hex = "b".repeat(64);
+    let scrape_token = "scrape-token-secret-42".to_string();
+    let syslog_key = "-----BEGIN PRIVATE KEY-----\nsyslogsinkkey".to_string();
+    let otlp_auth = "Bearer otlp-sink-token-42".to_string();
+    {
+        let s = state.store.lock().await;
+        let mut cur = s.get_global_settings().expect("test setup");
+        cur.bot_hmac_secret_hex = secret_hex.clone();
+        cur.prometheus_scrape_token = Some(scrape_token.clone());
+        cur.syslog_tls_client_key_pem = Some(syslog_key.clone());
+        cur.otlp_logs_auth_header = Some(otlp_auth.clone());
+        s.update_global_settings(&cur).expect("test setup");
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    // A minimal no-op PATCH: every field absent, so nothing changes
+    // and the handler returns the (masked) merged row.
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Cookie", &cookie)
+        .header("Content-Type", "application/json")
+        .body(Body::from("{}"))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["bot_hmac_secret_hex"], "**REDACTED**");
+    assert_eq!(json["data"]["prometheus_scrape_token"], "**REDACTED**");
+    assert_eq!(json["data"]["syslog_tls_client_key_pem"], "**REDACTED**");
+    assert_eq!(json["data"]["otlp_logs_auth_header"], "**REDACTED**");
+    for raw in [
+        secret_hex.as_bytes(),
+        scrape_token.as_bytes(),
+        b"syslogsinkkey".as_slice(),
+        otlp_auth.as_bytes(),
+    ] {
+        assert!(
+            !body.windows(raw.len()).any(|w| w == raw),
+            "raw secret bytes must not appear anywhere in the PUT response body"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2470,7 +2616,10 @@ async fn test_update_settings_scrape_token_sentinel_round_trip() {
     };
 
     // Echoing the sentinel leaves the token unchanged.
-    assert_eq!(put_token(serde_json::json!("**REDACTED**")).await, StatusCode::OK);
+    assert_eq!(
+        put_token(serde_json::json!("**REDACTED**")).await,
+        StatusCode::OK
+    );
     {
         let s = state.store.lock().await;
         assert_eq!(
@@ -2483,7 +2632,10 @@ async fn test_update_settings_scrape_token_sentinel_round_trip() {
     }
 
     // A fresh value overwrites.
-    assert_eq!(put_token(serde_json::json!("rotated-token")).await, StatusCode::OK);
+    assert_eq!(
+        put_token(serde_json::json!("rotated-token")).await,
+        StatusCode::OK
+    );
     {
         let s = state.store.lock().await;
         assert_eq!(
@@ -2603,7 +2755,9 @@ async fn test_dns_provider_credentials_never_returned() {
         .await
         .expect("test setup");
     assert!(
-        !created.windows(secret.len()).any(|w| w == secret.as_bytes()),
+        !created
+            .windows(secret.len())
+            .any(|w| w == secret.as_bytes()),
         "create response must not echo the raw credential"
     );
 
@@ -3410,7 +3564,13 @@ async fn test_session_purge_expired() {
     let store = SessionStore::new(Arc::new(Mutex::new(db))).await;
 
     // Create a session
-    let sid = store.create("user1".into(), "admin".into(), lorica_config::models::Role::SuperAdmin).await;
+    let sid = store
+        .create(
+            "user1".into(),
+            "admin".into(),
+            lorica_config::models::Role::SuperAdmin,
+        )
+        .await;
 
     // Nothing expired yet
     assert_eq!(store.purge_expired().await, 0);
@@ -4610,6 +4770,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         log_store: None,
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        cluster: crate::cluster::ClusterRuntime::Standalone,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -4649,6 +4810,7 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         log_store: None,
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        cluster: crate::cluster::ClusterRuntime::Standalone,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -5838,4 +6000,1478 @@ async fn test_settings_schema_bounds_match_validator() {
             );
         }
     }
+}
+
+// ---- Story 9.3: cluster registry endpoints ----
+
+/// A control-plane runtime for the API tests: a fresh CA, a leaf, and
+/// the fleet handles wired the way the binary wires them. Returns the
+/// handle and the token-liveness receiver the enrollment listener
+/// would watch.
+fn test_control_plane() -> (
+    std::sync::Arc<crate::cluster::ControlPlaneRuntime>,
+    tokio::sync::watch::Receiver<u32>,
+) {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let ca = lorica_cluster::ClusterCa::generate("Test Cluster CA").expect("test setup");
+    let (leaf_cert, leaf_key) = ca.issue_server_leaf("cp.internal").expect("test setup");
+    let config = lorica_cluster::operational_server_config(ca.cert_pem(), &leaf_cert, &leaf_key)
+        .expect("test setup");
+    let acceptor = std::sync::Arc::new(lorica_cluster::SwappableAcceptor::new(
+        std::sync::Arc::new(config),
+    ));
+    let (liveness_tx, liveness_rx) = tokio::sync::watch::channel(0u32);
+    let control = std::sync::Arc::new(lorica_cluster::ControlPlane::new(
+        ca,
+        &leaf_cert,
+        &leaf_key,
+        acceptor,
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        liveness_tx,
+        false,
+        "cp.internal",
+        "test",
+    ));
+    (
+        std::sync::Arc::new(crate::cluster::ControlPlaneRuntime::new(control)),
+        liveness_rx,
+    )
+}
+
+async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
+}
+
+#[tokio::test]
+async fn test_cluster_status_standalone_and_role_floors() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "viewer1",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    // Standalone status is Viewer-readable.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/status",
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let status = body_json(resp).await;
+    assert_eq!(status["data"]["role"], "standalone");
+    assert_eq!(status["data"]["fleet"].as_array().map(Vec::len), Some(0));
+
+    // Tokens are SuperAdmin for every method, even the list.
+    for (method, path) in [
+        ("GET", "/api/v1/cluster/tokens"),
+        ("POST", "/api/v1/cluster/tokens"),
+        ("DELETE", "/api/v1/cluster/tokens/abc"),
+        ("POST", "/api/v1/cluster/nodes/abc/activate"),
+        ("DELETE", "/api/v1/cluster/nodes/abc"),
+        ("POST", "/api/v1/cluster/leave"),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            path,
+            &viewer,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+
+    // On a standalone node the control-plane endpoints answer 409,
+    // not 500, and leave is a follower-only operation.
+    for (method, path) in [
+        ("GET", "/api/v1/cluster/nodes"),
+        ("GET", "/api/v1/cluster/tokens"),
+        ("POST", "/api/v1/cluster/tokens"),
+        ("POST", "/api/v1/cluster/leave"),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            path,
+            &admin,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    let (control, mut liveness) = test_control_plane();
+    state.cluster = crate::cluster::ClusterRuntime::ControlPlane(std::sync::Arc::clone(&control));
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Mint: the token is returned once, the window opens.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/cluster/tokens",
+        &admin,
+        Some(serde_json::json!({ "ttl_seconds": 600, "node_name": "edge-1" })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let minted = body_json(resp).await;
+    let token_value = minted["data"]["token"].as_str().expect("token").to_string();
+    let public_id = minted["data"]["public_id"]
+        .as_str()
+        .expect("public id")
+        .to_string();
+    assert!(token_value.starts_with(&format!("{public_id}.")));
+    assert_eq!(minted["data"]["bound_node_name"], "edge-1");
+    assert_eq!(
+        *liveness.borrow_and_update(),
+        1,
+        "the enrollment window opened"
+    );
+    // The token pins the control plane's leaf SPKI.
+    let parsed = lorica_cluster::token::parse(&token_value).expect("parse");
+    assert_eq!(
+        parsed.pin,
+        lorica_cluster::leaf_spki_sha256(&control.control.leaf_cert_pem).expect("pin")
+    );
+
+    // Bad inputs are 400.
+    for body in [
+        serde_json::json!({ "ttl_seconds": 0 }),
+        serde_json::json!({ "ttl_seconds": 90000 }),
+        serde_json::json!({ "source_cidr": "not-a-cidr" }),
+        serde_json::json!({ "node_name": "" }),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/cluster/tokens",
+            &admin,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    // The list never carries the secret or its HMAC.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/tokens",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listed = body_json(resp).await;
+    let entries = listed["data"].as_array().expect("array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["public_id"], public_id);
+    assert_eq!(entries[0]["state"], "unused");
+    assert!(entries[0].get("secret_hmac").is_none());
+    assert!(entries[0].get("token").is_none());
+
+    // Withdraw: the window closes; a second withdrawal is 404.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/cluster/tokens/{public_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        *liveness.borrow_and_update(),
+        0,
+        "the enrollment window closed"
+    );
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/cluster/tokens/{public_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // A node enrolled through the registry (what the redemption
+    // handler writes) shows up pending, activates once, then revokes.
+    let node_id = "11111111-2222-4333-8444-555555555555";
+    {
+        let store = state.store.lock().await;
+        let now = chrono::Utc::now();
+        store
+            .create_cluster_node(&lorica_config::models::ClusterNode {
+                node_id: node_id.to_string(),
+                name: "edge-1".to_string(),
+                cert_fingerprint: "ab".repeat(32),
+                cert_serial: "4A".repeat(16),
+                prev_cert_fingerprint: None,
+                prev_cert_serial: None,
+                address: "192.0.2.10:5000".to_string(),
+                version: "1.7.0".to_string(),
+                schema_version: 50,
+                status: lorica_config::models::NodeStatus::Pending,
+                enrolled_at: now,
+                last_seen_at: None,
+                applied_config_generation: 0,
+                applied_config_hash: String::new(),
+                cert_not_after: now + chrono::Duration::days(90),
+                revoked_at: None,
+            })
+            .expect("test setup");
+    }
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/nodes",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let nodes = body_json(resp).await;
+    assert_eq!(nodes["data"][0]["node_id"], node_id);
+    assert_eq!(nodes["data"][0]["status"], "pending");
+    assert_eq!(nodes["data"][0]["connected"], false);
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        &format!("/api/v1/cluster/nodes/{node_id}/activate"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["status"], "active");
+    assert_eq!(
+        control
+            .control
+            .roster
+            .lookup(&"ab".repeat(32))
+            .map(|n| n.state),
+        Some(lorica_cluster::NodeState::Active),
+        "the roster is reloaded after activation"
+    );
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        &format!("/api/v1/cluster/nodes/{node_id}/activate"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "already active");
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/cluster/nodes/{node_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["newly_revoked"], true);
+    assert!(
+        body["data"]["certificates_to_reissue"].is_array(),
+        "a revocation names the keys it cannot take back: {body}"
+    );
+    assert_eq!(
+        control
+            .control
+            .roster
+            .lookup(&"ab".repeat(32))
+            .map(|n| n.state),
+        Some(lorica_cluster::NodeState::Revoked)
+    );
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/cluster/nodes/{node_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["status"], "revoked");
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/cluster/nodes/{node_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "revoking twice is idempotent (re-runs CRL rebuild and session kill)"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["data"]["newly_revoked"], false,
+        "the row had already flipped"
+    );
+    {
+        let store = state.store.lock().await;
+        let serials: Vec<String> = store
+            .list_cluster_revoked_serials(chrono::Utc::now())
+            .expect("crl")
+            .into_iter()
+            .map(|r| r.serial)
+            .collect();
+        assert_eq!(serials, vec!["4A".repeat(16)]);
+    }
+
+    // Status on a control plane lists the roster.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/status",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let status = body_json(resp).await;
+    assert_eq!(status["data"]["role"], "control_plane");
+    assert_eq!(status["data"]["fleet"][0]["status"], "revoked");
+}
+
+// ---- Story 9.4: replication, drift, break-glass, follower read-only ----
+
+/// A follower runtime for the API tests, holding no live session: the
+/// state a node is in before its first connect and between reconnects.
+fn test_follower_runtime() -> std::sync::Arc<crate::cluster::FollowerRuntime> {
+    std::sync::Arc::new(crate::cluster::FollowerRuntime {
+        node_id: "11111111-2222-3333-4444-555555555555".to_string(),
+        node_name: "edge-01".to_string(),
+        control_plane: "cp.internal:7443".to_string(),
+        connection: lorica_cluster::ClusterConnection::disconnected(),
+        left: tokio::sync::watch::channel(false).0,
+        applied: std::sync::Arc::new(std::sync::Mutex::new(
+            lorica_cluster::AppliedConfig::default(),
+        )),
+        break_glass: tokio::sync::watch::channel(None).0,
+    })
+}
+
+/// A route body the CRUD handler accepts, so the read-only gate is
+/// what decides the outcome rather than validation.
+fn a_valid_route(hostname: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hostname": hostname,
+        "path_prefix": "/",
+        "load_balancing": "round_robin"
+    })
+}
+
+#[tokio::test]
+async fn test_replication_and_drift_are_control_plane_only() {
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    let (control, _liveness) = test_control_plane();
+    state.cluster = crate::cluster::ClusterRuntime::ControlPlane(std::sync::Arc::clone(&control));
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Before any round: the current version, nothing in flight, no
+    // last report. The endpoint must not invent one.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/replication",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["current_generation"], 0);
+    assert!(body["data"]["in_flight"].is_null());
+    assert!(body["data"]["last"].is_null());
+
+    // Drift on an empty fleet is empty, not an error.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/drift",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["drifted"].as_array().map(Vec::len), Some(0));
+    assert_eq!(body["data"]["in_sync"], 0);
+
+    // Break-glass is a follower lever; a control plane refuses it.
+    for method in ["GET", "POST", "DELETE"] {
+        let body = (method == "POST").then(|| serde_json::json!({"duration_s": 60}));
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            "/api/v1/cluster/break-glass",
+            &admin,
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{method} break-glass");
+    }
+}
+
+#[tokio::test]
+async fn test_follower_read_only_gate_and_break_glass_window() {
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    let follower = test_follower_runtime();
+    state.cluster = crate::cluster::ClusterRuntime::Follower(std::sync::Arc::clone(&follower));
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // A configuration mutation is refused with 409 NAMING the control
+    // plane, so the operator knows where to make the change.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(a_valid_route("refused.example.com")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cp.internal:7443"),
+        "the refusal must name the control plane: {body}"
+    );
+
+    // Reads are untouched.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/routes",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The window starts closed.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/cluster/break-glass",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["active"], false);
+
+    // The duration is bounded on both ends.
+    for duration in [0u64, crate::cluster::runtime::MAX_BREAK_GLASS_SECS + 1] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/cluster/break-glass",
+            &admin,
+            Some(serde_json::json!({ "duration_s": duration })),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "duration {duration}"
+        );
+    }
+
+    // Open it: the response says so, and it is persisted so a restart
+    // does not silently reconcile the operator's edits away.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/cluster/break-glass",
+        &admin,
+        Some(serde_json::json!({"duration_s": 3600})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["active"], true);
+    assert!(body["data"]["remaining_s"].as_i64().unwrap_or(0) > 3500);
+    assert!(follower.break_glass_active());
+    assert!(state
+        .store
+        .lock()
+        .await
+        .cluster_break_glass_until()
+        .expect("test setup")
+        .is_some());
+
+    // The same mutation now goes through.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(a_valid_route("break-glass.example.com")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Close it: read-only comes straight back.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        "/api/v1/cluster/break-glass",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["active"], false);
+    assert!(!follower.break_glass_active());
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(a_valid_route("refused-again.example.com")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // An expired window is closed even though the row still holds a
+    // timestamp: the check is against now, not against presence.
+    follower
+        .break_glass
+        .send_replace(Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
+    assert!(!follower.break_glass_active());
+
+    // Replication and drift are control-plane levers.
+    for path in ["/api/v1/cluster/replication", "/api/v1/cluster/drift"] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            path,
+            &admin,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{path}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1.7.0 hygiene pass: the OTLP signal-path helper (#55 c) and the metrics
+// document behind the session (#80).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn otlp_signal_url_appends_the_signal_path_exactly_once() {
+    use crate::settings::otlp_signal_url;
+    assert_eq!(
+        otlp_signal_url("http://otel.internal.example.org:4318", "/v1/traces"),
+        "http://otel.internal.example.org:4318/v1/traces"
+    );
+    // A trailing slash on the endpoint does not double the separator.
+    assert_eq!(
+        otlp_signal_url("http://otel.internal.example.org:4318/", "/v1/logs"),
+        "http://otel.internal.example.org:4318/v1/logs"
+    );
+    // An endpoint that already names the signal is left alone, slash or not.
+    assert_eq!(
+        otlp_signal_url(
+            "http://otel.internal.example.org:4318/v1/traces",
+            "/v1/traces"
+        ),
+        "http://otel.internal.example.org:4318/v1/traces"
+    );
+    assert_eq!(
+        otlp_signal_url(
+            "http://otel.internal.example.org:4318/v1/traces/",
+            "/v1/traces"
+        ),
+        "http://otel.internal.example.org:4318/v1/traces"
+    );
+    // A different signal on a suffixed endpoint still gets its own path.
+    assert_eq!(
+        otlp_signal_url(
+            "http://otel.internal.example.org:4318/v1/traces",
+            "/v1/logs"
+        ),
+        "http://otel.internal.example.org:4318/v1/traces/v1/logs"
+    );
+}
+
+// The handler refreshes system counters under `block_in_place`, which
+// needs the multi-threaded runtime Lorica runs on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_api_v1_metrics_is_the_metrics_document_behind_the_session() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let router = app(state, session_store, rate_limiter);
+
+    // No session: the ordinary API gate answers, not the metrics one.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/metrics")
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.clone().oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // With the session cookie: the Prometheus exposition, same as /metrics.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/metrics")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("# HELP lorica_") || text.contains("lorica_"),
+        "expected a Prometheus exposition, got: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SLA and active-probe handlers (`sla.rs`, `probes.rs`). Until the 1.7.0
+// coverage pass these two files were exercised by the Docker e2e suite only.
+// ---------------------------------------------------------------------------
+
+/// One request against a fresh router; returns the status and the parsed body
+/// (`Value::Null` when the body is not JSON, e.g. a CSV export).
+async fn sla_call(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value, http::HeaderMap) {
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Cookie", cookie);
+    let body = match body {
+        Some(json) => {
+            builder = builder.header("Content-Type", "application/json");
+            Body::from(serde_json::to_string(&json).expect("test setup"))
+        }
+        None => Body::empty(),
+    };
+    let response = router
+        .oneshot(builder.body(body).expect("test setup"))
+        .await
+        .expect("test setup");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json, headers)
+}
+
+async fn sla_create_route(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    hostname: &str,
+) -> String {
+    let (status, json, _) = sla_call(
+        state,
+        session_store,
+        rate_limiter,
+        cookie,
+        "POST",
+        "/api/v1/routes",
+        Some(serde_json::json!({ "hostname": hostname })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    json["data"]["id"].as_str().expect("route id").to_string()
+}
+
+fn sla_bucket(route_id: &str, source: &str, minutes_ago: i64) -> lorica_config::models::SlaBucket {
+    lorica_config::models::SlaBucket {
+        id: None,
+        route_id: route_id.to_string(),
+        bucket_start: chrono::Utc::now() - chrono::Duration::minutes(minutes_ago),
+        request_count: 90,
+        success_count: 81,
+        error_count: 9,
+        latency_sum_ms: 9_000,
+        latency_min_ms: 20,
+        latency_max_ms: 700,
+        latency_p50_ms: 90,
+        latency_p95_ms: 400,
+        latency_p99_ms: 650,
+        source: source.to_string(),
+        cfg_max_latency_ms: 1_000,
+        cfg_status_min: 200,
+        cfg_status_max: 399,
+        cfg_target_pct: 99.0,
+    }
+}
+
+#[tokio::test]
+async fn sla_reads_report_the_inserted_buckets_per_window_and_source() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "sla-reads.example.com",
+    )
+    .await;
+    {
+        let store = state.store.lock().await;
+        store
+            .insert_sla_bucket(&sla_bucket(&route_id, "passive", 10))
+            .expect("passive bucket");
+        store
+            .insert_sla_bucket(&sla_bucket(&route_id, "active", 10))
+            .expect("active bucket");
+    }
+
+    // Overview: two windows (1h, 24h) per route, passive figures only.
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/sla/overview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let rows = json["data"].as_array().expect("overview array");
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row["route_id"], route_id);
+        assert_eq!(row["total_requests"], 90);
+        assert_eq!(row["successful_requests"], 81);
+    }
+    assert_eq!(rows[0]["window"], "1h");
+    assert_eq!(rows[1]["window"], "24h");
+
+    // Per-route passive windows, then the active-probe windows.
+    for (path, expected_total) in [
+        (format!("/api/v1/sla/routes/{route_id}"), 90),
+        (format!("/api/v1/sla/routes/{route_id}/active"), 90),
+    ] {
+        let (status, json, _) = sla_call(
+            &state,
+            &session_store,
+            &rate_limiter,
+            &cookie,
+            "GET",
+            &path,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {json}");
+        let windows = json["data"].as_array().expect("windows array");
+        assert!(!windows.is_empty(), "{path}");
+        assert!(
+            windows
+                .iter()
+                .any(|w| w["total_requests"] == expected_total),
+            "{path}: {json}"
+        );
+    }
+
+    // Raw buckets: default source is passive, `source=active` selects the other
+    // one, a window that ends before the bucket is empty.
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/sla/routes/{route_id}/buckets"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let buckets = json["data"].as_array().expect("buckets");
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0]["source"], "passive");
+    assert_eq!(buckets[0]["latency_p99_ms"], 650);
+
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/sla/routes/{route_id}/buckets?source=active"),
+        None,
+    )
+    .await;
+    assert_eq!(json["data"].as_array().expect("buckets").len(), 1);
+    assert_eq!(json["data"][0]["source"], "active");
+
+    // `Z`, not `+00:00`: a bare `+` in a query string decodes as a space.
+    let to = (chrono::Utc::now() - chrono::Duration::hours(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/sla/routes/{route_id}/buckets?to={to}"),
+        None,
+    )
+    .await;
+    assert_eq!(json["data"].as_array().expect("buckets").len(), 0);
+
+    // Unknown route: 404 on every per-route read.
+    for path in [
+        "/api/v1/sla/routes/no-such-route",
+        "/api/v1/sla/routes/no-such-route/buckets",
+        "/api/v1/sla/routes/no-such-route/active",
+        "/api/v1/sla/routes/no-such-route/config",
+        "/api/v1/sla/routes/no-such-route/export",
+    ] {
+        let (status, _, _) = sla_call(
+            &state,
+            &session_store,
+            &rate_limiter,
+            &cookie,
+            "GET",
+            path,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn sla_config_round_trips_and_rejects_out_of_range_values() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "sla-config.example.com",
+    )
+    .await;
+    let config_path = format!("/api/v1/sla/routes/{route_id}/config");
+
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &config_path,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["route_id"], route_id);
+    let default_target = json["data"]["target_pct"].as_f64().expect("target_pct");
+    assert!((0.0..=100.0).contains(&default_target));
+
+    for bad in [
+        serde_json::json!({ "target_pct": 150.0 }),
+        serde_json::json!({ "target_pct": -1.0 }),
+        serde_json::json!({ "max_latency_ms": 0 }),
+    ] {
+        let (status, json, _) = sla_call(
+            &state,
+            &session_store,
+            &rate_limiter,
+            &cookie,
+            "PUT",
+            &config_path,
+            Some(bad.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {json}");
+    }
+
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "PUT",
+        &config_path,
+        Some(serde_json::json!({
+            "target_pct": 95.5,
+            "max_latency_ms": 800,
+            "success_status_min": 200,
+            "success_status_max": 399
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["target_pct"], 95.5);
+    assert_eq!(json["data"]["max_latency_ms"], 800);
+    assert_eq!(json["data"]["success_status_max"], 399);
+
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &config_path,
+        None,
+    )
+    .await;
+    assert_eq!(json["data"]["target_pct"], 95.5);
+    assert_eq!(json["data"]["success_status_min"], 200);
+
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "PUT",
+        "/api/v1/sla/routes/no-such-route/config",
+        Some(serde_json::json!({ "target_pct": 90.0 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sla_export_serves_json_and_csv_and_clear_empties_the_route() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "sla-export.example.com",
+    )
+    .await;
+    {
+        let store = state.store.lock().await;
+        store
+            .insert_sla_bucket(&sla_bucket(&route_id, "passive", 30))
+            .expect("bucket");
+    }
+
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/sla/routes/{route_id}/export"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["route_id"], route_id);
+    assert!(json["data"]["config"].is_object());
+    assert_eq!(
+        json["data"]["buckets"].as_array().expect("buckets").len(),
+        1
+    );
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/sla/routes/{route_id}/export?format=csv"))
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"].to_str().expect("header"),
+        "text/csv"
+    );
+    assert!(response.headers()["content-disposition"]
+        .to_str()
+        .expect("header")
+        .contains(&format!("sla-{route_id}.csv")));
+    let csv = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let csv = String::from_utf8(csv.to_vec()).expect("utf-8");
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines.len(), 2, "{csv}");
+    assert!(lines[0].starts_with("bucket_start,request_count,success_count,error_count"));
+    assert!(
+        lines[1].contains(",90,81,9,9000,20,700,90,400,650"),
+        "{csv}"
+    );
+
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "DELETE",
+        &format!("/api/v1/sla/routes/{route_id}/data"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["deleted_buckets"], 1);
+
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/sla/routes/{route_id}/buckets"),
+        None,
+    )
+    .await;
+    assert_eq!(json["data"].as_array().expect("buckets").len(), 0);
+
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "DELETE",
+        "/api/v1/sla/routes/no-such-route/data",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sla_reads_with_a_node_selector_are_refused_off_a_control_plane() {
+    // Story 9.7 AC #5: `?node=` is a fleet read served through the control
+    // plane. A single node has none, so the honest answer is 409, not an
+    // empty chart. An empty selector means "this node" and is served.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "sla-node.example.com",
+    )
+    .await;
+    for path in [
+        "/api/v1/sla/overview?node=edge-b".to_string(),
+        format!("/api/v1/sla/routes/{route_id}?node=edge-b"),
+        format!("/api/v1/sla/routes/{route_id}/buckets?node=edge-b"),
+        format!("/api/v1/sla/routes/{route_id}/active?node=edge-b"),
+    ] {
+        let (status, json, _) = sla_call(
+            &state,
+            &session_store,
+            &rate_limiter,
+            &cookie,
+            "GET",
+            &path,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}: {json}");
+    }
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/sla/overview?node=",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn answer_sla_pull_serves_what_a_follower_measures_and_round_trips_the_wire() {
+    use crate::sla::{answer_sla_pull, bucket_from_wire, bucket_to_wire};
+    use lorica_cluster::messages::SlaPull;
+
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "sla-pull.example.com",
+    )
+    .await;
+    let bucket = sla_bucket(&route_id, "passive", 15);
+    let store = state.store.lock().await;
+    store.insert_sla_bucket(&bucket).expect("bucket");
+
+    // No route id: the overview, two windows per route.
+    let ack = answer_sla_pull(
+        &store,
+        &SlaPull {
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        },
+    )
+    .expect("overview");
+    assert_eq!(ack.summaries.len(), 2);
+    assert!(ack.buckets.is_empty());
+    assert_eq!(ack.summaries[0].total_requests, 90);
+
+    // One route, windows only.
+    let ack = answer_sla_pull(
+        &store,
+        &SlaPull {
+            route_id: route_id.clone(),
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        },
+    )
+    .expect("route windows");
+    assert!(!ack.summaries.is_empty());
+    assert!(ack.buckets.is_empty());
+
+    // One route, raw buckets over the default 24 h window.
+    let ack = answer_sla_pull(
+        &store,
+        &SlaPull {
+            route_id: route_id.clone(),
+            source: "passive".to_string(),
+            buckets: true,
+            ..SlaPull::default()
+        },
+    )
+    .expect("route buckets");
+    assert_eq!(ack.buckets.len(), 1);
+    assert!(ack.summaries.is_empty());
+
+    // A route this node does not hold is an error, not an empty answer.
+    let err = answer_sla_pull(
+        &store,
+        &SlaPull {
+            route_id: "no-such-route".to_string(),
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        },
+    )
+    .expect_err("unknown route");
+    assert!(err.contains("not found"), "{err}");
+
+    // Wire round trip keeps every figure; the row id is not carried.
+    let back = bucket_from_wire(bucket_to_wire(&bucket)).expect("from wire");
+    assert_eq!(back.id, None);
+    assert_eq!(back.route_id, bucket.route_id);
+    assert_eq!(back.bucket_start, bucket.bucket_start);
+    assert_eq!(back.request_count, 90);
+    assert_eq!(back.latency_p99_ms, 650);
+    assert_eq!(back.cfg_target_pct, 99.0);
+    let mut broken = bucket_to_wire(&bucket);
+    broken.bucket_start = "yesterday".to_string();
+    assert!(bucket_from_wire(broken).is_err());
+}
+
+#[tokio::test]
+async fn probe_crud_history_and_validation() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = sla_create_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "probes.example.com",
+    )
+    .await;
+
+    // Defaults on create.
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "POST",
+        "/api/v1/probes",
+        Some(serde_json::json!({ "route_id": route_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    let probe_id = json["data"]["id"].as_str().expect("probe id").to_string();
+    assert_eq!(json["data"]["method"], "GET");
+    assert_eq!(json["data"]["path"], "/");
+    assert_eq!(json["data"]["expected_status"], 200);
+    assert_eq!(json["data"]["interval_s"], 30);
+    assert_eq!(json["data"]["timeout_ms"], 5000);
+    assert_eq!(json["data"]["enabled"], true);
+
+    // Validation and unknown route.
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "POST",
+        "/api/v1/probes",
+        Some(serde_json::json!({ "route_id": route_id, "interval_s": 2 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "POST",
+        "/api/v1/probes",
+        Some(serde_json::json!({ "route_id": "no-such-route" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Listings.
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/probes",
+        None,
+    )
+    .await;
+    assert_eq!(json["data"].as_array().expect("probes").len(), 1);
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/probes/route/{route_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(json["data"][0]["id"], probe_id);
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/probes/route/no-such-route",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Update, its validation, and an unknown probe.
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "PUT",
+        &format!("/api/v1/probes/{probe_id}"),
+        Some(serde_json::json!({
+            "method": "HEAD",
+            "path": "/health",
+            "expected_status": 204,
+            "interval_s": 60,
+            "timeout_ms": 1500,
+            "enabled": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["method"], "HEAD");
+    assert_eq!(json["data"]["path"], "/health");
+    assert_eq!(json["data"]["expected_status"], 204);
+    assert_eq!(json["data"]["interval_s"], 60);
+    assert_eq!(json["data"]["timeout_ms"], 1500);
+    assert_eq!(json["data"]["enabled"], false);
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "PUT",
+        &format!("/api/v1/probes/{probe_id}"),
+        Some(serde_json::json!({ "interval_s": 1 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "PUT",
+        "/api/v1/probes/no-such-probe",
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // History: newest first, capped by `limit`, 404 for an unknown probe.
+    {
+        let store = state.store.lock().await;
+        for (code, ok) in [(200u16, true), (503u16, false), (200u16, true)] {
+            store
+                .insert_probe_result(&probe_id, &route_id, code, 12, ok, None)
+                .expect("probe result");
+        }
+    }
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/probes/{probe_id}/history?limit=2"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["total"], 2);
+    assert_eq!(
+        json["data"]["results"].as_array().expect("results").len(),
+        2
+    );
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        &format!("/api/v1/probes/{probe_id}/history"),
+        None,
+    )
+    .await;
+    assert_eq!(json["data"]["total"], 3);
+    let (status, _, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/probes/no-such-probe/history",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Delete, then the listing is empty.
+    let (status, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "DELETE",
+        &format!("/api/v1/probes/{probe_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["deleted"], probe_id);
+    let (_, json, _) = sla_call(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "GET",
+        "/api/v1/probes",
+        None,
+    )
+    .await;
+    assert_eq!(json["data"].as_array().expect("probes").len(), 0);
 }

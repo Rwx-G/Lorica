@@ -55,7 +55,16 @@ impl LoadBalancing {
 /// authorization floor can be expressed as `session.role >= min_role`
 /// via the derived `PartialOrd`.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, EnumString,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    EnumString,
     IntoStaticStr,
 )]
 #[serde(rename_all = "snake_case")]

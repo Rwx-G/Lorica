@@ -454,6 +454,7 @@ mod tests {
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
             group_name: String::new(),
+            node_selector: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -590,6 +591,7 @@ mod tests {
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
             group_name: String::new(),
+            node_selector: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

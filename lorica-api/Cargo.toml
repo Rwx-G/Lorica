@@ -1,6 +1,6 @@
 [package]
 name = "lorica-api"
-version = "1.6.0"
+version = "1.7.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -8,14 +8,15 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
-lorica-acme = { version = "1.6.0", path = "../lorica-acme" }
+lorica-acme = { version = "1.7.0", path = "../lorica-acme" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-config = { version = "1.6.0", path = "../lorica-config" }
-lorica-dashboard = { version = "1.6.0", path = "../lorica-dashboard" }
-lorica-metrics = { version = "1.6.0", path = "../lorica-metrics" }
-lorica-waf = { version = "1.6.0", path = "../lorica-waf" }
-lorica-notify = { version = "1.6.0", path = "../lorica-notify" }
-lorica-bench = { version = "1.6.0", path = "../lorica-bench" }
+lorica-config = { version = "1.7.0", path = "../lorica-config" }
+lorica-dashboard = { version = "1.7.0", path = "../lorica-dashboard" }
+lorica-metrics = { version = "1.7.0", path = "../lorica-metrics" }
+lorica-waf = { version = "1.7.0", path = "../lorica-waf" }
+lorica-notify = { version = "1.7.0", path = "../lorica-notify" }
+lorica-bench = { version = "1.7.0", path = "../lorica-bench" }
+lorica-cluster = { version = "1.7.0", path = "../lorica-cluster" }
 # Used in `certificates.rs::validate_certificate_bundle` to gate
 # every cert upload (POST /certificates, PUT /certificates/{id},
 # POST /config/import) with the exact loader the worker uses :
@@ -30,7 +31,9 @@ axum = { version = "0.8", features = ["multipart", "ws"] }
 futures-util = "0.3"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time"] }
+# `net` was added for the Story 9.8 log-export sinks (UDP / TCP /
+# TCP+TLS syslog client sockets); no new crate, tokio already ships it.
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time", "net"] }
 # Management-plane TLS (Story 8.8 AC #1/#2). The management API moved
 # off plaintext `axum::serve` onto a manual rustls accept loop: axum 0.7
 # `Router` -> `hyper-util` auto (h1/h2) connection server over a

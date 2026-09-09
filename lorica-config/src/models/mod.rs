@@ -6,6 +6,7 @@ mod ai_crawler;
 mod backend;
 mod cert_export_acl;
 mod certificate;
+mod cluster;
 mod enums;
 mod loadtest;
 mod notification;
@@ -26,6 +27,7 @@ pub use cert_export_acl::{
     pattern_matches, resolve as resolve_cert_export_acl, specificity, CertExportAcl,
 };
 pub use certificate::{Certificate, DnsProvider};
+pub use cluster::{ClusterIdentity, ClusterNode, JoinToken, NodeStatus, RevokedSerial, TokenState};
 pub use enums::{
     HeaderMatchType, HealthStatus, LifecycleState, LoadBalancing, NotificationChannel,
     PathMatchType, PreferenceValue, Role, WafMode,
@@ -38,10 +40,10 @@ pub use notification::NotificationConfig;
 pub use preferences::{User, UserPreference};
 pub use probes::{ProbeConfig, ProbeResultRow};
 pub use route::{
-    AiBotPolicy, BotBypassRules, BotProtectionConfig, BotProtectionMode, ForwardAuthConfig,
-    GeoIpConfig, GeoIpMode, HeaderRule, MirrorConfig, MtlsConfig, PathRule, RateLimit,
-    RateLimitScope, ResponseRewriteConfig, ResponseRewriteRule, Route, SpoofedFallback,
-    TrafficSplit,
+    validate_node_selector_names, AiBotPolicy, BotBypassRules, BotProtectionConfig,
+    BotProtectionMode, ForwardAuthConfig, GeoIpConfig, GeoIpMode, HeaderRule, MirrorConfig,
+    MtlsConfig, PathRule, RateLimit, RateLimitScope, ResponseRewriteConfig, ResponseRewriteRule,
+    Route, SpoofedFallback, TrafficSplit, NODE_SELECTOR_MAX_ENTRIES,
 };
 pub use settings::{
     builtin_security_presets, resolve_security_preset, GlobalSettings, SecurityHeaderPreset,

@@ -106,6 +106,26 @@ When comparing files across repositories, apply these substitutions:
 3. **New TLS features** in `pingora-rustls` (Lorica's TLS is based on this)
 4. **Breaking API changes** that affect `lorica-proxy` integration points
 
+## Upstream sync record
+
+Each release cycle that pulls upstream commits into the forked crates is
+recorded here, most recent first. Commit ids are upstream `main` ids
+(`git fetch upstream`). `docs/backlog.md` #81 carries the reasoning per
+commit; the `[1.7.0]` CHANGELOG entries describe the user-visible effect.
+
+| Cycle | Upstream range | Ported | Not ported (deliberate) |
+|-------|----------------|--------|-------------------------|
+| 1.7.0 (2026-09-09) | fork baseline to `09696b51` (2026-08-25) | `aece9932`, `6e2158d5` (re-implemented on the `RwLock` pool), `d5ade3a2`, `e21646be`, `f486cd84`, `b8aacad8`, `28c18e6b` + `ca23f166` (source, not the integration tests), `ff6693b7`, `d248583f` (source), `0c081493`, `7166d81e`, `6dcc236a`, `5bec4059`, `915590a9`, `3e657e2f` + `3dd51643` | proxy task API family `d7728cac`, `5a822047`, `8683056e`, `7142ad46`, `9c16af9c`, `17325ff4`, `b90d4203` and the six April feature commits it sits on (backlog #83); feature commits `21140569`, `4a9a34c5`, `600c5c0d`, `402acae5` |
+| 1.5.8 (2026-06-05) | `0.8.1` | bounded HTTP/2 server limits (`default_h2_options`) | - |
+
+How a commit is ported: `git format-patch -1 <sha>`, rename the paths and
+identifiers per the mapping above, then `git -c rerere.enabled=false apply
+--3way`. A hunk that does not apply is ported by hand; the fork's
+`Box<HttpSession>` in `H2Accept::Session` and its `RwLock<HashMap>`
+connection pool are the two places upstream has since diverged. Never
+stage a file that still carries conflict markers: rerere would record the
+broken state as a resolution.
+
 ## Attribution
 
 See [NOTICE](NOTICE) for full attribution. Lorica is licensed under Apache-2.0, same as upstream Pingora.

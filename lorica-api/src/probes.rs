@@ -241,7 +241,15 @@ pub async fn delete_probe(
     state.notify_config_changed();
 
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::audit::record(&state, &audit_ctx, "probe.delete", ("probe", &id), None, None).await;
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "probe.delete",
+        ("probe", &id),
+        None,
+        None,
+    )
+    .await;
 
     Ok(json_data(serde_json::json!({"deleted": id})))
 }
@@ -283,8 +291,25 @@ pub async fn probe_history(
 /// Returns active SLA summaries for a route (from probe results).
 pub async fn get_active_sla(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(route_id): Path<String>,
+    Query(node): Query<crate::sla::NodeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // `?node=`: one follower's active windows (Story 9.7 AC #5).
+    if let Some(node) = node.node.as_deref().filter(|n| !n.is_empty()) {
+        let pull = lorica_cluster::messages::SlaPull {
+            route_id,
+            source: "active".to_string(),
+            ..lorica_cluster::messages::SlaPull::default()
+        };
+        let ack = crate::sla::pull_from_node(&state, &session, node, pull).await?;
+        let summaries: Vec<lorica_config::models::SlaSummary> = ack
+            .summaries
+            .into_iter()
+            .map(crate::sla::summary_from_wire)
+            .collect();
+        return Ok(json_data(summaries));
+    }
     let summaries = db_blocking(&state.store, move |store| {
         store
             .get_route(&route_id)?

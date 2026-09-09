@@ -58,7 +58,17 @@ impl ConfigStore {
     /// Insert a new route into the database.
     pub fn create_route(&self, route: &Route) -> Result<()> {
         self.validate_hostname_uniqueness(&route.id, &route.hostname, &route.hostname_aliases)?;
+        self.insert_route_row(route)
+    }
 
+    /// The INSERT half of [`ConfigStore::create_route`], without the
+    /// cross-route hostname-uniqueness check.
+    ///
+    /// The replica apply (Story 9.4) writes a whole route set that the
+    /// control plane already validated as internally consistent, and
+    /// checking each row against the rows not yet rewritten would
+    /// reject a legal generation that swaps two hostnames.
+    pub(super) fn insert_route_row(&self, route: &Route) -> Result<()> {
         let hostname_aliases_json = serialize_field("hostname_aliases", &route.hostname_aliases)?;
         let proxy_headers_json = serialize_field("proxy_headers", &route.proxy_headers)?;
         let response_headers_json = serialize_field("response_headers", &route.response_headers)?;
@@ -100,6 +110,7 @@ impl ConfigStore {
                 SpoofedFallback::Log => "log",
                 SpoofedFallback::Allow => "allow",
             });
+        let node_selector_json = serialize_field("node_selector", &route.node_selector)?;
 
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
@@ -136,13 +147,14 @@ impl ConfigStore {
              geoip,
              bot_protection,
              group_name,
-             ai_bot_policy, ai_bot_spoofed_fallback, serve_robots_txt)
+             ai_bot_policy, ai_bot_spoofed_fallback, serve_robots_txt,
+             node_selector)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
                      ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45,
                      ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65, ?66,
-                     ?67, ?68, ?69)",
+                     ?67, ?68, ?69, ?70)",
             params![
                 route.id,
                 route.hostname,
@@ -213,6 +225,7 @@ impl ConfigStore {
                 ai_bot_policy_str,
                 ai_bot_spoofed_fallback_str,
                 route.serve_robots_txt,
+                node_selector_json,
             ],
         )?;
         Ok(())
@@ -256,7 +269,8 @@ impl ConfigStore {
                  geoip,
                  bot_protection,
                  group_name,
-                 ai_bot_policy, ai_bot_spoofed_fallback, serve_robots_txt
+                 ai_bot_policy, ai_bot_spoofed_fallback, serve_robots_txt,
+                 node_selector
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
@@ -302,7 +316,8 @@ impl ConfigStore {
              geoip,
              bot_protection,
              group_name,
-             ai_bot_policy, ai_bot_spoofed_fallback, serve_robots_txt
+             ai_bot_policy, ai_bot_spoofed_fallback, serve_robots_txt,
+             node_selector
              FROM routes ORDER BY hostname, path_prefix",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_route(row)))?;
@@ -316,7 +331,13 @@ impl ConfigStore {
     /// Update an existing route. Returns `NotFound` if the ID does not exist.
     pub fn update_route(&self, route: &Route) -> Result<()> {
         self.validate_hostname_uniqueness(&route.id, &route.hostname, &route.hostname_aliases)?;
+        self.update_route_row(route)
+    }
 
+    /// The UPDATE half of [`ConfigStore::update_route`], without the
+    /// cross-route hostname-uniqueness check. Same rationale as
+    /// [`ConfigStore::insert_route_row`].
+    pub(super) fn update_route_row(&self, route: &Route) -> Result<()> {
         let hostname_aliases_json = serialize_field("hostname_aliases", &route.hostname_aliases)?;
         let proxy_headers_json = serialize_field("proxy_headers", &route.proxy_headers)?;
         let response_headers_json = serialize_field("response_headers", &route.response_headers)?;
@@ -358,6 +379,7 @@ impl ConfigStore {
                 SpoofedFallback::Log => "log",
                 SpoofedFallback::Allow => "allow",
             });
+        let node_selector_json = serialize_field("node_selector", &route.node_selector)?;
 
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,
@@ -393,7 +415,8 @@ impl ConfigStore {
              geoip=?63,
              bot_protection=?64,
              group_name=?65,
-             ai_bot_policy=?66, ai_bot_spoofed_fallback=?67, serve_robots_txt=?68
+             ai_bot_policy=?66, ai_bot_spoofed_fallback=?67, serve_robots_txt=?68,
+             node_selector=?69
              WHERE id=?1",
             params![
                 route.id,
@@ -464,6 +487,7 @@ impl ConfigStore {
                 ai_bot_policy_str,
                 ai_bot_spoofed_fallback_str,
                 route.serve_robots_txt,
+                node_selector_json,
             ],
         )?;
         if changed == 0 {

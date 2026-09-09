@@ -32,6 +32,24 @@ ssh -L 9443:localhost:9443 user@lorica-host
 - **HTTP (8080)**: Use for redirect-to-HTTPS only, or for internal-only traffic
 - **HTTPS (8443)**: Primary public-facing port with TLS termination
 
+### Cluster Plane (v1.7.0+, opt-in)
+
+The cluster plane only exists when a control plane is started with `--cluster-listen <host:port>` (9444 in the examples below). Two listeners share that surface:
+
+- **Operational listener**: mutual TLS is mandatory; only nodes holding a certificate issued by the fleet's cluster CA can complete the handshake. Still, do not expose it wider than needed: allow only the addresses of enrolled nodes.
+- **Enrollment listener** (cluster port + 1 by default, so 9445 below; `--cluster-enrollment-listen host:port` moves it, for example onto an admin interface): the only unauthenticated surface in the product. It is closed unless a join token is live and auto-closes when the last token is burned or expires, but the firewall should mirror that lifecycle: open it only for the duration of an enrollment window, and only from admin-controlled source addresses.
+
+Followers dial out to the control plane and expose no inbound cluster port; no follower-side firewall opening is needed.
+
+Enrollment hygiene (Story 9.3):
+
+- Mint join tokens with the shortest lifetime the operation allows (`ttl_seconds`, default one hour, cap 24 hours) and bind them to the expected node name and source CIDR whenever they are known.
+- Hand the token to the joining node through a file with mode 0600, standard input, or `LORICA_JOIN_TOKEN`; never on a command line, never in a ticket. `lorica cluster join` refuses a token on argv.
+- The same goes for the admin password every management CLI command needs (`unban`, `upgrade`, `cluster token`, `cluster leave`, `cluster status`): use `--password-file` (mode 0600), `--password-stdin` or `LORICA_ADMIN_PASSWORD`; `--password` on argv only prints a warning. An explicit source wins over the environment variable.
+- Leave `--cluster-auto-activate` off in production: review each `pending` node in the roster and activate it deliberately.
+- Revoke decommissioned nodes on the control plane before wiping them (`DELETE /api/v1/cluster/nodes/{id}`); `lorica cluster leave` on the node then proves the deregistration and wipes the fleet identity.
+- Revocation cuts access, not possession: a revoked node keeps the certificate private keys it was entitled to. The revocation response and the `cluster.node.revoke` audit row list them as `certificates_to_reissue`; re-issue every one before considering the incident closed. A node you cannot run `leave` on is exactly the case this bullet is for.
+
 ### Firewall Rules
 
 ```bash
@@ -41,6 +59,32 @@ iptables -A INPUT -p tcp --dport 8443 -j ACCEPT
 
 # Block management from network (redundant with localhost binding, defense-in-depth)
 iptables -A INPUT -p tcp --dport 9443 -j DROP
+
+# Cluster plane (control plane only, when --cluster-listen is set):
+# default-deny, then allow ONLY enrolled-node sources on the
+# operational port. 192.0.2.10 / 192.0.2.11 stand in for your
+# followers' addresses.
+iptables -A INPUT -p tcp --dport 9444 -s 192.0.2.10 -j ACCEPT
+iptables -A INPUT -p tcp --dport 9444 -s 192.0.2.11 -j ACCEPT
+iptables -A INPUT -p tcp --dport 9444 -j DROP
+# Enrollment listener (cluster port + 1): closed by default. During
+# an enrollment window, insert a temporary allow for the joining
+# node's address ahead of the drop, and remove it once the token is
+# burned.
+iptables -I INPUT -p tcp --dport 9445 -s 192.0.2.12 -j ACCEPT
+iptables -A INPUT -p tcp --dport 9445 -j DROP
+```
+
+The same policy in nftables form:
+
+```bash
+nft add rule inet filter input tcp dport { 8080, 8443 } accept
+nft add rule inet filter input tcp dport 9443 drop
+nft add rule inet filter input ip saddr { 192.0.2.10, 192.0.2.11 } tcp dport 9444 accept
+nft add rule inet filter input tcp dport 9444 drop
+# Enrollment window only (remove after the token is burned):
+nft add rule inet filter input ip saddr 192.0.2.12 tcp dport 9445 accept
+nft add rule inet filter input tcp dport 9445 drop
 ```
 
 ## 2. TLS Configuration
@@ -223,3 +267,5 @@ Run this checklist periodically:
 - [ ] File permissions correct on data directory
 - [ ] Prometheus metrics collected by monitoring system
 - [ ] Config backup taken within last 7 days
+- [ ] (Clustered) Cluster port reachable from enrolled-node sources only
+- [ ] (Clustered) No enrollment window left open (no live join token, enrollment listener closed)

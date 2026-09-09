@@ -648,14 +648,16 @@ fi
 # =============================================================================
 log "=== 10. Prometheus Metrics ==="
 
-METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics" 2>/dev/null || true)
+# Authenticated with the dashboard session: `metrics_require_auth` is
+# on by default since v1.7.0, and the base suite owns the 401 assertion.
+METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" "$API/metrics" 2>/dev/null || true)
 if [ "$METRICS_STATUS" = "200" ]; then
     ok "Prometheus /metrics accessible in worker mode"
 else
     fail "Prometheus /metrics should return 200 (got $METRICS_STATUS)"
 fi
 
-METRICS_BODY=$(curl -sf "$API/metrics" 2>/dev/null || echo "")
+METRICS_BODY=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null || echo "")
 if echo "$METRICS_BODY" | grep -q "lorica_http_requests_total" 2>/dev/null; then
     ok "Workers: metrics contain request counters"
 else
@@ -1083,7 +1085,7 @@ for i in $(seq 1 5); do
 done
 sleep 2
 
-METRICS_BODY=$(curl -sf "$API/metrics" 2>/dev/null || echo "")
+METRICS_BODY=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null || echo "")
 
 if echo "$METRICS_BODY" | grep -q "lorica_requests_total" 2>/dev/null; then
     ok "Worker metrics: lorica_requests_total present"
@@ -1346,7 +1348,7 @@ sleep 2
 
 mp_counter() {
     local labels="$1"
-    curl -s "$API/metrics" 2>/dev/null \
+    curl -s -b "$SESSION" "$API/metrics" 2>/dev/null \
         | grep "^lorica_supervisor_rpc_outcome_total{${labels}}" \
         | awk '{print $2}' | head -1
 }
@@ -1363,7 +1365,7 @@ sleep 1
 
 # Two scrapes in a row: second should dedup within the 250 ms window
 # but the counter must have incremented at least once.
-curl -s "$API/metrics" > /dev/null 2>&1 || true
+curl -s -b "$SESSION" "$API/metrics" > /dev/null 2>&1 || true
 MP_AFTER=$(mp_counter 'kind="metrics_pull",outcome="ok"')
 MP_AFTER=${MP_AFTER:-0}
 
@@ -1393,7 +1395,7 @@ api_del "/api/v1/backends/$MP_B_ID" >/dev/null 2>&1
 # fires on partial-failure paths so it is soft-checked.
 log "=== 19f. Supervisor RPC Outcomes ==="
 
-RPC_METRICS=$(curl -s "$API/metrics" 2>/dev/null || echo "")
+RPC_METRICS=$(curl -s -b "$SESSION" "$API/metrics" 2>/dev/null || echo "")
 for kind in metrics_pull config_reload_prepare config_reload_commit; do
     if echo "$RPC_METRICS" | grep -q "^lorica_supervisor_rpc_outcome_total{[^}]*kind=\"${kind}\""; then
         ok "Supervisor RPC outcome: kind=${kind} is exposed"
@@ -1406,7 +1408,7 @@ done
 # least once (an empty-state PUT counts as a reload).
 api_put "/api/v1/settings" "{}" >/dev/null 2>&1 || true
 sleep 1
-RPC_RELOAD_OK=$(curl -s "$API/metrics" 2>/dev/null \
+RPC_RELOAD_OK=$(curl -s -b "$SESSION" "$API/metrics" 2>/dev/null \
     | grep '^lorica_supervisor_rpc_outcome_total{[^}]*kind="config_reload_commit",outcome="ok"' \
     | awk '{print $2}' | head -1)
 RPC_RELOAD_OK=${RPC_RELOAD_OK:-0}
@@ -1447,7 +1449,7 @@ FAC_R_ID=$(echo "$FAC_R" | jq -r '.data.id')
 sleep 2
 
 fac_hit_count() {
-    curl -s "$API/metrics" 2>/dev/null \
+    curl -s -b "$SESSION" "$API/metrics" 2>/dev/null \
         | grep '^lorica_forward_auth_cache_total{[^}]*outcome="hit"' \
         | awk '{ sum += $2 } END { print sum+0 }'
 }

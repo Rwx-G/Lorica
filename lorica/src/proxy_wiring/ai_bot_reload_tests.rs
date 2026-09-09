@@ -15,7 +15,12 @@ use lorica_config::ConfigStore;
 use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use crate::ai_bot::BUILTIN_CRAWLERS;
 
-fn custom(name: &str, pattern: &str, verification: CustomVerification, enabled: bool) -> CustomCrawler {
+fn custom(
+    name: &str,
+    pattern: &str,
+    verification: CustomVerification,
+    enabled: bool,
+) -> CustomCrawler {
     let now = Utc::now();
     CustomCrawler {
         id: 0,
@@ -74,7 +79,11 @@ fn custom_wins_on_name_conflict() {
 
     let gptbot_entries: Vec<&MergedCrawler> =
         registry.iter().filter(|c| c.name == "GPTBot").collect();
-    assert_eq!(gptbot_entries.len(), 1, "custom must replace, not duplicate");
+    assert_eq!(
+        gptbot_entries.len(),
+        1,
+        "custom must replace, not duplicate"
+    );
     assert!(
         matches!(gptbot_entries[0].verification, MergedVerification::UaOnly),
         "custom verification must win over the built-in IpRanges"
@@ -89,7 +98,12 @@ fn malformed_regex_row_skipped_registry_intact() {
     // loads, the invalid is dropped, and the entire built-in registry
     // survives - the rebuild never aborts on bad operator input.
     let rows = vec![
-        custom("GoodBot", r"(?i)\bGoodBot\b", CustomVerification::UaOnly, true),
+        custom(
+            "GoodBot",
+            r"(?i)\bGoodBot\b",
+            CustomVerification::UaOnly,
+            true,
+        ),
         custom("BadBot", r"[invalid", CustomVerification::UaOnly, true),
     ];
     let registry = ai_bot_merged::build_merged(&rows);

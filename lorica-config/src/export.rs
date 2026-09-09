@@ -71,9 +71,7 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
             // a literal `Bearer <token>` / `Basic <base64>`.
             if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&nc.config) {
                 let mutated = match nc.channel {
-                    NotificationChannel::Email => {
-                        scrub_secret_field(&mut val, "smtp_password")
-                    }
+                    NotificationChannel::Email => scrub_secret_field(&mut val, "smtp_password"),
                     NotificationChannel::Webhook | NotificationChannel::Slack => {
                         // `url` carries the secret in the path for
                         // Slack / Discord / Teams webhooks.
@@ -113,6 +111,26 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
     let mut global_settings = store.get_global_settings()?;
     if !global_settings.bot_hmac_secret_hex.is_empty() {
         global_settings.bot_hmac_secret_hex = REDACTED.into();
+    }
+
+    // Log-sink secrets (Story 9.8 AC #8): the syslog mTLS client key
+    // and the OTLP logs Authorization header are credentials for the
+    // operator's log pipeline. Same treatment as the bot HMAC secret;
+    // import rejects the placeholder so a round-trip cannot clear a
+    // live credential silently.
+    if global_settings.syslog_tls_client_key_pem.is_some() {
+        global_settings.syslog_tls_client_key_pem = Some(REDACTED.into());
+    }
+    if global_settings.otlp_logs_auth_header.is_some() {
+        global_settings.otlp_logs_auth_header = Some(REDACTED.into());
+    }
+    // The `/metrics` bearer token (Story 8.8), missed when the API
+    // mask was written and found at the Epic 9 close: the export is
+    // the second serialisation route, and since v1.7.0 it is served
+    // on every follower at the Operator floor while the token is the
+    // only authentication `/metrics` has.
+    if global_settings.prometheus_scrape_token.is_some() {
+        global_settings.prometheus_scrape_token = Some(REDACTED.into());
     }
 
     let data = ExportData {

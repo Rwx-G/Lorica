@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// [`EncryptionKey`](crate::EncryptionKey) is configured. `is_acme` /
 /// `acme_*` fields drive the ACME renewal loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Certificate {
     /// Stable UUID; primary key of the `certificates` table.
     pub id: String,
@@ -47,6 +48,7 @@ pub struct Certificate {
 /// Instead of storing DNS credentials on each certificate, providers are
 /// configured once and referenced by ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnsProvider {
     /// Stable UUID; primary key of the `dns_providers` table.
     pub id: String,

@@ -34,11 +34,38 @@ impl Default for AcmeConfig {
 
 impl AcmeConfig {
     /// Return the ACME directory URL (staging or production).
-    pub fn directory_url(&self) -> &str {
+    ///
+    /// `LORICA_ACME_DIRECTORY_URL`, when set and non-empty, overrides
+    /// both built-in Let's Encrypt directories. This covers private
+    /// ACME CAs (step-ca, Pebble) whose directory does not live at
+    /// the Let's Encrypt `/directory` path; the Docker e2e suite
+    /// relies on it to target its local Pebble fixture.
+    pub fn directory_url(&self) -> String {
+        if let Ok(url) = std::env::var("LORICA_ACME_DIRECTORY_URL") {
+            let url = url.trim();
+            if !url.is_empty() {
+                if url.starts_with("https://") {
+                    // WARN, not info: redirecting issuance to another
+                    // CA is a trust decision that must be unmistakable
+                    // in the journal, not silent success.
+                    tracing::warn!(
+                        directory = %url,
+                        "ACME directory overridden by LORICA_ACME_DIRECTORY_URL"
+                    );
+                    return url.to_string();
+                }
+                // Fail closed toward the trusted default: a cleartext
+                // or malformed directory must not weaken issuance.
+                tracing::error!(
+                    directory = %url,
+                    "ignoring LORICA_ACME_DIRECTORY_URL: only https:// directories are accepted"
+                );
+            }
+        }
         if self.staging {
-            "https://acme-staging-v02.api.letsencrypt.org/directory"
+            "https://acme-staging-v02.api.letsencrypt.org/directory".to_string()
         } else {
-            "https://acme-v02.api.letsencrypt.org/directory"
+            "https://acme-v02.api.letsencrypt.org/directory".to_string()
         }
     }
 }

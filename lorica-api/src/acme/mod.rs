@@ -38,6 +38,7 @@
 mod dns01;
 mod dns01_manual;
 mod expiry;
+mod fleet;
 mod http01;
 mod renewal;
 mod store;
@@ -59,7 +60,27 @@ pub use dns01_manual::{
     AcmeDnsManualConfirmRequest, AcmeDnsManualRequest,
 };
 pub use expiry::{check_cert_expiry, spawn_cert_expiry_check_task};
+pub use fleet::FleetHttp01Solver;
 pub use http01::{provision_certificate, serve_challenge, AcmeProvisionRequest};
 pub use renewal::{renew_certificate, spawn_renewal_task, superseded_orphans};
-pub use store::AcmeChallengeStore;
+pub use store::{AcmeChallengeStore, CHALLENGE_TTL};
 pub use types::{PendingDnsChallenge, PendingDnsChallenges};
+
+/// The shared tail of every certificate issuance path (HTTP-01,
+/// DNS-01, manual DNS-01, and renewal).
+///
+/// One call site rather than four copies, for the same reason
+/// `run_api_server` exists: the v1.5.2 cert-hotswap bug came from a
+/// spawn added to one path and missed in another. Story 9.5 adds the
+/// fleet push here, so a new issuance path cannot forget it.
+///
+/// The push is best effort (Story 9.5 D2): a node that is down or slow
+/// is absent from the round and asks for what it lacks after its next
+/// configuration apply, so nothing here can fail the issuance that
+/// just succeeded. On a node that is not a control plane it does
+/// nothing at all.
+pub(crate) async fn after_certificate_issued(state: &crate::server::AppState, cert_id: &str) {
+    state.rotate_bot_hmac_on_cert_event().await;
+    state.notify_config_changed();
+    crate::cluster::runtime::distribute_certificate(&state.cluster, &state.store, cert_id).await;
+}

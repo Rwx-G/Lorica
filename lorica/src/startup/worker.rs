@@ -163,6 +163,13 @@ pub(crate) fn run_worker(
     // supervisor has its own init (for API / health spans).
     rt.block_on(try_init_otel_from_settings(&store, "worker"));
 
+    // Story 9.8: install this worker's log-export sinks at boot
+    // (access logs and WAF events are produced in the worker
+    // process). Reloads refresh them via
+    // apply_per_process_reload_state in the two-phase commit handler
+    // and the legacy fallback.
+    rt.block_on(lorica::reload::apply_log_sinks_from_store(&store));
+
     // Build CertResolver for TLS termination in worker
     let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
     rt.block_on(worker_load_certs_into_resolver(&store, &cert_resolver, id));
@@ -820,17 +827,7 @@ async fn worker_load_certs_into_resolver(
     if certs.is_empty() {
         return;
     }
-    let cert_data: Vec<lorica_tls::cert_resolver::CertData> = certs
-        .iter()
-        .map(|c| lorica_tls::cert_resolver::CertData {
-            domain: c.domain.clone(),
-            san_domains: c.san_domains.clone(),
-            cert_pem: c.cert_pem.clone(),
-            key_pem: c.key_pem.clone(),
-            not_after_epoch: c.not_after.timestamp(),
-            ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
-        })
-        .collect();
+    let cert_data = lorica::reload::cert_data_for_resolver(&certs);
     match cert_resolver.reload(cert_data) {
         Ok(stats) => {
             if stats.skipped > 0 {
@@ -856,7 +853,10 @@ async fn worker_load_certs_into_resolver(
 /// supervisor owns the Data-Shield fetch), the disabled-rule set, and any
 /// custom rules. Synchronous - called outside a runtime, so it takes the
 /// store's blocking lock.
-fn worker_restore_waf_state(store: &Arc<Mutex<ConfigStore>>, waf_engine: &Arc<lorica_waf::WafEngine>) {
+fn worker_restore_waf_state(
+    store: &Arc<Mutex<ConfigStore>>,
+    waf_engine: &Arc<lorica_waf::WafEngine>,
+) {
     let s = store.blocking_lock();
     if let Ok(settings) = s.get_global_settings() {
         if settings.ip_blocklist_enabled {

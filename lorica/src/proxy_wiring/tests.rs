@@ -69,6 +69,7 @@ fn make_route(id: &str, hostname: &str, path: &str, enabled: bool) -> Route {
         geoip: None,
         bot_protection: None,
         group_name: String::new(),
+        node_selector: Vec::new(),
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
@@ -653,7 +654,10 @@ fn test_ewma_tracker_explores_unscored_bounded() {
     }
     // Tickets 0 and 10 explore the unscored backend (index 1); the other 18
     // exploit the only scored backend (index 0).
-    assert_eq!(picks[1], 2, "unscored backend explored on exactly 2 of 20 calls");
+    assert_eq!(
+        picks[1], 2,
+        "unscored backend explored on exactly 2 of 20 calls"
+    );
     assert_eq!(picks[0], 18, "exploit picks the scored backend the rest");
 }
 
@@ -2254,11 +2258,7 @@ fn test_should_rewrite_response_skips_grpc_family() {
         "application/grpc-web-text",
         ""
     ));
-    assert!(!should_rewrite_response(
-        &cfg,
-        "application/grpc+proto",
-        ""
-    ));
+    assert!(!should_rewrite_response(&cfg, "application/grpc+proto", ""));
     // Regular JSON on the same prefix list is still rewritten.
     assert!(should_rewrite_response(&cfg, "application/json", ""));
 }

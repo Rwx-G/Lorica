@@ -445,10 +445,7 @@ impl WorkerManager {
     /// task on the same runtime (heartbeats from peer workers, API
     /// requests, OTel exports). The split lets the caller use
     /// `tokio::time::sleep` instead.
-    pub fn restart_worker(
-        &mut self,
-        id: u32,
-    ) -> Result<Option<(OwnedFd, OwnedFd)>, WorkerError> {
+    pub fn restart_worker(&mut self, id: u32) -> Result<Option<(OwnedFd, OwnedFd)>, WorkerError> {
         // Retrieve the old handle's backoff state
         let (prev_restart_count, prev_spawned_at) = self
             .workers
@@ -493,15 +490,11 @@ impl WorkerManager {
 
         // Take BOTH the cmd_fd AND the rpc_fd of the newly spawned
         // worker (audit C-1 closure - see fn-doc above).
-        let fds = self
-            .workers
-            .iter_mut()
-            .find(|w| w.id == id)
-            .and_then(|w| {
-                let cmd = w.take_cmd_fd()?;
-                let rpc = w.take_rpc_fd()?;
-                Some((cmd, rpc))
-            });
+        let fds = self.workers.iter_mut().find(|w| w.id == id).and_then(|w| {
+            let cmd = w.take_cmd_fd()?;
+            let rpc = w.take_rpc_fd()?;
+            Some((cmd, rpc))
+        });
         Ok(fds)
     }
 

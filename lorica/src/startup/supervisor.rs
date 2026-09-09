@@ -88,6 +88,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 info!(
                     proxy_listeners = i.proxy.len(),
                     has_management = i.management.is_some(),
+                    // The operational cluster listener is handed off
+                    // (Story 9.2); the enrollment one is not (its
+                    // socket is only bound while a join token is
+                    // live, and it rebinds on the next liveness edge).
+                    cluster_listeners = i.cluster.len(),
                     "hot upgrade: pulled inherited listeners from outgoing supervisor"
                 );
                 Some(i)
@@ -135,9 +140,29 @@ pub(crate) fn run_supervisor(cli: Cli) {
             }
         };
         let db_path = data_dir.join("lorica.db");
-        if let Err(e) = ConfigStore::open(&db_path, encryption_key) {
-            error!(error = %e, "failed to run database migrations before forking workers");
-            std::process::exit(1);
+        match ConfigStore::open(&db_path, encryption_key) {
+            Ok(store) => {
+                // Story 9.1 AC #7 interlock: a NEW supervisor taking
+                // over via --hot-upgrade bumps the takeover epoch
+                // BEFORE it serves anything. Cluster sessions (Story
+                // 9.2) tag themselves with the epoch they were
+                // accepted under and the registry fences older
+                // epochs, so a follower never holds two live sessions
+                // for one node_id during the old/new overlap.
+                if cli.hot_upgrade {
+                    match store.increment_cluster_takeover_epoch() {
+                        Ok(epoch) => info!(epoch, "hot upgrade: took cluster takeover epoch"),
+                        Err(e) => {
+                            error!(error = %e, "hot upgrade: failed to take cluster takeover epoch");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "failed to run database migrations before forking workers");
+                std::process::exit(1);
+            }
         }
         info!("database migrations completed, forking workers");
     }
@@ -440,7 +465,12 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // `lorica_ban_broadcast_lagged_total{worker_id}` Prometheus
         // counter and the ban is still persisted to SQLite, so the
         // next `ConfigReload` picks it up.
-        let (ban_bc_tx, _) = broadcast::channel::<(String, u64)>(1024);
+        // The reason rides with the ban (Story 9.6 AC #10): a
+        // fleet-wide operator ban and a local WAF auto-ban are
+        // different events, and a worker that labelled every ban as
+        // an auto-ban would make the two indistinguishable in
+        // `GET /api/v1/bans` and in the fleet view.
+        let (ban_bc_tx, _) = broadcast::channel::<(String, u64, i32)>(1024);
         // Clone for the API's watch-based reload signal
         let reload_bc_tx_clone = reload_bc_tx.clone();
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
@@ -793,7 +823,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
                                                             "global WAF auto-ban: IP banned for repeated violations"
                                                         );
                                                         // Broadcast BanIp to all workers
-                                                        let _ = ban_tx.send((event.client_ip.clone(), duration_s));
+                                                        let _ = ban_tx.send((
+                                                            event.client_ip.clone(),
+                                                            duration_s,
+                                                            lorica_api::ban::BanReason::WafCriticalRule.as_i32(),
+                                                        ));
                                                         // Dispatch ip_banned alert
                                                         alert_tx.send(
                                                             lorica_notify::AlertEvent::new(
@@ -943,6 +977,73 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // Capacity 1: a second upgrade while one is in flight is shed.
         let (upgrade_tx, mut upgrade_rx) =
             tokio::sync::mpsc::channel::<lorica_api::upgrade::StagedBinary>(1);
+        // The fleet role (control plane, follower or standalone), shared
+        // by both startup modes: see `startup::spawn_cluster_runtime`.
+        // Spawned BEFORE the API so AppState carries it.
+        // On a hot upgrade the operational cluster SOCKET is adopted
+        // from the outgoing supervisor (Story 9.1's FD slot) so there
+        // is no rebind gap; its sessions reconnect once, to this
+        // process. Exactly one descriptor is adoptable (the
+        // operational one, when the plane is configured); every
+        // other inherited cluster descriptor is closed here so it
+        // cannot leak for the process lifetime. The enrollment socket
+        // is never handed off: it only exists while a join token is
+        // live and rebinds on the next liveness edge.
+        let mut inherited_operational: Option<(String, RawFd)> = None;
+        if let Some(inherited) = inherited.as_ref() {
+            for (role, bind, fd) in &inherited.cluster {
+                let adoptable = *role == hot_upgrade::ClusterListenerRole::Operational
+                    && hu_cli.cluster_listen.is_some()
+                    && inherited_operational.is_none();
+                if adoptable {
+                    inherited_operational = Some((bind.clone(), *fd));
+                } else {
+                    info!(?role, %bind, "hot upgrade: closing an inherited cluster listener this process does not adopt");
+                    startup::cluster_plane::close_inherited_fd(*fd);
+                }
+            }
+        }
+        let startup::ClusterStartup {
+            plane: mut cluster_plane,
+            follower: mut follower_plane,
+            runtime: cluster_runtime,
+        } = startup::spawn_cluster_runtime(
+            startup::cluster_plane::ClusterPlaneOptions {
+                cluster_listen: hu_cli.cluster_listen.clone(),
+                enrollment_listen: hu_cli.cluster_enrollment_listen.clone(),
+                advertise: hu_cli.cluster_advertise.clone(),
+                listen_any: hu_cli.cluster_listen_any,
+                reserved: crate::cli::ReservedPorts {
+                    management: management_port,
+                    http: hu_cli.http_port,
+                    https: hu_cli.https_port,
+                },
+                inherited_operational,
+                auto_activate: hu_cli.cluster_auto_activate,
+                log_store: log_store.clone(),
+                alert_sender: alert_sender.clone(),
+                config_reload: config_reload_tx.clone(),
+                data_dir: PathBuf::from(&hu_cli.data_dir),
+            },
+            &store,
+            // Supervisor mode: the ban map lives in each worker, so a
+            // fleet-wide ban rides the same broadcast the local WAF
+            // auto-ban uses and lands as a `BanIp` command.
+            startup::cluster_follower::BanApplier::Workers {
+                broadcast: ban_bc_tx.clone(),
+                reports: Arc::clone(&aggregated_metrics),
+            },
+        )
+        .await;
+
+        // Captured before `cluster_runtime` moves into the API task:
+        // only a control plane has a fan-in store, and the retention
+        // loop below needs it.
+        let fleet_telemetry = match &cluster_runtime {
+            lorica_api::cluster::ClusterRuntime::ControlPlane(runtime) => runtime.telemetry.clone(),
+            _ => None,
+        };
+
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -976,6 +1077,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 log_store: api_log_store,
                 log_writer: None,
                 task_tracker: api_task_tracker,
+                cluster: cluster_runtime,
             };
             // Session store + ACME auto-renewal + cert-expiry notifier
             // + server loop, shared with single-process mode (audit
@@ -990,7 +1092,14 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // events, SLA buckets), shared across modes (audit H-9, see
         // `startup::spawn_retention_loop`). No-op when the access-log
         // store failed to open.
-        startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
+        startup::spawn_retention_loop(
+            log_store.clone(),
+            Arc::clone(&store),
+            // Only a control plane holds a fan-in store; every other
+            // role passes `None` and the per-node quota is skipped.
+            fleet_telemetry,
+        );
+
 
         // Worker monitoring loop (crash detection and restart with backoff)
         let manager = Arc::new(std::sync::Mutex::new(manager));
@@ -1264,6 +1373,14 @@ pub(crate) fn run_supervisor(cli: Cli) {
             tokio::select! {
                 _ = shutdown_signal() => {
                     info!("supervisor shutting down");
+                    // Stop accepting cluster sessions and tear down the
+                    // established ones before the workers drain.
+                    if let Some(plane) = cluster_plane.take() {
+                        plane.shutdown();
+                    }
+                    if let Some(follower) = follower_plane.take() {
+                        follower.shutdown();
+                    }
                     // CRITICAL ordering: stop the worker monitor BEFORE
                     // telling workers to drain. The monitor respawns
                     // crashed workers; during shutdown the SIGKILL we
@@ -1346,6 +1463,13 @@ pub(crate) fn run_supervisor(cli: Cli) {
                         proxy_fds: handoff_proxy_fds.clone(),
                         management_fd: mgmt_handoff_fd,
                         management_port,
+                        // The operational cluster listener rides the
+                        // same FD handoff as the proxy sockets; the
+                        // enrollment one is rebound by the new side.
+                        cluster_fds: cluster_plane
+                            .as_ref()
+                            .map(|plane| plane.handoff_fds())
+                            .unwrap_or_default(),
                         child_argv,
                     })
                     .await;
@@ -1353,6 +1477,19 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     match run.decision {
                         hot_upgrade::HandoffDecision::Drain => {
                             info!("hot upgrade: new supervisor is up; draining old workers");
+                            // The new supervisor owns its own dup of
+                            // the cluster socket and serves the new
+                            // takeover epoch: stop accepting and end
+                            // every session here NOW, so no follower
+                            // lands a session on a process that is
+                            // about to exit (it would be stamped with
+                            // the old epoch and cut without a goodbye).
+                            if let Some(plane) = cluster_plane.take() {
+                                plane.shutdown();
+                            }
+                            if let Some(follower) = follower_plane.take() {
+                                follower.shutdown();
+                            }
                             // Stop the monitor so a drained worker is not
                             // seen as a crash and respawned.
                             shutting_down.store(true, std::sync::atomic::Ordering::Release);
@@ -1442,6 +1579,25 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             let _ = std::fs::remove_file(hot_upgrade::transfer_sock_path(&data_dir_path));
                             let _ = std::fs::remove_file(hot_upgrade::ready_sock_path(&data_dir_path));
                             let _ = std::fs::remove_file(hot_upgrade::ack_sock_path(&data_dir_path));
+                            // The failed NEW supervisor already bumped the
+                            // persisted takeover epoch during its boot, so
+                            // under Story 9.2's "fence sessions from older
+                            // epochs" rule the SURVIVING supervisor's
+                            // sessions would be the ones fenced - the
+                            // interlock inverting on exactly the path it
+                            // exists to protect. Re-take the epoch so the
+                            // survivor is newest again ("newest writer
+                            // wins" is preserved: we still own the DB).
+                            match store.lock().await.increment_cluster_takeover_epoch() {
+                                Ok(epoch) => info!(
+                                    epoch,
+                                    "hot upgrade: re-took cluster takeover epoch after rollback"
+                                ),
+                                Err(e) => warn!(
+                                    error = %e,
+                                    "hot upgrade: failed to re-take cluster takeover epoch after rollback"
+                                ),
+                            }
                             lorica_api::metrics::record_hot_upgrade(reason.metric_outcome());
                             error!(
                                 reason = reason.metric_outcome(),
@@ -1477,7 +1633,10 @@ async fn supervisor_restore_waf_state(
     if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
         if !disabled_ids.is_empty() {
             waf_engine.set_disabled_rules(&disabled_ids);
-            info!(count = disabled_ids.len(), "supervisor: WAF disabled rules restored");
+            info!(
+                count = disabled_ids.len(),
+                "supervisor: WAF disabled rules restored"
+            );
         }
     }
     if let Ok(custom_rules) = s.load_waf_custom_rules() {
@@ -1488,7 +1647,10 @@ async fn supervisor_restore_waf_state(
             let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
         }
         if !custom_rules.is_empty() {
-            info!(count = custom_rules.len(), "supervisor: WAF custom rules restored");
+            info!(
+                count = custom_rules.len(),
+                "supervisor: WAF custom rules restored"
+            );
         }
     }
 }
@@ -1503,7 +1665,7 @@ fn spawn_worker_channel_task(
     worker_id: u32,
     worker_pid: i32,
     mut channel: lorica_command::CommandChannel,
-    mut ban_rx: tokio::sync::broadcast::Receiver<(String, u64)>,
+    mut ban_rx: tokio::sync::broadcast::Receiver<(String, u64, i32)>,
     mut reload_rx: tokio::sync::broadcast::Receiver<u64>,
     hb_seq: Arc<std::sync::atomic::AtomicU64>,
     hb_shutting_down: Arc<std::sync::atomic::AtomicBool>,
@@ -1513,218 +1675,212 @@ fn spawn_worker_channel_task(
     use lorica_command::{Command, CommandType, Response};
     use std::sync::atomic::Ordering;
     tokio::spawn(async move {
-                let heartbeat_interval = Duration::from_secs(5);
-                let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
-                heartbeat_timer.tick().await; // skip first immediate tick
+        let heartbeat_interval = Duration::from_secs(5);
+        let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
+        heartbeat_timer.tick().await; // skip first immediate tick
 
-
-                loop {
-                    tokio::select! {
-                        // BanIp command from supervisor's global WAF counter
-                        ban_result = ban_rx.recv() => {
-                            match ban_result {
-                                Ok((ip, duration_s)) => {
-                                    let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
-                                    let cmd = Command::ban_ip(
-                                        seq,
-                                        &ip,
-                                        duration_s,
-                                        lorica_api::ban::BanReason::WafCriticalRule.as_i32(),
-                                    );
-                                    if let Err(e) = channel.send(&cmd).await {
-                                        warn!(worker_id, error = %e, "BanIp send failed");
-                                        continue;
-                                    }
-                                    match channel.recv::<Response>().await {
-                                        Ok(resp) => match resp.typed_status() {
-                                            lorica_command::ResponseStatus::Ok => {
-                                                info!(worker_id, ip = %ip, "worker applied BanIp");
-                                            }
-                                            lorica_command::ResponseStatus::Error => {
-                                                error!(worker_id, message = %resp.message, "worker BanIp failed");
-                                            }
-                                            _ => {}
-                                        },
-                                        Err(e) => warn!(worker_id, error = %e, "BanIp response failed"),
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    // Subscriber fell behind the bounded channel.
-                                    // The missed bans are still in SQLite (auto-
-                                    // ban logic persists before broadcasting),
-                                    // and the next ConfigReload rehydrates them.
-                                    warn!(
-                                        worker_id,
-                                        dropped = n,
-                                        "BanIp broadcast lagged; missed bans will be applied via next ConfigReload"
-                                    );
-                                    lorica_api::metrics::inc_ban_broadcast_lagged(
-                                        &worker_id.to_string(),
-                                        n,
-                                    );
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    break;
-                                }
-                            }
-                        }
-                        // Config reload triggered by API.
-                        //
-                        // Use an explicit `match` on `reload_rx.recv()` instead
-                        // of the convenience `Ok(seq) = ...` pattern so that a
-                        // `RecvError::Lagged(n)` is surfaced (counter + warn +
-                        // catch-up reload) instead of silently disabling the
-                        // branch for this select iteration. Without this, a
-                        // burst > the broadcast capacity (16 today) leaves the
-                        // worker on a stale config with zero log, zero metric,
-                        // zero notification (audit C-2 ; mirrors the BanIp
-                        // arm above).
-                        reload_result = reload_rx.recv() => {
-                            let seq = match reload_result {
-                                Ok(s) => s,
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    warn!(
-                                        worker_id,
-                                        dropped = n,
-                                        "ConfigReload broadcast lagged ; issuing catch-up reload to bring worker to latest DB state"
-                                    );
-                                    lorica_api::metrics::inc_reload_broadcast_lagged(
-                                        &worker_id.to_string(),
-                                        n,
-                                    );
-                                    // Synthesize a single catch-up reload with
-                                    // a fresh sequence number from the per-
-                                    // worker counter so the seq stays unique
-                                    // on this command channel.
-                                    hb_seq.fetch_add(1, Ordering::Relaxed)
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    break;
-                                }
-                            };
-                            let cmd = Command::new(CommandType::ConfigReload, seq);
+        loop {
+            tokio::select! {
+                // BanIp command from supervisor's global WAF counter
+                ban_result = ban_rx.recv() => {
+                    match ban_result {
+                        Ok((ip, duration_s, reason)) => {
+                            let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                            let cmd = Command::ban_ip(seq, &ip, duration_s, reason);
                             if let Err(e) = channel.send(&cmd).await {
-                                warn!(worker_id, error = %e, "config reload send failed");
+                                warn!(worker_id, error = %e, "BanIp send failed");
                                 continue;
                             }
                             match channel.recv::<Response>().await {
                                 Ok(resp) => match resp.typed_status() {
                                     lorica_command::ResponseStatus::Ok => {
-                                        info!(worker_id, seq, "worker applied config reload");
+                                        info!(worker_id, ip = %ip, "worker applied BanIp");
                                     }
                                     lorica_command::ResponseStatus::Error => {
-                                        error!(worker_id, message = %resp.message, "worker config reload failed");
-                                    }
-                                    lorica_command::ResponseStatus::Processing => {
-                                        info!(worker_id, message = %resp.message, "worker processing config reload");
+                                        error!(worker_id, message = %resp.message, "worker BanIp failed");
                                     }
                                     _ => {}
                                 },
-                                Err(e) => warn!(worker_id, error = %e, "config reload response failed"),
+                                Err(e) => warn!(worker_id, error = %e, "BanIp response failed"),
                             }
                         }
-                        // Periodic heartbeat
-                        _ = heartbeat_timer.tick() => {
-                            // Skip the probe entirely once the supervisor is
-                            // tearing down: workers are SIGTERM'd in the same
-                            // instant, so any send would race the worker's
-                            // exit and log a spurious "Broken pipe" warning.
-                            if hb_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
-                                continue;
-                            }
-                            let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
-                            let cmd = Command::new(CommandType::Heartbeat, seq);
-                            let start = Instant::now();
-                            if let Err(e) = channel.send(&cmd).await {
-                                warn!(worker_id, error = %e, "heartbeat send failed");
-                                continue;
-                            }
-                            match channel.recv::<Response>().await {
-                                Ok(_) => {
-                                    let latency_ms = start.elapsed().as_millis() as u64;
-                                    hb_metrics.record_heartbeat(worker_id, worker_pid, latency_ms).await;
-
-                                    // Request metrics from this worker
-                                    let m_seq = hb_seq.fetch_add(1, Ordering::Relaxed);
-                                    let m_cmd = Command::new(CommandType::MetricsRequest, m_seq);
-                                    if let Err(e) = channel.send(&m_cmd).await {
-                                        warn!(worker_id, error = %e, "metrics request send failed");
-                                    } else if let Ok(report) = channel.recv::<lorica_command::MetricsReport>().await {
-                                        // Consume the Response::ok that follows the report
-                                        let _ = channel.recv::<Response>().await;
-                                        let ewma: std::collections::HashMap<String, f64> = report
-                                            .ewma_entries
-                                            .iter()
-                                            .map(|e| (e.backend_address.clone(), e.score_us))
-                                            .collect();
-                                        let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
-                                            .ban_entries
-                                            .iter()
-                                            .map(decode_ban_report_entry)
-                                            .collect();
-                                        let backend_conns: std::collections::HashMap<String, u64> = report
-                                            .backend_conn_entries
-                                            .iter()
-                                            .map(|e| (e.backend_address.clone(), e.connections))
-                                            .collect();
-                                        let req_counts: Vec<(String, u32, u64)> = report
-                                            .request_entries
-                                            .iter()
-                                            .map(|e| (e.route_id.clone(), e.status_code, e.count))
-                                            .collect();
-                                        let waf_counts: Vec<(String, String, u64)> = report
-                                            .waf_entries
-                                            .iter()
-                                            .map(|e| (e.category.clone(), e.action.clone(), e.count))
-                                            .collect();
-                                        agg_metrics
-                                            .update_worker(
-                                                worker_id,
-                                                report.cache_hits,
-                                                report.cache_misses,
-                                                report.active_connections,
-                                                bans,
-                                                ewma,
-                                                backend_conns,
-                                                req_counts,
-                                                waf_counts,
-                                            )
-                                            .await;
-                                        // Cross-worker generic-counter
-                                        // aggregation (v1.4.0
-                                        // follow-up).
-                                        // Pair up the flat ["k","v","k","v",...]
-                                        // list back into (String, String) label
-                                        // pairs. Odd trailing entries are
-                                        // silently dropped — safe default
-                                        // since a truncated wire payload
-                                        // just skips the affected metric.
-                                        let gc: Vec<GenericCounterRow> =
-                                            report
-                                                .generic_counters
-                                                .iter()
-                                                .map(|e| {
-                                                    let pairs: Vec<(String, String)> = e
-                                                        .labels
-                                                        .chunks_exact(2)
-                                                        .map(|c| (c[0].clone(), c[1].clone()))
-                                                        .collect();
-                                                    (e.name.clone(), pairs, e.value)
-                                                })
-                                                .collect();
-                                        lorica_api::metrics::apply_worker_generic_counters(
-                                            worker_id,
-                                            &gc,
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(worker_id, error = %e, "heartbeat response failed - worker may be unresponsive");
-                                }
-                            }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // Subscriber fell behind the bounded channel.
+                            // The missed bans are still in SQLite (auto-
+                            // ban logic persists before broadcasting),
+                            // and the next ConfigReload rehydrates them.
+                            warn!(
+                                worker_id,
+                                dropped = n,
+                                "BanIp broadcast lagged; missed bans will be applied via next ConfigReload"
+                            );
+                            lorica_api::metrics::inc_ban_broadcast_lagged(
+                                &worker_id.to_string(),
+                                n,
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
                         }
                     }
                 }
+                // Config reload triggered by API.
+                //
+                // Use an explicit `match` on `reload_rx.recv()` instead
+                // of the convenience `Ok(seq) = ...` pattern so that a
+                // `RecvError::Lagged(n)` is surfaced (counter + warn +
+                // catch-up reload) instead of silently disabling the
+                // branch for this select iteration. Without this, a
+                // burst > the broadcast capacity (16 today) leaves the
+                // worker on a stale config with zero log, zero metric,
+                // zero notification (audit C-2 ; mirrors the BanIp
+                // arm above).
+                reload_result = reload_rx.recv() => {
+                    let seq = match reload_result {
+                        Ok(s) => s,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(
+                                worker_id,
+                                dropped = n,
+                                "ConfigReload broadcast lagged ; issuing catch-up reload to bring worker to latest DB state"
+                            );
+                            lorica_api::metrics::inc_reload_broadcast_lagged(
+                                &worker_id.to_string(),
+                                n,
+                            );
+                            // Synthesize a single catch-up reload with
+                            // a fresh sequence number from the per-
+                            // worker counter so the seq stays unique
+                            // on this command channel.
+                            hb_seq.fetch_add(1, Ordering::Relaxed)
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                    };
+                    let cmd = Command::new(CommandType::ConfigReload, seq);
+                    if let Err(e) = channel.send(&cmd).await {
+                        warn!(worker_id, error = %e, "config reload send failed");
+                        continue;
+                    }
+                    match channel.recv::<Response>().await {
+                        Ok(resp) => match resp.typed_status() {
+                            lorica_command::ResponseStatus::Ok => {
+                                info!(worker_id, seq, "worker applied config reload");
+                            }
+                            lorica_command::ResponseStatus::Error => {
+                                error!(worker_id, message = %resp.message, "worker config reload failed");
+                            }
+                            lorica_command::ResponseStatus::Processing => {
+                                info!(worker_id, message = %resp.message, "worker processing config reload");
+                            }
+                            _ => {}
+                        },
+                        Err(e) => warn!(worker_id, error = %e, "config reload response failed"),
+                    }
+                }
+                // Periodic heartbeat
+                _ = heartbeat_timer.tick() => {
+                    // Skip the probe entirely once the supervisor is
+                    // tearing down: workers are SIGTERM'd in the same
+                    // instant, so any send would race the worker's
+                    // exit and log a spurious "Broken pipe" warning.
+                    if hb_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                        continue;
+                    }
+                    let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                    let cmd = Command::new(CommandType::Heartbeat, seq);
+                    let start = Instant::now();
+                    if let Err(e) = channel.send(&cmd).await {
+                        warn!(worker_id, error = %e, "heartbeat send failed");
+                        continue;
+                    }
+                    match channel.recv::<Response>().await {
+                        Ok(_) => {
+                            let latency_ms = start.elapsed().as_millis() as u64;
+                            hb_metrics.record_heartbeat(worker_id, worker_pid, latency_ms).await;
+
+                            // Request metrics from this worker
+                            let m_seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                            let m_cmd = Command::new(CommandType::MetricsRequest, m_seq);
+                            if let Err(e) = channel.send(&m_cmd).await {
+                                warn!(worker_id, error = %e, "metrics request send failed");
+                            } else if let Ok(report) = channel.recv::<lorica_command::MetricsReport>().await {
+                                // Consume the Response::ok that follows the report
+                                let _ = channel.recv::<Response>().await;
+                                let ewma: std::collections::HashMap<String, f64> = report
+                                    .ewma_entries
+                                    .iter()
+                                    .map(|e| (e.backend_address.clone(), e.score_us))
+                                    .collect();
+                                let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
+                                    .ban_entries
+                                    .iter()
+                                    .map(decode_ban_report_entry)
+                                    .collect();
+                                let backend_conns: std::collections::HashMap<String, u64> = report
+                                    .backend_conn_entries
+                                    .iter()
+                                    .map(|e| (e.backend_address.clone(), e.connections))
+                                    .collect();
+                                let req_counts: Vec<(String, u32, u64)> = report
+                                    .request_entries
+                                    .iter()
+                                    .map(|e| (e.route_id.clone(), e.status_code, e.count))
+                                    .collect();
+                                let waf_counts: Vec<(String, String, u64)> = report
+                                    .waf_entries
+                                    .iter()
+                                    .map(|e| (e.category.clone(), e.action.clone(), e.count))
+                                    .collect();
+                                agg_metrics
+                                    .update_worker(
+                                        worker_id,
+                                        report.cache_hits,
+                                        report.cache_misses,
+                                        report.active_connections,
+                                        bans,
+                                        ewma,
+                                        backend_conns,
+                                        req_counts,
+                                        waf_counts,
+                                    )
+                                    .await;
+                                // Cross-worker generic-counter
+                                // aggregation (v1.4.0
+                                // follow-up).
+                                // Pair up the flat ["k","v","k","v",...]
+                                // list back into (String, String) label
+                                // pairs. Odd trailing entries are
+                                // silently dropped — safe default
+                                // since a truncated wire payload
+                                // just skips the affected metric.
+                                let gc: Vec<GenericCounterRow> =
+                                    report
+                                        .generic_counters
+                                        .iter()
+                                        .map(|e| {
+                                            let pairs: Vec<(String, String)> = e
+                                                .labels
+                                                .chunks_exact(2)
+                                                .map(|c| (c[0].clone(), c[1].clone()))
+                                                .collect();
+                                            (e.name.clone(), pairs, e.value)
+                                        })
+                                        .collect();
+                                lorica_api::metrics::apply_worker_generic_counters(
+                                    worker_id,
+                                    &gc,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(worker_id, error = %e, "heartbeat response failed - worker may be unresponsive");
+                        }
+                    }
+                }
+            }
+        }
     })
 }
 
@@ -2562,7 +2718,15 @@ async fn pull_all_metrics_via_rpc(
                     let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
                         .ban_entries
                         .iter()
-                        .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds, lorica_api::ban::BanReason::from_i32(b.reason).unwrap_or(lorica_api::ban::BanReason::WafCriticalRule)))
+                        .map(|b| {
+                            (
+                                b.ip.clone(),
+                                b.remaining_seconds,
+                                b.ban_duration_seconds,
+                                lorica_api::ban::BanReason::from_i32(b.reason)
+                                    .unwrap_or(lorica_api::ban::BanReason::WafCriticalRule),
+                            )
+                        })
                         .collect();
                     let backend_conns: std::collections::HashMap<String, u64> = report
                         .backend_conn_entries

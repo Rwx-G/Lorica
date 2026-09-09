@@ -62,7 +62,9 @@ pub enum UpgradeError {
 
     /// The configured public-key file does not hold a 32-byte Ed25519
     /// verifying key hex-encoded as 64 characters.
-    #[error("upgrade signing public key is malformed (expected 64 hex chars / 32-byte Ed25519 key)")]
+    #[error(
+        "upgrade signing public key is malformed (expected 64 hex chars / 32-byte Ed25519 key)"
+    )]
     BadPublicKey,
 
     /// The detached signature is not a 64-byte Ed25519 signature.
@@ -186,7 +188,8 @@ pub async fn load_signing_public_key(state: &AppState) -> Result<Vec<u8>, Upgrad
         return Err(UpgradeError::NoSigningKey);
     };
 
-    let raw: String = std::fs::read_to_string(&path).map_err(|e| UpgradeError::Io(e.to_string()))?;
+    let raw: String =
+        std::fs::read_to_string(&path).map_err(|e| UpgradeError::Io(e.to_string()))?;
     decode_public_key_hex(raw.trim())
 }
 
@@ -395,10 +398,9 @@ pub async fn upgrade_binary(
                 // contiguous owned buffer, so a `.to_vec()` here would
                 // duplicate the whole (up to 128 MiB) upload for no reason
                 // (audit M5). `Bytes` derefs to `&[u8]` for every consumer.
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| ApiError::BadRequest(format!("failed to read binary part: {e}")))?;
+                let bytes = field.bytes().await.map_err(|e| {
+                    ApiError::BadRequest(format!("failed to read binary part: {e}"))
+                })?;
                 binary = Some(bytes);
             }
             Some("signature") => {
@@ -489,7 +491,8 @@ mod tests {
         let key = signing_key(1);
         let binary = b"the next lorica release binary";
         let sig = key.sign(binary);
-        let result = verify_binary_signature(binary, &sig.to_bytes(), key.verifying_key().as_bytes());
+        let result =
+            verify_binary_signature(binary, &sig.to_bytes(), key.verifying_key().as_bytes());
         assert!(result.is_ok(), "a valid signature must verify: {result:?}");
     }
 
@@ -499,8 +502,9 @@ mod tests {
         let binary = b"original binary bytes";
         let sig = key.sign(binary);
         let tampered = b"original binary bytez";
-        let err = verify_binary_signature(tampered, &sig.to_bytes(), key.verifying_key().as_bytes())
-            .expect_err("a tampered binary must not verify");
+        let err =
+            verify_binary_signature(tampered, &sig.to_bytes(), key.verifying_key().as_bytes())
+                .expect_err("a tampered binary must not verify");
         assert!(matches!(err, UpgradeError::SignatureMismatch));
     }
 
@@ -510,8 +514,9 @@ mod tests {
         let other = signing_key(4);
         let binary = b"binary signed by signer";
         let sig = signer.sign(binary);
-        let err = verify_binary_signature(binary, &sig.to_bytes(), other.verifying_key().as_bytes())
-            .expect_err("a signature from a different key must not verify");
+        let err =
+            verify_binary_signature(binary, &sig.to_bytes(), other.verifying_key().as_bytes())
+                .expect_err("a signature from a different key must not verify");
         assert!(matches!(err, UpgradeError::SignatureMismatch));
     }
 
@@ -601,10 +606,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("test tempdir");
         let payload = b"#!/bin/sh\necho lorica\n";
         let staged = stage_binary(dir.path(), payload).expect("staging must succeed");
-        assert_eq!(
-            staged,
-            dir.path().join("upgrade").join(STAGED_BINARY_NAME)
-        );
+        assert_eq!(staged, dir.path().join("upgrade").join(STAGED_BINARY_NAME));
         let written = std::fs::read(&staged).expect("staged file must be readable");
         assert_eq!(written, payload);
         let mode = std::fs::metadata(&staged)

@@ -104,6 +104,61 @@ pub struct AuditRecord {
     pub prev_chain_hash: String,
     /// This row's chain hash.
     pub chain_hash: String,
+    /// The node this row was recorded on (Story 9.9 AC #2).
+    ///
+    /// Empty means this node, on every install: a standalone node has
+    /// no node id to stamp, and giving one to a clustered node's own
+    /// rows would make the column change meaning the day it joins a
+    /// fleet. Only fanned-in rows carry a value, stamped by the control
+    /// plane from the mutual-TLS session and never from the payload.
+    pub node_id: String,
+    /// The row id the ORIGIN node assigned (Story 9.9 AC #2).
+    ///
+    /// Zero on a local row, where `id` already is that id. On a fanned-
+    /// in row it is what reconstructs the origin's own order, which the
+    /// aggregated `id` does not, and what lets an operator match an
+    /// aggregated row against the node's own copy.
+    pub origin_id: i64,
+}
+
+/// One audit row as another node published it (Story 9.9 AC #2).
+///
+/// Every field is the origin's, including both chain hashes, and the
+/// control plane stores them verbatim. It deliberately carries no
+/// `node_id`: the control plane stamps that from the mutual-TLS
+/// session, never from the payload, which is the Story 9.5 D15 rule
+/// and the reason a follower cannot write rows into another node's
+/// history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FannedInAuditRow {
+    /// The row id the origin node assigned.
+    pub origin_id: i64,
+    /// RFC 3339 UTC timestamp of the mutation.
+    pub timestamp: String,
+    /// RBAC username of the operator.
+    pub operator_username: String,
+    /// RBAC role at mutation time.
+    pub operator_role: String,
+    /// Dotted action verb.
+    pub action: String,
+    /// Entity kind.
+    pub target_type: String,
+    /// Entity id.
+    pub target_id: String,
+    /// SHA-256 hex of the pre-mutation payload ("" = absent).
+    pub before_payload_hash: String,
+    /// SHA-256 hex of the post-mutation payload ("" = absent).
+    pub after_payload_hash: String,
+    /// Source IP.
+    pub ip: String,
+    /// Client User-Agent.
+    pub user_agent: String,
+    /// The origin's `prev_chain_hash`, stored unchanged.
+    pub prev_chain_hash: String,
+    /// The origin's `chain_hash`, stored unchanged. Never recomputed:
+    /// the aggregated copy is worth something only if it is identical
+    /// to what the node published on its own anchor stream.
+    pub chain_hash: String,
 }
 
 /// Filters for `GET /api/v1/audit`.
@@ -121,6 +176,11 @@ pub struct AuditQuery {
     pub limit: usize,
     /// Cursor: only rows with `id` strictly below this (pagination).
     pub before_id: Option<i64>,
+    /// Restrict to one node's rows (Story 9.9 AC #5).
+    ///
+    /// `Some("")` is meaningful and selects THIS node's own rows, which
+    /// is why it is not folded into `None`.
+    pub node_id: Option<String>,
 }
 
 /// Outcome of `GET /api/v1/audit/verify`.
@@ -317,7 +377,9 @@ where
     type Rejection = Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self(parts.extensions.get::<ConnectInfo<SocketAddr>>().cloned()))
+        Ok(Self(
+            parts.extensions.get::<ConnectInfo<SocketAddr>>().cloned(),
+        ))
     }
 }
 
@@ -343,15 +405,34 @@ pub async fn record(
     before: Option<&serde_json::Value>,
     after: Option<&serde_json::Value>,
 ) {
-    let (target_type, target_id) = target;
+    record_with_store(state.log_store.clone(), ctx, action, target, before, after).await;
+}
 
-    let Some(log_store) = state.log_store.clone() else {
-        emit_audit_event(ctx, action, target_type, target_id, "");
+/// [`record`] for callers that hold the log store but no `AppState`:
+/// the cluster plane's lifecycle hooks (enrollment, renewal, leave,
+/// identity refusals), which run in the binary before and beside the
+/// API. Same persistence, same sink copy, same failure policy.
+pub async fn record_with_store(
+    log_store: Option<std::sync::Arc<crate::log_store::LogStore>>,
+    ctx: &AuditContext,
+    action: &str,
+    target: (&str, &str),
+    before: Option<&serde_json::Value>,
+    after: Option<&serde_json::Value>,
+) {
+    let (target_type, target_id) = target;
+    // One timestamp shared by the persisted row and the sink copy, so
+    // the SIEM-side and DB-side records agree exactly (QA finding:
+    // timestamp equality is the cheapest out-of-band join key).
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    let Some(log_store) = log_store else {
+        emit_audit_event(ctx, action, target_type, target_id, "", &timestamp);
         return;
     };
 
     let entry = NewAuditEntry {
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: timestamp.clone(),
         operator_username: ctx.username.clone(),
         operator_role: ctx.role.clone(),
         action: action.to_string(),
@@ -366,30 +447,33 @@ pub async fn record(
     let result = tokio::task::spawn_blocking(move || log_store.insert_audit(&entry)).await;
     match result {
         Ok(Ok((_id, chain_hash))) => {
-            emit_audit_event(ctx, action, target_type, target_id, &chain_hash);
+            emit_audit_event(ctx, action, target_type, target_id, &chain_hash, &timestamp);
         }
         Ok(Err(e)) => {
             crate::metrics::inc_audit_insert_failed();
             tracing::error!(error = %e, "audit log insert failed");
-            emit_audit_event(ctx, action, target_type, target_id, "");
+            emit_audit_event(ctx, action, target_type, target_id, "", &timestamp);
         }
         Err(e) => {
             crate::metrics::inc_audit_insert_failed();
             tracing::error!(error = %e, "audit log insert task failed");
-            emit_audit_event(ctx, action, target_type, target_id, "");
+            emit_audit_event(ctx, action, target_type, target_id, "", &timestamp);
         }
     }
 }
 
-/// Emit the `lorica::audit` tracing event for one mutation. `chain_hash`
-/// is the committed chain head (the out-of-band anchor), or `""` when
-/// nothing was persisted (worker mode or an insert failure).
+/// Emit the `lorica::audit` tracing event for one mutation, and offer
+/// the entry to the log-export sinks (Story 9.8). `chain_hash` is the
+/// committed chain head (the out-of-band anchor), or `""` when
+/// nothing was persisted (worker mode or an insert failure) - the
+/// sink copy is best-effort either way.
 fn emit_audit_event(
     ctx: &AuditContext,
     action: &str,
     target_type: &str,
     target_id: &str,
     chain_hash: &str,
+    timestamp: &str,
 ) {
     tracing::info!(
         target: "lorica::audit",
@@ -402,6 +486,21 @@ fn emit_audit_event(
         chain_hash = %chain_hash,
         "audit"
     );
+    // Gate before building the record so the seven allocations are
+    // only paid when an audit-interested sink is installed (QA
+    // finding; matches the publish_access / publish_waf pattern).
+    if crate::log_sinks::wants(crate::log_sinks::SinkKind::Audit) {
+        crate::log_sinks::publish_audit(crate::log_sinks::AuditSinkRecord {
+            timestamp: timestamp.to_string(),
+            operator_username: ctx.username.clone(),
+            operator_role: ctx.role.clone(),
+            action: action.to_string(),
+            target_type: target_type.to_string(),
+            target_id: target_id.to_string(),
+            ip: ctx.ip.clone(),
+            chain_hash: chain_hash.to_string(),
+        });
+    }
 }
 
 /// Query-string parameters of `GET /api/v1/audit`.
@@ -419,6 +518,12 @@ pub struct AuditListParams {
     pub limit: Option<usize>,
     /// Cursor: rows with `id` strictly below this value.
     pub before_id: Option<i64>,
+    /// Restrict to one node's rows (Story 9.9 AC #5).
+    ///
+    /// The empty string selects THIS node's own rows, which is a real
+    /// filter and not the absence of one; omitting the parameter
+    /// selects every node's.
+    pub node: Option<String>,
 }
 
 /// GET /api/v1/audit - list audit entries, newest first (Operator+,
@@ -426,8 +531,29 @@ pub struct AuditListParams {
 /// mode, tests) reads as an empty log.
 pub async fn list_audit(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Query(params): Query<AuditListParams>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // On a control plane the table aggregates every follower's
+    // operators, roles, addresses and user agents (Story 9.9), and
+    // the Operator floor was set when it held one node's rows. The
+    // fleet's trail (`node` absent, or naming another node) is
+    // SuperAdmin; `node=` with the empty string is this node's own
+    // chain and keeps the single-node floor exactly (Epic 9 close,
+    // backlog #73 decided). A standalone install or a follower holds
+    // one chain, so nothing changes there.
+    let aggregates = matches!(
+        state.cluster,
+        crate::cluster::ClusterRuntime::ControlPlane(_)
+    );
+    if aggregates
+        && params.node.as_deref() != Some("")
+        && session.role < lorica_config::models::Role::SuperAdmin
+    {
+        return Err(ApiError::Forbidden(
+            "the fleet's audit trail is SuperAdmin; pass node= (empty) for this node's own".into(),
+        ));
+    }
     let Some(log_store) = state.log_store.clone() else {
         return Ok(json_data(serde_json::json!({ "entries": [], "total": 0 })));
     };
@@ -439,6 +565,7 @@ pub async fn list_audit(
         to: params.to,
         limit: params.limit.unwrap_or(100).min(1000),
         before_id: params.before_id,
+        node_id: params.node,
     };
 
     let (entries, total) = tokio::task::spawn_blocking(move || log_store.query_audit(&query))
@@ -452,26 +579,76 @@ pub async fn list_audit(
     })))
 }
 
-/// GET /api/v1/audit/verify - walk the whole chain and recompute every
-/// hash (SuperAdmin only, enforced by the authorize middleware).
+/// Query string of `GET /api/v1/audit/verify`.
+#[derive(Debug, Deserialize)]
+pub struct AuditVerifyParams {
+    /// Verify one node's chain. The empty string is this node's own.
+    /// Omitted, every chain in the table is verified and reported
+    /// separately.
+    pub node: Option<String>,
+}
+
+/// One chain's verdict (Story 9.9 AC #3).
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeVerifyResult {
+    /// The chain's node id; empty is this node's own.
+    pub node_id: String,
+    /// That chain's verdict.
+    #[serde(flatten)]
+    pub result: VerifyResult,
+}
+
+/// GET /api/v1/audit/verify - recompute the hash chain (SuperAdmin
+/// only, enforced by the authorize middleware).
+///
+/// Reports PER NODE. An aggregated table interleaves N chains, so one
+/// verdict over the whole table would be meaningless: it would chain
+/// one node's row to another's and break at the first interleave. The
+/// top-level `verified` is the conjunction, so a caller that only reads
+/// that field still gets a correct answer.
 pub async fn verify_audit(
     Extension(state): Extension<AppState>,
+    Query(params): Query<AuditVerifyParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Some(log_store) = state.log_store.clone() else {
-        return Ok(json_data(VerifyResult {
-            verified: true,
-            total_rows: 0,
-            first_break_id: None,
-            first_break_reason: None,
-        }));
+        return Ok(json_data(serde_json::json!({
+            "verified": true,
+            "nodes": Vec::<NodeVerifyResult>::new(),
+        })));
     };
 
-    let result = tokio::task::spawn_blocking(move || log_store.verify_audit_chain())
-        .await
-        .map_err(|e| ApiError::Internal(format!("audit verify task failed: {e}")))?
-        .map_err(ApiError::Internal)?;
+    let requested = params.node;
+    let nodes = tokio::task::spawn_blocking(move || {
+        let ids = match requested {
+            Some(node_id) => vec![node_id],
+            None => {
+                let mut ids = log_store.audit_node_ids()?;
+                // A table with no rows at all still has a local chain
+                // to report on, and reporting nothing reads as "not
+                // checked" rather than "nothing to check".
+                if ids.is_empty() {
+                    ids.push(String::new());
+                }
+                ids
+            }
+        };
+        ids.into_iter()
+            .map(|node_id| {
+                log_store
+                    .verify_audit_chain_for(&node_id)
+                    .map(|result| NodeVerifyResult { node_id, result })
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("audit verify task failed: {e}")))?
+    .map_err(ApiError::Internal)?;
 
-    Ok(json_data(result))
+    let verified = nodes.iter().all(|n| n.result.verified);
+    Ok(json_data(serde_json::json!({
+        "verified": verified,
+        "nodes": nodes,
+    })))
 }
 
 #[cfg(test)]

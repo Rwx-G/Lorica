@@ -12,6 +12,7 @@ use super::route::SpoofedFallback;
 /// resolves the name against builtin presets first, then custom presets from
 /// `GlobalSettings`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityHeaderPreset {
     /// Preset identifier (matches `Route.security_headers`).
     pub name: String,
@@ -390,12 +391,23 @@ pub struct GlobalSettings {
     pub upgrade_signing_pubkey_path: Option<String>,
 
     /// Require authentication on the `/metrics` endpoint (Story 8.8
-    /// AC #4). Default `false` in v1.6.0 for back-compat: existing
-    /// Prometheus scrapers keep working unauthenticated. When `true`,
-    /// `/metrics` demands either a valid dashboard session cookie OR
-    /// the static bearer token in `prometheus_scrape_token`. Flips to
-    /// `true` in v1.7.0 with a release-note migration paragraph.
-    #[serde(default)]
+    /// AC #4). When `true`, `/metrics` demands either a valid dashboard
+    /// session cookie OR the static bearer token in
+    /// `prometheus_scrape_token`.
+    ///
+    /// Default `true` since v1.7.0, the flip v1.6.0's field doc
+    /// promised. v1.6.0 shipped `false` for back-compat and said so in
+    /// its release note. An install that never wrote this key takes the
+    /// new default on upgrade, so its unauthenticated scrapes answer
+    /// 401 from the first boot; the v1.7.0 release note and
+    /// `docs/security.md` carry the migration paragraph. A stored value
+    /// always wins over the default, so an install that had set it
+    /// either way is unaffected.
+    ///
+    /// One default function serves both the serde attribute and
+    /// `Default`, so a TOML import omitting the field and a fresh
+    /// store cannot disagree.
+    #[serde(default = "default_metrics_require_auth")]
     pub metrics_require_auth: bool,
 
     /// Static bearer token accepted on `/metrics` when
@@ -404,9 +416,10 @@ pub struct GlobalSettings {
     /// environment variable `LORICA_PROMETHEUS_SCRAPE_TOKEN` overrides
     /// this value at request time so operators can inject the token
     /// out of band without persisting it in the database. Compared in
-    /// constant time (AC #5). Never serialised back over the API: the
+    /// constant time (AC #5). Never serialised back in the clear: the
     /// `GET /api/v1/settings` handler masks it like the bot HMAC
-    /// secret.
+    /// secret, and the TOML export redacts it (import rejects the
+    /// placeholder).
     #[serde(default)]
     pub prometheus_scrape_token: Option<String>,
 
@@ -424,6 +437,83 @@ pub struct GlobalSettings {
     /// for the operator override to take effect.
     #[serde(default)]
     pub management_key_pem_path: Option<String>,
+
+    /// Syslog export collector as `host:port` (Story 9.8 AC #1).
+    /// `None` = syslog sink disabled. The transport is selected by
+    /// `syslog_transport`; delivery is fire-and-forget with a bounded
+    /// queue, so an unreachable collector never affects request
+    /// serving.
+    #[serde(default)]
+    pub syslog_endpoint: Option<String>,
+    /// Syslog transport: `udp`, `tcp`, or `tcp-tls`. Default `udp`
+    /// (RFC 5426); `tcp` / `tcp-tls` use RFC 6587 octet-counting
+    /// framing.
+    #[serde(default = "default_syslog_transport")]
+    pub syslog_transport: String,
+    /// RFC 5424 facility code (0-23) stamped on every exported
+    /// message. Default 16 (`local0`).
+    #[serde(default = "default_syslog_facility")]
+    pub syslog_facility: u32,
+    /// RFC 5424 severity (0-7) for access-log messages. Default 6
+    /// (informational).
+    #[serde(default = "default_syslog_severity_access")]
+    pub syslog_severity_access: u32,
+    /// RFC 5424 severity (0-7) for WAF-event messages. Default 4
+    /// (warning).
+    #[serde(default = "default_syslog_severity_waf")]
+    pub syslog_severity_waf: u32,
+    /// RFC 5424 severity (0-7) for audit-entry messages. Default 5
+    /// (notice).
+    #[serde(default = "default_syslog_severity_audit")]
+    pub syslog_severity_audit: u32,
+    /// Export access-log rows to the syslog sink. Default `true`
+    /// (only meaningful once `syslog_endpoint` is set).
+    #[serde(default = "default_true")]
+    pub syslog_access_enabled: bool,
+    /// Export WAF events to the syslog sink. Default `true`.
+    #[serde(default = "default_true")]
+    pub syslog_waf_enabled: bool,
+    /// Export audit entries to the syslog sink. Default `true`.
+    #[serde(default = "default_true")]
+    pub syslog_audit_enabled: bool,
+    /// PEM CA bundle trusted when `syslog_transport` is `tcp-tls`.
+    /// `None` = platform trust store. Not a secret (public
+    /// certificates only).
+    #[serde(default)]
+    pub syslog_tls_ca_pem: Option<String>,
+    /// Optional PEM client certificate chain presented to the
+    /// collector when it requires mutual TLS. Public half; the key
+    /// lives in `syslog_tls_client_key_pem`.
+    #[serde(default)]
+    pub syslog_tls_client_cert_pem: Option<String>,
+    /// PEM private key paired with `syslog_tls_client_cert_pem`.
+    /// Secret: scrubbed from `GET /api/v1/settings` responses and
+    /// from TOML export like the bot HMAC secret (Story 9.8 AC #8).
+    #[serde(default)]
+    pub syslog_tls_client_key_pem: Option<String>,
+    /// Extra static structured-data parameters appended to the
+    /// `[lorica@32473 ...]` SD element on every message, as
+    /// comma-separated `key=value` pairs (e.g. `env=prod,dc=eu-west`).
+    /// `None` = no extra parameters.
+    #[serde(default)]
+    pub syslog_extra_sd: Option<String>,
+    /// Export access logs, WAF events and audit entries as OTLP log
+    /// records to the collector configured in `otlp_endpoint`
+    /// (Story 9.8 AC #2). Requires a binary built with
+    /// `--features otel`; default `false`.
+    #[serde(default)]
+    pub otlp_logs_enabled: bool,
+    /// Optional `Authorization` header value sent by the OTLP logs
+    /// exporter (e.g. `Bearer <token>`). Secret: scrubbed from JSON
+    /// responses and TOML export (Story 9.8 AC #8).
+    #[serde(default)]
+    pub otlp_logs_auth_header: Option<String>,
+}
+
+/// `true` since v1.7.0. See the field doc on
+/// [`GlobalSettings::metrics_require_auth`] for the migration.
+fn default_metrics_require_auth() -> bool {
+    true
 }
 
 fn default_header_timeout_s() -> u32 {
@@ -507,6 +597,30 @@ fn default_cert_export_dir_mode() -> u32 {
 }
 
 fn default_ai_bot_inject_headers() -> bool {
+    true
+}
+
+fn default_syslog_transport() -> String {
+    "udp".to_string()
+}
+
+fn default_syslog_facility() -> u32 {
+    16
+}
+
+fn default_syslog_severity_access() -> u32 {
+    6
+}
+
+fn default_syslog_severity_waf() -> u32 {
+    4
+}
+
+fn default_syslog_severity_audit() -> u32 {
+    5
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -597,7 +711,7 @@ impl Default for GlobalSettings {
             ai_bot_treat_spoofed_as: SpoofedFallback::default(),
             ai_bot_inject_headers: default_ai_bot_inject_headers(),
             upgrade_signing_pubkey_path: None,
-            metrics_require_auth: false,
+            metrics_require_auth: default_metrics_require_auth(),
             prometheus_scrape_token: None,
             management_cert_pem_path: None,
             management_key_pem_path: None,
@@ -608,6 +722,21 @@ impl Default for GlobalSettings {
             bot_stash_per_prefix_max: default_bot_stash_per_prefix_max(),
             mirror_max_concurrent_per_route: default_mirror_max_concurrent_per_route(),
             mirror_max_concurrent_global: default_mirror_max_concurrent_global(),
+            syslog_endpoint: None,
+            syslog_transport: default_syslog_transport(),
+            syslog_facility: default_syslog_facility(),
+            syslog_severity_access: default_syslog_severity_access(),
+            syslog_severity_waf: default_syslog_severity_waf(),
+            syslog_severity_audit: default_syslog_severity_audit(),
+            syslog_access_enabled: true,
+            syslog_waf_enabled: true,
+            syslog_audit_enabled: true,
+            syslog_tls_ca_pem: None,
+            syslog_tls_client_cert_pem: None,
+            syslog_tls_client_key_pem: None,
+            syslog_extra_sd: None,
+            otlp_logs_enabled: false,
+            otlp_logs_auth_header: None,
         }
     }
 }

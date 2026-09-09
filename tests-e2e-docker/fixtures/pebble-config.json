@@ -1,0 +1,12 @@
+{
+  "pebble": {
+    "listenAddress": "0.0.0.0:443",
+    "managementListenAddress": "0.0.0.0:15000",
+    "certificate": "/shared/pebble-dir.pem",
+    "privateKey": "/shared/pebble-dir.key",
+    "httpPort": 8080,
+    "tlsPort": 8443,
+    "ocspResponderURL": "",
+    "externalAccountBindingRequired": false
+  }
+}

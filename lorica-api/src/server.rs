@@ -100,6 +100,17 @@ pub const RL_LOGS_CLEAR: u32 = 1;
 /// Users CRUD (Story 8.3). Moderate cap : account management is
 /// low-frequency, and create/update run an argon2 hash per call.
 pub const RL_USERS: u32 = 20;
+/// Cluster registry mutations (token mint/revoke, activate, revoke,
+/// leave) per window: operator-driven, a few per incident at most.
+pub const RL_CLUSTER: u32 = 30;
+/// Cluster reads (status, roster, replication, drift, fan-in queries)
+/// per window: a separate, larger bucket. The dashboard polls the
+/// roster every ten seconds and the status more often, and the
+/// `cluster` e2e smoke polls between assertions, so sharing the
+/// mutation bucket answered 429 to the fleet view within a minute.
+/// Ten a second is far above any dashboard and still a ceiling on a
+/// Viewer paging the fleet's rows against the ingest writer.
+pub const RL_CLUSTER_READ: u32 = 600;
 
 /// Type-erased metrics refresher closure (WPAR-7 pull-on-scrape).
 ///
@@ -240,7 +251,12 @@ pub struct AppState {
     /// calls `task_tracker.close(); task_tracker.wait().await` so
     /// in-flight work completes rather than being dropped mid-step.
     /// Cheap to clone (internal `Arc`).
+    /// (`cluster` below carries the fleet role; see
+    /// `crate::cluster::ClusterRuntime`.)
     pub task_tracker: tokio_util::task::TaskTracker,
+    /// This process's fleet role and its live handles (Story 9.3):
+    /// `Standalone` on every install without a cluster role.
+    pub cluster: crate::cluster::ClusterRuntime,
 }
 
 impl AppState {
@@ -468,9 +484,10 @@ pub fn build_router(
         .route("/api/v1/auth/login", post(crate::auth::login))
         .route("/api/v1/auth/logout", post(crate::auth::logout));
 
-    // `/metrics` carries an opt-in auth gate (Story 8.8 AC #4/#5):
-    // pass-through when `metrics_require_auth` is off (the default),
-    // else a session cookie OR the bearer scrape token is required. The
+    // `/metrics` carries an auth gate (Story 8.8 AC #4/#5, on by
+    // default since v1.7.0): pass-through when `metrics_require_auth`
+    // is off, else a session cookie OR the bearer scrape token is
+    // required. The
     // ACME challenge stays fully public (the CA reaches it un
     // authenticated), so the two endpoints are split into separate
     // sub-routers and only `/metrics` gets the layer.
@@ -486,6 +503,12 @@ pub fn build_router(
 
     // Protected routes (auth required)
     let protected_routes = Router::new()
+        // The same document as `/metrics`, behind the session like
+        // every other read here (backlog #80): the session cookie is
+        // scoped `Path=/api`, so a browser reaches the metrics through
+        // this path and a scraper through `/metrics` with the bearer
+        // token. One handler, two doors.
+        .route("/api/v1/metrics", get(crate::metrics::get_metrics))
         .route(
             "/api/v1/auth/password",
             put(crate::auth::change_password).layer(rl(
@@ -514,6 +537,88 @@ pub fn build_router(
                 .put(crate::users::update_user)
                 .delete(crate::users::delete_user)
                 .layer(rl("users", RL_USERS, RL_WINDOW_S)),
+        )
+        // Cluster registry (Story 9.3). Role floors live in the
+        // authorize middleware: tokens and every mutation are
+        // SuperAdmin, reads are Viewer+.
+        // The reads carry a limiter too (Epic 9 close, security
+        // audit): the two fan-in queries take the telemetry store's
+        // one connection away from ingest for the duration, and every
+        // one of these is at the Viewer floor. Their own bucket, not
+        // the mutations': see `RL_CLUSTER_READ`.
+        .route(
+            "/api/v1/cluster/status",
+            get(crate::cluster::get_status).layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/tokens",
+            get(crate::cluster::list_tokens)
+                .post(crate::cluster::mint_token)
+                .layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/tokens/{public_id}",
+            delete(crate::cluster::revoke_token).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/nodes",
+            get(crate::cluster::list_nodes).layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/nodes/{id}",
+            get(crate::cluster::get_node)
+                .delete(crate::cluster::revoke_node)
+                .layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/nodes/{id}/activate",
+            post(crate::cluster::activate_node).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/leave",
+            post(crate::cluster::leave).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        // Configuration replication (Story 9.4): the last round's
+        // report, the drift view, and the follower's break-glass window.
+        .route(
+            "/api/v1/cluster/replication",
+            get(crate::cluster::get_replication).layer(rl(
+                "cluster_read",
+                RL_CLUSTER_READ,
+                RL_WINDOW_S,
+            )),
+        )
+        .route(
+            "/api/v1/cluster/drift",
+            get(crate::cluster::get_drift).layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
+        )
+        // Telemetry fan-in (Story 9.6 AC #9). Cursor-paginated with no
+        // total: a COUNT(*) per page on an aggregated table is a full
+        // scan under the store lock, which would stall ingest.
+        .route(
+            "/api/v1/cluster/bans",
+            get(crate::cluster::fleet_bans)
+                .post(crate::cluster::fleet_ban)
+                .layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/logs",
+            get(crate::cluster::fleet_logs).layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/cluster/waf-events",
+            get(crate::cluster::fleet_waf_events).layer(rl(
+                "cluster_read",
+                RL_CLUSTER_READ,
+                RL_WINDOW_S,
+            )),
+        )
+        .route(
+            "/api/v1/cluster/break-glass",
+            get(crate::cluster::get_break_glass)
+                .post(crate::cluster::open_break_glass)
+                .delete(crate::cluster::close_break_glass)
+                .layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
         )
         .route("/api/v1/routes", get(crate::routes::list_routes))
         .route(
@@ -710,18 +815,27 @@ pub fn build_router(
         )
         .route(
             "/api/v1/ai-crawlers/custom",
-            post(crate::ai_crawlers::create_custom_crawler)
-                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+            post(crate::ai_crawlers::create_custom_crawler).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/ai-crawlers/custom/{id}",
-            put(crate::ai_crawlers::update_custom_crawler)
-                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+            put(crate::ai_crawlers::update_custom_crawler).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/ai-crawlers/custom/{id}",
-            delete(crate::ai_crawlers::delete_custom_crawler)
-                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+            delete(crate::ai_crawlers::delete_custom_crawler).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/ai-crawlers/builtin",
@@ -753,9 +867,34 @@ pub fn build_router(
             "/api/v1/settings/schema",
             get(crate::settings::get_settings_schema),
         )
+        // Rate-limited since Story 9.8 QA flagged the asymmetry with
+        // the sink test endpoints below: all three probes open an
+        // outbound connection to an operator-configured target.
         .route(
             "/api/v1/settings/otel/test",
-            post(crate::settings::test_otel_connection),
+            post(crate::settings::test_otel_connection).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
+        )
+        // Story 9.8 AC #6. The syslog test emits a real message
+        // towards an operator-configured network target.
+        .route(
+            "/api/v1/settings/syslog/test",
+            post(crate::settings::test_syslog_connection).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
+        )
+        .route(
+            "/api/v1/settings/otlp-logs/test",
+            post(crate::settings::test_otlp_logs_connection).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/dns-providers",
@@ -1070,7 +1209,12 @@ pub fn build_router(
         )
         // Layer order (outermost runs first): require_auth
         // authenticates and injects the Session extension, then
-        // authorize enforces the role floor (Story 8.3 AC #6).
+        // authorize enforces the role floor (Story 8.3 AC #6), then
+        // the follower read-only gate refuses configuration mutations
+        // owned by the control plane (Story 9.4 AC #10).
+        .layer(middleware::from_fn(
+            crate::middleware::authorize::follower_read_only,
+        ))
         .layer(middleware::from_fn(crate::middleware::authorize::authorize))
         .layer(middleware::from_fn(require_auth));
 
@@ -1168,8 +1312,8 @@ pub async fn start_server(
     // output is the router with a `ConnectInfo<SocketAddr>` extension
     // injected; the manual loop calls it once per accepted connection so
     // handlers keep seeing the peer address (audit logging, rate limits).
-    let mut make_service =
-        build_router(state, session_store, rate_limiter).into_make_service_with_connect_info::<SocketAddr>();
+    let mut make_service = build_router(state, session_store, rate_limiter)
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     let listener: tokio::net::TcpListener = match inherited_listener {
         Some(std_listener) => {

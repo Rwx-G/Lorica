@@ -22,16 +22,16 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use chrono::{Duration, Utc};
-use lorica_command::{command, Command, CommandType, ConfigReloadCommit, GenerationGate, IncomingCommand};
+use lorica_command::{
+    command, Command, CommandType, ConfigReloadCommit, GenerationGate, IncomingCommand,
+};
 use lorica_config::models::{Certificate, LoadBalancing, WafMode};
 use lorica_config::{store::new_id, ConfigStore};
 use lorica_tls::cert_resolver::CertResolver;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use tokio::sync::Mutex;
 
-use super::{
-    handle_config_reload_commit, PendingProxyConfig, ProxyConfig, ProxyConfigGlobals,
-};
+use super::{handle_config_reload_commit, PendingProxyConfig, ProxyConfig, ProxyConfigGlobals};
 use crate::reload::PreparedReload;
 
 /// Generate a real self-signed cert PEM pair via `rcgen` 0.13 so the
@@ -53,7 +53,11 @@ fn make_self_signed_pem(cn: &str) -> (String, String) {
 /// `reload_cert_resolver` keeps the cert (it filters by
 /// `routes.certificate_id` so an unreferenced cert is intentionally
 /// dropped from the resolver).
-fn make_route_referencing(route_id: &str, hostname: &str, cert_id: &str) -> lorica_config::models::Route {
+fn make_route_referencing(
+    route_id: &str,
+    hostname: &str,
+    cert_id: &str,
+) -> lorica_config::models::Route {
     let now = Utc::now();
     lorica_config::models::Route {
         id: route_id.into(),
@@ -120,6 +124,7 @@ fn make_route_referencing(route_id: &str, hostname: &str, cert_id: &str) -> lori
         geoip: None,
         bot_protection: None,
         group_name: String::new(),
+        node_selector: Vec::new(),
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,

@@ -53,7 +53,9 @@ fn fork_child<F: FnOnce(&'static SharedRegion)>(fd: RawFd, body: F) -> Pid {
             // `open_worker` adopts a `RawFd`, so borrow the inherited raw
             // fd and release the dup's ownership with `into_raw_fd`.
             let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-            let dup_fd = nix::unistd::dup(borrowed).expect("dup in child").into_raw_fd();
+            let dup_fd = nix::unistd::dup(borrowed)
+                .expect("dup in child")
+                .into_raw_fd();
             let region = unsafe { SharedRegion::open_worker(dup_fd) }.expect("open_worker");
             body(region);
             std::process::exit(0);

@@ -49,6 +49,7 @@ COPY lorica-runtime/ lorica-runtime/
 COPY lorica-timeout/ lorica-timeout/
 COPY lorica-tls/ lorica-tls/
 COPY lorica-worker/ lorica-worker/
+COPY lorica-cluster/ lorica-cluster/
 COPY lorica-command/ lorica-command/
 COPY lorica-bench/ lorica-bench/
 COPY lorica-notify/ lorica-notify/

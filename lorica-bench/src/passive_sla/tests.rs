@@ -214,6 +214,7 @@ fn test_store_sla_bucket_insert_and_query() {
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         group_name: String::new(),
+        node_selector: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -329,6 +330,7 @@ fn test_store_sla_summary() {
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         group_name: String::new(),
+        node_selector: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -459,6 +461,7 @@ fn test_store_prune_buckets() {
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         group_name: String::new(),
+        node_selector: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -576,6 +579,7 @@ fn test_store_sla_config_upsert_and_get() {
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         group_name: String::new(),
+        node_selector: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -678,6 +682,7 @@ fn test_store_export_sla_data() {
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         group_name: String::new(),
+        node_selector: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };

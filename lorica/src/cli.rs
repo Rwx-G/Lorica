@@ -66,7 +66,9 @@ fn parse_workers(s: &str) -> Result<Workers, String> {
     match s.parse::<usize>() {
         Ok(0) => Ok(Workers::Single),
         Ok(n) => Ok(Workers::Fixed(n)),
-        Err(_) => Err(format!("expected `auto`, `0`, or a positive integer, got `{s}`")),
+        Err(_) => Err(format!(
+            "expected `auto`, `0`, or a positive integer, got `{s}`"
+        )),
     }
 }
 
@@ -124,6 +126,41 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) hot_upgrade: bool,
 
+    /// Cluster-plane listen address as an explicit `host:port`
+    /// (Story 9.2, opt-in; the plane is disabled when absent). A bare
+    /// port is refused; a wildcard host (`0.0.0.0` / `::`) is refused
+    /// unless `--cluster-listen-any` is also passed; the management
+    /// port is refused. See docs/cluster.md.
+    #[arg(long)]
+    pub(crate) cluster_listen: Option<String>,
+
+    /// Explicitly allow a wildcard host in `--cluster-listen` (and in
+    /// `--cluster-enrollment-listen`). Without it a fleet listener
+    /// can never be exposed on every interface by accident.
+    #[arg(long)]
+    pub(crate) cluster_listen_any: bool,
+
+    /// Enrollment listener bind as an explicit `host:port`. Defaults
+    /// to the `--cluster-listen` host on the next port; set it to put
+    /// the only unauthenticated surface on a different interface
+    /// (an admin VLAN) than the operational plane.
+    #[arg(long)]
+    pub(crate) cluster_enrollment_listen: Option<String>,
+
+    /// Hostname or IP followers dial to reach this control plane
+    /// (the SAN on its TLS certificate). Defaults to the
+    /// `--cluster-listen` host; required whenever followers reach the
+    /// control plane through DNS, NAT or a load balancer.
+    #[arg(long)]
+    pub(crate) cluster_advertise: Option<String>,
+
+    /// Enrolled nodes become `Active` immediately instead of waiting
+    /// for a SuperAdmin to activate them (Story 9.3 AC #5). Off by
+    /// default: a redeemed token is a Pending node with no
+    /// configuration until an operator looks at it.
+    #[arg(long)]
+    pub(crate) cluster_auto_activate: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -179,9 +216,19 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "admin")]
         user: String,
 
-        /// Admin password
+        /// Read the admin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the admin password from standard input.
         #[arg(long)]
-        password: String,
+        password_stdin: bool,
+
+        /// Admin password on the command line (discouraged: argv is
+        /// visible to every local process and lands in shell history;
+        /// `LORICA_ADMIN_PASSWORD` is also read).
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Upload a new signed `lorica` binary to the running instance and
     /// trigger a zero-downtime hot upgrade (Story 8.4).
@@ -199,9 +246,181 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "admin")]
         user: String,
 
-        /// Admin password
+        /// Read the admin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the admin password from standard input.
         #[arg(long)]
-        password: String,
+        password_stdin: bool,
+
+        /// Admin password on the command line (discouraged; see `unban`).
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Cluster-plane management commands (Story 9.2).
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ClusterAction {
+    /// Initialise this node as a cluster control plane: generate the
+    /// cluster CA and persist it in the configuration database (the
+    /// CA private key is encrypted at rest under the node master
+    /// key; see docs/cluster.md for what that implies).
+    Init {
+        /// Common name recorded on the generated CA certificate.
+        #[arg(long, default_value = "Lorica Cluster CA")]
+        common_name: String,
+    },
+    /// Join a fleet (Story 9.3): redeem a join token on the control
+    /// plane's enrollment listener and persist this node's fleet
+    /// identity. The token is read from `--token-file`,
+    /// `--token-stdin` or `LORICA_JOIN_TOKEN`, never from the command
+    /// line. Restart lorica afterwards to start the cluster session.
+    Join {
+        /// The control plane's operational `host:port`
+        /// (its `--cluster-listen` bind or the name it advertises).
+        #[arg(long)]
+        control_plane: String,
+
+        /// The enrollment listener's `host:port`; defaults to the
+        /// control-plane host on the next port.
+        #[arg(long)]
+        enrollment: Option<String>,
+
+        /// Display name for this node; defaults to the hostname.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Read the join token from this file.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+
+        /// Read the join token from standard input.
+        #[arg(long)]
+        token_stdin: bool,
+
+        /// Name the control-plane certificate must carry in its SAN;
+        /// defaults to the `--control-plane` host.
+        #[arg(long)]
+        server_name: Option<String>,
+    },
+    /// Leave the fleet (Story 9.3 AC #13): wipe this node's fleet
+    /// identity. Authorised either by a SuperAdmin credential on the
+    /// local management API (the running instance tells the control
+    /// plane, wipes and audits) or, without credentials, by proof
+    /// that the control plane already deregistered this node (it
+    /// refuses the node's certificate).
+    Leave {
+        /// SuperAdmin username on the local management API.
+        #[arg(long)]
+        user: Option<String>,
+
+        /// Read the SuperAdmin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the SuperAdmin password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// SuperAdmin password on the command line (discouraged: argv
+        /// is visible to every local process and lands in shell
+        /// history; `LORICA_ADMIN_PASSWORD` is also read).
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Print this node's fleet role (Story 9.3 AC #14): the persisted
+    /// facts always, the live connection state and roster when
+    /// management credentials are passed.
+    Status {
+        /// Username on the local management API (Viewer+).
+        #[arg(long)]
+        user: Option<String>,
+
+        /// Read the password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// Password on the command line (discouraged; see `leave`).
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Re-enable local configuration mutations on a follower for a
+    /// bounded window (Story 9.4 AC #11). A follower normally refuses
+    /// every configuration change: the control plane owns it. Use this
+    /// when the control plane is unreachable and an edge needs an
+    /// emergency change. Everything changed locally is reconciled away
+    /// when the window ends.
+    BreakGlass {
+        /// Window length in seconds (max 86400). Ignored with --close.
+        #[arg(long, default_value_t = 3600)]
+        duration: u64,
+
+        /// Close the window now instead of opening one.
+        #[arg(long)]
+        close: bool,
+
+        /// SuperAdmin username on the local management API.
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// Read the SuperAdmin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the SuperAdmin password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// SuperAdmin password on the command line (discouraged; see
+        /// `leave`).
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Mint a join token on this control plane through the local
+    /// management API (SuperAdmin). The token is printed once, apart
+    /// from the command that consumes it.
+    Token {
+        /// Lifetime in seconds (default 3600, max 86400).
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+
+        /// The node name this token may enrol. Required: route
+        /// selectors resolve against this name to decide which node
+        /// receives which private key, so the token, not the joining
+        /// machine, decides which name may be claimed.
+        #[arg(long)]
+        node_name: String,
+
+        /// Bind the token to this source CIDR.
+        #[arg(long)]
+        source_cidr: Option<String>,
+
+        /// SuperAdmin username
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// Read the SuperAdmin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the SuperAdmin password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// SuperAdmin password on the command line (discouraged: it
+        /// mints the credentials AC #6 keeps off argv; see `leave`).
+        #[arg(long)]
+        password: Option<String>,
     },
 }
 
@@ -216,7 +435,11 @@ impl Cli {
     /// child does not re-resolve `auto` to a possibly different core count);
     /// `--hot-upgrade` is always set so the child adopts the inherited
     /// listening sockets.
-    pub(crate) fn hot_upgrade_argv(&self, staged_binary: &str, resolved_workers: usize) -> Vec<String> {
+    pub(crate) fn hot_upgrade_argv(
+        &self,
+        staged_binary: &str,
+        resolved_workers: usize,
+    ) -> Vec<String> {
         let mut argv: Vec<String> = vec![
             staged_binary.to_string(),
             "--data-dir".to_string(),
@@ -243,8 +466,181 @@ impl Cli {
             argv.push("--upstream-crl-file".to_string());
             argv.push(crl.clone());
         }
+        if let Some(ref cluster_listen) = self.cluster_listen {
+            argv.push("--cluster-listen".to_string());
+            argv.push(cluster_listen.clone());
+        }
+        if self.cluster_listen_any {
+            argv.push("--cluster-listen-any".to_string());
+        }
+        if let Some(ref enrollment) = self.cluster_enrollment_listen {
+            argv.push("--cluster-enrollment-listen".to_string());
+            argv.push(enrollment.clone());
+        }
+        if let Some(ref advertise) = self.cluster_advertise {
+            argv.push("--cluster-advertise".to_string());
+            argv.push(advertise.clone());
+        }
+        if self.cluster_auto_activate {
+            argv.push("--cluster-auto-activate".to_string());
+        }
         argv
     }
+}
+
+/// The validated cluster-plane binds (Story 9.2 AC #11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClusterBinds {
+    /// The mandatory-mTLS operational listener.
+    pub operational: std::net::SocketAddr,
+    /// The token-gated enrollment listener (explicit or derived as
+    /// operational host, port + 1).
+    pub enrollment: std::net::SocketAddr,
+    /// The name followers dial, placed in the control-plane leaf's
+    /// SAN (explicit `--cluster-advertise` or the operational host).
+    pub advertise_host: String,
+}
+
+/// Ports the cluster plane must never share: the management API and
+/// the two proxy listeners.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReservedPorts {
+    /// The loopback management API port.
+    pub management: u16,
+    /// The HTTP proxy listener port.
+    pub http: u16,
+    /// The HTTPS proxy listener port.
+    pub https: u16,
+}
+
+fn parse_cluster_bind(
+    flag: &str,
+    value: &str,
+    allow_any: bool,
+) -> Result<std::net::SocketAddr, String> {
+    if !value.contains(':') {
+        return Err(format!(
+            "{flag} `{value}`: a bare port is refused; pass an explicit host:port \
+             (e.g. 192.0.2.10:9444)"
+        ));
+    }
+    let addr: std::net::SocketAddr = value.parse().map_err(|_| {
+        format!(
+            "{flag} `{value}`: not a valid host:port \
+             (an IP address is required; IPv6 as [::1]:9444)"
+        )
+    })?;
+    if addr.port() == 0 {
+        return Err(format!(
+            "{flag} `{value}`: an explicit non-zero port is required"
+        ));
+    }
+    if addr.ip().is_unspecified() && !allow_any {
+        return Err(format!(
+            "{flag} `{value}`: a wildcard host exposes the cluster plane on every \
+             interface; pass --cluster-listen-any to do that deliberately"
+        ));
+    }
+    Ok(addr)
+}
+
+fn refuse_reserved(
+    flag: &str,
+    addr: std::net::SocketAddr,
+    reserved: ReservedPorts,
+) -> Result<(), String> {
+    let port = addr.port();
+    let clash = if port == reserved.management {
+        Some("the management API port")
+    } else if port == reserved.http || port == reserved.https {
+        Some("a proxy listener port")
+    } else {
+        None
+    };
+    match clash {
+        Some(what) => Err(format!(
+            "{flag} `{addr}`: port {port} is {what}; the cluster plane must not share it"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Validate the cluster-plane CLI per Story 9.2 AC #11. Both binds
+/// need an explicit `host:port` (a bare port is refused), a wildcard
+/// host needs the separate `--cluster-listen-any` opt-in, and neither
+/// bind may land on the management or proxy ports - the DERIVED
+/// enrollment bind included, so `host:65535` (overflow) and
+/// `host:9442` (enrollment would sit on 9443) are refused rather
+/// than silently misplacing the only unauthenticated surface. The
+/// startup path logs the effective binds at WARN.
+pub(crate) fn validate_cluster_listen(
+    value: &str,
+    enrollment_override: Option<&str>,
+    advertise: Option<&str>,
+    reserved: ReservedPorts,
+    allow_any: bool,
+) -> Result<ClusterBinds, String> {
+    let operational = parse_cluster_bind("--cluster-listen", value, allow_any)?;
+    refuse_reserved("--cluster-listen", operational, reserved)?;
+
+    let enrollment = match enrollment_override {
+        Some(explicit) => parse_cluster_bind("--cluster-enrollment-listen", explicit, allow_any)?,
+        None => {
+            let port = operational.port().checked_add(1).ok_or_else(|| {
+                format!(
+                    "--cluster-listen `{value}`: the derived enrollment port (port + 1) \
+                     overflows; pass --cluster-enrollment-listen explicitly"
+                )
+            })?;
+            std::net::SocketAddr::new(operational.ip(), port)
+        }
+    };
+    refuse_reserved("--cluster-enrollment-listen", enrollment, reserved)?;
+    if enrollment == operational {
+        return Err(format!(
+            "--cluster-enrollment-listen `{enrollment}`: the enrollment and operational \
+             listeners must not share a bind"
+        ));
+    }
+
+    let advertise_host = match advertise {
+        Some(name) => {
+            let name = name.trim();
+            if name.is_empty()
+                || name.len() > 253
+                || name
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+            {
+                return Err(format!(
+                    "--cluster-advertise `{name}`: expected a hostname or IP address"
+                ));
+            }
+            // A `host:port` here is the mistake worth catching, because
+            // nothing downstream catches it: the value becomes the SAN
+            // of the control-plane leaf, a joining node checks that SAN
+            // against the host it dialled, and the two can never match.
+            // The fleet then refuses every join with a TLS verification
+            // failure that names neither the cause nor this flag.
+            //
+            // An IPv6 literal is full of colons, so the test is "does
+            // it parse as an address" first, and only then "does it
+            // look like someone appended a port".
+            if name.parse::<std::net::IpAddr>().is_err() && name.contains(':') {
+                return Err(format!(
+                    "--cluster-advertise `{name}`: expected a host, without a port. This value becomes the control-plane certificate's SAN and is matched against the host a joining node dials"
+                ));
+            }
+            name.to_string()
+        }
+        None => operational.ip().to_string(),
+    };
+
+    Ok(ClusterBinds {
+        operational,
+        enrollment,
+        advertise_host,
+    })
 }
 
 /// Guard that must be held alive for the non-blocking file appender to flush.
@@ -394,16 +790,15 @@ pub(crate) fn run_rotate_key(data_dir: &str, new_key_file: &str) {
 
     let data_dir = PathBuf::from(data_dir);
     let key_path = data_dir.join("encryption.key");
-    let old_key = EncryptionKey::load_or_create(&key_path)
-        .expect("failed to load current encryption key");
+    let old_key =
+        EncryptionKey::load_or_create(&key_path).expect("failed to load current encryption key");
 
     let new_key_path = PathBuf::from(&new_key_file);
     let new_key = EncryptionKey::load_or_create(&new_key_path)
         .expect("failed to load/create new encryption key");
 
     let db_path = data_dir.join("lorica.db");
-    let store =
-        ConfigStore::open(&db_path, Some(old_key)).expect("failed to open database");
+    let store = ConfigStore::open(&db_path, Some(old_key)).expect("failed to open database");
 
     let count = store
         .rotate_encryption_key(&new_key)
@@ -424,38 +819,8 @@ pub(crate) fn run_rotate_key(data_dir: &str, new_key_file: &str) {
 pub(crate) fn run_unban(port: u16, ip: String, user: String, password: String) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        // The management API is served over TLS on localhost (Story 8.8
-        // AC #1), by default with an auto-generated self-signed cert.
-        // `danger_accept_invalid_certs(true)` is intentional: the target
-        // is always `127.0.0.1`, so there is no MITM surface to defend
-        // against, and the self-signed leaf has no chain to validate.
-        let client = reqwest::Client::builder()
-            .cookie_store(true)
-            .danger_accept_invalid_certs(true)
-            .build()
-            .expect("HTTP client");
-
-        // Login
-        let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
-        let login_res = client
-            .post(&login_url)
-            .json(&serde_json::json!({ "username": user, "password": password }))
-            .send()
-            .await;
-        match login_res {
-            Ok(r) if r.status().is_success() => {}
-            Ok(r) => {
-                eprintln!("Login failed ({}). Check credentials.", r.status());
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!(
-                    "Cannot connect to management API on port {port}: {e}. \
-                     Hint: is lorica running and is --management-port correct?"
-                );
-                std::process::exit(1);
-            }
-        }
+        let client = crate::cli_client::management_client();
+        crate::cli_client::management_login(&client, port, &user, &password).await;
 
         // Unban
         let unban_url = format!("https://127.0.0.1:{port}/api/v1/bans/{ip}");
@@ -483,8 +848,9 @@ pub(crate) fn run_unban(port: u16, ip: String, user: String, password: String) {
 ///
 /// The multipart body is assembled by hand rather than via reqwest's
 /// `multipart` feature so no extra cargo feature (and its transitive
-/// deps) is pulled in just for one upload. Mirrors `run_unban`'s
-/// login-then-call flow against the localhost management API.
+/// deps) is pulled in just for one upload. The client and the login
+/// are the shared `cli_client` ones (one loopback trust decision, one
+/// login contract for every CLI command).
 pub(crate) fn run_upgrade(
     port: u16,
     binary: String,
@@ -511,33 +877,9 @@ pub(crate) fn run_upgrade(
             }
         };
 
-        // Same localhost-only TLS management API as `run_unban` (Story
-        // 8.8 AC #1): accept the self-signed cert since the target is
-        // always `127.0.0.1`.
-        let client = reqwest::Client::builder()
-            .cookie_store(true)
-            .danger_accept_invalid_certs(true)
-            .build()
-            .expect("HTTP client");
-
         // Login (the upgrade endpoint is behind require_auth).
-        let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
-        match client
-            .post(&login_url)
-            .json(&serde_json::json!({ "username": user, "password": password }))
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => {}
-            Ok(r) => {
-                eprintln!("Login failed ({}). Check credentials.", r.status());
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("Cannot connect to management API on port {port}: {e}");
-                std::process::exit(1);
-            }
-        }
+        let client = crate::cli_client::management_client();
+        crate::cli_client::management_login(&client, port, &user, &password).await;
 
         // Hand-rolled multipart/form-data body: `binary` (raw bytes) +
         // `signature` (hex text), matching the axum Multipart extractor.
@@ -688,5 +1030,173 @@ mod tests {
         assert_eq!(child.upstream_crl_file, original.upstream_crl_file);
         // `auto` is resolved to the concrete count for the child.
         assert_eq!(child.workers, Workers::Fixed(8));
+    }
+
+    #[test]
+    fn hot_upgrade_argv_inherits_cluster_flags() {
+        let original = Cli::parse_from([
+            "lorica",
+            "--cluster-listen",
+            "192.0.2.10:9444",
+            "--cluster-listen-any",
+            "--cluster-auto-activate",
+            "--cluster-enrollment-listen",
+            "192.0.2.20:9500",
+            "--cluster-advertise",
+            "cp.example.com",
+        ]);
+        let child = Cli::parse_from(original.hot_upgrade_argv("/tmp/lorica.new", 1));
+        assert_eq!(child.cluster_listen, original.cluster_listen);
+        assert!(child.cluster_listen_any);
+        assert!(child.cluster_auto_activate);
+        assert_eq!(
+            child.cluster_enrollment_listen,
+            original.cluster_enrollment_listen
+        );
+        assert_eq!(child.cluster_advertise, original.cluster_advertise);
+    }
+
+    const RESERVED: ReservedPorts = ReservedPorts {
+        management: 9443,
+        http: 8080,
+        https: 8443,
+    };
+
+    fn validate(value: &str, allow_any: bool) -> Result<ClusterBinds, String> {
+        validate_cluster_listen(value, None, None, RESERVED, allow_any)
+    }
+
+    #[test]
+    fn cluster_listen_requires_explicit_host_and_port() {
+        // Story 9.2 AC #11 refusal matrix.
+        assert!(validate("9444", false).unwrap_err().contains("bare port"));
+        assert!(validate("192.0.2.10", false).is_err());
+        assert!(validate("192.0.2.10:0", false)
+            .unwrap_err()
+            .contains("non-zero"));
+        // Wildcards refused without the explicit opt-in, v4 and v6.
+        assert!(validate("0.0.0.0:9444", false)
+            .unwrap_err()
+            .contains("--cluster-listen-any"));
+        assert!(validate("[::]:9444", false).is_err());
+        assert!(validate("0.0.0.0:9444", true).is_ok());
+        // The management and proxy ports are refused regardless of host.
+        assert!(validate("192.0.2.10:9443", false)
+            .unwrap_err()
+            .contains("management"));
+        assert!(validate("192.0.2.10:8443", false)
+            .unwrap_err()
+            .contains("proxy"));
+        // Nominal accepts, v4 and v6; enrollment derives as port + 1 on
+        // the same host and the advertised name defaults to the host.
+        let binds = validate("192.0.2.10:9444", false).expect("valid");
+        assert_eq!(binds.operational.port(), 9444);
+        assert_eq!(binds.enrollment, "192.0.2.10:9445".parse().expect("addr"));
+        assert_eq!(binds.advertise_host, "192.0.2.10");
+        assert!(validate("[2001:db8::10]:9444", false).is_ok());
+    }
+
+    #[test]
+    fn derived_enrollment_bind_is_validated_too() {
+        // port + 1 must not overflow or land on a reserved port: the
+        // enrollment listener is the product's only unauthenticated
+        // surface, it must never end up somewhere the operator did
+        // not firewall.
+        assert!(validate("192.0.2.10:65535", false)
+            .unwrap_err()
+            .contains("overflows"));
+        assert!(validate("192.0.2.10:9442", false)
+            .unwrap_err()
+            .contains("--cluster-enrollment-listen"));
+        assert!(validate("192.0.2.10:8079", false).is_err());
+
+        // An explicit enrollment bind goes through the same matrix and
+        // may sit on another interface.
+        let binds = validate_cluster_listen(
+            "192.0.2.10:9444",
+            Some("192.0.2.20:9500"),
+            None,
+            RESERVED,
+            false,
+        )
+        .expect("valid");
+        assert_eq!(binds.enrollment, "192.0.2.20:9500".parse().expect("addr"));
+        assert!(
+            validate_cluster_listen("192.0.2.10:9444", Some("9500"), None, RESERVED, false)
+                .is_err()
+        );
+        assert!(validate_cluster_listen(
+            "192.0.2.10:9444",
+            Some("192.0.2.10:9444"),
+            None,
+            RESERVED,
+            false
+        )
+        .unwrap_err()
+        .contains("must not share"));
+        assert!(validate_cluster_listen(
+            "192.0.2.10:9444",
+            Some("0.0.0.0:9500"),
+            None,
+            RESERVED,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn advertise_name_is_shape_checked() {
+        let binds = validate_cluster_listen(
+            "192.0.2.10:9444",
+            None,
+            Some(" cp.example.com "),
+            RESERVED,
+            false,
+        )
+        .expect("valid");
+        assert_eq!(binds.advertise_host, "cp.example.com");
+        assert!(
+            validate_cluster_listen("192.0.2.10:9444", None, Some(""), RESERVED, false).is_err()
+        );
+        assert!(validate_cluster_listen(
+            "192.0.2.10:9444",
+            None,
+            Some("cp example"),
+            RESERVED,
+            false
+        )
+        .is_err());
+    }
+
+    /// The first run of the `cluster` e2e profile passed
+    /// `--cluster-advertise lorica-cp:9444`. It was accepted, became the
+    /// control-plane leaf's SAN, and every join then failed with a TLS
+    /// verification error that named neither the cause nor the flag.
+    #[test]
+    fn advertise_name_refuses_a_port_but_not_an_ipv6_literal() {
+        let err = validate_cluster_listen(
+            "192.0.2.10:9444",
+            None,
+            Some("cp.example.com:9444"),
+            RESERVED,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("without a port"), "{err}");
+        assert!(
+            err.contains("SAN"),
+            "the message names the consequence: {err}"
+        );
+
+        // An IPv6 literal is full of colons and is a valid SAN.
+        let binds = validate_cluster_listen(
+            "192.0.2.10:9444",
+            None,
+            Some("2001:db8::10"),
+            RESERVED,
+            false,
+        )
+        .expect("an IPv6 literal is an address, not a host:port");
+        assert_eq!(binds.advertise_host, "2001:db8::10");
     }
 }

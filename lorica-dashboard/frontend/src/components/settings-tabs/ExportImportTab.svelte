@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, type ImportDiffResponse } from '../../lib/api';
-  import { canWrite, isSuperAdmin } from '../../lib/auth';
+  import { canWriteRole, isSuperAdmin } from '../../lib/auth';
 
   interface Props {
     expanded: boolean;
@@ -117,7 +117,14 @@
           {#if exportError}
             <div class="settings-form-error">{exportError}</div>
           {/if}
-          {#if $canWrite}
+          <!--
+            `follower_local_request` names `/api/v1/config/export`: a
+            follower can hand out its own configuration snapshot, which
+            is exactly what an operator diagnosing drift wants. Import
+            stays on `isSuperAdmin` because the apply is refused there;
+            offering a preview that cannot be applied is a dead end.
+          -->
+          {#if $canWriteRole}
             <div class="actions-center">
               <button class="btn btn-primary" onclick={handleExport} disabled={exporting}>
                 {exporting ? 'Exporting...' : 'Download TOML'}

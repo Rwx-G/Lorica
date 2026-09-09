@@ -39,7 +39,10 @@ pub use messages::{
     RateLimitResult, RateLimitSnapshot, RequestCountEntry, Response, ResponseStatus, Verdict,
     VerdictLookup, VerdictPush, VerdictResult, WafCountEntry,
 };
-pub use rpc::{IncomingCommand, IncomingCommands, RpcEndpoint, DEFAULT_REQUEST_TIMEOUT};
+pub use rpc::{
+    Frame, FrameKind, IncomingCommand, IncomingCommands, IncomingRequest, IncomingRequests,
+    RpcEndpoint, RpcLimits, DEFAULT_REQUEST_TIMEOUT,
+};
 
 /// Errors from the command channel.
 #[derive(Debug, thiserror::Error)]
@@ -50,8 +53,11 @@ pub enum ChannelError {
     #[error("protobuf decode error: {0}")]
     Decode(prost::DecodeError),
 
-    #[error("message too large: {0} bytes (max 1MB)")]
+    #[error("message too large: {0} bytes (exceeds the endpoint's max_message_size)")]
     MessageTooLarge(u64),
+
+    #[error("in-flight request cap reached (endpoint's max_inflight)")]
+    InflightFull,
 
     #[error("channel operation timed out")]
     Timeout,

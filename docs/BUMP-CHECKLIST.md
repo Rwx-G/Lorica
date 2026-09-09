@@ -17,14 +17,17 @@ When bumping the version, update ALL of these files:
 - [ ] `lorica-waf/Cargo.toml` - `version` (first-party; follows product since v1.6.0)
 - [ ] `lorica-notify/Cargo.toml` - `version` (first-party; follows product since v1.6.0)
 - [ ] `lorica-acme/Cargo.toml` - `version` (first-party; follows product since v1.6.0)
+- [ ] `lorica-cluster/Cargo.toml` - `version` (first-party; follows product since v1.7.0)
 
 ## Internal dependency references (cross-crate deps)
 - [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-bench, lorica-worker, lorica-command, lorica-shmem, lorica-geoip, lorica-challenge, lorica-waf, lorica-notify versions
 - [ ] `lorica-api/Cargo.toml` - lorica-acme, lorica-config, lorica-dashboard, lorica-bench, lorica-metrics, lorica-waf, lorica-notify versions
-- [ ] `lorica-bench/Cargo.toml` - lorica-config, lorica-notify versions
+- [ ] `lorica-bench/Cargo.toml` - lorica-config, lorica-metrics, lorica-notify versions
+- [ ] `lorica-notify/Cargo.toml` - lorica-metrics version
 
 ## Frontend and API spec
 - [ ] `lorica-dashboard/frontend/package.json` - `version`
+- [ ] `lorica-dashboard/frontend/package-lock.json` - the root `version`, twice (`pnpm-lock.yaml` does not record it)
 - [ ] `lorica-api/openapi.yaml` - `version`
 
 ## Documentation

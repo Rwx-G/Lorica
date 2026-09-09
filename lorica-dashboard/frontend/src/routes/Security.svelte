@@ -1,11 +1,19 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry, type AuditRecord, type AuditVerifyResult, type AuditQuery } from '../lib/api';
+  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry, type AuditRecord, type AuditVerifyReport, type AuditQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import NodeFilter from '../components/NodeFilter.svelte';
   import { showToast } from '../lib/toast';
-  import { canWrite, isSuperAdmin } from '../lib/auth';
+  import { canWrite, canWriteRole, isSuperAdmin, isSuperAdminRole } from '../lib/auth';
+  import { clusterStatus, isFleetView, type FleetBanRow } from '../lib/cluster';
 
-  let events: WafEvent[] = $state([]);
+  /**
+   * The events table. On a control plane the rows come from the fan-in
+   * store and carry the node that produced them; `node_id` is absent
+   * on a standalone install rather than empty, so the Node column
+   * exists only where it means something.
+   */
+  let events: (WafEvent & { node_id?: string })[] = $state([]);
   let stats: { total_events: number; total_24h: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
     total_events: 0,
     total_24h: 0,
@@ -20,9 +28,27 @@
   let loading = $state(true);
   let error = $state('');
   let filterCategory = $state('');
+  /** Selected node id, or `''` for every node (Story 9.7 AC #5). */
+  let filterNode = $state('');
+  /**
+   * Whether this page is reading the FAN-IN store rather than this
+   * node's own tables. Only a control plane holds fanned-in rows.
+   */
+  // The fleet view reads Operator-floor endpoints; a Viewer on the
+  // control plane sees this node's own data, as on a standalone.
+  const fleetView = $derived(isFleetView($clusterStatus) && $canWriteRole);
   let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' | 'bans' | 'audit' = $state('events');
   let showClearConfirm = $state(false);
   let bans: BanEntry[] = $state([]);
+  /**
+   * The fleet's bans, kept separate from `bans` rather than mapped
+   * onto it: a fan-in row has no `banned_seconds_ago`, its `reason` is
+   * an arbitrary string from another node rather than this build's
+   * `BanReason` union, and there is no fleet unban endpoint, so the
+   * two tables genuinely differ in columns and in what they let an
+   * operator do.
+   */
+  let fleetBans: FleetBanRow[] = $state([]);
   let bansLoading = $state(false);
   let unbanningIp: string | null = $state(null);
   let bansRefreshTimer: ReturnType<typeof setInterval> | null = $state(null);
@@ -37,7 +63,11 @@
   let auditFrom = $state('');
   let auditTo = $state('');
   let auditLimit = $state(250);
-  let auditVerifyResult: AuditVerifyResult | null = $state(null);
+  let auditVerifyResult: AuditVerifyReport | null = $state(null);
+  /** Audit node filter; `undefined` is every node (Story 9.9 AC #7). */
+  let auditNode: string | undefined = $state(undefined);
+  let auditNodeIds = $state<string[]>([]);
+  let auditNodeNames = $state<Record<string, string>>({});
   let auditVerifying = $state(false);
 
   // Custom rule form
@@ -54,18 +84,38 @@
   async function loadData() {
     loading = true;
     error = '';
-    const [eventsRes, statsRes, rulesRes, blRes, crRes] = await Promise.all([
-      api.getWafEvents({ limit: 100, category: filterCategory || undefined }),
+    // The rules, blocklist and custom-rule views describe THIS node's
+    // WAF configuration, which replication keeps identical across the
+    // fleet, so they are read locally in both modes. Only the event
+    // stream differs, because only it is fanned in.
+    const [statsRes, rulesRes, blRes, crRes] = await Promise.all([
       api.getWafStats(),
       api.getWafRules(),
       api.getBlocklistStatus(),
       api.listCustomRules(),
     ]);
 
-    if (eventsRes.error) {
-      error = eventsRes.error.message;
-    } else if (eventsRes.data) {
-      events = eventsRes.data.events;
+    if (fleetView) {
+      const res = await api.getFleetWafEvents({
+        ...(filterNode ? { node: filterNode } : {}),
+        ...(filterCategory ? { category: filterCategory } : {}),
+        limit: 100,
+      });
+      if (res.error) {
+        error = res.error.message;
+      } else if (res.data) {
+        events = res.data.rows;
+      }
+    } else {
+      const res = await api.getWafEvents({
+        limit: 100,
+        category: filterCategory || undefined,
+      });
+      if (res.error) {
+        error = res.error.message;
+      } else if (res.data) {
+        events = res.data.events;
+      }
     }
 
     if (statsRes.data) {
@@ -98,9 +148,16 @@
 
   async function loadBans() {
     bansLoading = true;
-    const res = await api.listBans();
-    if (res.data) {
-      bans = res.data.bans;
+    if (fleetView) {
+      const res = await api.getFleetBans(filterNode || undefined);
+      if (res.data) {
+        fleetBans = res.data;
+      }
+    } else {
+      const res = await api.listBans();
+      if (res.data) {
+        bans = res.data.bans;
+      }
     }
     bansLoading = false;
   }
@@ -271,6 +328,7 @@
     if (auditAction.trim()) params.action = auditAction.trim();
     if (auditFrom) params.from = new Date(auditFrom).toISOString();
     if (auditTo) params.to = new Date(auditTo).toISOString();
+    if (auditNode !== undefined) params.node = auditNode;
     return params;
   }
 
@@ -301,9 +359,38 @@
     auditLoadingMore = false;
   }
 
+  /**
+   * A node id as an operator reads it: the roster name when the
+   * roster is loaded, the id otherwise, and "This node" for the empty
+   * local marker.
+   */
+  function fleetNodeName(nodeId: string): string {
+    // A node's display name is chosen at enrolment and validated only
+    // for length and control characters, so a follower can call itself
+    // "This node". The local marker therefore has to be something a
+    // name cannot forge: the caller renders it as a badge, and this
+    // returns the node's own name unchanged.
+    return auditNodeNames[nodeId] ?? nodeId;
+  }
+
+  /** Whether a chain is this node's own, which no display name can claim. */
+  function isLocalChain(nodeId: string): boolean {
+    return nodeId === '';
+  }
+
+  async function loadAuditNodes() {
+    if (!fleetView) return;
+    const res = await api.listClusterNodes();
+    if (!res.data) return;
+    auditNodeNames = Object.fromEntries(
+      res.data.map((n) => [n.node_id, n.name]),
+    );
+    auditNodeIds = ['', ...res.data.map((n) => n.node_id)];
+  }
+
   async function verifyAuditChain() {
     auditVerifying = true;
-    const res = await api.verifyAudit();
+    const res = await api.verifyAudit(auditNode);
     if (res.error) {
       showToast(res.error.message, 'error');
     } else if (res.data) {
@@ -318,7 +405,7 @@
     <h1>Security</h1>
     <div class="header-actions">
       <button class="btn btn-secondary" onclick={loadData}>Refresh</button>
-      {#if $canWrite && activeTab === 'events' && events.length > 0}
+      {#if $canWrite && !fleetView && activeTab === 'events' && events.length > 0}
         <button class="btn btn-secondary" style="color: var(--color-red)" onclick={() => (showClearConfirm = true)}>Clear Events</button>
       {/if}
     </div>
@@ -328,7 +415,12 @@
     <div class="error-banner">{error}</div>
   {/if}
 
-  <!-- Stats cards -->
+  <!-- Stats cards. Local counters: the WAF statistics endpoint has no
+       fan-in counterpart, so on a control plane they describe this node
+       while the table below describes the fleet. -->
+  {#if fleetView}
+    <p class="text-muted">Counters below are this node's own.</p>
+  {/if}
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-value">{rulesEnabled}/{stats.rule_count}</div>
@@ -374,12 +466,19 @@
         <span class="tab-badge-on">{bans.length}</span>
       {/if}
     </button>
-    <button class="tab" class:active={activeTab === 'audit'} onclick={() => { stopBansRefresh(); activeTab = 'audit'; loadAudit(); }}>Audit log</button>
+    <button class="tab" class:active={activeTab === 'audit'} onclick={() => { stopBansRefresh(); activeTab = 'audit'; loadAudit(); void loadAuditNodes(); }}>Audit log</button>
   </div>
 
   {#if activeTab === 'events'}
     <!-- Filter -->
     <div class="filter-bar">
+      <NodeFilter
+        value={filterNode}
+        onchange={(id) => {
+          filterNode = id;
+          void loadData();
+        }}
+      />
       <label for="cat-filter">Filter by category:</label>
       <select id="cat-filter" bind:value={filterCategory} onchange={handleFilterChange}>
         <option value="">All categories</option>
@@ -410,6 +509,9 @@
         <table>
           <thead>
             <tr>
+              {#if fleetView}
+                <th>Node</th>
+              {/if}
               <th>Time</th>
               <th>Client IP</th>
               <th>Route</th>
@@ -423,8 +525,17 @@
             </tr>
           </thead>
           <tbody>
-            {#each events as event, i (i)}
+            <!--
+              Keyed by the fan-in row id where there is one. A local
+              WAF event has no id, so the index remains the key there;
+              that list is replaced wholesale on every load, which is
+              the case index keying is safe for.
+            -->
+            {#each events as event, i (event.node_id ? `${event.node_id}:${i}` : i)}
               <tr>
+                {#if fleetView}
+                  <td class="mono">{event.node_id ?? '-'}</td>
+                {/if}
                 <td class="mono">{formatTime(event.timestamp)}</td>
                 <td class="mono">{event.client_ip || '-'}</td>
                 <td class="mono">{event.route_hostname || '-'}</td>
@@ -633,8 +744,57 @@
         IPs automatically banned for repeated rate limit violations. Bans expire after 1 hour.
         Auto-refreshes every 10 seconds.
       </p>
+      {#if fleetView}
+        <p class="text-muted">
+          Each node reports the bans it currently holds. Bans live in memory,
+          so a node that restarted reports none until it bans again, and
+          lifting one is done on the node that applied it.
+        </p>
+      {/if}
+      <div class="filter-bar">
+        <NodeFilter
+          value={filterNode}
+          onchange={(id) => {
+            filterNode = id;
+            void loadBans();
+          }}
+        />
+      </div>
 
-      {#if bansLoading && bans.length === 0}
+      {#if fleetView}
+        {#if bansLoading && fleetBans.length === 0}
+          <p class="loading">Loading...</p>
+        {:else if fleetBans.length === 0}
+          <div class="empty-state">
+            <p>No node reports a banned IP.</p>
+          </div>
+        {:else}
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Node</th>
+                  <th>IP Address</th>
+                  <th>Reason</th>
+                  <th>Expires In</th>
+                  <th>Reported</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each fleetBans as ban (ban.node_id + ban.client_ip)}
+                  <tr>
+                    <td class="mono">{ban.node_id}</td>
+                    <td class="mono">{ban.client_ip}</td>
+                    <td><span class="ban-reason-badge">{ban.reason}</span></td>
+                    <td>{formatDuration(ban.remaining_s)}</td>
+                    <td class="mono">{formatTime(ban.observed_at)}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      {:else if bansLoading && bans.length === 0}
         <p class="loading">Loading...</p>
       {:else if bans.length === 0}
         <div class="empty-state">
@@ -698,6 +858,15 @@
       <p class="text-muted">
         Tamper-evident record of every operator mutation. Hash-chained, newest first.
       </p>
+      {#if fleetView}
+        <p class="text-muted">
+          This node also holds the rows other nodes fanned in. Each chain is
+          verified separately. The hash is unkeyed, so this proves what a node
+          sent is internally consistent and nothing about authenticity: the
+          authoritative copy is each node's own, anchored by the audit stream
+          it ships to a write-once sink.
+        </p>
+      {/if}
 
       <div class="audit-filters">
         <input
@@ -728,8 +897,35 @@
           <option value={500}>500</option>
           <option value={1000}>1000</option>
         </select>
+        {#if fleetView}
+          <select
+            class="audit-select"
+            aria-label="Filter audit by node"
+            value={auditNode ?? ''}
+            onchange={(e) => {
+              const picked = (e.currentTarget as HTMLSelectElement).value;
+              // `''` is a real filter (this node's own rows) and the
+              // sentinel below is "no filter", so they cannot share a
+              // value.
+              auditNode = picked === '__all__' ? undefined : picked;
+              void loadAudit();
+            }}
+          >
+            <option value="__all__">All nodes</option>
+            <option value="">This node (local chain)</option>
+            {#each auditNodeIds.filter((n) => n !== '') as id (id)}
+              <option value={id}>{fleetNodeName(id)}</option>
+            {/each}
+          </select>
+        {/if}
         <button class="btn btn-secondary" onclick={loadAudit}>Apply</button>
-        {#if $isSuperAdmin}
+        <!--
+          The audit log is node-local and `follower_local_request`
+          names the `/api/v1/audit` prefix. Verifying the chain reads
+          this node's own records and changes nothing, so read-only
+          mode has no reason to withhold it.
+        -->
+        {#if $isSuperAdminRole}
           <button class="btn btn-secondary" onclick={verifyAuditChain} disabled={auditVerifying}>
             {auditVerifying ? 'Verifying...' : 'Verify chain integrity'}
           </button>
@@ -737,15 +933,31 @@
       </div>
 
       {#if auditVerifyResult}
-        {#if auditVerifyResult.verified}
-          <div class="audit-verify audit-verify-ok" role="status">
-            Chain verified - {auditVerifyResult.total_rows} rows
-          </div>
-        {:else}
-          <div class="audit-verify audit-verify-broken" role="alert">
-            Chain BROKEN at row {auditVerifyResult.first_break_id}: {auditVerifyResult.first_break_reason}
-          </div>
-        {/if}
+        <!--
+          One verdict per chain, never one for the table: an aggregated
+          table interleaves N chains, so a single walk would chain one
+          node's row to another's and break at the first interleave.
+        -->
+        {#each auditVerifyResult.nodes as chain (chain.node_id)}
+          {#if chain.verified}
+            <div class="audit-verify audit-verify-ok" role="status">
+              {#if isLocalChain(chain.node_id)}
+                <span class="local-chain">this node</span>
+              {:else}
+                {fleetNodeName(chain.node_id)}
+              {/if}: chain verified, {chain.total_rows} rows
+            </div>
+          {:else}
+            <div class="audit-verify audit-verify-broken" role="alert">
+              {#if isLocalChain(chain.node_id)}
+                <span class="local-chain">this node</span>
+              {:else}
+                {fleetNodeName(chain.node_id)}
+              {/if}: chain BROKEN at row
+              {chain.first_break_id}: {chain.first_break_reason}
+            </div>
+          {/if}
+        {/each}
       {/if}
 
       {#if auditLoading}
@@ -759,6 +971,9 @@
           <table>
             <thead>
               <tr>
+                {#if fleetView}
+                  <th>Node</th>
+                {/if}
                 <th>Timestamp</th>
                 <th>Operator</th>
                 <th>Action</th>
@@ -770,6 +985,15 @@
             <tbody>
               {#each auditEntries as record (record.id)}
                 <tr>
+                  {#if fleetView}
+                    <td class="mono">
+                      {#if isLocalChain(record.node_id)}
+                        <span class="local-chain">this node</span>
+                      {:else}
+                        {fleetNodeName(record.node_id)}
+                      {/if}
+                    </td>
+                  {/if}
                   <td class="mono">{formatTime(record.timestamp)}</td>
                   <td>
                     {record.operator_username}
@@ -1206,6 +1430,19 @@
   .audit-verify-broken {
     background: var(--color-red-subtle);
     color: var(--color-red);
+  }
+
+  /* The local chain is marked by a badge, not by a name: a node's
+     display name is chosen at enrolment, so a follower could otherwise
+     call itself "This node" and have its rows read as the control
+     plane's own. */
+  .local-chain {
+    display: inline-block;
+    padding: 0 0.35rem;
+    border-radius: 0.25rem;
+    background: var(--color-border);
+    color: var(--color-text-muted);
+    font-style: italic;
   }
 
   .audit-footer {

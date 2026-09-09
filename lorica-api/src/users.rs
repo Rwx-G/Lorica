@@ -108,7 +108,9 @@ pub async fn list_users(
     Extension(state): Extension<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let users = db_blocking(&state.store, |store| {
-        store.list_users().map_err(|e| ApiError::Internal(e.to_string()))
+        store
+            .list_users()
+            .map_err(|e| ApiError::Internal(e.to_string()))
     })
     .await?;
     let users: Vec<UserResponse> = users.into_iter().map(UserResponse::from).collect();

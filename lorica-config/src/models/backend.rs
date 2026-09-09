@@ -11,6 +11,7 @@ use super::enums::{HealthStatus, LifecycleState};
 ///
 /// [`LoadBalancing`]: super::enums::LoadBalancing
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Backend {
     /// Stable UUID; primary key of the `backends` table.
     pub id: String,
@@ -65,6 +66,7 @@ pub struct Backend {
 ///
 /// [`Route`]: super::route::Route
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteBackend {
     /// ID of the associated `Route`.
     pub route_id: String,

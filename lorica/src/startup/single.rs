@@ -135,6 +135,12 @@ pub(crate) fn run_single_process(cli: Cli) {
 
         try_init_otel_from_settings(&store, "single-process").await;
 
+        // Story 9.8: install the log-export sinks (syslog / OTLP
+        // logs) from persisted settings. Reloads go through
+        // apply_per_process_reload_state; this is the boot-time
+        // equivalent, mirroring the OTel init above.
+        lorica::reload::apply_log_sinks_from_store(&store).await;
+
         // Build the CertResolver for SNI-based certificate selection
         let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
         load_certs_into_resolver(&store, &cert_resolver).await;
@@ -347,11 +353,60 @@ pub(crate) fn run_single_process(cli: Cli) {
         let api_active_connections = Arc::clone(&active_connections);
         let api_log_store = log_store.clone();
         let management_port = cli.management_port;
+        let cluster_listen = cli.cluster_listen.clone();
+        let cluster_enrollment_listen = cli.cluster_enrollment_listen.clone();
+        let cluster_advertise = cli.cluster_advertise.clone();
+        let cluster_listen_any = cli.cluster_listen_any;
+        let cluster_auto_activate = cli.cluster_auto_activate;
+        let http_port = cli.http_port;
+        let https_port = cli.https_port;
         // `single_task_tracker` is already defined above (before the
         // WAF blocklist refresh spawn). Clone it for AppState and the
         // shutdown drain path.
         let api_task_tracker = single_task_tracker.clone();
         let shutdown_task_tracker = single_task_tracker.clone();
+        // The fleet role (control plane, follower or standalone), shared
+        // by both startup modes: see `startup::spawn_cluster_runtime`.
+        // Spawned BEFORE the API so AppState carries it.
+        let startup::ClusterStartup {
+            plane: mut cluster_plane,
+            follower: mut follower_plane,
+            runtime: cluster_runtime,
+        } = startup::spawn_cluster_runtime(
+            startup::cluster_plane::ClusterPlaneOptions {
+                cluster_listen,
+                enrollment_listen: cluster_enrollment_listen,
+                advertise: cluster_advertise,
+                listen_any: cluster_listen_any,
+                reserved: crate::cli::ReservedPorts {
+                    management: management_port,
+                    http: http_port,
+                    https: https_port,
+                },
+                // Single-process mode never hot-upgrades (it binds the
+                // management port fresh), so there is nothing to adopt.
+                inherited_operational: None,
+                auto_activate: cluster_auto_activate,
+                log_store: log_store.clone(),
+                alert_sender: alert_sender.clone(),
+                config_reload: config_reload_tx.clone(),
+                data_dir: data_dir.clone(),
+            },
+            &store,
+            // Single-process: a fleet-wide ban writes the shared
+            // data-plane map the request path already reads.
+            startup::cluster_follower::BanApplier::Direct(Arc::clone(&proxy_ban_list)),
+        )
+        .await;
+
+        // Captured before `cluster_runtime` moves into the API task:
+        // only a control plane has a fan-in store, and the retention
+        // loop below needs it.
+        let fleet_telemetry = match &cluster_runtime {
+            lorica_api::cluster::ClusterRuntime::ControlPlane(runtime) => runtime.telemetry.clone(),
+            _ => None,
+        };
+
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store.clone(),
@@ -386,6 +441,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 log_store: api_log_store,
                 log_writer: log_writer.clone(),
                 task_tracker: api_task_tracker,
+                cluster: cluster_runtime,
             };
 
             // Session store + ACME auto-renewal + cert-expiry notifier
@@ -399,7 +455,14 @@ pub(crate) fn run_single_process(cli: Cli) {
         // events, SLA buckets), shared across modes (audit H-9, see
         // `startup::spawn_retention_loop`). No-op when the access-log
         // store failed to open.
-        startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
+        startup::spawn_retention_loop(
+            log_store.clone(),
+            Arc::clone(&store),
+            // Only a control plane holds a fan-in store; every other
+            // role passes `None` and the per-node quota is skipped.
+            fleet_telemetry,
+        );
+
 
         // Background OCSP-staple refresh (Story 8.5). Reload swaps cert
         // bodies with no staple; this loop attaches OCSP responses out
@@ -481,6 +544,15 @@ pub(crate) fn run_single_process(cli: Cli) {
 
         info!("Lorica shutting down gracefully");
 
+        // Stop accepting cluster sessions and tear down the established
+        // ones before the rest of the process winds down.
+        if let Some(plane) = cluster_plane.take() {
+            plane.shutdown();
+        }
+        if let Some(follower) = follower_plane.take() {
+            follower.shutdown();
+        }
+
         // Drain tracked background tasks before tearing down the API
         // server. Bounded at 10 s so a hung task does not delay exit.
         shutdown_task_tracker.close();
@@ -514,17 +586,7 @@ async fn load_certs_into_resolver(
     if db_certs.is_empty() {
         return;
     }
-    let cert_data: Vec<lorica_tls::cert_resolver::CertData> = db_certs
-        .iter()
-        .map(|c| lorica_tls::cert_resolver::CertData {
-            domain: c.domain.clone(),
-            san_domains: c.san_domains.clone(),
-            cert_pem: c.cert_pem.clone(),
-            key_pem: c.key_pem.clone(),
-            not_after_epoch: c.not_after.timestamp(),
-            ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
-        })
-        .collect();
+    let cert_data = lorica::reload::cert_data_for_resolver(&db_certs);
     match cert_resolver.reload(cert_data) {
         Ok(stats) => {
             if stats.skipped > 0 {
@@ -548,7 +610,10 @@ async fn load_certs_into_resolver(
 /// (enable flag plus an initial Data-Shield fetch when on), the operator
 /// disabled-rule set, and any custom rules. Single-process mode owns the
 /// blocklist fetch (workers inherit the enable flag only).
-async fn restore_waf_state(store: &Arc<Mutex<ConfigStore>>, waf_engine: &Arc<lorica_waf::WafEngine>) {
+async fn restore_waf_state(
+    store: &Arc<Mutex<ConfigStore>>,
+    waf_engine: &Arc<lorica_waf::WafEngine>,
+) {
     let s = store.lock().await;
     if let Ok(settings) = s.get_global_settings() {
         if settings.ip_blocklist_enabled {

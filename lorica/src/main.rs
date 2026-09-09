@@ -13,13 +13,16 @@
 // limitations under the License.
 
 mod cli;
+mod cli_client;
+mod cli_cluster;
 mod health;
 mod startup;
 
 use clap::Parser;
 
 use crate::cli::{
-    init_logging, run_rotate_key, run_unban, run_upgrade, startup_banner, Cli, Commands,
+    init_logging, run_rotate_key, run_unban, run_upgrade, startup_banner, Cli, ClusterAction,
+    Commands,
 };
 
 fn main() {
@@ -53,17 +56,128 @@ fn main() {
         Some(Commands::RotateKey { new_key_file }) => {
             run_rotate_key(&cli.data_dir, &new_key_file);
         }
-        Some(Commands::Unban { ip, user, password }) => {
+        Some(Commands::Unban {
+            ip,
+            user,
+            password_file,
+            password_stdin,
+            password,
+        }) => {
+            let password =
+                cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
+                    .unwrap_or_else(|e| cli_client::fail(e));
             run_unban(cli.management_port, ip, user, password);
         }
         Some(Commands::Upgrade {
             binary,
             signature,
             user,
+            password_file,
+            password_stdin,
             password,
         }) => {
+            let password =
+                cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
+                    .unwrap_or_else(|e| cli_client::fail(e));
             run_upgrade(cli.management_port, binary, signature, user, password);
         }
+        Some(Commands::Cluster { action }) => match action {
+            ClusterAction::Init { common_name } => {
+                cli_cluster::run_cluster_init(&cli.data_dir, &common_name);
+            }
+            ClusterAction::Join {
+                control_plane,
+                enrollment,
+                name,
+                token_file,
+                token_stdin,
+                server_name,
+            } => {
+                cli_cluster::run_cluster_join(
+                    &cli.data_dir,
+                    control_plane,
+                    enrollment,
+                    name,
+                    token_file,
+                    token_stdin,
+                    server_name,
+                );
+            }
+            ClusterAction::Leave {
+                user,
+                password_file,
+                password_stdin,
+                password,
+            } => {
+                let password = cli_client::optional_admin_password(
+                    user.as_deref(),
+                    password,
+                    password_file.as_deref(),
+                    password_stdin,
+                );
+                cli_cluster::run_cluster_leave(&cli.data_dir, cli.management_port, user, password);
+            }
+            ClusterAction::Status {
+                user,
+                password_file,
+                password_stdin,
+                password,
+            } => {
+                let password = cli_client::optional_admin_password(
+                    user.as_deref(),
+                    password,
+                    password_file.as_deref(),
+                    password_stdin,
+                );
+                cli_cluster::run_cluster_status(&cli.data_dir, cli.management_port, user, password);
+            }
+            ClusterAction::BreakGlass {
+                duration,
+                close,
+                user,
+                password_file,
+                password_stdin,
+                password,
+            } => {
+                let password = cli_client::read_admin_password(
+                    password,
+                    password_file.as_deref(),
+                    password_stdin,
+                )
+                .unwrap_or_else(|e| cli_client::fail(e));
+                cli_cluster::run_cluster_break_glass(
+                    cli.management_port,
+                    duration,
+                    close,
+                    user,
+                    password,
+                );
+            }
+            ClusterAction::Token {
+                ttl_seconds,
+                node_name,
+                source_cidr,
+                user,
+                password_file,
+                password_stdin,
+                password,
+            } => {
+                let password = cli_client::read_admin_password(
+                    password,
+                    password_file.as_deref(),
+                    password_stdin,
+                )
+                .unwrap_or_else(|e| cli_client::fail(e));
+                cli_cluster::run_cluster_token(
+                    cli.management_port,
+                    ttl_seconds,
+                    node_name,
+                    source_cidr,
+                    user,
+                    password,
+                );
+            }
+        },
         None => {
             init_logging(&cli.log_level, &cli.log_format, cli.log_file.as_deref());
             startup_banner(&cli);

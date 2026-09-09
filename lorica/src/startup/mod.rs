@@ -21,9 +21,12 @@
 //! module is the single source of truth for one such cluster;
 //! mode-specific differences are explicit parameters, never copies.
 
+pub(crate) mod cluster_follower;
+pub(crate) mod cluster_plane;
 pub(crate) mod hot_upgrade;
 pub(crate) mod single;
 pub(crate) mod supervisor;
+pub(crate) mod telemetry_drain;
 pub(crate) mod worker;
 
 use std::collections::VecDeque;
@@ -51,8 +54,7 @@ pub(crate) struct AlertingStack {
     /// dispatcher is wrapped. Single-process mode hands it straight to
     /// `AppState`; supervisor mode re-reads it via
     /// `notify_dispatcher.lock().await.history()` at AppState build.
-    pub(crate) notification_history:
-        Arc<parking_lot::Mutex<VecDeque<lorica_notify::AlertEvent>>>,
+    pub(crate) notification_history: Arc<parking_lot::Mutex<VecDeque<lorica_notify::AlertEvent>>>,
     /// Active probe scheduler, already loaded via `reload()`.
     pub(crate) probe_scheduler: Arc<lorica_bench::ProbeScheduler>,
     /// SLA collector with its flush task already started.
@@ -170,22 +172,48 @@ pub(crate) async fn run_api_server(
         .with_task_tracker(state.task_tracker.clone());
     let rate_limiter = RateLimiter::new();
 
-    // One-shot startup purge of superseded orphan ACME certs (fix
-    // 1.5.12). Shared by both modes here so single-process and
-    // supervisor cannot drift, exactly like the renewal spawn below.
-    purge_superseded_acme_orphans(&state.store).await;
+    // Issuance belongs to the control plane (Story 9.5 AC #3). A
+    // follower renews nothing and warns about nothing: the fleet's
+    // certificates are issued once, centrally, and pushed down.
+    //
+    // The guard sits HERE, at the spawn, not inside either task. The
+    // expiry notifier runs one check immediately before entering its
+    // loop, so a guard placed in the loop would still fire one
+    // duplicate fleet-wide alert per node at every boot. The orphan
+    // purge joins them because it DELETES certificates, which on a
+    // follower is both redundant with the replica apply's own delete
+    // pass and capable of racing it.
+    //
+    // OCSP refresh is deliberately NOT gated: stapling is a serving
+    // concern and followers are the nodes terminating client TLS (AC
+    // #4). See `spawn_ocsp_refresh_loop`.
+    let is_follower = matches!(
+        state.cluster,
+        lorica_api::cluster::ClusterRuntime::Follower(_)
+    );
+    if is_follower {
+        info!(
+            "follower mode: certificate issuance, renewal and expiry alerting are the control plane's job; this node installs what it is sent and keeps stapling its own certs"
+        );
+    } else {
+        // One-shot startup purge of superseded orphan ACME certs (fix
+        // 1.5.12). Shared by both modes here so single-process and
+        // supervisor cannot drift, exactly like the renewal spawn
+        // below.
+        purge_superseded_acme_orphans(&state.store).await;
 
-    let _acme_renewal = lorica_api::acme::spawn_renewal_task(
-        state.clone(),
-        std::time::Duration::from_secs(12 * 3600),
-        30,
-        Some(alert_sender.clone()),
-    );
-    let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
-        state.clone(),
-        std::time::Duration::from_secs(12 * 3600),
-        alert_sender,
-    );
+        let _acme_renewal = lorica_api::acme::spawn_renewal_task(
+            state.clone(),
+            std::time::Duration::from_secs(12 * 3600),
+            30,
+            Some(alert_sender.clone()),
+        );
+        let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
+            state.clone(),
+            std::time::Duration::from_secs(12 * 3600),
+            alert_sender,
+        );
+    }
 
     if let Err(e) = lorica_api::server::start_server(
         management_port,
@@ -251,21 +279,29 @@ async fn purge_superseded_acme_orphans(store: &Arc<Mutex<ConfigStore>>) {
 
 /// Spawn the hourly retention loop shared by supervisor and
 /// single-process modes (audit H-9 dedup): access-log retention, probe
-/// result purge (keep 1000), WAF event retention (keep 100 000), and
-/// the daily SLA bucket purge.
+/// result purge (keep 1000), WAF event retention (keep 100 000),
+/// expired ACME challenge purge (Story 9.5), and the daily SLA bucket
+/// purge.
 ///
-/// No-op when the access-log store failed to open (`log_store` is
-/// `None`), exactly like the original `if let Some(...)` guard at both
-/// call sites. The `JoinHandle` was discarded at both original call
-/// sites, so it is not returned. Must be called from within a tokio
-/// runtime context.
+/// A `None` `log_store` (the access-log store failed to open) skips
+/// only the jobs that read it. The configuration-store jobs still run:
+/// Story 9.5 iteration 1 found the challenge purge silently disabled
+/// on any node whose log store was missing, which is exactly the
+/// degraded node where stale rows accumulate unnoticed.
+///
+/// The `JoinHandle` was discarded at both original call sites, so it
+/// is not returned. Must be called from within a tokio runtime
+/// context.
 pub(crate) fn spawn_retention_loop(
     log_store: Option<Arc<lorica_api::log_store::LogStore>>,
     config_store: Arc<Mutex<ConfigStore>>,
+    telemetry: Option<Arc<lorica_api::cluster_telemetry_store::ClusterTelemetryStore>>,
 ) {
-    let Some(retention_log_store) = log_store else {
-        return;
-    };
+    // The loop runs even with no log store: several of its jobs
+    // (expired ACME challenges, probe results, SLA windows) live in
+    // the configuration store and must not be hostage to whether this
+    // process happens to keep access logs.
+    let retention_log_store = log_store;
     let retention_config_store = config_store;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
@@ -284,25 +320,129 @@ pub(crate) fn spawn_retention_loop(
                     })
                     .unwrap_or((100_000, 100_000, 90))
             };
-            if retention > 0 {
-                if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
-                    tracing::warn!(error = %e, "access log retention cleanup failed");
+            if let Some(logs) = &retention_log_store {
+                if retention > 0 {
+                    if let Err(e) = logs.enforce_retention(retention as u64) {
+                        tracing::warn!(error = %e, "access log retention cleanup failed");
+                    }
+                }
+            }
+            // Fan-in retention (Story 9.6 AC #3): a PER-NODE quota,
+            // not a global row cap. A global cap would make the fleet
+            // view shallower than each node's own local log and let
+            // one noisy edge evict every quiet edge's rows, which is
+            // the incident-correlation case fan-in exists for. Only a
+            // control plane has this store.
+            if let Some(telemetry) = &telemetry {
+                let telemetry = Arc::clone(telemetry);
+                // The roster decides which node ids still own their
+                // rows. A node id absent from the registry (deleted,
+                // or superseded by a re-enrolment under a fresh id)
+                // owns nothing; a revoked node keeps its rows for a
+                // day, because the hours before a revocation are
+                // exactly what an operator reviews after one. Without
+                // this, retired ids held up to twice their quota
+                // forever and counted toward the watermark that sheds
+                // the whole fleet (Epic 9 close, architecture review).
+                let roster = {
+                    let s = retention_config_store.lock().await;
+                    s.list_cluster_nodes().unwrap_or_default()
+                };
+                let pruned = tokio::task::spawn_blocking(move || {
+                    let mut total = 0u64;
+                    let retired_cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+                    let nodes = telemetry.nodes_with_rows()?;
+                    for node_id in &nodes {
+                        let owner = roster.iter().find(|n| &n.node_id == node_id);
+                        let retired = match owner {
+                            None => true,
+                            Some(n) => {
+                                n.status == lorica_config::models::NodeStatus::Revoked
+                                    && n.revoked_at.is_some_and(|at| at < retired_cutoff)
+                            }
+                        };
+                        if retired {
+                            let reclaimed = telemetry.forget_node(node_id)?;
+                            if reclaimed > 0 {
+                                tracing::info!(
+                                    node_id,
+                                    rows = reclaimed,
+                                    "fleet telemetry of a retired node reclaimed"
+                                );
+                            }
+                            total += reclaimed;
+                            continue;
+                        }
+                        for table in [
+                            lorica_api::cluster_telemetry_store::TelemetryTable::Access,
+                            lorica_api::cluster_telemetry_store::TelemetryTable::Waf,
+                        ] {
+                            total += telemetry.enforce_node_quota(
+                                table,
+                                node_id,
+                                lorica_api::cluster_telemetry_store::DEFAULT_ROWS_PER_NODE,
+                            )?;
+                        }
+                    }
+                    // A node that stops reporting keeps its rows until
+                    // the quota reclaims them, but its BANS are live
+                    // state: a snapshot nobody refreshed for a day is
+                    // not a ban any more.
+                    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+                    total += telemetry.prune_stale_bans(&cutoff)?;
+                    Ok::<_, String>(total)
+                })
+                .await;
+                match pruned {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(rows)) => {
+                        tracing::info!(rows, "fleet telemetry retention reclaimed rows");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "fleet telemetry retention failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "fleet telemetry retention task failed");
+                    }
+                }
+            }
+            // Expired ACME challenges (Story 9.5 AC #6). Reclaiming the
+            // rows is housekeeping, so it rides this loop rather than
+            // the request path: the read side already refuses an
+            // expired entry, so a late purge costs storage, never
+            // correctness. Runs on every node, because every node can
+            // hold challenges it served.
+            {
+                let s = retention_config_store.lock().await;
+                match s.purge_expired_acme_challenges(chrono::Utc::now()) {
+                    Ok(0) => {}
+                    Ok(purged) => {
+                        tracing::info!(purged, "expired ACME challenges removed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ACME challenge purge failed");
+                    }
                 }
             }
             // Audit-log retention is day-based and chain-safe: the
             // store writes a retention seal before truncating so
             // /api/v1/audit/verify keeps passing (Story 8.9 AC #9).
-            if audit_retention_days > 0 {
-                let cutoff = (chrono::Utc::now()
-                    - chrono::Duration::days(i64::from(audit_retention_days)))
-                .to_rfc3339();
-                match retention_log_store.enforce_audit_retention(&cutoff) {
-                    Ok(0) => {}
-                    Ok(deleted) => {
-                        tracing::info!(deleted, "audit log retention: expired rows sealed and removed");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "audit log retention cleanup failed");
+            if let Some(logs) = &retention_log_store {
+                if audit_retention_days > 0 {
+                    let cutoff = (chrono::Utc::now()
+                        - chrono::Duration::days(i64::from(audit_retention_days)))
+                    .to_rfc3339();
+                    match logs.enforce_audit_retention(&cutoff) {
+                        Ok(0) => {}
+                        Ok(deleted) => {
+                            tracing::info!(
+                                deleted,
+                                "audit log retention: expired rows sealed and removed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "audit log retention cleanup failed");
+                        }
                     }
                 }
             }
@@ -312,13 +452,14 @@ pub(crate) fn spawn_retention_loop(
                     tracing::warn!(error = %e, "probe result retention cleanup failed");
                 }
             }
-            if waf_retention > 0 {
-                if let Err(e) = retention_log_store.enforce_waf_retention(waf_retention as u64) {
-                    tracing::warn!(error = %e, "WAF event retention cleanup failed");
+            if let Some(logs) = &retention_log_store {
+                if waf_retention > 0 {
+                    if let Err(e) = logs.enforce_waf_retention(waf_retention as u64) {
+                        tracing::warn!(error = %e, "WAF event retention cleanup failed");
+                    }
                 }
             }
-            last_sla_purge_day =
-                run_sla_purge(&retention_config_store, last_sla_purge_day).await;
+            last_sla_purge_day = run_sla_purge(&retention_config_store, last_sla_purge_day).await;
         }
     });
 }
@@ -752,6 +893,150 @@ pub(crate) fn restrict_key_permissions(path: &std::path::Path) -> bool {
     true
 }
 
+/// What [`spawn_cluster_runtime`] hands back to a startup mode.
+pub(crate) struct ClusterStartup {
+    /// The control plane, when `--cluster-listen` is set.
+    pub plane: Option<cluster_plane::ClusterPlane>,
+    /// The follower, when this node holds a fleet identity.
+    pub follower: Option<cluster_follower::FollowerPlane>,
+    /// The role handed to `AppState`.
+    pub runtime: lorica_api::cluster::ClusterRuntime,
+}
+
+/// Start the fleet role shared by both startup modes (Stories
+/// 9.2/9.3): the control-plane listeners and registry, opt-in via
+/// `--cluster-listen`, or the follower dialer when this node holds a
+/// fleet identity. Registers the Prometheus bridge. A bad bind, a
+/// missing CA, or a node that is both is fatal: the operator asked
+/// for a role, running without it is the wrong failure mode. The only
+/// mode-specific input is the inherited operational socket inside
+/// `opts`.
+pub(crate) async fn spawn_cluster_runtime(
+    opts: cluster_plane::ClusterPlaneOptions,
+    store: &Arc<Mutex<ConfigStore>>,
+    bans: cluster_follower::BanApplier,
+) -> ClusterStartup {
+    let drain_logs = opts.log_store.clone();
+    let bans_for_drain = bans.clone();
+    // Both roles need these; `opts` is consumed by the control-plane
+    // path, so take the copies the follower needs first.
+    let follower_reload = opts.config_reload.clone();
+    let follower_alerts = opts.alert_sender.clone();
+    let follower_data_dir = opts.data_dir.clone();
+    let follower_log_store = opts.log_store.clone();
+    let plane = match cluster_plane::spawn_cluster_plane(opts, store).await {
+        Ok(Some(plane)) => {
+            lorica_api::metrics::install_cluster_plane_stats(
+                Arc::clone(&plane.operational_stats),
+                Arc::clone(&plane.enrollment_stats),
+            );
+            // Story 9.4 AC #14: the per-node applied generation is read
+            // from the live sessions at every scrape.
+            lorica_api::metrics::install_cluster_registry(Arc::clone(&plane.control.sessions));
+            Some(plane)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!(error = %e, "cluster plane failed to start");
+            std::process::exit(1);
+        }
+    };
+    let follower = match cluster_follower::spawn_follower(
+        cluster_follower::FollowerOptions {
+            is_control_plane: plane.is_some(),
+            config_reload: follower_reload,
+            alert_sender: follower_alerts,
+            bans,
+            data_dir: follower_data_dir,
+            log_store: follower_log_store,
+        },
+        store,
+    )
+    .await
+    {
+        Ok(follower) => follower,
+        Err(e) => {
+            error!(error = %e, "cluster follower failed to start");
+            std::process::exit(1);
+        }
+    };
+    // Story 9.6 AC #5/#7: the follower's telemetry drain. It rides
+    // the same connection the dialer owns and reads the shared log
+    // store by cursor, so it starts here, once the follower exists,
+    // and only on a node that actually has a control plane to report
+    // to.
+    if let Some(follower) = &follower {
+        let drain = telemetry_drain::spawn_telemetry_drain(
+            Arc::clone(&follower.runtime),
+            drain_logs,
+            Arc::clone(store),
+            bans_for_drain,
+        );
+        follower.watch(drain);
+    }
+    let runtime = match (&plane, &follower) {
+        (Some(plane), _) => {
+            // One runtime handle shared by the API and the binary's
+            // replication tasks, so the drift bookkeeping the report
+            // reads is the same one the alert loop advances.
+            lorica_api::cluster::ClusterRuntime::ControlPlane(Arc::clone(&plane.runtime))
+        }
+        (None, Some(follower)) => {
+            lorica_api::cluster::ClusterRuntime::Follower(Arc::clone(&follower.runtime))
+        }
+        (None, None) => lorica_api::cluster::ClusterRuntime::Standalone,
+    };
+    ClusterStartup {
+        plane,
+        follower,
+        runtime,
+    }
+}
+
+/// Inspect `encryption.key` before promoting it to the identity root
+/// of a fleet (`lorica cluster init`), then tighten it to 0600.
+///
+/// Returns `Err` when the file is owned by a different uid than this
+/// process (a key someone else controls must not become the fleet
+/// root), `Ok(Some(warning))` when the file WAS readable beyond its
+/// owner before being tightened (the key may already have leaked and
+/// the operator must decide), and `Ok(None)` when it was already
+/// private. The process uid is read from `/proc/self`, which the
+/// kernel owns by the effective uid, so no libc binding is needed.
+pub(crate) fn check_key_file_before_promotion(
+    path: &std::path::Path,
+) -> Result<Option<String>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+    let process_uid = std::fs::metadata("/proc/self")
+        .map(|m| m.uid())
+        .map_err(|e| format!("cannot determine the process uid from /proc/self: {e}"))?;
+    if meta.uid() != process_uid {
+        return Err(format!(
+            "{} is owned by uid {} but this process runs as uid {}; the fleet identity root \
+             must be owned by the service user",
+            path.display(),
+            meta.uid(),
+            process_uid
+        ));
+    }
+    let mode = meta.mode() & 0o777;
+    let exposure = (mode & 0o077 != 0).then(|| {
+        format!(
+            "{} was mode {:04o} (readable beyond its owner) before being tightened to 0600; \
+             treat the key as possibly exposed and consider `lorica rotate-key` before \
+             clustering",
+            path.display(),
+            mode
+        )
+    });
+    if !restrict_key_permissions(path) {
+        return Err(format!("cannot restrict {} to mode 0600", path.display()));
+    }
+    Ok(exposure)
+}
+
 /// Persist the first-run admin password to a 0600 file under the data
 /// directory and return its path.
 ///
@@ -795,5 +1080,67 @@ pub(crate) async fn shutdown_signal() {
         _ = sigint.recv() => {
             warn!("Received SIGINT");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Story 9.5 AC #4 / D7 drift gate.
+    ///
+    /// OCSP stapling is a SERVING concern, not an issuance one: the
+    /// loop attaches staples to the resolver the node actually
+    /// terminates TLS from. Disabling it on followers would strip
+    /// stapling from exactly the nodes serving client traffic, with
+    /// no push path to replace it. AC #3 gates the renewal task and
+    /// the expiry notifier on `is_follower`; the risk this test
+    /// exists for is someone extending that guard by one line.
+    ///
+    /// The gate is deliberately a source scan rather than a runtime
+    /// assertion, because the two call sites are in DIFFERENT
+    /// PROCESSES (single-process boot, and each forked worker) and
+    /// `supervisor.rs` never calls it at all. There is no single
+    /// runtime in which both could be observed.
+    #[test]
+    fn ocsp_refresh_is_spawned_on_every_role_and_never_gated_on_being_a_follower() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/startup");
+        let mut call_sites = Vec::new();
+
+        for file in ["single.rs", "worker.rs"] {
+            let src = std::fs::read_to_string(root.join(file))
+                .unwrap_or_else(|e| panic!("test setup: {file} reads: {e}"));
+            let lines: Vec<&str> = src.lines().collect();
+            let calls: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    l.contains("spawn_ocsp_refresh_loop(") && !l.trim_start().starts_with("//")
+                })
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                calls.len(),
+                1,
+                "{file} must spawn the OCSP refresh loop exactly once; found {} call sites",
+                calls.len()
+            );
+
+            // Nothing in the enclosing run-up may make this call
+            // conditional on the node's cluster role. Twenty lines is
+            // well past the top of both call sites' blocks.
+            let call = calls[0];
+            let from = call.saturating_sub(20);
+            for (offset, line) in lines[from..call].iter().enumerate() {
+                assert!(
+                    !line.contains("is_follower"),
+                    "{file}:{}: the OCSP refresh loop must not be gated on the node being a \
+                     follower (Story 9.5 AC #4): stapling is a serving concern and a follower \
+                     is exactly the node terminating client TLS",
+                    from + offset + 1
+                );
+            }
+            call_sites.push(file);
+        }
+
+        assert_eq!(call_sites, vec!["single.rs", "worker.rs"]);
     }
 }

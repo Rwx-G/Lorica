@@ -194,7 +194,8 @@ pub async fn rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let client_ip = connect_info.0
+    let client_ip = connect_info
+        .0
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     match limiter

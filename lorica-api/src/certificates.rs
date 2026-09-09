@@ -641,7 +641,8 @@ pub async fn download_certificate(
     Path(id): Path<String>,
     Query(q): Query<DownloadCertificateQuery>,
 ) -> Result<Response, ApiError> {
-    let client_ip = connect_info.0
+    let client_ip = connect_info
+        .0
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
 

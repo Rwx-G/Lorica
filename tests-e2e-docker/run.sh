@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the Lorica E2E test suite with Docker Compose.
-# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-rbac] [--skip-hot-upgrade]
+# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-rbac] [--skip-hot-upgrade] [--skip-log-sinks] [--skip-acme]
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
@@ -9,6 +9,9 @@
 #   --skip-rbac         Skip the v1.6.0 Story 8.3 RBAC profile (faster)
 #   --skip-audit        Skip the v1.6.0 Story 8.9 audit-log profile (faster)
 #   --skip-hot-upgrade  Skip the v1.6.0 Story 8.4 hot binary-upgrade profile (faster)
+#   --skip-log-sinks    Skip the v1.7.0 Story 9.8 log-sinks profile (faster)
+#   --skip-acme         Skip the v1.7.0 Story 9.1 Pebble ACME profile (faster)
+#   --skip-cluster      Skip the v1.7.0 Epic 9 cluster profile (faster)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -21,6 +24,9 @@ SKIP_AI_BOT=false
 SKIP_RBAC=false
 SKIP_AUDIT=false
 SKIP_HOT_UPGRADE=false
+SKIP_LOG_SINKS=false
+SKIP_ACME=false
+SKIP_CLUSTER=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -32,6 +38,9 @@ for arg in "$@"; do
         --skip-rbac)         SKIP_RBAC=true ;;
         --skip-audit)        SKIP_AUDIT=true ;;
         --skip-hot-upgrade)  SKIP_HOT_UPGRADE=true ;;
+        --skip-log-sinks)    SKIP_LOG_SINKS=true ;;
+        --skip-acme)         SKIP_ACME=true ;;
+        --skip-cluster)      SKIP_CLUSTER=true ;;
     esac
 done
 
@@ -42,7 +51,7 @@ EXIT_CODE=0
 # run boots against stale data - e.g. the cert-export smoke rotates the
 # admin password, and a stale volume 401s the next login), and on BUILD a
 # plain `docker compose build` (no profile flags) skips them entirely.
-ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade"
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks --profile acme --profile cluster"
 
 # `docker compose run` never rebuilds an existing image, so a stale runner
 # would silently run old assertions. With --build, build every service
@@ -287,6 +296,103 @@ if [ "$SKIP_HOT_UPGRADE" = false ] && [ "$EXIT_CODE" = "0" ]; then
     done
 
     docker compose --profile hot-upgrade run --rm hot-upgrade-smoke || EXIT_CODE=$?
+fi
+
+# ---- Phase 8: Log-sinks profile (Story 9.8, IV1/IV2/IV3) ------------
+# Syslog (RFC 5424 over TCP) + OTLP logs delivery for all three event
+# kinds, trace correlation on the OTLP record, and zero request-path
+# impact with both collectors dead. Opt-out via --skip-log-sinks
+# (default ON).
+if [ "$SKIP_LOG_SINKS" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (log-sinks profile) ==="
+    echo ""
+
+    docker compose --profile log-sinks up $BUILD_FLAG -d backend1 syslog-collector otelcol-logs lorica-log-sinks
+
+    echo "Waiting for Lorica (log-sinks) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica-log-sinks curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (log-sinks) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (log-sinks) did not start within 120s"
+            docker compose logs lorica-log-sinks | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    docker compose --profile log-sinks run --rm log-sinks-smoke || EXIT_CODE=$?
+fi
+
+# ---- Phase 9: ACME / Pebble profile (Story 9.1 AC #13) --------------
+# First end-to-end ACME coverage (audit M-22): HTTP-01 issuance
+# against Pebble routed through the proxy, and DNS-01 via the manual
+# flow with TXT records published on the challtestsrv mock DNS
+# provider. Opt-out via --skip-acme (default ON).
+if [ "$SKIP_ACME" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (acme profile) ==="
+    echo ""
+
+    docker compose --profile acme up $BUILD_FLAG -d backend1 challtestsrv pebble lorica-acme
+
+    echo "Waiting for Lorica (acme) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica-acme curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (acme) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (acme) did not start within 120s"
+            docker compose logs lorica-acme | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    docker compose --profile acme run --rm acme-smoke || EXIT_CODE=$?
+fi
+
+# ---- Phase: cluster (Epic 9 Integration Verification, backlog #66) ----
+# One control plane and two followers, one of them in workers mode. This
+# is the profile stories 9.2 through 9.9 were written against and none
+# of them could run: each of those story files records that it shipped
+# on unit tests alone. Opt-out via --skip-cluster (default ON).
+if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (cluster profile) ==="
+    echo ""
+
+    docker compose --profile cluster up $BUILD_FLAG -d \
+        backend1 challtestsrv pebble lorica-cp lorica-edge-a lorica-edge-b
+
+    # The followers mint and redeem a real join token before they start,
+    # so readiness here means the whole enrolment handshake completed,
+    # not merely that a process is up.
+    echo "Waiting for the fleet to form..."
+    for i in $(seq 1 90); do
+        # `sh -c` on purpose: a bare `/shared/...` argument is rewritten
+        # into a Windows path by Git Bash before docker sees it (MSYS
+        # path conversion), so the probe never succeeded on a Windows
+        # host and this phase always waited out its full budget.
+        if docker compose --profile cluster exec -T lorica-cp sh -c 'test -f /shared/edge-b_ready' >/dev/null 2>&1; then
+            echo "Fleet is ready."
+            break
+        fi
+        if [ "$i" = "90" ]; then
+            echo "ERROR: the fleet did not form within 180s"
+            docker compose logs lorica-cp | tail -30
+            docker compose logs lorica-edge-a | tail -30
+            docker compose logs lorica-edge-b | tail -30
+            break
+        fi
+        sleep 2
+    done
+
+    docker compose --profile cluster run --rm cluster-smoke || EXIT_CODE=$?
 fi
 
 # Cleanup unless --keep

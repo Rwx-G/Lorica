@@ -159,11 +159,7 @@ impl WafEngine {
     /// Disable a specific rule by ID. Returns false if rule ID not found.
     pub fn disable_rule(&self, rule_id: u32) -> bool {
         let known = self.ruleset.rules().iter().any(|r| r.id == rule_id)
-            || self
-                .ruleset
-                .header_scoped()
-                .iter()
-                .any(|r| r.id == rule_id);
+            || self.ruleset.header_scoped().iter().any(|r| r.id == rule_id);
         if known {
             self.disabled_rules.write().insert(rule_id);
             true
@@ -175,11 +171,7 @@ impl WafEngine {
     /// Enable a previously disabled rule by ID. Returns false if rule ID not found.
     pub fn enable_rule(&self, rule_id: u32) -> bool {
         let known = self.ruleset.rules().iter().any(|r| r.id == rule_id)
-            || self
-                .ruleset
-                .header_scoped()
-                .iter()
-                .any(|r| r.id == rule_id);
+            || self.ruleset.header_scoped().iter().any(|r| r.id == rule_id);
         if known {
             self.disabled_rules.write().remove(&rule_id);
             true

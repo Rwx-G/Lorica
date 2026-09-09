@@ -715,5 +715,4 @@ mod tests {
         assert!(s.contains("SameSite=Lax"));
         assert!(s.contains("Path=/"));
     }
-
 }

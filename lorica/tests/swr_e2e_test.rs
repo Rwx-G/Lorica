@@ -256,6 +256,7 @@ fn cacheable_route(ttl_s: i32, swr_s: i32, sie_s: i32) -> Route {
         geoip: None,
         bot_protection: None,
         group_name: String::new(),
+        node_selector: Vec::new(),
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,

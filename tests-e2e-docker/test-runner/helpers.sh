@@ -117,7 +117,11 @@ wait_for_backend() {
 wait_for_api() {
     local max_wait="${1:-120}"
     for i in $(seq 1 "$max_wait"); do
-        if curl -skf "$API/api/v1/status" >/dev/null 2>&1; then
+        # Any HTTP status (401 included: /status requires auth) means
+        # the API is up and answering; only no-connection keeps waiting.
+        local code
+        code=$(curl -sk -o /dev/null -w '%{http_code}' "$API/api/v1/status" 2>/dev/null || true)
+        if [ -n "$code" ] && [ "$code" != "000" ]; then
             return 0
         fi
         sleep 1

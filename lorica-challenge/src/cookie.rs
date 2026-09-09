@@ -225,8 +225,8 @@ fn hmac_tag(secret: &[u8; 32], bytes: &[u8]) -> [u8; TAG_LEN] {
     // direct copy into the inner / outer pad. Panic surface:
     // `Hmac::new_from_slice` only errors on key length issues,
     // which is impossible here since the key type is fixed-size.
-    let mut mac =
-        <Hmac<Sha256> as KeyInit>::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret)
+        .expect("HMAC-SHA256 accepts any key length");
     mac.update(bytes);
     let full = mac.finalize().into_bytes();
     let mut out = [0u8; TAG_LEN];

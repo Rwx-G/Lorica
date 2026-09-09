@@ -219,12 +219,31 @@ pub fn export_certificate(
     let root = PathBuf::from(dir);
 
     // Sanitise hostname for the subdirectory name. A malformed domain
-    // (wildcard, pure-unicode, path-traversal) falls back to the
-    // opaque cert id so we never expand attacker-controlled bytes
-    // onto the filesystem.
-    let subdir_name =
-        sanitize_hostname(&cert.domain).unwrap_or_else(|| format!("cert-{}", cert.id));
+    // (wildcard, pure-unicode, path-traversal) falls back to the cert
+    // id, and the id goes through the SAME sanitiser.
+    //
+    // It used to be interpolated raw, on the reasoning that an id is
+    // always a server-generated UUID. That stopped being true when
+    // Story 9.5 made a follower export certificates whose rows arrived
+    // in a replicated blob: the id is then whatever the control plane
+    // put there. A domain crafted to fail the sanitiser plus an id
+    // carrying `..` gave a write outside the export root on every
+    // follower. Both halves are sanitised now, and the last resort is
+    // a constant.
+    let subdir_name = sanitize_hostname(&cert.domain)
+        .or_else(|| sanitize_hostname(&cert.id).map(|id| format!("cert-{id}")))
+        .unwrap_or_else(|| "cert-unnamed".to_string());
     let host_dir = root.join(&subdir_name);
+    // Belt to the sanitiser's braces, and the same containment check
+    // the orphan-removal path already applies before it deletes. A
+    // single path component cannot escape, so this only fires if the
+    // sanitiser is ever weakened.
+    if host_dir.parent() != Some(root.as_path()) {
+        return Err(ExportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to export outside the configured export directory",
+        )));
+    }
 
     // ACLs are the allowlist (UI text : "If no pattern matches, the
     // cert is not exported. [...] Patterns accept `*` (all), ..."),

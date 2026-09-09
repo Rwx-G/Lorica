@@ -13,12 +13,22 @@
 // limitations under the License.
 
 //! Read and configure SLA windows, raw buckets, and CSV/JSON exports per route.
+//!
+//! On a control plane the three reads (overview, per-route windows,
+//! raw buckets) and the active-probe windows in `probes.rs` accept
+//! `?node=<node_id>` (Story 9.7 AC #5, Epic 9 close): the figures are
+//! then ONE follower's own, computed on that follower over its cluster
+//! session and served here unchanged. Nothing fans in for SLA, and
+//! nothing is aggregated: a fleet percentile is not a function of
+//! per-node percentiles, so the page shows one node at a time.
 
-use axum::extract::{Path};
+use axum::extract::{Path, Query};
 use axum::response::IntoResponse;
 use axum::Extension;
 use axum::Json;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
+use lorica_cluster::messages::{SlaBucketRow, SlaPull, SlaPullAck, SlaSummaryRow};
+use lorica_config::models::{Role, SlaBucket, SlaSummary};
 use serde::Deserialize;
 
 use crate::db::db_blocking;
@@ -26,11 +36,209 @@ use crate::error::{json_data, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
 
+/// `?node=` on an SLA read. Absent or empty: this node's own figures.
+#[derive(Deserialize)]
+pub struct NodeQuery {
+    /// A follower's node id, on a control plane.
+    pub node: Option<String>,
+}
+
+/// Which node a read is for, or `None` for this one.
+fn foreign_node(node: &Option<String>) -> Option<&str> {
+    node.as_deref().filter(|n| !n.is_empty())
+}
+
+/// Read one follower's SLA over the cluster plane (Story 9.7 AC #5).
+///
+/// Operator floor, like every other fleet read since the Epic 9
+/// close; 409 off a control plane; 409 with the reason when the node
+/// holds no session or refused, because the honest answer to "what
+/// does that node measure" when it cannot be asked is not an empty
+/// chart.
+pub(crate) async fn pull_from_node(
+    state: &AppState,
+    session: &Session,
+    node: &str,
+    pull: SlaPull,
+) -> Result<SlaPullAck, ApiError> {
+    if session.role < Role::Operator {
+        return Err(ApiError::Forbidden(
+            "another node's SLA is a fleet read: Operator or above".into(),
+        ));
+    }
+    let control = crate::cluster::control_plane_for_reads(state)?;
+    control
+        .sla_pull(node, pull)
+        .await
+        .map_err(|e| ApiError::Conflict(format!("node {node}: {e}")))
+}
+
+/// Answer a [`SlaPull`] over `store`: what the FOLLOWER runs. Kept in
+/// this crate so the same code serves the local handlers and the
+/// proxied read, and so it is testable without a cluster.
+///
+/// # Errors
+///
+/// The store's error text, or `route ... not found` for a route this
+/// node does not hold (a control plane may ask about a route the
+/// follower's selector excluded).
+pub fn answer_sla_pull(
+    store: &lorica_config::ConfigStore,
+    pull: &SlaPull,
+) -> Result<SlaPullAck, String> {
+    let now = Utc::now();
+    if pull.route_id.is_empty() {
+        let routes = store.list_routes().map_err(|e| e.to_string())?;
+        let mut summaries = Vec::with_capacity(routes.len() * 2);
+        let from_1h = now - Duration::hours(1);
+        let from_24h = now - Duration::hours(24);
+        for route in &routes {
+            for (from, window) in [(from_1h, "1h"), (from_24h, "24h")] {
+                let summary = store
+                    .compute_sla_summary(&route.id, &from, &now, window, &pull.source)
+                    .map_err(|e| e.to_string())?;
+                summaries.push(summary_to_wire(&summary));
+            }
+        }
+        return Ok(SlaPullAck {
+            summaries,
+            buckets: Vec::new(),
+        });
+    }
+    store
+        .get_route(&pull.route_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("route {} not found on this node", pull.route_id))?;
+    if pull.buckets {
+        let from = parse_rfc3339(&pull.from).unwrap_or_else(|| now - Duration::hours(24));
+        let to = parse_rfc3339(&pull.to).unwrap_or(now);
+        let buckets = store
+            .query_sla_buckets(&pull.route_id, &from, &to, &pull.source)
+            .map_err(|e| e.to_string())?;
+        return Ok(SlaPullAck {
+            summaries: Vec::new(),
+            buckets: buckets.iter().map(bucket_to_wire).collect(),
+        });
+    }
+    let summaries = lorica_bench::results::compute_all_windows(store, &pull.route_id, &pull.source)
+        .map_err(|e| e.to_string())?;
+    Ok(SlaPullAck {
+        summaries: summaries.iter().map(summary_to_wire).collect(),
+        buckets: Vec::new(),
+    })
+}
+
+fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// The API struct, field for field, onto the wire.
+pub fn summary_to_wire(s: &SlaSummary) -> SlaSummaryRow {
+    SlaSummaryRow {
+        route_id: s.route_id.clone(),
+        window: s.window.clone(),
+        total_requests: s.total_requests,
+        successful_requests: s.successful_requests,
+        sla_pct: s.sla_pct,
+        avg_latency_ms: s.avg_latency_ms,
+        p50_latency_ms: s.p50_latency_ms,
+        p95_latency_ms: s.p95_latency_ms,
+        p99_latency_ms: s.p99_latency_ms,
+        target_pct: s.target_pct,
+        meets_target: s.meets_target,
+    }
+}
+
+/// The wire row back into the API struct the dashboard already reads.
+pub fn summary_from_wire(r: SlaSummaryRow) -> SlaSummary {
+    SlaSummary {
+        route_id: r.route_id,
+        window: r.window,
+        total_requests: r.total_requests,
+        successful_requests: r.successful_requests,
+        sla_pct: r.sla_pct,
+        avg_latency_ms: r.avg_latency_ms,
+        p50_latency_ms: r.p50_latency_ms,
+        p95_latency_ms: r.p95_latency_ms,
+        p99_latency_ms: r.p99_latency_ms,
+        target_pct: r.target_pct,
+        meets_target: r.meets_target,
+    }
+}
+
+/// The API bucket, field for field, onto the wire. The row id is
+/// this node's and travels nowhere.
+pub fn bucket_to_wire(b: &SlaBucket) -> SlaBucketRow {
+    SlaBucketRow {
+        route_id: b.route_id.clone(),
+        bucket_start: b.bucket_start.to_rfc3339(),
+        request_count: b.request_count,
+        success_count: b.success_count,
+        error_count: b.error_count,
+        latency_sum_ms: b.latency_sum_ms,
+        latency_min_ms: b.latency_min_ms,
+        latency_max_ms: b.latency_max_ms,
+        latency_p50_ms: b.latency_p50_ms,
+        latency_p95_ms: b.latency_p95_ms,
+        latency_p99_ms: b.latency_p99_ms,
+        source: b.source.clone(),
+        cfg_max_latency_ms: b.cfg_max_latency_ms,
+        cfg_status_min: b.cfg_status_min,
+        cfg_status_max: b.cfg_status_max,
+        cfg_target_pct: b.cfg_target_pct,
+    }
+}
+
+/// The wire bucket back into the API struct.
+///
+/// # Errors
+///
+/// A `bucket_start` that is not RFC 3339: the follower wrote it from
+/// a `DateTime`, so this is a peer that is not a Lorica follower.
+pub fn bucket_from_wire(r: SlaBucketRow) -> Result<SlaBucket, String> {
+    let bucket_start = parse_rfc3339(&r.bucket_start)
+        .ok_or_else(|| format!("bucket_start {:?} is not RFC 3339", r.bucket_start))?;
+    Ok(SlaBucket {
+        id: None,
+        route_id: r.route_id,
+        bucket_start,
+        request_count: r.request_count,
+        success_count: r.success_count,
+        error_count: r.error_count,
+        latency_sum_ms: r.latency_sum_ms,
+        latency_min_ms: r.latency_min_ms,
+        latency_max_ms: r.latency_max_ms,
+        latency_p50_ms: r.latency_p50_ms,
+        latency_p95_ms: r.latency_p95_ms,
+        latency_p99_ms: r.latency_p99_ms,
+        source: r.source,
+        cfg_max_latency_ms: r.cfg_max_latency_ms,
+        cfg_status_min: r.cfg_status_min,
+        cfg_status_max: r.cfg_status_max,
+        cfg_target_pct: r.cfg_target_pct,
+    })
+}
+
 /// GET /api/v1/sla/routes/:id - return passive SLA summaries for all standard windows (1h, 24h, 7d, 30d).
+/// With `?node=`, the same for one follower (Story 9.7 AC #5).
 pub async fn get_route_sla(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(route_id): Path<String>,
+    Query(node): Query<NodeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(node) = foreign_node(&node.node) {
+        let pull = SlaPull {
+            route_id,
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        };
+        let ack = pull_from_node(&state, &session, node, pull).await?;
+        let summaries: Vec<SlaSummary> = ack.summaries.into_iter().map(summary_from_wire).collect();
+        return Ok(json_data(summaries));
+    }
     let summaries = db_blocking(&state.store, move |store| {
         // Verify route exists
         store
@@ -45,7 +253,7 @@ pub async fn get_route_sla(
     Ok(json_data(summaries))
 }
 
-/// Query parameters for bucket queries: `?from=&to=&source=passive|active`.
+/// Query parameters for bucket queries: `?from=&to=&source=passive|active&node=`.
 #[derive(Deserialize)]
 pub struct BucketQuery {
     /// Start of the window (RFC 3339) ; default now - 24 h.
@@ -54,14 +262,37 @@ pub struct BucketQuery {
     pub to: Option<String>,
     /// Bucket source (`"passive"` / `"active"`) ; default `"passive"`.
     pub source: Option<String>,
+    /// A follower's node id, on a control plane (Story 9.7 AC #5).
+    pub node: Option<String>,
 }
 
 /// GET /api/v1/sla/routes/:id/buckets - return raw SLA buckets within the requested time range.
 pub async fn get_route_sla_buckets(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(route_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<BucketQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(node) = foreign_node(&query.node) {
+        let pull = SlaPull {
+            route_id,
+            source: query
+                .source
+                .clone()
+                .unwrap_or_else(|| "passive".to_string()),
+            from: query.from.clone().unwrap_or_default(),
+            to: query.to.clone().unwrap_or_default(),
+            buckets: true,
+        };
+        let ack = pull_from_node(&state, &session, node, pull).await?;
+        let buckets = ack
+            .buckets
+            .into_iter()
+            .map(bucket_from_wire)
+            .collect::<Result<Vec<SlaBucket>, String>>()
+            .map_err(ApiError::Internal)?;
+        return Ok(json_data(buckets));
+    }
     let now = Utc::now();
     let from = query
         .from
@@ -348,9 +579,21 @@ pub async fn clear_route_sla(
 }
 
 /// GET /api/v1/sla/overview - return 1h and 24h passive SLA summaries for every route.
+/// With `?node=`, one follower's overview (Story 9.7 AC #5).
 pub async fn get_sla_overview(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+    Query(node): Query<NodeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(node) = foreign_node(&node.node) {
+        let pull = SlaPull {
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        };
+        let ack = pull_from_node(&state, &session, node, pull).await?;
+        let summaries: Vec<SlaSummary> = ack.summaries.into_iter().map(summary_from_wire).collect();
+        return Ok(json_data(summaries));
+    }
     // One store acquisition for the whole overview, as before the
     // blocking-pool migration: every per-route summary runs inside a
     // single closure.

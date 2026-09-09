@@ -127,6 +127,15 @@ impl SystemCache {
         self.sys.used_memory()
     }
 
+    /// Get total memory in bytes after refresh.
+    ///
+    /// Paired with [`SystemCache::memory_used_bytes`] so a consumer
+    /// can report a ratio rather than a bare figure; the cluster
+    /// heartbeat sends both for exactly that reason.
+    pub fn memory_total_bytes(&self) -> u64 {
+        self.sys.total_memory()
+    }
+
     /// Refresh only the metrics we need (CPU, memory, process).
     pub fn refresh(&mut self) {
         self.sys.refresh_cpu_all();
@@ -258,7 +267,12 @@ fn public_version(full: &str) -> String {
 ///
 /// Returns `None` if the path does not exist, is on a filesystem
 /// that does not support statvfs, or the call fails.
-fn disk_usage_statvfs(path: &std::path::Path, label: &str) -> Option<DiskUsage> {
+///
+/// Public because the cluster heartbeat samples the data directory's
+/// filesystem the same way (Story 9.7 AC #3), and two implementations
+/// of "how full is this disk" would be two places for the reserved-
+/// blocks correction above to drift.
+pub fn disk_usage_statvfs(path: &std::path::Path, label: &str) -> Option<DiskUsage> {
     let stat = nix::sys::statvfs::statvfs(path).ok()?;
 
     let frsize = stat.fragment_size();

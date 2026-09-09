@@ -1,0 +1,19 @@
+# OpenTelemetry Collector config for the log-sinks e2e profile
+# (Story 9.8). Logs-only pipeline: OTLP/HTTP in, file exporter out to
+# the shared volume so the smoke runner can grep the received records
+# (trace correlation + body content) without a query API.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  file:
+    path: /shared/otlp-logs.json
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [file]

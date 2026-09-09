@@ -20,12 +20,12 @@
 use axum::extract::Extension;
 use axum::http::header;
 use axum::response::IntoResponse;
-use lorica_metrics::REGISTRY;
-use once_cell::sync::Lazy;
 use lorica_metrics::prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    TextEncoder,
+    IntGaugeVec, TextEncoder,
 };
+use lorica_metrics::REGISTRY;
+use once_cell::sync::Lazy;
 
 use crate::server::AppState;
 
@@ -44,9 +44,7 @@ static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
         "http_request_duration_seconds",
         "HTTP request latency in seconds",
         &["route_id"],
-        vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
-        ],
+        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
     )
 });
 
@@ -75,6 +73,678 @@ static CERT_EXPIRY_DAYS: Lazy<GaugeVec> = Lazy::new(|| {
         &["domain"],
     )
 });
+
+// ---- Cluster plane (Story 9.2 AC #12) ----
+//
+// Cardinality discipline: `node_id` is the SERVER-side identity a
+// node gets at enrollment (Story 9.3), never the follower-supplied
+// `node_name` - a compromised follower rotating its name on every
+// reconnect could otherwise mint unbounded series. `direction` is
+// inbound|outbound, `method` is a fixed protocol vocabulary
+// (hello|heartbeat|tls|bridge|session), `outcome` a fixed result
+// vocabulary. Every fixed label combination is created at install
+// time so a reason that never fired reads as 0, not as an absent
+// series (`rate()` alerts on absent series do not fire).
+
+/// Per-node cluster connection state (1 = in that state). Labels:
+/// node_id, state. Series appear once enrolled identities exist
+/// (Story 9.3); the family is registered here so the contract is
+/// stable from v1.7.0.
+static CLUSTER_CONNECTION_STATE: Lazy<GaugeVec> = Lazy::new(|| {
+    lorica_metrics::register_gauge_vec(
+        "cluster_connection_state",
+        "Cluster-plane connection state per node (1 = in this state)",
+        &["node_id", "state"],
+    )
+});
+
+/// Cluster RPC outcomes. Labels: direction, method, outcome.
+static CLUSTER_RPC_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "cluster_rpc_total",
+        "Cluster-plane RPCs by direction, method and outcome",
+        &["direction", "method", "outcome"],
+    )
+});
+
+/// Cluster RPC latency. Labels: direction, method. Observed by the
+/// per-node session layer (Story 9.3+); registered here with the
+/// rest of the AC #12 contract.
+static CLUSTER_RPC_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    lorica_metrics::register_histogram_vec(
+        "cluster_rpc_duration_seconds",
+        "Cluster-plane RPC latency in seconds",
+        &["direction", "method"],
+        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
+    )
+});
+
+/// Enrollment-listener pre-authentication rejections (Story 9.2
+/// AC #3). Labels: reason, a fixed vocabulary.
+static CLUSTER_PREAUTH_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "cluster_preauth_rejections_total",
+        "Enrollment connections dropped by a pre-authentication budget",
+        &["reason"],
+    )
+});
+
+/// Token redemptions on the enrollment listener (Story 9.3 AC #1/#4).
+/// Labels: outcome (granted|refused).
+static CLUSTER_ENROLLMENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "cluster_enrollments_total",
+        "Join-token redemptions by outcome",
+        &["outcome"],
+    )
+});
+
+/// Failed `accept()` calls per listener (descriptor exhaustion and
+/// the like; each one pauses the accept loop). Labels: listener
+/// (operational|enrollment).
+static CLUSTER_ACCEPT_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "cluster_accept_errors_total",
+        "Cluster listener accept() failures",
+        &["listener"],
+    )
+});
+
+/// Connections accepted by the enrollment listener before any budget
+/// ran: the volume on the product's only unauthenticated surface.
+static CLUSTER_ENROLLMENT_CONNECTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "cluster_enrollment_connections_total",
+        "Connections accepted by the enrollment listener",
+    )
+});
+
+/// Enrollment listener bind attempts that failed while a join token
+/// was live (retried on a bounded backoff).
+static CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "cluster_enrollment_bind_failures_total",
+        "Enrollment listener bind failures while a join token was live",
+    )
+});
+
+/// Whether the token-gated enrollment listener is currently open
+/// (1) or closed (0).
+static CLUSTER_ENROLLMENT_LISTENER_OPEN: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "cluster_enrollment_listener_open",
+        "1 while the enrollment listener is bound (a join token is live), else 0",
+    )
+});
+
+/// Configuration generation each connected node reports applying
+/// (Story 9.4 AC #14). Labels: node_id (bounded by the fleet; a series
+/// disappears when the node's session ends, so a disconnected node
+/// never reports a stale generation).
+static CLUSTER_CONFIG_GENERATION: Lazy<IntGaugeVec> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge_vec(
+        "cluster_config_generation",
+        "Configuration generation applied by each connected cluster node",
+        &["node_id"],
+    )
+});
+
+/// Replication outcomes per node (Story 9.4 AC #14). Labels: node_id,
+/// outcome (`committed | evicted | rejected | commit_failed | pulled |
+/// pull_failed | refused`).
+static CLUSTER_CONFIG_APPLY_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "cluster_config_apply_total",
+        "Configuration replication outcomes per cluster node",
+        &["node_id", "outcome"],
+    )
+});
+
+/// Nodes whose applied configuration differs from the control plane's
+/// current one (Story 9.4 AC #12/#14), refreshed by the drift
+/// evaluation task.
+static CLUSTER_DRIFT_NODES: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "cluster_drift_nodes",
+        "Cluster nodes whose applied configuration differs from the current one",
+    )
+});
+
+/// The session registry the generation gauge is read from at scrape
+/// time; set once on the control plane.
+static CLUSTER_REGISTRY: std::sync::OnceLock<std::sync::Arc<lorica_cluster::SessionRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Node ids the generation gauge carried at the previous scrape, so a
+/// node whose session ended has its series removed instead of
+/// freezing at its last value.
+static CLUSTER_GENERATION_SERIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Hand the control plane's session registry to the Prometheus bridge
+/// (Story 9.4 AC #14): `lorica_cluster_config_generation{node_id}` is
+/// read from the live sessions at every scrape. A second call is
+/// ignored (the plane starts once).
+pub fn install_cluster_registry(registry: std::sync::Arc<lorica_cluster::SessionRegistry>) {
+    Lazy::force(&CLUSTER_CONFIG_GENERATION);
+    Lazy::force(&CLUSTER_CONFIG_APPLY_TOTAL);
+    Lazy::force(&CLUSTER_DRIFT_NODES);
+    Lazy::force(&CLUSTER_CERT_PUSH_TOTAL);
+    let _ = CLUSTER_REGISTRY.set(registry);
+}
+
+/// Count one replication outcome for a node (Story 9.4 AC #14).
+pub fn inc_cluster_config_apply(node_id: &str, outcome: &str) {
+    CLUSTER_CONFIG_APPLY_TOTAL
+        .with_label_values(&[node_id, outcome])
+        .inc();
+}
+
+/// Telemetry rows the control plane refused to store, per node and
+/// reason (Story 9.6 AC #5/#8).
+///
+/// `reason` is `node_quota` (that node is over its own budget) or
+/// `storage_watermark` (the fan-in database is at its cap, so EVERY
+/// node is shed). The two need different operator responses: the
+/// first is one misbehaving node, the second is retention not keeping
+/// up fleet-wide.
+///
+/// Bounded cardinality: fleet size times two.
+static CLUSTER_TELEMETRY_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "cluster_telemetry_dropped_total",
+        "Telemetry rows the control plane did not store, by node and reason",
+        &["node_id", "reason"],
+    )
+});
+
+/// Count `rows` dropped for `node_id` with `reason` (AC #5/#8).
+pub fn inc_cluster_telemetry_dropped(node_id: &str, reason: &str, rows: u64) {
+    if rows == 0 {
+        return;
+    }
+    CLUSTER_TELEMETRY_DROPPED_TOTAL
+        .with_label_values(&[node_id, reason])
+        .inc_by(rows);
+}
+
+/// Telemetry rows the control plane stored, per node (Story 9.6).
+///
+/// The denominator for the drop counter: without it, a non-zero drop
+/// count says nothing about whether a node is mostly fine or mostly
+/// shed.
+static CLUSTER_TELEMETRY_INGESTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "cluster_telemetry_ingested_total",
+        "Telemetry rows the control plane stored, by node",
+        &["node_id"],
+    )
+});
+
+/// Count `rows` stored for `node_id`.
+pub fn inc_cluster_telemetry_ingested(node_id: &str, rows: u64) {
+    if rows == 0 {
+        return;
+    }
+    CLUSTER_TELEMETRY_INGESTED_TOTAL
+        .with_label_values(&[node_id])
+        .inc_by(rows);
+}
+
+/// Publish the number of drifted nodes (Story 9.4 AC #12).
+pub fn set_cluster_drift_nodes(count: usize) {
+    CLUSTER_DRIFT_NODES.set(i64::try_from(count).unwrap_or(i64::MAX));
+}
+
+/// Certificate distribution outcomes per node (Story 9.5 AC #10).
+///
+/// One unit is one CERTIFICATE, on every outcome, so the series can
+/// be compared with each other. `node_id` always names the FOLLOWER
+/// the certificate was for, whichever side incremented it.
+///
+/// Control-plane side, what was sent:
+/// - `pushed`: handed to that node at issuance and acknowledged installed.
+/// - `push_failed`: the push round failed for that node (it converges by pull).
+/// - `served`: handed to that node in answer to its own pull.
+///
+/// Follower side, what was applied:
+/// - `installed`: written to the local store, whether pushed or pulled.
+/// - `refused`: rejected locally (defective bundle, store error).
+///
+/// The two sides count different events on purpose: `pushed + served`
+/// against `installed + refused` is the delivery gap. Nothing counts
+/// the same certificate twice under the same outcome.
+static CLUSTER_CERT_PUSH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "cluster_cert_push_total",
+        "Certificate distribution outcomes per cluster node, counted per certificate",
+        &["node_id", "outcome"],
+    )
+});
+
+/// Count one certificate-distribution outcome for a node (AC #10).
+pub fn inc_cluster_cert_push(node_id: &str, outcome: &str) {
+    CLUSTER_CERT_PUSH_TOTAL
+        .with_label_values(&[node_id, outcome])
+        .inc();
+}
+
+/// Count `n` certificates at once for a node (AC #10), for the paths
+/// that resolve a batch rather than one certificate.
+pub fn inc_cluster_cert_push_by(node_id: &str, outcome: &str, n: usize) {
+    if n == 0 {
+        return;
+    }
+    CLUSTER_CERT_PUSH_TOTAL
+        .with_label_values(&[node_id, outcome])
+        .inc_by(n as u64);
+}
+
+/// Publish this node's own applied generation (a follower reports
+/// itself under its node id; the control plane reports its current
+/// generation under `control_plane`).
+pub fn set_cluster_config_generation(node_id: &str, generation: u64) {
+    CLUSTER_CONFIG_GENERATION
+        .with_label_values(&[node_id])
+        .set(i64::try_from(generation).unwrap_or(i64::MAX));
+}
+
+/// Refresh the per-node generation gauge from the live sessions.
+fn sync_cluster_generation_gauge() {
+    let Some(registry) = CLUSTER_REGISTRY.get() else {
+        return;
+    };
+    let snapshot = registry.snapshot();
+    let mut previous = CLUSTER_GENERATION_SERIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for node_id in previous.iter() {
+        if !snapshot.iter().any(|s| &s.node_id == node_id) {
+            let _ = CLUSTER_CONFIG_GENERATION.remove_label_values(&[node_id]);
+        }
+    }
+    previous.clear();
+    for session in snapshot {
+        CLUSTER_CONFIG_GENERATION
+            .with_label_values(&[&session.node_id])
+            .set(i64::try_from(session.applied.generation).unwrap_or(i64::MAX));
+        previous.push(session.node_id);
+    }
+}
+
+/// The fixed `lorica_cluster_rpc_total` label triples the operational
+/// listener feeds, one per `OperationalStats` counter.
+const CLUSTER_RPC_LABELS: &[&[&str]] = &[
+    &["inbound", "tls", "concurrent_limit"],
+    &["inbound", "tls", "per_source_limit"],
+    &["inbound", "tls", "timeout"],
+    &["inbound", "tls", "failed"],
+    &["inbound", "tls", "alpn_refused"],
+    &["inbound", "tls", "identity_refused"],
+    &["inbound", "hello", "opener_timeout"],
+    &["inbound", "hello", "transport_failure"],
+    &["inbound", "hello", "admitted"],
+    &["inbound", "hello", "retry_later"],
+    &["inbound", "hello", "session_full"],
+    &["inbound", "hello", "refused"],
+    &["inbound", "bridge", "protocol_violation"],
+    &["inbound", "bridge", "unsupported_method"],
+    &["inbound", "heartbeat", "ok"],
+    &["inbound", "renew", "ok"],
+    &["inbound", "leave", "ok"],
+    &["inbound", "session", "killed"],
+    &["inbound", "session", "ended"],
+];
+
+/// The fixed `lorica_cluster_preauth_rejections_total` reasons.
+const CLUSTER_PREAUTH_REASONS: &[&str] = &[
+    "handshake_failed",
+    "handshake_timeout",
+    "alpn",
+    "concurrent_handshakes",
+    "per_source",
+    "attempt_window",
+    "inflight_enrollments",
+    "byte_budget",
+    "time_budget",
+    "window_closed",
+];
+
+/// Last-synced snapshot of the cluster-plane atomics, so each scrape
+/// increments the Prometheus counters by exactly the delta since the
+/// previous scrape (the crate exposes monotonic atomics, not
+/// registry handles - it must stay free of the metrics dependency).
+#[derive(Default)]
+struct ClusterPlaneSnapshot {
+    op_rejected_concurrent_handshakes: u64,
+    op_rejected_per_source: u64,
+    op_handshake_timeouts: u64,
+    op_tls_failures: u64,
+    op_alpn_refusals: u64,
+    op_identity_refusals: u64,
+    op_opener_timeouts: u64,
+    op_handshake_transport_failures: u64,
+    op_sessions_admitted: u64,
+    op_sessions_retry_later: u64,
+    op_sessions_rejected_full: u64,
+    op_handshake_refusals: u64,
+    op_protocol_violations: u64,
+    op_unsupported_methods: u64,
+    op_heartbeats_served: u64,
+    op_renewals_served: u64,
+    op_leaves_served: u64,
+    op_sessions_killed: u64,
+    op_sessions_ended: u64,
+    op_accept_errors: u64,
+    en_connections_total: u64,
+    en_rejected_handshake_failed: u64,
+    en_rejected_handshake_timeout: u64,
+    en_rejected_alpn: u64,
+    en_rejected_concurrent_handshakes: u64,
+    en_rejected_per_source: u64,
+    en_rejected_attempt_window: u64,
+    en_rejected_inflight_enrollments: u64,
+    en_rejected_byte_budget: u64,
+    en_rejected_time_budget: u64,
+    en_rejected_window_closed: u64,
+    en_accept_errors: u64,
+    en_enrollments_granted: u64,
+    en_enrollments_refused: u64,
+    en_bind_failures: u64,
+}
+
+struct ClusterPlaneStats {
+    operational: std::sync::Arc<lorica_cluster::OperationalStats>,
+    enrollment: std::sync::Arc<lorica_cluster::EnrollmentStats>,
+    last: std::sync::Mutex<ClusterPlaneSnapshot>,
+}
+
+/// Set once per process. The plane starts once and is never
+/// restarted in-process; if that ever changes, a fresh set of atomics
+/// would under-count until it passed the old snapshot, and this must
+/// become a swap that resets the snapshot.
+static CLUSTER_PLANE_STATS: std::sync::OnceLock<ClusterPlaneStats> = std::sync::OnceLock::new();
+
+/// Hand the running control plane's listener counters to the
+/// Prometheus bridge. Called once at startup when `--cluster-listen`
+/// is set; a second call is ignored (the plane starts once). Every
+/// fixed label combination is created here so it scrapes as 0 from
+/// the first scrape.
+pub fn install_cluster_plane_stats(
+    operational: std::sync::Arc<lorica_cluster::OperationalStats>,
+    enrollment: std::sync::Arc<lorica_cluster::EnrollmentStats>,
+) {
+    for labels in CLUSTER_RPC_LABELS {
+        CLUSTER_RPC_TOTAL.with_label_values(labels);
+    }
+    for reason in CLUSTER_PREAUTH_REASONS {
+        CLUSTER_PREAUTH_REJECTIONS_TOTAL.with_label_values(&[reason]);
+    }
+    for listener in ["operational", "enrollment"] {
+        CLUSTER_ACCEPT_ERRORS_TOTAL.with_label_values(&[listener]);
+    }
+    for outcome in ["granted", "refused"] {
+        CLUSTER_ENROLLMENTS_TOTAL.with_label_values(&[outcome]);
+    }
+    Lazy::force(&CLUSTER_ENROLLMENT_CONNECTIONS_TOTAL);
+    Lazy::force(&CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL);
+    Lazy::force(&CLUSTER_ENROLLMENT_LISTENER_OPEN);
+    Lazy::force(&CLUSTER_CONNECTION_STATE);
+    Lazy::force(&CLUSTER_RPC_DURATION_SECONDS);
+    let _ = CLUSTER_PLANE_STATS.set(ClusterPlaneStats {
+        operational,
+        enrollment,
+        last: std::sync::Mutex::new(ClusterPlaneSnapshot::default()),
+    });
+}
+
+/// Increment a labelled counter by the growth of a monotonic atomic
+/// since the previous scrape.
+fn bump_vec(counter: &IntCounterVec, labels: &[&str], now: u64, last: &mut u64) {
+    let delta = now.saturating_sub(*last);
+    if delta > 0 {
+        counter.with_label_values(labels).inc_by(delta);
+    }
+    *last = now;
+}
+
+/// Same for an unlabelled counter.
+fn bump(counter: &IntCounter, now: u64, last: &mut u64) {
+    let delta = now.saturating_sub(*last);
+    if delta > 0 {
+        counter.inc_by(delta);
+    }
+    *last = now;
+}
+
+/// Fold the cluster-plane atomics into the registry (delta since the
+/// last scrape). No-op when the plane is not running.
+fn sync_cluster_plane_metrics() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let Some(stats) = CLUSTER_PLANE_STATS.get() else {
+        return;
+    };
+    let mut last = stats
+        .last
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let op = &stats.operational;
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "tls", "concurrent_limit"],
+        op.rejected_concurrent_handshakes.load(Relaxed),
+        &mut last.op_rejected_concurrent_handshakes,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "tls", "per_source_limit"],
+        op.rejected_per_source.load(Relaxed),
+        &mut last.op_rejected_per_source,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "tls", "timeout"],
+        op.handshake_timeouts.load(Relaxed),
+        &mut last.op_handshake_timeouts,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "tls", "failed"],
+        op.tls_failures.load(Relaxed),
+        &mut last.op_tls_failures,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "tls", "alpn_refused"],
+        op.alpn_refusals.load(Relaxed),
+        &mut last.op_alpn_refusals,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "tls", "identity_refused"],
+        op.identity_refusals.load(Relaxed),
+        &mut last.op_identity_refusals,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "opener_timeout"],
+        op.opener_timeouts.load(Relaxed),
+        &mut last.op_opener_timeouts,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "transport_failure"],
+        op.handshake_transport_failures.load(Relaxed),
+        &mut last.op_handshake_transport_failures,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "admitted"],
+        op.sessions_admitted.load(Relaxed),
+        &mut last.op_sessions_admitted,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "retry_later"],
+        op.sessions_retry_later.load(Relaxed),
+        &mut last.op_sessions_retry_later,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "session_full"],
+        op.sessions_rejected_full.load(Relaxed),
+        &mut last.op_sessions_rejected_full,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "hello", "refused"],
+        op.handshake_refusals.load(Relaxed),
+        &mut last.op_handshake_refusals,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "bridge", "protocol_violation"],
+        op.protocol_violations.load(Relaxed),
+        &mut last.op_protocol_violations,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "bridge", "unsupported_method"],
+        op.unsupported_methods.load(Relaxed),
+        &mut last.op_unsupported_methods,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "heartbeat", "ok"],
+        op.heartbeats_served.load(Relaxed),
+        &mut last.op_heartbeats_served,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "renew", "ok"],
+        op.renewals_served.load(Relaxed),
+        &mut last.op_renewals_served,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "leave", "ok"],
+        op.leaves_served.load(Relaxed),
+        &mut last.op_leaves_served,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "session", "killed"],
+        op.sessions_killed.load(Relaxed),
+        &mut last.op_sessions_killed,
+    );
+    bump_vec(
+        &CLUSTER_RPC_TOTAL,
+        &["inbound", "session", "ended"],
+        op.sessions_ended.load(Relaxed),
+        &mut last.op_sessions_ended,
+    );
+    bump_vec(
+        &CLUSTER_ACCEPT_ERRORS_TOTAL,
+        &["operational"],
+        op.accept_errors.load(Relaxed),
+        &mut last.op_accept_errors,
+    );
+
+    let en = &stats.enrollment;
+    bump(
+        &CLUSTER_ENROLLMENT_CONNECTIONS_TOTAL,
+        en.connections_total.load(Relaxed),
+        &mut last.en_connections_total,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["handshake_failed"],
+        en.rejected_handshake_failed.load(Relaxed),
+        &mut last.en_rejected_handshake_failed,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["handshake_timeout"],
+        en.rejected_handshake_timeout.load(Relaxed),
+        &mut last.en_rejected_handshake_timeout,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["alpn"],
+        en.rejected_alpn.load(Relaxed),
+        &mut last.en_rejected_alpn,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["concurrent_handshakes"],
+        en.rejected_concurrent_handshakes.load(Relaxed),
+        &mut last.en_rejected_concurrent_handshakes,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["per_source"],
+        en.rejected_per_source.load(Relaxed),
+        &mut last.en_rejected_per_source,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["attempt_window"],
+        en.rejected_attempt_window.load(Relaxed),
+        &mut last.en_rejected_attempt_window,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["inflight_enrollments"],
+        en.rejected_inflight_enrollments.load(Relaxed),
+        &mut last.en_rejected_inflight_enrollments,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["byte_budget"],
+        en.rejected_byte_budget.load(Relaxed),
+        &mut last.en_rejected_byte_budget,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["time_budget"],
+        en.rejected_time_budget.load(Relaxed),
+        &mut last.en_rejected_time_budget,
+    );
+    bump_vec(
+        &CLUSTER_PREAUTH_REJECTIONS_TOTAL,
+        &["window_closed"],
+        en.rejected_window_closed.load(Relaxed),
+        &mut last.en_rejected_window_closed,
+    );
+    bump_vec(
+        &CLUSTER_ACCEPT_ERRORS_TOTAL,
+        &["enrollment"],
+        en.accept_errors.load(Relaxed),
+        &mut last.en_accept_errors,
+    );
+    bump_vec(
+        &CLUSTER_ENROLLMENTS_TOTAL,
+        &["granted"],
+        en.enrollments_granted.load(Relaxed),
+        &mut last.en_enrollments_granted,
+    );
+    bump_vec(
+        &CLUSTER_ENROLLMENTS_TOTAL,
+        &["refused"],
+        en.enrollments_refused.load(Relaxed),
+        &mut last.en_enrollments_refused,
+    );
+    bump(
+        &CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL,
+        en.bind_failures.load(Relaxed),
+        &mut last.en_bind_failures,
+    );
+
+    let open = en.lifecycle_opens.load(Relaxed) > en.lifecycle_closes.load(Relaxed);
+    CLUSTER_ENROLLMENT_LISTENER_OPEN.set(i64::from(open));
+    sync_cluster_generation_gauge();
+}
 
 /// WAF events counter. Labels: category, action (detected/blocked).
 static WAF_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -583,6 +1253,14 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     // aggregation the supervisor's /metrics never sees them.
     "lorica_cert_resolver_reload_total",
     "lorica_ocsp_refresh_total",
+    // Log-export sink counters (Story 9.8). Access-log and WAF events
+    // publish from the worker processes, so without aggregation the
+    // supervisor's /metrics would read ~0 for drops/sends in the
+    // default packaged deployment (--workers auto) - exactly the
+    // blind spot AC #4's drop counter exists to close.
+    "lorica_log_sink_dropped_total",
+    "lorica_log_sink_sent_total",
+    "lorica_log_sink_truncated_total",
 ];
 
 /// Re-export of the worker -> supervisor wire tuple. The lorica
@@ -646,12 +1324,19 @@ fn resolve_per_worker_counter(
         "lorica_per_ip_connection_refused_total" => {
             Some((&[], CounterTarget::Scalar(&PER_IP_CONNECTION_REFUSED_TOTAL)))
         }
-        "lorica_cert_resolver_reload_total" => Some((
-            &["result"],
-            CounterTarget::Vec(&CERT_RESOLVER_RELOAD_TOTAL),
+        "lorica_cert_resolver_reload_total" => {
+            Some((&["result"], CounterTarget::Vec(&CERT_RESOLVER_RELOAD_TOTAL)))
+        }
+        "lorica_ocsp_refresh_total" => Some((&["result"], CounterTarget::Vec(&OCSP_REFRESH_TOTAL))),
+        "lorica_log_sink_dropped_total" => Some((
+            &["sink", "kind"],
+            CounterTarget::Vec(&LOG_SINK_DROPPED_TOTAL),
         )),
-        "lorica_ocsp_refresh_total" => {
-            Some((&["result"], CounterTarget::Vec(&OCSP_REFRESH_TOTAL)))
+        "lorica_log_sink_sent_total" => {
+            Some((&["sink", "kind"], CounterTarget::Vec(&LOG_SINK_SENT_TOTAL)))
+        }
+        "lorica_log_sink_truncated_total" => {
+            Some((&["sink"], CounterTarget::Vec(&LOG_SINK_TRUNCATED_TOTAL)))
         }
         _ => None,
     }
@@ -726,6 +1411,62 @@ static LOG_WRITE_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// Bump the dropped-log-write counter for `kind` (`"access"` or `"waf"`).
 pub fn inc_log_write_dropped(kind: &str) {
     LOG_WRITE_DROPPED_TOTAL.with_label_values(&[kind]).inc();
+}
+
+/// Counter: events dropped by a log-export sink (Story 9.8 AC #4),
+/// either on queue overflow or because the collector is unreachable
+/// and the message was shed during backoff. Same policy as the log
+/// writer: the proxy keeps serving and sheds export rows, never
+/// latency.
+static LOG_SINK_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "log_sink_dropped_total",
+        "Events dropped by a log-export sink (sink=syslog|otlp, kind=access|waf|audit)",
+        &["sink", "kind"],
+    )
+});
+
+/// Bump the dropped-sink-event counter for `sink` (`"syslog"` /
+/// `"otlp"`) and `kind` (`"access"` / `"waf"` / `"audit"`).
+pub fn inc_log_sink_dropped(sink: &str, kind: &str) {
+    LOG_SINK_DROPPED_TOTAL
+        .with_label_values(&[sink, kind])
+        .inc();
+}
+
+/// Counter: events successfully handed to a log-export sink's
+/// transport (written to the socket for syslog, emitted into the
+/// batch exporter for OTLP). Paired with the drop counter so an
+/// operator can tell "sink healthy, low traffic" apart from "sink
+/// dead" (QA finding, Story 9.8).
+static LOG_SINK_SENT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "log_sink_sent_total",
+        "Events successfully handed to a log-export sink's transport (sink=syslog|otlp, kind=access|waf|audit)",
+        &["sink", "kind"],
+    )
+});
+
+/// Bump the sent-sink-event counter.
+pub fn inc_log_sink_sent(sink: &str, kind: &str) {
+    LOG_SINK_SENT_TOTAL.with_label_values(&[sink, kind]).inc();
+}
+
+/// Counter: syslog messages whose JSON body was truncated to the
+/// per-transport size ceiling before sending (QA finding, Story 9.8:
+/// an unbounded message lets a client evict its own records via UDP
+/// EMSGSIZE or desync a size-capped collector).
+static LOG_SINK_TRUNCATED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "log_sink_truncated_total",
+        "Log-export sink messages truncated to the transport size ceiling (sink=syslog)",
+        &["sink"],
+    )
+});
+
+/// Bump the truncated-sink-message counter.
+pub fn inc_log_sink_truncated(sink: &str) {
+    LOG_SINK_TRUNCATED_TOTAL.with_label_values(&[sink]).inc();
 }
 
 /// Counter: log-stream WebSocket entries dropped because a
@@ -949,6 +1690,30 @@ pub fn inc_certificates_invalid_bundle_by(source: &str, count: u64) {
     CERTIFICATES_INVALID_BUNDLE_TOTAL
         .with_label_values(&[source])
         .inc_by(count);
+}
+
+/// Gauge: certificate rows this node holds with a chain but no
+/// private key (Story 9.5 decision D12).
+///
+/// This is the state a follower is in between receiving a
+/// configuration that announces a certificate and receiving the key
+/// itself, so it is expected to be non-zero briefly and expected to
+/// return to zero. It exists because before it, such a row was
+/// indistinguishable from a corrupt bundle: both landed in
+/// `certificates_invalid_bundle_total{source="reload"}`, and the two
+/// need opposite operator responses. A row that stays here is a
+/// distribution failure to chase on the control plane; an invalid
+/// bundle is a broken certificate to replace.
+static CERTIFICATES_AWAITING_KEY: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "certificates_awaiting_key",
+        "Certificate rows held with a chain but no private key, awaiting distribution",
+    )
+});
+
+/// Publish how many certificate rows are waiting for their key (D12).
+pub fn set_certificates_awaiting_key(count: usize) {
+    CERTIFICATES_AWAITING_KEY.set(i64::try_from(count).unwrap_or(i64::MAX));
 }
 
 /// Counter: audit-log row inserts that failed (DB error or task panic).
@@ -1252,6 +2017,10 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
         set_system_metrics(cpu, mem);
     }
 
+    // Cluster-plane counters (Story 9.2): delta-synced from the
+    // listener atomics right before gathering.
+    sync_cluster_plane_metrics();
+
     // Encode and return
     let encoder = TextEncoder::new();
     let content_type = encoder.format_type().to_string();
@@ -1307,6 +2076,35 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Epic 9 close: every cluster family was registered with a
+    /// `lorica_` prefix while the registry adds the `lorica` namespace
+    /// itself, so `/metrics` exported `lorica_lorica_cluster_*` from
+    /// Story 9.2 on and no scrape ever matched the documented names.
+    /// Found by the cluster load phase, the first e2e to read one.
+    #[test]
+    fn cluster_metric_families_carry_the_namespace_once() {
+        inc_cluster_config_apply("node-namespace-test", "committed");
+        inc_cluster_telemetry_ingested("node-namespace-test", 1);
+        let names: Vec<String> = REGISTRY
+            .gather()
+            .iter()
+            .map(|family| family.name().to_string())
+            .collect();
+        for expected in [
+            "lorica_cluster_config_apply_total",
+            "lorica_cluster_telemetry_ingested_total",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} missing from {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n.starts_with("lorica_lorica_")),
+            "a family carries the namespace twice: {names:?}"
+        );
+    }
 
     #[test]
     fn per_worker_counter_resolver_matches_registered_arity() {

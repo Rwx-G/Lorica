@@ -15,13 +15,13 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Read channel + components from rust-toolchain.toml so CI and
       # local dev always run identical rustc/clippy versions.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -37,8 +37,18 @@ jobs:
           npm run check
           npm run lint
 
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      # Same four gates as the local Docker recipe (see CONTRIBUTING.md).
       - name: Clippy (product crates)
         run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings
+
+      - name: Clippy (tests and benches of the API and cluster crates)
+        run: cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings
+
+      - name: Clippy (binary crate with the otel feature)
+        run: cargo clippy -p lorica --all-targets --features otel -- -D warnings
 
       - name: Cargo audit
         run: |
@@ -54,10 +64,10 @@ jobs:
     # reviewers still see the report on the PR.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python for Semgrep
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -107,7 +117,7 @@ jobs:
 
       - name: Upload Semgrep SARIF
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: semgrep-reports
           path: |
@@ -120,10 +130,10 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -162,12 +172,12 @@ jobs:
           npm run build
 
       - name: Run Rust unit tests (product crates)
-        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command
+        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-tls -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem
         env:
           SKIP_FRONTEND_BUILD: ""
 
       - name: Run Rust unit tests (forked crates)
-        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb || true
+        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
         env:
           SKIP_FRONTEND_BUILD: "1"
 
@@ -186,12 +196,12 @@ jobs:
     # blind threshold would flake the pipeline. Add a floor here once a
     # baseline is agreed (do not silently drop the report if you do).
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -204,12 +214,19 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Collect coverage (product crates)
+      - name: Collect coverage (every crate with tests)
         run: |
+          # Every crate whose tests run in CI, product and forked alike:
+          # a crate that is compiled as a dependency but whose own tests
+          # are not run shows up at 0% and makes the total meaningless
+          # (the v1.7.0 report read 52% with 14k such lines).
           cargo llvm-cov --no-report \
             -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify \
             -p lorica-bench -p lorica-command -p lorica-metrics -p lorica-acme \
-            -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker
+            -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker \
+            -p lorica-cluster -p lorica-tls \
+            -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \
+            -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
 
       - name: Report coverage summary
         run: |
@@ -222,7 +239,7 @@ jobs:
             --ignore-filename-regex '(tests?\.rs$|/tests/)'
 
       - name: Upload lcov report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-lcov
           path: lcov.info
@@ -243,7 +260,7 @@ jobs:
     # and its per-assertion output lands in this job log.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run the Docker e2e suite
         run: |
           cd tests-e2e-docker
@@ -255,10 +272,10 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -277,7 +294,7 @@ jobs:
           target/release/lorica --version
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lorica-linux-x86_64
           path: target/release/lorica
@@ -298,7 +315,7 @@ jobs:
           done
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lorica-deb
           path: dist/*.deb
@@ -341,14 +358,14 @@ jobs:
           done
 
       - name: Upload .rpm artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lorica-rpm
           path: dist/*.rpm
           retention-days: 30
 
       - name: Upload GPG signatures
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lorica-signatures
           path: dist/*.asc
@@ -359,7 +376,7 @@ jobs:
     needs: build-and-package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: lorica-deb
           path: dist/
@@ -414,7 +431,7 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: lorica-rpm
           path: dist/
@@ -434,20 +451,20 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: lorica-linux-x86_64
           path: dist/
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: lorica-deb
           path: dist/
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: lorica-rpm
           path: dist/
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: lorica-signatures
           path: dist/

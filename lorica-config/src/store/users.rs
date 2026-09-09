@@ -61,9 +61,9 @@ impl ConfigStore {
 
     /// List all users, ordered by username.
     pub fn list_users(&self) -> Result<Vec<User>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {USER_COLUMNS} FROM users ORDER BY username"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {USER_COLUMNS} FROM users ORDER BY username"
+        ))?;
         let rows = stmt.query_map([], |row| Ok(row_to_user(row)))?;
         let mut users = Vec::new();
         for r in rows {

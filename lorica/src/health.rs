@@ -17,10 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use futures_util::stream::StreamExt;
 use lorica_config::models::{Backend, HealthStatus, LifecycleState};
 use lorica_config::ConfigStore;
 use once_cell::sync::Lazy;
-use futures_util::stream::StreamExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -202,15 +202,17 @@ pub async fn health_check_loop(
         // stream combinators cannot prove `Send` across the await points.
         let eligible: Vec<Backend> = backends
             .iter()
-            .filter(|b| {
-                b.lifecycle_state != LifecycleState::Closing && b.health_check_enabled
-            })
+            .filter(|b| b.lifecycle_state != LifecycleState::Closing && b.health_check_enabled)
             .cloned()
             .collect();
         let probe_results: Vec<(Backend, HealthStatus)> = futures_util::stream::iter(eligible)
             .map(|backend| async move {
                 let probe = if let Some(ref path) = backend.health_check_path {
-                    let scheme = if backend.tls_upstream { "https" } else { "http" };
+                    let scheme = if backend.tls_upstream {
+                        "https"
+                    } else {
+                        "http"
+                    };
                     let url = format!("{scheme}://{}{path}", backend.address);
                     http_probe(&url).await
                 } else {

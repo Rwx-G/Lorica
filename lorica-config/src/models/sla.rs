@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// AND its latency is `<= max_latency_ms`. `target_pct` is the success
 /// percentage that defines "meets SLA" in summary reports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlaConfig {
     /// `Route.id` this SLA target applies to (primary key).
     pub route_id: String,

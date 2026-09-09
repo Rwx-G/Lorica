@@ -7,6 +7,7 @@ use super::enums::NotificationChannel;
 /// encryption key) and `alert_types` lists the alert categories this
 /// destination subscribes to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NotificationConfig {
     /// Stable UUID.
     pub id: String,

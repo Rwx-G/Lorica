@@ -79,6 +79,7 @@ mod tests {
             geoip: None,
             bot_protection: None,
             group_name: String::new(),
+            node_selector: Vec::new(),
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
@@ -305,6 +306,105 @@ mod tests {
             .expect("test setup")
             .expect("test setup");
         assert_eq!(got.group_name, "retired");
+    }
+
+    #[test]
+    fn test_route_node_selector_round_trips_and_scopes_the_route() {
+        // Story 9.4 D11 / AC #13: the selector is a new column, so
+        // INSERT, UPDATE, SELECT and the canonical blob must all carry
+        // it end to end.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let mut route = make_route();
+        route.id = "r-selector".into();
+        route.node_selector = vec!["edge-1".into(), "edge-2".into()];
+        store.create_route(&route).expect("test setup");
+
+        let got = store
+            .get_route("r-selector")
+            .expect("test setup")
+            .expect("test setup");
+        assert_eq!(
+            got.node_selector,
+            vec!["edge-1".to_string(), "edge-2".to_string()]
+        );
+        let listed = store.list_routes().expect("test setup");
+        assert_eq!(listed[0].node_selector, got.node_selector);
+
+        assert!(got.applies_to_node("edge-1"));
+        assert!(got.applies_to_node("edge-2"));
+        assert!(!got.applies_to_node("edge-3"));
+
+        // An empty selector is fleet-wide.
+        let mut fleet_wide = got.clone();
+        fleet_wide.node_selector.clear();
+        store.update_route(&fleet_wide).expect("test setup");
+        let got = store
+            .get_route("r-selector")
+            .expect("test setup")
+            .expect("test setup");
+        assert!(got.node_selector.is_empty());
+        assert!(got.applies_to_node("any-node"));
+
+        // The selector rides the replication payload.
+        store.update_route(&route).expect("test setup");
+        let blob = crate::canonical::canonical_bytes(&store).expect("encode");
+        let text = String::from_utf8(blob).expect("utf8");
+        assert!(text.contains("node_selector"));
+        assert!(text.contains("edge-1"));
+    }
+
+    #[test]
+    fn test_route_node_selector_validation_matches_the_group_name_alphabet() {
+        let mut route = make_route();
+        route.node_selector = vec!["edge-1".into(), "edge_2".into()];
+        assert!(route.validate_node_selector().is_ok());
+
+        route.node_selector = vec!["Edge 1".into()];
+        assert!(route.validate_node_selector().is_err());
+
+        route.node_selector = vec![String::new()];
+        assert!(route.validate_node_selector().is_err());
+
+        route.node_selector = (0..=NODE_SELECTOR_MAX_ENTRIES)
+            .map(|i| format!("edge-{i}"))
+            .collect();
+        assert!(route.validate_node_selector().is_err());
+    }
+
+    #[test]
+    fn test_cluster_applied_config_and_break_glass_round_trip() {
+        // Story 9.4 AC #7 / AC #11: both live in `cluster_replica`
+        // (migration 52) because `cluster_state.value` is INTEGER.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        assert_eq!(
+            store.cluster_applied_config().expect("read"),
+            (0, String::new()),
+            "a node that has never applied a replica reports generation 0"
+        );
+        assert!(store.cluster_break_glass_until().expect("read").is_none());
+
+        store
+            .set_cluster_applied_config(42, "abc123")
+            .expect("write applied config");
+        assert_eq!(
+            store.cluster_applied_config().expect("read"),
+            (42, "abc123".to_string())
+        );
+
+        let until = Utc::now() + chrono::Duration::minutes(30);
+        store
+            .set_cluster_break_glass_until(Some(until))
+            .expect("arm break-glass");
+        let read = store
+            .cluster_break_glass_until()
+            .expect("read")
+            .expect("armed");
+        assert_eq!(read.to_rfc3339(), until.to_rfc3339());
+
+        store
+            .set_cluster_break_glass_until(None)
+            .expect("disarm break-glass");
+        assert!(store.cluster_break_glass_until().expect("read").is_none());
     }
 
     #[test]
@@ -764,9 +864,7 @@ mod tests {
             .expect("test setup: value present");
         assert_eq!(by_name.id, user.id);
 
-        let users = store
-            .list_users()
-            .expect("test setup: admin users listed");
+        let users = store.list_users().expect("test setup: admin users listed");
         assert_eq!(users.len(), 1);
 
         user.must_change_password = false;
@@ -1091,19 +1189,108 @@ created_at = "2026-01-01T00:00:00Z"
         assert!(fetched.otlp_endpoint.is_none());
     }
 
+    #[test]
+    fn test_global_settings_log_sinks_round_trip() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+
+        // Defaults: syslog disabled (no endpoint), udp transport,
+        // local0 facility, per-kind severities info/warning/notice,
+        // all three kinds enabled, OTLP logs off.
+        let settings = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert!(settings.syslog_endpoint.is_none());
+        assert_eq!(settings.syslog_transport, "udp");
+        assert_eq!(settings.syslog_facility, 16);
+        assert_eq!(settings.syslog_severity_access, 6);
+        assert_eq!(settings.syslog_severity_waf, 4);
+        assert_eq!(settings.syslog_severity_audit, 5);
+        assert!(settings.syslog_access_enabled);
+        assert!(settings.syslog_waf_enabled);
+        assert!(settings.syslog_audit_enabled);
+        assert!(settings.syslog_tls_ca_pem.is_none());
+        assert!(settings.syslog_extra_sd.is_none());
+        assert!(!settings.otlp_logs_enabled);
+        assert!(settings.otlp_logs_auth_header.is_none());
+
+        // Round-trip non-default values.
+        let mut updated = settings;
+        updated.syslog_endpoint = Some("siem.internal.example.org:6514".to_string());
+        updated.syslog_transport = "tcp-tls".to_string();
+        updated.syslog_facility = 17;
+        updated.syslog_severity_access = 7;
+        updated.syslog_severity_waf = 3;
+        updated.syslog_severity_audit = 2;
+        updated.syslog_access_enabled = false;
+        updated.syslog_waf_enabled = true;
+        updated.syslog_audit_enabled = false;
+        updated.syslog_tls_ca_pem = Some("-----BEGIN CERTIFICATE-----".to_string());
+        updated.syslog_tls_client_cert_pem = Some("-----BEGIN CERTIFICATE-----".to_string());
+        updated.syslog_tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----".to_string());
+        updated.syslog_extra_sd = Some("env=prod,dc=eu-west".to_string());
+        updated.otlp_logs_enabled = true;
+        updated.otlp_logs_auth_header = Some("Bearer token123".to_string());
+        store
+            .update_global_settings(&updated)
+            .expect("test setup: global settings update");
+
+        let fetched = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert_eq!(
+            fetched.syslog_endpoint.as_deref(),
+            Some("siem.internal.example.org:6514")
+        );
+        assert_eq!(fetched.syslog_transport, "tcp-tls");
+        assert_eq!(fetched.syslog_facility, 17);
+        assert_eq!(fetched.syslog_severity_access, 7);
+        assert_eq!(fetched.syslog_severity_waf, 3);
+        assert_eq!(fetched.syslog_severity_audit, 2);
+        assert!(!fetched.syslog_access_enabled);
+        assert!(fetched.syslog_waf_enabled);
+        assert!(!fetched.syslog_audit_enabled);
+        assert_eq!(
+            fetched.syslog_tls_client_key_pem.as_deref(),
+            Some("-----BEGIN PRIVATE KEY-----")
+        );
+        assert_eq!(
+            fetched.syslog_extra_sd.as_deref(),
+            Some("env=prod,dc=eu-west")
+        );
+        assert!(fetched.otlp_logs_enabled);
+        assert_eq!(
+            fetched.otlp_logs_auth_header.as_deref(),
+            Some("Bearer token123")
+        );
+
+        // Clearing an optional field (empty string in the KV table)
+        // deserialises back to None.
+        let mut cleared = fetched;
+        cleared.syslog_endpoint = None;
+        cleared.otlp_logs_auth_header = None;
+        store
+            .update_global_settings(&cleared)
+            .expect("test setup: global settings update");
+        let fetched = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert!(fetched.syslog_endpoint.is_none());
+        assert!(fetched.otlp_logs_auth_header.is_none());
+    }
+
     // ---- Migration ----
 
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 46 is the current head of the tracked MIGRATIONS table (every
+        // 54 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            46
+            54
         );
     }
 
@@ -1121,9 +1308,369 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                46
+                54
             );
         }
+    }
+
+    #[test]
+    fn test_acme_challenges_owned_by_migrations() {
+        // Story 9.1 AC #10: the table is created by migration v47, not
+        // by lorica-api's ad-hoc DDL, so schema changes to it flow
+        // through MIGRATIONS.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='acme_challenges'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("test setup: sqlite_master query");
+        assert_eq!(count, 1, "acme_challenges must exist after migrations");
+
+        // Shape, not just existence: `IF NOT EXISTS` makes migration
+        // v47 a no-op on databases where the retired ad-hoc DDL
+        // already created the table, so the columns the Story 9.5
+        // network writer binds must be asserted explicitly.
+        // `expires_at` joined them in migration v54 (Story 9.5 AC #6),
+        // which is what stops a crashed order from leaving a key
+        // authorization served forever.
+        let mut stmt = store
+            .conn
+            .prepare("SELECT name, type FROM pragma_table_info('acme_challenges') ORDER BY name")
+            .expect("test setup: pragma prepares");
+        let columns: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("test setup: pragma queries")
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()
+            .expect("test setup: pragma rows read");
+        assert_eq!(
+            columns,
+            vec![
+                ("expires_at".to_string(), "TEXT".to_string()),
+                ("key_auth".to_string(), "TEXT".to_string()),
+                ("token".to_string(), "TEXT".to_string()),
+            ],
+            "acme_challenges columns must match the migration-owned shape"
+        );
+    }
+
+    #[test]
+    fn test_cluster_config_generation_persists_and_increments() {
+        // Story 9.1 AC #6: the counter is persisted (survives a store
+        // reopen), unlike the supervisor's in-memory reload
+        // generation.
+        let tmp = NamedTempFile::new().expect("test setup: new() succeeds");
+        let path = tmp.path();
+        {
+            let store = ConfigStore::open(path, None).expect("test setup: store opens");
+            assert_eq!(
+                store
+                    .cluster_config_generation()
+                    .expect("test setup: generation reads"),
+                0
+            );
+            assert_eq!(
+                store
+                    .increment_cluster_config_generation()
+                    .expect("test setup: increment"),
+                1
+            );
+            assert_eq!(
+                store
+                    .increment_cluster_config_generation()
+                    .expect("test setup: increment"),
+                2
+            );
+        }
+        {
+            let store = ConfigStore::open(path, None).expect("test setup: store reopens");
+            assert_eq!(
+                store
+                    .cluster_config_generation()
+                    .expect("test setup: generation reads"),
+                2,
+                "generation must survive a restart"
+            );
+            // Story 9.1 AC #7: the takeover epoch is an independent
+            // persisted counter (the hot-upgrade double-session
+            // interlock primitive).
+            assert_eq!(
+                store
+                    .cluster_takeover_epoch()
+                    .expect("test setup: epoch reads"),
+                0
+            );
+            assert_eq!(
+                store
+                    .increment_cluster_takeover_epoch()
+                    .expect("test setup: epoch increments"),
+                1
+            );
+            assert_eq!(
+                store
+                    .cluster_config_generation()
+                    .expect("test setup: generation reads"),
+                2,
+                "epoch and generation must not share a counter"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cluster_ca_round_trips_and_rotates() {
+        // Story 9.2 AC #8: the cluster CA persists encrypted and is
+        // covered by table-driven key rotation from day one (the
+        // fleet identity root must never repeat the dns_providers
+        // rotation gap).
+        use crate::crypto::EncryptionKey;
+
+        let key1 = EncryptionKey::generate().expect("test setup: key generates");
+        let key2 = EncryptionKey::generate().expect("test setup: key generates");
+        let store = ConfigStore::open_in_memory_with_key(key1)
+            .expect("test setup: in-memory store opens with key");
+
+        assert!(
+            store.get_cluster_ca().expect("read").is_none(),
+            "no CA before cluster init"
+        );
+        store
+            .set_cluster_ca(
+                "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----",
+                "-----BEGIN PRIVATE KEY-----\ncluster-ca-secret\n-----END PRIVATE KEY-----",
+            )
+            .expect("test setup: CA persists");
+        let (cert, key) = store.get_cluster_ca().expect("read").expect("CA present");
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        assert!(key.contains("cluster-ca-secret"));
+
+        let count = store
+            .rotate_encryption_key(&key2)
+            .expect("test setup: rotation succeeds");
+        assert_eq!(count, 1, "the cluster CA key must rotate");
+        assert!(
+            store.get_cluster_ca().is_err(),
+            "post-rotation read under the old key must fail to decrypt"
+        );
+    }
+
+    #[test]
+    fn test_rotation_covers_dns_provider_credentials() {
+        // Story 9.1 AC #8's motivating bug, found live: the pre-9.1
+        // hardcoded rotation loop skipped `dns_providers.config`, so a
+        // key rotation left DNS credentials undecryptable while
+        // reporting success. The table-driven registry must include it.
+        use crate::crypto::EncryptionKey;
+
+        let key1 = EncryptionKey::generate().expect("test setup: key generates");
+        let key2 = EncryptionKey::generate().expect("test setup: key generates");
+        let store = ConfigStore::open_in_memory_with_key(key1)
+            .expect("test setup: in-memory store opens with key");
+
+        let provider = make_dns_provider();
+        store
+            .create_dns_provider(&provider)
+            .expect("test setup: dns provider inserts");
+
+        let count = store
+            .rotate_encryption_key(&key2)
+            .expect("test setup: rotation succeeds");
+        assert_eq!(count, 1, "the dns provider credential must rotate");
+
+        // The store still holds key1 in memory, so a read now fails to
+        // decrypt - proof the stored bytes were re-encrypted under
+        // key2 (production rotation restarts with the new key file).
+        assert!(
+            store.get_dns_provider(&provider.id).is_err(),
+            "post-rotation read under the old key must fail to decrypt"
+        );
+    }
+
+    #[test]
+    fn rotation_registry_covers_every_encrypting_store_module() {
+        // Story 9.1 AC #8 drift gate: recursively scan every store
+        // module at test time. A module that encrypts at rest may only
+        // write into tables that ENCRYPTED_COLUMNS names (or tables
+        // explicitly listed below as non-encrypted write targets), so
+        // a new module encrypting into an unregistered table fails
+        // here instead of silently bricking that secret at the next
+        // key rotation. `mod.rs` is exempt: it hosts the registry and
+        // the table-driven rotation itself, whose SQL is format!-built
+        // from the registry.
+        use std::collections::HashSet;
+
+        // Tables an encrypting module writes WITHOUT encrypted
+        // content. Every entry is a reviewed decision.
+        const NON_ENCRYPTED_WRITE_TARGETS: &[(&str, &str)] = &[
+            // delete_certificate clears routes.certificate_id.
+            ("certs.rs", "routes"),
+        ];
+
+        // Normalise before scanning so the gate does not depend on
+        // the author's SQL formatting habits: collapse all whitespace
+        // (multi-line statements) and match keywords
+        // ASCII-case-insensitively (per-char uppercase, so byte
+        // offsets stay aligned with the normalised source).
+        fn extract_write_tables(src: &str) -> HashSet<String> {
+            let normalized: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+            let upper: String = normalized.chars().map(|c| c.to_ascii_uppercase()).collect();
+            let mut tables = HashSet::new();
+            for (marker, is_update) in [
+                ("INSERT INTO ", false),
+                ("INSERT OR REPLACE INTO ", false),
+                ("UPDATE ", true),
+            ] {
+                for (idx, _) in upper.match_indices(marker) {
+                    let rest = &normalized[idx + marker.len()..];
+                    let table: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || *c == '_')
+                        .collect();
+                    if table.is_empty() {
+                        continue;
+                    }
+                    // Only count actual SQL statements: the keyword
+                    // also appears in prose ("Update an existing
+                    // certificate"), so require the table to be
+                    // followed by the statement's next clause.
+                    let after = rest[table.len()..].trim_start();
+                    let after_upper: String = after
+                        .chars()
+                        .take(8)
+                        .map(|c| c.to_ascii_uppercase())
+                        .collect();
+                    let is_sql = if is_update {
+                        after_upper.starts_with("SET ")
+                    } else {
+                        after.starts_with('(') || after_upper.starts_with("VALUES")
+                    };
+                    if is_sql {
+                        tables.insert(table);
+                    }
+                }
+            }
+            tables
+        }
+
+        // Table-level coverage is too coarse for the key/value
+        // `global_settings` table: dozens of plaintext settings and a
+        // few encrypted secrets share the same INSERT, so a new
+        // encrypted row could hide behind the already-registered
+        // table. For every `encrypt_config(` call whose following
+        // INSERT targets `global_settings`, extract the literal row
+        // key and require a matching `EncryptedColumn::KvText` entry.
+        fn extract_encrypted_kv_row_keys(src: &str, path: &std::path::Path) -> HashSet<String> {
+            let normalized: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut keys = HashSet::new();
+            for (idx, _) in normalized.match_indices("encrypt_config(") {
+                let mut window_end = std::cmp::min(idx + 800, normalized.len());
+                while !normalized.is_char_boundary(window_end) {
+                    window_end -= 1;
+                }
+                let window = &normalized[idx..window_end];
+                let Some(into_at) = window.find("INTO global_settings") else {
+                    continue;
+                };
+                let after_into = &window[into_at..];
+                let key = after_into
+                    .find("VALUES ('")
+                    .map(|v| &after_into[v + "VALUES ('".len()..])
+                    .and_then(|rest| rest.split('\'').next())
+                    .filter(|k| !k.is_empty());
+                match key {
+                    Some(k) => {
+                        keys.insert(k.to_string());
+                    }
+                    None => panic!(
+                        "{}: encrypt_config() write into global_settings without an \
+                         extractable literal row key; the KV coverage gate needs updating \
+                         for the new write shape",
+                        path.display()
+                    ),
+                }
+            }
+            keys
+        }
+
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("test setup: store dir lists") {
+                let path = entry.expect("test setup: dir entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store");
+        let registry: HashSet<&str> = crate::store::rotation_covered_tables()
+            .into_iter()
+            .collect();
+        let kv_registry: HashSet<&str> = crate::store::rotation_covered_kv_row_keys()
+            .into_iter()
+            .collect();
+        let mut files = Vec::new();
+        rs_files(&dir, &mut files);
+        let mut scanned = 0usize;
+        let mut kv_keys_seen = 0usize;
+        for path in files {
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("test setup: file name")
+                .to_string();
+            if file_name == "mod.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("test setup: source reads");
+            if !(src.contains("encrypt_config(") || src.contains("encrypt_key_pem")) {
+                continue;
+            }
+            scanned += 1;
+            let tables = extract_write_tables(&src);
+            assert!(
+                !tables.is_empty(),
+                "{} encrypts at rest but the scan found no INSERT/UPDATE target; \
+                 the gate's SQL extraction needs updating",
+                path.display()
+            );
+            for table in &tables {
+                let exempt = NON_ENCRYPTED_WRITE_TARGETS
+                    .iter()
+                    .any(|(file, t)| *file == file_name && t == table);
+                assert!(
+                    registry.contains(table.as_str()) || exempt,
+                    "{} encrypts at rest and writes into `{table}`, which is neither in \
+                     ENCRYPTED_COLUMNS nor listed as a reviewed non-encrypted write target; \
+                     register the column in store/mod.rs (or record the exemption here)",
+                    path.display()
+                );
+            }
+            for row_key in extract_encrypted_kv_row_keys(&src, &path) {
+                kv_keys_seen += 1;
+                assert!(
+                    kv_registry.contains(row_key.as_str()),
+                    "{} encrypts the global_settings row `{row_key}` but no \
+                     EncryptedColumn::KvText entry covers it; a key rotation would \
+                     silently skip this secret - register it in store/mod.rs",
+                    path.display()
+                );
+            }
+        }
+        // Same floor logic as `scanned`: the KV extraction must keep
+        // finding the two Story 9.8 sink secrets or it has gone blind.
+        assert!(
+            kv_keys_seen >= 2,
+            "expected at least 2 encrypted global_settings row keys, found {kv_keys_seen}"
+        );
+        // Sanity floor so a scan breakage fails loudly instead of
+        // passing on an empty set (same pattern as the openapi gate).
+        assert!(
+            scanned >= 4,
+            "expected at least 4 encrypting store modules, scanned {scanned}"
+        );
     }
 
     // ---- Export/Import round-trip ----
@@ -1225,9 +1772,7 @@ created_at = "2026-01-01T00:00:00Z"
         assert_eq!(prefs2.len(), 1);
         assert_eq!(prefs2[0].preference_key, pref.preference_key);
 
-        let users2 = store2
-            .list_users()
-            .expect("test setup: admin users listed");
+        let users2 = store2.list_users().expect("test setup: admin users listed");
         assert_eq!(users2.len(), 1);
         assert_eq!(users2[0].username, user.username);
 
@@ -2089,8 +2634,7 @@ cert_critical_days = 3
         // existing `password_hash` / `key_pem` / SMTP-password
         // rejections), so the REDACTED bot HMAC secret is caught
         // at parse time - even earlier than `import_to_store`.
-        let err = parse_toml(&toml_str)
-            .expect_err("parse must reject the REDACTED placeholder");
+        let err = parse_toml(&toml_str).expect_err("parse must reject the REDACTED placeholder");
         let msg = err.to_string();
         assert!(
             msg.contains("bot_hmac_secret_hex"),
@@ -2099,6 +2643,98 @@ cert_critical_days = 3
         assert!(
             msg.contains("redacted"),
             "error message must mention the redacted state, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_export_redacts_log_sink_secrets() {
+        // Story 9.8 AC #8: the syslog mTLS client key and the OTLP
+        // logs Authorization header are credentials for the operator's
+        // log pipeline and must never leave the node in a TOML export.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut s = store.get_global_settings().expect("test setup");
+        s.syslog_tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----\nsecret".to_string());
+        s.otlp_logs_auth_header = Some("Bearer sink-token-42".to_string());
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+
+        assert!(
+            toml_str.contains("syslog_tls_client_key_pem = \"**REDACTED**\""),
+            "client key must be replaced with the REDACTED placeholder"
+        );
+        assert!(
+            toml_str.contains("otlp_logs_auth_header = \"**REDACTED**\""),
+            "auth header must be replaced with the REDACTED placeholder"
+        );
+        assert!(
+            !toml_str.contains("sink-token-42") && !toml_str.contains("BEGIN PRIVATE KEY"),
+            "raw secret material must not appear anywhere in the export"
+        );
+    }
+
+    #[test]
+    fn test_export_redacts_the_scrape_token_and_import_rejects_it() {
+        // The `/metrics` bearer token is the endpoint's only
+        // authentication since v1.7.0, and the export is served on
+        // every follower at the Operator floor.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut s = store.get_global_settings().expect("test setup");
+        s.prometheus_scrape_token = Some("scrape-token-42".to_string());
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        assert!(
+            toml_str.contains("prometheus_scrape_token = \"**REDACTED**\""),
+            "the scrape token must be replaced with the REDACTED placeholder"
+        );
+        assert!(
+            !toml_str.contains("scrape-token-42"),
+            "the raw token must not appear anywhere in the export"
+        );
+        let err = parse_toml(&toml_str).expect_err("parse must reject the REDACTED placeholder");
+        assert!(
+            err.to_string().contains("prometheus_scrape_token"),
+            "error message must name the field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_import_rejects_redacted_log_sink_secrets() {
+        // Story 9.8 AC #8: a round-trip of an export holding redacted
+        // sink secrets must fail loudly instead of silently clearing
+        // live credentials.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut s = store.get_global_settings().expect("test setup");
+        s.syslog_tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----\nsecret".to_string());
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        let err = parse_toml(&toml_str).expect_err("parse must reject the REDACTED placeholder");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("syslog_tls_client_key_pem"),
+            "error message must name the field, got: {msg}"
+        );
+
+        // Same for the OTLP logs auth header on its own.
+        let store2 = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut s2 = store2.get_global_settings().expect("test setup");
+        s2.otlp_logs_auth_header = Some("Bearer sink-token-42".to_string());
+        store2
+            .update_global_settings(&s2)
+            .expect("test setup: settings update");
+        let toml_str2 = export_to_toml(&store2).expect("test setup: toml export succeeds");
+        let err2 = parse_toml(&toml_str2).expect_err("parse must reject the REDACTED placeholder");
+        assert!(
+            err2.to_string().contains("otlp_logs_auth_header"),
+            "error message must name the field, got: {err2}"
         );
     }
 
@@ -2495,6 +3131,33 @@ cert_critical_days = 3
             .rotate_encryption_key(&key2)
             .expect("test setup: value present");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_log_sink_secrets_participate_in_key_rotation() {
+        // Story 9.8 QA: the syslog mTLS client key and the OTLP logs
+        // auth header are encrypted at rest and must be re-encrypted
+        // by a key rotation like their notification / certificate
+        // peers. The count doubles as coverage proof: with only the
+        // two sink secrets set, rotation must touch exactly two rows.
+        use crate::crypto::EncryptionKey;
+
+        let key1 = EncryptionKey::generate().expect("test setup: key generates");
+        let key2 = EncryptionKey::generate().expect("test setup: key generates");
+        let store = ConfigStore::open_in_memory_with_key(key1)
+            .expect("test setup: in-memory store opens with key");
+
+        let mut s = store.get_global_settings().expect("test setup");
+        s.syslog_tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----\nsink".to_string());
+        s.otlp_logs_auth_header = Some("Bearer sink-token".to_string());
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let count = store
+            .rotate_encryption_key(&key2)
+            .expect("test setup: rotation succeeds");
+        assert_eq!(count, 2, "both sink secrets must be re-encrypted");
     }
 
     #[test]
@@ -3181,5 +3844,285 @@ cert_critical_days = 3
             .expect("test setup: route fetch")
             .expect("test setup: value present");
         assert!(loaded.header_rules.is_empty());
+    }
+
+    // ---- Story 9.3: cluster registry, tokens, identity ----
+
+    fn sample_node(id: &str, fp: &str, serial: &str) -> crate::models::ClusterNode {
+        let now = chrono::Utc::now();
+        crate::models::ClusterNode {
+            node_id: id.to_string(),
+            name: format!("edge-{id}"),
+            cert_fingerprint: fp.to_string(),
+            cert_serial: serial.to_string(),
+            prev_cert_fingerprint: None,
+            prev_cert_serial: None,
+            address: String::new(),
+            version: String::new(),
+            schema_version: 0,
+            status: crate::models::NodeStatus::Pending,
+            enrolled_at: now,
+            last_seen_at: None,
+            applied_config_generation: 0,
+            applied_config_hash: String::new(),
+            cert_not_after: now + chrono::Duration::days(90),
+            revoked_at: None,
+        }
+    }
+
+    fn sample_token(public_id: &str, ttl: chrono::Duration) -> crate::models::JoinToken {
+        let now = chrono::Utc::now();
+        crate::models::JoinToken {
+            public_id: public_id.to_string(),
+            secret_hmac: "ab".repeat(32),
+            state: crate::models::TokenState::Unused,
+            created_at: now,
+            expires_at: now + ttl,
+            created_by: "admin".to_string(),
+            bound_node_name: None,
+            bound_source_cidr: None,
+            burned_at: None,
+            burned_by_node_id: None,
+        }
+    }
+
+    #[test]
+    fn test_join_token_burn_is_single_use_and_expiry_aware() {
+        // Story 9.3 AC #4: the burn is one conditional UPDATE; a
+        // second burn, a burn of an expired token and a burn of a
+        // revoked token all report zero rows.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let now = chrono::Utc::now();
+        store
+            .create_join_token(&sample_token("live", chrono::Duration::hours(1)))
+            .expect("mint");
+        store
+            .create_join_token(&sample_token("stale", chrono::Duration::seconds(-1)))
+            .expect("mint");
+        store
+            .create_join_token(&sample_token("pulled", chrono::Duration::hours(1)))
+            .expect("mint");
+        assert_eq!(store.count_live_join_tokens(now).expect("count"), 2);
+        assert!(store.revoke_join_token("pulled").expect("revoke"));
+        assert!(!store.revoke_join_token("pulled").expect("revoke twice"));
+        assert_eq!(store.count_live_join_tokens(now).expect("count"), 1);
+        assert!(store.next_join_token_expiry(now).expect("expiry").is_some());
+
+        assert!(store.burn_join_token("live", "node-1", now).expect("burn"));
+        assert!(!store
+            .burn_join_token("live", "node-2", now)
+            .expect("second burn"));
+        assert!(!store
+            .burn_join_token("stale", "node-3", now)
+            .expect("expired burn"));
+        assert!(!store
+            .burn_join_token("pulled", "node-4", now)
+            .expect("revoked burn"));
+        assert!(!store
+            .burn_join_token("ghost", "node-5", now)
+            .expect("unknown burn"));
+        assert_eq!(store.count_live_join_tokens(now).expect("count"), 0);
+        assert!(store.next_join_token_expiry(now).expect("expiry").is_none());
+
+        let burned = store.get_join_token("live").expect("read").expect("row");
+        assert_eq!(burned.state, crate::models::TokenState::Burned);
+        assert_eq!(burned.burned_by_node_id.as_deref(), Some("node-1"));
+        assert_eq!(store.list_join_tokens().expect("list").len(), 3);
+    }
+
+    #[test]
+    fn test_cluster_node_lifecycle_and_revocation_list() {
+        // Story 9.3 AC #5/#7/#12: pending -> active once, revocation
+        // records every serial, renewal keeps the previous certificate
+        // resolvable until retired.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let now = chrono::Utc::now();
+        store
+            .create_cluster_node(&sample_node("n1", "fp1", "01AA"))
+            .expect("enroll");
+        assert!(store.activate_cluster_node("n1").expect("activate"));
+        assert!(!store.activate_cluster_node("n1").expect("activate twice"));
+        assert!(!store
+            .activate_cluster_node("nope")
+            .expect("activate absent"));
+        assert_eq!(
+            store
+                .count_cluster_nodes_with_status(crate::models::NodeStatus::Active)
+                .expect("count"),
+            1
+        );
+
+        store
+            .touch_cluster_node(&crate::store::LiveNodeFacts {
+                node_id: "n1".to_string(),
+                address: "192.0.2.10:5000".to_string(),
+                version: "1.7.0".to_string(),
+                schema_version: 50,
+                last_seen_at: now,
+                applied_config_generation: 7,
+                applied_config_hash: "cafebabe".to_string(),
+            })
+            .expect("touch");
+        let node = store.get_cluster_node("n1").expect("read").expect("row");
+        assert_eq!(node.address, "192.0.2.10:5000");
+        assert_eq!(node.schema_version, 50);
+        assert!(node.last_seen_at.is_some());
+        assert_eq!(node.applied_config_generation, 7);
+        assert_eq!(node.applied_config_hash, "cafebabe");
+
+        // A pending node cannot renew (AC #5); an active one can:
+        // fp2 becomes current, fp1 stays resolvable.
+        store
+            .create_cluster_node(&sample_node("pending", "fpp", "0FFF"))
+            .expect("enroll");
+        assert!(!store
+            .record_cluster_node_renewal("pending", "fpq", "0FFE", now, now)
+            .expect("pending renewal refused"));
+        assert!(store
+            .record_cluster_node_renewal("n1", "fp2", "02BB", now + chrono::Duration::days(90), now)
+            .expect("renew"));
+        let by_old = store
+            .get_cluster_node_by_fingerprint("fp1")
+            .expect("read")
+            .expect("old fingerprint still resolves");
+        assert_eq!(by_old.node_id, "n1");
+        assert_eq!(by_old.cert_fingerprint, "fp2");
+        assert_eq!(by_old.prev_cert_serial.as_deref(), Some("01AA"));
+        assert!(store
+            .list_cluster_revoked_serials(now)
+            .expect("crl")
+            .is_empty());
+
+        // First session on the new certificate retires the old one.
+        assert_eq!(
+            store
+                .retire_previous_cluster_certificate("n1", now)
+                .expect("retire"),
+            Some("01AA".to_string())
+        );
+        assert!(store
+            .retire_previous_cluster_certificate("n1", now)
+            .expect("retire twice")
+            .is_none());
+        assert!(store
+            .get_cluster_node_by_fingerprint("fp1")
+            .expect("read")
+            .is_none());
+        let crl = store.list_cluster_revoked_serials(now).expect("crl");
+        assert_eq!(crl.len(), 1);
+        assert_eq!(crl[0].reason, "superseded");
+        assert!(crl[0].expires_at > now);
+        // Past the certificate's expiry the serial leaves the CRL and
+        // is pruned.
+        let later = now + chrono::Duration::days(91);
+        assert!(store
+            .list_cluster_revoked_serials(later)
+            .expect("crl")
+            .is_empty());
+        assert_eq!(
+            store.prune_cluster_revoked_serials(later).expect("prune"),
+            1
+        );
+        assert_eq!(
+            store
+                .prune_cluster_revoked_serials(later)
+                .expect("prune twice"),
+            0
+        );
+
+        // Revocation records the current serial and is idempotent.
+        let revoked = store
+            .revoke_cluster_node("n1", now)
+            .expect("revoke")
+            .expect("row returned");
+        assert_eq!(revoked.status, crate::models::NodeStatus::Active);
+        assert!(store
+            .revoke_cluster_node("n1", now)
+            .expect("revoke twice")
+            .is_none());
+        let node = store.get_cluster_node("n1").expect("read").expect("row");
+        assert_eq!(node.status, crate::models::NodeStatus::Revoked);
+        assert!(node.revoked_at.is_some());
+        let serials: Vec<String> = store
+            .list_cluster_revoked_serials(now)
+            .expect("crl")
+            .into_iter()
+            .map(|r| r.serial)
+            .collect();
+        assert_eq!(serials, vec!["02BB".to_string()], "01AA was pruned above");
+        assert_eq!(store.list_cluster_nodes().expect("list").len(), 2);
+        // The batched touch persists a whole snapshot in one go.
+        store
+            .touch_cluster_nodes(&[
+                crate::store::LiveNodeFacts {
+                    node_id: "n1".to_string(),
+                    address: "192.0.2.10:5001".to_string(),
+                    version: "1.7.1".to_string(),
+                    schema_version: 52,
+                    last_seen_at: now,
+                    applied_config_generation: 9,
+                    applied_config_hash: "deadbeef".to_string(),
+                },
+                crate::store::LiveNodeFacts {
+                    node_id: "ghost".to_string(),
+                    address: String::new(),
+                    version: String::new(),
+                    schema_version: 0,
+                    last_seen_at: now,
+                    applied_config_generation: 0,
+                    applied_config_hash: String::new(),
+                },
+            ])
+            .expect("batch touch");
+        let node = store.get_cluster_node("n1").expect("read").expect("row");
+        assert_eq!(node.address, "192.0.2.10:5001");
+        assert_eq!(node.version, "1.7.1");
+        assert_eq!(node.applied_config_generation, 9);
+        assert_eq!(node.applied_config_hash, "deadbeef");
+    }
+
+    #[test]
+    fn test_cluster_identity_and_token_key_round_trip_and_rotate() {
+        // Story 9.3: the follower identity key and the token HMAC key
+        // are encrypted at rest and covered by rotation.
+        use crate::crypto::EncryptionKey;
+        let key1 = EncryptionKey::generate().expect("key");
+        let key2 = EncryptionKey::generate().expect("key");
+        let store = ConfigStore::open_in_memory_with_key(key1).expect("store");
+        assert!(store.get_cluster_identity().expect("read").is_none());
+
+        let now = chrono::Utc::now();
+        store
+            .set_cluster_identity(&crate::models::ClusterIdentity {
+                node_id: "n1".to_string(),
+                node_name: "edge-1".to_string(),
+                cert_pem: "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----"
+                    .to_string(),
+                key_pem: "-----BEGIN PRIVATE KEY-----\nnode-secret\n-----END PRIVATE KEY-----"
+                    .to_string(),
+                ca_pem: "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----".to_string(),
+                control_plane: "cp.example.com:9444".to_string(),
+                server_name: "cp.example.com".to_string(),
+                enrolled_at: now,
+                cert_not_after: now + chrono::Duration::days(90),
+            })
+            .expect("persist identity");
+        let identity = store.get_cluster_identity().expect("read").expect("row");
+        assert_eq!(identity.node_id, "n1");
+        assert!(identity.key_pem.contains("node-secret"));
+
+        let token_key = store.token_hmac_key().expect("token key");
+        assert_eq!(token_key, store.token_hmac_key().expect("stable"));
+        assert_ne!(token_key, [0u8; 32]);
+
+        // Rotation covers both blobs (plus nothing else in this store).
+        let count = store.rotate_encryption_key(&key2).expect("rotate");
+        assert_eq!(count, 2);
+        assert!(store.get_cluster_identity().is_err());
+        assert!(store.token_hmac_key().is_err());
+
+        // Leaving wipes the identity.
+        let store = ConfigStore::open_in_memory().expect("store");
+        assert!(!store.delete_cluster_identity().expect("delete absent"));
     }
 }

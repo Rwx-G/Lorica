@@ -32,7 +32,7 @@
 //! use std::sync::Arc;
 //!
 //! // Create a custom filter (operator-supplied type implementing
-//! // `ConnectionFilter` — see `connection_filter.rs` for the example).
+//! // `ConnectionFilter` - see `connection_filter.rs` for the example).
 //! let filter = Arc::new(MyCustomFilter::new());
 //!
 //! // Apply to listeners

@@ -43,10 +43,8 @@ const HTTP_METHODS: [&str; 7] = ["get", "post", "put", "delete", "patch", "optio
 
 #[test]
 fn openapi_spec_matches_routes() {
-    let server_src: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs"));
-    let openapi_src: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"));
+    let server_src: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs"));
+    let openapi_src: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"));
 
     let routes: BTreeSet<(String, String)> = extract_routes(server_src);
     let spec: BTreeSet<(String, String)> = extract_spec_paths(openapi_src);

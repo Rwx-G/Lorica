@@ -28,15 +28,26 @@ use crate::server::AppState;
 
 use super::types::{default_true, AcmeProvisionResponse};
 
-/// No-op HTTP-01 solver used when the process has no challenge store
-/// (`state.acme_challenge_store` is `None`). It publishes nowhere, matching
-/// the pre-extraction behaviour where a missing store simply skipped the
-/// token set/remove calls.
+/// Solver used when the process has no challenge store
+/// (`state.acme_challenge_store` is `None` - test states only; all
+/// three real startup modes construct one). It fails `present` so the
+/// order aborts with a clear error instead of telling the CA to
+/// validate against a node serving no token (the fail-closed contract
+/// Story 9.1 AC #9 introduced).
 struct NoopHttp01Solver;
 
 #[async_trait::async_trait]
 impl Http01ChallengeSolver for NoopHttp01Solver {
-    async fn present(&self, _token: String, _key_authorization: String) {}
+    async fn present(
+        &self,
+        _identifier: &str,
+        _token: String,
+        _key_authorization: String,
+    ) -> Result<(), lorica_acme::AcmeError> {
+        Err(lorica_acme::AcmeError::Solver(
+            "no HTTP-01 challenge store configured in this process".to_string(),
+        ))
+    }
     async fn cleanup(&self, _token: &str) {}
 }
 
@@ -139,10 +150,12 @@ pub async fn serve_challenge(
         .as_ref()
         .ok_or_else(|| ApiError::NotFound("ACME not initialized".into()))?;
 
+    // The token is not echoed back: this endpoint is unauthenticated
+    // and the value comes straight from the request path.
     challenge_store
         .get(&token)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("challenge token {token} not found")))
+        .ok_or_else(|| ApiError::NotFound("challenge token not found".into()))
 }
 
 /// Internal ACME provisioning: drives issuance via `lorica_acme::issue_http01`
@@ -161,12 +174,22 @@ pub(super) async fn provision_with_acme(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let primary_domain = &domains[0];
 
-    // Drive the pure ACME protocol via `lorica-acme`. The challenge tokens
-    // are published through `AcmeChallengeStore` (the `Http01ChallengeSolver`
-    // impl); a process without a store falls back to a no-op solver, matching
+    // Drive the pure ACME protocol via `lorica-acme`. Tokens are
+    // published through the challenge store, wrapped since Story 9.5 so
+    // that on a control plane they also reach every follower that could
+    // answer for the hostname being validated (AC #6). On a standalone
+    // node or a follower the wrapper is a passthrough, and a process
+    // without a store still falls back to the no-op solver, matching
     // the pre-extraction behaviour.
     let issued = match &state.acme_challenge_store {
-        Some(store) => lorica_acme::issue_http01(config, domains, store).await?,
+        Some(store) => {
+            let solver = super::FleetHttp01Solver::new(
+                store.clone(),
+                state.cluster.clone(),
+                std::sync::Arc::clone(&state.store),
+            );
+            lorica_acme::issue_http01(config, domains, &solver).await?
+        }
         None => lorica_acme::issue_http01(config, domains, &NoopHttp01Solver).await?,
     };
     let cert_pem = issued.cert_pem;
@@ -177,8 +200,8 @@ pub(super) async fn provision_with_acme(
     // binding survive ; on first issuance insert a fresh row.
     let now = chrono::Utc::now();
     let is_renewal = existing_cert_id.is_some();
-    let cert_id = existing_cert_id
-        .map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
+    let cert_id =
+        existing_cert_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
     let san_domains: Vec<String> = domains.to_vec();
     let fingerprint = format!("acme:{}", domains.join(","));
 
@@ -221,8 +244,7 @@ pub(super) async fn provision_with_acme(
     if let Some((settings, acls)) = export_snapshot {
         crate::cert_export::export_after_release(settings, acls, cert).await;
     }
-    state.rotate_bot_hmac_on_cert_event().await;
-    state.notify_config_changed();
+    super::after_certificate_issued(state, &cert_id).await;
 
     Ok(cert_id)
 }

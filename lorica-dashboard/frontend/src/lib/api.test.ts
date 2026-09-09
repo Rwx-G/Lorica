@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { api, sanitizeFilenameFromHeader, isValidUpgradeSignatureHex } from './api';
+import {
+  api,
+  fleetQuery,
+  sanitizeFilenameFromHeader,
+  isValidUpgradeSignatureHex,
+} from './api';
 
 const mockRoute = {
   id: '123',
@@ -575,5 +580,66 @@ describe('sanitizeFilenameFromHeader', () => {
     expect(
       sanitizeFilenameFromHeader('attachment; filename="x"', ''),
     ).toBe('x');
+  });
+});
+
+describe('api SLA reads with a node', () => {
+  it('sends node= only when a follower is named', async () => {
+    mockFetch([]);
+    await api.getSlaOverview();
+    expect(fetch).toHaveBeenCalledWith('/api/v1/sla/overview', expect.objectContaining({ method: 'GET' }));
+    mockFetch([]);
+    await api.getSlaOverview('node-a');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/sla/overview?node=node-a',
+      expect.objectContaining({ method: 'GET' }),
+    );
+    mockFetch([]);
+    await api.getRouteSlaBuckets('r1', { source: 'passive', node: 'node-a' });
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/sla/routes/r1/buckets?source=passive&node=node-a',
+      expect.objectContaining({ method: 'GET' }),
+    );
+  });
+});
+
+describe('fleetQuery', () => {
+  it('produces no query string at all when nothing is filtered', () => {
+    expect(fleetQuery({})).toBe('');
+  });
+
+  it('treats an empty filter the same as an absent one', () => {
+    // The pages hold `''` for "all nodes". Sending `node=` would ask
+    // the backend for the node whose id is the empty string, which
+    // matches nothing, so the whole fleet view would come back blank.
+    expect(fleetQuery({ node: '', route: '', category: '' })).toBe('');
+  });
+
+  it('carries every set filter, encoded', () => {
+    const q = new URLSearchParams(fleetQuery({
+      node: 'node a/b',
+      route: 'shop.example.com',
+      category: 'sql_injection',
+      from: '2026-09-09T09:00:00Z',
+      to: '2026-09-09T10:00:00Z',
+      before_id: 42,
+      limit: 100,
+    }).slice(1));
+    expect(q.get('node')).toBe('node a/b');
+    expect(q.get('route')).toBe('shop.example.com');
+    expect(q.get('category')).toBe('sql_injection');
+    expect(q.get('from')).toBe('2026-09-09T09:00:00Z');
+    expect(q.get('to')).toBe('2026-09-09T10:00:00Z');
+    expect(q.get('before_id')).toBe('42');
+    expect(q.get('limit')).toBe('100');
+  });
+
+  it('keeps a zero cursor and a zero limit, which are not "unset"', () => {
+    // `before_id` and `limit` are compared against undefined rather
+    // than for truthiness: 0 is a value the backend interprets, and
+    // dropping it would silently change the page the caller asked for.
+    const q = new URLSearchParams(fleetQuery({ before_id: 0, limit: 0 }).slice(1));
+    expect(q.get('before_id')).toBe('0');
+    expect(q.get('limit')).toBe('0');
   });
 });

@@ -154,7 +154,11 @@ fn load_or_generate_self_signed(data_dir: &Path) -> Result<(String, String), Man
 fn needs_rotation(cert_pem: &str) -> bool {
     let parsed = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
         .ok()
-        .and_then(|(_, pem)| pem.parse_x509().ok().map(|c| c.validity().not_after.timestamp()));
+        .and_then(|(_, pem)| {
+            pem.parse_x509()
+                .ok()
+                .map(|c| c.validity().not_after.timestamp())
+        });
     match parsed {
         Some(not_after) => {
             let cutoff: i64 = chrono::Utc::now().timestamp() + ROTATE_WITHIN_DAYS * 24 * 3600;
@@ -208,8 +212,11 @@ fn generate_self_signed(validity_days: i64) -> Result<(String, String), Manageme
         not_before.month() as u8,
         not_before.day() as u8,
     );
-    params.not_after =
-        rcgen::date_time_ymd(not_after.year(), not_after.month() as u8, not_after.day() as u8);
+    params.not_after = rcgen::date_time_ymd(
+        not_after.year(),
+        not_after.month() as u8,
+        not_after.day() as u8,
+    );
 
     let key_pair: KeyPair =
         KeyPair::generate().map_err(|e| ManagementTlsError::Generate(e.to_string()))?;
@@ -351,7 +358,10 @@ mod tests {
 
         // First call generates and persists.
         let cfg = build_management_server_config(dir.path(), None, None);
-        assert!(cfg.is_ok(), "first build should generate a self-signed cert");
+        assert!(
+            cfg.is_ok(),
+            "first build should generate a self-signed cert"
+        );
 
         let cert_path = dir.path().join("management").join("cert.pem");
         let key_path = dir.path().join("management").join("key.pem");
@@ -374,7 +384,10 @@ mod tests {
         let cfg2 = build_management_server_config(dir.path(), None, None);
         assert!(cfg2.is_ok(), "second build should reuse the persisted cert");
         let cert_after = std::fs::read_to_string(&cert_path).unwrap();
-        assert_eq!(cert_before, cert_after, "valid leaf must not be regenerated");
+        assert_eq!(
+            cert_before, cert_after,
+            "valid leaf must not be regenerated"
+        );
     }
 
     #[test]

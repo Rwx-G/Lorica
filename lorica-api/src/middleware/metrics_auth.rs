@@ -2,12 +2,14 @@
 //! AC #4 / AC #5).
 //!
 //! When the global setting `metrics_require_auth` is `false` (the
-//! v1.6.0 default) this middleware is a straight pass-through, so
-//! existing unauthenticated Prometheus scrapes keep working. When it is
-//! `true`, a scrape must present ONE of:
+//! v1.6.0 default, kept by any install that stored it) this middleware
+//! is a straight pass-through. Since v1.7.0 the default is `true`, and
+//! a scrape must present ONE of:
 //!
-//! - a valid dashboard session cookie (an operator viewing `/metrics`
-//!   in the browser), or
+//! - a valid dashboard session cookie sent explicitly by an API client
+//!   (the cookie is scoped `Path=/api`, so a browser does NOT send it
+//!   to `/metrics`; a browser reads the same document at
+//!   `/api/v1/metrics`, behind the ordinary session gate), or
 //! - the static bearer token in `prometheus_scrape_token` (or its
 //!   environment override `LORICA_PROMETHEUS_SCRAPE_TOKEN`), supplied
 //!   as `Authorization: Bearer <token>`.
@@ -37,9 +39,8 @@ const METRICS_REALM: &str = "lorica-metrics";
 /// How long a cached auth-settings snapshot is reused before re-reading
 /// the store. Bounds the settings DB read to at most once per this window
 /// regardless of scrape rate (performance: a Prometheus scrape must not
-/// pay a blocking SQLite read every time, especially in the default
-/// `metrics_require_auth = false` configuration). A change to the toggle
-/// or token takes effect within one TTL.
+/// pay a blocking SQLite read every time, whichever way the toggle is
+/// set). A change to the toggle or token takes effect within one TTL.
 const AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The two settings the middleware needs, cached to keep `/metrics`
@@ -52,8 +53,9 @@ struct AuthSettings {
 
 /// Process-wide TTL cache of [`AuthSettings`]. The management API runs in
 /// a single process, so one cache suffices.
-static AUTH_CACHE: std::sync::LazyLock<std::sync::RwLock<Option<(AuthSettings, std::time::Instant)>>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+static AUTH_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<Option<(AuthSettings, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
 
 /// Return the auth settings, from the TTL cache when fresh, otherwise
 /// re-read them from the store and refresh the cache. `Err(())` on a
@@ -153,10 +155,7 @@ fn bearer_authorized(req: &Request, setting_token: Option<&str>) -> bool {
     else {
         return false;
     };
-    provided
-        .as_bytes()
-        .ct_eq(expected.as_bytes())
-        .into()
+    provided.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 /// Extract the `lorica_session` cookie value from the request, if present.
@@ -173,10 +172,13 @@ fn session_cookie_value(req: &Request) -> Option<String> {
 /// Build the `401 Unauthorized` response with the metrics `WWW-Authenticate`
 /// challenge (AC #5).
 fn unauthorized() -> Response {
-    let mut response = (StatusCode::UNAUTHORIZED, "metrics authentication required").into_response();
+    let mut response =
+        (StatusCode::UNAUTHORIZED, "metrics authentication required").into_response();
     let challenge = format!("Bearer realm=\"{METRICS_REALM}\"");
     if let Ok(value) = HeaderValue::from_str(&challenge) {
-        response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
     }
     response
 }

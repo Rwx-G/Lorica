@@ -3,7 +3,9 @@
   import { SvelteURLSearchParams } from 'svelte/reactivity';
   import { api, type LogEntry, type LogsQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
-  import { canWrite } from '../lib/auth';
+  import NodeFilter from '../components/NodeFilter.svelte';
+  import { canWrite, canWriteRole } from '../lib/auth';
+  import { clusterStatus, isFleetView } from '../lib/cluster';
 
   let entries: LogEntry[] = $state([]);
   let total = $state(0);
@@ -18,6 +20,28 @@
   let filterStatusCategory = $state('');
   let filterTimeRange = $state('');
   let filterLimit = $state(500);
+  /** Selected node id, or `''` for every node (Story 9.7 AC #5). */
+  let filterNode = $state('');
+  /**
+   * Whether this page is showing the FAN-IN store rather than this
+   * node's own log. Only a control plane holds fanned-in rows.
+   */
+  // The fleet view reads Operator-floor endpoints; a Viewer on the
+  // control plane sees this node's own data, as on a standalone.
+  const fleetView = $derived(isFleetView($clusterStatus) && $canWriteRole);
+  /**
+   * Row id to the node that produced it, for the fleet view's Node
+   * column.
+   *
+   * Keyed by id rather than held parallel to `entries`, because the
+   * table renders them reversed and an index-aligned array would
+   * silently mislabel every row. Kept beside the rows rather than
+   * pushed into `LogEntry`: that type is the single-node shape the
+   * rest of the page and the export path share, and widening it for a
+   * column only the fleet view shows would put an always-empty field
+   * on every standalone install.
+   */
+  let fleetNodeById = $state<Record<number, string>>({});
   let autoRefresh = $state(localStorage.getItem('lorica-logs-autorefresh') !== 'false');
 
   // Export controls
@@ -124,6 +148,47 @@
       params.time_from = from.toISOString();
     }
 
+    // On a control plane with a node picked (or with "all nodes" while
+    // clustered), read the FAN-IN store rather than this node's own
+    // log: the point of the filter is to see other nodes' traffic.
+    // The fan-in view has no total, by design, so the count is the
+    // page itself rather than a number the server had to scan for.
+    if (fleetView) {
+      const res = await api.getFleetLogs({
+        ...(filterNode ? { node: filterNode } : {}),
+        ...(filterRoute.trim() ? { route: filterRoute.trim() } : {}),
+        ...(typeof params.time_from === 'string' ? { from: params.time_from } : {}),
+        limit: filterLimit,
+      });
+      if (res.error) {
+        error = res.error.message;
+      } else if (res.data) {
+        entries = res.data.rows.map((r) => ({
+          id: r.id,
+          timestamp: r.timestamp,
+          method: r.method,
+          path: r.path,
+          host: r.host,
+          status: r.status,
+          latency_ms: r.latency_ms,
+          backend: r.backend,
+          error: r.error === '' ? null : r.error,
+          client_ip: r.client_ip,
+          // The fan-in view does not carry these: they are local
+          // request details the fleet table has no column for.
+          is_xff: false,
+          xff_proxy_ip: '',
+          source: '',
+          request_id: r.request_id,
+        }));
+        fleetNodeById = Object.fromEntries(res.data.rows.map((r) => [r.id, r.node_id]));
+        total = res.data.rows.length;
+        error = '';
+      }
+      loading = false;
+      return;
+    }
+
     const res = await api.getLogs(params);
     if (res.error) {
       error = res.error.message;
@@ -178,7 +243,12 @@
 
   onMount(() => {
     loadLogs();
-    if (autoRefresh) connectWebSocket();
+    // The live tail carries only THIS node's rows and the fan-in view
+    // has no node id for them, so they would render under "-" beside
+    // genuinely fanned-in rows: the control plane's own traffic,
+    // labelled as if its origin were unknown. The fleet view polls
+    // instead.
+    if (autoRefresh && !fleetView) connectWebSocket();
   });
 
   onDestroy(() => {
@@ -260,6 +330,13 @@
   {/if}
 
   <div class="filters">
+    <NodeFilter
+      value={filterNode}
+      onchange={(id) => {
+        filterNode = id;
+        void loadLogs();
+      }}
+    />
     <input
       type="text"
       class="filter-input search-input"
@@ -316,6 +393,9 @@
       <table>
         <thead>
           <tr>
+            {#if fleetView}
+              <th>Node</th>
+            {/if}
             <th>Time</th>
             <th>Method</th>
             <th>Client IP</th>
@@ -330,6 +410,9 @@
         <tbody>
           {#each [...entries].reverse() as entry (entry.id)}
             <tr>
+              {#if fleetView}
+                <td class="mono">{fleetNodeById[entry.id] ?? '-'}</td>
+              {/if}
               <td class="mono time-col">{formatTimestamp(entry.timestamp)}</td>
               <td class="method-col">
                 <span class="method-badge">{entry.method}</span>

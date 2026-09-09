@@ -1,0 +1,612 @@
+// Cluster-plane protocol between a Lorica control-plane node and its
+// followers (Epic 9, Story 9.2). This file documents the wire format.
+// The actual Rust types are defined using prost derive macros in
+// src/messages.rs (no protoc compilation needed), mirroring the
+// lorica-command pattern.
+//
+// DISJOINT FROM `lorica.command` BY CONSTRUCTION (Story 9.2 AC #6).
+// This package shares no message with the worker plane, and
+// ClusterFrame's top-level oneof deliberately uses tags 101/102 while
+// the worker Envelope uses 1/2: bytes of one frame type decode to an
+// EMPTY frame (kind = None) on the other plane, never to a valid
+// message. A cluster peer therefore cannot smuggle a worker Command
+// (SHUTDOWN, BAN_IP, ...) through the framing; the bridge into
+// lorica-command is additionally an explicit whitelist translation
+// with no pass-through of any peer-supplied command type.
+//
+// Framing on the wire is the RpcEndpoint format:
+// [8 bytes LE length][prost-encoded ClusterFrame], carried inside the
+// mutual-TLS stream. Request/response matching uses per-direction
+// monotonic sequences exactly as on the worker plane.
+
+syntax = "proto3";
+package lorica.cluster.v1;
+
+// Top-level frame. Tags 101/102 (NOT 1/2) - see the disjointness note
+// above.
+message ClusterFrame {
+  oneof kind {
+    ClusterRequest request = 101;
+    ClusterResponse response = 102;
+  }
+}
+
+// A request from either side (the dialing follower or the control
+// plane). Body tags:
+//   10-19  session control (Story 9.2) and lifecycle (Story 9.3:
+//          enroll on the enrollment listener, renew and leave on an
+//          established session)
+//   20-39  configuration replication (Story 9.4: 20-23 in use, the
+//          rest reserved). 20-22 are CONTROL-PLANE-INITIATED and are
+//          the only frames a follower accepts on its incoming half;
+//          23 is the follower's convergence pull.
+//   40-59  telemetry fan-in (Story 9.6: 40-41 in use, the rest
+//          reserved). 40 is the follower's telemetry push, 41 is
+//          the control plane's fleet-wide ban; each is a
+//          PROTOCOL_VIOLATION in the opposite direction.
+//   60-79  certificate distribution and HTTP-01 challenge fan-out
+//          (Story 9.5: 60-63 in use, the rest reserved). 60, 62 and
+//          63 are CONTROL-PLANE-INITIATED, 61 is the follower's
+//          certificate pull; each is a PROTOCOL_VIOLATION in the
+//          opposite direction.
+//
+// `body_kind` duplicates the body's oneof tag as a scalar. A receiver
+// that does not know the body (an older build talking to a newer
+// peer) decodes the unknown tag as an unknown field and sees no body;
+// the scalar lets it answer UNSUPPORTED_METHOD and keep the connection
+// instead of treating the peer as hostile. `body_kind = 0` with no
+// body is a protocol violation.
+message ClusterRequest {
+  uint64 sequence = 1;    // Monotonic per direction, RpcEndpoint-managed
+  uint32 body_kind = 3;   // The body's oneof tag, set by the sender
+  oneof body {
+    Hello hello = 10;
+    Heartbeat heartbeat = 11;
+    Enroll enroll = 12;
+    Renew renew = 13;
+    Leave leave = 14;
+    ConfigPrepare config_prepare = 20;
+    ConfigCommit config_commit = 21;
+    ConfigAbort config_abort = 22;
+    ConfigPull config_pull = 23;
+    TelemetryPush telemetry_push = 40;
+    BanPush ban_push = 41;
+    SlaPull sla_pull = 42;
+    CertPush cert_push = 60;
+    CertPull cert_pull = 61;
+    ChallengePublish challenge_publish = 62;
+    ChallengeRetract challenge_retract = 63;
+  }
+}
+
+// A response matched to a request by `sequence`. `status` is a
+// ClusterStatus; `retry_after_s` is only meaningful with RETRY_LATER
+// (Story 9.2 AC #10 admission control).
+message ClusterResponse {
+  uint64 sequence = 1;
+  int32 status = 2;
+  uint32 retry_after_s = 3;
+  oneof body {
+    HelloAck hello_ack = 10;
+    HeartbeatAck heartbeat_ack = 11;
+    EnrollAck enroll_ack = 12;
+    RenewAck renew_ack = 13;
+    LeaveAck leave_ack = 14;
+    ConfigPrepareAck config_prepare_ack = 20;
+    ConfigCommitAck config_commit_ack = 21;
+    ConfigAbortAck config_abort_ack = 22;
+    ConfigPullAck config_pull_ack = 23;
+    TelemetryPushAck telemetry_push_ack = 40;
+    BanPushAck ban_push_ack = 41;
+    SlaPullAck sla_pull_ack = 42;
+    CertPushAck cert_push_ack = 60;
+    CertPullAck cert_pull_ack = 61;
+    ChallengePublishAck challenge_publish_ack = 62;
+    ChallengeRetractAck challenge_retract_ack = 63;
+  }
+}
+
+// First request on every operational connection, sent AFTER the mutual
+// TLS handshake has verified the client certificate (AC #4: the
+// version exchange is post-authentication on the operational path).
+message Hello {
+  // Protocol range the sender speaks (AC #4: minimum-compatible-version
+  // range, not exact equality, so rolling upgrades have a valid order).
+  uint32 protocol_min = 1;
+  uint32 protocol_max = 2;
+  // The sender's database schema version (AC #5). A follower below the
+  // control plane's schema must not apply configuration.
+  uint32 schema_version = 3;
+  // Display name only. Node IDENTITY is always the peer-certificate
+  // fingerprint recorded at enrollment (Story 9.3 AC #8); this field
+  // must never be used for authorization or as a metric label.
+  string node_name = 4;
+  // The sender's build version, display only (Story 9.3 AC #9's
+  // `version` column). Bounded like node_name.
+  string build_version = 5;
+  // Story 9.4 AC #7: what the follower runs, so a reconnect converges
+  // at the handshake. `applied_hash` is at most 64 lowercase hex
+  // characters; anything else is a PROTOCOL_VIOLATION.
+  uint64 applied_generation = 6;
+  string applied_hash = 7;
+  // Story 9.4 AC #11: the follower is in a break-glass window and is
+  // excluded from commit sets until it ends.
+  bool break_glass = 8;
+}
+
+// Token redemption (Story 9.3 AC #1/#3), the ONLY frame the
+// enrollment listener accepts, sent inside a TLS session pinned to
+// the control-plane leaf SPKI carried by the token. No CSR: the node
+// sends its bare public key and the control plane assigns every
+// certificate parameter itself.
+message Enroll {
+  string public_id = 1;        // Token lookup half
+  bytes secret = 2;            // Token secret half (32 bytes)
+  bytes public_key_der = 3;    // The node's SubjectPublicKeyInfo, DER
+  string node_name = 4;        // Requested display name (bounded)
+  string build_version = 5;    // Display only (bounded)
+  uint32 schema_version = 6;   // The node's database schema version
+}
+
+// A granted enrollment. Any refusal is the opaque status with no
+// body (Story 9.2 AC #4).
+message EnrollAck {
+  string node_id = 1;          // Server-assigned identity
+  string cert_pem = 2;         // The node's clientAuth leaf
+  string ca_pem = 3;           // The cluster CA bundle
+  string status = 4;           // "pending" or "active" (AC #5)
+  string cert_not_after = 5;   // RFC 3339
+}
+
+// Certificate renewal over an established session (AC #12): the node
+// sends a NEW bare public key; the previous certificate stays valid
+// until the node's first session on the new one.
+message Renew {
+  bytes public_key_der = 1;
+}
+
+message RenewAck {
+  string cert_pem = 1;
+  string cert_not_after = 2;   // RFC 3339
+}
+
+// The node is leaving the fleet (AC #13): the control plane revokes
+// it, audits and alerts; the session ends with the acknowledgement.
+message Leave {}
+
+message LeaveAck {}
+
+// ---- Configuration replication (Story 9.4), tags 20-23 ----
+//
+// Prepare/Commit/Abort are CONTROL-PLANE-INITIATED and travel on the
+// follower's incoming half; a follower sending one to the control
+// plane is a PROTOCOL_VIOLATION (a follower never pushes
+// configuration). ConfigPull is the reverse: follower to control
+// plane, and a control plane sending one is equally a violation.
+//
+// The payload is the Story 9.1 canonical blob: byte-stable, strictly
+// decoded on the follower (`deny_unknown_fields`), with secret
+// material replaced by `sha256:` digests. `hash` is its SHA-256 in
+// lowercase hex, and the follower verifies it before decoding. Blob
+// size is bounded by the 4 MiB frame cap.
+
+// Phase one: stage this generation, do not apply it yet (AC #4).
+message ConfigPrepare {
+  uint64 generation = 1;
+  string hash = 2;
+  bytes blob = 3;
+}
+
+// The follower's verdict. `accepted = false` is the SEMANTIC
+// rejection that aborts the round fleet-wide (AC #5); `reason` names
+// the cause without echoing configuration values. A transport
+// timeout is NOT this: it evicts the node and the commit proceeds.
+message ConfigPrepareAck {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+// Phase two: apply the staged generation.
+message ConfigCommit {
+  uint64 generation = 1;
+}
+
+message ConfigCommitAck {
+  uint64 applied_generation = 1;
+  string applied_hash = 2;
+}
+
+// Drop a staged generation (another follower rejected it).
+message ConfigAbort {
+  uint64 generation = 1;
+}
+
+message ConfigAbortAck {}
+
+// Convergence pull (AC #7), follower to control plane: "this is what
+// I run; send me the current generation if it differs".
+message ConfigPull {
+  uint64 applied_generation = 1;
+  string applied_hash = 2;
+}
+
+// A matching hash answers with `up_to_date = true` and no blob: the
+// "delta keyed on the applied hash" is "nothing to transfer".
+message ConfigPullAck {
+  uint64 generation = 1;
+  string hash = 2;
+  bytes blob = 3;
+  bool up_to_date = 4;
+}
+
+// ---- Certificate distribution (Story 9.5), tags 60-61 ----
+//
+// Deliberately NOT on the configuration commit path (AC #7): if keys
+// rode Prepare/Commit, one slow or drifted follower would block fleet
+// renewals until expiry. CertPush is control-plane-initiated and
+// travels on the follower's incoming half; a follower sending one is
+// pushing private keys AT its control plane and is a
+// PROTOCOL_VIOLATION. CertPull is the reverse, and a control plane
+// sending one is equally a violation.
+//
+// The push is best effort (D2): a failed or refused push is counted
+// and logged, never fatal. The pull is the guarantee, and it inherits
+// the same NodeState::Active gate the configuration pull has, so a
+// node awaiting operator activation receives no key material.
+//
+// The mutual-TLS channel is the confidentiality boundary (D5): key_pem
+// travels in the clear inside it, because no per-node public key
+// exists to wrap a key to. key_digest is the `sha256:<hex>` the
+// canonical blob carries in place of the key, so a follower can check
+// that what arrived is what the configuration announced.
+
+// One certificate's material.
+message CertMaterial {
+  string cert_id = 1;      // The certificate's stable id (a UUID)
+  string domain = 2;       // Primary hostname; display only
+  string cert_pem = 3;     // PEM leaf + chain
+  string key_pem = 4;      // PEM private key; never logged
+  string key_digest = 5;   // "sha256:" + 64 lowercase hex of key_pem
+}
+
+// Install this material now (AC #7). At most 64 bundles per batch;
+// a longer batch is a PROTOCOL_VIOLATION.
+message CertPush {
+  repeated CertMaterial bundles = 1;
+}
+
+// One certificate the follower would not or could not install.
+message CertRefusal {
+  string cert_id = 1;
+  string reason = 2;       // Never echoes key material
+}
+
+// What the follower did with the batch.
+message CertPushAck {
+  repeated string installed = 1;
+  repeated CertRefusal refused = 2;
+}
+
+// A follower asks for keys it lacks (AC #8). At most 256 ids; the
+// list is a REQUEST, never an authorization input: the control plane
+// resolves entitlement itself and may answer with fewer bundles.
+message CertPull {
+  repeated string cert_ids = 1;
+}
+
+message CertPullAck {
+  repeated CertMaterial bundles = 1;
+}
+
+// ---- Telemetry fan-in (Story 9.6), tags 40-41 ----
+//
+// TelemetryPush is FOLLOWER-INITIATED and is the only frame in this
+// range a control plane accepts; a control plane sending one is a
+// PROTOCOL_VIOLATION. BanPush is the reverse.
+//
+// NOTHING here carries a node id, and that is deliberate (decision
+// D2). The control plane stamps every row it accepts with the node_id
+// the mutual-TLS session already proves. A node_id in the payload
+// would be a node-supplied identity, and a compromised follower could
+// file rows under another node's name, which is exactly the confusion
+// an incident-correlation view must not have. It is the same rule
+// Story 9.5 D15 arrived at for node names.
+//
+// Batches are bounded and the control plane quotas them per node
+// (AC #8): the follower-side bound protects the follower, not the
+// control plane.
+
+// One access-log row. Mirrors the local `access_logs` columns minus
+// the local rowid, which is meaningless on another machine.
+message TelemetryAccessRow {
+  string timestamp = 1;      // RFC 3339
+  string method = 2;
+  string path = 3;
+  string host = 4;
+  uint32 status = 5;
+  uint64 latency_ms = 6;
+  string backend = 7;
+  string error = 8;
+  string client_ip = 9;
+  bool is_xff = 10;
+  string xff_proxy_ip = 11;
+  string source = 12;
+  string request_id = 13;
+}
+
+// One WAF event.
+message TelemetryWafRow {
+  uint32 rule_id = 1;
+  string description = 2;
+  string category = 3;
+  uint32 severity = 4;
+  string matched_field = 5;
+  string matched_value = 6;
+  string timestamp = 7;
+  string client_ip = 8;
+  string route_hostname = 9;
+  string action = 10;
+}
+
+// One live ban. Bans have no table on a node: they are an in-memory
+// map rebuilt from nothing on restart (decision D3), so this is a
+// snapshot for visibility and is lossy across a restart by
+// construction.
+message TelemetryBan {
+  string client_ip = 1;
+  uint64 remaining_s = 2;
+  string reason = 3;        // BanReason::as_str
+}
+
+// One audit row as the ORIGIN node wrote it (Story 9.9 AC #2).
+//
+// Both chain hashes ride verbatim and the control plane stores them
+// unchanged. Nothing recomputes them: the aggregated copy is worth
+// something only if it is identical to what the node published on its
+// own `lorica::audit` stream, which is the out-of-band anchor.
+//
+// No node identity in the payload, like every other fanned-in row: the
+// control plane stamps it from the mutual-TLS session, so a follower
+// cannot write rows into another node's history.
+message TelemetryAuditRow {
+  uint64 origin_id = 1;            // The row id the origin assigned
+  string timestamp = 2;
+  string operator_username = 3;
+  string operator_role = 4;
+  string action = 5;
+  string target_type = 6;
+  string target_id = 7;
+  string before_payload_hash = 8;
+  string after_payload_hash = 9;
+  string ip = 10;
+  string user_agent = 11;
+  string prev_chain_hash = 12;
+  string chain_hash = 13;
+}
+
+// A batch of telemetry. At most 512 access rows and 512 WAF events
+// per push; a longer batch is a PROTOCOL_VIOLATION.
+//
+// The cursors are the sender's local rowids for the last row in each
+// list. The control plane echoes them back so the follower knows what
+// to advance past; it never interprets them as anything but opaque
+// progress markers belonging to that node.
+message TelemetryPush {
+  repeated TelemetryAccessRow access = 1;
+  repeated TelemetryWafRow waf = 2;
+  repeated TelemetryBan bans = 3;
+  uint64 access_cursor = 4;
+  uint64 waf_cursor = 5;
+  uint64 dropped_since_last = 6;  // Follower-side overflow, for the gauge
+  // Story 9.9. Counted against the ingest quota but NEVER shed by it:
+  // losing an access row costs a line of traffic, losing an audit row
+  // costs the record of an operator action, on the one table whose
+  // entire purpose is that the record exists.
+  repeated TelemetryAuditRow audit = 7;
+  uint64 audit_cursor = 8;
+}
+
+// What the control plane stored. `accepted_*` may be lower than what
+// was sent when a quota shed part of the batch; `retry_after_s` is
+// non-zero when the node should back off (AC #8).
+message TelemetryPushAck {
+  uint64 accepted_access = 1;
+  uint64 accepted_waf = 2;
+  uint64 accepted_bans = 3;
+  uint32 retry_after_s = 4;
+  uint64 access_cursor = 5;   // Echoed back, unmodified
+  uint64 waf_cursor = 6;
+  uint64 accepted_audit = 7;  // Story 9.9: equals what was sent, or the push failed
+  uint64 audit_cursor = 8;
+}
+
+// A fleet-wide ban issued by an operator on the control plane
+// (AC #10). CONTROL-PLANE-INITIATED. Automatic per-node auto-ban is
+// NOT replicated: it is a local reflex to local traffic, and
+// replicating it would let one node's view of one client ban that
+// client everywhere, turning a local false positive into a fleet-wide
+// outage for that client.
+message BanPush {
+  string client_ip = 1;
+  uint64 duration_s = 2;
+  string reason = 3;
+}
+
+// Story 9.7 AC #5 (Epic 9 close): the control plane reads ONE
+// follower's SLA on an operator's behalf. Nothing fans in: a minute
+// bucket is rewritten until its minute closes, which does not fit the
+// id-cursor drain, and a fleet percentile is not a function of
+// per-node percentiles. So the dashboard shows one node's own figures,
+// computed on that node, over the session the control plane already
+// holds. Control plane to follower.
+message SlaPull {
+  string route_id = 1;       // Empty: the overview (every route, 1h and 24h)
+  string source = 2;         // "passive" or "active"
+  string from = 3;           // RFC 3339, buckets only; empty = now - 24h
+  string to = 4;             // RFC 3339, buckets only; empty = now
+  bool buckets = 5;          // Raw minute buckets instead of summaries
+}
+
+// One SLA summary as the follower computed it (mirrors the API's
+// `SlaSummary`, so the control plane serves it unchanged).
+message SlaSummaryRow {
+  string route_id = 1;
+  string window = 2;
+  int64 total_requests = 3;
+  int64 successful_requests = 4;
+  double sla_pct = 5;
+  double avg_latency_ms = 6;
+  int64 p50_latency_ms = 7;
+  int64 p95_latency_ms = 8;
+  int64 p99_latency_ms = 9;
+  double target_pct = 10;
+  bool meets_target = 11;
+}
+
+// One raw minute bucket (mirrors the API's `SlaBucket`).
+message SlaBucketRow {
+  string route_id = 1;
+  string bucket_start = 2;   // RFC 3339
+  int64 request_count = 3;
+  int64 success_count = 4;
+  int64 error_count = 5;
+  int64 latency_sum_ms = 6;
+  int64 latency_min_ms = 7;
+  int64 latency_max_ms = 8;
+  int64 latency_p50_ms = 9;
+  int64 latency_p95_ms = 10;
+  int64 latency_p99_ms = 11;
+  string source = 12;
+  int64 cfg_max_latency_ms = 13;
+  int32 cfg_status_min = 14;
+  int32 cfg_status_max = 15;
+  double cfg_target_pct = 16;
+}
+
+// Exactly one of the two lists is populated, by `SlaPull.buckets`.
+message SlaPullAck {
+  repeated SlaSummaryRow summaries = 1;
+  repeated SlaBucketRow buckets = 2;
+}
+
+message BanPushAck {
+  bool applied = 1;
+}
+
+// ---- HTTP-01 challenge fan-out (Story 9.5), tags 62-63 ----
+//
+// AC #6: the control plane holds the ACME account and completes the
+// order, but the certificate authority validates HTTP-01 against the
+// hostname, which a follower serves. So the token is distributed to
+// the nodes plausibly serving that hostname before the authority is
+// told to validate. Both frames are CONTROL-PLANE-INITIATED; a
+// follower sending either is choosing what the fleet answers a
+// certificate authority, and is a PROTOCOL_VIOLATION.
+//
+// Publication is reported PER NODE and the transport takes no
+// all-or-nothing decision. The caller is the ACME solver, and it is
+// the one that refuses the order unless every recipient took the
+// token: telling the authority to validate while one node has nothing
+// is the opaque failure this story exists to remove. Retraction is
+// best effort and reports nothing.
+//
+// NO EXPIRY FIELD, DELIBERATELY. The follower stamps its own deadline
+// from its own clock when it writes the entry. A timestamp taken on
+// the control plane's clock and evaluated on the follower's produces,
+// under skew, either a token already expired on arrival or one that
+// outlives the validation window on a node nobody is watching, and
+// neither is visible where it is caused. Do not add the field back.
+
+message ChallengePublish {
+  // The per-SAN hostname being validated, not the order's primary
+  // domain: node selection is per hostname.
+  string identifier = 1;
+  // base64url, RFC 8555 section 8.3. It becomes the last path segment
+  // of /.well-known/acme-challenge/<token>, so its ALPHABET is
+  // checked at the decode boundary, not just its length.
+  string token = 2;
+  // Served verbatim as the response body; bounded for the same reason.
+  string key_authorization = 3;
+}
+
+// The follower is serving the token. Anything else is a refusal
+// status with no body, and the caller aborts the order.
+message ChallengePublishAck {}
+
+// Stop serving a token. The token alone identifies the entry, so the
+// key authorization does not travel a second time.
+message ChallengeRetract {
+  string token = 1;
+}
+
+message ChallengeRetractAck {}
+
+// Control-plane answer to Hello when the session is admitted.
+message HelloAck {
+  uint32 negotiated_version = 1;   // Highest common protocol version
+  uint32 schema_version = 2;       // Control plane's schema version
+  // Approximate fleet size, so the follower can scale its reconnect
+  // backoff cap (Story 9.2 AC #9) without knowing the roster.
+  uint32 fleet_size_hint = 3;
+  // Story 9.4 AC #7: the control plane's current configuration; a
+  // follower behind it pulls immediately after the handshake.
+  uint64 current_generation = 4;
+  string current_hash = 5;
+}
+
+// Liveness probe, either direction. Story 9.4 AC #6/#7: the follower
+// reports what it runs on every beat, so a missed commit converges
+// within one heartbeat interval.
+// Current resource usage, sampled by the sender at heartbeat time
+// (Story 9.7 AC #3). Current values, never a series: a gauge on a
+// node drawer needs one number, and the fan-in channel is the place
+// for anything with history.
+//
+// A message rather than five scalars on Heartbeat, so absence is
+// representable. A node whose runtime has no sampler omits it, and
+// the dashboard shows a dash; scalar fields would report zero, which
+// reads as an idle node rather than an unknown one.
+message NodeResources {
+  uint32 cpu_percent = 1;         // Whole percent, 0-100, rounded
+  uint64 memory_used_bytes = 2;
+  uint64 memory_total_bytes = 3;
+  uint64 disk_used_bytes = 4;     // The data directory's filesystem
+  uint64 disk_total_bytes = 5;
+}
+
+message Heartbeat {
+  uint64 timestamp_ms = 1;
+  uint64 applied_generation = 2;
+  string applied_hash = 3;
+  bool break_glass = 4;
+  NodeResources resources = 5;    // Absent when the node has no sampler
+}
+
+message HeartbeatAck {
+  uint64 timestamp_ms = 1;         // Echo of the probe's timestamp
+  uint32 fleet_size_hint = 2;      // Refreshed backoff-cap input
+  uint64 current_generation = 3;   // Story 9.4: current version
+  string current_hash = 4;
+}
+
+// Response status. UNSPECIFIED doubles as the OPAQUE refusal the
+// enrollment (pre-authentication) path sends for every failure class:
+// an unauthenticated peer must not learn build or protocol facts from
+// refusal shapes (AC #4); the real diagnostic is logged locally. An
+// older peer also decodes any status it does not know as UNSPECIFIED,
+// so it cannot distinguish a newer status from an opaque refusal.
+enum ClusterStatus {
+  CLUSTER_STATUS_UNSPECIFIED = 0;  // Opaque refusal (pre-auth paths)
+  OK = 1;
+  RETRY_LATER = 2;                 // AC #10: admission queue full
+  INCOMPATIBLE_VERSION = 3;        // AC #4: no protocol overlap
+  SCHEMA_TOO_OLD = 4;              // AC #5: follower schema below ours
+  PROTOCOL_VIOLATION = 5;          // AC #6: malformed / wrong-plane frame
+  UNSUPPORTED_METHOD = 6;          // AC #4: known shape, method not in this build
+}
+
+// Transport: TLS 1.3 only, ALPN "lorica-cluster/1" negotiated on every
+// connection (a peer that does not negotiate it is dropped after the
+// handshake). Node names in Hello are bounded to 64 bytes with no
+// control characters; longer or injected names are a
+// PROTOCOL_VIOLATION.

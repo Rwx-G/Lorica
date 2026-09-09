@@ -25,6 +25,17 @@ pub enum AlertType {
     SlaBreached,
     SlaRecovered,
     IpBanned,
+    /// A cluster node left the fleet or was revoked (Story 9.3
+    /// AC #13); raised on the control plane.
+    ClusterNodeLeft,
+    /// A follower refused a replicated configuration wholesale
+    /// (Story 9.4 AC #1: unknown field, version or hash mismatch);
+    /// raised on the follower that refused it.
+    ClusterConfigRefused,
+    /// A node's applied configuration differs from the control
+    /// plane's current one (Story 9.4 AC #12); raised on the control
+    /// plane, suppressed per node by an exponential backoff.
+    ClusterDrift,
 }
 
 impl AlertType {
@@ -42,6 +53,9 @@ impl AlertType {
             Self::SlaBreached => "sla_breached",
             Self::SlaRecovered => "sla_recovered",
             Self::IpBanned => "ip_banned",
+            Self::ClusterNodeLeft => "cluster_node_left",
+            Self::ClusterConfigRefused => "cluster_config_refused",
+            Self::ClusterDrift => "cluster_drift",
         }
     }
 }
@@ -57,6 +71,9 @@ impl std::str::FromStr for AlertType {
             "sla_breached" => Ok(Self::SlaBreached),
             "sla_recovered" => Ok(Self::SlaRecovered),
             "ip_banned" => Ok(Self::IpBanned),
+            "cluster_node_left" => Ok(Self::ClusterNodeLeft),
+            "cluster_config_refused" => Ok(Self::ClusterConfigRefused),
+            "cluster_drift" => Ok(Self::ClusterDrift),
             other => Err(format!("unknown alert type: {other}")),
         }
     }
@@ -107,6 +124,9 @@ mod tests {
             ("sla_breached", AlertType::SlaBreached),
             ("sla_recovered", AlertType::SlaRecovered),
             ("ip_banned", AlertType::IpBanned),
+            ("cluster_node_left", AlertType::ClusterNodeLeft),
+            ("cluster_config_refused", AlertType::ClusterConfigRefused),
+            ("cluster_drift", AlertType::ClusterDrift),
         ] {
             assert_eq!(
                 s.parse::<AlertType>().expect("known AlertType variant"),

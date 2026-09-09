@@ -4,8 +4,7 @@
 //! Sessions are tracked by [`SessionStore`] and exposed via an HTTP-only
 //! `lorica_session` cookie.
 
-
-use axum::extract::{Extension};
+use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -97,7 +96,8 @@ pub async fn login(
     headers: http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let client_ip = connect_info.0
+    let client_ip = connect_info
+        .0
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     // Legacy fixed 5/60 s login bucket. Retained via

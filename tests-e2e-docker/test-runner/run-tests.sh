@@ -399,6 +399,99 @@ if [ -n "$SESSION" ]; then
     sleep 1
 
 # =============================================================================
+# 6c. UPSTREAM REQUEST SANITISATION (RFC 9110 hop-by-hop, v1.7.0 Pingora sync)
+# =============================================================================
+    log "=== 6c. Upstream Request Sanitisation ==="
+
+    # Standard hop-by-hop fields and every field nominated by the
+    # downstream Connection header stop at the proxy; ordinary headers
+    # still cross it.
+    ECHO_JSON=$(curl -sf -H "Host: test.local" \
+        -H "Connection: X-Private-Hop, keep-alive" -H "X-Private-Hop: secret" \
+        -H "Proxy-Authorization: Basic Zm9vOmJhcg==" -H "TE: trailers" -H "Trailer: X-T" \
+        -H "X-Kept: yes" "${PROXY}/echo" 2>/dev/null || echo "{}")
+    assert_json "$ECHO_JSON" ".received_headers[\"x-kept\"]" "yes" "Ordinary header still forwarded next to hop-by-hop ones"
+    for HOP in x-private-hop proxy-authorization te trailer; do
+        HOP_VALUE=$(echo "$ECHO_JSON" | jq -r ".received_headers[\"$HOP\"] // \"absent\"" 2>/dev/null || echo "?")
+        if [ "$HOP_VALUE" = "absent" ]; then
+            ok "Hop-by-hop field '$HOP' stripped before the upstream"
+        else
+            fail "Hop-by-hop field '$HOP' reached the upstream (value '$HOP_VALUE')"
+        fi
+    done
+
+    # A Connection header that nominates a protected field, a pseudo-header
+    # or a non-token spelling is refused rather than forwarded.
+    for NOMINATION in "X-Forwarded-For" "Host" ":authority" "\"X-Forwarded-For\""; do
+        NOM_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: test.local" \
+            -H "Connection: $NOMINATION" "${PROXY}/echo" 2>/dev/null || true)
+        if [ "$NOM_STATUS" = "400" ]; then
+            ok "Connection nomination of $NOMINATION refused (400)"
+        else
+            fail "Connection nomination of $NOMINATION should be refused with 400 (got $NOM_STATUS)"
+        fi
+    done
+
+    # Conflicting Content-Length values are an unrecoverable framing error
+    # (RFC 9110 section 8.6): refused at the listener, never reconciled
+    # towards the upstream. curl folds duplicate headers, so speak raw HTTP.
+    PROXY_HOST=$(echo "$PROXY" | sed -E 's#^https?://##; s#/.*##; s#:.*##')
+    PROXY_PORT=$(echo "$PROXY" | sed -E 's#^https?://##; s#/.*##' | awk -F: '{print ($2 == "") ? "80" : $2}')
+    CL_STATUS=$(python3 - "$PROXY_HOST" "$PROXY_PORT" <<'PY'
+import socket, sys
+sock = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5)
+sock.sendall(
+    b"POST /echo HTTP/1.1\r\nHost: test.local\r\n"
+    b"Content-Length: 5\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcde"
+)
+data = b""
+try:
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+except OSError:
+    pass
+line = data.split(b"\r\n", 1)[0].decode(errors="replace")
+print(line.split(" ")[1] if line.startswith("HTTP/") and " " in line else "closed")
+PY
+)
+    if [ "$CL_STATUS" = "400" ]; then
+        ok "Conflicting Content-Length values refused (400)"
+    else
+        fail "Conflicting Content-Length values should be refused with 400 (got '$CL_STATUS')"
+    fi
+
+    # Identical duplicates reconcile to one value and the body goes through.
+    CL_OK=$(python3 - "$PROXY_HOST" "$PROXY_PORT" <<'PY'
+import socket, sys
+sock = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5)
+sock.sendall(
+    b"POST /echo HTTP/1.1\r\nHost: test.local\r\n"
+    b"Content-Length: 5\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabcde"
+)
+data = b""
+try:
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+except OSError:
+    pass
+head, _, body = data.partition(b"\r\n\r\n")
+status = head.split(b" ")[1].decode() if head.startswith(b"HTTP/") else "closed"
+print(status + ("+body" if b"abcde" in body else "-body"))
+PY
+)
+    if [ "$CL_OK" = "200+body" ]; then
+        ok "Identical duplicate Content-Length values reconciled, body forwarded"
+    else
+        fail "Identical duplicate Content-Length values should pass (got '$CL_OK')"
+    fi
+
+# =============================================================================
 # 7. WAF - DETECTION MODE
 # =============================================================================
     log "=== 7. WAF Detection ==="
@@ -901,19 +994,44 @@ if [ -n "$SESSION" ]; then
 # =============================================================================
     log "=== 19. Prometheus Metrics ==="
 
-    # /metrics endpoint should be accessible without auth
+    # v1.7.0 flipped `metrics_require_auth` to `true` by default (the
+    # migration v1.6.0's release note announced). This is that flip's
+    # regression test: a bare scrape is refused, and a scrape carrying
+    # one of the two accepted credentials (here the dashboard session)
+    # is served. Before v1.7.0 this block asserted the opposite.
     METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics" 2>/dev/null || true)
-    if [ "$METRICS_STATUS" = "200" ]; then
-        ok "Prometheus /metrics endpoint accessible (no auth)"
+    if [ "$METRICS_STATUS" = "401" ]; then
+        ok "Prometheus /metrics refuses an unauthenticated scrape by default (401)"
     else
-        fail "Prometheus /metrics should return 200 (got $METRICS_STATUS)"
+        fail "Prometheus /metrics should be 401 without auth since v1.7.0 (got $METRICS_STATUS)"
+    fi
+    METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" "$API/metrics" 2>/dev/null || true)
+    if [ "$METRICS_STATUS" = "200" ]; then
+        ok "Prometheus /metrics accepts a dashboard session (200)"
+    else
+        fail "Prometheus /metrics should return 200 with a session (got $METRICS_STATUS)"
     fi
 
-    METRICS_BODY=$(curl -sf "$API/metrics" 2>/dev/null || echo "")
+    METRICS_BODY=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null || echo "")
     if echo "$METRICS_BODY" | grep -q "lorica_http_requests_total" 2>/dev/null; then
         ok "Metrics contain lorica_http_requests_total"
     else
         fail "Metrics should contain lorica_http_requests_total"
+    fi
+
+    # v1.7.0 (#80): the same document under /api/v1/metrics, behind the
+    # ordinary session gate, for a browser whose cookie is scoped to /api.
+    API_METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/metrics" 2>/dev/null || true)
+    if [ "$API_METRICS_STATUS" = "401" ]; then
+        ok "/api/v1/metrics refuses an unauthenticated request (401)"
+    else
+        fail "/api/v1/metrics should be 401 without a session (got $API_METRICS_STATUS)"
+    fi
+    API_METRICS_BODY=$(curl -sf -b "$SESSION" "$API/api/v1/metrics" 2>/dev/null || echo "")
+    if echo "$API_METRICS_BODY" | grep -q "lorica_http_requests_total" 2>/dev/null; then
+        ok "/api/v1/metrics serves the Prometheus document behind the session"
+    else
+        fail "/api/v1/metrics should serve the same document as /metrics behind the session"
     fi
 
     if echo "$METRICS_BODY" | grep -q "lorica_http_request_duration_seconds" 2>/dev/null; then
@@ -2317,7 +2435,7 @@ if [ -n "$SESSION" ]; then
 # =============================================================================
     log "=== 45. Prometheus Metrics Detail ==="
 
-    METRICS=$(curl -sf "$API/metrics" 2>/dev/null || echo "")
+    METRICS=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null || echo "")
 
     if echo "$METRICS" | grep -q "lorica_http_requests_total" 2>/dev/null; then
         ok "Metrics contain lorica_http_requests_total"

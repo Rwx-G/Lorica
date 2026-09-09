@@ -24,6 +24,7 @@ members = [
     "lorica-metrics",
     "lorica-dashboard",
     "lorica-worker",
+    "lorica-cluster",
     "lorica-command",
     "lorica-shmem",
     "lorica-waf",

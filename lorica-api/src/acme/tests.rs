@@ -30,13 +30,21 @@ use super::types::{PendingDnsChallenge, PendingDnsChallenges};
 fn temp_challenge_store() -> AcmeChallengeStore {
     let dir = tempfile::tempdir().expect("tempdir available for test");
     let db_path = dir.keep().join("test-acme.db");
+    // Since Story 9.1 AC #10 the `acme_challenges` table is owned by
+    // lorica-config migration v47; mirror production, where
+    // ConfigStore::open runs migrations on the shared file before the
+    // challenge store attaches to it.
+    drop(lorica_config::ConfigStore::open(&db_path, None).expect("config store migrates the db"));
     AcmeChallengeStore::with_db_path(db_path)
 }
 
 #[tokio::test]
 async fn test_challenge_store_set_get_remove() {
     let store = temp_challenge_store();
-    store.set("token1".into(), "auth1".into()).await;
+    store
+        .set("token1".into(), "auth1".into())
+        .await
+        .expect("challenge persists");
     assert_eq!(store.get("token1").await, Some("auth1".to_string()));
     store.remove("token1").await;
     assert_eq!(store.get("token1").await, None);
@@ -261,6 +269,7 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         log_store: None,
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        cluster: crate::cluster::ClusterRuntime::Standalone,
     };
 
     let alert_sender = lorica_notify::AlertSender::new(64);
@@ -546,8 +555,7 @@ fn cooldown_from_error_falls_back_to_24h_without_stamp() {
     let now = chrono::Utc::now();
     // Rate-limit URN present but no parseable retry-after stamp.
     let msg = "rateLimited: too many certificates already issued";
-    let cooldown =
-        cooldown_from_error(msg, now).expect("rate-limit error must yield a cooldown");
+    let cooldown = cooldown_from_error(msg, now).expect("rate-limit error must yield a cooldown");
     assert_eq!(cooldown, now + chrono::Duration::hours(24));
 }
 
@@ -764,4 +772,45 @@ fn superseded_orphans_keeps_both_on_not_after_tie() {
         purge.is_empty(),
         "certs tied on not_after supersede neither, so both are kept"
     );
+}
+
+/// Story 9.5 AC #5 drift gate: DNS-01 stays a control-plane-only
+/// affair.
+///
+/// AC #5 says DNS-01 is unchanged by clustering: the control plane
+/// holds the DNS provider account and completes the challenge itself,
+/// and no follower is involved. That is a claim about what the DNS-01
+/// path is allowed to touch, so it is checked as one. The day someone
+/// fans a TXT record out to the fleet the way HTTP-01 fans out its
+/// token, this fails and the AC gets revisited deliberately.
+///
+/// A source scan rather than a behavioural test on purpose: the
+/// property is "these modules never reach the cluster", and the only
+/// way to assert that behaviourally would be to stand up a control
+/// plane and prove a negative about traffic it did not send.
+#[test]
+fn the_dns01_path_never_reaches_the_cluster() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/acme");
+    for file in ["dns01.rs", "dns01_manual.rs"] {
+        let src = std::fs::read_to_string(root.join(file))
+            .unwrap_or_else(|e| panic!("test setup: {file} reads: {e}"));
+        for (index, line) in src.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            for forbidden in [
+                "ClusterRuntime",
+                "publish_challenge",
+                "retract_challenge",
+                "FleetHttp01Solver",
+                "challenge_recipients",
+            ] {
+                assert!(
+                    !code.contains(forbidden),
+                    "{file}:{}: DNS-01 must not reach the cluster (Story 9.5 AC #5): found \
+                     `{forbidden}`. The control plane owns the DNS provider account and \
+                     completes the challenge itself; if that is changing, AC #5 changes too",
+                    index + 1
+                );
+            }
+        }
+    }
 }

@@ -238,9 +238,7 @@ impl BotEngine {
         match &self.backend {
             StashBackend::InMemory(mx) => {
                 let mut map = mx.lock();
-                if max_entries > 0
-                    && map.len() >= max_entries as usize
-                    && !map.contains_key(&nonce)
+                if max_entries > 0 && map.len() >= max_entries as usize && !map.contains_key(&nonce)
                 {
                     return BotStashInsertOutcome::GlobalCapExceeded;
                 }

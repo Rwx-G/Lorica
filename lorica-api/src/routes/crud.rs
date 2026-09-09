@@ -409,6 +409,29 @@ fn validate_group_name(raw: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_string())
 }
 
+/// Validate a `node_selector` input for a Route (Story 9.4 AC #13):
+/// the cluster node names the route is pinned to, empty = fleet-wide.
+/// Entries are trimmed and blank ones dropped, so a list of empty
+/// strings widens the route instead of pinning it to a node that
+/// cannot exist. Each surviving entry must satisfy the same rule as
+/// `group_name`, and the list is capped at
+/// [`lorica_config::models::NODE_SELECTOR_MAX_ENTRIES`] entries.
+/// Returns the normalised list.
+fn validate_node_selector(raw: &[String]) -> Result<Vec<String>, ApiError> {
+    let names: Vec<String> = raw
+        .iter()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+    // Normalise here, then delegate to the ONE rule. A second copy of
+    // the predicate on this side of the replication boundary is a
+    // drift trap: loosen it and the control plane accepts a selector
+    // the follower's `prepare_replica` refuses, which aborts the round
+    // for the whole fleet.
+    lorica_config::models::validate_node_selector_names(&names).map_err(ApiError::BadRequest)?;
+    Ok(names)
+}
+
 /// Knobs for `validate_dns_hostname` (audit M-23 closure).
 ///
 /// Two callers in this file used to hand-roll near-identical RFC-1123
@@ -2742,6 +2765,10 @@ pub struct RouteResponse {
     /// Empty string = ungrouped. Mirrors `Backend.group_name`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group_name: String,
+    /// Cluster node names this route applies to (Story 9.4 AC #13).
+    /// Empty = fleet-wide.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_selector: Vec<String>,
     /// Per-route AI / LLM crawler deny-list policy (Story 8.2 AC #2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_bot_policy: Option<lorica_config::models::AiBotPolicy>,
@@ -2895,6 +2922,10 @@ pub struct CreateRouteRequest {
     /// Omit or send empty string for ungrouped. Validated against a
     /// lowercase ASCII + digits + `-` + `_` alphabet, 1..=64 chars.
     pub group_name: Option<String>,
+    /// Cluster node names this route applies to (Story 9.4 AC #13).
+    /// Omit or send an empty list for fleet-wide. Each entry follows
+    /// the `group_name` alphabet; at most 64 entries.
+    pub node_selector: Option<Vec<String>>,
     /// Per-route AI / LLM crawler deny-list policy (Story 8.2 AC #2).
     pub ai_bot_policy: Option<lorica_config::models::AiBotPolicy>,
     /// Per-route override for the global `ai_bot_treat_spoofed_as`
@@ -3065,6 +3096,10 @@ pub struct UpdateRouteRequest {
     /// Free-form operator classification (prod / staging / homelab / ...).
     /// Empty string clears the grouping. `None` leaves the field unchanged.
     pub group_name: Option<String>,
+    /// Cluster node names this route applies to (Story 9.4 AC #13).
+    /// An empty list widens the route back to fleet-wide. `None`
+    /// leaves the field unchanged.
+    pub node_selector: Option<Vec<String>>,
     /// Per-route AI / LLM crawler deny-list policy (Story 8.2 AC #2).
     /// `None` leaves alone ; `Some(Off)` is equivalent to clearing.
     pub ai_bot_policy: Option<lorica_config::models::AiBotPolicy>,
@@ -3234,6 +3269,7 @@ fn route_to_response(
         geoip: route.geoip.clone(),
         bot_protection: route.bot_protection.clone(),
         group_name: route.group_name.clone(),
+        node_selector: route.node_selector.clone(),
         ai_bot_policy: route.ai_bot_policy,
         ai_bot_spoofed_fallback: route.ai_bot_spoofed_fallback,
         serve_robots_txt: route.serve_robots_txt,
@@ -3592,6 +3628,10 @@ pub async fn create_route(
         group_name: match body.group_name.as_deref() {
             Some(g) => validate_group_name(g)?,
             None => String::new(),
+        },
+        node_selector: match body.node_selector.as_deref() {
+            Some(names) => validate_node_selector(names)?,
+            None => Vec::new(),
         },
         // Story 8.2 AC #2 / #3 / #10. None at the route level is the
         // backward-compat default ; serde-derive parsing of the enum
@@ -4032,6 +4072,11 @@ pub async fn update_route(
         }
         if let Some(ref raw) = body.group_name {
             route.group_name = validate_group_name(raw)?;
+        }
+        // Story 9.4 AC #13. An explicit empty list widens the route
+        // back to fleet-wide; absent leaves the pinning alone.
+        if let Some(ref names) = body.node_selector {
+            route.node_selector = validate_node_selector(names)?;
         }
         // Story 8.2 AC #2 / #3 / #10. None on the patch leaves alone ;
         // explicit Some(_) installs. The serde-derived enum guards the

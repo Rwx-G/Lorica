@@ -6,16 +6,16 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.6.0-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.7.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-1306%2B-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-690-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-2034-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-658-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
 
-Lorica is a production-ready reverse proxy with a built-in web dashboard, WAF, SLA monitoring, and HTTP caching. One binary, zero external dependencies. Install it, open your browser, and manage everything from the UI - routes, backends, certificates, security rules, and performance metrics.
+Lorica is a production-ready reverse proxy with a built-in web dashboard, WAF, SLA monitoring, and HTTP caching. One binary, zero external dependencies. Install it, open your browser, and manage everything from the UI - routes, backends, certificates, security rules, and performance metrics. Since 1.7.0 the same binary runs as a fleet: one control plane pushes configuration and certificates to any number of followers over mutual TLS, and their logs, WAF events and audit trails fan back in.
 
 Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine that powers a significant portion of Cloudflare's CDN traffic.
 
@@ -41,6 +41,10 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :lock: Security
 
 - **WAF engine** - 49 OWASP CRS-inspired rules (SQLi, XSS, path traversal, command injection, SSRF, Log4Shell, XXE, CRLF)
+- **AI / LLM crawler deny-list** (v1.6.0) - curated registry of AI crawler User-Agents with per-vendor verification (forward-confirmed rDNS, published IP ranges, or UA-only), per-route policy (off / deny / log), auto-served `/robots.txt` advertising the active deny-list, spoofed-UA fallback policy, custom crawler rules, `lorica_ai_bot_total` counter. See `docs/ai-crawlers.md`
+- **Tamper-evident audit log** (v1.6.0) - every state-mutating management call records operator, role, action, target, source IP, user agent and before/after payload hashes in a SHA-256 hash chain; `GET /api/v1/audit/verify` walks the chain and localises tampering to the earliest broken row; day-based retention is chain-safe. In a fleet (v1.7.0) every follower's trail fans in to the control plane as its own chain, verified separately
+- **Management plane over TLS** (v1.6.0) - the loopback dashboard/API is served over HTTPS with a self-signed certificate generated on first boot (or an operator-supplied one), so the session cookie is `Secure`; `/metrics` requires a session or the bearer token in `prometheus_scrape_token` by default since v1.7.0
+- **Secrets never on argv** (v1.7.0) - every management CLI command (`unban`, `upgrade`, `cluster token|leave|status|break-glass`) reads its password from `--password-file`, `--password-stdin` or `LORICA_ADMIN_PASSWORD`, and a join token only from a file, stdin or `LORICA_JOIN_TOKEN`
 - **mTLS client verification** - per-route CA bundle + optional organization allowlist. Chain validated at the TLS handshake (rustls `WebPkiClientVerifier`), per-route enforcement returns 496 ("cert required") or 495 ("cert error"). `required` and org-allowlist hot-reload; CA edits take effect on restart
 - **Forward authentication** - per-route sub-request to Authelia / Authentik / Keycloak / oauth2-proxy before proxying; 2xx injects response headers into upstream, 401/403/3xx forwarded verbatim to the client, timeout = fail-closed 503. Optional opt-in verdict cache (TTL-capped at 60s, Cookie-keyed) to shortcut hot paths. Under `--workers N` the cache is owned by the supervisor and routed through the pipelined RPC channel, so an Allow verdict cached by one worker is served from every worker, and a session revocation invalidates the cache uniformly (WPAR-2, design § 7)
 - **Connection pre-filter** - global IP allow/deny CIDR policy enforced at TCP accept, before the TLS handshake. Deny always wins; non-empty allow switches to default-deny. Hot-reloaded via arc-swap in single-process and worker modes
@@ -65,11 +69,61 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Real-time access logs** - WebSocket streaming to the dashboard with filtering
 - **Load testing** - built-in load test engine with SSE streaming, cron scheduling, CPU circuit breaker, and result comparison
 - **SLA breach alerts** - automatic notifications when SLA drops below target
+- **Syslog export** (v1.7.0) - ship access logs, WAF events and audit entries to an existing SIEM as RFC 5424 messages over UDP, TCP (RFC 6587 octet-counting framing) or TCP+TLS (optional mutual TLS towards the collector). Configurable facility, per-event-kind severity mapping, per-kind toggles, and static structured-data parameters (`env=prod,dc=eu-west`). Fire-and-forget with a bounded queue: an unreachable collector sheds export rows (`lorica_log_sink_dropped_total`) and never affects request serving
+- **OTLP logs export** (v1.7.0, needs a build with `--features otel`) - the same three event kinds as OTLP log records to the OpenTelemetry collector already configured for tracing, with `trace_id` / `span_id` attached from the request's span context so a log record joins its trace in Grafana / Tempo / Loki-style backends. Optional `Authorization` header for authenticated collectors (HTTP transports)
+
+  <details>
+  <summary>Worked examples: SIEM (syslog) and OTLP collector</summary>
+
+  Syslog towards an rsyslog / SIEM ingest listening in TCP on 6514 with TLS:
+  set **Settings → Log export** to endpoint `siem.example.com:6514`, transport
+  `tcp-tls`, facility 16 (`local0`), keep the default severities
+  (access=info, waf=warning, audit=notice), paste the collector CA if it is
+  private. Matching rsyslog receiver:
+
+  ```conf
+  module(load="imtcp" StreamDriver.Name="gtls" StreamDriver.Mode="1")
+  input(type="imtcp" port="6514")
+  template(name="lorica" type="string" string="/var/log/lorica/%APP-NAME%-%$YEAR%%$MONTH%%$DAY%.log")
+  if $app-name == "lorica" then action(type="omfile" dynaFile="lorica")
+  ```
+
+  OTLP logs towards an OpenTelemetry collector: enable **OTLP logs** in the
+  same tab (the collector endpoint and protocol come from the Observability
+  tab). Minimal collector pipeline:
+
+  ```yaml
+  receivers:
+    otlp:
+      protocols:
+        http:
+  exporters:
+    file:
+      path: /var/log/otel/lorica-logs.json
+  service:
+    pipelines:
+      logs:
+        receivers: [otlp]
+        exporters: [file]
+  ```
+
+  Both sinks hot-reload on save (no restart) and each has a per-sink test
+  button reporting success, failure reason and round-trip time.
+
+  Capacity note: sinks are per-process by design (mode-independent, no
+  cross-process queue). Under `--workers auto` an N-core node holds N
+  worker connections plus one supervisor connection to the same
+  collector, each with its own bounded queue - size collector
+  connection limits for `cores`, not `1`, per node. Ordering across
+  processes is the collector's concern.
+  </details>
 
 ### :globe_with_meridians: Management
 
-- **Web dashboard** - Svelte 5 UI (~59 KB) embedded in the binary: routes, backends, certs, WAF, SLA, load tests, settings
-- **REST API** - full CRUD for all entities, session-based auth, rate-limited login
+- **Multi-node cluster** (v1.7.0) - one control plane, any number of followers over mutual TLS with a fleet CA; short-lived join tokens bound to a node name, explicit activation, two-phase configuration replication with per-node route targeting, fleet-wide certificate issuance with need-to-know key distribution, and access logs / WAF events / bans / audit trail aggregated per node with one verifiable hash chain each. Followers are read-only with an audited break-glass window. See `docs/cluster.md`
+- **Multi-user RBAC** (v1.6.0) - team accounts with three roles: `super_admin` (users, settings, config import, upgrades, fleet mutations), `operator` (full CRUD on routes, backends, certificates, WAF, SLA, probes, load tests, cache, bans; fleet reads) and `viewer` (read-only, secrets masked, fleet views hidden). Any role change, disable or password reset ends the target's sessions at once
+- **Web dashboard** - Svelte 5 UI (~59 KB) embedded in the binary: routes, backends, certs, WAF, SLA, load tests, cluster, team, settings
+- **REST API** - full CRUD for all entities, session-based auth, rate-limited login, a single fail-closed authorization middleware, OpenAPI description in `lorica-api/openapi.yaml`
 - **TOML config export/import** - with diff preview before applying changes
 - **Nginx config import** - paste an `nginx.conf` to auto-create routes, backends, certificates, and path rules with cert import support
 - **ACME / Let's Encrypt** - automatic TLS provisioning via HTTP-01 and DNS-01 challenges (Cloudflare, Route53, OVH providers), multi-domain SAN and wildcard support, smart auto-renewal, OCSP stapling
@@ -94,6 +148,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Health checks** - TCP and HTTP probes, backends marked degraded (>2s) or down and removed from rotation
 - **Graceful drain** - per-backend active connection tracking with Closing/Closed lifecycle states
 - **Certificate hot-swap** - atomic swap via arc-swap, zero downtime during rotation
+- **Hot binary upgrade** (v1.6.0) - `POST /api/v1/system/upgrade`, `lorica upgrade --binary <path>` or the Settings "Binary upgrade" panel replaces the running binary with no dropped connections and no systemd restart: the new binary and its detached Ed25519 signature are verified against an operator-configured public key, the live listening sockets are handed over on a Unix socket, both supervisors accept during the overlap, and a new binary that fails within 10 s is quarantined while the old one resumes. Opt-in until a signing key is configured. See `docs/hot-upgrade.md`
 - **Encrypted storage** - AES-256-GCM encryption for certificate private keys at rest
 
 ## Quick Start
@@ -195,19 +250,43 @@ first run, a random admin password is written to
 ### CLI options
 
 ```
-lorica [OPTIONS]
+lorica [OPTIONS] [COMMAND]
 
 Options:
-  --data-dir <PATH>          Data directory (default: /var/lib/lorica)
-  --management-port <PORT>   Dashboard/API port (default: 9443)
-  --http-port <PORT>         HTTP proxy port (default: 8080)
-  --https-port <PORT>        HTTPS proxy port (default: 8443)
-  --workers <N>              Worker processes (default: 0 = single-process)
-  --log-level <LEVEL>        Log level (default: info)
-  --log-format <FORMAT>      Log format: json (default) or text
-  --log-file <PATH>          Log to file (in addition to stdout)
-  --version                  Print version
+  --data-dir <PATH>                 Data directory (default: /var/lib/lorica)
+  --management-port <PORT>          Dashboard/API port, loopback only (default: 9443)
+  --http-port <PORT>                HTTP proxy port (default: 8080)
+  --https-port <PORT>               HTTPS proxy port (default: 8443)
+  --workers <N|auto>                Worker processes (default: 0 = single-process)
+  --upstream-crl-file <PATH>        CRL checked against upstream server certificates
+  --log-level <LEVEL>               Log level (default: info)
+  --log-format <FORMAT>             Log format: json (default) or text
+  --log-file <PATH>                 Log to file (in addition to stdout)
+  --cluster-listen <HOST:PORT>      Serve the cluster plane (makes this node a control plane)
+  --cluster-enrollment-listen <H:P> Enrollment listener bind (default: next port on the same host)
+  --cluster-advertise <HOST>        Name followers dial, the SAN of the control-plane certificate
+  --cluster-listen-any              Allow a wildcard host on the two listeners (never by accident)
+  --cluster-auto-activate           Enrolled nodes become Active without operator approval (off)
+  --version                         Print version
+
+Commands:
+  rotate-key                        Re-encrypt every stored secret under a new master key
+  unban <IP>                        Lift a ban through the local management API
+  upgrade --binary <PATH>           Hot binary upgrade (signature-verified, zero downtime)
+  cluster init                      Generate the fleet CA on this control plane
+  cluster token --node-name <NAME>  Mint a join token (SuperAdmin), printed once
+  cluster join --control-plane <H:P> --token-file <PATH>
+                                    Redeem a token and persist this node's fleet identity
+  cluster status                    This node's fleet role and, with credentials, the live roster
+  cluster break-glass [--close]     Re-enable local edits on a follower for a bounded window
+  cluster leave                     Wipe this node's fleet identity (SuperAdmin, or proof of revocation)
 ```
+
+Every command that needs the admin password reads it from `--password-file`
+(mode 0600), `--password-stdin` or `LORICA_ADMIN_PASSWORD`; `--password` on
+argv only prints a warning. `cluster join` accepts a token only from a file,
+stdin or `LORICA_JOIN_TOKEN`. The global `--data-dir` goes before the
+subcommand.
 
 ## Dashboard
 
@@ -249,18 +328,19 @@ The dashboard ships inside the binary and is served on the management port (defa
 - **Routes** - create/edit routes with host matching, path prefixes, load balancing, WAF mode, rate limits, caching, timeouts, security headers, CORS, and 25 other per-route settings
 - **Backends** - manage backend addresses, weights, health check type (TCP/HTTP), TLS upstream, active connections
 - **Certificates** - upload PEM certificates, view expiry dates, provision via ACME/Let's Encrypt (HTTP-01, DNS-01)
-- **Security** - WAF event table with category filtering, 49 rule toggles, IP ban list with unban button
-- **SLA** - per-route passive/active SLA side-by-side, latency percentile tables, config editor, CSV/JSON export
+- **Security** - WAF event table with category filtering, 49 rule toggles, IP ban list with unban button, admin audit log with chain verification; on a control plane every tab carries a node filter over the fleet's events, bans and audit chains
+- **SLA** - per-route passive/active SLA side-by-side, latency percentile tables, config editor, CSV/JSON export; on a control plane a node picker shows one follower's own figures (never a fleet aggregate: a fleet percentile is not a function of per-node percentiles)
 - **Load Tests** - test config management with clone, one-click execution, real-time SSE progress panel, historical results
 - **Active Probes** - CRUD for synthetic health probes with route selection, HTTP method/path/status/interval/timeout
-- **Access Logs** - scrollable real-time log stream via WebSocket with green pulsing indicator
+- **Access Logs** - scrollable real-time log stream via WebSocket with green pulsing indicator; on a control plane, the fleet's access logs with a node column and filter
+- **Cluster** (v1.7.0) - the fleet roster with live sessions, applied configuration generation, resource gauges, per-node certificate entitlement and recent WAF events, join-token dialog with the ready-to-paste `cluster join` command, activation and revocation (which names the keys to re-issue); on a follower, the read-only banner with break-glass and leave
 - **System** - worker table with PID, health, heartbeat latency; CPU/memory/disk gauges
-- **Settings** - notification channels, security header presets, DNS providers (Cloudflare / Route53 / OVH), ban rules, OpenTelemetry exporter, GeoIP / ASN databases, certificate filesystem export zone + ACL editor, config export / import with diff preview
+- **Settings** - notification channels, security header presets, DNS providers (Cloudflare / Route53 / OVH), ban rules, OpenTelemetry exporter, log export (syslog and OTLP logs, per-sink test), GeoIP / ASN databases, AI crawler policy, team (users and roles), binary upgrade, certificate filesystem export zone + ACL editor, config export / import with diff preview
 - **Theme** - light/dark mode toggle
 
 ## Architecture
 
-Lorica is a Rust workspace with 30 crates: 16 forked from Cloudflare Pingora and 14 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
+Lorica is a Rust workspace with 31 crates: 16 forked from Cloudflare Pingora and 15 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
 
 | Crate | Purpose |
 |-------|---------|
@@ -278,6 +358,9 @@ Lorica is a Rust workspace with 30 crates: 16 forked from Cloudflare Pingora and
 | `lorica-worker` | fork+exec worker isolation, typed FD passing (Listener / Shmem / Rpc) |
 | `lorica-command` | Protobuf supervisor-worker command channel + pipelined RpcEndpoint (Envelope framing, in-flight demux, bounded backpressure), `Coalescer`, `GenerationGate` |
 | `lorica-shmem` | Anonymous `memfd` region shared across all workers; `AtomicHashTable` for per-IP WAF flood / auto-ban counters; SipHash-1-3 anti-HashDoS; 5-min eviction walker |
+| `lorica-cluster` | Cluster plane (v1.7.0): mutual-TLS transport on the same `RpcEndpoint` as the worker channel, fleet CA, join tokens, enrollment and operational listeners, roster and session registry, two-phase replication, telemetry ingest quota; configuration-blind by design (the blob is opaque bytes to it) |
+| `lorica-geoip` | GeoIP / ASN lookups (MaxMind-format databases) for country and network policy |
+| `lorica-challenge` | Bot challenges: proof-of-work, image captcha (vendored renderer), cookie issuance |
 | `lorica-lb` | Load balancing (Round Robin, Peak EWMA, Hash, Random, Least Conn) |
 | `lorica-cache` | HTTP response cache, LRU eviction |
 | `lorica-limits` | Rate estimator + per-route `LocalBucket` / `AuthoritativeBucket` token-bucket primitives (lock-free CAS, 100 ms cross-worker sync) |
@@ -307,11 +390,11 @@ Create a route via the REST API:
 TOKEN=$(curl -sk https://127.0.0.1:9443/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"your-admin-password"}' \
-  -c - | grep session | awk '{print $NF}')
+  -c - | grep lorica_session | awk '{print $NF}')
 
 # Create a backend
 curl -sk https://127.0.0.1:9443/api/v1/backends \
-  -b "session=$TOKEN" \
+  -b "lorica_session=$TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "address": "127.0.0.1:8080",
@@ -320,17 +403,17 @@ curl -sk https://127.0.0.1:9443/api/v1/backends \
     "health_check_path": "/healthz"
   }'
 
-# Create a route
+# Create a route (ids are server-assigned UUIDs returned by the creates above)
 curl -sk https://127.0.0.1:9443/api/v1/routes \
-  -b "session=$TOKEN" \
+  -b "lorica_session=$TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "hostname": "app.example.com",
     "path_prefix": "/",
-    "backend_ids": [1],
+    "backend_ids": ["<backend-uuid>"],
     "load_balancing": "peak_ewma",
     "tls_enabled": true,
-    "certificate_id": 1,
+    "certificate_id": "<certificate-uuid>",
     "waf_enabled": true,
     "waf_mode": "block",
     "rate_limit_rps": 100,
@@ -354,7 +437,7 @@ All endpoints are served on the management port (default `9443`) over HTTPS (a s
 |--------|------|-------------|
 | `POST` | `/api/v1/auth/login` | Authenticate (returns session cookie) |
 | `POST` | `/api/v1/auth/logout` | Invalidate session |
-| `GET` | `/metrics` | Prometheus metrics (public by default; requires a session cookie or bearer token when `metrics_require_auth` is enabled) |
+| `GET` | `/metrics` | Prometheus metrics. Authenticated by default since 1.7.0: the bearer token in `prometheus_scrape_token` (or `LORICA_PROMETHEUS_SCRAPE_TOKEN`), or a session cookie sent as a header (it is scoped to `/api`, so a browser does not send it here); `metrics_require_auth = false` restores the open endpoint |
 | `GET` | `/.well-known/acme-challenge/{token}` | ACME HTTP-01 challenge response |
 
 ### Auth & Users (RBAC)
@@ -457,13 +540,13 @@ All endpoints are served on the management port (default `9443`) over HTTPS (a s
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/sla/overview` | SLA overview for all routes |
-| `GET` | `/api/v1/sla/routes/{id}` | SLA metrics for route |
-| `GET` | `/api/v1/sla/routes/{id}/buckets` | Time-bucketed SLA data |
+| `GET` | `/api/v1/sla/overview` | SLA overview for all routes (`?node=` on a control plane: one follower's own, Operator+) |
+| `GET` | `/api/v1/sla/routes/{id}` | SLA metrics for route (`?node=` as above) |
+| `GET` | `/api/v1/sla/routes/{id}/buckets` | Time-bucketed SLA data (`?node=` as above) |
 | `GET` | `/api/v1/sla/routes/{id}/config` | SLA config |
 | `PUT` | `/api/v1/sla/routes/{id}/config` | Update SLA config |
 | `GET` | `/api/v1/sla/routes/{id}/export` | Export SLA data (CSV/JSON) |
-| `GET` | `/api/v1/sla/routes/{id}/active` | Active probe results |
+| `GET` | `/api/v1/sla/routes/{id}/active` | Active probe results (`?node=` as above) |
 | `DELETE` | `/api/v1/sla/routes/{id}/data` | Clear stored SLA data for a route |
 | `GET` | `/api/v1/probes` | List probes |
 | `POST` | `/api/v1/probes` | Create probe |
@@ -502,8 +585,29 @@ All endpoints are served on the management port (default `9443`) over HTTPS (a s
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/audit` | List admin audit-log entries |
-| `GET` | `/api/v1/audit/verify` | Verify the audit-log hash chain |
+| `GET` | `/api/v1/audit` | List admin audit-log entries (Operator+; on a control plane the fleet's trail needs SuperAdmin unless `?node=` names this node's own chain) |
+| `GET` | `/api/v1/audit/verify` | Verify the audit-log hash chains, one verdict per node (SuperAdmin) |
+
+### Cluster (v1.7.0)
+
+Fleet reads are Operator+, fleet mutations SuperAdmin; every one of them answers `409` on a node that is not a control plane. See `docs/cluster.md`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/cluster/status` | This node's fleet role, connection state and, on a control plane, the roster summary (Viewer+) |
+| `GET` | `/api/v1/cluster/nodes` | The roster with live session facts, resource gauges and certificate entitlement |
+| `GET` | `/api/v1/cluster/nodes/{id}` | One enrolled node |
+| `POST` | `/api/v1/cluster/nodes/{id}/activate` | Approve a pending node: it receives configuration and keys from then on |
+| `DELETE` | `/api/v1/cluster/nodes/{id}` | Revoke a node (CRL, session ended at once); the answer names the certificates whose key it keeps, to re-issue |
+| `GET` / `POST` | `/api/v1/cluster/tokens` | List / mint join tokens (bound to a node name, optionally a source CIDR, short-lived) |
+| `DELETE` | `/api/v1/cluster/tokens/{public_id}` | Revoke an unused token |
+| `GET` | `/api/v1/cluster/replication` | The last replication round's report per node |
+| `GET` | `/api/v1/cluster/drift` | Nodes whose applied configuration differs from the current generation |
+| `GET` | `/api/v1/cluster/logs` | The fleet's access logs, cursor-paginated, `?node=` / `?route=` filters |
+| `GET` | `/api/v1/cluster/waf-events` | The fleet's WAF events, `?node=` / `?category=` filters |
+| `GET` / `POST` | `/api/v1/cluster/bans` | Every node's live bans as last reported / issue a fleet-wide ban |
+| `GET` / `POST` / `DELETE` | `/api/v1/cluster/break-glass` | On a follower: the window's state / open it for a bounded time / close it (SuperAdmin) |
+| `POST` | `/api/v1/cluster/leave` | On a follower: tell the control plane, wipe the fleet identity (SuperAdmin) |
 
 ### System & Configuration
 
@@ -513,9 +617,12 @@ All endpoints are served on the management port (default `9443`) over HTTPS (a s
 | `PUT` | `/api/v1/settings` | Update settings (rejects cross-field-inconsistent values with 400) |
 | `GET` | `/api/v1/settings/schema` | Settings field schema (bounds, defaults) |
 | `POST` | `/api/v1/settings/otel/test` | Test the OpenTelemetry exporter connection |
+| `POST` | `/api/v1/settings/syslog/test` | Send a test message over the syslog export sink |
+| `POST` | `/api/v1/settings/otlp-logs/test` | Probe the OTLP collector's logs signal path |
 | `GET` | `/api/v1/status` | System status summary |
 | `GET` | `/api/v1/system` | CPU, memory, disk usage |
 | `POST` | `/api/v1/system/upgrade` | Hot binary upgrade (signature-verified, zero-downtime) |
+| `GET` | `/api/v1/metrics` | The `/metrics` document behind the dashboard session, for a browser (the session cookie is scoped to `/api`) |
 | `GET` | `/api/v1/workers` | Worker heartbeat metrics |
 | `GET` | `/api/v1/logs` | Access logs |
 | `DELETE` | `/api/v1/logs` | Clear logs |
@@ -553,73 +660,58 @@ cargo build --release
 ### Running tests
 
 ```bash
-# All Rust unit tests (~2100 tests across 30 crates)
+# Every Rust test in the workspace
 cargo test --workspace
 
-# Product crate tests only (~1306 tests - lorica-native, include
-# the v1.5.0 hardening coverage : rate-limit buckets, body-size
-# layers, session rotation, public_version masking, ammonia bypass
-# corpus, map_err context preservation, cert-export orphan sweep)
+# Product crates only (2034 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-limits -p lorica-shmem \
            -p lorica-challenge -p lorica-geoip -p lorica-acme \
-           -p lorica-metrics
+           -p lorica-metrics -p lorica-cluster -p lorica-dashboard \
+           --features otel
 
-# Pingora-forked crate tests (~690 tests)
+# Pingora-forked crates (658 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-error -p lorica-tls -p lorica-cache \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
-           --features ring -p lorica-lb
+           -p lorica-lb -p lorica-ketama -p lorica-lru \
+           -p lorica-memory-cache -p lorica-header-serde -p tinyufo
 
-# End-to-end tests driving a real Pingora Server (95 tests, 16 binaries)
-cargo test -p lorica --test bot_rpc_cache_e2e_test \
-                     --test canary_e2e_test \
-                     --test config_reload_rpc_e2e_test \
-                     --test connection_filter_test \
-                     --test forward_auth_e2e_test \
-                     --test header_routing_e2e_test \
-                     --test metrics_pull_rpc_e2e_test \
-                     --test mirror_e2e_test \
-                     --test mtls_e2e_test \
-                     --test proxy_config_test \
-                     --test proxy_routing_test \
-                     --test rate_limit_e2e_test \
-                     --test rate_limit_sync_e2e_test \
-                     --test response_rewrite_e2e_test \
-                     --test swr_e2e_test \
-                     --test verdict_breaker_rpc_e2e_test
+# The cluster crate's integration binaries, including the frozen v1.7.0
+# wire corpus (every message's encoding, pinned)
+cargo test -p lorica-cluster --tests
 
-# Frontend tests (320 Vitest tests across 9 files)
-cd lorica-dashboard/frontend && npx vitest run
+# Frontend (423 Vitest cases across 15 files) and its gates
+cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 
-#### Test coverage by layer
-
-| Layer | Count | Notes |
-|---|---|---|
-| Product unit (config, api, lib, waf, notify, bench, worker, command, limits, challenge, shmem, geoip) | ~1306 | Lorica-specific code, including v1.5.0 hardening coverage (ammonia bypass corpus, named rate-limit buckets with Retry-After, per-route body-size 413 path, session rotation integration test, `public_version` masking, map_err context preservation, cert-export orphan sweep + path-traversal rejection). The verdict-cache global-state race (backlog #16) is fixed in v1.5.0 via `serial_test` so the full suite runs parallel. |
-| Product e2e (real Pingora `Server` + mock backends) | 95 | 16 binaries: mTLS, response rewriting, mirroring, forward auth, SWR, connection filter, canary, header routing, config, routing, rate-limit (legacy + sync), bot RPC cache, config-reload RPC, metrics-pull RPC, verdict-breaker RPC |
-| Pingora-forked crates (core, proxy, http, error, tls, cache, pool, runtime, timeout, lb, ketama, lru, memory-cache, limits, header-serde, tinyufo) | ~690 | Inherited upstream coverage kept passing on every change, plus Lorica-added regression tests in `lorica-core` (396) and `lorica-cache` (103) |
-| Frontend (vitest / svelte-check) | 320 | Form validation, type safety, component wiring |
-| **Total shipping tests** | **~2411** | |
+The `lorica` binary crate carries 17 end-to-end binaries under
+`lorica/tests/` that drive a real Pingora `Server` against mock backends
+(mTLS, response rewriting, mirroring, forward auth, stale-while-revalidate,
+the connection pre-filter, canary and header routing, config reload, rate
+limits and their cross-worker sync, the circuit breaker and the RPC
+plane). They run as part of `cargo test -p lorica`.
 
 #### Docker end-to-end suites
 
-`tests-e2e-docker/` spins Lorica up against real backend containers
-and drives 660+ assertions through the actual network stack:
+`tests-e2e-docker/` spins Lorica up against real backend containers and
+drives every profile through the actual network stack. `./run.sh --build`
+runs them all in sequence; each `--skip-<profile>` flag drops one.
 
-```bash
-cd tests-e2e-docker
-./run.sh                                    # single-process (429 asserts) + workers mode (109) + cert-export (26)
-docker compose --profile bot run --rm bot-smoke                   # 29 asserts - graded bot challenge
-docker compose --profile bot-workers run --rm bot-smoke-workers   # 29 asserts - same under --workers 2
-docker compose --profile geoip run --rm geoip-smoke               # 16 asserts - country allow/deny
-docker compose --profile rdns run --rm rdns-smoke                 # 7  asserts - forward-confirmed rDNS bypass
-docker compose --profile otel run --rm otel-smoke                 # 16 asserts - OTLP + W3C + log/trace correlation
-docker compose --profile otel-workers run --rm otel-smoke-workers # 16 asserts - same under --workers 2
-docker compose --profile cert-export run --rm cert-export-smoke   # 26 asserts - PEM disk export + ACL + reapply
-```
+| Profile | Assertions | What it proves |
+|---|---|---|
+| base (single-process) | 361 | routing, TLS, WAF, rate limits, cache, SLA, load tests, ACME challenge path, `/metrics` gated by default |
+| workers | 90 | the same under `--workers 2`: two-phase reload, cross-worker breaker, shmem auto-ban, metrics pull-on-scrape, forward-auth cache |
+| cert-export | 39 | PEM disk export, ACL, reapply, orphans |
+| ai-bot, ai-bot-workers | 52, 49 | AI crawler verdicts, robots.txt, verified-bot headers, in both modes |
+| rbac, rbac-workers | 37, 37 | per-role 403 matrix, user CRUD, session invalidation |
+| audit | 17 | the hash chain, tamper localisation, role floors |
+| hot-upgrade | 29 | signature verification, socket handover, rollback of a failing binary |
+| log-sinks | 23 | RFC 5424 syslog over TCP and OTLP logs, delivered to real collectors |
+| acme | 15 | HTTP-01 and manual DNS-01 issuance against the Pebble fixture |
+| cluster | 63 | a control plane and two followers (one in workers mode): enrollment, activation, replication, an HTTP-01 order validated through the selected follower, need-to-know key distribution, telemetry and audit fan-in, a load phase at 300 rps per follower, per-node SLA reads, break-glass, revocation |
+| bot, bot-workers, geoip, rdns, otel, otel-workers | 29, 29, 16, 7, 16, 16 | bot challenges, country policy, rDNS bypass, OTLP traces; run individually with `docker compose --profile <name> run --rm <name>-smoke` |
 
 The two intentional gaps in the Docker harness are:
 
@@ -670,6 +762,47 @@ See [docs/tuning.md](docs/tuning.md) for kernel parameters (`sysctl`), file desc
 
 When running with `--workers N >= 1`, see [docs/worker-mode.md](docs/worker-mode.md) for the operational notes (which settings require a supervisor restart, what changes between single-process and worker mode).
 
+## Running a Fleet
+
+One node is the control plane; every other node is a follower that receives
+its configuration and certificates from it and fans its logs, WAF events,
+bans and audit trail back in. Followers are read-only (a mutation answers
+`409`) until a SuperAdmin opens a bounded, audited break-glass window.
+
+```bash
+# On the control plane: generate the fleet CA, then serve the cluster plane.
+lorica --data-dir /var/lib/lorica cluster init
+lorica --data-dir /var/lib/lorica --cluster-listen 10.0.0.10:9444 --cluster-advertise cp.internal.example.org
+
+# Mint a token bound to the node name the route selectors will use.
+lorica cluster token --node-name edge-01 --password-file /root/.lorica-admin
+
+# On the new node: redeem it (the token never touches argv), then start.
+lorica --data-dir /var/lib/lorica cluster join \
+  --control-plane cp.internal.example.org:9444 --name edge-01 --token-file /root/join-token
+lorica --data-dir /var/lib/lorica
+
+# Back on the control plane: approve it. Nothing flows before activation.
+curl -sk -b "lorica_session=$TOKEN" -X POST https://127.0.0.1:9443/api/v1/cluster/nodes/<node-id>/activate
+```
+
+What every node keeps as its own: listening addresses, data directory, log
+sinks' endpoints, export zone and master key. Everything else replicates.
+Upgrade followers before the control plane (a follower whose schema is behind
+is refused at the handshake). `docs/cluster.md` covers the trust model (the
+control plane's `encryption.key` is the fleet's identity root), replication,
+key distribution, telemetry fan-in and its measured envelope, the audit
+trail, failure modes and how to replace a control plane.
+
+## Documentation
+
+- [docs/installation.md](docs/installation.md) - packages, first boot, the management plane's TLS certificate
+- [docs/cluster.md](docs/cluster.md) - multi-node operation, end to end
+- [docs/security.md](docs/security.md), [docs/security/hardening-guide.md](docs/security/hardening-guide.md), [docs/security/threat-model.md](docs/security/threat-model.md) - what is protected, how, and what is not
+- [docs/worker-mode.md](docs/worker-mode.md), [docs/tuning.md](docs/tuning.md) - `--workers`, kernel and file-descriptor tuning
+- [docs/hot-upgrade.md](docs/hot-upgrade.md), [docs/ai-crawlers.md](docs/ai-crawlers.md), [docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md)
+- [CHANGELOG.md](CHANGELOG.md), [COMPARISON.md](COMPARISON.md), [FORK.md](FORK.md)
+
 ## Package Verification
 
 Release `.deb` and `.rpm` packages are GPG-signed. Import the public key to verify:
@@ -687,6 +820,8 @@ gpg --verify lorica.deb.asc lorica.deb
 | v1.5.0 | Operator-input guard-rails on every field with blur + input inline errors; Route `group_name` + filter + colored pill; Certificate download API + dashboard split-menu with private-key confirm; Filesystem certificate export zone with per-pattern ACL, Settings tab, operator re-export endpoint, orphan sweep + per-row delete; Path-rule redirect fix ; Security hardening wave: `ammonia` HTML sanitiser, per-endpoint rate limits on management plane, per-route body-size limits with 1 MiB global default, session cookie rotation on password change, `/system` response filter, `rustls-pemfile → rustls-pki-types` migration, `rand 0.9` bump, source-error preservation on `.map_err` chains, WebSocket log-stream backpressure with close-on-slow-client ; Doc coverage pass + `#![warn(missing_docs)]` on every Lorica-native crate ; ACME unit tests (`wiremock` on Cloudflare + OVH challengers, `is_valid_dns_server` shell-filter, pure `should_auto_renew` predicate) ; `verdict_cache` test-parallelism race fixed via `serial_test` | Shipped |
 | **v1.5.1 + v1.5.2 (audit-closure cycles)** | Worker-mode cert hot-reload (cert install / renew now serves new cert across all workers without restart) ; SMTP encryption modes (`starttls` / `tls` / `none`) for the Email notification channel ; security defense-in-depth pass : webhook URL + Slack URL + auth_header scrubbed on JSON GET (matched the v1.5.1 TOML scrub asymmetry), CSV formula injection guard on access-log export, CSP3 directives (`frame-ancestors`, `form-action`, `base-uri`, `object-src`), per-endpoint rate limits broadened to ~16 mutating endpoints, redirect-policy=none on webhook / OCSP / blocklist clients ; reactor-stall pass : `LogStore` + `enforce_notification_retention` off-loaded to `spawn_blocking` ; reload pass : two-phase + legacy converged through one `apply_per_process_resolver_hooks` helper, cert-resolver reload serialised, OTel / GeoIP / ASN apply-error counter ; perf : Cow URL decode + `itoa` status formatting + chrono deferred until WAF match + `dashmap` fast-path on bot stash + `parking_lot::Mutex` on hot path + `RuleSet::matches` prefilter shortcut ; deps : `rustls-webpki 0.103.13` (RUSTSEC-2026-0104 + 0099), `postcss 8.5.10` (CVE-2026-41305), `aws-lc-rs` dropped from the `lorica-tls` crypto stack in favor of `ring` (the broader binary still pulls `aws-lc-rs` transitively via the rustls 0.23 default stack in `lorica-api`), `x509-parser 0.18` aligned across `lorica-tls` / `lorica-api` ; chore : `~50` magic-number `bl()` / `rl()` calls in `server.rs` lifted to `pub const`, 3 `formatBytes` dashboard implementations consolidated into `lib/format.ts`, 3 `docs/security.md` drift items fixed (49 WAF rules + ~80k IP blocklist) | Shipped |
 | v1.6.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC), TLS management plane, cert-resolver reliability + background OCSP, rate-limit unification, vendored captcha | Shipped |
+| v1.7.0 | Multi-node cluster (control plane + followers over mutual TLS, token enrollment with explicit activation, two-phase configuration replication with per-node route targeting, fleet-wide certificate issuance with need-to-know key distribution, telemetry and audit-trail fan-in with one chain per node, fleet dashboard), syslog (RFC 5424) and OTLP logs export, `/metrics` authenticated by default | Shipped |
+| v1.8.0 | Conditional request capture (per-route rules with request-side predicates on source CIDR, path, method and headers, response-side predicates on status and latency, capped request and response bodies, per-rule budgets and TTL, header and query-string redaction, export to the log sinks and a dashboard page) and a CI automation API (a separate listener on its own port, off by default, behind a source-CIDR allowlist and scoped bearer tokens while the management API stays on loopback; an idempotent `environment` resource that binds a hostname, a backend and a certificate in one atomic apply for review apps, optional GitLab OIDC ID-token authentication). PRD: [Epic 10](docs/prd/epic-10-v1.8.0.md), stories 10.1 to 10.5. | Planned |
 | v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
 
 ### Backlog (tracking only, blocked on upstream)

@@ -117,9 +117,13 @@ for n in $(seq 1 5); do
         | jq -r '.data.id')
     api_del "/api/v1/routes/$RID" >/dev/null
 done
+# Since Story 9.9 verify reports PER CHAIN under `.data.nodes[]`; the
+# local chain is the entry whose node_id is the empty string, and the
+# top-level `verified` is the conjunction over every chain.
+LOCAL_CHAIN='.data.nodes[] | select(.node_id == "")'
 VERIFY=$(api_get "/api/v1/audit/verify")
 assert_json "$VERIFY" '.data.verified' "true" "honest chain verifies"
-assert_json_gt "$VERIFY" '.data.total_rows' 5 "verify walked the full chain"
+assert_json_gt "$VERIFY" "$LOCAL_CHAIN | .total_rows" 5 "verify walked the full chain"
 
 # --- IV4: tamper a middle row, verify localises the break ----------------
 log "=== audit smoke: IV4 tamper detection ==="
@@ -135,8 +139,8 @@ ok "tampered audit row id=$MID_ID in SQLite"
 
 VERIFY_BROKEN=$(api_get "/api/v1/audit/verify")
 assert_json "$VERIFY_BROKEN" '.data.verified' "false" "verify detects tampering"
-assert_json "$VERIFY_BROKEN" '.data.first_break_id' "$MID_ID" "verify localises the earliest broken row"
-assert_json "$VERIFY_BROKEN" '.data.first_break_reason' "chain_hash_mismatch" "break reason is chain_hash_mismatch"
+assert_json "$VERIFY_BROKEN" "$LOCAL_CHAIN | .first_break_id" "$MID_ID" "verify localises the earliest broken row"
+assert_json "$VERIFY_BROKEN" "$LOCAL_CHAIN | .first_break_reason" "chain_hash_mismatch" "break reason is chain_hash_mismatch"
 
 # --- RBAC: audit-read floor is Operator+, verify is SuperAdmin ------------
 log "=== audit smoke: RBAC floors ==="

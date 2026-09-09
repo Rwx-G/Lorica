@@ -40,9 +40,107 @@ export function sanitizeFilenameFromHeader(
   return cleaned.length > 0 ? cleaned : fallback;
 }
 
+import type {
+  ClusterNodeResponse,
+  ClusterStatus,
+  FleetAccessRow,
+  FleetBanRow,
+  FleetWafRow,
+  RevokeNodeResponse,
+} from './cluster';
+
 export interface ApiError {
   code: string;
   message: string;
+}
+
+/** Body of `POST /api/v1/cluster/tokens` (Story 9.3, 9.5 D15). */
+export interface MintTokenRequest {
+  ttl_seconds?: number;
+  /**
+   * Mandatory since Story 9.5 D15. A route's `node_selector` names
+   * nodes, and that name decides which private keys a node receives,
+   * so the token, not the joining machine, chooses it.
+   */
+  node_name: string;
+  source_cidr?: string;
+}
+
+/** Filters accepted by the two fleet fan-in endpoints. */
+export interface FleetQueryParams {
+  node?: string;
+  route?: string;
+  /** Exact WAF rule category. Ignored by the access-log endpoint. */
+  category?: string;
+  from?: string;
+  to?: string;
+  before_id?: number;
+  limit?: number;
+}
+
+/**
+ * One page of fan-in rows. `next_cursor` is `null` on the last page,
+ * and there is deliberately no total (Story 9.6 AC #9).
+ */
+export interface FleetPage<T> {
+  rows: T[];
+  next_cursor: number | null;
+}
+
+/**
+ * Build the query string, omitting every unset filter.
+ *
+ * Exported for its unit tests: an omitted filter and a filter set to
+ * the empty string must produce the same URL, because the backend
+ * treats a present-but-empty `node` as "match the node whose id is the
+ * empty string" and would return nothing.
+ */
+/**
+ * `?node=` for the SLA reads (Story 9.7 AC #5): one follower's own
+ * figures, computed on that follower and served by the control plane.
+ * Empty or absent is this node, so nothing is sent.
+ */
+export function nodeQuery(node?: string): string {
+  return node ? `?node=${encodeURIComponent(node)}` : '';
+}
+
+export function fleetQuery(params: FleetQueryParams): string {
+  const q = new URLSearchParams();
+  if (params.node) q.set('node', params.node);
+  if (params.route) q.set('route', params.route);
+  if (params.category) q.set('category', params.category);
+  if (params.from) q.set('from', params.from);
+  if (params.to) q.set('to', params.to);
+  if (params.before_id !== undefined) q.set('before_id', String(params.before_id));
+  if (params.limit !== undefined) q.set('limit', String(params.limit));
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
+
+/** A follower's break-glass window (Story 9.4 AC #11). */
+export interface BreakGlassState {
+  active: boolean;
+  until: string | null;
+  remaining_s: number | null;
+}
+
+/** What `POST /api/v1/cluster/leave` reports. */
+export interface LeaveFleetResult {
+  node_id: string;
+  /**
+   * `false` when the control plane could not be told. The node has
+   * still left; the operator must revoke it on the control plane.
+   */
+  control_plane_notified: boolean;
+}
+
+/** The token, shown once and never recoverable. */
+export interface MintedTokenResponse {
+  token: string;
+  public_id: string;
+  expires_at: string;
+  bound_node_name: string | null;
+  bound_source_cidr: string | null;
 }
 
 export interface ApiResponse<T> {
@@ -658,6 +756,17 @@ export interface AuditRecord {
   user_agent: string;
   prev_chain_hash: string;
   chain_hash: string;
+  /**
+   * The node this row was recorded on (Story 9.9 AC #2). Empty means
+   * this node, on every install.
+   */
+  node_id: string;
+  /**
+   * The row id the origin node assigned. Zero on a local row, where
+   * `id` already is that id; on a fanned-in row it is what matches
+   * this row against the origin's own copy.
+   */
+  origin_id: number;
 }
 
 export interface AuditQuery {
@@ -667,6 +776,12 @@ export interface AuditQuery {
   to?: string;
   limit?: number;
   before_id?: number;
+  /**
+   * Restrict to one node's rows (Story 9.9 AC #5). The empty string
+   * is a real filter selecting this node's own rows, so this is
+   * compared against undefined rather than for truthiness.
+   */
+  node?: string;
 }
 
 /// Result of the SuperAdmin-only chain integrity check. When
@@ -677,6 +792,25 @@ export interface AuditVerifyResult {
   total_rows: number;
   first_break_id?: number;
   first_break_reason?: string;
+}
+
+/** One chain's verdict (Story 9.9 AC #3). */
+export interface NodeVerifyResult extends AuditVerifyResult {
+  /** The chain's node; the empty string is this node's own. */
+  node_id: string;
+}
+
+/**
+ * `GET /api/v1/audit/verify`, which reports per chain.
+ *
+ * An aggregated table holds one chain per node, so a single verdict
+ * over the whole table would be meaningless: it would chain one node's
+ * row to another's and break at the first interleave. `verified` is
+ * the conjunction.
+ */
+export interface AuditVerifyReport {
+  verified: boolean;
+  nodes: NodeVerifyResult[];
 }
 
 export interface DiskUsage {
@@ -796,6 +930,24 @@ export interface GlobalSettingsResponse {
   bot_stash_per_prefix_max: number;
   mirror_max_concurrent_per_route: number;
   mirror_max_concurrent_global: number;
+  // Log-export sinks (Story 9.8). Empty endpoint = syslog sink off.
+  syslog_endpoint?: string | null;
+  syslog_transport?: string;
+  syslog_facility?: number;
+  syslog_severity_access?: number;
+  syslog_severity_waf?: number;
+  syslog_severity_audit?: number;
+  syslog_access_enabled?: boolean;
+  syslog_waf_enabled?: boolean;
+  syslog_audit_enabled?: boolean;
+  syslog_tls_ca_pem?: string | null;
+  syslog_tls_client_cert_pem?: string | null;
+  // SECRET: GET returns "**REDACTED**" when a key is stored.
+  syslog_tls_client_key_pem?: string | null;
+  syslog_extra_sd?: string | null;
+  otlp_logs_enabled?: boolean;
+  // SECRET: GET returns "**REDACTED**" when a header is stored.
+  otlp_logs_auth_header?: string | null;
 }
 
 export interface UpdateSettingsRequest {
@@ -840,6 +992,23 @@ export interface UpdateSettingsRequest {
   bot_stash_per_prefix_max?: number;
   mirror_max_concurrent_per_route?: number;
   mirror_max_concurrent_global?: number;
+  // Log-export sinks (Story 9.8). Sending "" clears a string field;
+  // sending back the "**REDACTED**" sentinel leaves a secret unchanged.
+  syslog_endpoint?: string | null;
+  syslog_transport?: string;
+  syslog_facility?: number;
+  syslog_severity_access?: number;
+  syslog_severity_waf?: number;
+  syslog_severity_audit?: number;
+  syslog_access_enabled?: boolean;
+  syslog_waf_enabled?: boolean;
+  syslog_audit_enabled?: boolean;
+  syslog_tls_ca_pem?: string | null;
+  syslog_tls_client_cert_pem?: string | null;
+  syslog_tls_client_key_pem?: string | null;
+  syslog_extra_sd?: string | null;
+  otlp_logs_enabled?: boolean;
+  otlp_logs_auth_header?: string | null;
 }
 
 /**
@@ -905,6 +1074,15 @@ export interface CertExportOrphansResponse {
 /// currently-configured endpoint + protocol and reports whether
 /// the collector accepted it.
 export interface OtelTestResponse {
+  ok: boolean;
+  message: string;
+  latency_ms?: number;
+}
+
+/// Result of the "Test syslog" / "Test OTLP logs" probes on the
+/// Log Export settings section (Story 9.8). Same contract as
+/// `OtelTestResponse`: always HTTP 200, `ok` carries the verdict.
+export interface LogSinkTestResponse {
   ok: boolean;
   message: string;
   latency_ms?: number;
@@ -1092,6 +1270,69 @@ export const api = {
 
   getStatus: () => request<StatusResponse>('GET', '/status'),
 
+  // ---- Cluster (Stories 9.3-9.7) ----
+
+  getClusterStatus: () => request<ClusterStatus>('GET', '/cluster/status'),
+
+  listClusterNodes: () => request<ClusterNodeResponse[]>('GET', '/cluster/nodes'),
+
+  getClusterNode: (id: string) =>
+    request<ClusterNodeResponse>('GET', `/cluster/nodes/${encodeURIComponent(id)}`),
+
+  activateClusterNode: (id: string) =>
+    request<ClusterNodeResponse>(
+      'POST',
+      `/cluster/nodes/${encodeURIComponent(id)}/activate`,
+    ),
+
+  revokeClusterNode: (id: string) =>
+    request<RevokeNodeResponse>('DELETE', `/cluster/nodes/${encodeURIComponent(id)}`),
+
+  mintClusterToken: (body: MintTokenRequest) =>
+    request<MintedTokenResponse>('POST', '/cluster/tokens', body),
+
+  /**
+   * The fleet's access logs (Story 9.6 AC #9).
+   *
+   * Cursor-paginated with no total: on an aggregated table a
+   * `COUNT(*)` per page is a full scan under the store lock, which
+   * would stall the control plane's telemetry ingest.
+   */
+  getFleetLogs: (params: FleetQueryParams) =>
+    request<FleetPage<FleetAccessRow>>('GET', `/cluster/logs${fleetQuery(params)}`),
+
+  /** The fleet's WAF events (Story 9.6 AC #9). */
+  getFleetWafEvents: (params: FleetQueryParams) =>
+    request<FleetPage<FleetWafRow>>('GET', `/cluster/waf-events${fleetQuery(params)}`),
+
+  /**
+   * The follower's break-glass window (Story 9.4 AC #11).
+   *
+   * These three plus `leaveCluster` are the only cluster mutations a
+   * follower serves, and they are why `isSuperAdminRole` exists: they
+   * are how an operator gets out of read-only mode, so gating them on
+   * read-only mode would lock the door from the inside.
+   */
+  getBreakGlass: () =>
+    request<BreakGlassState>('GET', '/cluster/break-glass'),
+
+  openBreakGlass: (duration_s: number) =>
+    request<BreakGlassState>('POST', '/cluster/break-glass', { duration_s }),
+
+  closeBreakGlass: () =>
+    request<BreakGlassState>('DELETE', '/cluster/break-glass'),
+
+  /** Leave the fleet (SuperAdmin, follower only, Story 9.3 AC #13). */
+  leaveCluster: () =>
+    request<LeaveFleetResult>('POST', '/cluster/leave'),
+
+  /** Every node's live bans, as last reported (Story 9.6 AC #10). */
+  getFleetBans: (node?: string) =>
+    request<FleetBanRow[]>(
+      'GET',
+      `/cluster/bans${node ? `?node=${encodeURIComponent(node)}` : ''}`,
+    ),
+
   listRoutes: () =>
     request<{ routes: RouteResponse[] }>('GET', '/routes'),
 
@@ -1219,12 +1460,20 @@ export const api = {
     if (params.to) query.set('to', params.to);
     if (params.limit !== undefined) query.set('limit', String(params.limit));
     if (params.before_id !== undefined) query.set('before_id', String(params.before_id));
+    // Compared against undefined, not for truthiness: the empty string
+    // is a real filter that selects this node's own rows, and dropping
+    // it would silently widen the query to the whole fleet.
+    if (params.node !== undefined) query.set('node', params.node);
     const qs = query.toString();
     return request<{ entries: AuditRecord[]; total: number }>('GET', `/audit${qs ? `?${qs}` : ''}`);
   },
 
-  verifyAudit: () =>
-    request<AuditVerifyResult>('GET', '/audit/verify'),
+  /** Verify the audit chains; one verdict per node (Story 9.9 AC #3). */
+  verifyAudit: (node?: string) =>
+    request<AuditVerifyReport>(
+      'GET',
+      `/audit/verify${node !== undefined ? `?node=${encodeURIComponent(node)}` : ''}`,
+    ),
 
   getSystem: () =>
     request<SystemResponse>('GET', '/system'),
@@ -1303,6 +1552,16 @@ export const api = {
   // change. Does not mutate state.
   testOtel: () =>
     request<OtelTestResponse>('POST', '/settings/otel/test', {}),
+
+  // Emit a canary syslog message via the CURRENTLY persisted
+  // syslog sink settings (Story 9.8). Does not mutate state.
+  testSyslog: () =>
+    request<LogSinkTestResponse>('POST', '/settings/syslog/test', {}),
+
+  // Emit a canary OTLP log record via the CURRENTLY persisted
+  // OTLP endpoint + protocol (Story 9.8). Does not mutate state.
+  testOtlpLogs: () =>
+    request<LogSinkTestResponse>('POST', '/settings/otlp-logs/test', {}),
 
   // Notifications
   listNotifications: () =>
@@ -1466,20 +1725,24 @@ export const api = {
     request<{ message: string }>('DELETE', `/backends/${id}`),
 
   // SLA
-  getSlaOverview: () =>
-    request<SlaSummary[]>('GET', '/sla/overview'),
+  getSlaOverview: (node?: string) =>
+    request<SlaSummary[]>('GET', `/sla/overview${nodeQuery(node)}`),
 
-  getRouteSla: (routeId: string) =>
-    request<SlaSummary[]>('GET', `/sla/routes/${routeId}`),
+  getRouteSla: (routeId: string, node?: string) =>
+    request<SlaSummary[]>('GET', `/sla/routes/${routeId}${nodeQuery(node)}`),
 
-  getRouteSlaActive: (routeId: string) =>
-    request<SlaSummary[]>('GET', `/sla/routes/${routeId}/active`),
+  getRouteSlaActive: (routeId: string, node?: string) =>
+    request<SlaSummary[]>('GET', `/sla/routes/${routeId}/active${nodeQuery(node)}`),
 
-  getRouteSlaBuckets: (routeId: string, params?: { from?: string; to?: string; source?: string }) => {
+  getRouteSlaBuckets: (
+    routeId: string,
+    params?: { from?: string; to?: string; source?: string; node?: string },
+  ) => {
     const query = new URLSearchParams();
     if (params?.from) query.set('from', params.from);
     if (params?.to) query.set('to', params.to);
     if (params?.source) query.set('source', params.source);
+    if (params?.node) query.set('node', params.node);
     const qs = query.toString();
     return request<SlaBucket[]>('GET', `/sla/routes/${routeId}/buckets${qs ? `?${qs}` : ''}`);
   },

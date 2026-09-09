@@ -286,8 +286,7 @@ pub(crate) use error_pages::render_error_body;
 
 pub mod config;
 pub use config::{
-    compute_pool_size, MtlsEnforcer, ProxyConfig, ProxyConfigGlobals, RouteEntry,
-    SmoothWrrState,
+    compute_pool_size, MtlsEnforcer, ProxyConfig, ProxyConfigGlobals, RouteEntry, SmoothWrrState,
 };
 
 pub mod lb;
@@ -299,14 +298,14 @@ pub use context::RequestCtx;
 pub mod ai_bot_merged;
 
 pub mod filters;
-pub use filters::ip_to_shmem_key;
 #[cfg(test)]
 pub(crate) use filters::build_redirect_location;
+pub use filters::ip_to_shmem_key;
 
 pub mod worker_rpc;
-pub use worker_rpc::PendingProxyConfig;
 #[cfg(test)]
 pub(crate) use worker_rpc::handle_config_reload_commit;
+pub use worker_rpc::PendingProxyConfig;
 
 impl LoricaProxy {
     pub fn new(
@@ -748,10 +747,10 @@ impl ProxyHttp for LoricaProxy {
             if let Some(ref challenge_store) = self.acme_challenge_store {
                 let path = session.req_header().uri.path();
                 if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-                    info!(
-                        token = token,
-                        "ACME challenge request intercepted, looking up token"
-                    );
+                    // Nothing is logged here: this is an unauthenticated
+                    // public path and the token is caller-controlled
+                    // text. `get` validates its shape and refuses an
+                    // expired entry.
                     if let Some(key_auth) = challenge_store.get(token).await {
                         let mut header = ResponseHeader::build(200, None)?;
                         header.insert_header("Content-Type", "text/plain")?;
@@ -907,7 +906,8 @@ impl ProxyHttp for LoricaProxy {
 
             // Per-route GeoIP country filter; resolves the country once
             // and hands it to the bot-protection stage below.
-            let (geo_handled, cached_country) = self.check_geoip_filter(session, ctx, entry).await?;
+            let (geo_handled, cached_country) =
+                self.check_geoip_filter(session, ctx, entry).await?;
             if let Some(handled) = geo_handled {
                 return Ok(handled);
             }
@@ -2446,8 +2446,15 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Push to the in-memory log buffer for dashboard viewing (if enabled)
-        if ctx.access_log_enabled {
+        // Push to the in-memory log buffer for dashboard viewing (if
+        // enabled) and offer to the log-export sinks. The sink export
+        // is deliberately NOT gated on `ctx.access_log_enabled` (QA
+        // finding: a compliance-relevant SIEM export must not be
+        // switched off by the unrelated local-log toggle); the entry
+        // is only built when at least one consumer wants it.
+        let sinks_want_access =
+            lorica_api::log_sinks::wants(lorica_api::log_sinks::SinkKind::Access);
+        if ctx.access_log_enabled || sinks_want_access {
             let entry = LogEntry {
                 id: 0, // assigned by LogBuffer
                 timestamp: chrono::Utc::now().to_rfc3339(),
@@ -2464,13 +2471,28 @@ impl ProxyHttp for LoricaProxy {
                 source: ctx.source.clone(),
                 request_id: ctx.request_id.clone(),
             };
-            // Non-blocking hand-off to the background log writer
-            // (backlog #24); the entry clone is far cheaper than the
-            // synchronous INSERT it replaces.
-            if let Some(ref writer) = self.log_writer {
-                writer.enqueue_access(entry.clone());
+            if sinks_want_access {
+                // Story 9.8: trace context is captured here - the sink
+                // consumer thread has no ambient span to read it from.
+                lorica_api::log_sinks::publish_access(
+                    &entry,
+                    ctx.outgoing_traceparent
+                        .as_ref()
+                        .map(|t| t.trace_id.as_str()),
+                    ctx.outgoing_traceparent
+                        .as_ref()
+                        .map(|t| t.parent_id.as_str()),
+                );
             }
-            self.log_buffer.push(entry);
+            if ctx.access_log_enabled {
+                // Non-blocking hand-off to the background log writer
+                // (backlog #24); the entry clone is far cheaper than
+                // the synchronous INSERT it replaces.
+                if let Some(ref writer) = self.log_writer {
+                    writer.enqueue_access(entry.clone());
+                }
+                self.log_buffer.push(entry);
+            }
         }
 
         // Record Prometheus metrics (bounded labels: route_id, not hostname)

@@ -55,7 +55,12 @@ pub enum CustomVerification {
 /// On conflict by `name` the custom entry wins (lets operators
 /// override a stale built-in vendor IP list with a fresh CIDR
 /// list mid-cycle, before the next Lorica patch release).
+// `CustomVerification` above cannot take `deny_unknown_fields`:
+// serde does not support it on internally-tagged enums (the tag
+// buffering deserializer ignores unknown keys by design). The struct
+// fields around it are still strict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomCrawler {
     /// Auto-incremented row id (DB-assigned).
     pub id: i64,
