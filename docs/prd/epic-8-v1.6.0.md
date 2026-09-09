@@ -2,7 +2,7 @@
 
 **Author:** Romain G.
 **Target version:** 1.6.0
-**Status:** InProgress (rebased plan, 2026-06-10)
+**Status:** Shipped in v1.6.0 (2026-08-12). Rebased plan of 2026-06-10 below; QA record in `docs/qa/epic-8-report.md`, release notes in the `[1.6.0]` section of `CHANGELOG.md`. The per-story status lines further down are the plan's history and are left as written.
 
 > **Plan revision (2026-06-10):** this branch was rebuilt from `main`
 > at v1.5.11 after the original `feat/v1.6.0` (May 2026) diverged by
