@@ -1283,14 +1283,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 54 is the current head of the tracked MIGRATIONS table (every
+        // 55 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            54
+            55
         );
     }
 
@@ -1308,7 +1308,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                54
+                55
             );
         }
     }
@@ -4256,6 +4256,51 @@ cert_critical_days = 3
             .expect("query active");
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].request_count, 3);
+    }
+
+    #[test]
+    fn deleting_a_route_leaves_its_sla_history_for_the_retention_pass() {
+        // Backlog #67: `sla_buckets.route_id` was REFERENCES routes(id) ON
+        // DELETE CASCADE with foreign keys enforced, so a control-plane edit
+        // that narrowed a `node_selector` made the follower's replica apply
+        // destroy that node's SLA history. Migration 55 rebuilds the table
+        // without the constraint; history is pruned by time only.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let mut route = make_route();
+        route.id = "r-sla-history".into();
+        store.create_route(&route).expect("test setup");
+        let minute = Utc::now()
+            .with_nanosecond(0)
+            .expect("test setup")
+            .with_second(0)
+            .expect("test setup");
+        store
+            .merge_sla_bucket(&sla_slice("r-sla-history", "passive", minute, 12, 12, 30))
+            .expect("bucket");
+
+        store.delete_route("r-sla-history").expect("delete route");
+        assert!(store
+            .get_route("r-sla-history")
+            .expect("get route")
+            .is_none());
+
+        let from = minute - chrono::Duration::minutes(1);
+        let to = minute + chrono::Duration::minutes(1);
+        let buckets = store
+            .query_sla_buckets("r-sla-history", &from, &to, "passive")
+            .expect("query");
+        assert_eq!(buckets.len(), 1, "the history outlives the route");
+        assert_eq!(buckets[0].request_count, 12);
+
+        // Retention is the one control that removes it.
+        let pruned = store
+            .prune_sla_buckets(&(minute + chrono::Duration::minutes(1)))
+            .expect("prune");
+        assert_eq!(pruned, 1);
+        assert!(store
+            .query_sla_buckets("r-sla-history", &from, &to, "passive")
+            .expect("query")
+            .is_empty());
     }
 
 }
