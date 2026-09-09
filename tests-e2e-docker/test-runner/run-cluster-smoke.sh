@@ -152,6 +152,8 @@ ROUTE=$(api_post /api/v1/routes \
       "backends":["cluster-be"],"load_balancing":"round_robin",
       "waf_enabled":true,"enabled":true,"node_selector":["edge-a"]}')
 assert_json_exists "$ROUTE" '.data.id' "the selected route was created"
+# The id in the body is not honoured; routes get a server-assigned id.
+ROUTE_ID=$(echo "$ROUTE" | jq -r '.data.id')
 
 GEN=$(echo "$STATUS" | jq -r '.data.applied_config_generation')
 log "control plane was at generation $GEN before the mutation"
@@ -306,14 +308,16 @@ fi
 
 # Bind it to the selected route: entitlement follows
 # `routes.certificate_id`, the same column the push path resolves.
-BIND=$(api_put "/api/v1/routes/cluster-route" "{\"certificate_id\":\"${CERT_ID}\"}")
+BIND=$(api_put "/api/v1/routes/$ROUTE_ID" "{\"certificate_id\":\"${CERT_ID}\"}")
 assert_json "$BIND" '.data.certificate_id' "$CERT_ID" "the certificate is bound to the selected route"
 
 # The roster's entitlement column: edge-a holds it, edge-b never does.
 for attempt in $(seq 1 30); do
     NODES=$(api_get /api/v1/cluster/nodes)
+    # `// []` so an error body (a limiter, a hiccup) polls again
+    # instead of killing the script under set -e.
     A_HAS=$(echo "$NODES" | jq --arg c "$CERT_ID" \
-        '[.data[] | select(.name == "edge-a") | .certificate_ids[] | select(. == $c)] | length')
+        '[(.data // [])[] | select(.name == "edge-a") | (.certificate_ids // [])[] | select(. == $c)] | length')
     [ "$A_HAS" = "1" ] && break
     sleep 2
 done

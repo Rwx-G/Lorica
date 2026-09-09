@@ -374,7 +374,7 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
     # not merely that a process is up.
     echo "Waiting for the fleet to form..."
     for i in $(seq 1 90); do
-        if docker compose exec -T lorica-cp test -f /shared/edge-b_ready >/dev/null 2>&1; then
+        if docker compose --profile cluster exec -T lorica-cp test -f /shared/edge-b_ready >/dev/null 2>&1; then
             echo "Fleet is ready."
             break
         fi
