@@ -2,10 +2,18 @@
   import { onMount } from 'svelte';
   import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry, type AuditRecord, type AuditVerifyResult, type AuditQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import NodeFilter from '../components/NodeFilter.svelte';
   import { showToast } from '../lib/toast';
   import { canWrite, isSuperAdmin } from '../lib/auth';
+  import { clusterStatus, isClustered, type FleetBanRow } from '../lib/cluster';
 
-  let events: WafEvent[] = $state([]);
+  /**
+   * The events table. On a control plane the rows come from the fan-in
+   * store and carry the node that produced them; `node_id` is absent
+   * on a standalone install rather than empty, so the Node column
+   * exists only where it means something.
+   */
+  let events: (WafEvent & { node_id?: string })[] = $state([]);
   let stats: { total_events: number; total_24h: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
     total_events: 0,
     total_24h: 0,
@@ -20,9 +28,27 @@
   let loading = $state(true);
   let error = $state('');
   let filterCategory = $state('');
+  /** Selected node id, or `''` for every node (Story 9.7 AC #5). */
+  let filterNode = $state('');
+  /**
+   * Whether this page is reading the FAN-IN store rather than this
+   * node's own tables. Only a control plane holds fanned-in rows.
+   */
+  const fleetView = $derived(
+    isClustered($clusterStatus) && $clusterStatus?.role === 'control_plane',
+  );
   let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' | 'bans' | 'audit' = $state('events');
   let showClearConfirm = $state(false);
   let bans: BanEntry[] = $state([]);
+  /**
+   * The fleet's bans, kept separate from `bans` rather than mapped
+   * onto it: a fan-in row has no `banned_seconds_ago`, its `reason` is
+   * an arbitrary string from another node rather than this build's
+   * `BanReason` union, and there is no fleet unban endpoint, so the
+   * two tables genuinely differ in columns and in what they let an
+   * operator do.
+   */
+  let fleetBans: FleetBanRow[] = $state([]);
   let bansLoading = $state(false);
   let unbanningIp: string | null = $state(null);
   let bansRefreshTimer: ReturnType<typeof setInterval> | null = $state(null);
@@ -54,18 +80,38 @@
   async function loadData() {
     loading = true;
     error = '';
-    const [eventsRes, statsRes, rulesRes, blRes, crRes] = await Promise.all([
-      api.getWafEvents({ limit: 100, category: filterCategory || undefined }),
+    // The rules, blocklist and custom-rule views describe THIS node's
+    // WAF configuration, which replication keeps identical across the
+    // fleet, so they are read locally in both modes. Only the event
+    // stream differs, because only it is fanned in.
+    const [statsRes, rulesRes, blRes, crRes] = await Promise.all([
       api.getWafStats(),
       api.getWafRules(),
       api.getBlocklistStatus(),
       api.listCustomRules(),
     ]);
 
-    if (eventsRes.error) {
-      error = eventsRes.error.message;
-    } else if (eventsRes.data) {
-      events = eventsRes.data.events;
+    if (fleetView) {
+      const res = await api.getFleetWafEvents({
+        ...(filterNode ? { node: filterNode } : {}),
+        ...(filterCategory ? { category: filterCategory } : {}),
+        limit: 100,
+      });
+      if (res.error) {
+        error = res.error.message;
+      } else if (res.data) {
+        events = res.data.rows;
+      }
+    } else {
+      const res = await api.getWafEvents({
+        limit: 100,
+        category: filterCategory || undefined,
+      });
+      if (res.error) {
+        error = res.error.message;
+      } else if (res.data) {
+        events = res.data.events;
+      }
     }
 
     if (statsRes.data) {
@@ -98,9 +144,16 @@
 
   async function loadBans() {
     bansLoading = true;
-    const res = await api.listBans();
-    if (res.data) {
-      bans = res.data.bans;
+    if (fleetView) {
+      const res = await api.getFleetBans(filterNode || undefined);
+      if (res.data) {
+        fleetBans = res.data;
+      }
+    } else {
+      const res = await api.listBans();
+      if (res.data) {
+        bans = res.data.bans;
+      }
     }
     bansLoading = false;
   }
@@ -318,7 +371,7 @@
     <h1>Security</h1>
     <div class="header-actions">
       <button class="btn btn-secondary" onclick={loadData}>Refresh</button>
-      {#if $canWrite && activeTab === 'events' && events.length > 0}
+      {#if $canWrite && !fleetView && activeTab === 'events' && events.length > 0}
         <button class="btn btn-secondary" style="color: var(--color-red)" onclick={() => (showClearConfirm = true)}>Clear Events</button>
       {/if}
     </div>
@@ -328,7 +381,12 @@
     <div class="error-banner">{error}</div>
   {/if}
 
-  <!-- Stats cards -->
+  <!-- Stats cards. Local counters: the WAF statistics endpoint has no
+       fan-in counterpart, so on a control plane they describe this node
+       while the table below describes the fleet. -->
+  {#if fleetView}
+    <p class="text-muted">Counters below are this node's own.</p>
+  {/if}
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-value">{rulesEnabled}/{stats.rule_count}</div>
@@ -380,6 +438,13 @@
   {#if activeTab === 'events'}
     <!-- Filter -->
     <div class="filter-bar">
+      <NodeFilter
+        value={filterNode}
+        onchange={(id) => {
+          filterNode = id;
+          void loadData();
+        }}
+      />
       <label for="cat-filter">Filter by category:</label>
       <select id="cat-filter" bind:value={filterCategory} onchange={handleFilterChange}>
         <option value="">All categories</option>
@@ -410,6 +475,9 @@
         <table>
           <thead>
             <tr>
+              {#if fleetView}
+                <th>Node</th>
+              {/if}
               <th>Time</th>
               <th>Client IP</th>
               <th>Route</th>
@@ -425,6 +493,9 @@
           <tbody>
             {#each events as event, i (i)}
               <tr>
+                {#if fleetView}
+                  <td class="mono">{event.node_id ?? '-'}</td>
+                {/if}
                 <td class="mono">{formatTime(event.timestamp)}</td>
                 <td class="mono">{event.client_ip || '-'}</td>
                 <td class="mono">{event.route_hostname || '-'}</td>
@@ -633,8 +704,57 @@
         IPs automatically banned for repeated rate limit violations. Bans expire after 1 hour.
         Auto-refreshes every 10 seconds.
       </p>
+      {#if fleetView}
+        <p class="text-muted">
+          Each node reports the bans it currently holds. Bans live in memory,
+          so a node that restarted reports none until it bans again, and
+          lifting one is done on the node that applied it.
+        </p>
+      {/if}
+      <div class="filter-bar">
+        <NodeFilter
+          value={filterNode}
+          onchange={(id) => {
+            filterNode = id;
+            void loadBans();
+          }}
+        />
+      </div>
 
-      {#if bansLoading && bans.length === 0}
+      {#if fleetView}
+        {#if bansLoading && fleetBans.length === 0}
+          <p class="loading">Loading...</p>
+        {:else if fleetBans.length === 0}
+          <div class="empty-state">
+            <p>No node reports a banned IP.</p>
+          </div>
+        {:else}
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Node</th>
+                  <th>IP Address</th>
+                  <th>Reason</th>
+                  <th>Expires In</th>
+                  <th>Reported</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each fleetBans as ban (ban.node_id + ban.client_ip)}
+                  <tr>
+                    <td class="mono">{ban.node_id}</td>
+                    <td class="mono">{ban.client_ip}</td>
+                    <td><span class="ban-reason-badge">{ban.reason}</span></td>
+                    <td>{formatDuration(ban.remaining_s)}</td>
+                    <td class="mono">{formatTime(ban.observed_at)}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      {:else if bansLoading && bans.length === 0}
         <p class="loading">Loading...</p>
       {:else if bans.length === 0}
         <div class="empty-state">

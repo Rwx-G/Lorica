@@ -55,7 +55,17 @@ without curl.
       `lib/cluster.ts` with the status store, the read-only and
       break-glass predicates, the badge builder and the join-command
       helper, 17 Vitest cases; the six `api.ts` cluster methods.
-- [ ] AC #5: node filter on three pages, hidden when standalone.
+- [x] AC #5: node filter on Access Logs and Security, hidden entirely
+      when standalone. On a control plane both pages read the fan-in
+      endpoints and name the origin node in a column; the actions that
+      would act on this node's own tables rather than on what is
+      displayed (Clear Events, Unban) are absent there rather than
+      wired to the wrong target. `category` was threaded through the
+      fleet WAF query so the existing filter keeps meaning the same
+      thing in both modes instead of quietly filtering one page of
+      results. **The SLA leg is deliberately not built**: see D17 in
+      the Debug Log. AC #5 as written is therefore short by one page,
+      and that is a decision for the user, not a silent omission.
 - [ ] AC #6: header badge with warning states.
 - [ ] AC #7: read-only and break-glass banners.
 - [ ] AC #8: Vitest files, gates green.
@@ -147,6 +157,81 @@ keep finding: a check that reports success without having verified
 anything is worse than no check, because it is quoted as evidence.
 Every "gates green" line recorded in this story before 2026-09-09
 covered less than it claimed.
+
+**D17: AC #5's SLA leg is not built. The filter would filter nothing.**
+
+AC #5 asks for a node filter on Access Logs, Security and SLA. The
+first two have fanned-in data; SLA does not. Story 9.6's Phase 1 review
+deliberately removed the `sla_buckets` node-id migration from its scope
+(`story-9.6-telemetry-fan-in.md`: "AC #1's six migrations become zero
+on the hot-path tables"), so the gap sits between the two stories, not
+inside this one. Two agents were dispatched on it as the standing
+instruction requires, one on published practice and one on the code.
+They agree on the mechanics and split on the conclusion; the mechanics
+decide it.
+
+What the code says. `sla_buckets` lives in `lorica.db`, not in a
+fan-in store, and is written with `INSERT OR REPLACE` on
+`UNIQUE(route_id, bucket_start, source)`. The telemetry drain advances
+a cursor with `MAX(value, excluded.value)` over a monotonic row id,
+which is correct precisely because access rows are never rewritten. A
+`REPLACE` in SQLite is a delete plus an insert, so a rewritten bucket
+returns above the cursor and is shipped again, and the fan-in ingest is
+a plain `INSERT` with no unique key. Shipping buckets down that channel
+would therefore accumulate one row per rewrite and over-count every
+`SUM(request_count)` by exactly that factor. The active-probe writer
+rewrites the open minute on every probe, roughly twelve times a minute
+at the five-second floor. Making it correct means a closed-bucket
+watermark on the sender and an upsert ingest on the receiver, neither
+of which the two existing row kinds use: new mechanism, not a copy of
+the access path. Around 35 to 45 edit sites across eight crates, two
+new schemas, plus the two pre-existing bugs now filed as backlog #68,
+because fanning in known-wrong numbers is worse than not fanning them
+in.
+
+What published practice says. Every system that pre-aggregates locally
+before shipping converges on the same rule: do not transmit the open
+window, hold it behind a watermark and emit once. VictoriaMetrics
+vmagent drops the first and last aggregation interval as known
+incomplete and, since v1.112.0, buffers two windows specifically
+because flushing on the tick was producing incomplete histograms.
+Prometheus remote-write, OpenTelemetry delta temporality and Netdata
+parent/child avoid the problem entirely by making the shipped unit
+immutable, which is what this project's existing row fan-in already
+does. That research supports building an SLA fan-in properly, and it
+also confirms it is a different pipeline from the one 9.6 built.
+
+What settles it. The only thing a fleet SLA view adds over the
+per-node pages is a fleet-wide figure, and the figure cannot be
+computed. Percentiles are not additive: p95 of node A and p95 of node B
+do not combine into a fleet p95 by any weighting. Correct fleet
+percentiles need either the raw latency samples, which
+`passive_sla/bucket.rs` discards, or a mergeable sketch per bucket
+instead of three scalar columns, which is a schema change to the SLA
+model itself and not a clustering feature. Both agents state this
+independently.
+
+Deriving the view from the access rows already fanned in was also
+examined and does not work: the fan-in table has no `route_id`, only
+host and path; the SLA collector deliberately excludes 101s, WAF
+blocks, bans, rate limits and connection errors, and no column records
+which of those a row was, so the derived numbers would not match the
+per-node page an operator can open beside them; and the retention
+windows are three orders of magnitude apart, 100 000 rows per node per
+kind against 90 days, so at 100 rps the fleet view would cover about
+seventeen minutes while the page is built around 1h, 24h, 7d and 30d.
+
+So: Access Logs and Security get the filter. SLA keeps being what it
+already is, a per-node view served by whichever node the operator is
+looking at, against a target that replication keeps identical fleet
+wide. `docs/cluster.md` already names Prometheus federation as the
+answer for cross-fleet metrics, and `lorica_sla_*` already feeds it.
+
+AC text is contract and has not been edited. The story ships AC #5
+short by one page, deliberately, and this is the item to put in front
+of the user: either AC #5 narrows to two pages, or a fleet SLA fan-in
+becomes its own story with the closed-bucket watermark, the upsert
+ingest and backlog #68 fixed first.
 
 ### Completion Notes
 
