@@ -17,15 +17,19 @@
 #   9.3  enrolment landed a roster row, and the node reports its role
 #   9.4  a route created on the control plane reaches both followers,
 #        and a follower refuses a local mutation with 409
-#   9.5  a certificate's private key reaches the node its route selects
-#        and no other
+#   9.5  an HTTP-01 order is validated through the selected follower
+#        (the challenge fanned out), and the issued certificate's
+#        private key reaches that node and no other
 #   9.6  access rows and WAF events fan in, stamped with the node the
 #        session proved
 #   9.7  the roster carries resource gauges and certificate entitlement
 #   9.9  audit rows fan in with their chain intact, and every chain
 #        verifies separately
+#   9.4  break-glass opens a follower to local edits and closes again
+#   9.3  revocation ends the session, and names the keys it cannot
+#        take back
 #
-# Pre-requisite: the `cluster` compose profile is up.
+# Pre-requisite: the `cluster` compose profile is up, Pebble included.
 # =============================================================================
 
 set -eu
@@ -36,8 +40,12 @@ source "$SCRIPT_DIR/helpers.sh"
 CP_API="${CP_API:?CP_API is required}"
 EDGE_A_API="${EDGE_A_API:?EDGE_A_API is required}"
 EDGE_A_PROXY="${EDGE_A_PROXY:?EDGE_A_PROXY is required}"
+EDGE_B_PROXY="${EDGE_B_PROXY:?EDGE_B_PROXY is required}"
 BACKEND1="${BACKEND1_ADDR:-backend1:80}"
 SHARED="${SHARED_DIR:-/shared}"
+CHALLTESTSRV="${CHALLTESTSRV:-http://challtestsrv:8055}"
+PEBBLE_DIR_URL="https://acme-staging-v02.api.letsencrypt.org/dir"
+FLEET_HOST="fleet.example.com"
 
 log "=== Cluster smoke: preflight ==="
 
@@ -242,25 +250,97 @@ assert_json_gt "$FLEET_WAF" '.data.rows | length' '0' \
     "edge-a's WAF events reached the control plane"
 
 # ---------------------------------------------------------------------
-# Story 9.5: the key goes only to the node the selector names.
+# Story 9.5: a real issuance through the selected follower, and the
+# key goes only to the node the selector names.
 # ---------------------------------------------------------------------
-log "=== 9.5: certificate entitlement is per node ==="
+log "=== 9.5: HTTP-01 through the fleet, and per-node key distribution ==="
 
-NODES=$(api_get /api/v1/cluster/nodes)
-A_CERTS=$(echo "$NODES" | jq '[.data[] | select(.name == "edge-a") | .certificate_ids[]] | length')
-B_CERTS=$(echo "$NODES" | jq '[.data[] | select(.name == "edge-b") | .certificate_ids[]] | length')
-log "edge-a is entitled to $A_CERTS certificates, edge-b to $B_CERTS"
-# The route names edge-a only, and it has no certificate attached in
-# this smoke, so what is asserted is the SHAPE of entitlement: the
-# resolver answers per node rather than fleet-wide.
-if [ "$A_CERTS" = "$B_CERTS" ] && [ "$A_CERTS" = "0" ]; then
-    ok "no certificate is bound to the route, so neither node is entitled"
-else
-    if [ "$A_CERTS" -ge "$B_CERTS" ]; then
-        ok "entitlement follows the selector rather than the fleet"
-    else
-        fail "the unselected node is entitled to more certificates than the selected one"
+PEBBLE_OK=false
+for i in $(seq 1 60); do
+    if curl -sk "$PEBBLE_DIR_URL" 2>/dev/null | jq -e '.newOrder' >/dev/null 2>&1; then
+        PEBBLE_OK=true
+        break
     fi
+    sleep 1
+done
+if [ "$PEBBLE_OK" = "true" ]; then
+    ok "pebble ACME directory reachable at the staging alias"
+else
+    fail "pebble directory never came up at $PEBBLE_DIR_URL"
+fi
+
+# Pebble validates HTTP-01 by dialling the hostname on port 8080. Point
+# it at edge-a, the ONLY node the route selects. The control plane runs
+# the order, but Pebble never talks to it: the validation can succeed
+# only if the challenge token fanned out to the selected follower (AC
+# #6), which is the cross-story path no unit test reaches.
+EDGE_A_IP=$(getent hosts lorica-edge-a | awk '{print $1}' | head -1)
+ADD_A=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$CHALLTESTSRV/add-a" \
+    -d "{\"host\":\"${FLEET_HOST}\",\"addresses\":[\"${EDGE_A_IP}\"]}")
+if [ "$ADD_A" = "200" ]; then
+    ok "${FLEET_HOST} resolves to edge-a (${EDGE_A_IP}) for Pebble's validation"
+else
+    fail "challtestsrv add-a HTTP $ADD_A"
+fi
+
+PROV_BODY=$(mktemp)
+PROV_CODE=$(curl -sk -o "$PROV_BODY" -w '%{http_code}' --max-time 240 \
+    -b "$SESSION" -X POST -H 'Content-Type: application/json' \
+    -d "{\"domain\":\"${FLEET_HOST}\",\"staging\":true,\"contact_email\":\"admin@example.com\"}" \
+    "$API/api/v1/acme/provision")
+if [ "$PROV_CODE" = "200" ]; then
+    ok "HTTP-01 order validated through the selected follower (challenge fan-out)"
+else
+    fail "HTTP-01 provision HTTP $PROV_CODE: $(cat "$PROV_BODY")"
+fi
+rm -f "$PROV_BODY"
+
+CERTS=$(api_get /api/v1/certificates)
+CERT_ID=$(echo "$CERTS" | jq -r --arg d "$FLEET_HOST" \
+    '[.data.certificates[]? | select(.domain == $d)][0].id // empty')
+if [ -n "$CERT_ID" ]; then
+    ok "the issued certificate is in the control plane's store (id=$CERT_ID)"
+else
+    fail "no certificate for ${FLEET_HOST} on the control plane"
+fi
+
+# Bind it to the selected route: entitlement follows
+# `routes.certificate_id`, the same column the push path resolves.
+BIND=$(api_put "/api/v1/routes/cluster-route" "{\"certificate_id\":\"${CERT_ID}\"}")
+assert_json "$BIND" '.data.certificate_id' "$CERT_ID" "the certificate is bound to the selected route"
+
+# The roster's entitlement column: edge-a holds it, edge-b never does.
+for attempt in $(seq 1 30); do
+    NODES=$(api_get /api/v1/cluster/nodes)
+    A_HAS=$(echo "$NODES" | jq --arg c "$CERT_ID" \
+        '[.data[] | select(.name == "edge-a") | .certificate_ids[] | select(. == $c)] | length')
+    [ "$A_HAS" = "1" ] && break
+    sleep 2
+done
+assert_json "$NODES" \
+    '[.data[] | select(.name == "edge-a") | .certificate_ids[] | select(. == "'"$CERT_ID"'")] | length' '1' \
+    "edge-a, the selected node, is entitled to the certificate's key"
+assert_json "$NODES" \
+    '[.data[] | select(.name == "edge-b") | .certificate_ids[] | select(. == "'"$CERT_ID"'")] | length' '0' \
+    "edge-b, not selected, is entitled to nothing"
+
+# What the followers actually did with it. Each follower tees its log
+# to the shared volume: the push lands as an install line on edge-a
+# and never on edge-b. The metadata replicates to both (the route row
+# does), the KEY to one.
+for attempt in $(seq 1 30); do
+    grep -q "installed certificate keys from the control plane" "$SHARED/edge-a.log" 2>/dev/null && break
+    sleep 2
+done
+if grep -q "installed certificate keys from the control plane" "$SHARED/edge-a.log" 2>/dev/null; then
+    ok "edge-a installed the private key the control plane pushed"
+else
+    fail "edge-a never logged a key install"
+fi
+if grep -q "installed certificate keys from the control plane" "$SHARED/edge-b.log" 2>/dev/null; then
+    fail "edge-b installed a key it is not entitled to"
+else
+    ok "edge-b received no private key"
 fi
 
 # ---------------------------------------------------------------------
@@ -312,5 +392,76 @@ if [ "$LOCAL_OK" = "1" ]; then
 else
     fail "the control plane's own chain did not verify"
 fi
+
+# ---------------------------------------------------------------------
+# Story 9.4 AC #11: break-glass opens a follower and closes again.
+# ---------------------------------------------------------------------
+log "=== 9.4: break-glass on a follower ==="
+
+API="$EDGE_A_API"
+login "$(cat "$SHARED/edge-a_admin_password")"
+
+GLASS=$(api_post /api/v1/cluster/break-glass '{"duration_s":120}')
+assert_json_exists "$GLASS" '.data.until' "break-glass opened on edge-a with a deadline"
+
+CODE=$(curl -sk -b "$SESSION" -o /dev/null -w '%{http_code}' \
+    -X POST -H 'Content-Type: application/json' \
+    -d '{"id":"glass-be","address":"'"$BACKEND1"'","weight":1}' \
+    "$API/api/v1/backends")
+if [ "$CODE" = "201" ]; then
+    ok "a local mutation is admitted while the window is open"
+else
+    fail "a local mutation answered $CODE inside break-glass, expected 201"
+fi
+
+CLOSE=$(curl -sk -b "$SESSION" -o /dev/null -w '%{http_code}' -X DELETE "$API/api/v1/cluster/break-glass")
+if [ "$CLOSE" = "200" ] || [ "$CLOSE" = "204" ]; then
+    ok "break-glass closed"
+else
+    fail "closing break-glass answered $CLOSE"
+fi
+CODE=$(curl -sk -b "$SESSION" -o /dev/null -w '%{http_code}' \
+    -X DELETE "$API/api/v1/backends/glass-be")
+if [ "$CODE" = "409" ]; then
+    ok "the follower is read-only again once the window is closed"
+else
+    fail "a local mutation answered $CODE after break-glass closed, expected 409"
+fi
+
+GLASS=$(api_get /api/v1/cluster/break-glass)
+assert_json "$GLASS" '.data.active' 'false' "edge-a reports its window closed"
+
+API="$CP_API"
+SESSION="$CP_SESSION"
+
+# ---------------------------------------------------------------------
+# Story 9.3 AC #7: revocation ends the session at once, and names the
+# keys it cannot take back (Epic 9 close, security audit).
+# ---------------------------------------------------------------------
+log "=== 9.3: revocation ==="
+
+EDGE_B_ID=$(api_get /api/v1/cluster/nodes | jq -r '.data[] | select(.name == "edge-b") | .node_id')
+REVOKE_B=$(api_del "/api/v1/cluster/nodes/$EDGE_B_ID")
+assert_json "$REVOKE_B" '.data.newly_revoked' 'true' "edge-b revoked"
+assert_json "$REVOKE_B" '.data.session_ended' 'true' "edge-b's live session was ended synchronously"
+assert_json "$REVOKE_B" '.data.certificates_to_reissue | length' '0' \
+    "edge-b held no key, so nothing is to re-issue"
+
+for attempt in $(seq 1 15); do
+    NODES=$(api_get /api/v1/cluster/nodes)
+    B_CONNECTED=$(echo "$NODES" | jq -r '.data[] | select(.name == "edge-b") | .connected')
+    [ "$B_CONNECTED" = "false" ] && break
+    sleep 2
+done
+assert_json "$NODES" '.data[] | select(.name == "edge-b") | .status' 'revoked' \
+    "edge-b is revoked in the roster"
+assert_json "$NODES" '.data[] | select(.name == "edge-b") | .connected' 'false' \
+    "edge-b holds no session any more"
+
+# edge-a holds the fleet certificate's key: revoking it must say so.
+REVOKE_A=$(api_del "/api/v1/cluster/nodes/$EDGE_A_ID")
+assert_json "$REVOKE_A" '.data.newly_revoked' 'true' "edge-a revoked"
+assert_json "$REVOKE_A" '[.data.certificates_to_reissue[] | select(. == "'"$CERT_ID"'")] | length' '1' \
+    "revoking edge-a names the certificate whose key it keeps, for re-issue"
 
 print_results

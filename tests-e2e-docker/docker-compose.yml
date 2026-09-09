@@ -879,7 +879,7 @@ services:
   acme-ca-init:
     build:
       context: ./test-runner
-    profiles: ["acme"]
+    profiles: ["acme", "cluster"]
     user: "0:0"
     entrypoint: ["sh", "/fixtures/gen-pebble-certs.sh"]
     volumes:
@@ -890,7 +890,12 @@ services:
 
   pebble:
     image: ghcr.io/letsencrypt/pebble:2.8.0
-    profiles: ["acme"]
+    # Also in the cluster profile: the PRD names the Pebble fixture a
+    # prerequisite of that profile's certificate assertions, and a
+    # smoke that asserted only the SHAPE of entitlement left Story
+    # 9.5's actual guarantee (the key reaches the selected node and no
+    # other) untested end to end.
+    profiles: ["acme", "cluster"]
     command: ["-config", "/test/pebble-config.json", "-dnsserver", "challtestsrv:8053", "-strict"]
     environment:
       # No artificial validation sleeps: the smoke polls with tight
@@ -917,7 +922,7 @@ services:
   # resolve.
   challtestsrv:
     image: ghcr.io/letsencrypt/pebble-challtestsrv:2.8.0
-    profiles: ["acme"]
+    profiles: ["acme", "cluster"]
     command: ["-defaultIPv4", "", "-defaultIPv6", ""]
     networks:
       - e2e
@@ -984,11 +989,19 @@ services:
       dockerfile: tests-e2e-docker/Dockerfile
     entrypoint: ["/entrypoint-cluster-cp.sh"]
     profiles: ["cluster"]
+    environment:
+      # The control plane runs ACME for the fleet against Pebble, like
+      # `lorica-acme` does alone: trust the fixture CA and use Pebble's
+      # directory path behind the staging alias.
+      - SSL_CERT_FILE=/acme/pebble-ca.pem
+      - LORICA_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/dir
     volumes:
       - lorica-cp-data:/var/lib/lorica
       - shared-cluster:/shared
+      - shared-acme:/acme:ro
     depends_on:
       - backend1
+      - pebble
     networks:
       - e2e
 
@@ -1043,13 +1056,17 @@ services:
       - lorica-cp
       - lorica-edge-a
       - lorica-edge-b
+      - pebble
+      - challtestsrv
     volumes:
       - shared-cluster:/shared:ro
     environment:
       - CP_API=https://lorica-cp:9443
       - EDGE_A_API=https://lorica-edge-a:9443
       - EDGE_A_PROXY=http://lorica-edge-a:8080
+      - EDGE_B_PROXY=http://lorica-edge-b:8080
       - BACKEND1_ADDR=backend1:80
+      - CHALLTESTSRV=http://challtestsrv:8055
       - SHARED_DIR=/shared
     networks:
       - e2e

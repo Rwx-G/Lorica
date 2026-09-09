@@ -33,6 +33,21 @@ say() { echo "$*" | tee -a "$LOGFILE"; }
 # `--data-dir` is a GLOBAL flag: it belongs before the subcommand, not
 # after it. The CA has to exist before the listener starts, or the node
 # comes up as a standalone install and every join is refused.
+# The control plane is the node that runs ACME for the fleet (Story
+# 9.5), against the Pebble fixture the `acme` profile already ships.
+# SSL_CERT_FILE names the fixture CA `acme-ca-init` writes; the client
+# reads it when the trust store is built, so it must exist first.
+if [ -n "${SSL_CERT_FILE:-}" ]; then
+    for i in $(seq 1 60); do
+        [ -f "$SSL_CERT_FILE" ] && break
+        sleep 1
+    done
+    if [ ! -f "$SSL_CERT_FILE" ]; then
+        say "$SSL_CERT_FILE never appeared (acme-ca-init failed?)"
+        exit 1
+    fi
+fi
+
 say "initialising the cluster CA"
 if ! lorica --data-dir "$DATA_DIR" cluster init \
         --common-name "Lorica E2E Cluster CA" 2>&1 | tee -a "$LOGFILE"; then
@@ -40,6 +55,10 @@ if ! lorica --data-dir "$DATA_DIR" cluster init \
     exit 1
 fi
 
+# Harness only: exposes the loopback management API to the runner and
+# the followers, which mint their own tokens through it. An operator's
+# control plane keeps its management API on loopback or behind the TLS
+# listener with a verified certificate.
 socat TCP-LISTEN:9443,fork,reuseaddr TCP:127.0.0.1:19443 &
 
 lorica --data-dir "$DATA_DIR" --management-port 19443 \

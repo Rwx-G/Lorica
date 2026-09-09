@@ -1348,7 +1348,7 @@ sleep 2
 
 mp_counter() {
     local labels="$1"
-    curl -s "$API/metrics" 2>/dev/null \
+    curl -s -b "$SESSION" "$API/metrics" 2>/dev/null \
         | grep "^lorica_supervisor_rpc_outcome_total{${labels}}" \
         | awk '{print $2}' | head -1
 }
@@ -1365,7 +1365,7 @@ sleep 1
 
 # Two scrapes in a row: second should dedup within the 250 ms window
 # but the counter must have incremented at least once.
-curl -s "$API/metrics" > /dev/null 2>&1 || true
+curl -s -b "$SESSION" "$API/metrics" > /dev/null 2>&1 || true
 MP_AFTER=$(mp_counter 'kind="metrics_pull",outcome="ok"')
 MP_AFTER=${MP_AFTER:-0}
 
@@ -1395,7 +1395,7 @@ api_del "/api/v1/backends/$MP_B_ID" >/dev/null 2>&1
 # fires on partial-failure paths so it is soft-checked.
 log "=== 19f. Supervisor RPC Outcomes ==="
 
-RPC_METRICS=$(curl -s "$API/metrics" 2>/dev/null || echo "")
+RPC_METRICS=$(curl -s -b "$SESSION" "$API/metrics" 2>/dev/null || echo "")
 for kind in metrics_pull config_reload_prepare config_reload_commit; do
     if echo "$RPC_METRICS" | grep -q "^lorica_supervisor_rpc_outcome_total{[^}]*kind=\"${kind}\""; then
         ok "Supervisor RPC outcome: kind=${kind} is exposed"
@@ -1408,7 +1408,7 @@ done
 # least once (an empty-state PUT counts as a reload).
 api_put "/api/v1/settings" "{}" >/dev/null 2>&1 || true
 sleep 1
-RPC_RELOAD_OK=$(curl -s "$API/metrics" 2>/dev/null \
+RPC_RELOAD_OK=$(curl -s -b "$SESSION" "$API/metrics" 2>/dev/null \
     | grep '^lorica_supervisor_rpc_outcome_total{[^}]*kind="config_reload_commit",outcome="ok"' \
     | awk '{print $2}' | head -1)
 RPC_RELOAD_OK=${RPC_RELOAD_OK:-0}
@@ -1449,7 +1449,7 @@ FAC_R_ID=$(echo "$FAC_R" | jq -r '.data.id')
 sleep 2
 
 fac_hit_count() {
-    curl -s "$API/metrics" 2>/dev/null \
+    curl -s -b "$SESSION" "$API/metrics" 2>/dev/null \
         | grep '^lorica_forward_auth_cache_total{[^}]*outcome="hit"' \
         | awk '{ sum += $2 } END { print sum+0 }'
 }

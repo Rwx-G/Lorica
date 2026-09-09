@@ -367,7 +367,7 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
 
     docker compose --profile cluster up $BUILD_FLAG -d \
-        backend1 lorica-cp lorica-edge-a lorica-edge-b
+        backend1 challtestsrv pebble lorica-cp lorica-edge-a lorica-edge-b
 
     # The followers mint and redeem a real join token before they start,
     # so readiness here means the whole enrolment handshake completed,
