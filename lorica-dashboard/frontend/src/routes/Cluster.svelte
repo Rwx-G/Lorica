@@ -3,7 +3,7 @@
 
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { api } from '../lib/api';
-  import type { MintedTokenResponse } from '../lib/api';
+  import type { CertificateResponse, MintedTokenResponse } from '../lib/api';
   import { isSuperAdmin } from '../lib/auth';
   import {
     clusterStatus,
@@ -12,6 +12,8 @@
     secondsUntil,
     type ClusterNodeResponse,
     type ClusterStatus,
+    type FleetBanRow,
+    type FleetWafRow,
   } from '../lib/cluster';
   import { showToast } from '../lib/toast';
 
@@ -26,6 +28,64 @@
 
   let selected = $state<ClusterNodeResponse | null>(null);
   let revoking = $state<ClusterNodeResponse | null>(null);
+
+  // Drawer contents (AC #3), loaded per node rather than with the
+  // roster: the roster refreshes every ten seconds for every node, and
+  // these three reads are only worth making for the one node an
+  // operator has open.
+  const DRAWER_EVENTS = 10;
+  let drawerWaf = $state<FleetWafRow[]>([]);
+  let drawerBans = $state<FleetBanRow[]>([]);
+  let certificates = $state<CertificateResponse[]>([]);
+  /** The node id `loadDrawer` last ran for, so a roster poll that
+      replaces the `selected` object does not refetch everything. */
+  let drawerLoadedFor: string | null = null;
+
+  async function loadDrawer(nodeId: string) {
+    const [waf, bans, certs] = await Promise.all([
+      api.getFleetWafEvents({ node: nodeId, limit: DRAWER_EVENTS }),
+      api.getFleetBans(nodeId),
+      api.listCertificates(),
+    ]);
+    drawerWaf = waf.data?.rows ?? [];
+    drawerBans = bans.data ?? [];
+    certificates = certs.data?.certificates ?? [];
+  }
+
+  $effect(() => {
+    const id = selected?.node.node_id ?? null;
+    if (id === null) {
+      drawerLoadedFor = null;
+      return;
+    }
+    if (id === drawerLoadedFor) return;
+    drawerLoadedFor = id;
+    drawerWaf = [];
+    drawerBans = [];
+    void loadDrawer(id);
+  });
+
+  /**
+   * The certificates whose private keys this node receives.
+   *
+   * Derived rather than reported: nothing records what was pushed to
+   * whom. A route selector naming the node is what makes the control
+   * plane send that hostname's key (Story 9.5 D15), so intersecting
+   * the node's selecting hostnames with each certificate's subject
+   * names reproduces the same rule the push path applies. A node that
+   * is still `pending` matches hostnames it has not been sent yet,
+   * which is the point of showing this before activating it.
+   */
+  function certificatesFor(node: ClusterNodeResponse): CertificateResponse[] {
+    const wanted = new Set(node.selected_for_hostnames);
+    return certificates.filter(
+      (c) => wanted.has(c.domain) || c.san_domains.some((d) => wanted.has(d)),
+    );
+  }
+
+  function daysUntil(iso: string): number {
+    return Math.floor((Date.parse(iso) - Date.now()) / 86_400_000);
+  }
 
   // Token dialog.
   let showMint = $state(false);
@@ -278,6 +338,86 @@
       </section>
     {/if}
 
+    <section class="drawer-section">
+      <h3>Certificates</h3>
+      {#if certificatesFor(node).length === 0}
+        <p class="muted">
+          No route selector names this node, so it receives no certificate
+          keys.
+        </p>
+      {:else}
+        <table class="mini-table">
+          <thead>
+            <tr><th>Subject</th><th>Expires</th></tr>
+          </thead>
+          <tbody>
+            {#each certificatesFor(node) as cert (cert.id)}
+              {@const days = daysUntil(cert.not_after)}
+              <tr>
+                <td class="mono">{cert.domain}</td>
+                <td class:expiry-warn={days < 30} class:expiry-crit={days < 7}>
+                  {#if days < 0}
+                    expired
+                  {:else}
+                    {days}d
+                  {/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+    </section>
+
+    <section class="drawer-section">
+      <h3>Recent WAF events</h3>
+      {#if drawerWaf.length === 0}
+        <p class="muted">Nothing this node reported.</p>
+      {:else}
+        <table class="mini-table">
+          <thead>
+            <tr><th>Time</th><th>Client</th><th>Rule</th><th>Action</th></tr>
+          </thead>
+          <tbody>
+            {#each drawerWaf as event (event.id)}
+              <tr>
+                <td class="mono">{event.timestamp}</td>
+                <td class="mono">{event.client_ip}</td>
+                <td class="mono">{event.rule_id}</td>
+                <td>{event.action}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+    </section>
+
+    <section class="drawer-section">
+      <h3>Bans this node holds</h3>
+      {#if drawerBans.length === 0}
+        <p class="muted">None reported.</p>
+      {:else}
+        <table class="mini-table">
+          <thead>
+            <tr><th>Client</th><th>Reason</th><th>Expires in</th></tr>
+          </thead>
+          <tbody>
+            {#each drawerBans as ban (ban.client_ip)}
+              <tr>
+                <td class="mono">{ban.client_ip}</td>
+                <td>{ban.reason}</td>
+                <td>{ban.remaining_s}s</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+        <p class="muted">
+          A snapshot of what this node last reported. Bans live in its memory,
+          so a restart clears them, and lifting one is done on that node.
+        </p>
+      {/if}
+    </section>
+
     {#if superAdmin && node.node.status !== 'revoked'}
       <footer class="drawer-footer">
         <button class="btn-danger" onclick={() => (revoking = node)}>Revoke node</button>
@@ -381,6 +521,40 @@
 {/if}
 
 <style>
+  .drawer-section {
+    border-top: 1px solid var(--color-border);
+    padding-top: 0.75rem;
+    margin-top: 0.75rem;
+  }
+  .drawer-section h3 {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-muted);
+    margin: 0 0 0.5rem;
+  }
+  .mini-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  .mini-table th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--color-text-muted);
+    padding-bottom: 0.25rem;
+  }
+  .mini-table td {
+    padding: 0.2rem 0.4rem 0.2rem 0;
+    border-top: 1px solid var(--color-border);
+  }
+  .expiry-warn {
+    color: var(--color-orange);
+  }
+  .expiry-crit {
+    color: var(--color-red);
+    font-weight: 600;
+  }
   .page {
     padding: 1.5rem;
   }
