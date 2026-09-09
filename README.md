@@ -701,7 +701,7 @@ runs them all in sequence; each `--skip-<profile>` flag drops one.
 
 | Profile | Assertions | What it proves |
 |---|---|---|
-| base (single-process) | 348 | routing, TLS, WAF, rate limits, cache, SLA, load tests, ACME challenge path, `/metrics` gated by default |
+| base (single-process) | 361 | routing, TLS, WAF, rate limits, cache, SLA, load tests, ACME challenge path, `/metrics` gated by default |
 | workers | 90 | the same under `--workers 2`: two-phase reload, cross-worker breaker, shmem auto-ban, metrics pull-on-scrape, forward-auth cache |
 | cert-export | 39 | PEM disk export, ACL, reapply, orphans |
 | ai-bot, ai-bot-workers | 52, 49 | AI crawler verdicts, robots.txt, verified-bot headers, in both modes |
