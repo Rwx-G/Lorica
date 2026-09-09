@@ -94,7 +94,7 @@ static CERT_EXPIRY_DAYS: Lazy<GaugeVec> = Lazy::new(|| {
 /// stable from v1.7.0.
 static CLUSTER_CONNECTION_STATE: Lazy<GaugeVec> = Lazy::new(|| {
     lorica_metrics::register_gauge_vec(
-        "lorica_cluster_connection_state",
+        "cluster_connection_state",
         "Cluster-plane connection state per node (1 = in this state)",
         &["node_id", "state"],
     )
@@ -103,7 +103,7 @@ static CLUSTER_CONNECTION_STATE: Lazy<GaugeVec> = Lazy::new(|| {
 /// Cluster RPC outcomes. Labels: direction, method, outcome.
 static CLUSTER_RPC_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
-        "lorica_cluster_rpc_total",
+        "cluster_rpc_total",
         "Cluster-plane RPCs by direction, method and outcome",
         &["direction", "method", "outcome"],
     )
@@ -114,7 +114,7 @@ static CLUSTER_RPC_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// rest of the AC #12 contract.
 static CLUSTER_RPC_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     lorica_metrics::register_histogram_vec(
-        "lorica_cluster_rpc_duration_seconds",
+        "cluster_rpc_duration_seconds",
         "Cluster-plane RPC latency in seconds",
         &["direction", "method"],
         vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
@@ -125,7 +125,7 @@ static CLUSTER_RPC_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
 /// AC #3). Labels: reason, a fixed vocabulary.
 static CLUSTER_PREAUTH_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
-        "lorica_cluster_preauth_rejections_total",
+        "cluster_preauth_rejections_total",
         "Enrollment connections dropped by a pre-authentication budget",
         &["reason"],
     )
@@ -135,7 +135,7 @@ static CLUSTER_PREAUTH_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// Labels: outcome (granted|refused).
 static CLUSTER_ENROLLMENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
-        "lorica_cluster_enrollments_total",
+        "cluster_enrollments_total",
         "Join-token redemptions by outcome",
         &["outcome"],
     )
@@ -146,7 +146,7 @@ static CLUSTER_ENROLLMENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// (operational|enrollment).
 static CLUSTER_ACCEPT_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
-        "lorica_cluster_accept_errors_total",
+        "cluster_accept_errors_total",
         "Cluster listener accept() failures",
         &["listener"],
     )
@@ -156,7 +156,7 @@ static CLUSTER_ACCEPT_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// ran: the volume on the product's only unauthenticated surface.
 static CLUSTER_ENROLLMENT_CONNECTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     lorica_metrics::register_int_counter(
-        "lorica_cluster_enrollment_connections_total",
+        "cluster_enrollment_connections_total",
         "Connections accepted by the enrollment listener",
     )
 });
@@ -165,7 +165,7 @@ static CLUSTER_ENROLLMENT_CONNECTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
 /// was live (retried on a bounded backoff).
 static CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     lorica_metrics::register_int_counter(
-        "lorica_cluster_enrollment_bind_failures_total",
+        "cluster_enrollment_bind_failures_total",
         "Enrollment listener bind failures while a join token was live",
     )
 });
@@ -174,7 +174,7 @@ static CLUSTER_ENROLLMENT_BIND_FAILURES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
 /// (1) or closed (0).
 static CLUSTER_ENROLLMENT_LISTENER_OPEN: Lazy<IntGauge> = Lazy::new(|| {
     lorica_metrics::register_int_gauge(
-        "lorica_cluster_enrollment_listener_open",
+        "cluster_enrollment_listener_open",
         "1 while the enrollment listener is bound (a join token is live), else 0",
     )
 });
@@ -185,7 +185,7 @@ static CLUSTER_ENROLLMENT_LISTENER_OPEN: Lazy<IntGauge> = Lazy::new(|| {
 /// never reports a stale generation).
 static CLUSTER_CONFIG_GENERATION: Lazy<IntGaugeVec> = Lazy::new(|| {
     lorica_metrics::register_int_gauge_vec(
-        "lorica_cluster_config_generation",
+        "cluster_config_generation",
         "Configuration generation applied by each connected cluster node",
         &["node_id"],
     )
@@ -196,7 +196,7 @@ static CLUSTER_CONFIG_GENERATION: Lazy<IntGaugeVec> = Lazy::new(|| {
 /// pull_failed | refused`).
 static CLUSTER_CONFIG_APPLY_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
-        "lorica_cluster_config_apply_total",
+        "cluster_config_apply_total",
         "Configuration replication outcomes per cluster node",
         &["node_id", "outcome"],
     )
@@ -207,7 +207,7 @@ static CLUSTER_CONFIG_APPLY_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// evaluation task.
 static CLUSTER_DRIFT_NODES: Lazy<IntGauge> = Lazy::new(|| {
     lorica_metrics::register_int_gauge(
-        "lorica_cluster_drift_nodes",
+        "cluster_drift_nodes",
         "Cluster nodes whose applied configuration differs from the current one",
     )
 });
@@ -253,7 +253,7 @@ pub fn inc_cluster_config_apply(node_id: &str, outcome: &str) {
 /// Bounded cardinality: fleet size times two.
 static CLUSTER_TELEMETRY_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
-        "lorica_cluster_telemetry_dropped_total",
+        "cluster_telemetry_dropped_total",
         "Telemetry rows the control plane did not store, by node and reason",
         &["node_id", "reason"],
     )
@@ -276,7 +276,7 @@ pub fn inc_cluster_telemetry_dropped(node_id: &str, reason: &str, rows: u64) {
 /// shed.
 static CLUSTER_TELEMETRY_INGESTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
-        "lorica_cluster_telemetry_ingested_total",
+        "cluster_telemetry_ingested_total",
         "Telemetry rows the control plane stored, by node",
         &["node_id"],
     )
@@ -317,7 +317,7 @@ pub fn set_cluster_drift_nodes(count: usize) {
 /// the same certificate twice under the same outcome.
 static CLUSTER_CERT_PUSH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
-        "lorica_cluster_cert_push_total",
+        "cluster_cert_push_total",
         "Certificate distribution outcomes per cluster node, counted per certificate",
         &["node_id", "outcome"],
     )
@@ -2079,6 +2079,32 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Epic 9 close: every cluster family was registered with a
+    /// `lorica_` prefix while the registry adds the `lorica` namespace
+    /// itself, so `/metrics` exported `lorica_lorica_cluster_*` from
+    /// Story 9.2 on and no scrape ever matched the documented names.
+    /// Found by the cluster load phase, the first e2e to read one.
+    #[test]
+    fn cluster_metric_families_carry_the_namespace_once() {
+        inc_cluster_config_apply("node-namespace-test", "committed");
+        inc_cluster_telemetry_ingested("node-namespace-test", 1);
+        let names: Vec<String> = REGISTRY
+            .gather()
+            .iter()
+            .map(|family| family.name().to_string())
+            .collect();
+        for expected in [
+            "lorica_cluster_config_apply_total",
+            "lorica_cluster_telemetry_ingested_total",
+        ] {
+            assert!(names.iter().any(|n| n == expected), "{expected} missing from {names:?}");
+        }
+        assert!(
+            !names.iter().any(|n| n.starts_with("lorica_lorica_")),
+            "a family carries the namespace twice: {names:?}"
+        );
+    }
 
     #[test]
     fn per_worker_counter_resolver_matches_registered_arity() {

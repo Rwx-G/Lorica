@@ -39,6 +39,10 @@ Author: Rwx-G
 
 - Per-node SLA on a control plane (Story 9.7 AC #5): `?node=<node_id>` on `GET /api/v1/sla/overview`, `/sla/routes/{id}`, `/sla/routes/{id}/buckets` and `/sla/routes/{id}/active` returns that follower's own figures, computed on the follower over its cluster session (`SlaPull`, protocol tag 42). The SLA page carries the node filter in single-node mode. Nothing is aggregated across nodes: a fleet percentile is not a function of per-node percentiles, and that is stated rather than approximated.
 
+### Fixed
+
+- The fifteen `lorica_cluster_*` Prometheus families were exported as `lorica_lorica_cluster_*`: they were registered with the `lorica_` prefix while the registry adds the namespace itself. Every name `docs/cluster.md` documents now matches what `/metrics` serves. Found by the cluster e2e load phase, the first test to read one of them.
+
 ### Changed
 
 - `/metrics` now requires authentication by default (Epic 9 close, the flip v1.6.0 announced). `metrics_require_auth` defaults to `true`: a scrape must present a dashboard session cookie or the bearer token in `prometheus_scrape_token` (or `LORICA_PROMETHEUS_SCRAPE_TOKEN`), and an unauthenticated one answers `401` with `WWW-Authenticate: Bearer realm="lorica-metrics"`. **Migration:** an install that never changed this setting has no stored value, so it takes the new default on upgrade and its existing scrape job breaks on the first boot of v1.7.0. Before upgrading, either configure the token and add the `Authorization: Bearer` header to the scrape job, or set `metrics_require_auth = false` explicitly to keep the v1.6.0 behaviour. An install that had already set the value either way is unaffected: a stored value always wins over the default. The ACME HTTP-01 challenge endpoint stays public.
