@@ -149,14 +149,19 @@ assert_json_gt "$NODES" '[.data[] | select(.resources.memory_total_bytes > 0)] |
 log "=== 9.4: configuration replication ==="
 
 BACKEND=$(api_post /api/v1/backends \
-    "{\"id\":\"cluster-be\",\"address\":\"$BACKEND1\",\"weight\":1}")
+    "{\"name\":\"cluster-be\",\"address\":\"$BACKEND1\",\"weight\":1}")
 assert_json_exists "$BACKEND" '.data.id' "the backend was created on the control plane"
+# Ids are server-assigned: a route naming a backend by a made-up id
+# has no backend at all and answers 502 everywhere. The first runs of
+# this profile did exactly that and never noticed, because nothing
+# asserted the status of a request through the route.
+BACKEND_ID=$(echo "$BACKEND" | jq -r '.data.id')
 
 # `node_selector: ["edge-a"]` is the Story 9.5 lever: only that node is
 # entitled to this route's certificate key.
 ROUTE=$(api_post /api/v1/routes \
     '{"id":"cluster-route","hostname":"fleet.example.com","path_prefix":"/",
-      "backends":["cluster-be"],"load_balancing":"round_robin",
+      "backends":["'"$BACKEND_ID"'"],"load_balancing":"round_robin",
       "waf_enabled":true,"enabled":true,"node_selector":["edge-a"]}')
 assert_json_exists "$ROUTE" '.data.id' "the selected route was created"
 # The id in the body is not honoured; routes get a server-assigned id.
@@ -219,9 +224,16 @@ fi
 # ---------------------------------------------------------------------
 log "=== 9.6: telemetry fan-in ==="
 
+SERVED=0
 for i in $(seq 1 5); do
-    curl -s -o /dev/null -H 'Host: fleet.example.com' "$EDGE_A_PROXY/" || true
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: fleet.example.com' "$EDGE_A_PROXY/" || true)
+    [ "$CODE" = "200" ] && SERVED=$((SERVED + 1))
 done
+if [ "$SERVED" = "5" ]; then
+    ok "edge-a serves the replicated route end to end (5/5 answered 200)"
+else
+    fail "edge-a answered 200 to $SERVED/5 requests through the replicated route"
+fi
 # One request the WAF blocks, so a WAF event exists to fan in.
 curl -s -o /dev/null -H 'Host: fleet.example.com' \
     "$EDGE_A_PROXY/?id=1%20OR%201=1--" || true
@@ -458,13 +470,20 @@ API="$CP_API"
 SESSION="$CP_SESSION"
 EDGE_B_ID=$(api_get /api/v1/cluster/nodes | jq -r '.data[] | select(.name == "edge-b") | .node_id')
 
+# The session cookie is scoped `Path=/api`, so a cookie JAR never sends
+# it to /metrics (the first run of this phase read every counter as 0
+# through a silent 401). The value is sent as an explicit header
+# instead, which is what the base suite does too.
+cp_cookie_header() {
+    awk -F'\t' '$6 == "lorica_session" { print "Cookie: " $6 "=" $7 }' "$CP_SESSION" | head -1
+}
 ingested_for() {
-    curl -sk -b "$CP_SESSION" "$CP_API/metrics" 2>/dev/null \
+    curl -sk -H "$(cp_cookie_header)" "$CP_API/metrics" 2>/dev/null \
         | grep "^lorica_cluster_telemetry_ingested_total{node_id=\"$1\"}" \
         | awk '{print $2}' | head -1
 }
 dropped_quota_for() {
-    curl -sk -b "$CP_SESSION" "$CP_API/metrics" 2>/dev/null \
+    curl -sk -H "$(cp_cookie_header)" "$CP_API/metrics" 2>/dev/null \
         | grep "^lorica_cluster_telemetry_dropped_total{node_id=\"$1\",reason=\"node_quota\"}" \
         | awk '{print $2}' | head -1
 }
@@ -545,6 +564,12 @@ if [ "$B_GOT" -ge $((B_ROWS * 95 / 100)) ]; then
     ok "the drain kept up with edge-b ($B_GOT/$B_ROWS rows fanned in)"
 else
     fail "the drain fell behind edge-b ($B_GOT/$B_ROWS rows fanned in)"
+fi
+SCRAPE_CODE=$(curl -sk -o /dev/null -w '%{http_code}' -H "$(cp_cookie_header)" "$CP_API/metrics")
+if [ "$SCRAPE_CODE" = "200" ]; then
+    ok "the control plane's /metrics answers the session (HTTP 200)"
+else
+    fail "the control plane's /metrics answered $SCRAPE_CODE to the session; the counters below are meaningless"
 fi
 A_DROP=$(dropped_quota_for "$EDGE_A_ID"); B_DROP=$(dropped_quota_for "$EDGE_B_ID")
 if [ "${A_DROP:-0}" = "0" ] || [ -z "$A_DROP" ]; then
