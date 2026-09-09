@@ -202,6 +202,12 @@ with `--cluster-auto-activate` skips that step; the flag is logged at
 WARN because it turns a one-hour token into a fleet member without an
 operator looking.
 
+Activation takes effect on the node's open session at once: the next
+replication round targets it, and its pulls and pushes are served from
+the next request. It does not need to reconnect. It did, once, and the
+roster and the dashboard said active while the node was refused
+everything; the `cluster` e2e profile found it on its first run.
+
 ### Identity, renewal, revocation
 
 A node's identity is the SHA-256 fingerprint of its certificate,

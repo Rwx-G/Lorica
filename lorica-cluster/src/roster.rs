@@ -151,11 +151,24 @@ pub struct LiveSession {
     pub build_version: String,
     /// The node's reported schema version.
     pub schema_version: u32,
-    /// The roster state the node held when the session was admitted.
+    /// The node's roster state, as of the last roster refresh.
+    ///
+    /// A cell rather than a value captured at admission, and the
+    /// difference is the difference between activation working and
+    /// not. A node enrols, is admitted `Pending`, and the operator
+    /// activates it through the API while the session is open. The
+    /// roster row flips; if the session kept the state it was admitted
+    /// under, every gate that consults it (configuration pull,
+    /// certificate pull, telemetry push, the replication coordinator's
+    /// target list) would keep refusing that node until it happened to
+    /// reconnect. The dashboard would say active, the roster would say
+    /// active, and the node would receive nothing. The first run of
+    /// the `cluster` e2e profile is where that showed.
+    ///
     /// The replication coordinator addresses [`NodeState::Active`]
     /// sessions only: a `Pending` node is visible and alive but no
     /// configuration flows to it (Story 9.3 AC #5).
-    pub state: NodeState,
+    state: Mutex<NodeState>,
     /// A clone of the session's RPC endpoint, so the control plane can
     /// PUSH configuration down an established session (Story 9.4 D5)
     /// instead of waiting to be asked.
@@ -186,7 +199,7 @@ impl std::fmt::Debug for LiveSession {
             .field("last_seen_unix", &self.last_seen_unix)
             .field("build_version", &self.build_version)
             .field("schema_version", &self.schema_version)
-            .field("state", &self.state)
+            .field("state", &self.state())
             .field("applied", &self.applied())
             .finish_non_exhaustive()
     }
@@ -196,6 +209,18 @@ impl LiveSession {
     /// Record activity now.
     pub fn touch(&self) {
         self.last_seen_unix.store(unix_now(), Ordering::Relaxed);
+    }
+
+    /// The node's roster state as of the last refresh.
+    pub fn state(&self) -> NodeState {
+        *self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn set_state(&self, state: NodeState) -> bool {
+        let mut current = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = *current != state;
+        *current = state;
+        changed
     }
 
     /// Replace what this node is known to run.
@@ -337,7 +362,7 @@ impl SessionRegistry {
             last_seen_unix: AtomicU64::new(unix_now()),
             build_version: build_version.to_string(),
             schema_version,
-            state: identity.state,
+            state: Mutex::new(identity.state),
             endpoint,
             applied: Mutex::new(applied),
             resources: Mutex::new(None),
@@ -370,7 +395,7 @@ impl SessionRegistry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .filter(|(_, session)| session.state == NodeState::Active)
+            .filter(|(_, session)| session.state() == NodeState::Active)
             .map(|(node_id, session)| {
                 (
                     node_id.clone(),
@@ -495,11 +520,41 @@ impl SessionRegistry {
                 last_seen_unix: s.last_seen_unix.load(Ordering::Relaxed),
                 build_version: s.build_version.clone(),
                 schema_version: s.schema_version,
-                state: s.state,
+                state: s.state(),
                 applied: s.applied(),
                 resources: s.resources(),
             })
             .collect()
+    }
+
+    /// Bring every live session's state in line with `roster`
+    /// (the fix the `cluster` e2e profile's first run demanded).
+    ///
+    /// Called from every roster refresh, which is what an activation,
+    /// a revocation and a leave all end with. A session whose node is
+    /// no longer in the roster is left alone: revocation and leave end
+    /// it through [`SessionRegistry::kill`], and a state this method
+    /// invented for a node the roster does not know would be a state
+    /// nobody chose.
+    ///
+    /// Returns how many sessions changed state, for the refresh log.
+    pub fn reconcile_states(&self, roster: &HashMap<String, NodeIdentity>) -> usize {
+        // The roster is keyed by certificate fingerprint; sessions are
+        // keyed by node id. Fold to the key the sessions use.
+        let by_node: HashMap<&str, NodeState> = roster
+            .values()
+            .map(|identity| (identity.node_id.as_str(), identity.state))
+            .collect();
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(node_id, session)| {
+                by_node
+                    .get(node_id.as_str())
+                    .is_some_and(|state| session.set_state(*state))
+            })
+            .count()
     }
 
     /// Live sessions.
@@ -779,6 +834,16 @@ impl ControlPlane {
 
     /// Replace the roster and refresh the fleet-size hint.
     pub fn replace_roster(&self, _guard: &RefreshGuard<'_>, entries: HashMap<String, NodeIdentity>) {
+        // Sessions first, roster second, so a gate that reads both
+        // during the swap cannot see a roster that says Active beside
+        // a session that still says Pending.
+        let flipped = self.sessions.reconcile_states(&entries);
+        if flipped > 0 {
+            tracing::info!(
+                sessions = flipped,
+                "live sessions brought in line with the refreshed roster"
+            );
+        }
         self.roster.replace(entries);
         let size = u32::try_from(self.roster.len()).unwrap_or(u32::MAX);
         self.fleet_size.store(size, Ordering::Relaxed);
@@ -981,6 +1046,56 @@ mod tests {
             .expect("killed resolves");
         assert!(!registry.kill("node-a"), "nothing left to kill");
         assert!(registry.snapshot().is_empty());
+    }
+
+    /// The first run of the `cluster` e2e profile: a node admitted
+    /// `Pending`, activated through the API while its session was open,
+    /// stayed `Pending` in the registry and was refused everything until
+    /// it reconnected, while the roster and the dashboard said active.
+    #[tokio::test]
+    async fn a_roster_refresh_flips_a_live_session_s_state() {
+        let registry = SessionRegistry::new();
+        let _guard = register(
+            &registry,
+            "node-a",
+            NodeState::Pending,
+            AppliedConfig::default(),
+        );
+        assert!(
+            registry.active_sessions().is_empty(),
+            "a pending node is never a replication target"
+        );
+
+        // The operator activated it: the refreshed roster says Active.
+        let mut roster: HashMap<String, NodeIdentity> = HashMap::new();
+        roster.insert(
+            "fingerprint-a".to_string(),
+            identity("node-a", NodeState::Active),
+        );
+        assert_eq!(registry.reconcile_states(&roster), 1, "one session changed");
+        assert_eq!(
+            registry.reconcile_states(&roster),
+            0,
+            "a second refresh with the same roster changes nothing"
+        );
+
+        let targets: Vec<String> = registry
+            .active_sessions()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(targets, vec!["node-a".to_string()]);
+        assert_eq!(
+            registry.snapshot()[0].state,
+            NodeState::Active,
+            "the API's view follows the roster without a reconnect"
+        );
+
+        // A session the roster no longer knows is left alone: revocation
+        // ends it through `kill`, not through an invented state.
+        let empty: HashMap<String, NodeIdentity> = HashMap::new();
+        assert_eq!(registry.reconcile_states(&empty), 0);
+        assert_eq!(registry.snapshot()[0].state, NodeState::Active);
     }
 
     #[tokio::test]

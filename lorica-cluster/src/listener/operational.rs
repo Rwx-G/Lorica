@@ -720,6 +720,23 @@ struct SessionTally {
     cert_pulls: u32,
 }
 
+/// Whether the node behind this session is `Active` NOW.
+///
+/// The live registry entry is consulted first, because it is the copy
+/// a roster refresh updates; the identity captured at admission is the
+/// fallback for a session that has no registry entry, which no
+/// operational request should have. Reading only the captured copy is
+/// the bug the `cluster` e2e profile found on its first run: a node
+/// activated while its session was open stayed `Pending` in the eyes
+/// of every gate here until it reconnected, while the roster and the
+/// dashboard both said active.
+fn node_is_active(ctx: &SessionContext, guard: Option<&SessionGuard>) -> bool {
+    match guard {
+        Some(guard) => guard.entry().state() == NodeState::Active,
+        None => ctx.node.as_ref().map(|n| n.state) == Some(NodeState::Active),
+    }
+}
+
 /// Serve one inbound request; `Some` ends the session.
 async fn serve_request(
     request: IncomingRequest<ClusterFrame>,
@@ -777,7 +794,7 @@ async fn serve_request(
             // blob to anyone who redeemed a join token, and the
             // activation review an operator performs would protect
             // nothing.
-            if ctx.node.as_ref().map(|n| n.state) != Some(NodeState::Active) {
+            if !node_is_active(ctx, guard) {
                 stats.config_pull_refusals.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     peer = %ctx.peer_addr,
@@ -843,7 +860,7 @@ async fn serve_request(
             // apply. A node awaiting activation is visible and alive,
             // but nothing it says belongs in the fleet's record of
             // what happened.
-            if ctx.node.as_ref().map(|n| n.state) != Some(NodeState::Active) {
+            if !node_is_active(ctx, guard) {
                 stats.telemetry_push_refusals.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     peer = %ctx.peer_addr,
@@ -887,7 +904,7 @@ async fn serve_request(
             // reason is stronger here: a node awaiting operator
             // activation is visible and alive, and what it would
             // receive on this path is private keys.
-            if ctx.node.as_ref().map(|n| n.state) != Some(NodeState::Active) {
+            if !node_is_active(ctx, guard) {
                 stats.cert_pull_refusals.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     peer = %ctx.peer_addr,
