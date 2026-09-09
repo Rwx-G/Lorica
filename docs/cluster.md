@@ -554,11 +554,235 @@ On a follower the export runs when a key is installed, not when
 configuration is applied. Exporting at apply time would write an empty
 private-key file for every certificate whose key had not arrived yet.
 
-## Node Identity in Telemetry
+## Telemetry Fan-In
 
-Log-sink events (RFC 5424 syslog and OTLP) carry the emitting node's
-identity via the sink configuration's node-identity fields, so a
-collector receiving the whole fleet's stream can attribute every event
-to its node. Fleet metrics label series with the server-side `node_id`
-recorded at enrollment, never a node-supplied name, so a compromised
-follower cannot mint unbounded label cardinality.
+Every node keeps its own logs. A follower additionally ships them to
+the control plane, so one place can answer "what happened across the
+fleet at 03:14" without three SSH sessions.
+
+### What travels, and what stamps it
+
+Access-log rows and WAF events travel; so does a snapshot of the live
+bans. Nothing else. Audit entries are Story 9.9's, and they need a
+different mechanism because the audit chain cannot simply be copied.
+
+**No message carries a node identity.** The control plane stamps every
+row it stores with the `node_id` that node's mutual-TLS session
+proved. A node id in the payload would be a node-supplied identity,
+and a compromised follower could then file rows under another node's
+name, which is precisely the confusion an incident view must not
+have. It is the same rule the node name follows at enrollment.
+
+For the same reason the LOCAL tables on each node carry no `node_id`
+column: in a per-node database that value is a constant, and paying
+per-row storage on the request path to record a constant is waste.
+
+### Where it lands
+
+In `cluster-telemetry.db`, beside `lorica.db` and `access-log.db` in
+the data directory, with its own connection.
+
+Not in the control plane's own access-log database, and the reason is
+arithmetic. That store is one connection behind one mutex shared by
+every insert, every dashboard query, every retention pass and the
+audit verify. Fan-in multiplies the write rate by the fleet size, and
+the control plane serves its own traffic on top. Putting the fleet's
+telemetry there would make the fleet's traffic volume a latency input
+to the control plane's own dashboard and audit paths.
+
+### The drain never touches the request path
+
+A follower's request path writes to its local log store exactly as a
+standalone node does. A background task on the supervisor then walks
+that store by row id and ships batches every ten seconds.
+
+That store already is a bounded, drop-on-overflow buffer written off
+the hot path, shared across worker processes, with its own drop
+counter. Putting a second queue in front of it would have duplicated a
+bound that already exists and still not solved worker mode, where the
+ban map and the log writer live in the worker processes while the
+cluster connection lives in the supervisor.
+
+With the control plane unreachable the drain simply stops advancing
+its cursor. Nothing is queued and nothing grows: the rows wait in the
+local store, where local retention bounds them exactly as it does on a
+standalone node. The cursor is persisted, so a restart does not
+re-send everything retention still holds, and a node that has never
+drained starts at the present rather than replaying its history.
+
+The cursor advances only past what the control plane **accepted**. If
+a quota sheds part of a batch, the cursor stays behind and those rows
+are offered again on the next tick.
+
+### The ceiling, stated rather than discovered
+
+SQLite is not a fleet log sink, and access-log fan-in is the part that
+tests that. Write amplification is exactly N: every request is written
+once on its own node and once on the control plane, which is also
+serving its own traffic.
+
+The supported envelope for access-log fan-in is **up to five nodes at
+a sustained few hundred requests per second each**. This figure is
+derived from the write ceiling the log-writer module documents for
+SQLite with batched inserts, halved for the retention passes and
+dashboard queries that contend for the same connection. It has not
+been measured on production hardware, and that is stated plainly here
+rather than implied by a number that looks measured.
+
+Beyond that envelope, the supported topology is: **fan in WAF events,
+bans and health, and send access logs to the Story 9.8 syslog or OTLP
+sinks instead.** WAF events are orders of magnitude rarer than access
+rows, so they fan in comfortably at any fleet size this product
+targets. That split is a supported configuration, not a degraded one.
+
+### Retention is per node
+
+Each node gets its own row budget in the fan-in database, not a share
+of a global one.
+
+A global cap would make the fleet view shallower than each node's own
+local log, and would let one noisy edge evict every quiet edge's rows
+— exactly the incident-correlation case fan-in exists for. Retention
+deletes in chunks and releases the database lock between them, so a
+large reclaim does not stall ingest.
+
+### What protects the control plane
+
+The follower-side bound protects the follower. Two separate
+mechanisms protect the control plane, because they answer different
+questions.
+
+A **per-node quota** bounds rows and bytes per minute for each node
+independently. Bytes as well as rows, because rows are variable length
+and a node sending maximum-length paths in every row costs far more
+disk than the same count of ordinary ones. A node over its budget has
+the excess dropped and counted; the others are unaffected.
+
+A **storage watermark** sheds every node at once when the fan-in
+database reaches its cap, including a node well inside its quota. It
+caps that database's own size rather than watching free disk: free
+disk moves for reasons that have nothing to do with the fleet, so a
+floor on it would shed telemetry because something else filled the
+volume, and would keep accepting long after the database had become
+unmanageable. Reaching the cap means retention is not keeping up, and
+shedding is what stops the growth while an operator finds out why.
+
+Telemetry is the first thing dropped and configuration and audit
+writes are the last. A fleet that cannot record what happened is
+inconvenient; a fleet that cannot be configured or audited is broken.
+
+Both mechanisms are visible:
+`lorica_cluster_telemetry_dropped_total{node_id, reason}` separates
+one node over its budget (`node_quota`) from the watermark shedding
+everyone (`storage_watermark`), and
+`lorica_cluster_telemetry_ingested_total{node_id}` is the denominator
+without which a drop count says nothing.
+
+### Reading it
+
+```
+GET /api/v1/cluster/logs?node=<node_id>&route=shop.example.com&from=...&to=...
+GET /api/v1/cluster/waf-events?node=<node_id>
+```
+
+Both are cursor-paginated and return no total. Pass the previous
+page's `next_cursor` as `before_id`; a null `next_cursor` is the last
+page. The absent total is deliberate: a `COUNT(*)` per page on an
+aggregated table is a full scan under the store lock, so a dashboard
+polling it would stall the ingest writer.
+
+### Bans
+
+Bans fan in for visibility, and an operator can ban across the fleet:
+
+```
+POST /api/v1/cluster/bans   {"client_ip": "192.0.2.10", "duration_s": 3600}
+```
+
+Two things about this are worth knowing before relying on it.
+
+**Automatic per-node auto-ban is not replicated.** A WAF flood or a
+rate-limit trip bans that client on the node that saw it, and nowhere
+else. Replicating it would turn one node's view of one client into a
+fleet-wide outage for that client, so a false positive on the least
+trusted edge would become everyone's false positive. Fleet-wide
+banning is an operator decision, taken deliberately.
+
+**A fleet-wide ban is best effort and does not converge.** A node that
+was down when the ban was issued does not receive it when it comes
+back; the response names the nodes that did not answer. Unlike
+configuration and certificate keys, a ban has no pull path, because
+the ban map is in-memory state that a node rebuilds from nothing on
+restart. For anything that must survive a restart, use a deny rule in
+the configuration, which does replicate.
+
+The same restart caveat applies to the fan-in view: it is a snapshot
+of live state, so it is lossy across a node restart by construction.
+
+## Fleet Metrics
+
+Per-node scrape or Prometheus federation, not a fleet-wide `/metrics`
+on the control plane.
+
+The reason is cardinality. Data-plane counters already carry route and
+rule labels; `lorica_ai_bot_total{crawler, route_id, action}` alone is
+roughly twenty thousand series on a node with twenty routes. Adding a
+`node` label at fleet level multiplies that by the fleet size, and it
+would invert the choice this product already made one level down,
+where per-worker counters are aggregated into a single supervisor-side
+counter with no `worker` label rather than being labelled per worker.
+`/metrics` is also pass-through by default, which would put the whole
+fleet's traffic profile on an unauthenticated endpoint.
+
+Only the cluster-plane series carry `node_id`, and those are bounded
+by fleet size.
+
+Scrape each node directly where you can. Where the nodes are not
+reachable from the monitoring network but the control plane is, federate:
+
+```yaml
+scrape_configs:
+  - job_name: lorica-fleet
+    honor_labels: true
+    metrics_path: /federate
+    params:
+      "match[]":
+        - '{__name__=~"lorica_cluster_.*"}'
+        - '{__name__=~"lorica_waf_.*"}'
+        - '{__name__=~"lorica_requests_.*"}'
+    static_configs:
+      - targets:
+          - "prometheus-edge-01.internal.example.org:9090"
+          - "prometheus-edge-02.internal.example.org:9090"
+```
+
+`honor_labels: true` matters: without it the federating Prometheus
+overwrites the `instance` label and every node's series collapse into
+one.
+
+## Migrating a Standalone Node into a Fleet
+
+An existing standalone install becomes the control plane without
+reinstalling.
+
+1. **Back up** `/var/lib/lorica/` while the service is stopped. The
+   encryption key becomes the identity root of the fleet, so this
+   backup is now more valuable than it was.
+2. `lorica cluster init` on the node that will be the control plane.
+   It generates the cluster CA from the existing master key.
+3. Start it with `--cluster-listen`. Its own routes and certificates
+   are untouched; it is now a control plane that also serves traffic.
+4. On each new node, `lorica cluster token --node-name edge-01` on the
+   control plane, then `lorica cluster join` on the node. The name is
+   mandatory and is bound to the token.
+5. Approve each node (`POST /api/v1/cluster/nodes/{id}/activate`, or
+   the dashboard). Nothing flows to a node before activation.
+
+The direction that does not work is merging two configured nodes: a
+follower's local configuration is REPLACED by the control plane's on
+its first apply. Bring a node in empty, or expect to lose what it had.
+
+What each node keeps as its own: the listening addresses, the data
+directory, the export zone's directory and file modes, the log sinks'
+endpoints, and its master key. Everything else replicates.
+

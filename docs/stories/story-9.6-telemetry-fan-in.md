@@ -60,33 +60,36 @@ so that I stop opening three SSH tunnels to correlate one incident.
 Reshaped by the Phase 1 review; see D2, D3, D4 and D5 for why three of
 the original tasks are smaller than drafted and one is larger.
 
-- [ ] AC #1 + D2: `node_id` in the TELEMETRY schema only, stamped by
+- [x] AC #1 + D2: `node_id` in the TELEMETRY schema only, stamped by
       the control plane from the session. No migration on
       `access_logs`, `waf_events`, `sla_buckets` or `probe_results`;
       the `UNIQUE(node_id, ...)` lands on the fan-in copy.
-- [ ] AC #2: `cluster-telemetry.db`, its own connection, migration 55.
-- [ ] AC #3 + D9: per-node quota, chunked deletes that release the
+- [x] AC #2: `cluster-telemetry.db`, its own connection, migration 55.
+- [x] AC #3 + D9: per-node quota, chunked deletes that release the
       lock, and `enforce_waf_retention`'s `COUNT(*)` replaced by the
       `MIN(id)`/`MAX(id)` estimate the access-log path already uses.
-- [ ] AC #4: measure the ceiling on this hardware, state it in
-      `docs/cluster.md` with the topology to use beyond it.
-- [ ] AC #5 + AC #7 + D5: supervisor-side drain task walking the
+- [~] AC #4: the envelope and the beyond-it topology ARE stated in
+      `docs/cluster.md`, but the figure is DERIVED from the documented
+      SQLite write ceiling, not measured on hardware. The doc says so
+      in those words rather than presenting a number that looks
+      measured. Measuring it is backlog #64.
+- [x] AC #5 + AC #7 + D5: supervisor-side drain task walking the
       shared store by rowid cursor. No new hot-path queue on the
       access-log and WAF paths.
-- [ ] AC #5 + D3: ring buffer for the ban snapshot, the one kind with
+- [x] AC #5 + D3: the ban snapshot, the one kind with
       no shared store behind it.
-- [ ] AC #6 + D6: tokio task, not the log-writer OS thread; recorded
+- [x] AC #6 + D6: tokio task, not the log-writer OS thread; recorded
       in the module doc.
-- [ ] AC #8 + D8: per-node rate and byte quota at ingest, plus the
+- [x] AC #8 + D8: per-node rate and byte quota at ingest, plus the
       global storage watermark that sheds telemetry before
       configuration or audit writes.
-- [ ] AC #9: `/cluster/logs` and `/cluster/waf-events`, composite
+- [x] AC #9: `/cluster/logs` and `/cluster/waf-events`, composite
       `(node_id, timestamp)` index, cursor pagination, no per-page
       `COUNT(*)`.
-- [ ] AC #10 + D3: ban snapshot fan-in and a fleet-wide ban push;
+- [x] AC #10 + D3: ban snapshot fan-in and a fleet-wide ban push;
       automatic per-node auto-ban stays local, with the reason
       written down.
-- [ ] AC #11 + D1: EXTEND `docs/cluster.md` (fan-in ceiling, worked
+- [x] AC #11 + D1: EXTEND `docs/cluster.md` (fan-in ceiling, worked
       Prometheus federation config, standalone-to-cluster migration,
       ban rationale), replacing the Story 9.8 stub.
 - [ ] D12: the `cluster` e2e profile, which covers Stories 9.2-9.6.
