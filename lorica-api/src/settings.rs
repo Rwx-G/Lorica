@@ -1253,6 +1253,22 @@ pub async fn test_otel_connection(
 /// which still means "TCP is open". A minimal empty POST is the most
 /// representative probe: real traffic is also POST, and a 400 / 415
 /// rejection still proves reachability.
+/// The OTLP/HTTP URL for one signal: the collector base with the
+/// signal path (`/v1/traces`, `/v1/logs`) appended unless the operator
+/// already wrote it. The opentelemetry-otlp builders use the endpoint
+/// as-is, and the collector, Tempo and Jaeger all expose the signal
+/// endpoints under one base, so this is the convention every HTTP
+/// exporter and probe in the tree follows (backlog #55 c: it used to
+/// be four copies of the same closure).
+pub fn otlp_signal_url(endpoint: &str, signal_path: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    if trimmed.ends_with(signal_path) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}{signal_path}")
+    }
+}
+
 async fn probe_otlp_endpoint(
     endpoint: &str,
     protocol: &str,
@@ -1262,14 +1278,7 @@ async fn probe_otlp_endpoint(
     use std::time::{Duration, Instant};
 
     let probe_url = match protocol {
-        "http-proto" | "http-json" => {
-            let trimmed = endpoint.trim_end_matches('/');
-            if trimmed.ends_with(signal_path) {
-                trimmed.to_string()
-            } else {
-                format!("{trimmed}{signal_path}")
-            }
-        }
+        "http-proto" | "http-json" => otlp_signal_url(endpoint, signal_path),
         _ => endpoint.to_string(),
     };
 

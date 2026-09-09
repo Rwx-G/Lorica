@@ -298,23 +298,10 @@ mod imp {
             let _ = old.shutdown();
         }
 
-        // OTLP/HTTP requires the signal-specific path on the URL
-        // (`/v1/traces` for spans). The opentelemetry-otlp 0.31
-        // builder uses `with_endpoint` as-is, so we append the path
-        // when the operator configured only the base URL — this
-        // matches the convention used by the OTel collector +
-        // Tempo + Jaeger HTTP receivers (all expose the four
-        // signal endpoints under the same base). The gRPC transport
-        // does not need this dance because the path is implicit in
-        // the proto definition.
-        let http_endpoint = || -> String {
-            let trimmed = cfg.endpoint.trim_end_matches('/');
-            if trimmed.ends_with("/v1/traces") {
-                trimmed.to_string()
-            } else {
-                format!("{trimmed}/v1/traces")
-            }
-        };
+        // OTLP/HTTP needs the signal path on the URL; the gRPC
+        // transport does not (the path is implicit in the proto).
+        let http_endpoint =
+            || -> String { lorica_api::settings::otlp_signal_url(&cfg.endpoint, "/v1/traces") };
 
         let exporter = match cfg.protocol {
             OtlpProtocol::HttpProto => SpanExporter::builder()
@@ -440,14 +427,8 @@ mod imp {
             return Ok(());
         }
 
-        let http_endpoint = || -> String {
-            let trimmed = cfg.endpoint.trim_end_matches('/');
-            if trimmed.ends_with("/v1/logs") {
-                trimmed.to_string()
-            } else {
-                format!("{trimmed}/v1/logs")
-            }
-        };
+        let http_endpoint =
+            || -> String { lorica_api::settings::otlp_signal_url(&cfg.endpoint, "/v1/logs") };
         let headers = || -> std::collections::HashMap<String, String> {
             cfg.auth_header
                 .as_ref()
