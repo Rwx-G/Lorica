@@ -44,16 +44,21 @@
 //! node's own local log, and would let one noisy edge evict every
 //! quiet edge's rows, which is exactly the incident-correlation case
 //! this store exists for. Each node gets its own budget, enforced
-//! with chunked deletes that release the lock between chunks, and
-//! sized from `MIN(id)`/`MAX(id)` rather than `COUNT(*)` for the
-//! reason `log_store.rs` already documents on the access-log path: a
-//! full count scans the table and can freeze the writer's connection
-//! for hundreds of milliseconds at millions of rows.
+//! with chunked deletes that release the lock between chunks.
+//!
+//! The cut is found EXACTLY, by seeking the `rows_per_node`-th newest
+//! row for that node through the `(node_id, id)` index, not estimated
+//! from `MIN(id)`/`MAX(id)`. The estimate is what `log_store.rs` uses
+//! and it is right there, on a single-writer table; on this table
+//! `id` is shared by every node, so a node's id span is inflated by
+//! every interleaved row from every other node and the estimate
+//! overstates by roughly the fleet size. See
+//! [`ClusterTelemetryStore::enforce_node_quota`].
 
 use std::path::Path;
 
 use parking_lot::Mutex;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// Rows kept per node, per kind, by default.
 ///
@@ -91,8 +96,9 @@ pub struct FleetAccessRow {
     pub path: String,
     /// Request host.
     pub host: String,
-    /// Response status.
-    pub status: u16,
+    /// Response status, the same width as the wire and local types
+    /// so the round trip cannot silently truncate.
+    pub status: u32,
     /// End-to-end latency in milliseconds.
     pub latency_ms: u64,
     /// Backend that served it.
@@ -132,6 +138,21 @@ pub struct FleetWafRow {
     pub route_hostname: String,
     /// What the WAF did.
     pub action: String,
+}
+
+/// One node's view of one banned client, as last reported (AC #10).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FleetBanRow {
+    /// The node reporting it, stamped from the session.
+    pub node_id: String,
+    /// The banned client address.
+    pub client_ip: String,
+    /// Seconds left when the snapshot was taken.
+    pub remaining_s: u64,
+    /// Why that node banned it.
+    pub reason: String,
+    /// When the control plane recorded this snapshot, RFC 3339.
+    pub observed_at: String,
 }
 
 /// Filters for a fan-in query (AC #9).
@@ -229,6 +250,12 @@ impl ClusterTelemetryStore {
                 source TEXT NOT NULL DEFAULT '',
                 request_id TEXT NOT NULL DEFAULT ''
             );
+            -- (node_id, id) serves BOTH the retention cut and every
+            -- node-scoped read, all of which order by id DESC. The
+            -- (node_id, timestamp) index alone forced either a sort
+            -- or a rowid scan filtering row by row.
+            CREATE INDEX IF NOT EXISTS idx_fleet_access_node_id
+                ON fleet_access_logs(node_id, id);
             CREATE INDEX IF NOT EXISTS idx_fleet_access_node_ts
                 ON fleet_access_logs(node_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_fleet_access_ts
@@ -248,6 +275,8 @@ impl ClusterTelemetryStore {
                 route_hostname TEXT NOT NULL DEFAULT '',
                 action TEXT NOT NULL DEFAULT ''
             );
+            CREATE INDEX IF NOT EXISTS idx_fleet_waf_node_id
+                ON fleet_waf_events(node_id, id);
             CREATE INDEX IF NOT EXISTS idx_fleet_waf_node_ts
                 ON fleet_waf_events(node_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_fleet_waf_ts
@@ -299,13 +328,21 @@ impl ClusterTelemetryStore {
             .map_err(|e| format!("failed to open a telemetry transaction: {e}"))?;
         let observed_at = chrono::Utc::now().to_rfc3339();
 
-        for row in access {
-            tx.execute(
-                "INSERT INTO fleet_access_logs
-                    (node_id, timestamp, method, path, host, status, latency_ms,
-                     backend, error, client_ip, is_xff, xff_proxy_ip, source, request_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                rusqlite::params![
+        {
+            // One prepared statement reused across the batch rather
+            // than a fresh compile per row. Up to 512 rows run under
+            // the store lock, which every other node's ingest and
+            // every dashboard read also wait on.
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO fleet_access_logs
+                        (node_id, timestamp, method, path, host, status, latency_ms,
+                         backend, error, client_ip, is_xff, xff_proxy_ip, source, request_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                )
+                .map_err(|e| format!("failed to prepare the access insert: {e}"))?;
+            for row in access {
+                stmt.execute(rusqlite::params![
                     node_id,
                     row.timestamp,
                     row.method,
@@ -320,18 +357,22 @@ impl ClusterTelemetryStore {
                     row.xff_proxy_ip,
                     row.source,
                     row.request_id,
-                ],
-            )
-            .map_err(|e| format!("failed to store a fanned-in access row: {e}"))?;
+                ])
+                .map_err(|e| format!("failed to store a fanned-in access row: {e}"))?;
+            }
         }
 
-        for row in waf {
-            tx.execute(
-                "INSERT INTO fleet_waf_events
-                    (node_id, rule_id, description, category, severity, matched_field,
-                     matched_value, timestamp, client_ip, route_hostname, action)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                rusqlite::params![
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO fleet_waf_events
+                        (node_id, rule_id, description, category, severity, matched_field,
+                         matched_value, timestamp, client_ip, route_hostname, action)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )
+                .map_err(|e| format!("failed to prepare the WAF insert: {e}"))?;
+            for row in waf {
+                stmt.execute(rusqlite::params![
                     node_id,
                     i64::from(row.rule_id),
                     row.description,
@@ -343,9 +384,9 @@ impl ClusterTelemetryStore {
                     row.client_ip,
                     row.route_hostname,
                     row.action,
-                ],
-            )
-            .map_err(|e| format!("failed to store a fanned-in WAF event: {e}"))?;
+                ])
+                .map_err(|e| format!("failed to store a fanned-in WAF event: {e}"))?;
+            }
         }
 
         // A snapshot replaces what that node last reported for that
@@ -452,17 +493,25 @@ impl ClusterTelemetryStore {
     ///
     /// Returns how many rows were removed.
     ///
-    /// The overflow estimate uses `MIN(id)`/`MAX(id)`, two index seeks
-    /// on the rowid, rather than `COUNT(*)`, which scans. On an
-    /// aggregated table the difference is the whole point: a count
-    /// here would hold the store lock against ingest for as long as it
-    /// takes to walk every row in the fleet.
+    /// # Why this is not a `MIN(id)` / `MAX(id)` estimate
     ///
-    /// The estimate over-counts when ids are sparse (rows already
-    /// deleted leave gaps), so this can under-delete on a table that
-    /// has been pruned before. That is the safe direction: it keeps
-    /// slightly more than the quota rather than evicting rows an
-    /// operator is about to read, and the next pass catches up.
+    /// It was, and that was wrong here. `id` is ONE autoincrement
+    /// sequence shared by every node writing into this table, so a
+    /// node's id span is inflated by every interleaved row from every
+    /// other node: with N nodes writing at similar rates the estimate
+    /// overstates a node's row count by roughly a factor of N. The
+    /// quota then believes a quiet node is far over budget and prunes
+    /// it below its allowance, which is exactly the "a noisy edge
+    /// evicts a quiet edge's rows" failure per-node retention exists
+    /// to prevent. The estimate is sound on the single-writer tables
+    /// in `log_store.rs`, where the only gaps come from earlier
+    /// deletes; it does not survive being copied to a shared table.
+    ///
+    /// So this finds the exact cut instead: the id of the
+    /// `rows_per_node`-th newest row FOR THIS NODE. Everything of
+    /// this node's at or below it is surplus. The walk is bounded by
+    /// `rows_per_node` and rides the `(node_id, id)` index, so it
+    /// costs neither a full-table scan nor a `COUNT(*)`.
     ///
     /// # Errors
     ///
@@ -474,41 +523,40 @@ impl ClusterTelemetryStore {
         rows_per_node: u64,
     ) -> Result<u64, String> {
         let table = table.as_str();
+        let cut: Option<i64> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                &format!(
+                    "SELECT id FROM {table} WHERE node_id = ?1
+                     ORDER BY id DESC LIMIT 1 OFFSET ?2"
+                ),
+                rusqlite::params![node_id, i64::try_from(rows_per_node).unwrap_or(i64::MAX)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("failed to find the retention cut for {table}: {e}"))?
+        };
+        // No row at that offset: the node holds at most its quota.
+        let Some(cut) = cut else {
+            return Ok(0);
+        };
+
         let mut removed = 0u64;
         loop {
             let chunk = {
                 let conn = self.conn.lock();
-                let span: Option<(i64, i64)> = conn
-                    .query_row(
-                        &format!(
-                            "SELECT MIN(id), MAX(id) FROM {table} WHERE node_id = ?1"
-                        ),
-                        rusqlite::params![node_id],
-                        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
-                    )
-                    .map_err(|e| format!("failed to size {table} for a node: {e}"))
-                    .map(|(min, max): (Option<i64>, Option<i64>)| match (min, max) {
-                        (Some(min), Some(max)) => Some((min, max)),
-                        _ => None,
-                    })?;
-                let Some((min_id, max_id)) = span else {
-                    return Ok(removed);
-                };
-                // `max - min + 1` is an upper bound on the live rows.
-                let estimated = u64::try_from(max_id - min_id + 1).unwrap_or(0);
-                if estimated <= rows_per_node {
-                    return Ok(removed);
-                }
-                let overflow = estimated - rows_per_node;
-                let take = overflow.min(RETENTION_CHUNK);
                 conn.execute(
                     &format!(
                         "DELETE FROM {table} WHERE id IN (
-                             SELECT id FROM {table} WHERE node_id = ?1
-                             ORDER BY id ASC LIMIT ?2
+                             SELECT id FROM {table} WHERE node_id = ?1 AND id <= ?2
+                             ORDER BY id ASC LIMIT ?3
                          )"
                     ),
-                    rusqlite::params![node_id, i64::try_from(take).unwrap_or(i64::MAX)],
+                    rusqlite::params![
+                        node_id,
+                        cut,
+                        i64::try_from(RETENTION_CHUNK).unwrap_or(i64::MAX)
+                    ],
                 )
                 .map_err(|e| format!("failed to prune {table}: {e}"))?
             };
@@ -536,6 +584,44 @@ impl ClusterTelemetryStore {
             )
             .map_err(|e| format!("failed to prune stale fleet bans: {e}"))?;
         Ok(removed as u64)
+    }
+
+    /// Every node's live bans, as last reported (AC #10).
+    ///
+    /// A snapshot rather than a history: bans are in-memory state on
+    /// each node, so this is what the fleet believed a moment ago and
+    /// is lossy across a node restart by construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read failure.
+    pub fn query_bans(&self, node_id: Option<&str>) -> Result<Vec<FleetBanRow>, String> {
+        let conn = self.conn.lock();
+        // One shape with a bound filter rather than two statements:
+        // an absent `node_id` matches every row instead of branching.
+        let mut stmt = conn
+            .prepare(
+                "SELECT node_id, client_ip, remaining_s, reason, observed_at
+                 FROM fleet_bans WHERE (?1 IS NULL OR node_id = ?1)
+                 ORDER BY node_id, client_ip",
+            )
+            .map_err(|e| format!("failed to prepare the fleet ban query: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![node_id], |row| {
+                Ok(FleetBanRow {
+                    node_id: row.get(0)?,
+                    client_ip: row.get(1)?,
+                    remaining_s: row.get::<_, i64>(2)? as u64,
+                    reason: row.get(3)?,
+                    observed_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| format!("failed to run the fleet ban query: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("failed to read a fleet ban row: {e}"))?);
+        }
+        Ok(out)
     }
 
     /// One page of fanned-in access rows, newest first (AC #9).
@@ -566,7 +652,7 @@ impl ClusterTelemetryStore {
                     method: row.get(3)?,
                     path: row.get(4)?,
                     host: row.get(5)?,
-                    status: row.get::<_, i64>(6)? as u16,
+                    status: row.get::<_, i64>(6)? as u32,
                     latency_ms: row.get::<_, i64>(7)? as u64,
                     backend: row.get(8)?,
                     error: row.get(9)?,
@@ -829,6 +915,94 @@ mod tests {
                 <= 100,
             "the noisy node is brought back to its quota"
         );
+    }
+
+    #[test]
+    fn interleaved_nodes_do_not_inflate_each_other_s_quota() {
+        // The test that was missing, and the reason the shared-id
+        // MIN/MAX estimate survived review: the original fixture
+        // wrote all of one node's rows before any of the other's, so
+        // ids never interleaved and the estimate happened to be
+        // right. Interleave them and the estimate overstates each
+        // node's count by roughly the number of nodes, which pruned a
+        // node that was inside its quota.
+        let (store, _dir) = store();
+        for i in 0..120 {
+            for node in ["node-a", "node-b", "node-c"] {
+                store
+                    .ingest(
+                        node,
+                        &[access_row("x.example.com", &format!("2026-09-09T10:00:{i:02}Z"))],
+                        &[],
+                        &[],
+                    )
+                    .expect("ingest");
+            }
+        }
+        // Every node holds 120 rows, inside a quota of 200. Nothing
+        // may be pruned: with the old estimate each node's id span
+        // was ~360, so all three looked 160 rows over budget.
+        for node in ["node-a", "node-b", "node-c"] {
+            assert_eq!(
+                store
+                    .enforce_node_quota(TelemetryTable::Access, node, 200)
+                    .expect("prune"),
+                0,
+                "{node} is inside its quota and must keep every row"
+            );
+            assert_eq!(
+                store
+                    .count_for_node(TelemetryTable::Access, node)
+                    .expect("count"),
+                120
+            );
+        }
+
+        // Now cut one node to 50 and check the cut is exact and does
+        // not touch its neighbours.
+        store
+            .enforce_node_quota(TelemetryTable::Access, "node-b", 50)
+            .expect("prune");
+        assert_eq!(
+            store
+                .count_for_node(TelemetryTable::Access, "node-b")
+                .expect("count"),
+            50,
+            "the cut is exact, not an estimate"
+        );
+        for node in ["node-a", "node-c"] {
+            assert_eq!(
+                store
+                    .count_for_node(TelemetryTable::Access, node)
+                    .expect("count"),
+                120,
+                "{node} was not touched by its neighbour's retention"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ban_snapshot_is_readable_back_per_node_and_fleet_wide() {
+        let (store, _dir) = store();
+        let ban = |ip: &str| TelemetryBan {
+            client_ip: ip.to_string(),
+            remaining_s: 60,
+            reason: "waf_flood".to_string(),
+        };
+        store
+            .replace_ban_snapshot("node-a", &[ban("192.0.2.10")])
+            .expect("snapshot");
+        store
+            .replace_ban_snapshot("node-b", &[ban("192.0.2.11")])
+            .expect("snapshot");
+
+        let all = store.query_bans(None).expect("read");
+        assert_eq!(all.len(), 2);
+        let scoped = store.query_bans(Some("node-a")).expect("read");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].node_id, "node-a");
+        assert_eq!(scoped[0].client_ip, "192.0.2.10");
+        assert_eq!(scoped[0].reason, "waf_flood");
     }
 
     #[test]

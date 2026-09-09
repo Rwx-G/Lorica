@@ -814,6 +814,20 @@ pub fn ban_target_is_valid(client_ip: &str) -> bool {
         && client_ip.parse::<std::net::IpAddr>().is_ok()
 }
 
+/// Longest a fleet-wide ban may last: a day.
+///
+/// Bounded HERE as well as at the API, because this file's rule is
+/// that a peer-supplied quantity is bounded at the decode boundary or
+/// nowhere. `duration_s` was the one field on this message that took
+/// the API's word for it.
+pub const MAX_BAN_DURATION_S: u64 = 24 * 3600;
+
+/// Whether a peer-supplied ban duration is acceptable (Story 9.6):
+/// non-zero and at most [`MAX_BAN_DURATION_S`].
+pub fn ban_duration_is_valid(duration_s: u64) -> bool {
+    duration_s > 0 && duration_s <= MAX_BAN_DURATION_S
+}
+
 /// Whether a peer-supplied ban reason is acceptable (Story 9.6):
 /// non-empty, bounded, and free of control characters, since it
 /// reaches a log line and a JSON response.

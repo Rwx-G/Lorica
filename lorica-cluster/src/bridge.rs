@@ -66,7 +66,8 @@
 use crate::certs::{cert_bundle_defect, CertBundle, MAX_CERT_BUNDLES, MAX_CERT_PULL_IDS};
 use crate::challenge::challenge_defect;
 use crate::messages::{
-    ban_reason_is_valid, ban_target_is_valid, cert_id_is_valid, challenge_token_is_valid,
+    ban_duration_is_valid, ban_reason_is_valid, ban_target_is_valid, cert_id_is_valid,
+    challenge_token_is_valid,
     cluster_request, config_hash_is_valid, ClusterRequest, TelemetryPush, MAX_TELEMETRY_BANS,
     MAX_TELEMETRY_ROWS,
 };
@@ -404,7 +405,10 @@ pub fn translate_control_plane_request(request: &ClusterRequest) -> FollowerBrid
             // The address becomes a key in the data-plane ban map and
             // the reason reaches a log line and the API: bound both
             // here rather than trusting a control plane to be sane.
-            if !ban_target_is_valid(&ban.client_ip) || !ban_reason_is_valid(&ban.reason) {
+            if !ban_target_is_valid(&ban.client_ip)
+                || !ban_reason_is_valid(&ban.reason)
+                || !ban_duration_is_valid(ban.duration_s)
+            {
                 return FollowerBridgeOutcome::ProtocolViolation;
             }
             FollowerBridgeOutcome::Serve(FollowerAction::ApplyBan {

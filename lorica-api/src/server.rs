@@ -564,7 +564,9 @@ pub fn build_router(
         // scan under the store lock, which would stall ingest.
         .route(
             "/api/v1/cluster/bans",
-            post(crate::cluster::fleet_ban).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+            get(crate::cluster::fleet_bans)
+                .post(crate::cluster::fleet_ban)
+                .layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
         )
         .route("/api/v1/cluster/logs", get(crate::cluster::fleet_logs))
         .route(

@@ -66,12 +66,31 @@ use tracing::{debug, info, warn};
 
 use crate::startup::cluster_follower::BanApplier;
 
-/// How often the drain looks for new rows.
+/// How often the drain looks for new rows when it is caught up.
 ///
-/// Fan-in is for correlating an incident minutes later, not for
-/// live tailing, so a short interval buys nothing and costs a wakeup
-/// per node per interval on the control plane.
+/// Fan-in is for correlating an incident minutes later, not for live
+/// tailing, so a short interval buys nothing and costs a wakeup per
+/// node per interval on the control plane. When there IS a backlog
+/// the tick is not the limit: see [`MAX_BATCHES_PER_TICK`].
 const DRAIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Batches one tick may ship before yielding until the next one.
+///
+/// Without this the drain shipped at most one batch per tick, so its
+/// ceiling was `MAX_TELEMETRY_ROWS / DRAIN_INTERVAL` = about 51 rows
+/// a second, far below the traffic the fan-in envelope claims to
+/// support. A node above that never caught up: the backlog grew
+/// until local retention evicted rows the cursor had not reached,
+/// which is silent, permanent loss rather than lag.
+///
+/// So a tick keeps shipping while batches come back full, and stops
+/// at this many. The bound is what keeps a huge backlog from
+/// monopolising the control plane's ingest for one node: 20 batches
+/// is about 1 000 rows a second sustained, an order of magnitude
+/// above the documented envelope, and the loop also stops early on
+/// any partial acceptance so a quota shedding this node ends the
+/// burst immediately.
+const MAX_BATCHES_PER_TICK: usize = 20;
 
 /// Bound on one push exchange.
 const PUSH_DEADLINE: Duration = Duration::from_secs(15);
@@ -94,7 +113,7 @@ pub(crate) fn spawn_telemetry_drain(
         // first impression of a node, and the history it would carry
         // predates the fleet knowing about this node at all.
         if let Some(logs) = &log_store {
-            if let Err(reason) = seed_cursors(&config_store, logs).await {
+            if let Err(reason) = seed_cursors(&config_store, Arc::clone(logs)).await {
                 warn!(%reason, "could not seed the telemetry cursors; the drain starts from zero");
             }
         }
@@ -102,12 +121,20 @@ pub(crate) fn spawn_telemetry_drain(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Err(reason) = drain_once(&runtime, log_store.as_deref(), &config_store, &bans).await
-            {
-                // Never fatal: a drain that cannot run is a
-                // visibility loss, and the session it rides carries
-                // configuration that matters more.
-                debug!(%reason, "telemetry drain tick did not complete");
+            for _ in 0..MAX_BATCHES_PER_TICK {
+                match drain_once(&runtime, log_store.as_ref(), &config_store, &bans).await {
+                    // A short batch means the backlog is gone; wait
+                    // for the next tick rather than spinning.
+                    Ok(DrainOutcome::CaughtUp) => break,
+                    Ok(DrainOutcome::MoreWaiting) => continue,
+                    Err(reason) => {
+                        // Never fatal: a drain that cannot run is a
+                        // visibility loss, and the session it rides
+                        // carries configuration that matters more.
+                        debug!(%reason, "telemetry drain tick did not complete");
+                        break;
+                    }
+                }
             }
         }
     })
@@ -117,65 +144,120 @@ pub(crate) fn spawn_telemetry_drain(
 /// has never pushed.
 async fn seed_cursors(
     config_store: &Arc<Mutex<ConfigStore>>,
-    logs: &LogStore,
+    logs: Arc<LogStore>,
 ) -> Result<(), String> {
-    let newest_access = logs.newest_access_id()?;
-    let newest_waf = logs.newest_waf_id()?;
-    let store = config_store.lock().await;
-    for (kind, newest) in [
-        (TelemetryCursor::Access, newest_access),
-        (TelemetryCursor::Waf, newest_waf),
-    ] {
-        let current = store
-            .telemetry_cursor(kind)
-            .map_err(|e| format!("could not read a telemetry cursor: {e}"))?;
-        if current == 0 && newest > 0 {
-            store
-                .advance_telemetry_cursor(kind, newest)
-                .map_err(|e| format!("could not seed a telemetry cursor: {e}"))?;
+    let (newest_access, newest_waf) = tokio::task::spawn_blocking(move || {
+        Ok::<_, String>((logs.newest_access_id()?, logs.newest_waf_id()?))
+    })
+    .await
+    .map_err(|e| format!("the cursor seed task failed: {e}"))??;
+    cursor_write(config_store, move |store| {
+        for (kind, newest) in [
+            (TelemetryCursor::Access, newest_access),
+            (TelemetryCursor::Waf, newest_waf),
+        ] {
+            let current = store
+                .telemetry_cursor(kind)
+                .map_err(|e| format!("could not read a telemetry cursor: {e}"))?;
+            if current == 0 && newest > 0 {
+                store
+                    .advance_telemetry_cursor(kind, newest)
+                    .map_err(|e| format!("could not seed a telemetry cursor: {e}"))?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
-/// One drain tick: read, push, advance.
+/// Run a synchronous closure against the configuration store off the
+/// executor, holding the async lock only across the handoff.
+///
+/// The store is `rusqlite`, so every call into it is blocking; doing
+/// it inline while holding the `tokio::sync::Mutex` guard would park
+/// a worker thread for as long as SQLite takes, up to its five-second
+/// busy timeout.
+async fn cursor_write<F>(config_store: &Arc<Mutex<ConfigStore>>, f: F) -> Result<(), String>
+where
+    F: FnOnce(&ConfigStore) -> Result<(), String> + Send + 'static,
+{
+    let guard = Arc::clone(config_store).lock_owned().await;
+    tokio::task::spawn_blocking(move || f(&guard))
+        .await
+        .map_err(|e| format!("the cursor task failed: {e}"))?
+}
+
+/// Whether a drain pass left anything behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// The batch was short, or the control plane asked this node to
+    /// back off: stop until the next tick.
+    CaughtUp,
+    /// The batch was full and fully accepted, so there is very likely
+    /// more waiting: go again inside this tick.
+    MoreWaiting,
+}
+
+/// One drain pass: read, push, advance.
 async fn drain_once(
     runtime: &FollowerRuntime,
-    logs: Option<&LogStore>,
+    logs: Option<&Arc<LogStore>>,
     config_store: &Arc<Mutex<ConfigStore>>,
     bans: &BanApplier,
-) -> Result<(), String> {
+) -> Result<DrainOutcome, String> {
     // No session: the control plane is unreachable right now, so
     // nothing is queued and the cursor stays put.
     let Some(session) = runtime.connection.current() else {
-        return Ok(());
+        return Ok(DrainOutcome::CaughtUp);
     };
 
     let (access_cursor, waf_cursor) = {
-        let store = config_store.lock().await;
-        (
-            store
-                .telemetry_cursor(TelemetryCursor::Access)
-                .map_err(|e| e.to_string())?,
-            store
-                .telemetry_cursor(TelemetryCursor::Waf)
-                .map_err(|e| e.to_string())?,
-        )
+        let guard = Arc::clone(config_store).lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            Ok::<_, String>((
+                guard
+                    .telemetry_cursor(TelemetryCursor::Access)
+                    .map_err(|e| e.to_string())?,
+                guard
+                    .telemetry_cursor(TelemetryCursor::Waf)
+                    .map_err(|e| e.to_string())?,
+            ))
+        })
+        .await
+        .map_err(|e| format!("the cursor read task failed: {e}"))??
     };
 
+    // Off the executor. Both stores open with `busy_timeout=5000`,
+    // so a contended read can park a worker thread for five seconds,
+    // and this task shares its runtime with the liveness publisher,
+    // the drift watch and the replication watch. Every other caller
+    // of these stores in this codebase offloads the same way; the one
+    // module written to honour that discipline should not be the one
+    // that breaks it.
     let (access, waf) = match logs {
-        Some(logs) => (
-            logs.access_rows_after(access_cursor, MAX_TELEMETRY_ROWS)?,
-            logs.waf_rows_after(waf_cursor, MAX_TELEMETRY_ROWS)?,
-        ),
+        Some(logs) => {
+            let logs = Arc::clone(logs);
+            tokio::task::spawn_blocking(move || {
+                Ok::<_, String>((
+                    logs.access_rows_after(access_cursor, MAX_TELEMETRY_ROWS)?,
+                    logs.waf_rows_after(waf_cursor, MAX_TELEMETRY_ROWS)?,
+                ))
+            })
+            .await
+            .map_err(|e| format!("the telemetry read task failed: {e}"))??
+        }
         None => (Vec::new(), Vec::new()),
     };
     let ban_snapshot = bans.snapshot().await;
 
     // Nothing new and nothing banned: do not spend a round trip.
     if access.is_empty() && waf.is_empty() && ban_snapshot.is_empty() {
-        return Ok(());
+        return Ok(DrainOutcome::CaughtUp);
     }
+    // A full batch on either kind means there is very likely more
+    // behind it, which is what lets one tick ship more than one.
+    let batch_was_full =
+        access.len() >= MAX_TELEMETRY_ROWS || waf.len() >= MAX_TELEMETRY_ROWS;
 
     let next_access = access.last().map(|(id, _)| *id as u64).unwrap_or(access_cursor);
     let next_waf = waf.last().map(|(id, _)| *id as u64).unwrap_or(waf_cursor);
@@ -248,13 +330,16 @@ async fn drain_once(
     let accepted_all = ack.accepted_access as usize == sent_access
         && ack.accepted_waf as usize == sent_waf;
     if accepted_all {
-        let store = config_store.lock().await;
-        store
-            .advance_telemetry_cursor(TelemetryCursor::Access, ack.access_cursor)
-            .map_err(|e| e.to_string())?;
-        store
-            .advance_telemetry_cursor(TelemetryCursor::Waf, ack.waf_cursor)
-            .map_err(|e| e.to_string())?;
+        let (access_to, waf_to) = (ack.access_cursor, ack.waf_cursor);
+        cursor_write(config_store, move |store| {
+            store
+                .advance_telemetry_cursor(TelemetryCursor::Access, access_to)
+                .map_err(|e| e.to_string())?;
+            store
+                .advance_telemetry_cursor(TelemetryCursor::Waf, waf_to)
+                .map_err(|e| e.to_string())
+        })
+        .await?;
         debug!(
             access = sent_access,
             waf = sent_waf,
@@ -274,8 +359,14 @@ async fn drain_once(
 
     if ack.retry_after_s > 0 {
         // Told to back off: sleep past the window rather than
-        // hammering a control plane that is already shedding.
+        // hammering a control plane that is already shedding, and end
+        // the burst.
         tokio::time::sleep(Duration::from_secs(u64::from(ack.retry_after_s))).await;
+        return Ok(DrainOutcome::CaughtUp);
     }
-    Ok(())
+    Ok(if batch_was_full && accepted_all {
+        DrainOutcome::MoreWaiting
+    } else {
+        DrainOutcome::CaughtUp
+    })
 }

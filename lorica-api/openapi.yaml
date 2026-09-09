@@ -3778,6 +3778,37 @@ paths:
         "409":
           description: This node is not a control plane
   /api/v1/cluster/bans:
+    get:
+      tags: [Cluster]
+      summary: Every node's live bans, as last reported (Viewer+, control plane)
+      description: >-
+        Story 9.6 AC #10, the visibility half. A snapshot of what each node
+        last reported, not a history: bans are in-memory state on each node,
+        so this is lossy across a node restart by construction. Each row is
+        stamped with the `node_id` the mutual-TLS session proved.
+      security:
+        - sessionCookie: []
+      parameters:
+        - in: query
+          name: node
+          schema: { type: string }
+          description: Restrict to one node id.
+      responses:
+        "200":
+          description: The fleet's live bans
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FleetBanRow"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: This node is not a control plane
     post:
       tags: [Cluster]
       summary: Ban a client across the whole fleet (SuperAdmin, control plane)
@@ -4270,6 +4301,21 @@ components:
         age_s:
           type: integer
           nullable: true
+    FleetBanRow:
+      type: object
+      description: One node's view of one banned client (Story 9.6 AC #10).
+      properties:
+        node_id:
+          type: string
+          description: The node reporting it, stamped from the session.
+        client_ip: { type: string }
+        remaining_s:
+          type: integer
+          description: Seconds left when the snapshot was taken.
+        reason: { type: string }
+        observed_at:
+          type: string
+          description: When the control plane recorded this snapshot, RFC 3339.
     FleetBanResult:
       type: object
       description: Payload of `POST /api/v1/cluster/bans` (Story 9.6 AC #10).

@@ -914,6 +914,28 @@ fn next_cursor(returned: usize, requested: Option<u32>, last_id: Option<i64>) ->
     (returned as u32 >= page).then_some(last_id).flatten()
 }
 
+/// GET /api/v1/cluster/bans - every node's live bans (Viewer+,
+/// control plane, Story 9.6 AC #10).
+///
+/// A snapshot of what each node last reported, not a history: bans
+/// are in-memory state on each node, so this is lossy across a node
+/// restart by construction (decision D3).
+pub async fn fleet_bans(
+    Extension(state): Extension<AppState>,
+    Query(params): Query<FleetLogsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let runtime = control_plane_runtime(&state)?;
+    let telemetry = runtime.telemetry.clone().ok_or_else(|| {
+        ApiError::Internal("the cluster telemetry database is not open".into())
+    })?;
+    let node = params.node.clone();
+    let rows = tokio::task::spawn_blocking(move || telemetry.query_bans(node.as_deref()))
+        .await
+        .map_err(|e| ApiError::Internal(format!("fleet ban query task failed: {e}")))?
+        .map_err(ApiError::Internal)?;
+    Ok(json_data(rows))
+}
+
 /// Body of `POST /api/v1/cluster/bans`.
 #[derive(Debug, Deserialize)]
 pub struct FleetBanRequest {
