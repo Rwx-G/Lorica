@@ -470,9 +470,16 @@ jobs:
           path: dist/
 
       - name: Generate SBOM
+        # cargo-cyclonedx writes next to the manifest it describes and has no
+        # output-path flag; `--output-file` was rejected and `|| true` hid it,
+        # so v1.6.0 and v1.7.0 shipped without the SBOM this step promises.
+        # One SBOM for the binary crate covers every workspace dependency.
         run: |
           cargo install cargo-cyclonedx --locked
-          cargo cyclonedx --format json --output-file dist/lorica-sbom.cdx.json || true
+          cargo cyclonedx --format json --spec-version 1.5 \
+            --manifest-path lorica/Cargo.toml --override-filename lorica-sbom
+          mv lorica/lorica-sbom.json dist/lorica-sbom.cdx.json
+          python3 -c "import json; d = json.load(open('dist/lorica-sbom.cdx.json')); assert d['components'], 'empty SBOM'; print(len(d['components']), 'components')"
 
       - name: Create GitHub Release
         run: |
