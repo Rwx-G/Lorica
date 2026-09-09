@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-
   import { api } from '../lib/api';
   import { clusterStatus, isClustered } from '../lib/cluster';
 
@@ -19,13 +17,30 @@
   // never clustered must not see a filter with one option in it.
   const clustered = $derived(isClustered($clusterStatus));
 
-  onMount(async () => {
-    if (!isClustered($clusterStatus)) return;
-    const res = await api.listClusterNodes();
-    if (!res.data) return;
-    names = res.data
-      .filter((n) => n.node.status !== 'revoked')
-      .map((n) => ({ id: n.node.node_id, label: n.node.name }));
+  /** Whether the roster has been fetched, so it is fetched once. */
+  let loaded = false;
+
+  // Driven by the store rather than by mount. `clusterStatus` starts
+  // null and is filled by an async read, so a component that mounts
+  // first would have returned early here and never populated: the
+  // select would appear a moment later with "All nodes" as its only
+  // option, on a real cluster, until the page was navigated away from
+  // and back.
+  $effect(() => {
+    if (loaded || !isClustered($clusterStatus)) return;
+    loaded = true;
+    void (async () => {
+      const res = await api.listClusterNodes();
+      if (!res.data) {
+        // Retry on the next status change rather than leaving the
+        // filter permanently empty on one failed read.
+        loaded = false;
+        return;
+      }
+      names = res.data
+        .filter((n) => n.node.status !== 'revoked')
+        .map((n) => ({ id: n.node.node_id, label: n.node.name }));
+    })();
   });
 </script>
 

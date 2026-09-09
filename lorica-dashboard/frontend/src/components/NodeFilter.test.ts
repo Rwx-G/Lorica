@@ -37,6 +37,7 @@ function node(id: string, name: string, state: 'pending' | 'active' | 'revoked')
     session_peer: null,
     session_last_seen_unix: null,
     selected_for_hostnames: [],
+    certificate_ids: [],
     resources: null,
   };
 }
@@ -70,6 +71,22 @@ describe('NodeFilter', () => {
       props: { value: '', onchange: () => {} },
     });
     expect(container.querySelector('select')).toBeNull();
+  });
+
+  it('populates when the status arrives after it mounted', async () => {
+    // The regression this pins: the roster load used to run once at
+    // mount, and `clusterStatus` is filled by an async read. A
+    // component that mounted first returned early and never loaded, so
+    // on a real cluster the select appeared a moment later with "All
+    // nodes" as its only option until the page was navigated away from
+    // and back.
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [node('id-a', 'edge-01', 'active')],
+    });
+    render(NodeFilter, { props: { value: '', onchange: () => {} } });
+    clusterStatus.set(status('control_plane'));
+
+    await waitFor(() => expect(screen.getByText('edge-01')).toBeInTheDocument());
   });
 
   it('lists the fleet, leaving out revoked nodes', async () => {

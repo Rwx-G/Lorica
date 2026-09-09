@@ -343,6 +343,33 @@ and hash are recorded and the existing reload path swaps the running
 configuration. A failure rolls the whole thing back; the node keeps
 serving what it had.
 
+### What may ride the heartbeat
+
+The heartbeat also carries a node's current CPU, memory and disk usage,
+for the dashboard's node drawer. That is a different class of payload
+from the rest of the frame, which is fleet-protocol state, so the rule
+that admitted it is written here rather than left as precedent:
+
+**The heartbeat carries current values that are cheap to sample and
+meaningless as history. Anything with a series, a cursor or a quota
+goes to the telemetry fan-in channel instead.**
+
+Two consequences follow, and both are the point. A gauge is replaced on
+every beat, so it needs no cursor, no acknowledgement and no retention;
+putting it on the fan-in channel would mean building all three for data
+that is worthless a beat later. And the heartbeat's own latency is a
+liveness input, so anything that rides it must stay cheap to produce:
+a payload whose sampling can block is a payload that can turn a slow
+disk into a false disconnect.
+
+A reading is optional on the wire. A node whose runtime installs no
+sampler omits it and the dashboard shows a dash; scalar fields would
+report zero, which reads as an idle node rather than an unknown one.
+It is session state on the control plane, never persisted: it is
+re-learned within one interval after a reconnect, and a figure from
+before a restart would look live while describing a process that no
+longer runs.
+
 ### Targeting a subset
 
 A route carries a `node_selector`: a list of node names, empty meaning

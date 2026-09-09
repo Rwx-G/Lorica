@@ -5,7 +5,7 @@
   import NodeFilter from '../components/NodeFilter.svelte';
   import { showToast } from '../lib/toast';
   import { canWrite, isSuperAdmin, isSuperAdminRole } from '../lib/auth';
-  import { clusterStatus, isClustered, type FleetBanRow } from '../lib/cluster';
+  import { clusterStatus, isFleetView, type FleetBanRow } from '../lib/cluster';
 
   /**
    * The events table. On a control plane the rows come from the fan-in
@@ -34,9 +34,7 @@
    * Whether this page is reading the FAN-IN store rather than this
    * node's own tables. Only a control plane holds fanned-in rows.
    */
-  const fleetView = $derived(
-    isClustered($clusterStatus) && $clusterStatus?.role === 'control_plane',
-  );
+  const fleetView = $derived(isFleetView($clusterStatus));
   let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' | 'bans' | 'audit' = $state('events');
   let showClearConfirm = $state(false);
   let bans: BanEntry[] = $state([]);
@@ -491,7 +489,13 @@
             </tr>
           </thead>
           <tbody>
-            {#each events as event, i (i)}
+            <!--
+              Keyed by the fan-in row id where there is one. A local
+              WAF event has no id, so the index remains the key there;
+              that list is replaced wholesale on every load, which is
+              the case index keying is safe for.
+            -->
+            {#each events as event, i (event.node_id ? `${event.node_id}:${i}` : i)}
               <tr>
                 {#if fleetView}
                   <td class="mono">{event.node_id ?? '-'}</td>

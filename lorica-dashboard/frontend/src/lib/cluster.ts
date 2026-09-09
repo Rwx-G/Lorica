@@ -86,6 +86,16 @@ export interface ClusterNodeResponse {
    * activating is the moment those selectors start handing it keys.
    */
   selected_for_hostnames: string[];
+  /**
+   * The certificates whose private key this node receives, resolved
+   * server-side by the stated inverse of the push path's own resolver.
+   *
+   * NOT derivable from `selected_for_hostnames`: that field omits
+   * fleet-wide routes, which entitle every Active node, so deriving
+   * from it reports "no certificate keys" on a node holding every
+   * fleet-wide one.
+   */
+  certificate_ids: string[];
   /** Absent from a node that has sent no reading on this session. */
   resources: NodeResources | null;
 }
@@ -213,6 +223,22 @@ export function isReadOnlyNode(
 /** True on a node that is part of a fleet, either side of it. */
 export function isClustered(status: ClusterStatus | null): boolean {
   return status !== null && status.role !== 'standalone';
+}
+
+/**
+ * Whether a page should read the FAN-IN store rather than this node's
+ * own tables (Story 9.7 AC #5).
+ *
+ * Only a control plane holds fanned-in rows: a follower ships its own
+ * and keeps no copy of anyone else's, so on a follower the local
+ * tables are the only truth there is.
+ *
+ * Lifted out of the pages because it is pure boolean logic with no
+ * dependency on row shape, it already had two call sites, and a third
+ * is plausible the day SLA gains a fan-in.
+ */
+export function isFleetView(status: ClusterStatus | null): boolean {
+  return isClustered(status) && status?.role === 'control_plane';
 }
 
 /** How the header badge should present the fleet (AC #6). */

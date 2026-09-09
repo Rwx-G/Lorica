@@ -5,7 +5,7 @@
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
   import { canWrite } from '../lib/auth';
-  import { clusterStatus, isClustered } from '../lib/cluster';
+  import { clusterStatus, isFleetView } from '../lib/cluster';
 
   let entries: LogEntry[] = $state([]);
   let total = $state(0);
@@ -26,9 +26,7 @@
    * Whether this page is showing the FAN-IN store rather than this
    * node's own log. Only a control plane holds fanned-in rows.
    */
-  const fleetView = $derived(
-    isClustered($clusterStatus) && $clusterStatus?.role === 'control_plane',
-  );
+  const fleetView = $derived(isFleetView($clusterStatus));
   /**
    * Row id to the node that produced it, for the fleet view's Node
    * column.
@@ -243,7 +241,12 @@
 
   onMount(() => {
     loadLogs();
-    if (autoRefresh) connectWebSocket();
+    // The live tail carries only THIS node's rows and the fan-in view
+    // has no node id for them, so they would render under "-" beside
+    // genuinely fanned-in rows: the control plane's own traffic,
+    // labelled as if its origin were unknown. The fleet view polls
+    // instead.
+    if (autoRefresh && !fleetView) connectWebSocket();
   });
 
   onDestroy(() => {
