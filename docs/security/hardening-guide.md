@@ -48,6 +48,7 @@ Enrollment hygiene (Story 9.3):
 - The same goes for the admin password every management CLI command needs (`unban`, `upgrade`, `cluster token`, `cluster leave`, `cluster status`): use `--password-file` (mode 0600), `--password-stdin` or `LORICA_ADMIN_PASSWORD`; `--password` on argv only prints a warning. An explicit source wins over the environment variable.
 - Leave `--cluster-auto-activate` off in production: review each `pending` node in the roster and activate it deliberately.
 - Revoke decommissioned nodes on the control plane before wiping them (`DELETE /api/v1/cluster/nodes/{id}`); `lorica cluster leave` on the node then proves the deregistration and wipes the fleet identity.
+- Revocation cuts access, not possession: a revoked node keeps the certificate private keys it was entitled to. The revocation response and the `cluster.node.revoke` audit row list them as `certificates_to_reissue`; re-issue every one before considering the incident closed. A node you cannot run `leave` on is exactly the case this bullet is for.
 
 ### Firewall Rules
 

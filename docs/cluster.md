@@ -237,6 +237,21 @@ with it and swapped without dropping the socket, and the node's live
 session is ended synchronously rather than at its next heartbeat. The
 registry row stays, marked revoked, for the audit trail.
 
+Revocation cuts the node's ACCESS. It does not take back what the node
+already holds, and the one thing worth holding is the certificate
+private keys it was entitled to (see "Need to know" below): those live
+on the node under its own master key, and only a cooperative `lorica
+cluster leave` wipes them, which is exactly what a node you are
+revoking will not run for you. So the revocation response, the
+`cluster.node.revoke` audit row and the alert all name the certificates
+the node was entitled to at that moment as `certificates_to_reissue`.
+Re-issue each one (a new ACME order, or upload a new pair): until you
+do, the revoked machine holds a valid private key for every hostname
+its routes selected. The dashboard keeps the list on screen until it is
+dismissed. On a retry of the same revocation the list is empty, because
+a revoked node is entitled to nothing; the first call's audit row has
+it.
+
 ### Leaving
 
 `lorica cluster leave` wipes the node's fleet identity (its private
@@ -342,6 +357,17 @@ commit converges within one heartbeat interval and a reconnect
 converges at the handshake. When the follower already holds the current
 hash the answer carries no blob at all.
 
+What "converged" rests on: outside a commit round, the generation and
+hash a node reports are the node's own claim. A commit acknowledgement
+is checked against the generation that was pushed, but a heartbeat is
+taken at its word and the registry row is refreshed from it, so a
+follower that lies about what it applied looks in sync in the roster,
+the dashboard and the metrics. There is no attestation of what a
+follower runs; the out-of-band anchor for a node's real state is its
+own audit stream, which records every apply on that node (see "The
+Fleet's Audit Trail"). This is the same statement the audit chapter
+makes about the aggregated copy, and it is the honest one.
+
 Applying a replica is one transaction: the fleet-policy settings are
 merged into the local settings (node-local fields untouched), the
 replicated tables are brought to the blob's state, then the generation
@@ -356,9 +382,10 @@ for the dashboard's node drawer. That is a different class of payload
 from the rest of the frame, which is fleet-protocol state, so the rule
 that admitted it is written here rather than left as precedent:
 
-**The heartbeat carries current values that are cheap to sample and
-meaningless as history. Anything with a series, a cursor or a quota
-goes to the telemetry fan-in channel instead.**
+**The heartbeat carries current values that are cheap to sample,
+bounded in size, and meaningless as history. Anything with a series, a
+cursor or a quota goes to the telemetry fan-in channel, and so does
+anything whose size the node does not control.**
 
 Two consequences follow, and both are the point. A gauge is replaced on
 every beat, so it needs no cursor, no acknowledgement and no retention;
@@ -375,6 +402,23 @@ It is session state on the control plane, never persisted: it is
 re-learned within one interval after a reconnect, and a figure from
 before a restart would look live while describing a process that no
 longer runs.
+
+Four kinds of payload cross the plane from a follower, and the rule
+above sorts them. Written out so the next payload lands in a class
+rather than as an exception:
+
+| Class | Example | Channel | Progress marker | Bounded by | Loss semantics | Survives a restart |
+|-------|---------|---------|-----------------|------------|----------------|--------------------|
+| Gauge | CPU, memory, disk | heartbeat | none, replaced each beat | its own fixed shape | superseded within one beat | no, session state by design |
+| Sheddable series | access rows, WAF events | fan-in, with cursors | rowid cursor, advanced per class on what was accepted | local retention, per-node quota, storage watermark | dropped and counted; the cursor holds | the cursor is persisted |
+| Durable series | audit rows | fan-in, with a cursor | rowid cursor, all-or-nothing per batch | charged to the quota but exempt from its verdict; a per-session push rate; retention by arrival time | never shed; a short count means storage failed | the cursor is persisted |
+| Live-state snapshot | bans | fan-in, no cursor | none, replaced wholesale | the storage watermark only | lossy by construction | no |
+
+Bans are the case the first sentence alone would have sent to the
+heartbeat: no cursor, no history, replaced each time. They ride the
+fan-in channel because their size is the node's ban map, which in
+worker mode lives in the worker processes and can be anything; that is
+the "bounded in size" clause, and it is why the rule has it.
 
 ### Targeting a subset
 
@@ -623,6 +667,16 @@ the control plane serves its own traffic on top. Putting the fleet's
 telemetry there would make the fleet's traffic volume a latency input
 to the control plane's own dashboard and audit paths.
 
+The one exception is deliberate: fanned-in AUDIT rows do land in
+`access-log.db`, in the same table as the control plane's own chain,
+because verify walks one table and a chain that lived elsewhere could
+not be reported beside the local one. What keeps that from re-creating
+the contention above is that audit rows are rare by nature, bounded per
+batch and per session (a push rate cap), charged to the per-node quota,
+and aged by the time they ARRIVED rather than by the timestamp the
+origin chose. Whether the shared connection shows under a large fleet
+is a measurement to take, not a fact to assert; backlog #75 holds it.
+
 ### The drain never touches the request path
 
 A follower's request path writes to its local log store exactly as a
@@ -643,9 +697,18 @@ standalone node. The cursor is persisted, so a restart does not
 re-send everything retention still holds, and a node that has never
 drained starts at the present rather than replaying its history.
 
-The cursor advances only past what the control plane **accepted**. If
-a quota sheds part of a batch, the cursor stays behind and those rows
-are offered again on the next tick.
+The cursor advances only past what the control plane **accepted**, and
+each class advances on its own: a batch whose WAF rows were shed still
+moves the access cursor, and a class the control plane did not
+acknowledge blocks only itself, which is what lets a follower one
+release ahead keep shipping the classes an older control plane
+understands.
+
+One loss is silent today and is stated here rather than hidden: a
+partition that outlasts the local retention window loses the rows
+retention evicted below the cursor, to the fleet view only (the node
+never had them for longer on its own), and nothing counts them yet.
+Backlog #76 names the signal to add.
 
 ### The ceiling, stated rather than discovered
 
@@ -905,6 +968,76 @@ scrape_configs:
 `honor_labels: true` matters: without it the federating Prometheus
 overwrites the `instance` label and every node's series collapse into
 one.
+
+## Running a Mixed-Version Fleet
+
+A fleet is upgraded one node at a time, so for a while the control
+plane and its followers run different builds. Three things decide
+whether they still talk, and only one of them is the protocol version.
+
+**Protocol version** is negotiated as a range in the session opener:
+each side advertises the versions it speaks and the session runs at
+the highest both contain. Until that number moves, every shipped build
+overlaps every other and this negotiation cannot fail; a session
+refused for `INCOMPATIBLE_VERSION` is a future event, not one to look
+for today. New request kinds degrade per method: a build that does not
+know one answers `UNSUPPORTED_METHOD` and the caller carries on.
+
+**Schema version** is the gate that actually binds, and it is
+asymmetric. A follower whose database schema is BEHIND the control
+plane's is refused at the handshake (`SCHEMA_TOO_OLD`), because the
+configuration blob it would be handed describes tables it does not
+have. A follower AHEAD of the control plane is admitted. Hence the
+order: **upgrade followers first, the control plane last.** Done the
+other way, a control plane that carries a migration disconnects every
+follower at once, and from outside that is indistinguishable from a
+control-plane outage. Already-configured traffic keeps flowing on the
+refused followers; they simply stop receiving changes until they are
+upgraded.
+
+**Wire encoding** is pinned by a frozen corpus: one instance of every
+message the v1.7.0 build puts on the wire, checked into
+`lorica-cluster/tests/fixtures/`, that every later build must still
+encode identically and decode back to the same value. A field added
+under a new tag is compatible by construction (an older peer ignores
+it, a newer one sees it absent); a field whose meaning changed is what
+the corpus exists to make visible. The telemetry cursors advance per
+class for the same reason: a class an older control plane does not
+know blocks only itself.
+
+## Failure Modes
+
+What converges on its own, what needs an operator, and what is lost,
+for the five things that go wrong:
+
+| Event | Configuration and keys | Fan-in | Needs an operator | Lost |
+|-------|------------------------|--------|-------------------|------|
+| Control plane restarts | converge by themselves: the generation is persisted, followers reconnect with backoff and pull | resumes from each follower's persisted cursors | no | the replicator's quarantine set and its last report (process memory, backlog #58) |
+| Follower restarts | converge at the handshake: the opener carries the applied generation and the control plane answers with the current one | resumes from the persisted cursors | no | the in-memory ban map (see "Bans") |
+| Partition shorter than local retention | as above, on reconnect | nothing: the rows waited locally | no | nothing |
+| Partition longer than local retention | as above | rows retention evicted below the cursor never reach the fleet view | no | those rows, uncounted today (backlog #76) |
+| Control plane machine lost | nothing converges: no changes, no renewals, no fleet actions until it is back; traffic keeps flowing | stops | **yes**, see below | see below |
+| Node re-enrolled under a new id | the new id is a new node; the old row must be revoked first because names are unique | the old id's rows are reclaimed by the hourly pass; the new id starts at the present | yes: revoke the dead row before re-enrolling under the same name | nothing that was not already on the dead node |
+
+### Replacing the control plane
+
+The control plane's identity is two files together: `lorica.db` (the
+cluster CA, the roster, the tokens, the generation counter) and
+`encryption.key` (what decrypts the CA's private key). Restore BOTH to
+the new machine, stop the old one for good, and start the new one with
+the SAME `--cluster-advertise` name: that name is the control-plane
+certificate's SAN and every follower pins it. Followers reconnect on
+their own; no re-enrolment is needed.
+
+Without `encryption.key` the cluster CA is unrecoverable and the fleet
+has no identity root. The procedure is then: `lorica cluster init` on a
+fresh control plane, revoke nothing (there is nothing to revoke
+against), `lorica cluster leave` on every follower so it wipes its old
+identity and keys, re-enrol each one with a new token, and treat every
+private key that was distributed by the old control plane as
+orphaned: re-issue every certificate. This is the cost the trust-model
+paragraph above warns about, and it is why that file is backed up like
+the root credential it is.
 
 ## Migrating a Standalone Node into a Fleet
 

@@ -116,6 +116,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 ### :globe_with_meridians: Management
 
+- **Multi-node cluster** (v1.7.0) - one control plane, any number of followers over mutual TLS with a fleet CA; short-lived join tokens bound to a node name, explicit activation, two-phase configuration replication with per-node route targeting, fleet-wide certificate issuance with need-to-know key distribution, and access logs / WAF events / bans / audit trail aggregated per node with one verifiable hash chain each. Followers are read-only with an audited break-glass window. See `docs/cluster.md`
 - **Web dashboard** - Svelte 5 UI (~59 KB) embedded in the binary: routes, backends, certs, WAF, SLA, load tests, settings
 - **REST API** - full CRUD for all entities, session-based auth, rate-limited login
 - **TOML config export/import** - with diff preview before applying changes
