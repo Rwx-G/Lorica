@@ -19,7 +19,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use lorica_cluster::{leaf_spki_sha256, token, ClusterRequest, ControlPlane, LiveSessionSnapshot};
-use lorica_config::models::{ClusterNode, JoinToken, NodeStatus, TokenState};
+use lorica_config::models::{ClusterNode, JoinToken, NodeStatus, Role, TokenState};
 use serde::{Deserialize, Serialize};
 
 use crate::cluster_telemetry_store::{FleetQuery, DEFAULT_PAGE, MAX_PAGE};
@@ -338,6 +338,14 @@ pub struct NodeResponse {
     /// is re-learned within one heartbeat when it returns. A figure
     /// from before a reconnect would be worse than none: the gauge
     /// would look live while describing a process that no longer runs.
+    ///
+    /// Also `null` for a Viewer, whatever the node reported. How much
+    /// RAM each node has and how full the filesystem holding its logs
+    /// and databases is are the two facts an attacker needs to pick
+    /// which node to exhaust to take a hostname offline, and no Viewer
+    /// workflow needs them. The field is new in Story 9.7, so the
+    /// house convention that carries the roster's other columns does
+    /// not carry it by default.
     pub resources: Option<NodeResourcesResponse>,
 }
 
@@ -346,6 +354,7 @@ fn node_responses(
     nodes: Vec<ClusterNode>,
     selected: &HashMap<String, Vec<String>>,
     certificates: &BTreeMap<String, Vec<String>>,
+    role: Role,
 ) -> Vec<NodeResponse> {
     let live: HashMap<String, LiveSessionSnapshot> = control
         .sessions
@@ -361,8 +370,9 @@ fn node_responses(
                 connected: session.is_some(),
                 session_peer: session.map(|s| s.peer_addr.to_string()),
                 session_last_seen_unix: session.map(|s| s.last_seen_unix),
-                resources: session
-                    .and_then(|s| s.resources.as_ref())
+                resources: (role >= Role::Operator)
+                    .then(|| session.and_then(|s| s.resources.as_ref()))
+                    .flatten()
                     .map(NodeResourcesResponse::from),
                 selected_for_hostnames: selected.get(&node.name).cloned().unwrap_or_default(),
                 certificate_ids: certificates.get(&node.node_id).cloned().unwrap_or_default(),
@@ -398,6 +408,7 @@ fn selected_hostnames(
 /// GET /api/v1/cluster/nodes - the fleet roster (Viewer+).
 pub async fn list_nodes(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
     let (nodes, selected, certificates) = db_blocking(&state.store, |store| {
@@ -420,12 +431,14 @@ pub async fn list_nodes(
         nodes,
         &selected,
         &certificates,
+        session.role,
     )))
 }
 
 /// GET /api/v1/cluster/nodes/{id} - one node (Viewer+).
 pub async fn get_node(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
@@ -439,7 +452,13 @@ pub async fn get_node(
         Ok::<_, ApiError>((node, selected, certificates))
     })
     .await?;
-    let mut responses = node_responses(&control, vec![node], &selected, &certificates);
+    let mut responses = node_responses(
+        &control,
+        vec![node],
+        &selected,
+        &certificates,
+        session.role,
+    );
     Ok(json_data(responses.remove(0)))
 }
 
@@ -488,7 +507,13 @@ pub async fn activate_node(
         Some(&serde_json::json!({ "status": "active", "name": node.name })),
     )
     .await;
-    let mut responses = node_responses(&control, vec![node], &selected, &certificates);
+    let mut responses = node_responses(
+        &control,
+        vec![node],
+        &selected,
+        &certificates,
+        session.role,
+    );
     Ok(json_data(responses.remove(0)))
 }
 
@@ -638,7 +663,15 @@ pub async fn get_status(
             // `FleetEntry` carries neither a selector nor a certificate
             // column, so the status summary skips the store passes the
             // roster does.
-            let fleet = node_responses(control, nodes, &HashMap::new(), &BTreeMap::new())
+            // `FleetEntry` carries no resource column either, so the
+            // role passed here decides nothing.
+            let fleet = node_responses(
+                control,
+                nodes,
+                &HashMap::new(),
+                &BTreeMap::new(),
+                Role::Viewer,
+            )
                 .into_iter()
                 .map(|n| FleetEntry {
                     node_id: n.node.node_id,
