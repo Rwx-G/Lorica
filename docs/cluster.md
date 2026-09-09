@@ -796,6 +796,35 @@ page. The absent total is deliberate: a `COUNT(*)` per page on an
 aggregated table is a full scan under the store lock, so a dashboard
 polling it would stall the ingest writer.
 
+Every fleet read (the roster, the replication and drift reports, the
+fan-in queries, the ban snapshot) sits at the **Operator** floor, and
+the aggregated audit trail at **SuperAdmin** unless `node=` names this
+node's own chain. On a single node these views show what that node
+already showed its Viewers; on a control plane they show every node's
+client addresses, paths, operators and key entitlements, which is
+cross-node data a delegated fleet does not hand to its least-trusted
+role. `GET /api/v1/cluster/status` stays Viewer, because the header
+badge every role sees is built from it and it carries no row.
+
+### Log sinks in a fleet
+
+The syslog and OTLP log sinks are **node-local**: each node ships its
+own access logs, WAF events and audit entries to the collector it is
+configured with, stamped with its `node_id` and `node_name` in the
+syslog structured-data element and the OTLP resource attributes. The
+sink settings replicate like every other fleet-policy setting, so one
+control-plane edit points the whole fleet at the SIEM, but the
+delivery itself never crosses the cluster plane: a node's sink
+connection is its own, backs off on its own, and sheds on its own
+(`lorica_log_sink_dropped_total{sink,kind}` per node).
+
+This is the division of labour the fan-in ceiling above implies. Fan
+in what the fleet view needs to correlate an incident (WAF events,
+bans, health, the audit trail, and access rows within the envelope);
+send the full access-log volume to the sinks, where a collector built
+for it does the retention. A fleet past the envelope runs both: fan-in
+for the dashboard, sinks for the record.
+
 ### Bans
 
 Bans fan in for visibility, and an operator can ban across the fleet:

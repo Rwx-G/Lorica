@@ -58,11 +58,13 @@ different certificates and do not burn the Let's Encrypt rate limit.
 - [x] AC #3 + D6: follower guard at the spawn site covering the renewal
       task, the expiry notifier (which runs one pass immediately) and
       the orphan purge.
-- [ ] AC #4 + D7: regression test that OCSP stays spawned on every
+- [x] AC #4 + D7: regression test that OCSP stays spawned on every
       role; comment recording why a follower flag must not be added.
-      (The comment is in; the test is NOT written.)
-- [ ] AC #5: no change; cluster-mode test for DNS-01. (No code change
-      was needed, as predicted; the test is NOT written.)
+      (`ocsp_refresh_is_spawned_on_every_role_and_never_gated_on_being_a_follower`
+      in `lorica/src/startup/mod.rs`; this box was stale.)
+- [x] AC #5: no change; cluster-mode test for DNS-01
+      (`the_dns01_path_never_reaches_the_cluster` in
+      `lorica-api/src/acme/tests.rs`; this box was stale).
 - [x] AC #6 + D10 + D16: fleet solver wrapping the local store,
       cleanup fan-out. The verdict is NOT all-or-nothing: a live node
       that refused blocks the order, an offline one does not.

@@ -92,10 +92,9 @@ the original tasks are smaller than drafted and one is larger.
 - [x] AC #11 + D1: EXTEND `docs/cluster.md` (fan-in ceiling, worked
       Prometheus federation config, standalone-to-cluster migration,
       ban rationale), replacing the Story 9.8 stub.
-- [ ] D12: the `cluster` e2e profile, which covers Stories 9.2-9.6.
-      Tracked apart from the code tasks so a partial outcome shows.
-      NOT DONE: this is the one piece of the story that did not land,
-      and it is inherited debt rather than new. Backlog #66.
+- [x] D12: the `cluster` e2e profile, which covers Stories 9.2-9.6.
+      Landed at the epic close (backlog #66 resolved), with a load
+      phase that measures the fan-in envelope (#64).
 
 Explicitly NOT in this story, with the reason recorded:
 
