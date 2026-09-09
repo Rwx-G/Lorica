@@ -297,6 +297,55 @@ a follower may never come.
 The disk gauge reports the data directory's filesystem, not the root
 one: what fills up on a proxy is where its logs and databases live.
 
+**D19: the AC #4 consumer review found four controls hidden from a
+follower that the server still serves.**
+
+Deriving `canWrite` and `isSuperAdmin` over the cluster state is one
+edit; the review pass the story flagged as NOT done is where the actual
+defects were. The authority is `follower_local_request` in
+`lorica-api/src/middleware/authorize.rs`, which lists what a follower
+still accepts. Four UI controls map to entries on that list and were
+nonetheless hidden:
+
+- **Load-test run and abort.** The allow-list names
+  `/api/v1/loadtest/start/` and `/api/v1/loadtest/abort`, and its own
+  comment calls them "a probe, not configuration". Editing a test
+  config is a genuine configuration mutation and stays on `canWrite`.
+- **Configuration export.** `/api/v1/config/export` is on the list. A
+  follower handing out its own snapshot is exactly what an operator
+  diagnosing drift wants.
+- **Audit chain verification.** The `/api/v1/audit` prefix is on the
+  list. It reads this node's own records and changes nothing.
+- **Users and Access.** `replica.rs` never writes `users`, and the
+  `/api/v1/users` prefix is on the list. This is the worst of the four:
+  a follower whose only SuperAdmin credential is compromised could not
+  rotate it without first opening a break-glass window, which is the
+  wrong tool and leaves the node writable meanwhile.
+
+Fixed with `canWriteRole`, the counterpart of the existing
+`isSuperAdminRole`: write permission from the role alone. Its doc says
+to reach for it only against a path the allow-list actually names, and
+each of the four call sites says which.
+
+Two cases were left as they are, deliberately:
+
+- **Import.** `/api/v1/config/import/preview` is allowed on a follower
+  but `/api/v1/config/import` is not. Offering a preview that cannot be
+  applied is a dead end, so the panel stays hidden.
+- **The connectivity probes** in the settings tabs (`otel/test`,
+  `syslog/test`, `otlp-logs/test`, and the per-notification and
+  per-DNS-provider ones). All are on the allow-list, but each sits
+  inside a form whose save is legitimately refused on a follower.
+  Splitting the buttons out of four settings tabs to expose a probe
+  against a setting you cannot change is not worth the restructuring.
+  Worth revisiting if an operator asks for it.
+
+The general lesson, and the reason this is written down: a role
+predicate and a node-mode predicate answer different questions, and
+collapsing them means every consumer inherits an answer nobody checked
+against the server. The server's allow-list is the specification; the
+dashboard has to be read against it, not guessed at.
+
 ### Completion Notes
 
 (empty)

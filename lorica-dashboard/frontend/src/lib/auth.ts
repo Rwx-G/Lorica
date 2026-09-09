@@ -49,11 +49,31 @@ export const isSuperAdmin = derived(
 /**
  * The role alone, ignoring read-only mode.
  *
- * For the few controls that must stay available on a follower because
- * they are how an operator gets OUT of read-only mode: opening a
- * break-glass window, and leaving the fleet.
+ * For the controls that must stay available on a follower: the two
+ * that are how an operator gets OUT of read-only mode (opening a
+ * break-glass window, leaving the fleet), and local account
+ * management, whose table replication never writes.
  */
 export const isSuperAdminRole = derived(
   auth,
   (a) => a.status === 'authenticated' && a.role === 'super_admin',
+);
+
+/**
+ * Write permission from the role alone, ignoring read-only mode.
+ *
+ * The counterpart of [`isSuperAdminRole`], for the actions the server
+ * still serves on a follower because they touch no replicated
+ * configuration. The authoritative list is `follower_local_request`
+ * in `lorica-api/src/middleware/authorize.rs`, and this store exists
+ * so the dashboard can match it rather than hide controls the server
+ * would have honoured.
+ *
+ * Use `canWrite` for anything that edits configuration. Reach for this
+ * one only against a path that allow-list actually names, and say
+ * which at the call site.
+ */
+export const canWriteRole = derived(
+  auth,
+  (a) => a.status === 'authenticated' && (a.role === 'operator' || a.role === 'super_admin'),
 );

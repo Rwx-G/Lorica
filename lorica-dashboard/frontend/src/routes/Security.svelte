@@ -4,7 +4,7 @@
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
   import { showToast } from '../lib/toast';
-  import { canWrite, isSuperAdmin } from '../lib/auth';
+  import { canWrite, isSuperAdmin, isSuperAdminRole } from '../lib/auth';
   import { clusterStatus, isClustered, type FleetBanRow } from '../lib/cluster';
 
   /**
@@ -849,7 +849,13 @@
           <option value={1000}>1000</option>
         </select>
         <button class="btn btn-secondary" onclick={loadAudit}>Apply</button>
-        {#if $isSuperAdmin}
+        <!--
+          The audit log is node-local and `follower_local_request`
+          names the `/api/v1/audit` prefix. Verifying the chain reads
+          this node's own records and changes nothing, so read-only
+          mode has no reason to withhold it.
+        -->
+        {#if $isSuperAdminRole}
           <button class="btn btn-secondary" onclick={verifyAuditChain} disabled={auditVerifying}>
             {auditVerifying ? 'Verifying...' : 'Verify chain integrity'}
           </button>

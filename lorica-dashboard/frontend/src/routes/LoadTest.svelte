@@ -12,7 +12,7 @@
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { showToast } from '../lib/toast';
-  import { canWrite } from '../lib/auth';
+  import { canWrite, canWriteRole } from '../lib/auth';
 
   let configs: LoadTestConfigResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
@@ -351,7 +351,15 @@
       <div class="live-header">
         <span class="live-dot"></span>
         <span class="live-title">Test Running</span>
-        {#if $canWrite}
+        <!--
+          Running and aborting a test are probes, not configuration:
+          `follower_local_request` names `/api/v1/loadtest/abort` and
+          `/api/v1/loadtest/start/`, so a follower still serves them
+          and hiding them here would withhold a control the server
+          would have honoured. Editing a test config is a different
+          matter and stays on `canWrite` below.
+        -->
+        {#if $canWriteRole}
           <button class="btn btn-danger-small" onclick={handleAbort}>Abort</button>
         {/if}
       </div>
@@ -420,10 +428,12 @@
               <td>{c.duration_s}s</td>
               <td class="mono small">{c.schedule_cron ?? 'Manual'}</td>
               <td class="actions">
-                {#if $canWrite}
+                {#if $canWriteRole}
                   <button class="btn btn-small btn-run" onclick={() => handleStart(c.id)} disabled={!!progress?.active} title={progress?.active ? 'Another test is already running' : 'Run this test'}>
                     Run
                   </button>
+                {/if}
+                {#if $canWrite}
                   <button class="btn-icon" onclick={() => openEditForm(c)} title="Edit" aria-label="Edit">
                     <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                     {@html editIcon}

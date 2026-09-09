@@ -26,7 +26,7 @@
   import CertExportTab from '../components/settings-tabs/CertExportTab.svelte';
   import BinaryUpgradeTab from '../components/settings-tabs/BinaryUpgradeTab.svelte';
   import UsersAccessTab from '../components/settings-tabs/UsersAccessTab.svelte';
-  import { isSuperAdmin } from '../lib/auth';
+  import { isSuperAdmin, isSuperAdminRole } from '../lib/auth';
   import { parseOctalMode } from '../lib/validators';
 
   // Global settings
@@ -536,7 +536,13 @@
       toggleSection={() => toggleSection('binary_upgrade')}
     />
 
-    {#if $isSuperAdmin}
+    <!--
+      Accounts are node-local: `replica.rs` never writes `users`, and
+      `follower_local_request` names the `/api/v1/users` prefix. A
+      follower whose only SuperAdmin credential is compromised must be
+      able to rotate it without first opening a break-glass window.
+    -->
+    {#if $isSuperAdminRole}
       <UsersAccessTab
         expanded={expandedSections.users_access}
         toggleSection={() => toggleSection('users_access')}
