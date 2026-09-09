@@ -471,6 +471,20 @@ generation and applies it wholesale: local edits are reconciled away.
 That is the documented meaning of the control plane owning the
 configuration, and the reason break-glass is a window and not a mode.
 
+The bit rides the heartbeat, so the control plane treats it as a claim
+and not as proof. A follower opens its window through its own
+management API, which means the only record the control plane can hold
+is the `cluster.break_glass.open` audit row that follower fans in. When
+a drifted node asserts break-glass and that row has arrived, the alert
+says the node is in break-glass and diverges, because an operator did
+that on purpose. When the row has not arrived, the alert says the node
+*claims* break-glass and carries `break_glass_corroborated: false`: a
+node that took itself out of every commit round without an operator
+opening a window looks exactly like a compromised one, and it is not
+the control plane's place to decide which it is. A window opened
+seconds ago can legitimately read uncorroborated for one telemetry
+drain (ten seconds).
+
 ### Watching it
 
 `GET /api/v1/cluster/replication` returns the last round (prepared,
