@@ -188,6 +188,8 @@ impl LogStore {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL DEFAULT '',
+                origin_id INTEGER NOT NULL DEFAULT 0,
                 timestamp TEXT NOT NULL,
                 operator_username TEXT NOT NULL,
                 operator_role TEXT NOT NULL,
@@ -204,12 +206,40 @@ impl LogStore {
             CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
             CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
             CREATE INDEX IF NOT EXISTS idx_audit_log_operator ON audit_log(operator_username);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_node ON audit_log(node_id, origin_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_log_origin
+                ON audit_log(node_id, origin_id) WHERE node_id != '';
             CREATE TABLE IF NOT EXISTS audit_log_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );",
         )
         .map_err(|e| format!("failed to initialize audit log schema: {e}"))?;
+
+        // Migrate: the fan-in columns (Story 9.9 AC #2). Both default
+        // to the local-row value, so an existing single-node database
+        // needs no backfill and reads exactly as it did.
+        let _ = conn.execute(
+            "ALTER TABLE audit_log ADD COLUMN node_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE audit_log ADD COLUMN origin_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_node ON audit_log(node_id, origin_id)",
+            [],
+        );
+        // PARTIAL on purpose. Every local row is `('', 0)`, so a plain
+        // unique index would refuse the second local audit entry ever
+        // written. Restricted to fanned-in rows it is what makes the
+        // fan-in insert idempotent, so a batch re-sent after a lost
+        // acknowledgement stores nothing twice.
+        let _ = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_log_origin              ON audit_log(node_id, origin_id) WHERE node_id != ''",
+            [],
+        );
 
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
@@ -855,6 +885,82 @@ impl LogStore {
         Ok(out)
     }
 
+    /// Local audit rows after `after_id`, oldest first, for the
+    /// cluster drain (Story 9.9 AC #2).
+    ///
+    /// `node_id = ''` on purpose: a follower ships only its OWN audit
+    /// rows. Without that clause a control plane demoted to a follower
+    /// would re-ship every other node's rows it had aggregated, under
+    /// its own session identity, and the receiving control plane would
+    /// stamp them with the wrong node.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read failure.
+    pub fn audit_rows_after(
+        &self,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<Vec<(i64, crate::audit::FannedInAuditRow)>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, timestamp, operator_username, operator_role, action,
+                        target_type, target_id, before_payload_hash, after_payload_hash,
+                        ip, user_agent, prev_chain_hash, chain_hash
+                 FROM audit_log WHERE node_id = '' AND id > ?1 ORDER BY id ASC LIMIT ?2",
+            )
+            .map_err(|e| format!("failed to prepare the audit drain: {e}"))?;
+        let rows = stmt
+            .query_map(params![after_id as i64, limit as i64], |row| {
+                let id: i64 = row.get(0)?;
+                Ok((
+                    id,
+                    crate::audit::FannedInAuditRow {
+                        // The origin id IS this row's local id. It is
+                        // carried explicitly rather than inferred at
+                        // the far end, where the aggregated id is a
+                        // different number entirely.
+                        origin_id: id,
+                        timestamp: row.get(1)?,
+                        operator_username: row.get(2)?,
+                        operator_role: row.get(3)?,
+                        action: row.get(4)?,
+                        target_type: row.get(5)?,
+                        target_id: row.get(6)?,
+                        before_payload_hash: row.get(7)?,
+                        after_payload_hash: row.get(8)?,
+                        ip: row.get(9)?,
+                        user_agent: row.get(10)?,
+                        prev_chain_hash: row.get(11)?,
+                        chain_hash: row.get(12)?,
+                    },
+                ))
+            })
+            .map_err(|e| format!("failed to run the audit drain: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("failed to read an audit row: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// The highest LOCAL audit rowid currently stored. See
+    /// [`LogStore::newest_access_id`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read failure.
+    pub fn newest_local_audit_id(&self) -> Result<u64, String> {
+        let conn = self.conn.lock();
+        let id: Option<i64> = conn
+            .query_row("SELECT MAX(id) FROM audit_log WHERE node_id = ''", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| format!("failed to read the newest audit id: {e}"))?;
+        Ok(id.unwrap_or(0).max(0) as u64)
+    }
+
     /// The highest access-log rowid currently stored, so a node that
     /// has never drained can start at the present instead of
     /// replaying everything retention still holds.
@@ -1064,15 +1170,35 @@ impl LogStore {
 impl LogStore {
     const RETENTION_SEAL_KEY: &'static str = "retention_seal";
 
-    fn audit_seal(conn: &Connection) -> Result<Option<String>, String> {
+    /// The seal key for one node's chain (Story 9.9 AC #3).
+    ///
+    /// The local chain keeps the exact literal it has always used, so
+    /// an upgraded single-node database reads as it did and needs no
+    /// migration of `audit_log_meta`. A fanned-in node gets a suffixed
+    /// key: N interleaved chains need N seals, and one shared key would
+    /// make every node's retention truncation reseal every other
+    /// node's chain.
+    fn seal_key(node_id: &str) -> String {
+        if node_id.is_empty() {
+            Self::RETENTION_SEAL_KEY.to_string()
+        } else {
+            format!("{}:{node_id}", Self::RETENTION_SEAL_KEY)
+        }
+    }
+
+    fn audit_seal_for(conn: &Connection, node_id: &str) -> Result<Option<String>, String> {
         use rusqlite::OptionalExtension;
         conn.query_row(
             "SELECT value FROM audit_log_meta WHERE key = ?1",
-            params![Self::RETENTION_SEAL_KEY],
+            params![Self::seal_key(node_id)],
             |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(|e| format!("failed to read audit retention seal: {e}"))
+    }
+
+    fn audit_seal(conn: &Connection) -> Result<Option<String>, String> {
+        Self::audit_seal_for(conn, "")
     }
 
     /// Append one audit row. `prev_chain_hash` and `chain_hash` are
@@ -1083,9 +1209,15 @@ impl LogStore {
         use rusqlite::OptionalExtension;
         let conn = self.conn.lock();
 
+        // The LOCAL tail, not the table's. Story 9.9 makes this table
+        // hold N interleaved chains, and reading the global tail would
+        // chain this node's next entry off whichever follower's row
+        // happened to arrive last: this node's own chain would then be
+        // verifiable by nothing but this exact aggregate, and would
+        // break the moment a fanned-in row was pruned.
         let last: Option<String> = conn
             .query_row(
-                "SELECT chain_hash FROM audit_log ORDER BY id DESC LIMIT 1",
+                "SELECT chain_hash FROM audit_log WHERE node_id = '' ORDER BY id DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -1103,6 +1235,9 @@ impl LogStore {
             &crate::audit::ChainInput::from(entry),
         );
 
+        // `node_id` and `origin_id` take their column defaults: this
+        // is a local row, on a standalone install and on a clustered
+        // one alike.
         conn.execute(
             "INSERT INTO audit_log (timestamp, operator_username, operator_role, action,
                 target_type, target_id, before_payload_hash, after_payload_hash,
@@ -1128,6 +1263,90 @@ impl LogStore {
         Ok((conn.last_insert_rowid(), chain_hash))
     }
 
+    /// Store audit rows fanned in from another node (Story 9.9 AC #2).
+    ///
+    /// A SEPARATE path from [`LogStore::insert_audit`], and the
+    /// separation is the whole point rather than a convenience. That
+    /// one computes `prev_chain_hash` from the table's global tail; if
+    /// fan-in rows went through it, the control plane's own next audit
+    /// entry would chain off a follower's row, so its chain would be
+    /// unverifiable by anything but this exact aggregate, and the
+    /// follower's rows would be re-hashed into a chain the origin
+    /// never published.
+    ///
+    /// So the chain fields are written VERBATIM. Nothing here
+    /// recomputes a hash: the aggregated copy is worth something only
+    /// if it is byte-identical to what the node itself published on its
+    /// `lorica::audit` stream, which is the out-of-band anchor the
+    /// whole feature leans on. A row whose hash does not recompute
+    /// stays as it arrived and is reported by verify; silently fixing
+    /// it would erase the only evidence.
+    ///
+    /// Idempotent on `(node_id, origin_id)`: a drain that re-sends a
+    /// batch after a lost acknowledgement must not duplicate rows, and
+    /// a duplicate would break the partitioned verify's ordering.
+    ///
+    /// Returns how many rows were newly stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a write failure, and refuses a
+    /// row with an empty `node_id`: that is the local marker, and a
+    /// fanned-in row claiming to be local would splice another node's
+    /// history into this node's chain.
+    pub fn insert_fanned_in_audit(
+        &self,
+        node_id: &str,
+        rows: &[crate::audit::FannedInAuditRow],
+    ) -> Result<u64, String> {
+        if node_id.is_empty() {
+            return Err("a fanned-in audit row cannot claim to be local".to_string());
+        }
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("failed to open the audit fan-in transaction: {e}"))?;
+        let mut stored = 0u64;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO audit_log (timestamp, operator_username,
+                        operator_role, action, target_type, target_id,
+                        before_payload_hash, after_payload_hash, ip, user_agent,
+                        prev_chain_hash, chain_hash, node_id, origin_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                )
+                .map_err(|e| format!("failed to prepare the audit fan-in insert: {e}"))?;
+            for row in rows {
+                stored += stmt
+                    .execute(params![
+                        row.timestamp,
+                        row.operator_username,
+                        row.operator_role,
+                        row.action,
+                        row.target_type,
+                        row.target_id,
+                        row.before_payload_hash,
+                        row.after_payload_hash,
+                        row.ip,
+                        row.user_agent,
+                        row.prev_chain_hash,
+                        row.chain_hash,
+                        node_id,
+                        row.origin_id,
+                    ])
+                    .map_err(|e| format!("failed to store a fanned-in audit row: {e}"))?
+                    as u64;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("failed to commit the audit fan-in: {e}"))?;
+        Ok(stored)
+    }
+
     fn row_to_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::audit::AuditRecord> {
         Ok(crate::audit::AuditRecord {
             id: row.get(0)?,
@@ -1143,12 +1362,14 @@ impl LogStore {
             user_agent: row.get(10)?,
             prev_chain_hash: row.get(11)?,
             chain_hash: row.get(12)?,
+            node_id: row.get(13)?,
+            origin_id: row.get(14)?,
         })
     }
 
     const AUDIT_COLUMNS: &'static str = "id, timestamp, operator_username, operator_role, \
         action, target_type, target_id, before_payload_hash, after_payload_hash, \
-        ip, user_agent, prev_chain_hash, chain_hash";
+        ip, user_agent, prev_chain_hash, chain_hash, node_id, origin_id";
 
     /// Query audit rows, newest first, with total count under the
     /// same filters (for pagination). `action_prefix` is a literal
@@ -1183,6 +1404,12 @@ impl LogStore {
         if let Some(before_id) = q.before_id {
             clauses.push("id < ?".into());
             binds.push(Box::new(before_id));
+        }
+        // `Some("")` selects this node's own rows and is not the same
+        // as `None`, which selects every node's.
+        if let Some(node_id) = &q.node_id {
+            clauses.push("node_id = ?".into());
+            binds.push(Box::new(node_id.clone()));
         }
 
         let where_sql = if clauses.is_empty() {
@@ -1226,19 +1453,53 @@ impl LogStore {
     /// Walk the whole chain from genesis (or the retention seal) and
     /// recompute every `chain_hash`. Stops at the earliest break.
     pub fn verify_audit_chain(&self) -> Result<crate::audit::VerifyResult, String> {
+        self.verify_audit_chain_for("")
+    }
+
+    /// Verify ONE node's chain (Story 9.9 AC #3). `""` is this node's.
+    ///
+    /// Partitioned, because the aggregated table interleaves N chains
+    /// and the unpartitioned walk would chain one node's row to
+    /// another's and report a break at the first interleave. Ordered by
+    /// `origin_id` for a fanned-in node, which reconstructs the order
+    /// that node wrote its rows in; the aggregated `id` reflects the
+    /// order they ARRIVED in, which two reconnecting followers can
+    /// interleave arbitrarily.
+    ///
+    /// A break is reported at the aggregated `id`, so an operator can
+    /// find the row, with the origin's own id beside it.
+    ///
+    /// What this proves is internal consistency of what the node sent,
+    /// and nothing about authenticity: a compromised follower streams a
+    /// self-consistent forged chain and this reports it clean. The
+    /// origin's own `lorica::audit` stream shipped to a WORM sink is
+    /// the anchor; see the module doc of [`crate::audit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read failure.
+    pub fn verify_audit_chain_for(
+        &self,
+        node_id: &str,
+    ) -> Result<crate::audit::VerifyResult, String> {
         let conn = self.conn.lock();
-        let mut expected: String = Self::audit_seal(&conn)?
+        let mut expected: String = Self::audit_seal_for(&conn, node_id)?
             .unwrap_or_else(|| crate::audit::GENESIS_HASH.to_string());
 
+        let order = if node_id.is_empty() {
+            "id ASC"
+        } else {
+            "origin_id ASC"
+        };
         let sql = format!(
-            "SELECT {} FROM audit_log ORDER BY id ASC",
+            "SELECT {} FROM audit_log WHERE node_id = ?1 ORDER BY {order}",
             Self::AUDIT_COLUMNS
         );
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("failed to prepare audit verify: {e}"))?;
         let rows = stmt
-            .query_map([], Self::row_to_audit)
+            .query_map(params![node_id], Self::row_to_audit)
             .map_err(|e| format!("failed to run audit verify: {e}"))?;
 
         let mut total_rows: u64 = 0;
@@ -1272,6 +1533,30 @@ impl LogStore {
         })
     }
 
+    /// Every node id that has rows in the aggregate, `""` included.
+    ///
+    /// The input to a verify that reports per node: an operator asking
+    /// "is the fleet's audit trail intact" needs one answer per chain,
+    /// and there is no other list of which chains exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read failure.
+    pub fn audit_node_ids(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT node_id FROM audit_log ORDER BY node_id")
+            .map_err(|e| format!("failed to prepare the audit node list: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("failed to list audit nodes: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("failed to read an audit node id: {e}"))?);
+        }
+        Ok(out)
+    }
+
     /// Delete audit rows older than `cutoff_timestamp` (RFC 3339),
     /// preserving chain verifiability: before deleting, the earliest
     /// SURVIVING row's `prev_chain_hash` (or, when nothing survives,
@@ -1293,33 +1578,72 @@ impl LogStore {
             return Ok(0);
         }
 
-        let survivor_prev: Option<String> = conn
-            .query_row(
-                "SELECT prev_chain_hash FROM audit_log WHERE timestamp >= ?1 ORDER BY id ASC LIMIT 1",
-                params![cutoff_timestamp],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("failed to read earliest surviving audit row: {e}"))?;
+        // One seal per chain, not one for the table (Story 9.9 AC #3).
+        // A truncation crosses every node's rows at once, so sealing
+        // only the local key would leave every fanned-in chain
+        // unverifiable from its new first surviving row: its `prev`
+        // points at a row this pass deleted.
+        let nodes: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT node_id FROM audit_log")
+                .map_err(|e| format!("failed to list audit chains: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("failed to list audit chains: {e}"))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| format!("failed to read an audit chain id: {e}"))?);
+            }
+            out
+        };
 
-        let seal: Option<String> = match survivor_prev {
-            Some(prev) => Some(prev),
-            None => conn
+        for node_id in &nodes {
+            // Ordered the way that chain is verified: arrival order for
+            // the local one, the origin's own order for a fanned-in
+            // one. Sealing with the wrong row's `prev` would hand
+            // verify a genesis that does not match its first row.
+            let order = if node_id.is_empty() {
+                "id ASC"
+            } else {
+                "origin_id ASC"
+            };
+            let survivor_prev: Option<String> = conn
                 .query_row(
-                    "SELECT chain_hash FROM audit_log ORDER BY id DESC LIMIT 1",
-                    [],
+                    &format!(
+                        "SELECT prev_chain_hash FROM audit_log                          WHERE node_id = ?1 AND timestamp >= ?2 ORDER BY {order} LIMIT 1"
+                    ),
+                    params![node_id, cutoff_timestamp],
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(|e| format!("failed to read audit chain tail: {e}"))?,
-        };
+                .map_err(|e| format!("failed to read earliest surviving audit row: {e}"))?;
 
-        if let Some(seal) = seal {
-            conn.execute(
-                "INSERT OR REPLACE INTO audit_log_meta (key, value) VALUES (?1, ?2)",
-                params![Self::RETENTION_SEAL_KEY, seal],
-            )
-            .map_err(|e| format!("failed to write audit retention seal: {e}"))?;
+            let tail_order = if node_id.is_empty() {
+                "id DESC"
+            } else {
+                "origin_id DESC"
+            };
+            let seal: Option<String> = match survivor_prev {
+                Some(prev) => Some(prev),
+                None => conn
+                    .query_row(
+                        &format!(
+                            "SELECT chain_hash FROM audit_log WHERE node_id = ?1                              ORDER BY {tail_order} LIMIT 1"
+                        ),
+                        params![node_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| format!("failed to read audit chain tail: {e}"))?,
+            };
+
+            if let Some(seal) = seal {
+                conn.execute(
+                    "INSERT OR REPLACE INTO audit_log_meta (key, value) VALUES (?1, ?2)",
+                    params![Self::seal_key(node_id), seal],
+                )
+                .map_err(|e| format!("failed to write audit retention seal: {e}"))?;
+            }
         }
 
         let deleted = conn
@@ -1503,6 +1827,235 @@ mod notification_history_tests {
     fn notification_history_count_on_empty_table() {
         let (store, _dir) = tmp_store();
         assert_eq!(store.notification_history_count().expect("count"), 0);
+    }
+}
+
+#[cfg(test)]
+mod fleet_audit_tests {
+    use super::*;
+    use crate::audit::{FannedInAuditRow, NewAuditEntry};
+
+    fn store() -> (LogStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("test setup: tempdir");
+        let store = LogStore::open(dir.path()).expect("test setup: log store opens");
+        (store, dir)
+    }
+
+    fn local_entry(action: &str) -> NewAuditEntry {
+        NewAuditEntry {
+            timestamp: "2026-09-09T10:00:00Z".to_string(),
+            operator_username: "admin".to_string(),
+            operator_role: "super_admin".to_string(),
+            action: action.to_string(),
+            target_type: "route".to_string(),
+            target_id: "r1".to_string(),
+            before_payload_hash: String::new(),
+            after_payload_hash: String::new(),
+            ip: "192.0.2.10".to_string(),
+            user_agent: "curl".to_string(),
+        }
+    }
+
+    /// Build a chain the way an origin node would, so the rows that
+    /// arrive are exactly what that node published.
+    fn origin_chain(actions: &[&str]) -> Vec<FannedInAuditRow> {
+        let mut prev = crate::audit::GENESIS_HASH.to_string();
+        let mut out = Vec::new();
+        for (i, action) in actions.iter().enumerate() {
+            let entry = local_entry(action);
+            let chain_hash =
+                crate::audit::compute_chain_hash(&prev, &crate::audit::ChainInput::from(&entry));
+            out.push(FannedInAuditRow {
+                origin_id: i as i64 + 1,
+                timestamp: entry.timestamp,
+                operator_username: entry.operator_username,
+                operator_role: entry.operator_role,
+                action: entry.action,
+                target_type: entry.target_type,
+                target_id: entry.target_id,
+                before_payload_hash: entry.before_payload_hash,
+                after_payload_hash: entry.after_payload_hash,
+                ip: entry.ip,
+                user_agent: entry.user_agent,
+                prev_chain_hash: prev.clone(),
+                chain_hash: chain_hash.clone(),
+            });
+            prev = chain_hash;
+        }
+        out
+    }
+
+    #[test]
+    fn a_fanned_in_row_never_joins_this_node_s_chain() {
+        // The reason AC #2 demands a separate insert path. If fan-in
+        // went through `insert_audit`, this node's next entry would
+        // chain off a follower's row and its own chain would be
+        // verifiable by nothing but this exact aggregate.
+        let (store, _dir) = store();
+        let (_, first_local) = store.insert_audit(&local_entry("route.create")).expect("local");
+        store
+            .insert_fanned_in_audit("node-a", &origin_chain(&["backend.create"]))
+            .expect("fan-in");
+        let (_, second_local) = store.insert_audit(&local_entry("route.delete")).expect("local");
+
+        let (rows, _) = store
+            .query_audit(&crate::audit::AuditQuery {
+                limit: 10,
+                node_id: Some(String::new()),
+                ..Default::default()
+            })
+            .expect("query");
+        let newest = rows.first().expect("a local row");
+        assert_eq!(newest.chain_hash, second_local);
+        assert_eq!(
+            newest.prev_chain_hash, first_local,
+            "the local chain skips the fanned-in row entirely"
+        );
+    }
+
+    #[test]
+    fn each_node_s_chain_verifies_on_its_own_and_the_unpartitioned_walk_would_not() {
+        let (store, _dir) = store();
+        store.insert_audit(&local_entry("route.create")).expect("local");
+        store
+            .insert_fanned_in_audit("node-a", &origin_chain(&["a.one", "a.two"]))
+            .expect("fan-in a");
+        store.insert_audit(&local_entry("route.delete")).expect("local");
+        store
+            .insert_fanned_in_audit("node-b", &origin_chain(&["b.one"]))
+            .expect("fan-in b");
+
+        for node_id in ["", "node-a", "node-b"] {
+            let result = store.verify_audit_chain_for(node_id).expect("verify");
+            assert!(
+                result.verified,
+                "chain {node_id} did not verify: {result:?}"
+            );
+        }
+        assert_eq!(
+            store.audit_node_ids().expect("node ids"),
+            vec!["".to_string(), "node-a".to_string(), "node-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_re_sent_batch_stores_nothing_twice() {
+        // The drain leaves its cursor put when a push is not fully
+        // accepted, so the same rows are offered again. Duplicates
+        // would break the partitioned verify's ordering.
+        let (store, _dir) = store();
+        let rows = origin_chain(&["a.one", "a.two"]);
+        assert_eq!(
+            store.insert_fanned_in_audit("node-a", &rows).expect("first"),
+            2
+        );
+        assert_eq!(
+            store.insert_fanned_in_audit("node-a", &rows).expect("second"),
+            0,
+            "the second delivery of the same rows stores nothing"
+        );
+        assert!(store.verify_audit_chain_for("node-a").expect("verify").verified);
+    }
+
+    #[test]
+    fn a_fanned_in_row_cannot_claim_to_be_local() {
+        // The empty node id is this node's own marker. A row claiming
+        // it would splice another node's history into this node's
+        // chain, which is the one thing the separate path exists to
+        // prevent.
+        let (store, _dir) = store();
+        assert!(store
+            .insert_fanned_in_audit("", &origin_chain(&["a.one"]))
+            .is_err());
+    }
+
+    #[test]
+    fn a_tampered_fanned_in_row_is_reported_rather_than_repaired() {
+        // Storing verbatim is the point: the aggregated copy is worth
+        // something only if it matches what the node published. A row
+        // whose hash does not recompute must stay as it arrived.
+        let (store, _dir) = store();
+        let mut rows = origin_chain(&["a.one", "a.two"]);
+        rows[1].action = "a.two.tampered".to_string();
+        store.insert_fanned_in_audit("node-a", &rows).expect("fan-in");
+
+        let result = store.verify_audit_chain_for("node-a").expect("verify");
+        assert!(!result.verified);
+        assert_eq!(result.first_break_reason.as_deref(), Some("chain_hash_mismatch"));
+    }
+
+    #[test]
+    fn retention_seals_every_chain_not_just_the_local_one() {
+        // A truncation crosses every node's rows at once. Sealing only
+        // the local key would leave each fanned-in chain unverifiable
+        // from its new first surviving row.
+        let (store, _dir) = store();
+        let mut old = local_entry("route.create");
+        old.timestamp = "2026-01-01T00:00:00Z".to_string();
+        store.insert_audit(&old).expect("local old");
+        store.insert_audit(&local_entry("route.delete")).expect("local new");
+
+        let mut rows = origin_chain(&["a.one", "a.two"]);
+        rows[0].timestamp = "2026-01-01T00:00:00Z".to_string();
+        // Rebuild the chain so the backdated row still hashes right.
+        let rebuilt = {
+            let mut prev = crate::audit::GENESIS_HASH.to_string();
+            let mut out = Vec::new();
+            for mut row in rows {
+                row.prev_chain_hash = prev.clone();
+                let entry = NewAuditEntry {
+                    timestamp: row.timestamp.clone(),
+                    operator_username: row.operator_username.clone(),
+                    operator_role: row.operator_role.clone(),
+                    action: row.action.clone(),
+                    target_type: row.target_type.clone(),
+                    target_id: row.target_id.clone(),
+                    before_payload_hash: row.before_payload_hash.clone(),
+                    after_payload_hash: row.after_payload_hash.clone(),
+                    ip: row.ip.clone(),
+                    user_agent: row.user_agent.clone(),
+                };
+                row.chain_hash = crate::audit::compute_chain_hash(
+                    &prev,
+                    &crate::audit::ChainInput::from(&entry),
+                );
+                prev = row.chain_hash.clone();
+                out.push(row);
+            }
+            out
+        };
+        store.insert_fanned_in_audit("node-a", &rebuilt).expect("fan-in");
+
+        let deleted = store
+            .enforce_audit_retention("2026-06-01T00:00:00Z")
+            .expect("retention");
+        assert_eq!(deleted, 2, "one local row and one fanned-in row expired");
+
+        for node_id in ["", "node-a"] {
+            assert!(
+                store.verify_audit_chain_for(node_id).expect("verify").verified,
+                "chain {node_id} lost its seal"
+            );
+        }
+    }
+
+    #[test]
+    fn the_drain_ships_only_this_node_s_own_rows() {
+        // A control plane demoted to a follower must not re-ship every
+        // other node's rows under its own session identity.
+        let (store, _dir) = store();
+        store.insert_audit(&local_entry("route.create")).expect("local");
+        store
+            .insert_fanned_in_audit("node-a", &origin_chain(&["a.one"]))
+            .expect("fan-in");
+
+        let shipped = store.audit_rows_after(0, 100).expect("drain read");
+        assert_eq!(shipped.len(), 1);
+        assert_eq!(shipped[0].1.action, "route.create");
+        assert_eq!(
+            store.newest_local_audit_id().expect("newest"),
+            shipped[0].0 as u64
+        );
     }
 }
 

@@ -134,14 +134,15 @@ pub use messages::{
     ConfigPrepare, ConfigPrepareAck, ConfigPull, ConfigPullAck, Enroll, EnrollAck, Heartbeat,
     HeartbeatAck, Hello, HelloAck, Leave, LeaveAck, NodeResources, Renew, RenewAck,
     TelemetryAccessRow,
-    TelemetryBan, TelemetryPush, TelemetryPushAck, TelemetryWafRow, BODY_KIND_BAN_PUSH,
+    TelemetryAuditRow, TelemetryBan, TelemetryPush, TelemetryPushAck, TelemetryWafRow,
+    BODY_KIND_BAN_PUSH,
     BODY_KIND_CERT_PULL, BODY_KIND_CERT_PUSH, BODY_KIND_CHALLENGE_PUBLISH,
     BODY_KIND_CHALLENGE_RETRACT, BODY_KIND_CONFIG_ABORT, BODY_KIND_CONFIG_COMMIT,
     BODY_KIND_CONFIG_PREPARE, BODY_KIND_CONFIG_PULL, BODY_KIND_ENROLL, BODY_KIND_HEARTBEAT,
     BODY_KIND_HELLO, BODY_KIND_LEAVE, BODY_KIND_RENEW, BODY_KIND_TELEMETRY_PUSH,
     CERT_DIGEST_PREFIX, MAX_CERT_DOMAIN_BYTES, MAX_CERT_ID_BYTES,
     MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES, MAX_CHALLENGE_TOKEN_BYTES, MAX_CONFIG_HASH_BYTES,
-    MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
+    MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
 };
 pub use preauth::{source_key, AttemptWindow, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
 pub use telemetry::{

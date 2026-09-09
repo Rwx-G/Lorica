@@ -770,11 +770,64 @@ impl SessionHandler for FleetHandlers {
                 return Err("the telemetry database is not open".to_string());
             };
 
-            // The storage watermark first, because it overrides every
-            // per-node budget: when the disk is short, a node well
-            // inside its quota is shed too. Telemetry is the first
-            // thing dropped so configuration and audit writes are the
-            // last (AC #8).
+            // Audit rows first, and outside every shedding decision
+            // below (Story 9.9 AC #2). Losing an access row costs a
+            // line of traffic; losing an audit row costs the record of
+            // an operator action, on the one table whose entire purpose
+            // is that the record exists. The watermark's own comment
+            // already says audit writes keep the volume when telemetry
+            // is dropped; this is that rule applied to the rows that
+            // arrive over the fan-in rather than only to local ones.
+            //
+            // They land in `audit_log` beside the local rows, not in
+            // the telemetry database: verify and retention operate on
+            // one table, partitioned by node.
+            //
+            // Bounded on the wire by `MAX_TELEMETRY_AUDIT`, so exempt
+            // from shedding is not the same as unbounded.
+            let audit_rows = std::mem::take(&mut batch.audit);
+            let accepted_audit = if audit_rows.is_empty() {
+                0
+            } else {
+                let Some(log_store) = self.log_store.clone() else {
+                    // Refused, not silently dropped, for the same
+                    // reason the missing telemetry database is: a
+                    // control plane that cannot store what its fleet
+                    // reports must not tell the fleet it did.
+                    return Err("the audit log is not open on this node".to_string());
+                };
+                let stamped = node_id.clone();
+                let rows: Vec<lorica_api::audit::FannedInAuditRow> = audit_rows
+                    .into_iter()
+                    .map(|r| lorica_api::audit::FannedInAuditRow {
+                        origin_id: i64::try_from(r.origin_id).unwrap_or(i64::MAX),
+                        timestamp: r.timestamp,
+                        operator_username: r.operator_username,
+                        operator_role: r.operator_role,
+                        action: r.action,
+                        target_type: r.target_type,
+                        target_id: r.target_id,
+                        before_payload_hash: r.before_payload_hash,
+                        after_payload_hash: r.after_payload_hash,
+                        ip: r.ip,
+                        user_agent: r.user_agent,
+                        prev_chain_hash: r.prev_chain_hash,
+                        chain_hash: r.chain_hash,
+                    })
+                    .collect();
+                tokio::task::spawn_blocking(move || {
+                    // `stamped` is the id the SESSION proved, like
+                    // every other fanned-in row.
+                    log_store.insert_fanned_in_audit(&stamped, &rows)
+                })
+                .await
+                .map_err(|e| format!("the audit fan-in task failed: {e}"))??
+            };
+
+            // The storage watermark, which overrides every per-node
+            // budget: when the disk is short, a node well inside its
+            // quota is shed too. Telemetry is the first thing dropped
+            // so configuration and audit writes are the last (AC #8).
             // Off the executor with the rest of the blocking work:
             // two stats are cheap, but this handler is careful to
             // offload everything else and an inconsistency here is a
@@ -804,6 +857,10 @@ impl SessionHandler for FleetHandlers {
                 );
                 return Ok(lorica_cluster::TelemetryPushAck {
                     retry_after_s: storage.retry_after_s(),
+                    // Already stored: the watermark sheds telemetry,
+                    // never the audit trail.
+                    accepted_audit,
+                    audit_cursor: batch.audit_cursor,
                     ..Default::default()
                 });
             }
@@ -879,6 +936,8 @@ impl SessionHandler for FleetHandlers {
                 retry_after_s: verdict.retry_after_s(),
                 access_cursor: batch.access_cursor,
                 waf_cursor: batch.waf_cursor,
+                accepted_audit,
+                audit_cursor: batch.audit_cursor,
             })
         })
     }

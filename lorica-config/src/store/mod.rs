@@ -189,6 +189,9 @@ pub enum TelemetryCursor {
     Access,
     /// Progress through the local `waf_events` table.
     Waf,
+    /// Progress through this node's OWN `audit_log` rows
+    /// (Story 9.9 AC #2).
+    Audit,
 }
 
 impl TelemetryCursor {
@@ -197,6 +200,7 @@ impl TelemetryCursor {
         match self {
             Self::Access => "telemetry_access_cursor",
             Self::Waf => "telemetry_waf_cursor",
+            Self::Audit => "telemetry_audit_cursor",
         }
     }
 }

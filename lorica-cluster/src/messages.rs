@@ -422,6 +422,16 @@ pub const MAX_TELEMETRY_ROWS: usize = 512;
 /// going to help with.
 pub const MAX_TELEMETRY_BANS: usize = 256;
 
+/// Audit rows one [`TelemetryPush`] may carry (Story 9.9 AC #2).
+///
+/// Smaller than [`MAX_TELEMETRY_ROWS`] because audit rows are orders
+/// of magnitude rarer than access rows: they are written by operator
+/// actions, not by traffic. A backlog this size still clears in one
+/// drain tick, and the bound is what stops a peer sending an unbounded
+/// batch, which is a different concern from the load shedding these
+/// rows are exempt from.
+pub const MAX_TELEMETRY_AUDIT: usize = 256;
+
 /// One access-log row on its way to the control plane (Story 9.6).
 ///
 /// Mirrors the local `access_logs` columns minus the rowid, which is
@@ -523,6 +533,60 @@ pub struct TelemetryBan {
     pub reason: ::prost::alloc::string::String,
 }
 
+/// One audit row as the ORIGIN node wrote it (Story 9.9 AC #2).
+///
+/// Both chain hashes ride verbatim and the control plane stores them
+/// unchanged. Nothing recomputes them: the aggregated copy is worth
+/// something only if it is byte-identical to what the node published
+/// on its own `lorica::audit` stream, which is the out-of-band anchor
+/// the whole feature leans on.
+///
+/// No node identity in the payload, like every other fanned-in row.
+/// The control plane stamps it from the mutual-TLS session, so a
+/// follower cannot write rows into another node's history.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct TelemetryAuditRow {
+    /// The row id the origin node assigned.
+    #[prost(uint64, tag = "1")]
+    pub origin_id: u64,
+    /// RFC 3339 UTC timestamp of the mutation.
+    #[prost(string, tag = "2")]
+    pub timestamp: ::prost::alloc::string::String,
+    /// RBAC username of the operator.
+    #[prost(string, tag = "3")]
+    pub operator_username: ::prost::alloc::string::String,
+    /// RBAC role at mutation time.
+    #[prost(string, tag = "4")]
+    pub operator_role: ::prost::alloc::string::String,
+    /// Dotted action verb.
+    #[prost(string, tag = "5")]
+    pub action: ::prost::alloc::string::String,
+    /// Entity kind.
+    #[prost(string, tag = "6")]
+    pub target_type: ::prost::alloc::string::String,
+    /// Entity id.
+    #[prost(string, tag = "7")]
+    pub target_id: ::prost::alloc::string::String,
+    /// SHA-256 hex of the pre-mutation payload, empty when absent.
+    #[prost(string, tag = "8")]
+    pub before_payload_hash: ::prost::alloc::string::String,
+    /// SHA-256 hex of the post-mutation payload, empty when absent.
+    #[prost(string, tag = "9")]
+    pub after_payload_hash: ::prost::alloc::string::String,
+    /// Source IP.
+    #[prost(string, tag = "10")]
+    pub ip: ::prost::alloc::string::String,
+    /// Client User-Agent.
+    #[prost(string, tag = "11")]
+    pub user_agent: ::prost::alloc::string::String,
+    /// The origin's `prev_chain_hash`, verbatim.
+    #[prost(string, tag = "12")]
+    pub prev_chain_hash: ::prost::alloc::string::String,
+    /// The origin's `chain_hash`, verbatim.
+    #[prost(string, tag = "13")]
+    pub chain_hash: ::prost::alloc::string::String,
+}
+
 /// A batch of telemetry (Story 9.6 AC #5), follower to control plane.
 ///
 /// Upwards only: a control plane sending one is inverting the fan-in
@@ -548,6 +612,19 @@ pub struct TelemetryPush {
     /// Rows the follower dropped since its last push, for the gauge.
     #[prost(uint64, tag = "6")]
     pub dropped_since_last: u64,
+    /// Audit rows, at most [`MAX_TELEMETRY_AUDIT`] (Story 9.9 AC #2).
+    ///
+    /// Counted against the ingest quota but never shed by it. Losing
+    /// an access row costs a line of traffic; losing an audit row
+    /// costs the record of an operator action, on the one table whose
+    /// entire purpose is that the record exists. A compliance feature
+    /// that drops rows silently under load is worse than one that does
+    /// not exist, because it is believed.
+    #[prost(message, repeated, tag = "7")]
+    pub audit: ::prost::alloc::vec::Vec<TelemetryAuditRow>,
+    /// The sender's own rowid for the last audit row in this batch.
+    #[prost(uint64, tag = "8")]
+    pub audit_cursor: u64,
 }
 
 /// What the control plane stored (Story 9.6).
@@ -575,6 +652,13 @@ pub struct TelemetryPushAck {
     /// The WAF cursor from the request, echoed unmodified.
     #[prost(uint64, tag = "6")]
     pub waf_cursor: u64,
+    /// Audit rows written. Equals what was sent, or the push failed:
+    /// unlike the other three, these are never partially accepted.
+    #[prost(uint64, tag = "7")]
+    pub accepted_audit: u64,
+    /// The audit cursor from the request, echoed unmodified.
+    #[prost(uint64, tag = "8")]
+    pub audit_cursor: u64,
 }
 
 /// A fleet-wide ban (Story 9.6 AC #10), control plane to follower.

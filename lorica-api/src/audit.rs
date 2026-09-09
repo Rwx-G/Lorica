@@ -104,6 +104,61 @@ pub struct AuditRecord {
     pub prev_chain_hash: String,
     /// This row's chain hash.
     pub chain_hash: String,
+    /// The node this row was recorded on (Story 9.9 AC #2).
+    ///
+    /// Empty means this node, on every install: a standalone node has
+    /// no node id to stamp, and giving one to a clustered node's own
+    /// rows would make the column change meaning the day it joins a
+    /// fleet. Only fanned-in rows carry a value, stamped by the control
+    /// plane from the mutual-TLS session and never from the payload.
+    pub node_id: String,
+    /// The row id the ORIGIN node assigned (Story 9.9 AC #2).
+    ///
+    /// Zero on a local row, where `id` already is that id. On a fanned-
+    /// in row it is what reconstructs the origin's own order, which the
+    /// aggregated `id` does not, and what lets an operator match an
+    /// aggregated row against the node's own copy.
+    pub origin_id: i64,
+}
+
+/// One audit row as another node published it (Story 9.9 AC #2).
+///
+/// Every field is the origin's, including both chain hashes, and the
+/// control plane stores them verbatim. It deliberately carries no
+/// `node_id`: the control plane stamps that from the mutual-TLS
+/// session, never from the payload, which is the Story 9.5 D15 rule
+/// and the reason a follower cannot write rows into another node's
+/// history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FannedInAuditRow {
+    /// The row id the origin node assigned.
+    pub origin_id: i64,
+    /// RFC 3339 UTC timestamp of the mutation.
+    pub timestamp: String,
+    /// RBAC username of the operator.
+    pub operator_username: String,
+    /// RBAC role at mutation time.
+    pub operator_role: String,
+    /// Dotted action verb.
+    pub action: String,
+    /// Entity kind.
+    pub target_type: String,
+    /// Entity id.
+    pub target_id: String,
+    /// SHA-256 hex of the pre-mutation payload ("" = absent).
+    pub before_payload_hash: String,
+    /// SHA-256 hex of the post-mutation payload ("" = absent).
+    pub after_payload_hash: String,
+    /// Source IP.
+    pub ip: String,
+    /// Client User-Agent.
+    pub user_agent: String,
+    /// The origin's `prev_chain_hash`, stored unchanged.
+    pub prev_chain_hash: String,
+    /// The origin's `chain_hash`, stored unchanged. Never recomputed:
+    /// the aggregated copy is worth something only if it is identical
+    /// to what the node published on its own anchor stream.
+    pub chain_hash: String,
 }
 
 /// Filters for `GET /api/v1/audit`.
@@ -121,6 +176,11 @@ pub struct AuditQuery {
     pub limit: usize,
     /// Cursor: only rows with `id` strictly below this (pagination).
     pub before_id: Option<i64>,
+    /// Restrict to one node's rows (Story 9.9 AC #5).
+    ///
+    /// `Some("")` is meaningful and selects THIS node's own rows, which
+    /// is why it is not folded into `None`.
+    pub node_id: Option<String>,
 }
 
 /// Outcome of `GET /api/v1/audit/verify`.
@@ -456,6 +516,12 @@ pub struct AuditListParams {
     pub limit: Option<usize>,
     /// Cursor: rows with `id` strictly below this value.
     pub before_id: Option<i64>,
+    /// Restrict to one node's rows (Story 9.9 AC #5).
+    ///
+    /// The empty string selects THIS node's own rows, which is a real
+    /// filter and not the absence of one; omitting the parameter
+    /// selects every node's.
+    pub node: Option<String>,
 }
 
 /// GET /api/v1/audit - list audit entries, newest first (Operator+,
@@ -476,6 +542,7 @@ pub async fn list_audit(
         to: params.to,
         limit: params.limit.unwrap_or(100).min(1000),
         before_id: params.before_id,
+        node_id: params.node,
     };
 
     let (entries, total) = tokio::task::spawn_blocking(move || log_store.query_audit(&query))
@@ -489,26 +556,76 @@ pub async fn list_audit(
     })))
 }
 
-/// GET /api/v1/audit/verify - walk the whole chain and recompute every
-/// hash (SuperAdmin only, enforced by the authorize middleware).
+/// Query string of `GET /api/v1/audit/verify`.
+#[derive(Debug, Deserialize)]
+pub struct AuditVerifyParams {
+    /// Verify one node's chain. The empty string is this node's own.
+    /// Omitted, every chain in the table is verified and reported
+    /// separately.
+    pub node: Option<String>,
+}
+
+/// One chain's verdict (Story 9.9 AC #3).
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeVerifyResult {
+    /// The chain's node id; empty is this node's own.
+    pub node_id: String,
+    /// That chain's verdict.
+    #[serde(flatten)]
+    pub result: VerifyResult,
+}
+
+/// GET /api/v1/audit/verify - recompute the hash chain (SuperAdmin
+/// only, enforced by the authorize middleware).
+///
+/// Reports PER NODE. An aggregated table interleaves N chains, so one
+/// verdict over the whole table would be meaningless: it would chain
+/// one node's row to another's and break at the first interleave. The
+/// top-level `verified` is the conjunction, so a caller that only reads
+/// that field still gets a correct answer.
 pub async fn verify_audit(
     Extension(state): Extension<AppState>,
+    Query(params): Query<AuditVerifyParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Some(log_store) = state.log_store.clone() else {
-        return Ok(json_data(VerifyResult {
-            verified: true,
-            total_rows: 0,
-            first_break_id: None,
-            first_break_reason: None,
-        }));
+        return Ok(json_data(serde_json::json!({
+            "verified": true,
+            "nodes": Vec::<NodeVerifyResult>::new(),
+        })));
     };
 
-    let result = tokio::task::spawn_blocking(move || log_store.verify_audit_chain())
-        .await
-        .map_err(|e| ApiError::Internal(format!("audit verify task failed: {e}")))?
-        .map_err(ApiError::Internal)?;
+    let requested = params.node;
+    let nodes = tokio::task::spawn_blocking(move || {
+        let ids = match requested {
+            Some(node_id) => vec![node_id],
+            None => {
+                let mut ids = log_store.audit_node_ids()?;
+                // A table with no rows at all still has a local chain
+                // to report on, and reporting nothing reads as "not
+                // checked" rather than "nothing to check".
+                if ids.is_empty() {
+                    ids.push(String::new());
+                }
+                ids
+            }
+        };
+        ids.into_iter()
+            .map(|node_id| {
+                log_store
+                    .verify_audit_chain_for(&node_id)
+                    .map(|result| NodeVerifyResult { node_id, result })
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("audit verify task failed: {e}")))?
+    .map_err(ApiError::Internal)?;
 
-    Ok(json_data(result))
+    let verified = nodes.iter().all(|n| n.result.verified);
+    Ok(json_data(serde_json::json!({
+        "verified": verified,
+        "nodes": nodes,
+    })))
 }
 
 #[cfg(test)]

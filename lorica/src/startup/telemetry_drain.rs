@@ -57,7 +57,8 @@ use std::time::Duration;
 use lorica_api::cluster::runtime::FollowerRuntime;
 use lorica_api::log_store::LogStore;
 use lorica_cluster::{
-    ClusterRequest, TelemetryAccessRow, TelemetryPush, TelemetryWafRow, MAX_TELEMETRY_ROWS,
+    ClusterRequest, TelemetryAccessRow, TelemetryAuditRow, TelemetryPush, TelemetryWafRow,
+    MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_ROWS,
 };
 use lorica_config::{ConfigStore, TelemetryCursor};
 use tokio::sync::Mutex;
@@ -146,8 +147,12 @@ async fn seed_cursors(
     config_store: &Arc<Mutex<ConfigStore>>,
     logs: Arc<LogStore>,
 ) -> Result<(), String> {
-    let (newest_access, newest_waf) = tokio::task::spawn_blocking(move || {
-        Ok::<_, String>((logs.newest_access_id()?, logs.newest_waf_id()?))
+    let (newest_access, newest_waf, newest_audit) = tokio::task::spawn_blocking(move || {
+        Ok::<_, String>((
+            logs.newest_access_id()?,
+            logs.newest_waf_id()?,
+            logs.newest_local_audit_id()?,
+        ))
     })
     .await
     .map_err(|e| format!("the cursor seed task failed: {e}"))??;
@@ -155,6 +160,12 @@ async fn seed_cursors(
         for (kind, newest) in [
             (TelemetryCursor::Access, newest_access),
             (TelemetryCursor::Waf, newest_waf),
+            // Audit seeds the same way: a node joining an existing
+            // fleet ships what it records from now on, not its whole
+            // pre-cluster history. Those rows are still on the node and
+            // still verifiable there; chaining them into the aggregate
+            // would say they were fanned in when they were not.
+            (TelemetryCursor::Audit, newest_audit),
         ] {
             let current = store
                 .telemetry_cursor(kind)
@@ -211,7 +222,7 @@ async fn drain_once(
         return Ok(DrainOutcome::CaughtUp);
     };
 
-    let (access_cursor, waf_cursor) = {
+    let (access_cursor, waf_cursor, audit_cursor) = {
         let guard = Arc::clone(config_store).lock_owned().await;
         tokio::task::spawn_blocking(move || {
             Ok::<_, String>((
@@ -220,6 +231,9 @@ async fn drain_once(
                     .map_err(|e| e.to_string())?,
                 guard
                     .telemetry_cursor(TelemetryCursor::Waf)
+                    .map_err(|e| e.to_string())?,
+                guard
+                    .telemetry_cursor(TelemetryCursor::Audit)
                     .map_err(|e| e.to_string())?,
             ))
         })
@@ -234,33 +248,36 @@ async fn drain_once(
     // of these stores in this codebase offloads the same way; the one
     // module written to honour that discipline should not be the one
     // that breaks it.
-    let (access, waf) = match logs {
+    let (access, waf, audit) = match logs {
         Some(logs) => {
             let logs = Arc::clone(logs);
             tokio::task::spawn_blocking(move || {
                 Ok::<_, String>((
                     logs.access_rows_after(access_cursor, MAX_TELEMETRY_ROWS)?,
                     logs.waf_rows_after(waf_cursor, MAX_TELEMETRY_ROWS)?,
+                    logs.audit_rows_after(audit_cursor, MAX_TELEMETRY_AUDIT)?,
                 ))
             })
             .await
             .map_err(|e| format!("the telemetry read task failed: {e}"))??
         }
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
     let ban_snapshot = bans.snapshot().await;
 
     // Nothing new and nothing banned: do not spend a round trip.
-    if access.is_empty() && waf.is_empty() && ban_snapshot.is_empty() {
+    if access.is_empty() && waf.is_empty() && audit.is_empty() && ban_snapshot.is_empty() {
         return Ok(DrainOutcome::CaughtUp);
     }
     // A full batch on either kind means there is very likely more
     // behind it, which is what lets one tick ship more than one.
-    let batch_was_full =
-        access.len() >= MAX_TELEMETRY_ROWS || waf.len() >= MAX_TELEMETRY_ROWS;
+    let batch_was_full = access.len() >= MAX_TELEMETRY_ROWS
+        || waf.len() >= MAX_TELEMETRY_ROWS
+        || audit.len() >= MAX_TELEMETRY_AUDIT;
 
     let next_access = access.last().map(|(id, _)| *id as u64).unwrap_or(access_cursor);
     let next_waf = waf.last().map(|(id, _)| *id as u64).unwrap_or(waf_cursor);
+    let next_audit = audit.last().map(|(id, _)| *id as u64).unwrap_or(audit_cursor);
 
     let batch = TelemetryPush {
         access: access
@@ -297,6 +314,29 @@ async fn drain_once(
             })
             .collect(),
         bans: ban_snapshot,
+        audit: audit
+            .into_iter()
+            .map(|(_, row)| TelemetryAuditRow {
+                origin_id: u64::try_from(row.origin_id).unwrap_or(0),
+                timestamp: row.timestamp,
+                operator_username: row.operator_username,
+                operator_role: row.operator_role,
+                action: row.action,
+                target_type: row.target_type,
+                target_id: row.target_id,
+                before_payload_hash: row.before_payload_hash,
+                after_payload_hash: row.after_payload_hash,
+                ip: row.ip,
+                user_agent: row.user_agent,
+                // Both hashes ride unchanged. Recomputing either would
+                // make the aggregated copy agree with itself and with
+                // nothing the node published, which is the one thing
+                // that gives it any value.
+                prev_chain_hash: row.prev_chain_hash,
+                chain_hash: row.chain_hash,
+            })
+            .collect(),
+        audit_cursor: next_audit,
         access_cursor: next_access,
         waf_cursor: next_waf,
         // The local writer already counts what it dropped; this field
@@ -306,6 +346,7 @@ async fn drain_once(
     };
     let sent_access = batch.access.len();
     let sent_waf = batch.waf.len();
+    let sent_audit = batch.audit.len();
 
     let response = tokio::time::timeout(
         PUSH_DEADLINE,
@@ -327,22 +368,32 @@ async fn drain_once(
     // Advance only past what was ACCEPTED. A quota that shed part of
     // the batch must not silently lose those rows: leaving the cursor
     // behind means the next tick offers them again.
+    // Audit rows are exempt from shedding, so a short audit count is
+    // never a quota decision: it means the control plane could not
+    // store them. The cursor stays put and the rows are offered again,
+    // which is what the fan-in insert's idempotency is for.
     let accepted_all = ack.accepted_access as usize == sent_access
-        && ack.accepted_waf as usize == sent_waf;
+        && ack.accepted_waf as usize == sent_waf
+        && ack.accepted_audit as usize == sent_audit;
     if accepted_all {
-        let (access_to, waf_to) = (ack.access_cursor, ack.waf_cursor);
+        let (access_to, waf_to, audit_to) =
+            (ack.access_cursor, ack.waf_cursor, ack.audit_cursor);
         cursor_write(config_store, move |store| {
             store
                 .advance_telemetry_cursor(TelemetryCursor::Access, access_to)
                 .map_err(|e| e.to_string())?;
             store
                 .advance_telemetry_cursor(TelemetryCursor::Waf, waf_to)
+                .map_err(|e| e.to_string())?;
+            store
+                .advance_telemetry_cursor(TelemetryCursor::Audit, audit_to)
                 .map_err(|e| e.to_string())
         })
         .await?;
         debug!(
             access = sent_access,
             waf = sent_waf,
+            audit = sent_audit,
             "telemetry delivered to the control plane"
         );
     } else {

@@ -252,6 +252,8 @@ impl SessionHandler for ControlPlaneHooks {
                 retry_after_s: 0,
                 access_cursor: batch.access_cursor,
                 waf_cursor: batch.waf_cursor,
+                accepted_audit: batch.audit.len() as u64,
+                audit_cursor: batch.audit_cursor,
             };
             *self.telemetry_seen.lock().expect("lock") = Some(batch);
             Ok(ack)

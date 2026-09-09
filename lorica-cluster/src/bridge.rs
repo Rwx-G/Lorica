@@ -69,7 +69,7 @@ use crate::messages::{
     ban_duration_is_valid, ban_reason_is_valid, ban_target_is_valid, cert_id_is_valid,
     challenge_token_is_valid,
     cluster_request, config_hash_is_valid, ClusterRequest, NodeResources, TelemetryPush,
-    MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
+    MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
 };
 use crate::replication::{AppliedConfig, ConfigPayload};
 
@@ -288,6 +288,7 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
             if push.access.len() > MAX_TELEMETRY_ROWS
                 || push.waf.len() > MAX_TELEMETRY_ROWS
                 || push.bans.len() > MAX_TELEMETRY_BANS
+                || push.audit.len() > MAX_TELEMETRY_AUDIT
             {
                 return BridgeOutcome::ProtocolViolation;
             }

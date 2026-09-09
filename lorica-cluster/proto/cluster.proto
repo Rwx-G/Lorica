@@ -363,6 +363,32 @@ message TelemetryBan {
 // list. The control plane echoes them back so the follower knows what
 // to advance past; it never interprets them as anything but opaque
 // progress markers belonging to that node.
+// One audit row as the ORIGIN node wrote it (Story 9.9 AC #2).
+//
+// Both chain hashes ride verbatim and the control plane stores them
+// unchanged. Nothing recomputes them: the aggregated copy is worth
+// something only if it is identical to what the node published on its
+// own `lorica::audit` stream, which is the out-of-band anchor.
+//
+// No node identity in the payload, like every other fanned-in row: the
+// control plane stamps it from the mutual-TLS session, so a follower
+// cannot write rows into another node's history.
+message TelemetryAuditRow {
+  uint64 origin_id = 1;            // The row id the origin assigned
+  string timestamp = 2;
+  string operator_username = 3;
+  string operator_role = 4;
+  string action = 5;
+  string target_type = 6;
+  string target_id = 7;
+  string before_payload_hash = 8;
+  string after_payload_hash = 9;
+  string ip = 10;
+  string user_agent = 11;
+  string prev_chain_hash = 12;
+  string chain_hash = 13;
+}
+
 message TelemetryPush {
   repeated TelemetryAccessRow access = 1;
   repeated TelemetryWafRow waf = 2;
@@ -370,6 +396,12 @@ message TelemetryPush {
   uint64 access_cursor = 4;
   uint64 waf_cursor = 5;
   uint64 dropped_since_last = 6;  // Follower-side overflow, for the gauge
+  // Story 9.9. Counted against the ingest quota but NEVER shed by it:
+  // losing an access row costs a line of traffic, losing an audit row
+  // costs the record of an operator action, on the one table whose
+  // entire purpose is that the record exists.
+  repeated TelemetryAuditRow audit = 7;
+  uint64 audit_cursor = 8;
 }
 
 // What the control plane stored. `accepted_*` may be lower than what
@@ -382,6 +414,8 @@ message TelemetryPushAck {
   uint32 retry_after_s = 4;
   uint64 access_cursor = 5;   // Echoed back, unmodified
   uint64 waf_cursor = 6;
+  uint64 accepted_audit = 7;  // Story 9.9: equals what was sent, or the push failed
+  uint64 audit_cursor = 8;
 }
 
 // A fleet-wide ban issued by an operator on the control plane

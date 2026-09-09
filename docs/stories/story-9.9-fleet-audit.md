@@ -1,7 +1,7 @@
 # Story 9.9: Fleet-Wide Audit Trail
 
 **Epic:** 9 (v1.7.0)
-**Status:** Draft
+**Status:** InProgress
 **Author:** Romain G.
 
 **Depends on:** Stories 9.3 (node identity), 9.6 (fan-in transport,
@@ -125,7 +125,110 @@ activation (Story 9.3 AC #5).
 
 ### Debug Log
 
-(empty)
+**Phase 1 review.** Every Dev Notes claim re-verified against the tree
+before anything was decided. As in Story 9.6, every line number in the
+Dev Notes is stale (9.5 through 9.8 landed after this story was
+drafted) and every substantive claim held:
+
+- `audit.rs`'s module doc states the chain is tamper-EVIDENT, that a
+  principal with write access can produce a self-consistent forged
+  history, and that an HMAC key was considered and rejected because on
+  a single host it lives under the same owner as the database. The
+  external anchor is named as the effective control.
+- `insert_audit` chains off the GLOBAL tail
+  (`SELECT chain_hash FROM audit_log ORDER BY id DESC LIMIT 1`) inside
+  the connection lock, falling back to the seal and then to genesis.
+- `verify_audit_chain` walks the whole table `ORDER BY id ASC` with one
+  running `expected`.
+- `RETENTION_SEAL_KEY` is the literal `"retention_seal"`, and
+  `audit_log_meta` is `key TEXT PRIMARY KEY`.
+- `record` skips persistence silently when the log store is absent.
+
+So the three reasons the seal does not compose on an aggregated table
+are all real, and the requirement for a separate insert path (AC #2) is
+correct: fan-in rows through `insert_audit` would make the control
+plane's own next entry chain off a follower's row.
+
+**D1 - the migration does not go where the File List says.** The File
+List anticipates `lorica-config/src/migrations/`. `audit_log` is not in
+the configuration database: it is created in `log_store.rs`'s
+`LogStore::open` against `access-log.db`, and that file has no
+migrations directory. The pattern it does have is a list of
+`ALTER TABLE ... ADD COLUMN` statements applied on open and tolerated
+when they fail because the column already exists, used for
+`access_logs` and `waf_events`. The node columns follow that pattern,
+in that file.
+
+**D2 - AC #4 is nine tenths delivered already, and the story should
+say which tenth is missing rather than re-auditing what is audited.**
+Verified by enumerating every emission site. Already recorded:
+
+| AC #4 asks for | Emitted as | Where |
+|---|---|---|
+| token mint | `cluster.token.mint` | control-plane API |
+| join | `cluster.node.enroll` | control-plane lifecycle hook |
+| activation | `cluster.node.activate` | control-plane API |
+| certificate issuance | part of `cluster.node.enroll` | lifecycle hook |
+| renewal | `cluster.node.renew` | lifecycle hook |
+| revocation | `cluster.node.revoke` | control-plane API |
+| `cluster leave` | `cluster.node.leave` | both sides |
+| break-glass entry, exit | `cluster.break_glass.open` / `.close` | follower API |
+| fleet-wide ban | `cluster.ban.fleet` | control-plane API |
+
+Two more the AC did not ask for are already there and worth keeping:
+`cluster.identity.refused` and `cluster.protocol.violation`.
+
+What is genuinely missing is the **node-scoped apply**: nothing records
+that a follower applied generation N, on either side. That is also what
+AC #6 needs, so the two are one piece of work rather than two.
+
+**D3 - audit rows ride the existing telemetry channel, as a new
+repeated field, and are exempt from shedding.** Story 9.6 built a
+cursor-drained fan-in with a per-node ingest quota whose verdicts are
+`Accept`, `Partial` and `Shed`. Audit rows fit its transport exactly:
+they are append-only, they have a monotonic id, and the drain already
+runs. They do NOT fit its quota. Shedding an access row loses a line of
+traffic; shedding an audit row loses the record of an operator action,
+on the one table whose entire purpose is that the record exists. A
+compliance feature that silently drops under load is worse than one
+that does not exist, because it is believed.
+
+So audit rows are counted against the quota but never dropped by it: a
+push whose access and WAF rows are shed still commits its audit rows,
+and the wire bound stays (a peer cannot send an unbounded batch), it is
+only the load-shedding verdict that does not apply to them. This is a
+deliberate asymmetry and the reason is written at the decision site.
+
+**D4 - `node_id` empty means "this node", and that is what keeps a
+standalone install unchanged.** A standalone node has no node id to
+stamp, and giving one to a clustered node's own rows would mean the
+column changes meaning when a node joins a fleet. Empty is the local
+row on every install, the fan-in stamps the origin, and the dashboard
+renders empty as this node. The column defaults to empty, so the
+`ALTER TABLE` is free on an existing database.
+
+`origin_id` is the row id the origin node assigned. It is what makes
+the partitioned verify possible (`ORDER BY origin_id ASC` reconstructs
+the origin's own order, which the aggregated `id` does not) and what
+lets an operator match an aggregated row to the node's own copy.
+
+**D5 - the seal becomes `retention_seal:<node_id>`, and the existing
+key is the local one.** Reading the bare `"retention_seal"` key for
+local rows keeps every existing database working with no migration and
+no special case: local rows are `node_id = ''`, so the key is the
+prefix with an empty suffix only if we chose that shape. We do not:
+local keeps the exact existing literal, and a fanned-in node uses
+`retention_seal:<node_id>`. A reader of `audit_log_meta` on an upgraded
+single-node install sees exactly what it saw before.
+
+**D6 - what this story does NOT claim.** Stated here because AC #1 is
+about not overstating: the aggregated copy proves internal consistency
+of what a node sent, and nothing about authenticity. A compromised
+follower streams a self-consistent forged chain and the control plane's
+verify reports it clean. The control plane's copy is strictly weaker
+than the origin's, and the origin's own tracing event shipped to a WORM
+sink remains the anchor. Signed checkpoints are the real fix and are
+out of scope by the PRD.
 
 ### Completion Notes
 
