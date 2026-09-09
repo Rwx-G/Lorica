@@ -286,8 +286,7 @@ pub(crate) use error_pages::render_error_body;
 
 pub mod config;
 pub use config::{
-    compute_pool_size, MtlsEnforcer, ProxyConfig, ProxyConfigGlobals, RouteEntry,
-    SmoothWrrState,
+    compute_pool_size, MtlsEnforcer, ProxyConfig, ProxyConfigGlobals, RouteEntry, SmoothWrrState,
 };
 
 pub mod lb;
@@ -299,14 +298,14 @@ pub use context::RequestCtx;
 pub mod ai_bot_merged;
 
 pub mod filters;
-pub use filters::ip_to_shmem_key;
 #[cfg(test)]
 pub(crate) use filters::build_redirect_location;
+pub use filters::ip_to_shmem_key;
 
 pub mod worker_rpc;
-pub use worker_rpc::PendingProxyConfig;
 #[cfg(test)]
 pub(crate) use worker_rpc::handle_config_reload_commit;
+pub use worker_rpc::PendingProxyConfig;
 
 impl LoricaProxy {
     pub fn new(
@@ -907,7 +906,8 @@ impl ProxyHttp for LoricaProxy {
 
             // Per-route GeoIP country filter; resolves the country once
             // and hands it to the bot-protection stage below.
-            let (geo_handled, cached_country) = self.check_geoip_filter(session, ctx, entry).await?;
+            let (geo_handled, cached_country) =
+                self.check_geoip_filter(session, ctx, entry).await?;
             if let Some(handled) = geo_handled {
                 return Ok(handled);
             }

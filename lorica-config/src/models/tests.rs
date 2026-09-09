@@ -529,7 +529,9 @@ fn effective_rate_limit_synthesises_from_legacy_rps() {
     let mut route = example_route_for_serde();
     route.rate_limit_rps = Some(10);
     route.rate_limit_burst = None;
-    let effective = route.effective_rate_limit().expect("legacy rps synthesises");
+    let effective = route
+        .effective_rate_limit()
+        .expect("legacy rps synthesises");
     assert_eq!(effective.capacity, 10);
     assert_eq!(effective.refill_per_sec, 10);
     assert_eq!(effective.scope, RateLimitScope::PerIp);
@@ -545,7 +547,9 @@ fn effective_rate_limit_prefers_structured_over_legacy() {
         refill_per_sec: 5,
         scope: RateLimitScope::PerRoute,
     });
-    let effective = route.effective_rate_limit().expect("structured limit present");
+    let effective = route
+        .effective_rate_limit()
+        .expect("structured limit present");
     assert_eq!(effective.capacity, 5);
     assert_eq!(effective.refill_per_sec, 5);
     assert_eq!(effective.scope, RateLimitScope::PerRoute);

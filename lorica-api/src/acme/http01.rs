@@ -200,8 +200,8 @@ pub(super) async fn provision_with_acme(
     // binding survive ; on first issuance insert a fresh row.
     let now = chrono::Utc::now();
     let is_renewal = existing_cert_id.is_some();
-    let cert_id = existing_cert_id
-        .map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
+    let cert_id =
+        existing_cert_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
     let san_domains: Vec<String> = domains.to_vec();
     let fingerprint = format!("acme:{}", domains.join(","));
 

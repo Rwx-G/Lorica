@@ -275,9 +275,15 @@ async fn drain_once(
         || waf.len() >= MAX_TELEMETRY_ROWS
         || audit.len() >= MAX_TELEMETRY_AUDIT;
 
-    let next_access = access.last().map(|(id, _)| *id as u64).unwrap_or(access_cursor);
+    let next_access = access
+        .last()
+        .map(|(id, _)| *id as u64)
+        .unwrap_or(access_cursor);
     let next_waf = waf.last().map(|(id, _)| *id as u64).unwrap_or(waf_cursor);
-    let next_audit = audit.last().map(|(id, _)| *id as u64).unwrap_or(audit_cursor);
+    let next_audit = audit
+        .last()
+        .map(|(id, _)| *id as u64)
+        .unwrap_or(audit_cursor);
 
     let batch = TelemetryPush {
         access: access

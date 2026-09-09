@@ -222,10 +222,7 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             row.get::<_, Option<String>>(60).unwrap_or(None),
             "response_rewrite",
         )?,
-        mtls: parse_optional_json_field(
-            row.get::<_, Option<String>>(61).unwrap_or(None),
-            "mtls",
-        )?,
+        mtls: parse_optional_json_field(row.get::<_, Option<String>>(61).unwrap_or(None), "mtls")?,
         rate_limit: parse_optional_json_field(
             row.get::<_, Option<String>>(62).unwrap_or(None),
             "rate_limit",

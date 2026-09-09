@@ -323,7 +323,11 @@ impl SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let mut sessions = self.registry.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sessions = self
+            .registry
+            .sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if let Some(current) = sessions.get(&self.node_id) {
             if Arc::ptr_eq(current, &self.entry) {
                 sessions.remove(&self.node_id);
@@ -397,11 +401,7 @@ impl SessionRegistry {
             .iter()
             .filter(|(_, session)| session.state() == NodeState::Active)
             .map(|(node_id, session)| {
-                (
-                    node_id.clone(),
-                    session.endpoint.clone(),
-                    session.applied(),
-                )
+                (node_id.clone(), session.endpoint.clone(), session.applied())
             })
             .collect()
     }
@@ -868,7 +868,11 @@ impl ControlPlane {
     }
 
     /// Replace the roster and refresh the fleet-size hint.
-    pub fn replace_roster(&self, _guard: &RefreshGuard<'_>, entries: HashMap<String, NodeIdentity>) {
+    pub fn replace_roster(
+        &self,
+        _guard: &RefreshGuard<'_>,
+        entries: HashMap<String, NodeIdentity>,
+    ) {
         // Sessions first, roster second, so a gate that reads both
         // during the swap cannot see a roster that says Active beside
         // a session that still says Pending.
@@ -990,8 +994,13 @@ mod tests {
         );
         roster.replace(map);
         assert_eq!(roster.len(), 2);
-        assert_eq!(roster.lookup("fp-a").map(|n| n.node_id), Some("a".to_string()));
-        assert!(roster.lookup("fp-b-old").is_some_and(|n| n.via_previous_certificate));
+        assert_eq!(
+            roster.lookup("fp-a").map(|n| n.node_id),
+            Some("a".to_string())
+        );
+        assert!(roster
+            .lookup("fp-b-old")
+            .is_some_and(|n| n.via_previous_certificate));
         assert!(roster.lookup("fp-zzz").is_none());
     }
 
@@ -1197,13 +1206,9 @@ mod tests {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let ca = ClusterCa::generate("Lorica Cluster CA").expect("ca");
         let (server_cert, server_key) = ca.issue_server_leaf("cp.example.com").expect("leaf");
-        let tls = operational_server_config_with_crl(
-            ca.cert_pem(),
-            &server_cert,
-            &server_key,
-            None,
-        )
-        .expect("server config");
+        let tls =
+            operational_server_config_with_crl(ca.cert_pem(), &server_cert, &server_key, None)
+                .expect("server config");
         let acceptor = Arc::new(SwappableAcceptor::new(Arc::new(tls)));
         let (token_liveness, _rx) = watch::channel(0u32);
         let control_plane = ControlPlane::new(

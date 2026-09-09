@@ -21,8 +21,8 @@ mod startup;
 use clap::Parser;
 
 use crate::cli::{
-    init_logging, run_rotate_key, run_unban, run_upgrade, startup_banner, Cli,
-    ClusterAction, Commands,
+    init_logging, run_rotate_key, run_unban, run_upgrade, startup_banner, Cli, ClusterAction,
+    Commands,
 };
 
 fn main() {
@@ -139,9 +139,12 @@ fn main() {
                 password_stdin,
                 password,
             } => {
-                let password =
-                    cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
-                        .unwrap_or_else(|e| cli_client::fail(e));
+                let password = cli_client::read_admin_password(
+                    password,
+                    password_file.as_deref(),
+                    password_stdin,
+                )
+                .unwrap_or_else(|e| cli_client::fail(e));
                 cli_cluster::run_cluster_break_glass(
                     cli.management_port,
                     duration,
@@ -159,9 +162,12 @@ fn main() {
                 password_stdin,
                 password,
             } => {
-                let password =
-                    cli_client::read_admin_password(password, password_file.as_deref(), password_stdin)
-                        .unwrap_or_else(|e| cli_client::fail(e));
+                let password = cli_client::read_admin_password(
+                    password,
+                    password_file.as_deref(),
+                    password_stdin,
+                )
+                .unwrap_or_else(|e| cli_client::fail(e));
                 cli_cluster::run_cluster_token(
                     cli.management_port,
                     ttl_seconds,

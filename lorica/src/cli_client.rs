@@ -92,7 +92,12 @@ pub(crate) fn read_admin_password(
     file: Option<&Path>,
     from_stdin: bool,
 ) -> Result<String, String> {
-    read_admin_password_with_env(literal, file, from_stdin, std::env::var(ADMIN_PASSWORD_ENV).ok())
+    read_admin_password_with_env(
+        literal,
+        file,
+        from_stdin,
+        std::env::var(ADMIN_PASSWORD_ENV).ok(),
+    )
 }
 
 fn read_admin_password_with_env(

@@ -70,7 +70,7 @@ use lorica_command::RpcEndpoint;
 use tokio::task::JoinSet;
 
 use crate::messages::{
-    challenge_key_authorization_is_valid, challenge_token_is_valid, cert_domain_is_valid,
+    cert_domain_is_valid, challenge_key_authorization_is_valid, challenge_token_is_valid,
     cluster_response, ChallengePublish, ClusterFrame, ClusterRequest, ClusterStatus,
 };
 use crate::replication::DEFAULT_PER_NODE_DEADLINE;
@@ -283,7 +283,9 @@ impl ChallengeFanout {
                          certificate authority with a 404, so the caller must not tell the \
                          authority to validate"
                     );
-                    report.failed.push((node_id, ChallengeMiss::Refused(reason)));
+                    report
+                        .failed
+                        .push((node_id, ChallengeMiss::Refused(reason)));
                 }
             }
         }
@@ -648,7 +650,10 @@ mod tests {
         let report = publish(&fanout(), &registry, &["node-a"]).await;
         assert_eq!(pending.publishes.load(Ordering::SeqCst), 0);
         assert!(report.delivered.is_empty());
-        assert_eq!(report.failed, vec![("node-a".to_string(), ChallengeMiss::Offline)]);
+        assert_eq!(
+            report.failed,
+            vec![("node-a".to_string(), ChallengeMiss::Offline)]
+        );
         assert!(!report.is_complete());
         drop(pending);
     }
@@ -691,7 +696,12 @@ mod tests {
 
         for (identifier, token, key_auth, expected) in [
             ("", TOKEN, KEY_AUTH, "malformed challenge identifier"),
-            (IDENTIFIER, "../../etc/passwd", KEY_AUTH, "malformed challenge token"),
+            (
+                IDENTIFIER,
+                "../../etc/passwd",
+                KEY_AUTH,
+                "malformed challenge token",
+            ),
             (IDENTIFIER, TOKEN, "", "malformed key authorization"),
         ] {
             let report = fanout
@@ -739,9 +749,7 @@ mod tests {
         );
         let fanout = fanout();
 
-        fanout
-            .retract(&registry, &names(&["node-a"]), TOKEN)
-            .await;
+        fanout.retract(&registry, &names(&["node-a"]), TOKEN).await;
         assert_eq!(wanted.retractions.load(Ordering::SeqCst), 1);
         assert_eq!(bystander.retractions.load(Ordering::SeqCst), 0);
         drop((wanted, bystander));
@@ -817,9 +825,10 @@ mod tests {
             failed: Vec::new(),
         };
         assert!(report.is_complete());
-        report
-            .failed
-            .push(("node-b".to_string(), ChallengeMiss::Refused("no".to_string())));
+        report.failed.push((
+            "node-b".to_string(),
+            ChallengeMiss::Refused("no".to_string()),
+        ));
         assert!(!report.is_complete());
     }
 

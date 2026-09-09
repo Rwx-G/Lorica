@@ -1,7 +1,7 @@
 //! Endpoints to export the running configuration as TOML and import a new
 //! one (with optional dry-run diff preview).
 
-use axum::extract::{Extension};
+use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;

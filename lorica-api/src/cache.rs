@@ -2,7 +2,7 @@
 
 use std::sync::atomic::Ordering;
 
-use axum::extract::{Path};
+use axum::extract::Path;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 

@@ -715,7 +715,9 @@ mod tests {
             store.create_route(r).expect("test setup: route inserts");
         }
         for b in &backends {
-            store.create_backend(b).expect("test setup: backend inserts");
+            store
+                .create_backend(b)
+                .expect("test setup: backend inserts");
         }
         let mut links: Vec<(&str, &str)> = routes
             .iter()

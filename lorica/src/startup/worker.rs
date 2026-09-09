@@ -853,7 +853,10 @@ async fn worker_load_certs_into_resolver(
 /// supervisor owns the Data-Shield fetch), the disabled-rule set, and any
 /// custom rules. Synchronous - called outside a runtime, so it takes the
 /// store's blocking lock.
-fn worker_restore_waf_state(store: &Arc<Mutex<ConfigStore>>, waf_engine: &Arc<lorica_waf::WafEngine>) {
+fn worker_restore_waf_state(
+    store: &Arc<Mutex<ConfigStore>>,
+    waf_engine: &Arc<lorica_waf::WafEngine>,
+) {
     let s = store.blocking_lock();
     if let Ok(settings) = s.get_global_settings() {
         if settings.ip_blocklist_enabled {

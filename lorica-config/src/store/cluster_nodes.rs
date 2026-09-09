@@ -378,7 +378,12 @@ impl ConfigStore {
             "UPDATE cluster_nodes SET prev_cert_fingerprint = cert_fingerprint, \
              prev_cert_serial = cert_serial, cert_fingerprint = ?2, cert_serial = ?3, \
              cert_not_after = ?4 WHERE node_id = ?1 AND status = 'active'",
-            params![node_id, new_fingerprint, new_serial, new_not_after.to_rfc3339()],
+            params![
+                node_id,
+                new_fingerprint,
+                new_serial,
+                new_not_after.to_rfc3339()
+            ],
         )?;
         tx.commit()?;
         Ok(changed == 1)
@@ -906,7 +911,15 @@ mod tests {
         cert_id: &str,
         selector: &[&str],
     ) {
-        bind_route_with_aliases(store, route_id, hostname, &[], path_prefix, cert_id, selector);
+        bind_route_with_aliases(
+            store,
+            route_id,
+            hostname,
+            &[],
+            path_prefix,
+            cert_id,
+            selector,
+        );
     }
 
     /// [`bind_route`] with `hostname_aliases`, the extra host keys the
@@ -988,7 +1001,13 @@ mod tests {
         enrol(&store, "node-p", "edge-p", NodeStatus::Pending);
         enrol(&store, "node-r", "edge-r", NodeStatus::Revoked);
         issue_certificate(&store, "cert-1", "shop.example.com");
-        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-a", "edge-p", "edge-r"]);
+        bind_route(
+            &store,
+            "r1",
+            "shop.example.com",
+            "cert-1",
+            &["edge-a", "edge-p", "edge-r"],
+        );
 
         assert_eq!(
             store
@@ -1119,7 +1138,13 @@ mod tests {
     #[test]
     fn a_selector_name_matching_no_node_is_skipped() {
         let store = fleet_of_three();
-        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-a", "edge-gone"]);
+        bind_route(
+            &store,
+            "r1",
+            "shop.example.com",
+            "cert-1",
+            &["edge-a", "edge-gone"],
+        );
 
         assert_eq!(
             store
@@ -1219,7 +1244,13 @@ mod tests {
         enrol(&store, "node-a", "edge-a", NodeStatus::Active);
         enrol(&store, "node-p", "edge-p", NodeStatus::Pending);
         issue_certificate(&store, "cert-1", "shop.example.com");
-        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-a", "edge-p"]);
+        bind_route(
+            &store,
+            "r1",
+            "shop.example.com",
+            "cert-1",
+            &["edge-a", "edge-p"],
+        );
 
         assert_eq!(
             store
@@ -1235,12 +1266,10 @@ mod tests {
         let store = fleet_of_three();
         bind_route(&store, "r1", "shop.example.com", "cert-1", &[]);
 
-        assert!(
-            store
-                .challenge_recipients("unknown.example.com")
-                .expect("an unserved hostname is not an error")
-                .is_empty()
-        );
+        assert!(store
+            .challenge_recipients("unknown.example.com")
+            .expect("an unserved hostname is not an error")
+            .is_empty());
         assert!(
             store
                 .challenge_recipients("SHOP.EXAMPLE.COM")
@@ -1254,7 +1283,14 @@ mod tests {
     fn two_routes_on_one_hostname_take_the_union() {
         let store = fleet_of_three();
         bind_route_under(&store, "r1", "shop.example.com", "/", "cert-1", &["edge-c"]);
-        bind_route_under(&store, "r2", "shop.example.com", "/api", "cert-1", &["edge-a"]);
+        bind_route_under(
+            &store,
+            "r2",
+            "shop.example.com",
+            "/api",
+            "cert-1",
+            &["edge-a"],
+        );
 
         assert_eq!(
             store
@@ -1371,12 +1407,10 @@ mod tests {
                 .expect("recipients resolve"),
             vec!["node-a".to_string()]
         );
-        assert!(
-            store
-                .challenge_recipients("example.com")
-                .expect("recipients resolve")
-                .is_empty()
-        );
+        assert!(store
+            .challenge_recipients("example.com")
+            .expect("recipients resolve")
+            .is_empty());
     }
 
     #[test]
@@ -1387,7 +1421,10 @@ mod tests {
         // failing assertion rather than as a silent divergence in who
         // receives a token.
         assert!(host_pattern_matches("shop.example.com", "shop.example.com"));
-        assert!(!host_pattern_matches("shop.example.com", "other.example.com"));
+        assert!(!host_pattern_matches(
+            "shop.example.com",
+            "other.example.com"
+        ));
         assert!(host_pattern_matches("*.example.com", "a.example.com"));
         assert!(host_pattern_matches("*.example.com", "deep.a.example.com"));
         assert!(!host_pattern_matches("*.example.com", "example.com"));
@@ -1446,22 +1483,29 @@ mod tests {
         // before the node was provisioned.
         let store = fleet_of_three();
         bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-b"]);
-        bind_route(&store, "r2", "api.example.com", "cert-1", &["edge-b", "edge-c"]);
+        bind_route(
+            &store,
+            "r2",
+            "api.example.com",
+            "cert-1",
+            &["edge-b", "edge-c"],
+        );
         bind_route(&store, "r3", "www.example.com", "cert-1", &["edge-c"]);
 
         assert_eq!(
             store
                 .hostnames_selecting_node_name("edge-b")
                 .expect("selection resolves"),
-            vec!["api.example.com".to_string(), "shop.example.com".to_string()],
+            vec![
+                "api.example.com".to_string(),
+                "shop.example.com".to_string()
+            ],
             "sorted and deduplicated, so the review column is stable"
         );
-        assert!(
-            store
-                .hostnames_selecting_node_name("edge-never-provisioned")
-                .expect("an unknown name is not an error")
-                .is_empty()
-        );
+        assert!(store
+            .hostnames_selecting_node_name("edge-never-provisioned")
+            .expect("an unknown name is not an error")
+            .is_empty());
     }
 
     #[test]

@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lorica_cluster::handshake::{client_handshake, serve_hello, HandshakeConfig};
-use lorica_cluster::replication::{AppliedConfig, ConfigVersion};
 use lorica_cluster::messages::ClusterFrame;
+use lorica_cluster::replication::{AppliedConfig, ConfigVersion};
 use lorica_cluster::{
     client_config, operational_server_config, ClusterCa, ClusterStatus, HandshakeError,
     PROTOCOL_VERSION,
@@ -85,10 +85,15 @@ async fn one_shot_server(
         .recv()
         .await
         .ok_or_else(|| "no opener".to_string())?;
-    let outcome = serve_hello(first, &server_cfg, fleet_size_hint, &ConfigVersion::default())
-        .await
-        .map_err(|e| e.to_string())?
-        .map(|(ack, _hello)| ack);
+    let outcome = serve_hello(
+        first,
+        &server_cfg,
+        fleet_size_hint,
+        &ConfigVersion::default(),
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .map(|(ack, _hello)| ack);
     // Dropping the endpoint aborts its writer task, which may still
     // hold the queued reply; stay alive until the CLIENT hangs up
     // (recv() returns None on peer EOF) so the reply is flushed.
@@ -100,8 +105,8 @@ async fn connect_client(
     addr: std::net::SocketAddr,
     p: &Pki,
 ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String> {
-    let cfg = client_config(p.ca.cert_pem(), &p.client_cert, &p.client_key)
-        .map_err(|e| e.to_string())?;
+    let cfg =
+        client_config(p.ca.cert_pem(), &p.client_cert, &p.client_key).map_err(|e| e.to_string())?;
     let connector = TlsConnector::from(Arc::new(cfg));
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
@@ -120,7 +125,9 @@ async fn full_mtls_session_handshake_round_trips() {
     let server_config =
         operational_server_config(p.ca.cert_pem(), &p.server_cert, &p.server_key).expect("cfg");
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
 
     let server = tokio::spawn(one_shot_server(listener, acceptor, local_cfg(49), 3));
@@ -134,8 +141,8 @@ async fn full_mtls_session_handshake_round_trips() {
         &AppliedConfig::default(),
         Duration::from_secs(5),
     )
-        .await
-        .expect("handshake admitted");
+    .await
+    .expect("handshake admitted");
     assert_eq!(ack.negotiated_version, PROTOCOL_VERSION);
     assert_eq!(ack.schema_version, 49);
     assert_eq!(ack.fleet_size_hint, 3);
@@ -160,7 +167,9 @@ async fn client_without_certificate_fails_the_tls_handshake() {
     let server_config =
         operational_server_config(p.ca.cert_pem(), &p.server_cert, &p.server_key).expect("cfg");
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
 
     // Server side: the accept must fail (certificate required).
@@ -207,7 +216,9 @@ async fn client_leaf_cannot_serve_and_server_leaf_cannot_dial() {
     let swapped_server_config =
         operational_server_config(p.ca.cert_pem(), &p.client_cert, &p.client_key).expect("cfg");
     let acceptor = TlsAcceptor::from(Arc::new(swapped_server_config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.expect("tcp accept");
@@ -225,7 +236,9 @@ async fn client_leaf_cannot_serve_and_server_leaf_cannot_dial() {
     let server_config =
         operational_server_config(p.ca.cert_pem(), &p.server_cert, &p.server_key).expect("cfg");
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.expect("tcp accept");
@@ -257,7 +270,9 @@ async fn schema_and_version_refusals_reach_the_dialer_distinctly() {
 
     // Follower schema BELOW the control plane's: SchemaTooOld.
     let acceptor = TlsAcceptor::from(Arc::new(server_config.clone()));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let server = tokio::spawn(one_shot_server(listener, acceptor, local_cfg(50), 1));
     let tls = connect_client(addr, &p).await.expect("mTLS connect");
@@ -269,8 +284,8 @@ async fn schema_and_version_refusals_reach_the_dialer_distinctly() {
         &AppliedConfig::default(),
         Duration::from_secs(5),
     )
-        .await
-        .expect_err("must be refused");
+    .await
+    .expect_err("must be refused");
     assert!(
         matches!(err, HandshakeError::Refused(ClusterStatus::SchemaTooOld)),
         "got {err:?}"

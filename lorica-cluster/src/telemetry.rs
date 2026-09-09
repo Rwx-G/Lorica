@@ -472,7 +472,11 @@ mod tests {
         assert_eq!(quota.tracked_nodes(), 1);
         std::thread::sleep(Duration::from_millis(30));
         quota.admit("node-here", 1, 0, 1);
-        assert_eq!(quota.tracked_nodes(), 1, "only the node that pushed inside the window");
+        assert_eq!(
+            quota.tracked_nodes(),
+            1,
+            "only the node that pushed inside the window"
+        );
         // The sweep is lossless: a swept entry had a rolled window,
         // which `roll` would have zeroed anyway, so the node's budget
         // is the full one either way.

@@ -200,9 +200,7 @@ impl<S> ConnectionPool<S> {
     /// from removing the map entry between looking it up and repopulating it.
     fn insert_pool_connection(&self, key: GroupKey, id: ID, connection: PoolConnection<S>) {
         let mut pool = self.pool.write();
-        let pool_node = pool
-            .entry(key)
-            .or_insert_with(|| Arc::new(PoolNode::new()));
+        let pool_node = pool.entry(key).or_insert_with(|| Arc::new(PoolNode::new()));
         pool_node.insert(id, connection);
     }
 

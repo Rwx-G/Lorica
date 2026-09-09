@@ -164,7 +164,10 @@ fn merged_from_builtin(verification: &Verification) -> MergedVerification {
 /// Resolve a custom row's verification into the owned merged form.
 /// `None` means the row must be skipped (an invalid CIDR was found) ;
 /// the skip is already logged and counted here.
-fn merged_from_custom(row_id: i64, verification: &CustomVerification) -> Option<MergedVerification> {
+fn merged_from_custom(
+    row_id: i64,
+    verification: &CustomVerification,
+) -> Option<MergedVerification> {
     match verification {
         CustomVerification::Rdns { suffixes } => Some(MergedVerification::Rdns(suffixes.clone())),
         CustomVerification::UaOnly => Some(MergedVerification::UaOnly),

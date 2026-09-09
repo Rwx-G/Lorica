@@ -71,9 +71,7 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
             // a literal `Bearer <token>` / `Basic <base64>`.
             if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&nc.config) {
                 let mutated = match nc.channel {
-                    NotificationChannel::Email => {
-                        scrub_secret_field(&mut val, "smtp_password")
-                    }
+                    NotificationChannel::Email => scrub_secret_field(&mut val, "smtp_password"),
                     NotificationChannel::Webhook | NotificationChannel::Slack => {
                         // `url` carries the secret in the path for
                         // Slack / Discord / Teams webhooks.

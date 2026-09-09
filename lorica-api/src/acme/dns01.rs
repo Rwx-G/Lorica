@@ -14,7 +14,7 @@
 
 //! Automated DNS-01 challenge provisioning: endpoint and internal flow.
 
-use axum::extract::{Extension};
+use axum::extract::Extension;
 use axum::Json;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -201,8 +201,8 @@ pub(super) async fn provision_with_acme_dns(
     // binding survive ; on first issuance insert a fresh row.
     let now = chrono::Utc::now();
     let is_renewal = existing_cert_id.is_some();
-    let cert_id = existing_cert_id
-        .map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
+    let cert_id =
+        existing_cert_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
     let fingerprint = format!("acme-dns:{}", domains.join(","));
 
     let cert = lorica_config::models::Certificate {

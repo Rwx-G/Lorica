@@ -399,9 +399,9 @@ impl LogStore {
         let count_sql = format!("SELECT COUNT(*) FROM access_logs {where_clause}");
         let refs: Vec<&dyn rusqlite::types::ToSql> =
             bind_values.iter().map(|b| b.as_ref()).collect();
-        let total: usize = conn
-            .query_row(&count_sql, refs.as_slice(), |row| row.get::<_, i64>(0))
-            .map_err(|e| format!("failed to count access logs: {e}"))? as usize;
+        let total: usize =
+            conn.query_row(&count_sql, refs.as_slice(), |row| row.get::<_, i64>(0))
+                .map_err(|e| format!("failed to count access logs: {e}"))? as usize;
 
         let query_sql = format!(
             "SELECT id, timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff, xff_proxy_ip, source, request_id \
@@ -965,9 +965,11 @@ impl LogStore {
     pub fn newest_local_audit_id(&self) -> Result<u64, String> {
         let conn = self.conn.lock();
         let id: Option<i64> = conn
-            .query_row("SELECT MAX(id) FROM audit_log WHERE node_id = ''", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT MAX(id) FROM audit_log WHERE node_id = ''",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|e| format!("failed to read the newest audit id: {e}"))?;
         Ok(id.unwrap_or(0).max(0) as u64)
     }
@@ -1236,7 +1238,10 @@ impl LogStore {
     /// computed HERE, inside the connection lock: two concurrent
     /// mutations cannot fork the chain. The previous hash comes from
     /// the newest stored row, else the retention seal, else genesis.
-    pub fn insert_audit(&self, entry: &crate::audit::NewAuditEntry) -> Result<(i64, String), String> {
+    pub fn insert_audit(
+        &self,
+        entry: &crate::audit::NewAuditEntry,
+    ) -> Result<(i64, String), String> {
         use rusqlite::{OptionalExtension, TransactionBehavior};
         let mut guard = self.conn.lock();
         // IMMEDIATE, so the tail read and the insert hold SQLite's
@@ -1267,8 +1272,9 @@ impl LogStore {
 
         let prev_chain_hash: String = match last {
             Some(hash) => hash,
-            None => Self::audit_seal(&conn)?
-                .unwrap_or_else(|| crate::audit::GENESIS_HASH.to_string()),
+            None => {
+                Self::audit_seal(&conn)?.unwrap_or_else(|| crate::audit::GENESIS_HASH.to_string())
+            }
         };
 
         let chain_hash: String = crate::audit::compute_chain_hash(
@@ -1742,7 +1748,11 @@ impl LogStore {
             // goes, and what survives is a suffix whose first row is
             // the one the seal is taken from.
             let (order, tail_order) = Self::chain_order(node_id);
-            let position = if node_id.is_empty() { "id" } else { "origin_id" };
+            let position = if node_id.is_empty() {
+                "id"
+            } else {
+                "origin_id"
+            };
 
             let cut: Option<i64> = conn
                 .query_row(
@@ -2071,7 +2081,9 @@ mod fleet_audit_tests {
             row.timestamp = "2999-01-01T00:00:00Z".to_string();
         }
         let rebuilt = rechain(rows);
-        store.insert_fanned_in_audit("node-a", &rebuilt).expect("fan-in");
+        store
+            .insert_fanned_in_audit("node-a", &rebuilt)
+            .expect("fan-in");
 
         // A cutoff a minute from now is after the arrival time of
         // every row and before their own stamp.
@@ -2099,7 +2111,9 @@ mod fleet_audit_tests {
         // must not keep it.
         rows[0].timestamp = "2999-01-01T00:00:00Z".to_string();
         let rebuilt = rechain(rows);
-        store.insert_fanned_in_audit("node-a", &rebuilt).expect("fan-in");
+        store
+            .insert_fanned_in_audit("node-a", &rebuilt)
+            .expect("fan-in");
         // The first two rows arrived long ago, the third just now.
         store.backdate_arrival("node-a", 1, "2026-01-01T00:00:00Z");
         store.backdate_arrival("node-a", 2, "2026-01-01T00:00:01Z");
@@ -2126,11 +2140,15 @@ mod fleet_audit_tests {
         // chain off a follower's row and its own chain would be
         // verifiable by nothing but this exact aggregate.
         let (store, _dir) = store();
-        let (_, first_local) = store.insert_audit(&local_entry("route.create")).expect("local");
+        let (_, first_local) = store
+            .insert_audit(&local_entry("route.create"))
+            .expect("local");
         store
             .insert_fanned_in_audit("node-a", &origin_chain(&["backend.create"]))
             .expect("fan-in");
-        let (_, second_local) = store.insert_audit(&local_entry("route.delete")).expect("local");
+        let (_, second_local) = store
+            .insert_audit(&local_entry("route.delete"))
+            .expect("local");
 
         let (rows, _) = store
             .query_audit(&crate::audit::AuditQuery {
@@ -2150,11 +2168,15 @@ mod fleet_audit_tests {
     #[test]
     fn each_node_s_chain_verifies_on_its_own_and_the_unpartitioned_walk_would_not() {
         let (store, _dir) = store();
-        store.insert_audit(&local_entry("route.create")).expect("local");
+        store
+            .insert_audit(&local_entry("route.create"))
+            .expect("local");
         store
             .insert_fanned_in_audit("node-a", &origin_chain(&["a.one", "a.two"]))
             .expect("fan-in a");
-        store.insert_audit(&local_entry("route.delete")).expect("local");
+        store
+            .insert_audit(&local_entry("route.delete"))
+            .expect("local");
         store
             .insert_fanned_in_audit("node-b", &origin_chain(&["b.one"]))
             .expect("fan-in b");
@@ -2183,11 +2205,15 @@ mod fleet_audit_tests {
         let (store, _dir) = store();
         let rows = origin_chain(&["a.one", "a.two"]);
         assert_eq!(
-            store.insert_fanned_in_audit("node-a", &rows).expect("first"),
+            store
+                .insert_fanned_in_audit("node-a", &rows)
+                .expect("first"),
             2
         );
         assert_eq!(
-            store.insert_fanned_in_audit("node-a", &rows).expect("second"),
+            store
+                .insert_fanned_in_audit("node-a", &rows)
+                .expect("second"),
             2,
             "a re-sent batch is acknowledged in full, or the cursor never moves again"
         );
@@ -2200,7 +2226,12 @@ mod fleet_audit_tests {
             })
             .expect("query");
         assert_eq!(all.len(), 2, "the second delivery stored no duplicate");
-        assert!(store.verify_audit_chain_for("node-a").expect("verify").verified);
+        assert!(
+            store
+                .verify_audit_chain_for("node-a")
+                .expect("verify")
+                .verified
+        );
     }
 
     #[test]
@@ -2215,7 +2246,9 @@ mod fleet_audit_tests {
         let full = origin_chain(&["a.one", "a.two", "a.three"]);
         let tail = &full[1..];
         assert_eq!(
-            store.insert_fanned_in_audit("node-a", tail).expect("fan-in"),
+            store
+                .insert_fanned_in_audit("node-a", tail)
+                .expect("fan-in"),
             2
         );
 
@@ -2243,7 +2276,10 @@ mod fleet_audit_tests {
 
         let result = store.verify_audit_chain_for("node-a").expect("verify");
         assert!(!result.verified, "the gap is reported rather than resealed");
-        assert_eq!(result.first_break_reason.as_deref(), Some("prev_hash_mismatch"));
+        assert_eq!(
+            result.first_break_reason.as_deref(),
+            Some("prev_hash_mismatch")
+        );
     }
 
     #[test]
@@ -2266,11 +2302,16 @@ mod fleet_audit_tests {
         let (store, _dir) = store();
         let mut rows = origin_chain(&["a.one", "a.two"]);
         rows[1].action = "a.two.tampered".to_string();
-        store.insert_fanned_in_audit("node-a", &rows).expect("fan-in");
+        store
+            .insert_fanned_in_audit("node-a", &rows)
+            .expect("fan-in");
 
         let result = store.verify_audit_chain_for("node-a").expect("verify");
         assert!(!result.verified);
-        assert_eq!(result.first_break_reason.as_deref(), Some("chain_hash_mismatch"));
+        assert_eq!(
+            result.first_break_reason.as_deref(),
+            Some("chain_hash_mismatch")
+        );
     }
 
     #[test]
@@ -2282,10 +2323,14 @@ mod fleet_audit_tests {
         let mut old = local_entry("route.create");
         old.timestamp = "2026-01-01T00:00:00Z".to_string();
         store.insert_audit(&old).expect("local old");
-        store.insert_audit(&local_entry("route.delete")).expect("local new");
+        store
+            .insert_audit(&local_entry("route.delete"))
+            .expect("local new");
 
         let rows = origin_chain(&["a.one", "a.two"]);
-        store.insert_fanned_in_audit("node-a", &rows).expect("fan-in");
+        store
+            .insert_fanned_in_audit("node-a", &rows)
+            .expect("fan-in");
         store.backdate_arrival("node-a", 1, "2026-01-01T00:00:00Z");
 
         let deleted = store
@@ -2295,7 +2340,10 @@ mod fleet_audit_tests {
 
         for node_id in ["", "node-a"] {
             assert!(
-                store.verify_audit_chain_for(node_id).expect("verify").verified,
+                store
+                    .verify_audit_chain_for(node_id)
+                    .expect("verify")
+                    .verified,
                 "chain {node_id} lost its seal"
             );
         }
@@ -2306,7 +2354,9 @@ mod fleet_audit_tests {
         // A control plane demoted to a follower must not re-ship every
         // other node's rows under its own session identity.
         let (store, _dir) = store();
-        store.insert_audit(&local_entry("route.create")).expect("local");
+        store
+            .insert_audit(&local_entry("route.create"))
+            .expect("local");
         store
             .insert_fanned_in_audit("node-a", &origin_chain(&["a.one"]))
             .expect("fan-in");
@@ -2351,7 +2401,9 @@ mod audit_tests {
     fn chain_inserts_and_verifies() {
         let (store, _dir) = tmp_store();
         for n in 1..=5 {
-            store.insert_audit(&entry(n, "route.create", "alice")).expect("insert");
+            store
+                .insert_audit(&entry(n, "route.create", "alice"))
+                .expect("insert");
         }
         let result = store.verify_audit_chain().expect("verify");
         assert!(result.verified);
@@ -2360,7 +2412,10 @@ mod audit_tests {
 
         // Genesis row anchors on the all-zero hash.
         let (rows, total) = store
-            .query_audit(&AuditQuery { limit: 10, ..Default::default() })
+            .query_audit(&AuditQuery {
+                limit: 10,
+                ..Default::default()
+            })
             .expect("query");
         assert_eq!(total, 5);
         assert_eq!(rows.last().expect("rows").prev_chain_hash, GENESIS_HASH);
@@ -2372,7 +2427,9 @@ mod audit_tests {
     fn tampering_breaks_at_the_modified_row() {
         let (store, _dir) = tmp_store();
         for n in 1..=4 {
-            store.insert_audit(&entry(n, "route.update", "alice")).expect("insert");
+            store
+                .insert_audit(&entry(n, "route.update", "alice"))
+                .expect("insert");
         }
         {
             let conn = store.conn.lock();
@@ -2382,30 +2439,41 @@ mod audit_tests {
         let result = store.verify_audit_chain().expect("verify");
         assert!(!result.verified);
         assert_eq!(result.first_break_id, Some(2));
-        assert_eq!(result.first_break_reason.as_deref(), Some("chain_hash_mismatch"));
+        assert_eq!(
+            result.first_break_reason.as_deref(),
+            Some("chain_hash_mismatch")
+        );
     }
 
     #[test]
     fn deleting_a_middle_row_breaks_the_successor() {
         let (store, _dir) = tmp_store();
         for n in 1..=4 {
-            store.insert_audit(&entry(n, "backend.delete", "bob")).expect("insert");
+            store
+                .insert_audit(&entry(n, "backend.delete", "bob"))
+                .expect("insert");
         }
         {
             let conn = store.conn.lock();
-            conn.execute("DELETE FROM audit_log WHERE id = 2", []).expect("delete");
+            conn.execute("DELETE FROM audit_log WHERE id = 2", [])
+                .expect("delete");
         }
         let result = store.verify_audit_chain().expect("verify");
         assert!(!result.verified);
         assert_eq!(result.first_break_id, Some(3));
-        assert_eq!(result.first_break_reason.as_deref(), Some("prev_hash_mismatch"));
+        assert_eq!(
+            result.first_break_reason.as_deref(),
+            Some("prev_hash_mismatch")
+        );
     }
 
     #[test]
     fn retention_seal_keeps_chain_verifiable() {
         let (store, _dir) = tmp_store();
         for n in 1..=10 {
-            store.insert_audit(&entry(n, "cert.renew", "alice")).expect("insert");
+            store
+                .insert_audit(&entry(n, "cert.renew", "alice"))
+                .expect("insert");
         }
         // Truncate the first 5 rows (timestamps 2026-08-01..05).
         let deleted = store
@@ -2418,7 +2486,9 @@ mod audit_tests {
         assert_eq!(result.total_rows, 5);
 
         // New inserts keep chaining onto the surviving tail.
-        store.insert_audit(&entry(11, "cert.renew", "alice")).expect("insert");
+        store
+            .insert_audit(&entry(11, "cert.renew", "alice"))
+            .expect("insert");
         let result = store.verify_audit_chain().expect("verify");
         assert!(result.verified);
         assert_eq!(result.total_rows, 6);
@@ -2428,7 +2498,9 @@ mod audit_tests {
     fn retention_that_empties_the_table_seals_the_tail() {
         let (store, _dir) = tmp_store();
         for n in 1..=3 {
-            store.insert_audit(&entry(n, "waf.toggle", "alice")).expect("insert");
+            store
+                .insert_audit(&entry(n, "waf.toggle", "alice"))
+                .expect("insert");
         }
         let deleted = store
             .enforce_audit_retention("2026-09-01T00:00:00+00:00")
@@ -2439,9 +2511,14 @@ mod audit_tests {
         assert_eq!(result.total_rows, 0);
 
         // The next insert anchors on the seal, not genesis.
-        store.insert_audit(&entry(4, "waf.toggle", "alice")).expect("insert");
+        store
+            .insert_audit(&entry(4, "waf.toggle", "alice"))
+            .expect("insert");
         let (rows, _) = store
-            .query_audit(&AuditQuery { limit: 1, ..Default::default() })
+            .query_audit(&AuditQuery {
+                limit: 1,
+                ..Default::default()
+            })
             .expect("query");
         assert_ne!(rows[0].prev_chain_hash, GENESIS_HASH);
         assert!(store.verify_audit_chain().expect("verify").verified);
@@ -2450,9 +2527,15 @@ mod audit_tests {
     #[test]
     fn query_filters_operator_action_prefix_and_cursor() {
         let (store, _dir) = tmp_store();
-        store.insert_audit(&entry(1, "route.create", "alice")).expect("insert");
-        store.insert_audit(&entry(2, "route.delete", "bob")).expect("insert");
-        store.insert_audit(&entry(3, "backend.create", "alice")).expect("insert");
+        store
+            .insert_audit(&entry(1, "route.create", "alice"))
+            .expect("insert");
+        store
+            .insert_audit(&entry(2, "route.delete", "bob"))
+            .expect("insert");
+        store
+            .insert_audit(&entry(3, "backend.create", "alice"))
+            .expect("insert");
 
         let (rows, total) = store
             .query_audit(&AuditQuery {

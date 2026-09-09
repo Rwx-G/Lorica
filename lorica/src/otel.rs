@@ -392,7 +392,9 @@ mod imp {
 
     // ---- OTLP logs signal (Story 9.8 AC #2) ----
 
-    use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
+    use opentelemetry::logs::{
+        AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity,
+    };
     use opentelemetry::trace::{SpanId, TraceFlags, TraceId};
     use opentelemetry_otlp::{LogExporter, WithHttpConfig};
     use opentelemetry_sdk::logs::SdkLoggerProvider;
@@ -433,10 +435,7 @@ mod imp {
             cfg.auth_header
                 .as_ref()
                 .map(|auth| {
-                    std::collections::HashMap::from([(
-                        "authorization".to_string(),
-                        auth.clone(),
-                    )])
+                    std::collections::HashMap::from([("authorization".to_string(), auth.clone())])
                 })
                 .unwrap_or_default()
         };
@@ -567,10 +566,7 @@ mod imp {
         record.set_body(AnyValue::from(lorica_api::log_sinks::body_json(event)));
         record.add_attribute("lorica.kind", kind.as_str());
         if let (Some(trace_id), Some(span_id)) = (&event.trace_id, &event.span_id) {
-            if let (Ok(tid), Ok(sid)) = (
-                TraceId::from_hex(trace_id),
-                SpanId::from_hex(span_id),
-            ) {
+            if let (Ok(tid), Ok(sid)) = (TraceId::from_hex(trace_id), SpanId::from_hex(span_id)) {
                 record.set_trace_context(tid, sid, Some(TraceFlags::SAMPLED));
             }
         }

@@ -110,8 +110,10 @@ pub async fn list_custom_crawlers(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     let crawlers = store.list_custom_crawlers()?;
-    let entries: Vec<CustomCrawlerResponse> =
-        crawlers.into_iter().map(CustomCrawlerResponse::from).collect();
+    let entries: Vec<CustomCrawlerResponse> = crawlers
+        .into_iter()
+        .map(CustomCrawlerResponse::from)
+        .collect();
     Ok(json_data(serde_json::json!({
         "entries": entries,
         "built_in_count": BUILTIN_CRAWLER_DESCRIPTORS.len(),
@@ -402,7 +404,10 @@ fn active_crawler_names(route: &Route, customs: &[CustomCrawler]) -> Vec<String>
     if route.ai_bot_policy.unwrap_or(AiBotPolicy::Off) == AiBotPolicy::Off {
         return Vec::new();
     }
-    let mut names: Vec<String> = BUILTIN_CRAWLER_DESCRIPTORS.iter().map(|d| d.name.to_string()).collect();
+    let mut names: Vec<String> = BUILTIN_CRAWLER_DESCRIPTORS
+        .iter()
+        .map(|d| d.name.to_string())
+        .collect();
     for c in customs.iter().filter(|c| c.enabled) {
         if !names.iter().any(|n| n == &c.name) {
             names.push(c.name.clone());
@@ -747,7 +752,11 @@ mod tests {
         assert!(validate_verification(&CustomVerification::UaOnly).is_ok());
     }
 
-    fn request(name: &str, pattern: &str, verification: CustomVerification) -> CustomCrawlerRequest {
+    fn request(
+        name: &str,
+        pattern: &str,
+        verification: CustomVerification,
+    ) -> CustomCrawlerRequest {
         CustomCrawlerRequest {
             name: name.to_string(),
             user_agent_pattern: pattern.to_string(),
@@ -759,11 +768,7 @@ mod tests {
     #[test]
     fn name_with_control_char_rejected() {
         // A newline in the name would inject robots.txt directives.
-        let body = request(
-            "Bad\nName",
-            r"(?i)\bSomeBot\b",
-            CustomVerification::UaOnly,
-        );
+        let body = request("Bad\nName", r"(?i)\bSomeBot\b", CustomVerification::UaOnly);
         let err = validate_request(&body).unwrap_err();
         match err {
             ApiError::BadRequest(msg) => assert!(msg.contains("control characters")),
@@ -775,11 +780,18 @@ mod tests {
     fn builtin_verification_downgrade_to_ua_only_rejected() {
         // GPTBot is a built-in verified by ip_ranges. A custom row of
         // the same name with ua_only verification must be rejected.
-        let body = request("GPTBot", r"(?i)\bMyGptbotClone\b", CustomVerification::UaOnly);
+        let body = request(
+            "GPTBot",
+            r"(?i)\bMyGptbotClone\b",
+            CustomVerification::UaOnly,
+        );
         let err = validate_request(&body).unwrap_err();
         match err {
             ApiError::BadRequest(msg) => {
-                assert!(msg.contains("downgrading to ua_only is not allowed"), "{msg}");
+                assert!(
+                    msg.contains("downgrading to ua_only is not allowed"),
+                    "{msg}"
+                );
                 assert!(msg.contains("ip_ranges"), "{msg}");
             }
             other => panic!("expected BadRequest, got {other:?}"),

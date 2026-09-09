@@ -397,7 +397,12 @@ fn migrate_users_rbac(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn migrate_route_sticky_session(conn: &Connection) -> rusqlite::Result<()> {
-    add_column_if_absent(conn, "routes", "sticky_session", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_absent(
+        conn,
+        "routes",
+        "sticky_session",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
 }
 
 fn migrate_route_basic_auth(conn: &Connection) -> rusqlite::Result<()> {
@@ -417,20 +422,40 @@ fn migrate_route_stale_cache(conn: &Connection) -> rusqlite::Result<()> {
         "stale_while_revalidate_s",
         "INTEGER NOT NULL DEFAULT 10",
     )?;
-    add_column_if_absent(conn, "routes", "stale_if_error_s", "INTEGER NOT NULL DEFAULT 60")
+    add_column_if_absent(
+        conn,
+        "routes",
+        "stale_if_error_s",
+        "INTEGER NOT NULL DEFAULT 60",
+    )
 }
 
 fn migrate_route_retry_on_methods(conn: &Connection) -> rusqlite::Result<()> {
-    add_column_if_absent(conn, "routes", "retry_on_methods", "TEXT NOT NULL DEFAULT '[]'")
+    add_column_if_absent(
+        conn,
+        "routes",
+        "retry_on_methods",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
 }
 
 fn migrate_route_maintenance(conn: &Connection) -> rusqlite::Result<()> {
-    add_column_if_absent(conn, "routes", "maintenance_mode", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_absent(
+        conn,
+        "routes",
+        "maintenance_mode",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_absent(conn, "routes", "error_page_html", "TEXT DEFAULT NULL")
 }
 
 fn migrate_route_cache_vary_headers(conn: &Connection) -> rusqlite::Result<()> {
-    add_column_if_absent(conn, "routes", "cache_vary_headers", "TEXT NOT NULL DEFAULT '[]'")
+    add_column_if_absent(
+        conn,
+        "routes",
+        "cache_vary_headers",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
 }
 
 fn migrate_route_header_rules(conn: &Connection) -> rusqlite::Result<()> {
@@ -438,7 +463,12 @@ fn migrate_route_header_rules(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn migrate_route_traffic_splits(conn: &Connection) -> rusqlite::Result<()> {
-    add_column_if_absent(conn, "routes", "traffic_splits", "TEXT NOT NULL DEFAULT '[]'")
+    add_column_if_absent(
+        conn,
+        "routes",
+        "traffic_splits",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
 }
 
 fn migrate_route_forward_auth(conn: &Connection) -> rusqlite::Result<()> {
@@ -514,7 +544,12 @@ fn migrate_cert_export_acls(conn: &Connection) -> rusqlite::Result<()> {
 
 fn migrate_route_ai_bot_policy(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_absent(conn, "routes", "ai_bot_policy", "TEXT DEFAULT NULL")?;
-    add_column_if_absent(conn, "routes", "ai_bot_spoofed_fallback", "TEXT DEFAULT NULL")
+    add_column_if_absent(
+        conn,
+        "routes",
+        "ai_bot_spoofed_fallback",
+        "TEXT DEFAULT NULL",
+    )
 }
 
 fn migrate_ai_crawlers_custom(conn: &Connection) -> rusqlite::Result<()> {
@@ -533,7 +568,12 @@ fn migrate_ai_crawlers_custom(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn migrate_route_serve_robots_txt(conn: &Connection) -> rusqlite::Result<()> {
-    add_column_if_absent(conn, "routes", "serve_robots_txt", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_absent(
+        conn,
+        "routes",
+        "serve_robots_txt",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
 }
 
 fn migrate_bot_pending_prefix_index(conn: &Connection) -> rusqlite::Result<()> {
@@ -544,7 +584,12 @@ fn migrate_bot_pending_prefix_index(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn migrate_session_role(conn: &Connection) -> rusqlite::Result<()> {
-    add_column_if_absent(conn, "sessions", "role", "TEXT NOT NULL DEFAULT 'super_admin'")
+    add_column_if_absent(
+        conn,
+        "sessions",
+        "role",
+        "TEXT NOT NULL DEFAULT 'super_admin'",
+    )
 }
 
 fn migrate_acme_challenges(conn: &Connection) -> rusqlite::Result<()> {
@@ -699,7 +744,12 @@ fn migrate_cluster_replication(conn: &Connection) -> rusqlite::Result<()> {
     // the break-glass deadline are text. `cluster_replica` is the text
     // sibling; both are single-row-per-key and read through
     // `store/cluster_replica.rs`.
-    add_column_if_absent(conn, "routes", "node_selector", "TEXT NOT NULL DEFAULT '[]'")?;
+    add_column_if_absent(
+        conn,
+        "routes",
+        "node_selector",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS cluster_replica (
             key TEXT PRIMARY KEY,
@@ -1180,8 +1230,7 @@ impl ConfigStore {
                     ))?;
                     for (id, stored) in &rows {
                         let plaintext = self.decrypt_config(stored)?;
-                        let re_encrypted =
-                            Self::reencrypt_verified(new_key, plaintext.as_bytes())?;
+                        let re_encrypted = Self::reencrypt_verified(new_key, plaintext.as_bytes())?;
                         let re_encoded =
                             base64::engine::general_purpose::STANDARD.encode(&re_encrypted);
                         update.execute(params![re_encoded, id])?;
@@ -1203,8 +1252,7 @@ impl ConfigStore {
                         .optional()?;
                     if let Some(stored) = stored.filter(|s| !s.is_empty()) {
                         let plaintext = self.decrypt_config(&stored)?;
-                        let re_encrypted =
-                            Self::reencrypt_verified(new_key, plaintext.as_bytes())?;
+                        let re_encrypted = Self::reencrypt_verified(new_key, plaintext.as_bytes())?;
                         let re_encoded =
                             base64::engine::general_purpose::STANDARD.encode(&re_encrypted);
                         tx.execute(
@@ -1538,7 +1586,12 @@ mod migration_tests {
         // Columns that were NOT pre-added must now exist too: the tail
         // ran to completion rather than aborting on the first
         // duplicate.
-        for column in ["bot_protection", "header_rules", "serve_robots_txt", "group_name"] {
+        for column in [
+            "bot_protection",
+            "header_rules",
+            "serve_robots_txt",
+            "group_name",
+        ] {
             assert_eq!(
                 column_count(&store.conn, "routes", column),
                 1,
@@ -1609,10 +1662,30 @@ mod migration_tests {
         let store = store_without_the_name_index();
         // Inserted out of enrollment order on purpose: the winner is
         // the oldest `enrolled_at`, not the first row SQLite hands back.
-        enrol(&store.conn, "33333333-new", "edge", "2026-03-01T00:00:00+00:00");
-        enrol(&store.conn, "11111111-old", "edge", "2026-01-01T00:00:00+00:00");
-        enrol(&store.conn, "22222222-mid", "edge", "2026-02-01T00:00:00+00:00");
-        enrol(&store.conn, "44444444-solo", "edge-solo", "2026-01-15T00:00:00+00:00");
+        enrol(
+            &store.conn,
+            "33333333-new",
+            "edge",
+            "2026-03-01T00:00:00+00:00",
+        );
+        enrol(
+            &store.conn,
+            "11111111-old",
+            "edge",
+            "2026-01-01T00:00:00+00:00",
+        );
+        enrol(
+            &store.conn,
+            "22222222-mid",
+            "edge",
+            "2026-02-01T00:00:00+00:00",
+        );
+        enrol(
+            &store.conn,
+            "44444444-solo",
+            "edge-solo",
+            "2026-01-15T00:00:00+00:00",
+        );
 
         migrate_cluster_node_name_unique(&store.conn)
             .expect("a fleet with duplicate names must still boot");
@@ -1644,8 +1717,18 @@ mod migration_tests {
     #[test]
     fn migration_53_is_idempotent_on_a_second_run() {
         let store = store_without_the_name_index();
-        enrol(&store.conn, "11111111-old", "edge", "2026-01-01T00:00:00+00:00");
-        enrol(&store.conn, "22222222-mid", "edge", "2026-02-01T00:00:00+00:00");
+        enrol(
+            &store.conn,
+            "11111111-old",
+            "edge",
+            "2026-01-01T00:00:00+00:00",
+        );
+        enrol(
+            &store.conn,
+            "22222222-mid",
+            "edge",
+            "2026-02-01T00:00:00+00:00",
+        );
 
         migrate_cluster_node_name_unique(&store.conn).expect("first run renames");
         let after_first = name_of(&store.conn, "22222222-mid");
@@ -1662,12 +1745,27 @@ mod migration_tests {
     #[test]
     fn migration_53_disambiguates_when_the_suffixed_name_is_itself_taken() {
         let store = store_without_the_name_index();
-        enrol(&store.conn, "11111111-old", "edge", "2026-01-01T00:00:00+00:00");
-        enrol(&store.conn, "22222222-mid", "edge", "2026-02-01T00:00:00+00:00");
+        enrol(
+            &store.conn,
+            "11111111-old",
+            "edge",
+            "2026-01-01T00:00:00+00:00",
+        );
+        enrol(
+            &store.conn,
+            "22222222-mid",
+            "edge",
+            "2026-02-01T00:00:00+00:00",
+        );
         // An operator who already named a node exactly what the rename
         // would produce. Colliding again would fail the index and take
         // the boot down, which is the one outcome the pass must avoid.
-        enrol(&store.conn, "99999999-squat", "edge-22222222", "2026-01-05T00:00:00+00:00");
+        enrol(
+            &store.conn,
+            "99999999-squat",
+            "edge-22222222",
+            "2026-01-05T00:00:00+00:00",
+        );
 
         migrate_cluster_node_name_unique(&store.conn)
             .expect("a squatted rename target must not fail the boot");
@@ -1683,8 +1781,18 @@ mod migration_tests {
         // overflowed would produce a node no route could ever name.
         let long_name = "e".repeat(64);
         let store = store_without_the_name_index();
-        enrol(&store.conn, "11111111-old", &long_name, "2026-01-01T00:00:00+00:00");
-        enrol(&store.conn, "22222222-mid", &long_name, "2026-02-01T00:00:00+00:00");
+        enrol(
+            &store.conn,
+            "11111111-old",
+            &long_name,
+            "2026-01-01T00:00:00+00:00",
+        );
+        enrol(
+            &store.conn,
+            "22222222-mid",
+            &long_name,
+            "2026-02-01T00:00:00+00:00",
+        );
 
         migrate_cluster_node_name_unique(&store.conn).expect("rename succeeds");
 

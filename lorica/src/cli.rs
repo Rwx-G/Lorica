@@ -66,7 +66,9 @@ fn parse_workers(s: &str) -> Result<Workers, String> {
     match s.parse::<usize>() {
         Ok(0) => Ok(Workers::Single),
         Ok(n) => Ok(Workers::Fixed(n)),
-        Err(_) => Err(format!("expected `auto`, `0`, or a positive integer, got `{s}`")),
+        Err(_) => Err(format!(
+            "expected `auto`, `0`, or a positive integer, got `{s}`"
+        )),
     }
 }
 
@@ -433,7 +435,11 @@ impl Cli {
     /// child does not re-resolve `auto` to a possibly different core count);
     /// `--hot-upgrade` is always set so the child adopts the inherited
     /// listening sockets.
-    pub(crate) fn hot_upgrade_argv(&self, staged_binary: &str, resolved_workers: usize) -> Vec<String> {
+    pub(crate) fn hot_upgrade_argv(
+        &self,
+        staged_binary: &str,
+        resolved_workers: usize,
+    ) -> Vec<String> {
         let mut argv: Vec<String> = vec![
             staged_binary.to_string(),
             "--data-dir".to_string(),
@@ -525,7 +531,9 @@ fn parse_cluster_bind(
         )
     })?;
     if addr.port() == 0 {
-        return Err(format!("{flag} `{value}`: an explicit non-zero port is required"));
+        return Err(format!(
+            "{flag} `{value}`: an explicit non-zero port is required"
+        ));
     }
     if addr.ip().is_unspecified() && !allow_any {
         return Err(format!(
@@ -536,7 +544,11 @@ fn parse_cluster_bind(
     Ok(addr)
 }
 
-fn refuse_reserved(flag: &str, addr: std::net::SocketAddr, reserved: ReservedPorts) -> Result<(), String> {
+fn refuse_reserved(
+    flag: &str,
+    addr: std::net::SocketAddr,
+    reserved: ReservedPorts,
+) -> Result<(), String> {
     let port = addr.port();
     let clash = if port == reserved.management {
         Some("the management API port")
@@ -596,7 +608,9 @@ pub(crate) fn validate_cluster_listen(
             let name = name.trim();
             if name.is_empty()
                 || name.len() > 253
-                || name.chars().any(|c| c.is_whitespace() || c.is_control() || c == '/')
+                || name
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == '/')
             {
                 return Err(format!(
                     "--cluster-advertise `{name}`: expected a hostname or IP address"
@@ -776,16 +790,15 @@ pub(crate) fn run_rotate_key(data_dir: &str, new_key_file: &str) {
 
     let data_dir = PathBuf::from(data_dir);
     let key_path = data_dir.join("encryption.key");
-    let old_key = EncryptionKey::load_or_create(&key_path)
-        .expect("failed to load current encryption key");
+    let old_key =
+        EncryptionKey::load_or_create(&key_path).expect("failed to load current encryption key");
 
     let new_key_path = PathBuf::from(&new_key_file);
     let new_key = EncryptionKey::load_or_create(&new_key_path)
         .expect("failed to load/create new encryption key");
 
     let db_path = data_dir.join("lorica.db");
-    let store =
-        ConfigStore::open(&db_path, Some(old_key)).expect("failed to open database");
+    let store = ConfigStore::open(&db_path, Some(old_key)).expect("failed to open database");
 
     let count = store
         .rotate_encryption_key(&new_key)
@@ -1036,7 +1049,10 @@ mod tests {
         assert_eq!(child.cluster_listen, original.cluster_listen);
         assert!(child.cluster_listen_any);
         assert!(child.cluster_auto_activate);
-        assert_eq!(child.cluster_enrollment_listen, original.cluster_enrollment_listen);
+        assert_eq!(
+            child.cluster_enrollment_listen,
+            original.cluster_enrollment_listen
+        );
         assert_eq!(child.cluster_advertise, original.cluster_advertise);
     }
 
@@ -1167,7 +1183,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("without a port"), "{err}");
-        assert!(err.contains("SAN"), "the message names the consequence: {err}");
+        assert!(
+            err.contains("SAN"),
+            "the message names the consequence: {err}"
+        );
 
         // An IPv6 literal is full of colons and is a valid SAN.
         let binds = validate_cluster_listen(

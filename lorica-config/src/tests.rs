@@ -323,7 +323,10 @@ mod tests {
             .get_route("r-selector")
             .expect("test setup")
             .expect("test setup");
-        assert_eq!(got.node_selector, vec!["edge-1".to_string(), "edge-2".to_string()]);
+        assert_eq!(
+            got.node_selector,
+            vec!["edge-1".to_string(), "edge-2".to_string()]
+        );
         let listed = store.list_routes().expect("test setup");
         assert_eq!(listed[0].node_selector, got.node_selector);
 
@@ -861,9 +864,7 @@ mod tests {
             .expect("test setup: value present");
         assert_eq!(by_name.id, user.id);
 
-        let users = store
-            .list_users()
-            .expect("test setup: admin users listed");
+        let users = store.list_users().expect("test setup: admin users listed");
         assert_eq!(users.len(), 1);
 
         user.must_change_password = false;
@@ -1252,7 +1253,10 @@ created_at = "2026-01-01T00:00:00Z"
             fetched.syslog_tls_client_key_pem.as_deref(),
             Some("-----BEGIN PRIVATE KEY-----")
         );
-        assert_eq!(fetched.syslog_extra_sd.as_deref(), Some("env=prod,dc=eu-west"));
+        assert_eq!(
+            fetched.syslog_extra_sd.as_deref(),
+            Some("env=prod,dc=eu-west")
+        );
         assert!(fetched.otlp_logs_enabled);
         assert_eq!(
             fetched.otlp_logs_auth_header.as_deref(),
@@ -1432,13 +1436,12 @@ created_at = "2026-01-01T00:00:00Z"
             "no CA before cluster init"
         );
         store
-            .set_cluster_ca("-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----",
-                "-----BEGIN PRIVATE KEY-----\ncluster-ca-secret\n-----END PRIVATE KEY-----")
+            .set_cluster_ca(
+                "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----",
+                "-----BEGIN PRIVATE KEY-----\ncluster-ca-secret\n-----END PRIVATE KEY-----",
+            )
             .expect("test setup: CA persists");
-        let (cert, key) = store
-            .get_cluster_ca()
-            .expect("read")
-            .expect("CA present");
+        let (cert, key) = store.get_cluster_ca().expect("read").expect("CA present");
         assert!(cert.contains("BEGIN CERTIFICATE"));
         assert!(key.contains("cluster-ca-secret"));
 
@@ -1532,8 +1535,11 @@ created_at = "2026-01-01T00:00:00Z"
                     // certificate"), so require the table to be
                     // followed by the statement's next clause.
                     let after = rest[table.len()..].trim_start();
-                    let after_upper: String =
-                        after.chars().take(8).map(|c| c.to_ascii_uppercase()).collect();
+                    let after_upper: String = after
+                        .chars()
+                        .take(8)
+                        .map(|c| c.to_ascii_uppercase())
+                        .collect();
                     let is_sql = if is_update {
                         after_upper.starts_with("SET ")
                     } else {
@@ -1599,7 +1605,9 @@ created_at = "2026-01-01T00:00:00Z"
         }
 
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store");
-        let registry: HashSet<&str> = crate::store::rotation_covered_tables().into_iter().collect();
+        let registry: HashSet<&str> = crate::store::rotation_covered_tables()
+            .into_iter()
+            .collect();
         let kv_registry: HashSet<&str> = crate::store::rotation_covered_kv_row_keys()
             .into_iter()
             .collect();
@@ -1764,9 +1772,7 @@ created_at = "2026-01-01T00:00:00Z"
         assert_eq!(prefs2.len(), 1);
         assert_eq!(prefs2[0].preference_key, pref.preference_key);
 
-        let users2 = store2
-            .list_users()
-            .expect("test setup: admin users listed");
+        let users2 = store2.list_users().expect("test setup: admin users listed");
         assert_eq!(users2.len(), 1);
         assert_eq!(users2[0].username, user.username);
 
@@ -2628,8 +2634,7 @@ cert_critical_days = 3
         // existing `password_hash` / `key_pem` / SMTP-password
         // rejections), so the REDACTED bot HMAC secret is caught
         // at parse time - even earlier than `import_to_store`.
-        let err = parse_toml(&toml_str)
-            .expect_err("parse must reject the REDACTED placeholder");
+        let err = parse_toml(&toml_str).expect_err("parse must reject the REDACTED placeholder");
         let msg = err.to_string();
         assert!(
             msg.contains("bot_hmac_secret_hex"),
@@ -3901,16 +3906,21 @@ cert_critical_days = 3
         assert!(store.revoke_join_token("pulled").expect("revoke"));
         assert!(!store.revoke_join_token("pulled").expect("revoke twice"));
         assert_eq!(store.count_live_join_tokens(now).expect("count"), 1);
-        assert!(store
-            .next_join_token_expiry(now)
-            .expect("expiry")
-            .is_some());
+        assert!(store.next_join_token_expiry(now).expect("expiry").is_some());
 
         assert!(store.burn_join_token("live", "node-1", now).expect("burn"));
-        assert!(!store.burn_join_token("live", "node-2", now).expect("second burn"));
-        assert!(!store.burn_join_token("stale", "node-3", now).expect("expired burn"));
-        assert!(!store.burn_join_token("pulled", "node-4", now).expect("revoked burn"));
-        assert!(!store.burn_join_token("ghost", "node-5", now).expect("unknown burn"));
+        assert!(!store
+            .burn_join_token("live", "node-2", now)
+            .expect("second burn"));
+        assert!(!store
+            .burn_join_token("stale", "node-3", now)
+            .expect("expired burn"));
+        assert!(!store
+            .burn_join_token("pulled", "node-4", now)
+            .expect("revoked burn"));
+        assert!(!store
+            .burn_join_token("ghost", "node-5", now)
+            .expect("unknown burn"));
         assert_eq!(store.count_live_join_tokens(now).expect("count"), 0);
         assert!(store.next_join_token_expiry(now).expect("expiry").is_none());
 
@@ -3932,7 +3942,9 @@ cert_critical_days = 3
             .expect("enroll");
         assert!(store.activate_cluster_node("n1").expect("activate"));
         assert!(!store.activate_cluster_node("n1").expect("activate twice"));
-        assert!(!store.activate_cluster_node("nope").expect("activate absent"));
+        assert!(!store
+            .activate_cluster_node("nope")
+            .expect("activate absent"));
         assert_eq!(
             store
                 .count_cluster_nodes_with_status(crate::models::NodeStatus::Active)
@@ -3976,7 +3988,10 @@ cert_critical_days = 3
         assert_eq!(by_old.node_id, "n1");
         assert_eq!(by_old.cert_fingerprint, "fp2");
         assert_eq!(by_old.prev_cert_serial.as_deref(), Some("01AA"));
-        assert!(store.list_cluster_revoked_serials(now).expect("crl").is_empty());
+        assert!(store
+            .list_cluster_revoked_serials(now)
+            .expect("crl")
+            .is_empty());
 
         // First session on the new certificate retires the old one.
         assert_eq!(
@@ -4004,8 +4019,16 @@ cert_critical_days = 3
             .list_cluster_revoked_serials(later)
             .expect("crl")
             .is_empty());
-        assert_eq!(store.prune_cluster_revoked_serials(later).expect("prune"), 1);
-        assert_eq!(store.prune_cluster_revoked_serials(later).expect("prune twice"), 0);
+        assert_eq!(
+            store.prune_cluster_revoked_serials(later).expect("prune"),
+            1
+        );
+        assert_eq!(
+            store
+                .prune_cluster_revoked_serials(later)
+                .expect("prune twice"),
+            0
+        );
 
         // Revocation records the current serial and is idempotent.
         let revoked = store
@@ -4013,7 +4036,10 @@ cert_critical_days = 3
             .expect("revoke")
             .expect("row returned");
         assert_eq!(revoked.status, crate::models::NodeStatus::Active);
-        assert!(store.revoke_cluster_node("n1", now).expect("revoke twice").is_none());
+        assert!(store
+            .revoke_cluster_node("n1", now)
+            .expect("revoke twice")
+            .is_none());
         let node = store.get_cluster_node("n1").expect("read").expect("row");
         assert_eq!(node.status, crate::models::NodeStatus::Revoked);
         assert!(node.revoked_at.is_some());
@@ -4070,8 +4096,10 @@ cert_critical_days = 3
             .set_cluster_identity(&crate::models::ClusterIdentity {
                 node_id: "n1".to_string(),
                 node_name: "edge-1".to_string(),
-                cert_pem: "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----".to_string(),
-                key_pem: "-----BEGIN PRIVATE KEY-----\nnode-secret\n-----END PRIVATE KEY-----".to_string(),
+                cert_pem: "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----"
+                    .to_string(),
+                key_pem: "-----BEGIN PRIVATE KEY-----\nnode-secret\n-----END PRIVATE KEY-----"
+                    .to_string(),
                 ca_pem: "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----".to_string(),
                 control_plane: "cp.example.com:9444".to_string(),
                 server_name: "cp.example.com".to_string(),

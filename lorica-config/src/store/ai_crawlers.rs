@@ -26,11 +26,11 @@ impl ConfigStore {
     /// `lorica-api/src/ai_crawlers.rs`). The store layer enforces
     /// the count cap and the table-level UNIQUE on `name`.
     pub fn create_custom_crawler(&self, crawler: &CustomCrawler) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM ai_crawlers_custom",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM ai_crawlers_custom", [], |row| {
+                    row.get(0)
+                })?;
         if count as usize >= CUSTOM_CRAWLER_MAX_COUNT {
             return Err(ConfigError::Validation(format!(
                 "Maximum {CUSTOM_CRAWLER_MAX_COUNT} custom crawlers reached ; \
@@ -237,11 +237,11 @@ impl ConfigStore {
     /// Total custom crawler row count. Used by the API layer to
     /// short-circuit POST when the count cap is reached.
     pub fn count_custom_crawlers(&self) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM ai_crawlers_custom",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM ai_crawlers_custom", [], |row| {
+                    row.get(0)
+                })?;
         Ok(count)
     }
 }
@@ -257,9 +257,10 @@ fn serialize_verification(v: &CustomVerification) -> Result<(&'static str, Optio
             ("rdns", Some(blob))
         }
         CustomVerification::IpRanges { cidrs } => {
-            let blob = serde_json::to_string(&serde_json::json!({ "cidrs": cidrs })).map_err(
-                |e| ConfigError::Validation(format!("verification_data serialize: {e}")),
-            )?;
+            let blob =
+                serde_json::to_string(&serde_json::json!({ "cidrs": cidrs })).map_err(|e| {
+                    ConfigError::Validation(format!("verification_data serialize: {e}"))
+                })?;
             ("ip_ranges", Some(blob))
         }
     })

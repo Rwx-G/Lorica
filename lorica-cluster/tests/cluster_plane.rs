@@ -33,8 +33,8 @@ use tokio_rustls::TlsConnector;
 
 use lorica_cluster::handshake::{client_handshake, HandshakeConfig};
 use lorica_cluster::listener::{
-    EnrollmentListener, EnrollmentStats, OperationalConfig, OperationalListener,
-    OperationalStats, PreAuthBudgets,
+    EnrollmentListener, EnrollmentStats, OperationalConfig, OperationalListener, OperationalStats,
+    PreAuthBudgets,
 };
 use lorica_cluster::messages::{cluster_request, ClusterFrame, ClusterRequest, Heartbeat};
 use lorica_cluster::replication::AppliedConfig;
@@ -341,7 +341,10 @@ async fn enrollment_per_source_cap_drops_the_excess_before_tls() {
         stats.rejected_per_source.load(Ordering::Relaxed) >= 1
     })
     .await;
-    assert_eq!(stats.rejected_concurrent_handshakes.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        stats.rejected_concurrent_handshakes.load(Ordering::Relaxed),
+        0
+    );
     drop(second);
     drop(first);
     drop(tokens_tx);
@@ -366,7 +369,13 @@ async fn session_cap_answers_retry_later_end_to_end() {
     let (ep1, _in1) = RpcEndpoint::<ClusterFrame>::from_stream(tls1);
     tokio::time::timeout(
         WAIT,
-        client_handshake(&ep1, &cfg(49), "node-a", &AppliedConfig::default(), Duration::from_secs(5)),
+        client_handshake(
+            &ep1,
+            &cfg(49),
+            "node-a",
+            &AppliedConfig::default(),
+            Duration::from_secs(5),
+        ),
     )
     .await
     .expect("handshake 1 in time")
@@ -377,7 +386,13 @@ async fn session_cap_answers_retry_later_end_to_end() {
     let (ep2, in2) = RpcEndpoint::<ClusterFrame>::from_stream(tls2);
     let err = tokio::time::timeout(
         WAIT,
-        client_handshake(&ep2, &cfg(49), "node-b", &AppliedConfig::default(), Duration::from_secs(5)),
+        client_handshake(
+            &ep2,
+            &cfg(49),
+            "node-b",
+            &AppliedConfig::default(),
+            Duration::from_secs(5),
+        ),
     )
     .await
     .expect("handshake answered in time")
@@ -439,7 +454,13 @@ async fn silent_authenticated_peer_is_counted_and_holds_no_session_slot() {
     let (ep, _inc) = RpcEndpoint::<ClusterFrame>::from_stream(tls);
     tokio::time::timeout(
         WAIT,
-        client_handshake(&ep, &cfg(49), "node-a", &AppliedConfig::default(), Duration::from_secs(5)),
+        client_handshake(
+            &ep,
+            &cfg(49),
+            "node-a",
+            &AppliedConfig::default(),
+            Duration::from_secs(5),
+        ),
     )
     .await
     .expect("handshake in time")
@@ -467,7 +488,10 @@ async fn per_source_cap_bounds_pre_session_connections_on_the_operational_listen
         stats.rejected_per_source.load(Ordering::Relaxed) >= 1
     })
     .await;
-    assert_eq!(stats.rejected_concurrent_handshakes.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        stats.rejected_concurrent_handshakes.load(Ordering::Relaxed),
+        0
+    );
     drop(second);
     drop(first);
     handle.shutdown();
@@ -483,7 +507,13 @@ async fn unsupported_method_is_refused_and_the_session_kept() {
     let (ep, _inc) = RpcEndpoint::<ClusterFrame>::from_stream(tls);
     tokio::time::timeout(
         WAIT,
-        client_handshake(&ep, &cfg(49), "node-a", &AppliedConfig::default(), Duration::from_secs(5)),
+        client_handshake(
+            &ep,
+            &cfg(49),
+            "node-a",
+            &AppliedConfig::default(),
+            Duration::from_secs(5),
+        ),
     )
     .await
     .expect("handshake in time")
@@ -576,7 +606,10 @@ async fn dialer_reconnects_after_control_plane_restart() {
     // Control-plane restart: tear the listener (and its sessions)
     // down; the connection slot must empty.
     handle.shutdown();
-    eventually("connection slot to empty", || connection.current().is_none()).await;
+    eventually("connection slot to empty", || {
+        connection.current().is_none()
+    })
+    .await;
 
     // Restart on the SAME address; the dialer must come back on its
     // own, with a new session generation, and heartbeats must resume.

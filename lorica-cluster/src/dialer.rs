@@ -463,7 +463,8 @@ impl DialerHandle {
         client_key_pem: &str,
     ) -> Result<(), ClusterTlsError> {
         let tls = client_config(&self.ca_pem, client_cert_pem, client_key_pem)?;
-        self.connector.store(Arc::new(TlsConnector::from(Arc::new(tls))));
+        self.connector
+            .store(Arc::new(TlsConnector::from(Arc::new(tls))));
         Ok(())
     }
 
@@ -497,7 +498,11 @@ impl Dialer {
     /// reconnect loop.
     pub fn spawn(config: DialerConfig) -> Result<DialerHandle, DialerError> {
         split_host_port(&config.control_plane)?;
-        let tls = client_config(&config.ca_pem, &config.client_cert_pem, &config.client_key_pem)?;
+        let tls = client_config(
+            &config.ca_pem,
+            &config.client_cert_pem,
+            &config.client_key_pem,
+        )?;
         let server_name: ServerName<'static> = ServerName::try_from(config.server_name.clone())
             .map_err(|e| ClusterTlsError::Parse(format!("invalid server name: {e}")))?;
         let connector: Arc<ArcSwap<TlsConnector>> =
@@ -635,8 +640,8 @@ async fn dial_loop(
                 // Counted as a failure so the exponential schedule
                 // floors a control plane that keeps saying "now".
                 failures = failures.saturating_add(1);
-                let delay = Duration::from_secs(u64::from(retry_after_s.max(1)))
-                    .min(BACKOFF_CAP_CEILING);
+                let delay =
+                    Duration::from_secs(u64::from(retry_after_s.max(1))).min(BACKOFF_CAP_CEILING);
                 tracing::info!(
                     control_plane = %config.control_plane,
                     retry_in = ?delay,
@@ -812,7 +817,11 @@ async fn heartbeat_until_dead(
             break_glass: applied.break_glass,
             resources: node_resources(config),
         });
-        match session.endpoint.request(probe, config.request_timeout).await {
+        match session
+            .endpoint
+            .request(probe, config.request_timeout)
+            .await
+        {
             Ok(resp) => match resp.body {
                 Some(cluster_response::Body::HeartbeatAck(ack)) => {
                     stats.heartbeats_ok.fetch_add(1, Ordering::Relaxed);
@@ -989,7 +998,10 @@ async fn serve_follower_action(
             stats.config_commits.fetch_add(1, Ordering::Relaxed);
             match handler.on_commit(generation).await {
                 Ok(applied) => {
-                    tracing::info!(generation = applied.generation, "applied a pushed configuration");
+                    tracing::info!(
+                        generation = applied.generation,
+                        "applied a pushed configuration"
+                    );
                     ClusterResponse::ok(cluster_response::Body::ConfigCommitAck(ConfigCommitAck {
                         applied_generation: applied.generation,
                         applied_hash: applied.hash,
@@ -1009,7 +1021,10 @@ async fn serve_follower_action(
         FollowerAction::Abort { generation } => {
             stats.config_aborts.fetch_add(1, Ordering::Relaxed);
             handler.on_abort(generation).await;
-            tracing::info!(generation, "dropped a staged configuration on the control plane's abort");
+            tracing::info!(
+                generation,
+                "dropped a staged configuration on the control plane's abort"
+            );
             ClusterResponse::ok(cluster_response::Body::ConfigAbortAck(ConfigAbortAck {}))
         }
         FollowerAction::InstallCerts(bundles) => {
@@ -1126,7 +1141,9 @@ async fn serve_follower_action(
 /// (`clamp` would panic on an inverted range).
 fn backoff_cap(default_cap: Duration, fleet_hint: u32) -> Duration {
     let scaled = default_cap + Duration::from_secs(u64::from(fleet_hint));
-    scaled.min(BACKOFF_CAP_CEILING).max(default_cap.min(BACKOFF_CAP_CEILING))
+    scaled
+        .min(BACKOFF_CAP_CEILING)
+        .max(default_cap.min(BACKOFF_CAP_CEILING))
 }
 
 /// Exponential delay with equal jitter.

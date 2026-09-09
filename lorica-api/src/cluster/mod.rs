@@ -139,9 +139,9 @@ pub async fn mint_token(
     // used to differ, so a node could register a name no selector could
     // ever reference (uppercase, spaces, homoglyphs), which made the
     // two sides of one string disagree.
-    if let Err(reason) = lorica_config::models::validate_node_selector_names(
-        std::slice::from_ref(name),
-    ) {
+    if let Err(reason) =
+        lorica_config::models::validate_node_selector_names(std::slice::from_ref(name))
+    {
         return Err(ApiError::BadRequest(format!("node_name: {reason}")));
     }
     if let Some(cidr) = &body.source_cidr {
@@ -457,13 +457,8 @@ pub async fn get_node(
         Ok::<_, ApiError>((node, selected, certificates))
     })
     .await?;
-    let mut responses = node_responses(
-        &control,
-        vec![node],
-        &selected,
-        &certificates,
-        session.role,
-    );
+    let mut responses =
+        node_responses(&control, vec![node], &selected, &certificates, session.role);
     Ok(json_data(responses.remove(0)))
 }
 
@@ -512,13 +507,8 @@ pub async fn activate_node(
         Some(&serde_json::json!({ "status": "active", "name": node.name })),
     )
     .await;
-    let mut responses = node_responses(
-        &control,
-        vec![node],
-        &selected,
-        &certificates,
-        session.role,
-    );
+    let mut responses =
+        node_responses(&control, vec![node], &selected, &certificates, session.role);
     Ok(json_data(responses.remove(0)))
 }
 
@@ -676,13 +666,15 @@ pub async fn get_status(
                 version.hash,
             )
         }
-        _ => db_blocking(&state.store, |store| {
-            let (applied, hash) = store
-                .cluster_applied_config()
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            Ok::<_, ApiError>((i64::try_from(applied).unwrap_or(i64::MAX), hash))
-        })
-        .await?,
+        _ => {
+            db_blocking(&state.store, |store| {
+                let (applied, hash) = store
+                    .cluster_applied_config()
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                Ok::<_, ApiError>((i64::try_from(applied).unwrap_or(i64::MAX), hash))
+            })
+            .await?
+        }
     };
     let response = match &state.cluster {
         ClusterRuntime::Standalone => ClusterStatusResponse {
@@ -718,21 +710,21 @@ pub async fn get_status(
                 &BTreeMap::new(),
                 Role::Viewer,
             )
-                .into_iter()
-                .map(|n| FleetEntry {
-                    node_id: n.node.node_id,
-                    name: n.node.name,
-                    status: n.node.status,
-                    connected: n.connected,
-                    last_seen_at: n
-                        .session_last_seen_unix
-                        .and_then(|s| DateTime::<Utc>::from_timestamp(i64::try_from(s).ok()?, 0))
-                        .or(n.node.last_seen_at)
-                        .map(|t| t.to_rfc3339()),
-                    version: n.node.version,
-                    applied_config_generation: n.node.applied_config_generation,
-                })
-                .collect();
+            .into_iter()
+            .map(|n| FleetEntry {
+                node_id: n.node.node_id,
+                name: n.node.name,
+                status: n.node.status,
+                connected: n.connected,
+                last_seen_at: n
+                    .session_last_seen_unix
+                    .and_then(|s| DateTime::<Utc>::from_timestamp(i64::try_from(s).ok()?, 0))
+                    .or(n.node.last_seen_at)
+                    .map(|t| t.to_rfc3339()),
+                version: n.node.version,
+                applied_config_generation: n.node.applied_config_generation,
+            })
+            .collect();
             let version = control.config_version();
             ClusterStatusResponse {
                 role: "control_plane",
@@ -1028,9 +1020,10 @@ pub async fn fleet_logs(
     Query(params): Query<FleetLogsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let runtime = control_plane_runtime(&state)?;
-    let telemetry = runtime.telemetry.clone().ok_or_else(|| {
-        ApiError::Internal("the cluster telemetry database is not open".into())
-    })?;
+    let telemetry = runtime
+        .telemetry
+        .clone()
+        .ok_or_else(|| ApiError::Internal("the cluster telemetry database is not open".into()))?;
     let query = params.to_store_query();
     let rows = tokio::task::spawn_blocking(move || telemetry.query_access(&query))
         .await
@@ -1047,9 +1040,10 @@ pub async fn fleet_waf_events(
     Query(params): Query<FleetLogsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let runtime = control_plane_runtime(&state)?;
-    let telemetry = runtime.telemetry.clone().ok_or_else(|| {
-        ApiError::Internal("the cluster telemetry database is not open".into())
-    })?;
+    let telemetry = runtime
+        .telemetry
+        .clone()
+        .ok_or_else(|| ApiError::Internal("the cluster telemetry database is not open".into()))?;
     let query = params.to_store_query();
     let rows = tokio::task::spawn_blocking(move || telemetry.query_waf(&query))
         .await
@@ -1082,9 +1076,10 @@ pub async fn fleet_bans(
     Query(params): Query<FleetLogsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let runtime = control_plane_runtime(&state)?;
-    let telemetry = runtime.telemetry.clone().ok_or_else(|| {
-        ApiError::Internal("the cluster telemetry database is not open".into())
-    })?;
+    let telemetry = runtime
+        .telemetry
+        .clone()
+        .ok_or_else(|| ApiError::Internal("the cluster telemetry database is not open".into()))?;
     let node = params.node.clone();
     let rows = tokio::task::spawn_blocking(move || telemetry.query_bans(node.as_deref()))
         .await

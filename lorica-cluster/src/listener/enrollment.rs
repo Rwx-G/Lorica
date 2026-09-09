@@ -314,10 +314,8 @@ impl EnrollmentListener {
 /// Let in-flight connections finish for at most `grace`, then abort
 /// whatever is left.
 async fn drain_or_abort(conns: &mut JoinSet<()>, grace: Duration) {
-    let drained = tokio::time::timeout(grace, async {
-        while conns.join_next().await.is_some() {}
-    })
-    .await;
+    let drained =
+        tokio::time::timeout(grace, async { while conns.join_next().await.is_some() {} }).await;
     if drained.is_err() {
         tracing::warn!(
             remaining = conns.len(),
@@ -345,24 +343,23 @@ async fn serve_enrollment_conn(
     let budgets = &shared.budgets;
     let overall = tokio::time::timeout(budgets.per_conn_max_duration, async {
         let tls_acceptor = TlsAcceptor::from(shared.acceptor.current());
-        let mut tls = match tokio::time::timeout(budgets.handshake_timeout, tls_acceptor.accept(tcp))
-            .await
-        {
-            Ok(Ok(tls)) => tls,
-            Ok(Err(e)) => {
-                tracing::debug!(%peer, error = %e, "enrollment TLS handshake failed");
-                stats
-                    .rejected_handshake_failed
-                    .fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Err(_) => {
-                stats
-                    .rejected_handshake_timeout
-                    .fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
+        let mut tls =
+            match tokio::time::timeout(budgets.handshake_timeout, tls_acceptor.accept(tcp)).await {
+                Ok(Ok(tls)) => tls,
+                Ok(Err(e)) => {
+                    tracing::debug!(%peer, error = %e, "enrollment TLS handshake failed");
+                    stats
+                        .rejected_handshake_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(_) => {
+                    stats
+                        .rejected_handshake_timeout
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
         if !negotiated_cluster_alpn(tls.get_ref().1) {
             stats.rejected_alpn.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(%peer, "enrollment peer did not negotiate the cluster ALPN");

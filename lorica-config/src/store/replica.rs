@@ -144,12 +144,11 @@ impl ConfigStore {
         if !sha256_hex(blob).eq_ignore_ascii_case(expected_hash) {
             return Err(ReplicaError::Refused("hash mismatch".to_string()));
         }
-        let config =
-            decode_canonical(blob).map_err(|e| ReplicaError::Refused(e.to_string()))?;
+        let config = decode_canonical(blob).map_err(|e| ReplicaError::Refused(e.to_string()))?;
         for route in &config.routes {
-            route.validate_node_selector().map_err(|reason| {
-                ReplicaError::Refused(format!("route {}: {reason}", route.id))
-            })?;
+            route
+                .validate_node_selector()
+                .map_err(|reason| ReplicaError::Refused(format!("route {}: {reason}", route.id)))?;
         }
         Ok(config)
     }
@@ -182,7 +181,10 @@ impl ConfigStore {
         generation: u64,
         hash: &str,
     ) -> std::result::Result<ReplicaOutcome, ReplicaError> {
-        let tx = self.conn.unchecked_transaction().map_err(ConfigError::from)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(ConfigError::from)?;
         // Every helper below writes through `self.conn`, the same
         // connection the transaction was opened on, so all of it is
         // inside this transaction. Returning early drops `tx`, which
@@ -349,11 +351,7 @@ impl ConfigStore {
     /// Deleting a backend cascades its `route_backends` rows, which the
     /// link pass rewrites anyway.
     fn apply_replica_backends(&self, config: &CanonicalConfig) -> Result<()> {
-        let local_ids: HashSet<String> = self
-            .list_backends()?
-            .into_iter()
-            .map(|b| b.id)
-            .collect();
+        let local_ids: HashSet<String> = self.list_backends()?.into_iter().map(|b| b.id).collect();
         let blob_ids: HashSet<&str> = config.backends.iter().map(|b| b.id.as_str()).collect();
         for backend in &config.backends {
             if local_ids.contains(&backend.id) {
@@ -478,10 +476,8 @@ impl ConfigStore {
             }
             // Delete-then-insert restores `route_id` and `created_at`
             // too, which `update_probe_config` leaves alone.
-            self.conn.execute(
-                "DELETE FROM probe_configs WHERE id = ?1",
-                params![probe.id],
-            )?;
+            self.conn
+                .execute("DELETE FROM probe_configs WHERE id = ?1", params![probe.id])?;
             self.create_probe_config(probe)?;
             written += 1;
         }
@@ -682,9 +678,7 @@ mod tests {
             make_backend("backend-1", "10.0.0.10:8080"),
             make_backend("backend-2", "10.0.0.11:8080"),
         ] {
-            store
-                .create_backend(&backend)
-                .expect("test setup: backend");
+            store.create_backend(&backend).expect("test setup: backend");
         }
         for route in [
             make_route("route-fleet", "fleet.example.com", &[]),
@@ -811,7 +805,9 @@ mod tests {
             .expect("target holds the key");
 
         let config = prepared(&source, &target).expect("prepare");
-        let outcome = target.apply_replica(&config, "edge-1", 1, "h1").expect("apply");
+        let outcome = target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("apply");
 
         assert_eq!(outcome.routes, 2);
         assert_eq!(outcome.routes_skipped_by_selector, 0);
@@ -852,8 +848,14 @@ mod tests {
         // Node-local settings and the follower's own operator survive.
         let settings = target.get_global_settings().expect("settings");
         assert_eq!(settings.management_port, 9999);
-        assert_eq!(settings.cert_export_dir.as_deref(), Some("/srv/edge-1/certs"));
-        assert_eq!(settings.bot_hmac_secret_hex, "feedfacefeedfacefeedfacefeedface");
+        assert_eq!(
+            settings.cert_export_dir.as_deref(),
+            Some("/srv/edge-1/certs")
+        );
+        assert_eq!(
+            settings.bot_hmac_secret_hex,
+            "feedfacefeedfacefeedfacefeedface"
+        );
         assert_eq!(settings.waf_ban_threshold, 11, "fleet policy did replicate");
         let users = target.list_users().expect("users");
         assert_eq!(users.len(), 1);
@@ -867,7 +869,9 @@ mod tests {
         seed_source(&source);
 
         let config = prepared(&source, &target).expect("prepare");
-        let outcome = target.apply_replica(&config, "edge-1", 1, "h1").expect("apply");
+        let outcome = target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("apply");
 
         assert_eq!(outcome.certificates, 1);
         assert_eq!(outcome.certificates_without_key, 1);
@@ -889,7 +893,9 @@ mod tests {
         seed_source(&source);
 
         let config = prepared(&source, &target).expect("prepare");
-        let outcome = target.apply_replica(&config, "edge-2", 1, "h1").expect("apply");
+        let outcome = target
+            .apply_replica(&config, "edge-2", 1, "h1")
+            .expect("apply");
 
         assert_eq!(outcome.routes, 1);
         assert_eq!(outcome.routes_skipped_by_selector, 1);
@@ -934,9 +940,10 @@ mod tests {
         // A blob carrying a field this node does not know is refused
         // by the strict decoder, hash and all.
         let mut root: serde_json::Value = serde_json::from_slice(&blob).expect("json");
-        root.as_object_mut()
-            .expect("object")
-            .insert("added_in_a_newer_schema".into(), serde_json::Value::Bool(true));
+        root.as_object_mut().expect("object").insert(
+            "added_in_a_newer_schema".into(),
+            serde_json::Value::Bool(true),
+        );
         let newer = serde_json::to_vec(&root).expect("re-encode");
         let newer_hash = sha256_hex(&newer);
         assert!(matches!(
@@ -970,7 +977,9 @@ mod tests {
         seed_source(&source);
         seed_target_node_local(&target);
         let config = prepared(&source, &target).expect("prepare");
-        target.apply_replica(&config, "edge-1", 1, "h1").expect("first apply");
+        target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("first apply");
         let baseline = canonical_hash(&target).expect("baseline hash");
 
         // A second generation that drops every certificate while a
@@ -979,7 +988,9 @@ mod tests {
         // apply, which must roll the whole thing back.
         let mut broken = config.clone();
         broken.certificates.clear();
-        broken.routes.push(make_route("route-broken", "broken.example.com", &[]));
+        broken
+            .routes
+            .push(make_route("route-broken", "broken.example.com", &[]));
         let err = target
             .apply_replica(&broken, "edge-1", 2, "h2")
             .expect_err("a foreign-key violation must fail the apply");
@@ -992,7 +1003,10 @@ mod tests {
         );
         assert!(target.get_route("route-broken").expect("route").is_none());
         assert_eq!(
-            target.get_global_settings().expect("settings").management_port,
+            target
+                .get_global_settings()
+                .expect("settings")
+                .management_port,
             9999
         );
     }
@@ -1007,9 +1021,13 @@ mod tests {
             .expect("target holds the key");
 
         let config = prepared(&source, &target).expect("prepare");
-        let first = target.apply_replica(&config, "edge-1", 1, "h1").expect("first apply");
+        let first = target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("first apply");
         let after_first = canonical_hash(&target).expect("hash");
-        let second = target.apply_replica(&config, "edge-1", 1, "h1").expect("second apply");
+        let second = target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("second apply");
 
         assert_eq!(after_first, canonical_hash(&target).expect("hash"));
         assert_eq!(first.routes, second.routes);
@@ -1031,7 +1049,9 @@ mod tests {
             .create_certificate(&make_certificate("cert-1", CERT_KEY))
             .expect("target holds the key");
         let config = prepared(&source, &target).expect("prepare");
-        target.apply_replica(&config, "edge-1", 1, "h1").expect("first apply");
+        target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("first apply");
 
         // The control plane deletes a route, a backend, the ACL and the
         // crawler, then republishes.
@@ -1049,18 +1069,14 @@ mod tests {
             .expect("delete crawler");
 
         let config = prepared(&source, &target).expect("prepare");
-        target.apply_replica(&config, "edge-1", 1, "h1").expect("second apply");
+        target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("second apply");
 
         assert!(target.get_route("route-edge").expect("route").is_none());
         assert!(target.get_backend("backend-2").expect("backend").is_none());
-        assert!(target
-            .list_cert_export_acls()
-            .expect("acls")
-            .is_empty());
-        assert!(target
-            .list_custom_crawlers()
-            .expect("crawlers")
-            .is_empty());
+        assert!(target.list_cert_export_acls().expect("acls").is_empty());
+        assert!(target.list_custom_crawlers().expect("crawlers").is_empty());
         assert_eq!(
             canonical_hash(&source).expect("source hash"),
             canonical_hash(&target).expect("target hash")

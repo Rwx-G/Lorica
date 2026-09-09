@@ -1124,10 +1124,7 @@ fn apply_sla_purge_schedule(value: Option<String>, target: &mut String) -> Resul
 /// `http://` / `https://` scheme, a hostname, and at most 2048
 /// chars. A plaintext `http://` endpoint is accepted but logged at
 /// `warn` level (side effect kept from the inline block).
-fn apply_otlp_endpoint(
-    value: Option<String>,
-    target: &mut Option<String>,
-) -> Result<(), ApiError> {
+fn apply_otlp_endpoint(value: Option<String>, target: &mut Option<String>) -> Result<(), ApiError> {
     let Some(endpoint) = value else {
         return Ok(());
     };

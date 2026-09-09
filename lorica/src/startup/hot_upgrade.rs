@@ -486,11 +486,7 @@ pub async fn wait_for_new_ready(
     let mut new_ready = false;
     let mut buf = [0u8; 64];
     loop {
-        match tokio::time::timeout(
-            Duration::from_millis(200),
-            ready_listener.recv(&mut buf),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_millis(200), ready_listener.recv(&mut buf)).await
         {
             Ok(Ok(n)) if buf.get(..n) == Some(READY_TOKEN) => {
                 if !new_ready {
@@ -505,8 +501,7 @@ pub async fn wait_for_new_ready(
             _ => {}
         }
         let child_alive = !lorica_worker::hot_upgrade::child_exited(child);
-        if let Some(decision) =
-            decide_readiness(new_ready, child_alive, start.elapsed(), deadline)
+        if let Some(decision) = decide_readiness(new_ready, child_alive, start.elapsed(), deadline)
         {
             return decision;
         }
@@ -607,7 +602,10 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
             };
         }
     };
-    tracing::info!(child_pid = child.as_raw(), "hot upgrade: forked new supervisor, awaiting readiness");
+    tracing::info!(
+        child_pid = child.as_raw(),
+        "hot upgrade: forked new supervisor, awaiting readiness"
+    );
 
     let ack_target = ack_sock_path(&args.data_dir);
     let decision = wait_for_new_ready(&ready_listener, &ack_target, child, READY_DEADLINE).await;
@@ -741,7 +739,10 @@ mod tests {
     #[test]
     fn rollback_reason_metric_labels() {
         assert_eq!(RollbackReason::ExecFailed.metric_outcome(), "exec_failed");
-        assert_eq!(RollbackReason::DrainTimeout.metric_outcome(), "drain_timeout");
+        assert_eq!(
+            RollbackReason::DrainTimeout.metric_outcome(),
+            "drain_timeout"
+        );
     }
 
     #[test]
@@ -802,7 +803,10 @@ mod tests {
             transfer_sock_path(d),
             PathBuf::from("/data/upgrade/transfer.sock")
         );
-        assert_eq!(ready_sock_path(d), PathBuf::from("/data/upgrade/ready.sock"));
+        assert_eq!(
+            ready_sock_path(d),
+            PathBuf::from("/data/upgrade/ready.sock")
+        );
     }
 
     #[test]

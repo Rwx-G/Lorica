@@ -61,8 +61,8 @@ use lorica_cluster::replication::{
 };
 use lorica_cluster::{
     operational_server_config, ClusterCa, ClusterRequest, ConfigPull, Dialer, DialerConfig,
-    DialerHandle, FollowerHandler, NodeIdentity, NodeState, Roster, SessionHandle,
-    SessionRegistry, SwappableAcceptor,
+    DialerHandle, FollowerHandler, NodeIdentity, NodeState, Roster, SessionHandle, SessionRegistry,
+    SwappableAcceptor,
 };
 
 const CP_HOST: &str = "cp.cluster.internal";
@@ -101,8 +101,8 @@ fn payload(generation: u64) -> ConfigPayload {
 }
 
 fn install_ring() {
-    let _ = lorica_cluster::tokio_rustls::rustls::crypto::ring::default_provider()
-        .install_default();
+    let _ =
+        lorica_cluster::tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 }
 
 struct ControlPlanePki {
@@ -336,8 +336,7 @@ async fn spawn_control_plane_with_state(
 
     let sessions = SessionRegistry::new();
     let hooks = Arc::new(ControlPlaneHooks::default());
-    let mut config =
-        OperationalConfig::new(listener, acceptor, HandshakeConfig::new(SCHEMA));
+    let mut config = OperationalConfig::new(listener, acceptor, HandshakeConfig::new(SCHEMA));
     config.fleet = Some(FleetHooks {
         roster,
         sessions: Arc::clone(&sessions),
@@ -544,7 +543,10 @@ impl FollowerHandler for TestFollower {
     fn on_challenge_retract(&self, token: String) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.challenge_retractions.fetch_add(1, Ordering::SeqCst);
-            self.served.lock().expect("lock").retain(|(_, t, _)| t != &token);
+            self.served
+                .lock()
+                .expect("lock")
+                .retain(|(_, t, _)| t != &token);
         })
     }
 
@@ -712,7 +714,10 @@ async fn a_rejecting_follower_aborts_the_round_for_the_node_that_had_staged_it()
     let report = fleet.replicate(payload(2)).await;
     assert!(report.aborted, "a semantic rejection aborts fleet-wide");
     assert_eq!(report.prepared, vec!["node-a".to_string()]);
-    assert!(report.committed.is_empty(), "nobody applies an aborted round");
+    assert!(
+        report.committed.is_empty(),
+        "nobody applies an aborted round"
+    );
     assert_eq!(report.rejected.len(), 1);
     assert_eq!(report.rejected[0].0, "node-b");
     assert_eq!(
@@ -1076,13 +1081,9 @@ async fn a_node_that_will_not_take_the_token_is_reported_while_the_others_are_de
     let recipients = vec!["node-a".to_string(), "node-b".to_string()];
     let report = tokio::time::timeout(
         WAIT,
-        fleet.challenges.publish(
-            &fleet.sessions,
-            &recipients,
-            IDENTIFIER,
-            TOKEN,
-            KEY_AUTH,
-        ),
+        fleet
+            .challenges
+            .publish(&fleet.sessions, &recipients, IDENTIFIER, TOKEN, KEY_AUTH),
     )
     .await
     .expect("a challenge fan-out must finish inside the test budget");
@@ -1104,12 +1105,19 @@ async fn a_node_that_will_not_take_the_token_is_reported_while_the_others_are_de
         )]
     );
     assert!(bad.served.lock().expect("lock").is_empty());
-    assert_eq!(count(&bad.challenge_publishes), 1, "it was asked, and it refused");
+    assert_eq!(
+        count(&bad.challenge_publishes),
+        1,
+        "it was asked, and it refused"
+    );
     // A refusal is not a protocol violation: the session stays up so
     // the order can be retried once the node is fixed.
     assert_eq!(fleet.stats.protocol_violations.load(Ordering::Relaxed), 0);
     assert_eq!(
-        good_dialer.stats().protocol_violations.load(Ordering::Relaxed),
+        good_dialer
+            .stats()
+            .protocol_violations
+            .load(Ordering::Relaxed),
         0
     );
 

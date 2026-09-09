@@ -31,8 +31,8 @@
 use chrono::{DateTime, Datelike, Utc};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, DistinguishedName,
-    DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
-    RevocationReason, RevokedCertParams, SanType, SerialNumber, SubjectPublicKeyInfo,
+    DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose, RevocationReason,
+    RevokedCertParams, SanType, SerialNumber, SubjectPublicKeyInfo,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls_pki_types::CertificateRevocationListDer;
@@ -133,9 +133,7 @@ pub fn check_public_key_allowlist(spki_der: &[u8]) -> Result<(), CaError> {
             .and_then(|p| p.as_oid().ok());
         return match curve {
             Some(curve) if curve == OID_EC_P256 => Ok(()),
-            _ => Err(CaError::PublicKey(
-                "elliptic-curve key is not P-256".into(),
-            )),
+            _ => Err(CaError::PublicKey("elliptic-curve key is not P-256".into())),
         };
     }
     if *alg == OID_PKCS1_RSAENCRYPTION {
@@ -207,13 +205,8 @@ fn unhex(s: &str) -> Result<Vec<u8>, CaError> {
 /// Midnight UTC of `now + days`, the instant `set_validity` encodes.
 fn midnight_after(now: DateTime<Utc>, days: i64) -> DateTime<Utc> {
     let date = (now + chrono::Duration::days(days)).date_naive();
-    DateTime::<Utc>::from_naive_utc_and_offset(
-        date.and_hms_opt(0, 0, 0).unwrap_or_default(),
-        Utc,
-    )
+    DateTime::<Utc>::from_naive_utc_and_offset(date.and_hms_opt(0, 0, 0).unwrap_or_default(), Utc)
 }
-
-
 
 /// A cluster CA loaded in memory, able to issue leaves.
 pub struct ClusterCa {
@@ -356,7 +349,8 @@ impl ClusterCa {
         let now = Utc::now();
         // rcgen's date type is not nameable without the `time` crate;
         // a closure infers it.
-        let ymd = |dt: DateTime<Utc>| rcgen::date_time_ymd(dt.year(), dt.month() as u8, dt.day() as u8);
+        let ymd =
+            |dt: DateTime<Utc>| rcgen::date_time_ymd(dt.year(), dt.month() as u8, dt.day() as u8);
         let mut revoked_certs = Vec::with_capacity(revoked.len());
         for entry in revoked {
             revoked_certs.push(RevokedCertParams {
@@ -463,8 +457,7 @@ mod tests {
     #[test]
     fn ca_round_trips_through_pem() {
         let ca = ClusterCa::generate("Lorica Cluster CA").expect("generate");
-        let reloaded =
-            ClusterCa::from_pem(ca.cert_pem(), &ca.key_pem()).expect("reload from PEM");
+        let reloaded = ClusterCa::from_pem(ca.cert_pem(), &ca.key_pem()).expect("reload from PEM");
         // The reloaded CA must still be able to sign.
         let (spki, key_pem) = generate_node_keypair().expect("keypair");
         let issued = reloaded
@@ -512,7 +505,10 @@ mod tests {
             let alg = tlv(
                 0x30,
                 &[
-                    tlv(0x06, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]),
+                    tlv(
+                        0x06,
+                        &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01],
+                    ),
                     vec![0x05, 0x00],
                 ]
                 .concat(),
@@ -584,8 +580,8 @@ mod tests {
             issued.cert_pem.as_bytes(),
         )
         .expect("der");
-        let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(der.as_ref())
-            .expect("parse");
+        let (_, parsed) =
+            x509_parser::certificate::X509Certificate::from_der(der.as_ref()).expect("parse");
         assert_eq!(hex_upper(parsed.raw_serial()), issued.serial_hex);
         assert_eq!(parsed.subject().to_string(), "CN=node-1");
         let eku = parsed
@@ -633,15 +629,17 @@ mod tests {
                 },
             ])
             .expect("CRL");
-        let (_, parsed) = x509_parser::revocation_list::CertificateRevocationList::from_der(
-            crl.as_ref(),
-        )
-        .expect("parse CRL");
+        let (_, parsed) =
+            x509_parser::revocation_list::CertificateRevocationList::from_der(crl.as_ref())
+                .expect("parse CRL");
         let serials: Vec<String> = parsed
             .iter_revoked_certificates()
             .map(|r| hex_upper(&r.user_certificate.to_bytes_be()))
             .collect();
-        assert_eq!(serials, vec!["4A".repeat(SERIAL_LEN), "5B".repeat(SERIAL_LEN)]);
+        assert_eq!(
+            serials,
+            vec!["4A".repeat(SERIAL_LEN), "5B".repeat(SERIAL_LEN)]
+        );
         assert!(matches!(
             ca.mint_crl(&[RevokedEntry {
                 serial_hex: "zz".to_string(),

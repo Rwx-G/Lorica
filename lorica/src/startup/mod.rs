@@ -54,8 +54,7 @@ pub(crate) struct AlertingStack {
     /// dispatcher is wrapped. Single-process mode hands it straight to
     /// `AppState`; supervisor mode re-reads it via
     /// `notify_dispatcher.lock().await.history()` at AppState build.
-    pub(crate) notification_history:
-        Arc<parking_lot::Mutex<VecDeque<lorica_notify::AlertEvent>>>,
+    pub(crate) notification_history: Arc<parking_lot::Mutex<VecDeque<lorica_notify::AlertEvent>>>,
     /// Active probe scheduler, already loaded via `reload()`.
     pub(crate) probe_scheduler: Arc<lorica_bench::ProbeScheduler>,
     /// SLA collector with its flush task already started.
@@ -460,8 +459,7 @@ pub(crate) fn spawn_retention_loop(
                     }
                 }
             }
-            last_sla_purge_day =
-                run_sla_purge(&retention_config_store, last_sla_purge_day).await;
+            last_sla_purge_day = run_sla_purge(&retention_config_store, last_sla_purge_day).await;
         }
     });
 }
@@ -1009,8 +1007,8 @@ pub(crate) fn check_key_file_before_promotion(
     path: &std::path::Path,
 ) -> Result<Option<String>, String> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)
-        .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
     let process_uid = std::fs::metadata("/proc/self")
         .map(|m| m.uid())
         .map_err(|e| format!("cannot determine the process uid from /proc/self: {e}"))?;

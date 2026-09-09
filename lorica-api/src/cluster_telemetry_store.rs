@@ -922,9 +922,7 @@ mod tests {
             )
             .expect("ingest");
 
-        let all = store
-            .query_access(&FleetQuery::default())
-            .expect("query");
+        let all = store.query_access(&FleetQuery::default()).expect("query");
         assert_eq!(all.len(), 2);
         // The identity is the caller's, never the payload's: nothing
         // in `TelemetryAccessRow` names a node at all.
@@ -950,7 +948,10 @@ mod tests {
             store
                 .ingest(
                     "node-noisy",
-                    &[access_row("noisy.example.com", &format!("2026-09-09T10:{i:02}:00Z"))],
+                    &[access_row(
+                        "noisy.example.com",
+                        &format!("2026-09-09T10:{i:02}:00Z"),
+                    )],
                     &[],
                     &[],
                 )
@@ -1000,7 +1001,10 @@ mod tests {
                 store
                     .ingest(
                         node,
-                        &[access_row("x.example.com", &format!("2026-09-09T10:00:{i:02}Z"))],
+                        &[access_row(
+                            "x.example.com",
+                            &format!("2026-09-09T10:00:{i:02}Z"),
+                        )],
                         &[],
                         &[],
                     )
@@ -1119,7 +1123,10 @@ mod tests {
             store
                 .ingest(
                     "node-a",
-                    &[access_row("a.example.com", &format!("2026-09-09T10:{i:02}:00Z"))],
+                    &[access_row(
+                        "a.example.com",
+                        &format!("2026-09-09T10:{i:02}:00Z"),
+                    )],
                     &[],
                     &[],
                 )

@@ -300,7 +300,11 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
             // bounding their CONTENT here the only thing standing
             // between a follower and unbounded growth in a table
             // retention deletes by a field that same follower chose.
-            if push.audit.iter().any(|r| telemetry_audit_row_defect(r).is_some()) {
+            if push
+                .audit
+                .iter()
+                .any(|r| telemetry_audit_row_defect(r).is_some())
+            {
                 return BridgeOutcome::ProtocolViolation;
             }
             BridgeOutcome::InPlane(InPlaneAction::TelemetryPush {

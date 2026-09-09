@@ -222,12 +222,7 @@ impl FollowerPlane {
         {
             task.abort();
         }
-        if let Some(dialer) = self
-            .dialer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
+        if let Some(dialer) = self.dialer.lock().unwrap_or_else(|p| p.into_inner()).take() {
             dialer.shutdown();
         }
     }
@@ -930,7 +925,10 @@ impl FollowerHandler for ReplicaHandler {
             .await;
             match written {
                 Ok(()) => {
-                    info!(identifier, "published an HTTP-01 challenge for the control plane");
+                    info!(
+                        identifier,
+                        "published an HTTP-01 challenge for the control plane"
+                    );
                     Ok(())
                 }
                 Err(e) => {
@@ -1245,13 +1243,18 @@ pub(crate) async fn spawn_follower(
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .as_ref()
-                        .map(|d| d.update_identity(&cert_pem, &key_pem).map(|()| d.reconnect()));
+                        .map(|d| {
+                            d.update_identity(&cert_pem, &key_pem)
+                                .map(|()| d.reconnect())
+                        });
                     match outcome {
                         Some(Ok(())) => info!(
                             not_after = %not_after.to_rfc3339(),
                             "follower: node certificate renewed; reconnecting on it now"
                         ),
-                        Some(Err(e)) => error!(error = %e, "follower: renewed identity rejected by the dialer"),
+                        Some(Err(e)) => {
+                            error!(error = %e, "follower: renewed identity rejected by the dialer")
+                        }
                         None => {}
                     }
                 }

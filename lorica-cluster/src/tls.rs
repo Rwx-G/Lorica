@@ -150,9 +150,7 @@ pub fn operational_server_config_with_crl(
     let roots = ca_root_store(ca_pem)?;
     let builder = WebPkiClientVerifier::builder(roots);
     let builder = match crl {
-        Some(crl) => builder
-            .with_crls([crl])
-            .only_check_end_entity_revocation(),
+        Some(crl) => builder.with_crls([crl]).only_check_end_entity_revocation(),
         None => builder,
     };
     let verifier = builder
@@ -301,7 +299,10 @@ impl ServerCertVerifier for SpkiPinVerifier {
         match self.check(end_entity, now) {
             Ok(()) => Ok(ServerCertVerified::assertion()),
             Err(reason) => {
-                tracing::warn!(reason, "join: control plane refused by the pinning verifier");
+                tracing::warn!(
+                    reason,
+                    "join: control plane refused by the pinning verifier"
+                );
                 Err(TlsError::InvalidCertificate(
                     CertificateError::ApplicationVerificationFailure,
                 ))
@@ -340,7 +341,10 @@ impl ServerCertVerifier for SpkiPinVerifier {
 /// the leaf checks in [`SpkiPinVerifier`]. This is the one
 /// `dangerous()` builder in the crate and it is confined to the
 /// enrollment dial.
-pub fn join_client_config(pin: &[u8; 32], expected_host: &str) -> Result<ClientConfig, ClusterTlsError> {
+pub fn join_client_config(
+    pin: &[u8; 32],
+    expected_host: &str,
+) -> Result<ClientConfig, ClusterTlsError> {
     if expected_host.is_empty() {
         return Err(ClusterTlsError::Parse(
             "the control-plane host must not be empty".into(),
@@ -484,7 +488,9 @@ mod tests {
         .check(&der(&ip_pem), now)
         .is_err());
         // Garbage and the empty host are refused at config time / check.
-        assert!(verifier.check(&CertificateDer::from(vec![1u8, 2, 3]), now).is_err());
+        assert!(verifier
+            .check(&CertificateDer::from(vec![1u8, 2, 3]), now)
+            .is_err());
         assert!(join_client_config(&pin, "").is_err());
         join_client_config(&pin, "cp.internal").expect("join config builds");
     }

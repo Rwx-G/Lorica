@@ -210,7 +210,11 @@ async fn connect(config: &SyslogSinkConfig, tls: Option<&TlsConnector>) -> Resul
                 .map_err(|e| format!("resolve failed: {e}"))?
                 .next()
                 .ok_or_else(|| "resolve returned no address".to_string())?;
-            let bind_addr = if peer.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+            let bind_addr = if peer.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
             let socket = UdpSocket::bind(bind_addr)
                 .await
                 .map_err(|e| format!("udp bind failed: {e}"))?;
@@ -221,18 +225,20 @@ async fn connect(config: &SyslogSinkConfig, tls: Option<&TlsConnector>) -> Resul
             Ok(Conn::Udp(socket))
         }
         SyslogTransport::Tcp => {
-            let stream = tokio::time::timeout(IO_TIMEOUT, TcpStream::connect((host.as_str(), port)))
-                .await
-                .map_err(|_| "connect timeout".to_string())?
-                .map_err(|e| format!("tcp connect failed: {e}"))?;
+            let stream =
+                tokio::time::timeout(IO_TIMEOUT, TcpStream::connect((host.as_str(), port)))
+                    .await
+                    .map_err(|_| "connect timeout".to_string())?
+                    .map_err(|e| format!("tcp connect failed: {e}"))?;
             Ok(Conn::Tcp(stream))
         }
         SyslogTransport::TcpTls => {
             let tls = tls.ok_or_else(|| "TLS connector unavailable".to_string())?;
-            let stream = tokio::time::timeout(IO_TIMEOUT, TcpStream::connect((host.as_str(), port)))
-                .await
-                .map_err(|_| "connect timeout".to_string())?
-                .map_err(|e| format!("tcp connect failed: {e}"))?;
+            let stream =
+                tokio::time::timeout(IO_TIMEOUT, TcpStream::connect((host.as_str(), port)))
+                    .await
+                    .map_err(|_| "connect timeout".to_string())?
+                    .map_err(|e| format!("tcp connect failed: {e}"))?;
             let server_name = ServerName::try_from(host.clone())
                 .map_err(|e| format!("invalid TLS server name {host:?}: {e}"))?;
             let stream = tokio::time::timeout(IO_TIMEOUT, tls.connect(server_name, stream))

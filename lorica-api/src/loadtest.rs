@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path};
+use axum::extract::Path;
 use axum::response::IntoResponse;
 use axum::Extension;
 use axum::Json;

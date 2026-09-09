@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use axum::extract::{Extension};
+use axum::extract::Extension;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::info;

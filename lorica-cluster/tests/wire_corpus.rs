@@ -55,7 +55,10 @@ use lorica_cluster::messages::{
 use prost::Message;
 use std::collections::BTreeMap;
 
-const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/wire-corpus-v1.txt");
+const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/wire-corpus-v1.txt"
+);
 
 /// Decodes frozen bytes and says whether they equal the instance.
 type RoundTrip = Box<dyn Fn(&[u8]) -> Result<bool, String>>;

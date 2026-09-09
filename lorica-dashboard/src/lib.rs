@@ -134,10 +134,7 @@ fn serve_embedded_file(path: &str) -> Response {
             let headers = response.headers_mut();
             headers.insert(header::CONTENT_TYPE, mime.as_ref().parse().unwrap());
             headers.insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
-            headers.insert(
-                header::CONTENT_SECURITY_POLICY,
-                CSP_HEADER.parse().unwrap(),
-            );
+            headers.insert(header::CONTENT_SECURITY_POLICY, CSP_HEADER.parse().unwrap());
             headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
             headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
             headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());

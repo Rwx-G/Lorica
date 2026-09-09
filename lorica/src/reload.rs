@@ -1017,11 +1017,8 @@ pub fn ocsp_refresh_notify() -> &'static tokio::sync::Notify {
 /// Shared by the three places that load certificates into a resolver
 /// (reload, single-process boot, worker boot) so the gauge cannot
 /// disagree with itself across process modes.
-pub fn cert_data_for_resolver(
-    certs: &[lorica_config::models::Certificate],
-) -> Vec<CertData> {
-    let (with_key, awaiting): (Vec<_>, Vec<_>) =
-        certs.iter().partition(|c| !c.key_pem.is_empty());
+pub fn cert_data_for_resolver(certs: &[lorica_config::models::Certificate]) -> Vec<CertData> {
+    let (with_key, awaiting): (Vec<_>, Vec<_>) = certs.iter().partition(|c| !c.key_pem.is_empty());
     lorica_api::metrics::set_certificates_awaiting_key(awaiting.len());
     if !awaiting.is_empty() {
         let domains: Vec<&str> = awaiting.iter().map(|c| c.domain.as_str()).collect();

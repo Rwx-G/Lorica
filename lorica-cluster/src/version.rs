@@ -42,12 +42,7 @@ pub const PROTOCOL_MIN_COMPATIBLE: u32 = 1;
 /// both inclusive ranges, or `None` when the ranges do not overlap
 /// (map that to `ClusterStatus::IncompatibleVersion` on the
 /// operational path, and to the opaque status pre-auth).
-pub fn negotiate(
-    local_min: u32,
-    local_max: u32,
-    peer_min: u32,
-    peer_max: u32,
-) -> Option<u32> {
+pub fn negotiate(local_min: u32, local_max: u32, peer_min: u32, peer_max: u32) -> Option<u32> {
     // Guard inverted ranges (a malformed Hello): treat as no overlap.
     if local_min > local_max || peer_min > peer_max {
         return None;

@@ -435,7 +435,10 @@ async fn resolve_identity(
     let Some(fingerprint) = fingerprint else {
         // Mandatory client auth always yields a chain; treat its
         // absence as unknown rather than trusting the peer.
-        shared.stats.identity_refusals.fetch_add(1, Ordering::Relaxed);
+        shared
+            .stats
+            .identity_refusals
+            .fetch_add(1, Ordering::Relaxed);
         fleet
             .handler
             .on_identity_refused("-", peer, "no peer certificate exposed")
@@ -446,7 +449,10 @@ async fn resolve_identity(
     match fleet.roster.lookup(fingerprint) {
         Some(identity) if identity.state != NodeState::Revoked => Ok(Some(identity)),
         Some(_) => {
-            shared.stats.identity_refusals.fetch_add(1, Ordering::Relaxed);
+            shared
+                .stats
+                .identity_refusals
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(%peer, fingerprint = prefix, "revoked node reached identity resolution; dropped");
             fleet
                 .handler
@@ -455,7 +461,10 @@ async fn resolve_identity(
             Err(())
         }
         None => {
-            shared.stats.identity_refusals.fetch_add(1, Ordering::Relaxed);
+            shared
+                .stats
+                .identity_refusals
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(%peer, fingerprint = prefix, "valid cluster certificate with no enrolled node; dropped");
             fleet
                 .handler
@@ -479,11 +488,8 @@ async fn serve_operational_conn(
 ) {
     let stats = &shared.stats;
     let tls_acceptor = TlsAcceptor::from(shared.acceptor.current());
-    let tls = match tokio::time::timeout(
-        shared.budgets.handshake_timeout,
-        tls_acceptor.accept(tcp),
-    )
-    .await
+    let tls = match tokio::time::timeout(shared.budgets.handshake_timeout, tls_acceptor.accept(tcp))
+        .await
     {
         Ok(Ok(tls)) => tls,
         Ok(Err(e)) => {
@@ -903,7 +909,9 @@ async fn serve_request(
             // but nothing it says belongs in the fleet's record of
             // what happened.
             if !node_is_active(ctx, guard) {
-                stats.telemetry_push_refusals.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .telemetry_push_refusals
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     peer = %ctx.peer_addr,
                     node_id,
@@ -916,7 +924,9 @@ async fn serve_request(
                     .map(|_| SessionEnd::Closed);
             }
             if tally.telemetry_push_over_rate(Instant::now()) {
-                stats.telemetry_push_refusals.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .telemetry_push_refusals
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     peer = %ctx.peer_addr,
                     node_id,
@@ -932,22 +942,26 @@ async fn serve_request(
                     ..TelemetryPushAck::default()
                 };
                 return request
-                    .reply_frame(ClusterResponse::ok(cluster_response::Body::TelemetryPushAck(
-                        ack,
-                    )))
+                    .reply_frame(ClusterResponse::ok(
+                        cluster_response::Body::TelemetryPushAck(ack),
+                    ))
                     .await
                     .err()
                     .map(|_| SessionEnd::Closed);
             }
             let reply = match fleet.handler.on_telemetry_push(node_id, *batch).await {
                 Ok(ack) => {
-                    stats.telemetry_pushes_served.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .telemetry_pushes_served
+                        .fetch_add(1, Ordering::Relaxed);
                     ClusterResponse::ok(cluster_response::Body::TelemetryPushAck(ack))
                 }
                 Err(reason) => {
                     // A control plane that cannot store telemetry must
                     // not drop the session that carries configuration.
-                    stats.telemetry_push_refusals.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .telemetry_push_refusals
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(peer = %ctx.peer_addr, node_id, %reason, "telemetry push refused");
                     ClusterResponse::refusal(ClusterStatus::Unspecified)
                 }

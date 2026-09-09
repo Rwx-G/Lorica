@@ -58,9 +58,9 @@ use chrono::{DateTime, Utc};
 use lorica_api::audit::{record_with_store, AuditContext};
 use lorica_api::cluster::runtime::{publish_token_liveness, refresh_control_plane, revoke_node};
 use lorica_api::cluster::ControlPlaneRuntime;
+use lorica_api::cluster_telemetry_store::ClusterTelemetryStore;
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
-use lorica_api::cluster_telemetry_store::ClusterTelemetryStore;
 use lorica_api::log_store::LogStore;
 use lorica_cluster::enroll::{
     BoxFuture, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, RenewGrant,
@@ -690,7 +690,10 @@ impl SessionHandler for FleetHandlers {
             .await;
             match retired {
                 Ok(Some(serial)) => {
-                    info!(node_id, serial, "superseded node certificate retired to the CRL");
+                    info!(
+                        node_id,
+                        serial, "superseded node certificate retired to the CRL"
+                    );
                     self.refresh().await;
                 }
                 Ok(None) => {}
@@ -701,7 +704,9 @@ impl SessionHandler for FleetHandlers {
 
     fn on_renew(&self, request: RenewRequest) -> BoxFuture<'_, Result<RenewGrant, String>> {
         Box::pin(async move {
-            self.renew(request).await.map_err(|refusal| refusal.to_string())
+            self.renew(request)
+                .await
+                .map_err(|refusal| refusal.to_string())
         })
     }
 
@@ -859,19 +864,19 @@ impl SessionHandler for FleetHandlers {
                             "a fanned-in audit row carries an out-of-range origin id".to_string()
                         })?;
                         Ok(lorica_api::audit::FannedInAuditRow {
-                        origin_id,
-                        timestamp: r.timestamp,
-                        operator_username: r.operator_username,
-                        operator_role: r.operator_role,
-                        action: r.action,
-                        target_type: r.target_type,
-                        target_id: r.target_id,
-                        before_payload_hash: r.before_payload_hash,
-                        after_payload_hash: r.after_payload_hash,
-                        ip: r.ip,
-                        user_agent: r.user_agent,
-                        prev_chain_hash: r.prev_chain_hash,
-                        chain_hash: r.chain_hash,
+                            origin_id,
+                            timestamp: r.timestamp,
+                            operator_username: r.operator_username,
+                            operator_role: r.operator_role,
+                            action: r.action,
+                            target_type: r.target_type,
+                            target_id: r.target_id,
+                            before_payload_hash: r.before_payload_hash,
+                            after_payload_hash: r.after_payload_hash,
+                            ip: r.ip,
+                            user_agent: r.user_agent,
+                            prev_chain_hash: r.prev_chain_hash,
+                            chain_hash: r.chain_hash,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
@@ -1044,11 +1049,7 @@ impl SessionHandler for FleetHandlers {
             // A node asking for something it is not selected for gets
             // silence on that id rather than a refusal: the answer must
             // not tell it whether the certificate exists at all.
-            info!(
-                node_id,
-                sent = bundles.len(),
-                "answered a certificate pull"
-            );
+            info!(node_id, sent = bundles.len(), "answered a certificate pull");
             lorica_api::metrics::inc_cluster_cert_push_by(&node_id, "served", bundles.len());
             Ok(bundles)
         })
@@ -1068,7 +1069,10 @@ impl SessionHandler for FleetHandlers {
                 // own and belongs back in the commit set, which is the
                 // release the documentation promises.
                 if self.control.replication.release(&node_id) {
-                    info!(node_id, "node released from replication quarantine: it converged");
+                    info!(
+                        node_id,
+                        "node released from replication quarantine: it converged"
+                    );
                 }
                 return Ok(None);
             }
@@ -1344,14 +1348,8 @@ fn spawn_drift_watch(
                     AlertEvent::new(AlertType::ClusterDrift, summary)
                         .with_detail("node_id", node_id.clone())
                         .with_detail("node_name", entry.name.clone())
-                        .with_detail(
-                            "applied_generation",
-                            entry.applied_generation.to_string(),
-                        )
-                        .with_detail(
-                            "current_generation",
-                            report.current_generation.to_string(),
-                        )
+                        .with_detail("applied_generation", entry.applied_generation.to_string())
+                        .with_detail("current_generation", report.current_generation.to_string())
                         .with_detail("connected", entry.connected.to_string())
                         .with_detail("break_glass", entry.break_glass.to_string())
                         .with_detail(
@@ -1750,8 +1748,8 @@ mod tests {
             .install_default();
         let ca = ClusterCa::generate("Test CA").expect("ca");
         let (leaf, key) = ca.issue_server_leaf("cp.internal").expect("leaf");
-        let config = lorica_cluster::operational_server_config(ca.cert_pem(), &leaf, &key)
-            .expect("config");
+        let config =
+            lorica_cluster::operational_server_config(ca.cert_pem(), &leaf, &key).expect("config");
         let acceptor = Arc::new(SwappableAcceptor::new(Arc::new(config)));
         let (liveness, _rx) = watch::channel(0u32);
         Arc::new(ControlPlane::new(
@@ -1817,7 +1815,10 @@ mod tests {
         // control plane's accept window, and a refused follower must
         // wait at least the cooldown before asking again.
         assert!(RENEWAL_ACCEPT_WINDOW > chrono::Duration::days(RENEWAL_LEAD_MAX_DAYS));
-        assert!(chrono::Duration::days(RENEWAL_LEAD_MIN_DAYS) < chrono::Duration::days(RENEWAL_LEAD_MAX_DAYS));
+        assert!(
+            chrono::Duration::days(RENEWAL_LEAD_MIN_DAYS)
+                < chrono::Duration::days(RENEWAL_LEAD_MAX_DAYS)
+        );
         assert!(RENEWAL_RETRY_AFTER_REFUSAL >= RENEWAL_COOLDOWN);
         assert!(RENEWAL_CHECK_INTERVAL < RENEWAL_COOLDOWN);
     }
@@ -1835,7 +1836,14 @@ mod tests {
         let control = test_control(false);
         let (request, public_id) = {
             let s = store.lock().await;
-            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", Some("edge-1"), None)
+            minted_request(
+                &s,
+                &control,
+                "192.0.2.10:5000",
+                "edge-1",
+                Some("edge-1"),
+                None,
+            )
         };
         let replay = request.clone();
         let grant = redeem_with_store(&store, &control, request, Utc::now())
@@ -1845,12 +1853,18 @@ mod tests {
         assert_eq!(grant.ca_pem, control.ca_pem());
         {
             let s = store.lock().await;
-            let node = s.get_cluster_node(&grant.node_id).expect("read").expect("row");
+            let node = s
+                .get_cluster_node(&grant.node_id)
+                .expect("read")
+                .expect("row");
             assert_eq!(node.status, NodeStatus::Pending);
             assert_eq!(node.name, "edge-1");
             let tok = s.get_join_token(&public_id).expect("read").expect("row");
             assert_eq!(tok.state, TokenState::Burned);
-            assert_eq!(tok.burned_by_node_id.as_deref(), Some(grant.node_id.as_str()));
+            assert_eq!(
+                tok.burned_by_node_id.as_deref(),
+                Some(grant.node_id.as_str())
+            );
         }
         // Replay of the same token is refused, and refused the same
         // way as an unknown one.
@@ -1956,7 +1970,10 @@ mod tests {
             "nothing is enrolled by a refused redemption"
         );
         assert_eq!(
-            s.get_join_token(&public_id).expect("read").expect("row").state,
+            s.get_join_token(&public_id)
+                .expect("read")
+                .expect("row")
+                .state,
             TokenState::Unused,
             "the refusal happens before the burn, so a corrected mint is not needed"
         );
@@ -1968,7 +1985,14 @@ mod tests {
         let control = test_control(false);
         let (mut request, _) = {
             let s = store.lock().await;
-            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", Some("edge-1"), None)
+            minted_request(
+                &s,
+                &control,
+                "192.0.2.10:5000",
+                "edge-1",
+                Some("edge-1"),
+                None,
+            )
         };
         request.node_name = "edge-2".to_string();
         assert!(matches!(
@@ -1983,7 +2007,14 @@ mod tests {
         let control = test_control(false);
         let (request, _) = {
             let s = store.lock().await;
-            minted_request(&s, &control, "192.0.2.10:5000", "edge-1", Some("edge-1"), None)
+            minted_request(
+                &s,
+                &control,
+                "192.0.2.10:5000",
+                "edge-1",
+                Some("edge-1"),
+                None,
+            )
         };
         let (a, b, c) = tokio::join!(
             redeem_with_store(&store, &control, request.clone(), Utc::now()),

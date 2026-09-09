@@ -132,8 +132,7 @@ pub async fn get_waf_stats(
     } else if let Some(ref waf_buffer) = state.waf_event_buffer {
         let buf = waf_buffer.lock();
         let total = buf.len() as u64;
-        let cutoff_24h: String =
-            (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let cutoff_24h: String = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
         let mut total_24h = 0u64;
         let mut counts = std::collections::HashMap::new();
         for event in buf.iter() {

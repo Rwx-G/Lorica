@@ -106,13 +106,13 @@ pub use certs::{
     CertPushReport, MAX_CERT_BUNDLES, MAX_CERT_PULL_IDS,
 };
 pub use challenge::{challenge_defect, ChallengeFanout, ChallengeMiss, ChallengeReport};
-pub use enroll::{
-    join, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, JoinError, JoinParams,
-    NoopSessionHandler, RefuseAllEnrollments, RenewGrant, RenewRequest, SessionHandler,
-};
 pub use dialer::{
     resolve_and_connect, split_host_port, ClusterConnection, Dialer, DialerConfig, DialerError,
     DialerHandle, DialerStats, FollowerHandler, SessionHandle, BACKOFF_CAP_CEILING,
+};
+pub use enroll::{
+    join, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, JoinError, JoinParams,
+    NoopSessionHandler, RefuseAllEnrollments, RenewGrant, RenewRequest, SessionHandler,
 };
 pub use handshake::{
     client_handshake, display_field_is_valid, evaluate_hello, node_name_is_valid, serve_hello,
@@ -121,45 +121,42 @@ pub use handshake::{
 pub use limits::{cluster_rpc_limits, CLUSTER_MAX_MESSAGE_SIZE, CLUSTER_QUEUE_CAP};
 pub use listener::{
     EnrollmentHandle, EnrollmentListener, EnrollmentStats, FleetHooks, OperationalConfig,
-    OperationalHandle, OperationalListener, OperationalStats, TokenLiveness,
-    DEFAULT_MAX_SESSIONS, DEFAULT_OPENER_TIMEOUT,
+    OperationalHandle, OperationalListener, OperationalStats, TokenLiveness, DEFAULT_MAX_SESSIONS,
+    DEFAULT_OPENER_TIMEOUT,
 };
 pub use messages::{
     cert_digest_is_valid, cert_domain_is_valid, cert_id_is_valid,
     challenge_key_authorization_is_valid, challenge_token_is_valid, config_hash_is_valid,
-    telemetry_audit_row_defect,
-    BanPush, BanPushAck, CertMaterial, CertPull, CertPullAck, CertPush, CertPushAck, CertRefusal,
-    ChallengePublish,
-    ChallengePublishAck, ChallengeRetract, ChallengeRetractAck, ClusterFrame, ClusterRequest,
-    ClusterResponse, ClusterStatus, ConfigAbort, ConfigAbortAck, ConfigCommit, ConfigCommitAck,
-    ConfigPrepare, ConfigPrepareAck, ConfigPull, ConfigPullAck, Enroll, EnrollAck, Heartbeat,
-    HeartbeatAck, Hello, HelloAck, Leave, LeaveAck, NodeResources, Renew, RenewAck,
-    TelemetryAccessRow,
-    TelemetryAuditRow, TelemetryBan, TelemetryPush, TelemetryPushAck, TelemetryWafRow,
-    BODY_KIND_BAN_PUSH,
-    BODY_KIND_CERT_PULL, BODY_KIND_CERT_PUSH, BODY_KIND_CHALLENGE_PUBLISH,
-    BODY_KIND_CHALLENGE_RETRACT, BODY_KIND_CONFIG_ABORT, BODY_KIND_CONFIG_COMMIT,
-    BODY_KIND_CONFIG_PREPARE, BODY_KIND_CONFIG_PULL, BODY_KIND_ENROLL, BODY_KIND_HEARTBEAT,
-    BODY_KIND_HELLO, BODY_KIND_LEAVE, BODY_KIND_RENEW, BODY_KIND_TELEMETRY_PUSH,
-    CERT_DIGEST_PREFIX, MAX_CERT_DOMAIN_BYTES, MAX_CERT_ID_BYTES,
-    MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES, MAX_CHALLENGE_TOKEN_BYTES, MAX_CONFIG_HASH_BYTES,
-    MAX_AUDIT_FIELD_BYTES, MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
+    telemetry_audit_row_defect, BanPush, BanPushAck, CertMaterial, CertPull, CertPullAck, CertPush,
+    CertPushAck, CertRefusal, ChallengePublish, ChallengePublishAck, ChallengeRetract,
+    ChallengeRetractAck, ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus, ConfigAbort,
+    ConfigAbortAck, ConfigCommit, ConfigCommitAck, ConfigPrepare, ConfigPrepareAck, ConfigPull,
+    ConfigPullAck, Enroll, EnrollAck, Heartbeat, HeartbeatAck, Hello, HelloAck, Leave, LeaveAck,
+    NodeResources, Renew, RenewAck, TelemetryAccessRow, TelemetryAuditRow, TelemetryBan,
+    TelemetryPush, TelemetryPushAck, TelemetryWafRow, BODY_KIND_BAN_PUSH, BODY_KIND_CERT_PULL,
+    BODY_KIND_CERT_PUSH, BODY_KIND_CHALLENGE_PUBLISH, BODY_KIND_CHALLENGE_RETRACT,
+    BODY_KIND_CONFIG_ABORT, BODY_KIND_CONFIG_COMMIT, BODY_KIND_CONFIG_PREPARE,
+    BODY_KIND_CONFIG_PULL, BODY_KIND_ENROLL, BODY_KIND_HEARTBEAT, BODY_KIND_HELLO, BODY_KIND_LEAVE,
+    BODY_KIND_RENEW, BODY_KIND_TELEMETRY_PUSH, CERT_DIGEST_PREFIX, MAX_AUDIT_FIELD_BYTES,
+    MAX_CERT_DOMAIN_BYTES, MAX_CERT_ID_BYTES, MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES,
+    MAX_CHALLENGE_TOKEN_BYTES, MAX_CONFIG_HASH_BYTES, MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS,
+    MAX_TELEMETRY_ROWS,
 };
 pub use preauth::{source_key, AttemptWindow, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
-pub use telemetry::{
-    storage_verdict, IngestQuota, IngestVerdict, DEFAULT_BYTES_PER_WINDOW,
-    DEFAULT_ROWS_PER_WINDOW, DEFAULT_STORAGE_CAP_BYTES, QUOTA_RETRY_AFTER_S, QUOTA_WINDOW,
-};
 pub use replication::{
     safe_reason, AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport,
-    Replicator, DEFAULT_PER_NODE_DEADLINE, DEFAULT_QUARANTINE_THRESHOLD,
-    MAX_HONOURED_BREAK_GLASS, MAX_REJECTION_REASON_BYTES,
+    Replicator, DEFAULT_PER_NODE_DEADLINE, DEFAULT_QUARANTINE_THRESHOLD, MAX_HONOURED_BREAK_GLASS,
+    MAX_REJECTION_REASON_BYTES,
 };
 pub use roster::{
     ControlPlane, LiveSession, LiveSessionSnapshot, NodeIdentity, NodeState, RefreshGuard, Roster,
     SessionGuard, SessionRegistry, MAX_SESSIONS_PER_NODE_PER_WINDOW, SESSION_RATE_WINDOW,
 };
 pub use session::SessionContext;
+pub use telemetry::{
+    storage_verdict, IngestQuota, IngestVerdict, DEFAULT_BYTES_PER_WINDOW, DEFAULT_ROWS_PER_WINDOW,
+    DEFAULT_STORAGE_CAP_BYTES, QUOTA_RETRY_AFTER_S, QUOTA_WINDOW,
+};
 pub use tls::{
     client_config, enrollment_server_config, join_client_config, leaf_spki_sha256,
     negotiated_cluster_alpn, operational_server_config, operational_server_config_with_crl,

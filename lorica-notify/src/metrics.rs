@@ -115,6 +115,9 @@ mod tests {
             "http_5xx"
         );
         // 3xx with redirects disabled has no 4xx/5xx bucket.
-        assert_eq!(classify_response_status(StatusCode::FOUND), "connect_failed");
+        assert_eq!(
+            classify_response_status(StatusCode::FOUND),
+            "connect_failed"
+        );
     }
 }

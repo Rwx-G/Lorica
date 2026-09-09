@@ -682,9 +682,16 @@ mod tests {
         fast(&mut distributor);
 
         let report = distributor
-            .push(&registry, &names(&["node-a", "node-b"]), vec![bundle("cert-1")])
+            .push(
+                &registry,
+                &names(&["node-a", "node-b"]),
+                vec![bundle("cert-1")],
+            )
             .await;
-        assert_eq!(report.targets, vec!["node-a".to_string(), "node-b".to_string()]);
+        assert_eq!(
+            report.targets,
+            vec!["node-a".to_string(), "node-b".to_string()]
+        );
         assert_eq!(
             report.installed,
             vec![("node-a".to_string(), 1)],
@@ -832,7 +839,11 @@ mod tests {
         fast(&mut distributor);
 
         let report = distributor
-            .push(&registry, &names(&["node-a", "node-b"]), vec![bundle("cert-1")])
+            .push(
+                &registry,
+                &names(&["node-a", "node-b"]),
+                vec![bundle("cert-1")],
+            )
             .await;
         assert_eq!(
             report.installed,
@@ -841,7 +852,9 @@ mod tests {
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, "node-b");
         assert!(report.failed[0].1.contains("cert-1"));
-        assert!(report.failed[0].1.contains("no route binds this hostname here"));
+        assert!(report.failed[0]
+            .1
+            .contains("no route binds this hostname here"));
         assert_eq!(good.pushes.load(Ordering::SeqCst), 1);
         drop((good, refuser));
     }
@@ -886,7 +899,10 @@ mod tests {
         assert_eq!(cert_bundle_defect(&bundle("cert-1")), None);
         let mut empty_id = bundle("cert-1");
         empty_id.cert_id = String::new();
-        assert_eq!(cert_bundle_defect(&empty_id), Some("malformed certificate id"));
+        assert_eq!(
+            cert_bundle_defect(&empty_id),
+            Some("malformed certificate id")
+        );
         let mut injected = bundle("cert-1");
         injected.domain = "edge.example.com\nforged".to_string();
         assert_eq!(
@@ -895,7 +911,10 @@ mod tests {
         );
         let mut no_chain = bundle("cert-1");
         no_chain.cert_pem = String::new();
-        assert_eq!(cert_bundle_defect(&no_chain), Some("empty certificate chain"));
+        assert_eq!(
+            cert_bundle_defect(&no_chain),
+            Some("empty certificate chain")
+        );
         // The Story 9.5 D8 failure in one assertion: a bundle with no
         // key would write an empty private-key file through the
         // follower's export path.
@@ -904,7 +923,10 @@ mod tests {
         assert_eq!(cert_bundle_defect(&no_key), Some("empty private key"));
         let mut bad_digest = bundle("cert-1");
         bad_digest.key_digest = digest('a').to_uppercase();
-        assert_eq!(cert_bundle_defect(&bad_digest), Some("malformed key digest"));
+        assert_eq!(
+            cert_bundle_defect(&bad_digest),
+            Some("malformed key digest")
+        );
     }
 
     #[test]
@@ -928,9 +950,6 @@ mod tests {
     #[test]
     fn a_bundle_round_trips_through_its_wire_form() {
         let original = bundle("cert-1");
-        assert_eq!(
-            CertBundle::from_material(original.to_material()),
-            original
-        );
+        assert_eq!(CertBundle::from_material(original.to_material()), original);
     }
 }

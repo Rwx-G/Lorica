@@ -610,7 +610,10 @@ async fn load_certs_into_resolver(
 /// (enable flag plus an initial Data-Shield fetch when on), the operator
 /// disabled-rule set, and any custom rules. Single-process mode owns the
 /// blocklist fetch (workers inherit the enable flag only).
-async fn restore_waf_state(store: &Arc<Mutex<ConfigStore>>, waf_engine: &Arc<lorica_waf::WafEngine>) {
+async fn restore_waf_state(
+    store: &Arc<Mutex<ConfigStore>>,
+    waf_engine: &Arc<lorica_waf::WafEngine>,
+) {
     let s = store.lock().await;
     if let Ok(settings) = s.get_global_settings() {
         if settings.ip_blocklist_enabled {

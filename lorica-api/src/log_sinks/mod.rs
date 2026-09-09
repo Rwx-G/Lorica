@@ -142,10 +142,7 @@ pub fn body_json(event: &SinkEvent) -> String {
     let mut value = serde_json::to_value(&event.payload).unwrap_or_default();
     if let Some(map) = value.as_object_mut() {
         map.insert("v".to_string(), serde_json::json!(SINK_BODY_VERSION));
-        map.insert(
-            "kind".to_string(),
-            serde_json::json!(event.kind().as_str()),
-        );
+        map.insert("kind".to_string(), serde_json::json!(event.kind().as_str()));
     }
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
 }
@@ -537,11 +534,7 @@ pub fn publish_access(entry: &LogEntry, trace_id: Option<&str>, span_id: Option<
 
 /// Publish a WAF event with its request trace context. Same
 /// non-blocking contract as [`publish_access`].
-pub fn publish_waf(
-    event: &lorica_waf::WafEvent,
-    trace_id: Option<&str>,
-    span_id: Option<&str>,
-) {
+pub fn publish_waf(event: &lorica_waf::WafEvent, trace_id: Option<&str>, span_id: Option<&str>) {
     let Some(state) = state_if_wants(SinkKind::Waf) else {
         return;
     };

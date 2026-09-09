@@ -53,8 +53,9 @@ struct AuthSettings {
 
 /// Process-wide TTL cache of [`AuthSettings`]. The management API runs in
 /// a single process, so one cache suffices.
-static AUTH_CACHE: std::sync::LazyLock<std::sync::RwLock<Option<(AuthSettings, std::time::Instant)>>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+static AUTH_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<Option<(AuthSettings, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
 
 /// Return the auth settings, from the TTL cache when fresh, otherwise
 /// re-read them from the store and refresh the cache. `Err(())` on a
@@ -154,10 +155,7 @@ fn bearer_authorized(req: &Request, setting_token: Option<&str>) -> bool {
     else {
         return false;
     };
-    provided
-        .as_bytes()
-        .ct_eq(expected.as_bytes())
-        .into()
+    provided.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 /// Extract the `lorica_session` cookie value from the request, if present.
@@ -174,10 +172,13 @@ fn session_cookie_value(req: &Request) -> Option<String> {
 /// Build the `401 Unauthorized` response with the metrics `WWW-Authenticate`
 /// challenge (AC #5).
 fn unauthorized() -> Response {
-    let mut response = (StatusCode::UNAUTHORIZED, "metrics authentication required").into_response();
+    let mut response =
+        (StatusCode::UNAUTHORIZED, "metrics authentication required").into_response();
     let challenge = format!("Bearer realm=\"{METRICS_REALM}\"");
     if let Ok(value) = HeaderValue::from_str(&challenge) {
-        response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
     }
     response
 }

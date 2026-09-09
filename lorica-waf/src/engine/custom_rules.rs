@@ -119,7 +119,13 @@ mod tests {
     fn rejects_invalid_regex() {
         let engine = WafEngine::new();
         let err = engine
-            .add_custom_rule(1, "bad regex".to_string(), RuleCategory::Xss, r"(unclosed", 3)
+            .add_custom_rule(
+                1,
+                "bad regex".to_string(),
+                RuleCategory::Xss,
+                r"(unclosed",
+                3,
+            )
             .expect_err("an invalid regex must be rejected");
         assert!(err.contains("invalid regex"), "got: {err}");
         assert!(engine.list_custom_rules().is_empty());

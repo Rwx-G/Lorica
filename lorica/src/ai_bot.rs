@@ -361,7 +361,6 @@ pub fn match_user_agent(ua: &str) -> Option<&'static AiCrawler> {
         .map(|(_, crawler)| *crawler)
 }
 
-
 /// Build the body of an auto-served `/robots.txt` (Story 8.2
 /// AC #10). Output conforms to RFC 9309 : LF line endings, no
 /// trailing whitespace, one `User-agent: <name>\nDisallow: /\n\n`
@@ -418,14 +417,22 @@ mod tests {
         let mut names: Vec<&str> = BUILTIN_CRAWLERS.iter().map(|c| c.name).collect();
         names.sort_unstable();
         let unique_count = names.iter().collect::<std::collections::HashSet<_>>().len();
-        assert_eq!(unique_count, names.len(), "duplicate crawler names: {names:?}");
+        assert_eq!(
+            unique_count,
+            names.len(),
+            "duplicate crawler names: {names:?}"
+        );
     }
 
     #[test]
     fn every_pattern_compiles() {
         for crawler in BUILTIN_CRAWLERS {
-            Regex::new(crawler.user_agent_pattern)
-                .unwrap_or_else(|e| panic!("{}: pattern {:?} -> {e}", crawler.name, crawler.user_agent_pattern));
+            Regex::new(crawler.user_agent_pattern).unwrap_or_else(|e| {
+                panic!(
+                    "{}: pattern {:?} -> {e}",
+                    crawler.name, crawler.user_agent_pattern
+                )
+            });
         }
     }
 
@@ -438,7 +445,8 @@ mod tests {
 
     #[test]
     fn ccbot_matches_with_version_suffix() {
-        let m = match_user_agent("CCBot/2.0 (https://commoncrawl.org/faq/)").expect("CCBot should match");
+        let m = match_user_agent("CCBot/2.0 (https://commoncrawl.org/faq/)")
+            .expect("CCBot should match");
         assert_eq!(m.name, "CCBot");
         assert!(matches!(m.verification, Verification::Rdns(_)));
     }
@@ -446,8 +454,12 @@ mod tests {
     #[test]
     fn applebot_extended_alias_matches() {
         // Same regex covers both Applebot and Applebot-Extended.
-        let m1 = match_user_agent("Mozilla/5.0 (Applebot/0.1; +http://www.apple.com/go/applebot)").expect("Applebot should match");
-        let m2 = match_user_agent("Mozilla/5.0 (compatible; Applebot-Extended; +http://www.apple.com/go/applebot)").expect("Applebot-Extended should match");
+        let m1 = match_user_agent("Mozilla/5.0 (Applebot/0.1; +http://www.apple.com/go/applebot)")
+            .expect("Applebot should match");
+        let m2 = match_user_agent(
+            "Mozilla/5.0 (compatible; Applebot-Extended; +http://www.apple.com/go/applebot)",
+        )
+        .expect("Applebot-Extended should match");
         assert_eq!(m1.name, "Applebot");
         assert_eq!(m2.name, "Applebot");
     }
@@ -583,7 +595,10 @@ mod tests {
     #[test]
     fn verification_kind_str() {
         assert_eq!(Verification::Rdns(&[".x.com"]).kind_str(), "rdns");
-        assert_eq!(Verification::IpRanges("openai_gptbot").kind_str(), "ip_ranges");
+        assert_eq!(
+            Verification::IpRanges("openai_gptbot").kind_str(),
+            "ip_ranges"
+        );
         assert_eq!(Verification::UaOnly.kind_str(), "ua_only");
     }
 
@@ -595,7 +610,11 @@ mod tests {
         // to defeat version-wildcard evasions ; the authoritative
         // expanded-size lock lives in lorica-config's
         // `ai_crawler_registry` tests.
-        assert!(BASELINE_UAS.len() >= 20, "BASELINE_UAS too small: {}", BASELINE_UAS.len());
+        assert!(
+            BASELINE_UAS.len() >= 20,
+            "BASELINE_UAS too small: {}",
+            BASELINE_UAS.len()
+        );
     }
 
     #[test]
@@ -620,7 +639,9 @@ mod tests {
             BUILTIN_CRAWLERS.len(),
             BUILTIN_CRAWLER_DESCRIPTORS.len()
         );
-        for (crawler, descriptor) in BUILTIN_CRAWLERS.iter().zip(BUILTIN_CRAWLER_DESCRIPTORS.iter())
+        for (crawler, descriptor) in BUILTIN_CRAWLERS
+            .iter()
+            .zip(BUILTIN_CRAWLER_DESCRIPTORS.iter())
         {
             assert_eq!(
                 crawler.name, descriptor.name,

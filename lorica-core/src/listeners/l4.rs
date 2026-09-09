@@ -385,9 +385,7 @@ impl ListenerEndpoint {
                 // Performance: nested if-let avoids cloning/allocations on each connection accept
                 let verdict = if let Some(digest) = stream.get_socket_digest() {
                     if let Some(peer_addr) = digest.peer_addr() {
-                        self.connection_filter
-                            .try_accept(peer_addr.as_inet())
-                            .await
+                        self.connection_filter.try_accept(peer_addr.as_inet()).await
                     } else {
                         // No peer address available - accept by default
                         super::AcceptVerdict::Accept(None)

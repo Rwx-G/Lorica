@@ -29,7 +29,6 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
 use lorica_cluster::certs::CertBundle;
-use lorica_cluster::messages::{TelemetryPush, TelemetryPushAck};
 use lorica_cluster::enroll::{
     BoxFuture, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, RenewGrant,
     RenewRequest, SessionHandler,
@@ -40,6 +39,7 @@ use lorica_cluster::listener::{
     OperationalStats, PreAuthBudgets,
 };
 use lorica_cluster::messages::{cluster_response, Renew};
+use lorica_cluster::messages::{TelemetryPush, TelemetryPushAck};
 use lorica_cluster::replication::{AppliedConfig, ConfigPayload};
 use lorica_cluster::{
     client_config, enrollment_server_config, join, leaf_spki_sha256, operational_server_config,
@@ -226,7 +226,10 @@ async fn one_token_three_simultaneous_joiners_exactly_one_enrolls() {
     assert_eq!(grant.ca_pem, pki.ca.cert_pem());
 
     // Sequential replay after the win is refused too.
-    assert!(matches!(join(params("joiner-d")).await, Err(JoinError::Refused)));
+    assert!(matches!(
+        join(params("joiner-d")).await,
+        Err(JoinError::Refused)
+    ));
     assert_eq!(stats.enrollments_granted.load(Ordering::Relaxed), 1);
     assert_eq!(stats.enrollments_refused.load(Ordering::Relaxed), 3);
     assert_eq!(handler.refused.load(Ordering::SeqCst), 3);
@@ -237,12 +240,22 @@ async fn one_token_three_simultaneous_joiners_exactly_one_enrolls() {
     let rogue = token::mint(&hmac_key, &other_pin).expect("mint");
     let mut rogue_params = params("joiner-e");
     rogue_params.token = token::parse(&rogue.token).expect("parse");
-    assert!(matches!(join(rogue_params).await, Err(JoinError::Transport(_))));
+    assert!(matches!(
+        join(rogue_params).await,
+        Err(JoinError::Transport(_))
+    ));
     // A wrong expected host is refused the same way.
     let mut wrong_host = params("joiner-f");
     wrong_host.expected_host = "other.internal".to_string();
-    assert!(matches!(join(wrong_host).await, Err(JoinError::Transport(_))));
-    assert_eq!(handler.refused.load(Ordering::SeqCst), 3, "TLS refusals never reach the handler");
+    assert!(matches!(
+        join(wrong_host).await,
+        Err(JoinError::Transport(_))
+    ));
+    assert_eq!(
+        handler.refused.load(Ordering::SeqCst),
+        3,
+        "TLS refusals never reach the handler"
+    );
 
     drop(tokens_tx);
     handle.shutdown();
@@ -279,8 +292,14 @@ impl SessionHandler for RecordingSessionHandler {
     fn on_renew(&self, request: RenewRequest) -> BoxFuture<'_, Result<RenewGrant, String>> {
         Box::pin(async move {
             self.renewals.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(request.node_id, "node-a", "identity comes from the certificate");
-            assert!(request.peer.ip().is_loopback(), "the peer travels with the request");
+            assert_eq!(
+                request.node_id, "node-a",
+                "identity comes from the certificate"
+            );
+            assert!(
+                request.peer.ip().is_loopback(),
+                "the peer travels with the request"
+            );
             Ok(RenewGrant {
                 cert_pem: "-----BEGIN CERTIFICATE-----\nrenewed\n-----END CERTIFICATE-----"
                     .to_string(),
@@ -354,7 +373,10 @@ struct Fleet {
     handle: lorica_cluster::listener::OperationalHandle,
 }
 
-async fn spawn_fleet(pki: &ControlPlanePki, roster_entries: HashMap<String, NodeIdentity>) -> Fleet {
+async fn spawn_fleet(
+    pki: &ControlPlanePki,
+    roster_entries: HashMap<String, NodeIdentity>,
+) -> Fleet {
     let acceptor = Arc::new(SwappableAcceptor::new(Arc::new(
         operational_server_config(pki.ca.cert_pem(), &pki.server_cert, &pki.server_key)
             .expect("config"),
@@ -367,7 +389,8 @@ async fn spawn_fleet(pki: &ControlPlanePki, roster_entries: HashMap<String, Node
     roster.replace(roster_entries);
     let sessions = SessionRegistry::new();
     let handler = Arc::new(RecordingSessionHandler::default());
-    let mut config = OperationalConfig::new(listener, Arc::clone(&acceptor), HandshakeConfig::new(50));
+    let mut config =
+        OperationalConfig::new(listener, Arc::clone(&acceptor), HandshakeConfig::new(50));
     config.fleet = Some(FleetHooks {
         roster: Arc::clone(&roster),
         sessions: Arc::clone(&sessions),
@@ -462,7 +485,10 @@ async fn identity_comes_from_the_certificate_and_unknown_ones_are_dropped() {
     let endpoint = open_session(&pki, &known, fleet.addr)
         .await
         .expect("pending node admitted");
-    eventually("session to register", || fleet.sessions.is_connected("node-a")).await;
+    eventually("session to register", || {
+        fleet.sessions.is_connected("node-a")
+    })
+    .await;
     assert_eq!(
         *fleet.handler.last_established_node.lock().expect("lock"),
         Some(("node-a".to_string(), false))
@@ -516,7 +542,10 @@ async fn identity_comes_from_the_certificate_and_unknown_ones_are_dropped() {
     let endpoint = open_session(&pki, &known, fleet.addr)
         .await
         .expect("re-admitted after the drop");
-    eventually("session to register again", || fleet.sessions.is_connected("node-a")).await;
+    eventually("session to register again", || {
+        fleet.sessions.is_connected("node-a")
+    })
+    .await;
 
     // A reconnect supersedes the older session (newest wins).
     let second = open_session(&pki, &known, fleet.addr)
@@ -526,7 +555,10 @@ async fn identity_comes_from_the_certificate_and_unknown_ones_are_dropped() {
         fleet.stats.sessions_killed.load(Ordering::Relaxed) == 1
     })
     .await;
-    assert!(endpoint.request(ClusterRequest::leave(), Duration::from_secs(2)).await.is_err());
+    assert!(endpoint
+        .request(ClusterRequest::leave(), Duration::from_secs(2))
+        .await
+        .is_err());
     assert!(fleet.sessions.is_connected("node-a"));
 
     // Leave: acknowledged, then the session ends.
@@ -556,11 +588,16 @@ async fn revoked_node_is_refused_at_tls_and_its_session_ends_synchronously() {
     let b = issue_node(&pki, "node-b");
     let fleet = spawn_fleet(
         &pki,
-        HashMap::from([identity(&a, NodeState::Active), identity(&b, NodeState::Active)]),
+        HashMap::from([
+            identity(&a, NodeState::Active),
+            identity(&b, NodeState::Active),
+        ]),
     )
     .await;
 
-    let session_a = open_session(&pki, &a, fleet.addr).await.expect("a admitted");
+    let session_a = open_session(&pki, &a, fleet.addr)
+        .await
+        .expect("a admitted");
     eventually("a to register", || fleet.sessions.is_connected("node-a")).await;
 
     // Revoke a: CRL on the acceptor, roster state, session kill.
@@ -615,10 +652,15 @@ async fn revoked_node_is_refused_at_tls_and_its_session_ends_synchronously() {
         fleet.stats.tls_failures.load(Ordering::Relaxed) == tls_failures_before + 1
     })
     .await;
-    assert_eq!(fleet.stats.identity_refusals.load(Ordering::Relaxed), refusals_before);
+    assert_eq!(
+        fleet.stats.identity_refusals.load(Ordering::Relaxed),
+        refusals_before
+    );
 
     // b is unaffected by a's revocation.
-    let session_b = open_session(&pki, &b, fleet.addr).await.expect("b admitted");
+    let session_b = open_session(&pki, &b, fleet.addr)
+        .await
+        .expect("b admitted");
     eventually("b to register", || fleet.sessions.is_connected("node-b")).await;
     drop(session_b);
     drop(session_a);
@@ -645,7 +687,10 @@ async fn a_superseded_certificate_is_accepted_until_the_new_one_connects() {
     let via_old = open_session(&pki, &old, fleet.addr)
         .await
         .expect("superseded certificate still admitted in its grace window");
-    eventually("session to register", || fleet.sessions.is_connected("node-a")).await;
+    eventually("session to register", || {
+        fleet.sessions.is_connected("node-a")
+    })
+    .await;
     assert_eq!(
         *fleet.handler.last_established_node.lock().expect("lock"),
         Some(("node-a".to_string(), true))
@@ -655,7 +700,12 @@ async fn a_superseded_certificate_is_accepted_until_the_new_one_connects() {
         .await
         .expect("new certificate admitted");
     eventually("handler to see the new-certificate session", || {
-        fleet.handler.last_established_node.lock().expect("lock").as_ref()
+        fleet
+            .handler
+            .last_established_node
+            .lock()
+            .expect("lock")
+            .as_ref()
             == Some(&("node-a".to_string(), false))
     })
     .await;
@@ -676,7 +726,10 @@ async fn a_heartbeat_carries_the_node_s_resource_reading_onto_its_session() {
     let endpoint = open_session(&pki, &node, fleet.addr)
         .await
         .expect("active node admitted");
-    eventually("session to register", || fleet.sessions.is_connected("node-a")).await;
+    eventually("session to register", || {
+        fleet.sessions.is_connected("node-a")
+    })
+    .await;
 
     let reading = lorica_cluster::NodeResources {
         cpu_percent: 37,

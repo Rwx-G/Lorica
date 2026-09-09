@@ -897,9 +897,7 @@ pub const MAX_SLA_TIME_BYTES: usize = 40;
 /// The times are only bounded here; the follower parses them and
 /// falls back to its defaults on a value that does not parse.
 pub fn sla_pull_defect(pull: &SlaPull) -> Option<&'static str> {
-    if pull.route_id.len() > MAX_SLA_ROUTE_ID_BYTES
-        || pull.route_id.chars().any(char::is_control)
-    {
+    if pull.route_id.len() > MAX_SLA_ROUTE_ID_BYTES || pull.route_id.chars().any(char::is_control) {
         return Some("route_id");
     }
     if pull.source != "passive" && pull.source != "active" {
@@ -1073,9 +1071,7 @@ pub const MAX_CONFIG_HASH_BYTES: usize = 64;
 /// registry entry or a comparison.
 pub fn config_hash_is_valid(hash: &str) -> bool {
     hash.len() <= MAX_CONFIG_HASH_BYTES
-        && hash
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Prefix every key digest carries, matching what the canonical blob
@@ -1195,9 +1191,7 @@ pub fn ban_reason_is_valid(reason: &str) -> bool {
 /// shape reaching a filesystem-adjacent name, and no legitimate CA
 /// produces one.
 pub fn challenge_token_is_valid(token: &str) -> bool {
-    !token.is_empty()
-        && token.len() <= MAX_CHALLENGE_TOKEN_BYTES
-        && token.bytes().all(is_base64url)
+    !token.is_empty() && token.len() <= MAX_CHALLENGE_TOKEN_BYTES && token.bytes().all(is_base64url)
 }
 
 /// Whether a peer-supplied key authorization is acceptable: non-empty,
@@ -1405,7 +1399,9 @@ impl ClusterRequest {
 
     /// Drop a staged generation.
     pub fn config_abort(generation: u64) -> Self {
-        Self::with_body(cluster_request::Body::ConfigAbort(ConfigAbort { generation }))
+        Self::with_body(cluster_request::Body::ConfigAbort(ConfigAbort {
+            generation,
+        }))
     }
 
     /// A convergence pull from a follower.
@@ -1675,7 +1671,11 @@ mod tests {
             }
             if let (Some(b), Some((lhs, rhs))) = (&block, line.split_once('=')) {
                 if line.ends_with(';') {
-                    let name = lhs.split_whitespace().last().expect("field name").to_string();
+                    let name = lhs
+                        .split_whitespace()
+                        .last()
+                        .expect("field name")
+                        .to_string();
                     let tag: u32 = rhs
                         .trim()
                         .trim_end_matches(';')
@@ -1818,7 +1818,10 @@ mod tests {
                 }
                 .encode_to_vec()
             ),
-            vec![tag("RenewAck", "cert_pem"), tag("RenewAck", "cert_not_after")]
+            vec![
+                tag("RenewAck", "cert_pem"),
+                tag("RenewAck", "cert_not_after")
+            ]
         );
         for (request, block_field) in [
             (ClusterRequest::enroll(Enroll::default()), "enroll"),
@@ -1828,20 +1831,33 @@ mod tests {
             let mut request = request;
             request.sequence = 1;
             assert_eq!(
-                *field_numbers(&request.encode_to_vec()).last().expect("body"),
+                *field_numbers(&request.encode_to_vec())
+                    .last()
+                    .expect("body"),
                 tag("ClusterRequest", block_field),
                 "{block_field}"
             );
             assert_eq!(request.body_kind, tag("ClusterRequest", block_field));
         }
         for (body, block_field) in [
-            (cluster_response::Body::EnrollAck(EnrollAck::default()), "enroll_ack"),
-            (cluster_response::Body::RenewAck(RenewAck::default()), "renew_ack"),
-            (cluster_response::Body::LeaveAck(LeaveAck::default()), "leave_ack"),
+            (
+                cluster_response::Body::EnrollAck(EnrollAck::default()),
+                "enroll_ack",
+            ),
+            (
+                cluster_response::Body::RenewAck(RenewAck::default()),
+                "renew_ack",
+            ),
+            (
+                cluster_response::Body::LeaveAck(LeaveAck::default()),
+                "leave_ack",
+            ),
         ] {
             let response = ClusterResponse::ok(body);
             assert_eq!(
-                *field_numbers(&response.encode_to_vec()).last().expect("body"),
+                *field_numbers(&response.encode_to_vec())
+                    .last()
+                    .expect("body"),
                 tag("ClusterResponse", block_field),
                 "{block_field}"
             );
@@ -2041,7 +2057,9 @@ mod tests {
             let mut request = request;
             request.sequence = 1;
             assert_eq!(
-                *field_numbers(&request.encode_to_vec()).last().expect("body"),
+                *field_numbers(&request.encode_to_vec())
+                    .last()
+                    .expect("body"),
                 tag("ClusterRequest", block_field),
                 "{block_field}"
             );
@@ -2067,7 +2085,9 @@ mod tests {
         ] {
             let response = ClusterResponse::ok(body);
             assert_eq!(
-                *field_numbers(&response.encode_to_vec()).last().expect("body"),
+                *field_numbers(&response.encode_to_vec())
+                    .last()
+                    .expect("body"),
                 tag("ClusterResponse", block_field),
                 "{block_field}"
             );
@@ -2080,7 +2100,10 @@ mod tests {
             BODY_KIND_CONFIG_COMMIT,
             tag("ClusterRequest", "config_commit")
         );
-        assert_eq!(BODY_KIND_CONFIG_ABORT, tag("ClusterRequest", "config_abort"));
+        assert_eq!(
+            BODY_KIND_CONFIG_ABORT,
+            tag("ClusterRequest", "config_abort")
+        );
         assert_eq!(BODY_KIND_CONFIG_PULL, tag("ClusterRequest", "config_pull"));
 
         // Story 9.5 certificate-distribution bodies.
@@ -2166,7 +2189,9 @@ mod tests {
             let mut request = request;
             request.sequence = 1;
             assert_eq!(
-                *field_numbers(&request.encode_to_vec()).last().expect("body"),
+                *field_numbers(&request.encode_to_vec())
+                    .last()
+                    .expect("body"),
                 tag("ClusterRequest", block_field),
                 "{block_field}"
             );
@@ -2196,7 +2221,9 @@ mod tests {
         ] {
             let response = ClusterResponse::ok(body);
             assert_eq!(
-                *field_numbers(&response.encode_to_vec()).last().expect("body"),
+                *field_numbers(&response.encode_to_vec())
+                    .last()
+                    .expect("body"),
                 tag("ClusterResponse", block_field),
                 "{block_field}"
             );
@@ -2226,19 +2253,22 @@ mod tests {
                 .encode_to_vec()
             ),
             (1..=11)
-                .map(|n| tag("SlaSummaryRow", match n {
-                    1 => "route_id",
-                    2 => "window",
-                    3 => "total_requests",
-                    4 => "successful_requests",
-                    5 => "sla_pct",
-                    6 => "avg_latency_ms",
-                    7 => "p50_latency_ms",
-                    8 => "p95_latency_ms",
-                    9 => "p99_latency_ms",
-                    10 => "target_pct",
-                    _ => "meets_target",
-                }))
+                .map(|n| tag(
+                    "SlaSummaryRow",
+                    match n {
+                        1 => "route_id",
+                        2 => "window",
+                        3 => "total_requests",
+                        4 => "successful_requests",
+                        5 => "sla_pct",
+                        6 => "avg_latency_ms",
+                        7 => "p50_latency_ms",
+                        8 => "p95_latency_ms",
+                        9 => "p99_latency_ms",
+                        10 => "target_pct",
+                        _ => "meets_target",
+                    }
+                ))
                 .collect::<Vec<_>>()
         );
         assert_eq!(BODY_KIND_CERT_PUSH, tag("ClusterRequest", "cert_push"));
@@ -2279,7 +2309,9 @@ mod tests {
             let mut request = request;
             request.sequence = 1;
             assert_eq!(
-                *field_numbers(&request.encode_to_vec()).last().expect("body"),
+                *field_numbers(&request.encode_to_vec())
+                    .last()
+                    .expect("body"),
                 tag("ClusterRequest", block_field),
                 "{block_field}"
             );
@@ -2297,7 +2329,9 @@ mod tests {
         ] {
             let response = ClusterResponse::ok(body);
             assert_eq!(
-                *field_numbers(&response.encode_to_vec()).last().expect("body"),
+                *field_numbers(&response.encode_to_vec())
+                    .last()
+                    .expect("body"),
                 tag("ClusterResponse", block_field),
                 "{block_field}"
             );
@@ -2359,7 +2393,9 @@ mod tests {
         );
         response.body = Some(cluster_response::Body::HeartbeatAck(HeartbeatAck::default()));
         assert_eq!(
-            *field_numbers(&response.encode_to_vec()).last().expect("body"),
+            *field_numbers(&response.encode_to_vec())
+                .last()
+                .expect("body"),
             tag("ClusterResponse", "heartbeat_ack")
         );
 
@@ -2454,7 +2490,9 @@ mod tests {
         assert!(config_hash_is_valid("0123456789abcdef"));
         // Too long, uppercase, or non-hex: refused before the value can
         // reach a log line or a comparison.
-        assert!(!config_hash_is_valid(&"a".repeat(MAX_CONFIG_HASH_BYTES + 1)));
+        assert!(!config_hash_is_valid(
+            &"a".repeat(MAX_CONFIG_HASH_BYTES + 1)
+        ));
         assert!(!config_hash_is_valid("ABCDEF"));
         assert!(!config_hash_is_valid("zz"));
         assert!(!config_hash_is_valid("ab cd"));
@@ -2487,14 +2525,20 @@ mod tests {
         assert!(!cert_id_is_valid("forged\nlog line"));
         assert!(cert_domain_is_valid("edge.example.com"));
         assert!(!cert_domain_is_valid(""));
-        assert!(!cert_domain_is_valid(&"d".repeat(MAX_CERT_DOMAIN_BYTES + 1)));
+        assert!(!cert_domain_is_valid(
+            &"d".repeat(MAX_CERT_DOMAIN_BYTES + 1)
+        ));
         assert!(!cert_domain_is_valid("edge.example.com\r\n"));
     }
 
     #[test]
     fn a_challenge_token_is_held_to_the_alphabet_the_rfc_makes_normative() {
-        assert!(challenge_token_is_valid("LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"));
-        assert!(challenge_token_is_valid(&"a".repeat(MAX_CHALLENGE_TOKEN_BYTES)));
+        assert!(challenge_token_is_valid(
+            "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"
+        ));
+        assert!(challenge_token_is_valid(
+            &"a".repeat(MAX_CHALLENGE_TOKEN_BYTES)
+        ));
         assert!(!challenge_token_is_valid(""));
         assert!(!challenge_token_is_valid(
             &"a".repeat(MAX_CHALLENGE_TOKEN_BYTES + 1)
@@ -2520,7 +2564,9 @@ mod tests {
             &"a".repeat(MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES + 1)
         ));
         assert!(!challenge_key_authorization_is_valid("token thumbprint"));
-        assert!(!challenge_key_authorization_is_valid("token\r\nInjected: 1"));
+        assert!(!challenge_key_authorization_is_valid(
+            "token\r\nInjected: 1"
+        ));
         assert!(!challenge_key_authorization_is_valid("<script>"));
     }
 }

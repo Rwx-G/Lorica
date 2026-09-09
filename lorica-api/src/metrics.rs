@@ -20,12 +20,12 @@
 use axum::extract::Extension;
 use axum::http::header;
 use axum::response::IntoResponse;
-use lorica_metrics::REGISTRY;
-use once_cell::sync::Lazy;
 use lorica_metrics::prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
     IntGaugeVec, TextEncoder,
 };
+use lorica_metrics::REGISTRY;
+use once_cell::sync::Lazy;
 
 use crate::server::AppState;
 
@@ -44,9 +44,7 @@ static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
         "http_request_duration_seconds",
         "HTTP request latency in seconds",
         &["route_id"],
-        vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
-        ],
+        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
     )
 });
 
@@ -1326,13 +1324,10 @@ fn resolve_per_worker_counter(
         "lorica_per_ip_connection_refused_total" => {
             Some((&[], CounterTarget::Scalar(&PER_IP_CONNECTION_REFUSED_TOTAL)))
         }
-        "lorica_cert_resolver_reload_total" => Some((
-            &["result"],
-            CounterTarget::Vec(&CERT_RESOLVER_RELOAD_TOTAL),
-        )),
-        "lorica_ocsp_refresh_total" => {
-            Some((&["result"], CounterTarget::Vec(&OCSP_REFRESH_TOTAL)))
+        "lorica_cert_resolver_reload_total" => {
+            Some((&["result"], CounterTarget::Vec(&CERT_RESOLVER_RELOAD_TOTAL)))
         }
+        "lorica_ocsp_refresh_total" => Some((&["result"], CounterTarget::Vec(&OCSP_REFRESH_TOTAL))),
         "lorica_log_sink_dropped_total" => Some((
             &["sink", "kind"],
             CounterTarget::Vec(&LOG_SINK_DROPPED_TOTAL),
@@ -1434,7 +1429,9 @@ static LOG_SINK_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// Bump the dropped-sink-event counter for `sink` (`"syslog"` /
 /// `"otlp"`) and `kind` (`"access"` / `"waf"` / `"audit"`).
 pub fn inc_log_sink_dropped(sink: &str, kind: &str) {
-    LOG_SINK_DROPPED_TOTAL.with_label_values(&[sink, kind]).inc();
+    LOG_SINK_DROPPED_TOTAL
+        .with_label_values(&[sink, kind])
+        .inc();
 }
 
 /// Counter: events successfully handed to a log-export sink's
@@ -2098,7 +2095,10 @@ mod tests {
             "lorica_cluster_config_apply_total",
             "lorica_cluster_telemetry_ingested_total",
         ] {
-            assert!(names.iter().any(|n| n == expected), "{expected} missing from {names:?}");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} missing from {names:?}"
+            );
         }
         assert!(
             !names.iter().any(|n| n.starts_with("lorica_lorica_")),

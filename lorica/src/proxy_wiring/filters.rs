@@ -23,7 +23,6 @@ use lorica_http::ResponseHeader;
 use lorica_proxy::Session;
 use tracing::{debug, warn};
 
-use crate::ai_bot::build_robots_txt_from_names;
 use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use super::{
     bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest,
@@ -31,6 +30,7 @@ use super::{
     run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome, LoricaProxy, MirrorBodyState,
     MirrorPending, ProxyConfig, RequestCtx, RouteEntry, VerdictCacheEngine, WAF_BODY_SCAN_MAX,
 };
+use crate::ai_bot::build_robots_txt_from_names;
 
 /// Compact a client IP into a `u64` key for the shmem hashtables.
 ///
@@ -735,8 +735,8 @@ impl LoricaProxy {
                     config.flood_threshold_rps / 2
                 };
                 if strict > 0 && config.flood_threshold_rps > strict {
-                    cost = ((config.flood_threshold_rps as f64 / strict as f64).round() as u32)
-                        .max(1);
+                    cost =
+                        ((config.flood_threshold_rps as f64 / strict as f64).round() as u32).max(1);
                 }
             }
         }
@@ -1433,8 +1433,7 @@ impl LoricaProxy {
         // denylist (not denied).
         let client_addr: Option<std::net::IpAddr> = ip.parse().ok();
         if !entry.route.ip_allowlist.is_empty()
-            && !client_addr
-                .is_some_and(|a| entry.ip_allowlist_nets.iter().any(|n| n.contains(&a)))
+            && !client_addr.is_some_and(|a| entry.ip_allowlist_nets.iter().any(|n| n.contains(&a)))
         {
             ctx.block_reason = Some("IP not in allowlist".to_string());
             return self
@@ -1514,10 +1513,7 @@ impl LoricaProxy {
         let registry = ai_bot_merged::handle().load_full();
         let crawler: &MergedCrawler = {
             let req = session.req_header();
-            let ua = req
-                .headers
-                .get("user-agent")
-                .and_then(|v| v.to_str().ok());
+            let ua = req.headers.get("user-agent").and_then(|v| v.to_str().ok());
             match ua.and_then(|ua| MergedCrawler::match_first(&registry, ua)) {
                 Some(c) => c,
                 None => return Ok(None),
@@ -2340,7 +2336,10 @@ mod tests {
             headers,
             vec![
                 ("X-Lorica-Verified-Bot".to_string(), "GPTBot".to_string()),
-                ("X-Lorica-Bot-Verification".to_string(), "ip_ranges".to_string()),
+                (
+                    "X-Lorica-Bot-Verification".to_string(),
+                    "ip_ranges".to_string()
+                ),
             ]
         );
     }
@@ -2381,7 +2380,10 @@ mod tests {
         let headers = verified_bot_headers(&c, false);
         assert_eq!(
             headers,
-            vec![("X-Lorica-Bot-Verification".to_string(), "ua_only".to_string())]
+            vec![(
+                "X-Lorica-Bot-Verification".to_string(),
+                "ua_only".to_string()
+            )]
         );
         assert!(
             !headers

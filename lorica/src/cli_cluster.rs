@@ -57,8 +57,9 @@ const PROBE_VERDICT_WINDOW: Duration = Duration::from_secs(3);
 
 /// Open the node's configuration database the way the service does.
 fn open_store(data_dir: &Path) -> ConfigStore {
-    let key = lorica_config::crypto::EncryptionKey::load_or_create(&data_dir.join("encryption.key"))
-        .unwrap_or_else(|e| fail(format!("failed to load the encryption key: {e}")));
+    let key =
+        lorica_config::crypto::EncryptionKey::load_or_create(&data_dir.join("encryption.key"))
+            .unwrap_or_else(|e| fail(format!("failed to load the encryption key: {e}")));
     ConfigStore::open(&data_dir.join("lorica.db"), Some(key))
         .unwrap_or_else(|e| fail(format!("failed to open the configuration database: {e}")))
 }
@@ -68,7 +69,8 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn install_tls_provider() {
-    let _ = lorica_cluster::tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let _ =
+        lorica_cluster::tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 }
 
 /// `lorica cluster init`: generate the cluster CA and persist it
@@ -133,10 +135,12 @@ fn read_join_token(token_file: Option<&Path>, token_stdin: bool) -> Result<Strin
     {
         return Ok(from_env);
     }
-    Err("no join token: pass --token-file <path>, --token-stdin, or set LORICA_JOIN_TOKEN. \
+    Err(
+        "no join token: pass --token-file <path>, --token-stdin, or set LORICA_JOIN_TOKEN. \
          A token is never accepted on the command line (argv is readable through /proc and \
          lands in shell history and CI logs)."
-        .to_string())
+            .to_string(),
+    )
 }
 
 /// This machine's hostname without a libc binding.
@@ -174,9 +178,9 @@ pub(crate) fn run_cluster_join(
     let enrollment_addr = match enrollment {
         Some(explicit) => explicit,
         None => {
-            let next = port
-                .checked_add(1)
-                .unwrap_or_else(|| fail("the control-plane port has no next port; pass --enrollment"));
+            let next = port.checked_add(1).unwrap_or_else(|| {
+                fail("the control-plane port has no next port; pass --enrollment")
+            });
             join_host_port(host, next)
         }
     };
@@ -186,9 +190,9 @@ pub(crate) fn run_cluster_join(
     // name outside that alphabet could never be selected, so accepting
     // it here would enrol a node that can never receive a certificate
     // key and give the operator no clue why.
-    if let Err(reason) = lorica_config::models::validate_node_selector_names(
-        std::slice::from_ref(&node_name),
-    ) {
+    if let Err(reason) =
+        lorica_config::models::validate_node_selector_names(std::slice::from_ref(&node_name))
+    {
         fail(format!(
             "node name {node_name:?} is not usable in a route selector: {reason}. Pass --name with a name over lowercase letters, digits, '-' and '_'."
         ));
@@ -252,7 +256,11 @@ pub(crate) fn run_cluster_join(
             enrolled_at: Utc::now(),
             cert_not_after,
         })
-        .unwrap_or_else(|e| fail(format!("enrolled, but failed to persist the fleet identity: {e}")));
+        .unwrap_or_else(|e| {
+            fail(format!(
+                "enrolled, but failed to persist the fleet identity: {e}"
+            ))
+        });
     println!(
         "Enrolled as node {} ({}) with status {}; certificate valid until {}.",
         grant.node_id,
@@ -314,28 +322,28 @@ async fn probe_registration(identity: &ClusterIdentity) -> Probe {
         Ok(name) => name,
         Err(e) => return Probe::Unreachable(format!("invalid server name: {e}")),
     };
-    let tcp = match tokio::time::timeout(PROBE_TIMEOUT, resolve_and_connect(&identity.control_plane))
-        .await
-    {
-        Ok(Ok((tcp, _))) => tcp,
-        Ok(Err(e)) => return Probe::Unreachable(e),
-        Err(_) => return Probe::Unreachable("tcp connect timed out".to_string()),
-    };
+    let tcp =
+        match tokio::time::timeout(PROBE_TIMEOUT, resolve_and_connect(&identity.control_plane))
+            .await
+        {
+            Ok(Ok((tcp, _))) => tcp,
+            Ok(Err(e)) => return Probe::Unreachable(e),
+            Err(_) => return Probe::Unreachable("tcp connect timed out".to_string()),
+        };
     // A verdict counts only once the peer is authenticated: an alert
     // that arrives while the handshake is still running comes from
     // whoever answered the connection, not necessarily from the
     // control plane, so it proves nothing.
-    let mut tls = match tokio::time::timeout(PROBE_TIMEOUT, connector.connect(server_name, tcp))
-        .await
-    {
-        Ok(Ok(tls)) => tls,
-        Ok(Err(e)) => {
-            return Probe::Unreachable(format!(
-                "TLS handshake failed before the control plane was authenticated: {e}"
-            ))
-        }
-        Err(_) => return Probe::Unreachable("TLS handshake timed out".to_string()),
-    };
+    let mut tls =
+        match tokio::time::timeout(PROBE_TIMEOUT, connector.connect(server_name, tcp)).await {
+            Ok(Ok(tls)) => tls,
+            Ok(Err(e)) => {
+                return Probe::Unreachable(format!(
+                    "TLS handshake failed before the control plane was authenticated: {e}"
+                ))
+            }
+            Err(_) => return Probe::Unreachable("TLS handshake timed out".to_string()),
+        };
     // TLS 1.3: the server verifies the client certificate after our
     // Finished and answers with an alert on the first read, over a
     // channel whose other end is now the authenticated control plane.
@@ -345,9 +353,13 @@ async fn probe_registration(identity: &ClusterIdentity) -> Probe {
     match tokio::time::timeout(PROBE_VERDICT_WINDOW, tls.read(&mut byte)).await {
         Ok(Err(e)) => match certificate_alert(&e) {
             Some(alert) => Probe::Deregistered(format!("TLS alert {alert:?}")),
-            None => Probe::Unreachable(format!("connection ended without a certificate alert: {e}")),
+            None => {
+                Probe::Unreachable(format!("connection ended without a certificate alert: {e}"))
+            }
         },
-        Ok(Ok(0)) => Probe::Unreachable("connection closed without a certificate alert".to_string()),
+        Ok(Ok(0)) => {
+            Probe::Unreachable("connection closed without a certificate alert".to_string())
+        }
         Ok(Ok(_)) => Probe::Unreachable("unexpected data before the session opener".to_string()),
         Err(_) => Probe::StillRegistered,
     }
@@ -530,7 +542,9 @@ pub(crate) fn run_cluster_status(
     }
 
     let (Some(user), Some(password)) = (user, password) else {
-        println!("(Pass --user and a password source for the live connection state and the roster.)");
+        println!(
+            "(Pass --user and a password source for the live connection state and the roster.)"
+        );
         return;
     };
     runtime().block_on(async {
@@ -627,12 +641,16 @@ pub(crate) fn run_cluster_token(
             .unwrap_or_else(|| fail("token mint: no token in the answer"));
         println!(
             "Join token (shown once; expires at {}):",
-            data.get("expires_at").and_then(|v| v.as_str()).unwrap_or("?")
+            data.get("expires_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
         );
         println!("{token_value}");
         println!();
         println!("On the joining node, hand it over on standard input, never on the command line:");
         println!("  lorica cluster join --control-plane <control-plane-host:port> --token-stdin");
-        println!("The enrollment window stays open until this token is redeemed, revoked or expires.");
+        println!(
+            "The enrollment window stays open until this token is redeemed, revoked or expires."
+        );
     });
 }

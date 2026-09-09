@@ -171,9 +171,9 @@ impl ConfigStore {
                 fresh.to_vec()
             }
         };
-        let key: [u8; TOKEN_HMAC_KEY_LEN] = raw.try_into().map_err(|_| {
-            ConfigError::Validation("stored token key has the wrong length".into())
-        })?;
+        let key: [u8; TOKEN_HMAC_KEY_LEN] = raw
+            .try_into()
+            .map_err(|_| ConfigError::Validation("stored token key has the wrong length".into()))?;
         Ok(key)
     }
 }

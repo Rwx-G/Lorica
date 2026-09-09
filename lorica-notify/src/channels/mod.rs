@@ -439,7 +439,8 @@ mod tests {
         // `smtp_encryption` key at all. Deserialization must land on
         // `SmtpEncryption::Starttls` so existing operators keep the
         // same transport behaviour after upgrade.
-        let json = r#"{"smtp_host":"mail.example.com","from_address":"a@b.com","to_address":"c@d.com"}"#;
+        let json =
+            r#"{"smtp_host":"mail.example.com","from_address":"a@b.com","to_address":"c@d.com"}"#;
         let config = validate_email_config(json).expect("pre-v1.5.2 JSON must still parse");
         assert_eq!(config.smtp_encryption, SmtpEncryption::Starttls);
     }

@@ -130,8 +130,10 @@ pub fn load_platform_certs_incl_env_into_store(ca_certs: &mut RootCertStore) -> 
 /// diagnostic on the server side.
 pub fn validate_certificate_bundle(cert_pem: &str, key_pem: &str) -> Result<()> {
     let ck = crate::cert_resolver::build_certified_key(cert_pem, key_pem, None)?;
-    ck.keys_match()
-        .or_err(ErrorType::InvalidCert, "certificate and private key do not form a matching pair (SubjectPublicKeyInfo mismatch)")?;
+    ck.keys_match().or_err(
+        ErrorType::InvalidCert,
+        "certificate and private key do not form a matching pair (SubjectPublicKeyInfo mismatch)",
+    )?;
     Ok(())
 }
 
@@ -234,9 +236,7 @@ pub fn load_crls_from_file<P: AsRef<Path>>(
     let bytes = read_file(&path)?;
     let crls: Vec<CertificateRevocationListDer<'static>> =
         CertificateRevocationListDer::pem_slice_iter(&bytes)
-            .map(|item_res| {
-                item_res.or_err(ErrorType::InvalidCert, "Failed to load CRL from file")
-            })
+            .map(|item_res| item_res.or_err(ErrorType::InvalidCert, "Failed to load CRL from file"))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .map(|crl| crl.to_owned())

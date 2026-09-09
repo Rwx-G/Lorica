@@ -1215,7 +1215,7 @@ mod tests {
         assert!(rule.pattern.is_match("chunked, chunked"));
         assert!(rule.pattern.is_match("chunked,chunked"));
         assert!(rule.pattern.is_match("CHUNKED, chunked")); // case-insensitive
-        // Legitimate shapes must NOT match
+                                                            // Legitimate shapes must NOT match
         assert!(!rule.pattern.is_match("chunked"));
         assert!(!rule.pattern.is_match("gzip, chunked"));
         assert!(!rule.pattern.is_match("identity"));
@@ -1240,7 +1240,7 @@ mod tests {
         assert!(rule.pattern.is_match("-1"));
         assert!(rule.pattern.is_match("0x10"));
         assert!(rule.pattern.is_match("")); // empty value is also invalid
-        // Legitimate shapes
+                                            // Legitimate shapes
         assert!(!rule.pattern.is_match("0"));
         assert!(!rule.pattern.is_match("1024"));
         assert!(!rule.pattern.is_match("  42  ")); // surrounding whitespace OK

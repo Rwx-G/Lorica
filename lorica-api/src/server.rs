@@ -582,8 +582,11 @@ pub fn build_router(
         // report, the drift view, and the follower's break-glass window.
         .route(
             "/api/v1/cluster/replication",
-            get(crate::cluster::get_replication)
-                .layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
+            get(crate::cluster::get_replication).layer(rl(
+                "cluster_read",
+                RL_CLUSTER_READ,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/cluster/drift",
@@ -604,8 +607,11 @@ pub fn build_router(
         )
         .route(
             "/api/v1/cluster/waf-events",
-            get(crate::cluster::fleet_waf_events)
-                .layer(rl("cluster_read", RL_CLUSTER_READ, RL_WINDOW_S)),
+            get(crate::cluster::fleet_waf_events).layer(rl(
+                "cluster_read",
+                RL_CLUSTER_READ,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/cluster/break-glass",
@@ -809,18 +815,27 @@ pub fn build_router(
         )
         .route(
             "/api/v1/ai-crawlers/custom",
-            post(crate::ai_crawlers::create_custom_crawler)
-                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+            post(crate::ai_crawlers::create_custom_crawler).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/ai-crawlers/custom/{id}",
-            put(crate::ai_crawlers::update_custom_crawler)
-                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+            put(crate::ai_crawlers::update_custom_crawler).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/ai-crawlers/custom/{id}",
-            delete(crate::ai_crawlers::delete_custom_crawler)
-                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+            delete(crate::ai_crawlers::delete_custom_crawler).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/ai-crawlers/builtin",
@@ -857,20 +872,29 @@ pub fn build_router(
         // outbound connection to an operator-configured target.
         .route(
             "/api/v1/settings/otel/test",
-            post(crate::settings::test_otel_connection)
-                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+            post(crate::settings::test_otel_connection).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         // Story 9.8 AC #6. The syslog test emits a real message
         // towards an operator-configured network target.
         .route(
             "/api/v1/settings/syslog/test",
-            post(crate::settings::test_syslog_connection)
-                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+            post(crate::settings::test_syslog_connection).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/settings/otlp-logs/test",
-            post(crate::settings::test_otlp_logs_connection)
-                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+            post(crate::settings::test_otlp_logs_connection).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/dns-providers",
@@ -1288,8 +1312,8 @@ pub async fn start_server(
     // output is the router with a `ConnectInfo<SocketAddr>` extension
     // injected; the manual loop calls it once per accepted connection so
     // handlers keep seeing the peer address (audit logging, rate limits).
-    let mut make_service =
-        build_router(state, session_store, rate_limiter).into_make_service_with_connect_info::<SocketAddr>();
+    let mut make_service = build_router(state, session_store, rate_limiter)
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     let listener: tokio::net::TcpListener = match inherited_listener {
         Some(std_listener) => {

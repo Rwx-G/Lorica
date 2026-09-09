@@ -555,8 +555,7 @@ fn cooldown_from_error_falls_back_to_24h_without_stamp() {
     let now = chrono::Utc::now();
     // Rate-limit URN present but no parseable retry-after stamp.
     let msg = "rateLimited: too many certificates already issued";
-    let cooldown =
-        cooldown_from_error(msg, now).expect("rate-limit error must yield a cooldown");
+    let cooldown = cooldown_from_error(msg, now).expect("rate-limit error must yield a cooldown");
     assert_eq!(cooldown, now + chrono::Duration::hours(24));
 }
 

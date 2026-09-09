@@ -1209,7 +1209,10 @@ mod tests {
                 Duration::from_millis(500),
             )
             .await;
-        assert!(matches!(res, Err(ChannelError::InflightFull)), "got {res:?}");
+        assert!(
+            matches!(res, Err(ChannelError::InflightFull)),
+            "got {res:?}"
+        );
         assert!(matches!(h1.await.unwrap(), Err(ChannelError::Timeout)));
         assert!(matches!(h2.await.unwrap(), Err(ChannelError::Timeout)));
     }

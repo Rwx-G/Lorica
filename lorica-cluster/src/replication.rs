@@ -553,7 +553,9 @@ impl Replicator {
             .break_glass_since
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let first = *since.entry(node_id.to_string()).or_insert_with(Instant::now);
+        let first = *since
+            .entry(node_id.to_string())
+            .or_insert_with(Instant::now);
         if first.elapsed() <= MAX_HONOURED_BREAK_GLASS {
             return true;
         }
@@ -865,14 +867,7 @@ mod tests {
         let (follower_endpoint, follower_incoming) =
             RpcEndpoint::<ClusterFrame>::with_limits(follower_side, cluster_rpc_limits());
         let peer: SocketAddr = PEER.parse().expect("addr");
-        let guard = registry.register(
-            &identity(node_id),
-            peer,
-            cp_endpoint,
-            "1.7.0",
-            50,
-            applied,
-        );
+        let guard = registry.register(&identity(node_id), peer, cp_endpoint, "1.7.0", 50, applied);
         let prepares = Arc::new(AtomicUsize::new(0));
         let commits = Arc::new(AtomicUsize::new(0));
         let aborts = Arc::new(AtomicUsize::new(0));
@@ -1007,7 +1002,10 @@ mod tests {
         assert!(report.committed.is_empty());
         assert_eq!(
             report.rejected,
-            vec![("node-b".to_string(), "unknown field in the blob".to_string())]
+            vec![(
+                "node-b".to_string(),
+                "unknown field in the blob".to_string()
+            )]
         );
         // The node that staged it is told to drop it; nobody committed.
         assert_eq!(good.commits.load(Ordering::SeqCst), 0);
@@ -1117,7 +1115,9 @@ mod tests {
         let accepted = AcceptedConfig::new();
 
         for generation in 1..=2 {
-            let report = replicator.replicate(&registry, &accepted, payload(generation)).await;
+            let report = replicator
+                .replicate(&registry, &accepted, payload(generation))
+                .await;
             assert!(!report.aborted, "a transport failure must not veto a round");
             assert_eq!(report.committed, vec!["node-a"]);
             assert_eq!(report.evicted.len(), 1, "generation {generation}");

@@ -52,10 +52,7 @@ impl From<ClusterRuntimeError> for ApiError {
 /// Run a pure-store closure and keep its error typed: `db_blocking`
 /// collapses everything into `ApiError`, which this layer must not
 /// name on its way out.
-async fn store_op<T, F>(
-    store: &Arc<Mutex<ConfigStore>>,
-    f: F,
-) -> Result<T, ClusterRuntimeError>
+async fn store_op<T, F>(store: &Arc<Mutex<ConfigStore>>, f: F) -> Result<T, ClusterRuntimeError>
 where
     F: FnOnce(&mut ConfigStore) -> Result<T, ConfigError> + Send + 'static,
     T: Send + 'static,
@@ -196,9 +193,7 @@ impl DriftTracker {
         // own once the node has been quiet longer than its current
         // interval, which is what "back to normal" should mean.
         let instant_now = Instant::now();
-        backoff.retain(|id, (next_allowed, _)| {
-            drifted.contains(id) || instant_now < *next_allowed
-        });
+        backoff.retain(|id, (next_allowed, _)| drifted.contains(id) || instant_now < *next_allowed);
         let mut due = Vec::new();
         for id in drifted {
             first_seen.entry(id.clone()).or_insert(now);
@@ -331,12 +326,17 @@ pub async fn distribute_certificate(
     // Three ways to have nothing to push, told apart because they mean
     // very different things to an operator watching an issuance.
     let Some(cert) = cert else {
-        tracing::warn!(cert_id, "certificate vanished between issuance and distribution");
+        tracing::warn!(
+            cert_id,
+            "certificate vanished between issuance and distribution"
+        );
         return;
     };
     if cert.key_pem.is_empty() {
-        tracing::error!(cert_id,
-            "certificate carries no private key; nothing to distribute");
+        tracing::error!(
+            cert_id,
+            "certificate carries no private key; nothing to distribute"
+        );
         return;
     }
     if recipients.is_empty() {
@@ -350,7 +350,12 @@ pub async fn distribute_certificate(
         .await;
     for (node_id, count) in &report.installed {
         crate::metrics::inc_cluster_cert_push_by(node_id, "pushed", *count);
-        tracing::info!(node_id, cert_id, installed = count, "certificate key pushed");
+        tracing::info!(
+            node_id,
+            cert_id,
+            installed = count,
+            "certificate key pushed"
+        );
     }
     for (node_id, reason) in &report.failed {
         // One certificate went into this round, so one certificate is
@@ -662,7 +667,13 @@ mod tests {
         // Once the interval has genuinely elapsed, it fires again and
         // the interval doubles, up to the cap.
         let elapse = |tracker: &DriftTracker| {
-            tracker.backoff.lock().expect("map").get_mut("a").expect("entry").0 = Instant::now();
+            tracker
+                .backoff
+                .lock()
+                .expect("map")
+                .get_mut("a")
+                .expect("entry")
+                .0 = Instant::now();
         };
         elapse(&tracker);
         assert_eq!(tracker.observe(&a, later), a);
@@ -681,7 +692,8 @@ mod tests {
     #[test]
     fn store_errors_keep_their_http_identity_through_the_runtime_error() {
         use axum::response::IntoResponse;
-        let absent: ApiError = ClusterRuntimeError::Store(ConfigError::NotFound("node".into())).into();
+        let absent: ApiError =
+            ClusterRuntimeError::Store(ConfigError::NotFound("node".into())).into();
         assert_eq!(
             absent.into_response().status(),
             axum::http::StatusCode::NOT_FOUND

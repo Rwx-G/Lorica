@@ -255,7 +255,10 @@ impl AttemptWindow {
     /// Sources currently tracked (bounded by `max_entries`).
     #[cfg(test)]
     fn tracked_sources(&self) -> usize {
-        self.attempts.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.attempts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 }
 
@@ -299,7 +302,10 @@ mod tests {
         let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x020a));
         let plain: IpAddr = "192.0.2.10".parse().expect("v4");
         assert_eq!(source_key(mapped), source_key(plain));
-        assert_eq!(source_key(plain), SourceKey::V4(Ipv4Addr::new(192, 0, 2, 10)));
+        assert_eq!(
+            source_key(plain),
+            SourceKey::V4(Ipv4Addr::new(192, 0, 2, 10))
+        );
     }
 
     #[test]
@@ -328,7 +334,10 @@ mod tests {
         let t0 = std::time::Instant::now();
         assert!(limiter.allow_at(a, t0));
         assert!(limiter.allow_at(a, t0 + Duration::from_secs(1)));
-        assert!(!limiter.allow_at(a, t0 + Duration::from_secs(2)), "third in the window");
+        assert!(
+            !limiter.allow_at(a, t0 + Duration::from_secs(2)),
+            "third in the window"
+        );
         // Refusals do not extend the penalty: once the first attempt
         // ages out (at exactly the window), one slot frees while the
         // second attempt still counts.

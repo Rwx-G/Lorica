@@ -2063,10 +2063,7 @@ mod tests_stream {
         assert_eq!(input.len(), res.unwrap());
 
         assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
-        assert_eq!(
-            http_stream.get_header("Server").unwrap(),
-            "lorica Foo: Bar"
-        );
+        assert_eq!(http_stream.get_header("Server").unwrap(), "lorica Foo: Bar");
 
         let input = b"HTTP/1.1 200 OK\r\nServer : lorica\r\n\t  Fizz: Buzz\r\n\r\n";
         let mock_io = Builder::new().read(&input[..]).build();

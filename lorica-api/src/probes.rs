@@ -241,7 +241,15 @@ pub async fn delete_probe(
     state.notify_config_changed();
 
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::audit::record(&state, &audit_ctx, "probe.delete", ("probe", &id), None, None).await;
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "probe.delete",
+        ("probe", &id),
+        None,
+        None,
+    )
+    .await;
 
     Ok(json_data(serde_json::json!({"deleted": id})))
 }

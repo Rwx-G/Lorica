@@ -188,9 +188,7 @@ impl CertResolver {
 
         let skipped = skipped_domains.len();
         if skipped > 0 {
-            warn!(
-                "cert resolver: {skipped}/{total} certificate(s) skipped due to load errors"
-            );
+            warn!("cert resolver: {skipped}/{total} certificate(s) skipped due to load errors");
         }
 
         let domains = map.len();
@@ -225,8 +223,7 @@ impl CertResolver {
     /// swaps staples, and the two never block each other on the network.
     pub fn refresh_staples(&self, staples: &HashMap<String, Vec<u8>>) -> RefreshStats {
         let current = self.inner.load();
-        let mut map: HashMap<String, Vec<CertEntry>> =
-            HashMap::with_capacity(current.certs.len());
+        let mut map: HashMap<String, Vec<CertEntry>> = HashMap::with_capacity(current.certs.len());
         let mut refreshed: usize = 0;
         let mut unchanged: usize = 0;
 
@@ -235,8 +232,7 @@ impl CertResolver {
                 let rebuilt: Vec<CertEntry> = entries
                     .iter()
                     .map(|e| {
-                        let mut ck =
-                            CertifiedKey::new(e.key.cert.clone(), Arc::clone(&e.key.key));
+                        let mut ck = CertifiedKey::new(e.key.cert.clone(), Arc::clone(&e.key.key));
                         ck.ocsp = Some(ocsp.clone());
                         CertEntry {
                             key: Arc::new(ck),
@@ -768,7 +764,10 @@ mod tests {
         assert_eq!(stats.refreshed, 2, "primary + SAN domain keys refreshed");
         assert_eq!(stats.unchanged, 0);
         assert_eq!(resolver.domain_count(), 2, "domain set is unchanged");
-        assert_eq!(resolver.staple_for("stapled.example.com"), Some(fresh.clone()));
+        assert_eq!(
+            resolver.staple_for("stapled.example.com"),
+            Some(fresh.clone())
+        );
         assert_eq!(resolver.staple_for("alt.example.com"), Some(fresh));
     }
 

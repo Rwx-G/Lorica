@@ -377,7 +377,9 @@ where
     type Rejection = Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self(parts.extensions.get::<ConnectInfo<SocketAddr>>().cloned()))
+        Ok(Self(
+            parts.extensions.get::<ConnectInfo<SocketAddr>>().cloned(),
+        ))
     }
 }
 
@@ -540,14 +542,16 @@ pub async fn list_audit(
     // chain and keeps the single-node floor exactly (Epic 9 close,
     // backlog #73 decided). A standalone install or a follower holds
     // one chain, so nothing changes there.
-    let aggregates = matches!(state.cluster, crate::cluster::ClusterRuntime::ControlPlane(_));
+    let aggregates = matches!(
+        state.cluster,
+        crate::cluster::ClusterRuntime::ControlPlane(_)
+    );
     if aggregates
         && params.node.as_deref() != Some("")
         && session.role < lorica_config::models::Role::SuperAdmin
     {
         return Err(ApiError::Forbidden(
-            "the fleet's audit trail is SuperAdmin; pass node= (empty) for this node's own"
-                .into(),
+            "the fleet's audit trail is SuperAdmin; pass node= (empty) for this node's own".into(),
         ));
     }
     let Some(log_store) = state.log_store.clone() else {

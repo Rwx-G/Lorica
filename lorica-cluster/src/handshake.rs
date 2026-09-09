@@ -200,7 +200,9 @@ pub async fn serve_hello(
             Ok(Ok((ack, hello)))
         }
         Err(status) => {
-            incoming.reply_frame(ClusterResponse::refusal(status)).await?;
+            incoming
+                .reply_frame(ClusterResponse::refusal(status))
+                .await?;
             Ok(Err(status))
         }
     }
@@ -278,7 +280,9 @@ mod tests {
             Err(ClusterStatus::ProtocolViolation)
         );
         assert_eq!(
-            HandshakeConfig::new(1).with_build_version("1.7.0").build_version,
+            HandshakeConfig::new(1)
+                .with_build_version("1.7.0")
+                .build_version,
             "1.7.0"
         );
     }

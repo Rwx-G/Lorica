@@ -457,12 +457,17 @@ mod tests {
         let found = families
             .iter()
             .any(|mf| mf.name() == "lorica_metrics_unit_helper_total");
-        assert!(found, "registered counter must appear with lorica namespace");
+        assert!(
+            found,
+            "registered counter must appear with lorica namespace"
+        );
     }
 
     #[test]
     fn snapshot_then_apply_aggregates_and_is_delta_based() {
-        let _guard = SNAPSHOT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SNAPSHOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_generic_counter_snapshot_for_test();
 
         // A labelled counter owned "by the caller" - here a local
@@ -515,7 +520,9 @@ mod tests {
 
     #[test]
     fn apply_handles_label_less_scalar() {
-        let _guard = SNAPSHOT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SNAPSHOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_generic_counter_snapshot_for_test();
 
         static TEST_SCALAR: Lazy<IntCounter> =
@@ -533,12 +540,20 @@ mod tests {
         let before = TEST_SCALAR.get();
         apply_worker_generic_counters(
             7,
-            &[("lorica_metrics_unit_scalar_total".to_string(), Vec::new(), 4)],
+            &[(
+                "lorica_metrics_unit_scalar_total".to_string(),
+                Vec::new(),
+                4,
+            )],
             resolve,
         );
         apply_worker_generic_counters(
             8,
-            &[("lorica_metrics_unit_scalar_total".to_string(), Vec::new(), 6)],
+            &[(
+                "lorica_metrics_unit_scalar_total".to_string(),
+                Vec::new(),
+                6,
+            )],
             resolve,
         );
         assert_eq!(TEST_SCALAR.get(), before + 10);
@@ -546,11 +561,17 @@ mod tests {
 
     #[test]
     fn forget_worker_resets_its_delta_baseline() {
-        let _guard = SNAPSHOT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SNAPSHOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_generic_counter_snapshot_for_test();
 
         static TEST_VEC: Lazy<IntCounterVec> = Lazy::new(|| {
-            register_int_counter_vec("metrics_unit_forget_total", "forget unit test", &["route_id"])
+            register_int_counter_vec(
+                "metrics_unit_forget_total",
+                "forget unit test",
+                &["route_id"],
+            )
         });
 
         fn resolve(name: &str) -> Option<(&'static [&'static str], CounterTarget)> {

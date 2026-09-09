@@ -276,7 +276,10 @@ pub async fn get_route_sla_buckets(
     if let Some(node) = foreign_node(&query.node) {
         let pull = SlaPull {
             route_id,
-            source: query.source.clone().unwrap_or_else(|| "passive".to_string()),
+            source: query
+                .source
+                .clone()
+                .unwrap_or_else(|| "passive".to_string()),
             from: query.from.clone().unwrap_or_default(),
             to: query.to.clone().unwrap_or_default(),
             buckets: true,

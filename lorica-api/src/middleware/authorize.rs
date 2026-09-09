@@ -74,9 +74,7 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
     // actions, not the Operator floor the local ban endpoints use.
     // READING the fan-in view falls through to the Viewer floor every
     // other cluster read uses.
-    if path == "/api/v1/cluster/bans"
-        && method != http::Method::GET
-        && method != http::Method::HEAD
+    if path == "/api/v1/cluster/bans" && method != http::Method::GET && method != http::Method::HEAD
     {
         return Role::SuperAdmin;
     }
@@ -213,8 +211,7 @@ pub fn follower_local_request(method: &http::Method, path: &str) -> bool {
     ];
     const PROBE_SCOPED: &[&str] = &["/api/v1/notifications/", "/api/v1/dns-providers/"];
     let is_probe = PROBE_EXACT.contains(&path)
-        || (path.ends_with("/test")
-            && PROBE_SCOPED.iter().any(|prefix| path.starts_with(prefix)));
+        || (path.ends_with("/test") && PROBE_SCOPED.iter().any(|prefix| path.starts_with(prefix)));
     PREFIXES.iter().any(|p| path.starts_with(p)) || EXACT.contains(&path) || is_probe
 }
 
@@ -314,15 +311,27 @@ mod tests {
             (Method::POST, "/api/v1/loadtest/abort", "LoadTest.svelte"),
             // components/settings-tabs/ExportImportTab.svelte,
             // `$canWriteRole` on Download TOML
-            (Method::POST, "/api/v1/config/export", "ExportImportTab.svelte"),
+            (
+                Method::POST,
+                "/api/v1/config/export",
+                "ExportImportTab.svelte",
+            ),
             // routes/Security.svelte, `$isSuperAdminRole` on Verify
             (Method::POST, "/api/v1/audit/verify", "Security.svelte"),
             // routes/Settings.svelte, `$isSuperAdminRole` on the tab
             (Method::POST, "/api/v1/users", "Settings.svelte"),
             // routes/Cluster.svelte, `superAdminRole` on the two ways
             // out of read-only mode
-            (Method::POST, "/api/v1/cluster/break-glass", "Cluster.svelte"),
-            (Method::DELETE, "/api/v1/cluster/break-glass", "Cluster.svelte"),
+            (
+                Method::POST,
+                "/api/v1/cluster/break-glass",
+                "Cluster.svelte",
+            ),
+            (
+                Method::DELETE,
+                "/api/v1/cluster/break-glass",
+                "Cluster.svelte",
+            ),
             (Method::POST, "/api/v1/cluster/leave", "Cluster.svelte"),
         ] {
             assert!(
@@ -401,7 +410,10 @@ mod tests {
 
     #[test]
     fn users_endpoints_are_super_admin_for_all_methods() {
-        assert_eq!(required_role(&Method::GET, "/api/v1/users"), Role::SuperAdmin);
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/users"),
+            Role::SuperAdmin
+        );
         assert_eq!(
             required_role(&Method::POST, "/api/v1/users"),
             Role::SuperAdmin
@@ -415,7 +427,10 @@ mod tests {
     #[test]
     fn reads_are_viewer_accessible() {
         assert_eq!(required_role(&Method::GET, "/api/v1/routes"), Role::Viewer);
-        assert_eq!(required_role(&Method::GET, "/api/v1/settings"), Role::Viewer);
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/settings"),
+            Role::Viewer
+        );
         assert_eq!(required_role(&Method::GET, "/api/v1/logs/ws"), Role::Viewer);
     }
 
@@ -434,7 +449,10 @@ mod tests {
 
     #[test]
     fn mutations_default_to_operator() {
-        assert_eq!(required_role(&Method::POST, "/api/v1/routes"), Role::Operator);
+        assert_eq!(
+            required_role(&Method::POST, "/api/v1/routes"),
+            Role::Operator
+        );
         assert_eq!(
             required_role(&Method::DELETE, "/api/v1/bans/1.2.3.4"),
             Role::Operator

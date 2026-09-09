@@ -378,7 +378,9 @@ mod tests {
     #[tokio::test]
     async fn test_session_store_create_and_get() {
         let store = test_store().await;
-        let sid = store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
+        let sid = store
+            .create("user-1".into(), "admin".into(), Role::SuperAdmin)
+            .await;
         let session = store.get(&sid).await.expect("test setup");
         assert_eq!(session.user_id, "user-1");
         assert_eq!(session.username, "admin");
@@ -393,7 +395,9 @@ mod tests {
     #[tokio::test]
     async fn test_session_store_remove() {
         let store = test_store().await;
-        let sid = store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
+        let sid = store
+            .create("user-1".into(), "admin".into(), Role::SuperAdmin)
+            .await;
         store.remove(&sid).await;
         // Allow spawned DB task to complete
         tokio::task::yield_now().await;
@@ -403,7 +407,9 @@ mod tests {
     #[tokio::test]
     async fn test_session_store_expires_at() {
         let store = test_store().await;
-        let sid = store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
+        let sid = store
+            .create("user-1".into(), "admin".into(), Role::SuperAdmin)
+            .await;
         let expires = store.expires_at(&sid).await;
         assert!(expires.is_some());
         assert!(expires.expect("test setup") > Utc::now());
@@ -437,7 +443,9 @@ mod tests {
         let store = test_store().await;
 
         // Insert a valid session
-        let valid_sid = store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
+        let valid_sid = store
+            .create("user-1".into(), "admin".into(), Role::SuperAdmin)
+            .await;
 
         // Insert an expired session
         let expired_sid = Uuid::new_v4().to_string();
@@ -466,7 +474,9 @@ mod tests {
     #[tokio::test]
     async fn test_purge_expired_returns_zero_when_none_expired() {
         let store = test_store().await;
-        store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
+        store
+            .create("user-1".into(), "admin".into(), Role::SuperAdmin)
+            .await;
         assert_eq!(store.purge_expired().await, 0);
     }
 
@@ -476,7 +486,9 @@ mod tests {
             ConfigStore::open_in_memory().expect("test setup"),
         ));
         let store = SessionStore::new(db.clone()).await;
-        let sid = store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
+        let sid = store
+            .create("user-1".into(), "admin".into(), Role::SuperAdmin)
+            .await;
 
         // Verify session exists in database
         let db_lock = db.lock().await;
@@ -494,7 +506,9 @@ mod tests {
 
         // Create a session with the first store instance
         let store1 = SessionStore::new(db.clone()).await;
-        let sid = store1.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
+        let sid = store1
+            .create("user-1".into(), "admin".into(), Role::SuperAdmin)
+            .await;
         drop(store1);
 
         // Create a new store instance (simulates restart)

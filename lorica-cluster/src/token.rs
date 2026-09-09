@@ -237,9 +237,21 @@ mod tests {
         assert_eq!(parsed.public_id, minted.public_id);
         assert_eq!(parsed.pin, pin);
         assert!(verify_secret(&key, &parsed.secret, &minted.secret_hmac));
-        assert!(!verify_secret(&[8u8; 32], &parsed.secret, &minted.secret_hmac));
-        assert!(!verify_secret(&key, &[0u8; SECRET_LEN], &minted.secret_hmac));
-        assert!(!verify_secret(&key, &parsed.secret, &dummy_secret_hmac_hex()));
+        assert!(!verify_secret(
+            &[8u8; 32],
+            &parsed.secret,
+            &minted.secret_hmac
+        ));
+        assert!(!verify_secret(
+            &key,
+            &[0u8; SECRET_LEN],
+            &minted.secret_hmac
+        ));
+        assert!(!verify_secret(
+            &key,
+            &parsed.secret,
+            &dummy_secret_hmac_hex()
+        ));
         assert!(!verify_secret(&key, &parsed.secret, "not hex"));
         // The token never contains the secret's HMAC or padding.
         assert!(!minted.token.contains(&minted.secret_hmac));

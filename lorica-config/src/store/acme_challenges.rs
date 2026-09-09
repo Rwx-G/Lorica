@@ -136,7 +136,9 @@ mod tests {
         // would be exactly the leak AC #6 closes.
         let later = now + Duration::minutes(6);
         assert_eq!(
-            store.get_acme_challenge("tok", later).expect("read succeeds"),
+            store
+                .get_acme_challenge("tok", later)
+                .expect("read succeeds"),
             None,
             "an expired challenge must not be served even before the purge runs"
         );

@@ -323,12 +323,21 @@ fn test_url_decode_form_overlong_utf8_neutralised() {
     // surfaces U+FFFD instead, so an attacker cannot smuggle a
     // NUL past `\0`-anchored signatures via overlong encoding.
     let decoded = WafEngine::url_decode_form("%C0%80");
-    assert!(!decoded.contains('\0'), "overlong NUL must not decode to a real NUL");
-    assert!(decoded.contains('\u{FFFD}'), "overlong NUL must surface as REPLACEMENT CHARACTER");
+    assert!(
+        !decoded.contains('\0'),
+        "overlong NUL must not decode to a real NUL"
+    );
+    assert!(
+        decoded.contains('\u{FFFD}'),
+        "overlong NUL must surface as REPLACEMENT CHARACTER"
+    );
 
     // Same for `%C0%BC` (overlong `<`) - must NOT decode to `<`.
     let decoded = WafEngine::url_decode_form("%C0%BC");
-    assert!(!decoded.contains('<'), "overlong `<` must not decode to a real `<`");
+    assert!(
+        !decoded.contains('<'),
+        "overlong `<` must not decode to a real `<`"
+    );
 }
 
 #[test]
@@ -474,7 +483,10 @@ fn test_clean_request_passes_with_custom_rule_loaded() {
         WafMode::Blocking,
         "/api/v1/users/42",
         Some("page=1&limit=20"),
-        &[("user-agent", "Mozilla/5.0"), ("accept", "application/json")],
+        &[
+            ("user-agent", "Mozilla/5.0"),
+            ("accept", "application/json"),
+        ],
         "example.com",
         "10.0.0.1",
     );
@@ -987,7 +999,10 @@ fn test_header_scoped_dispatch_case_insensitive() {
 #[test]
 fn test_header_scoped_disable_takes_effect() {
     let e = engine();
-    assert!(e.disable_rule(920140), "disable_rule must accept scoped IDs");
+    assert!(
+        e.disable_rule(920140),
+        "disable_rule must accept scoped IDs"
+    );
     let verdict = e.evaluate(
         WafMode::Blocking,
         "/",

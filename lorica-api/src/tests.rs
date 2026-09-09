@@ -462,7 +462,10 @@ async fn test_login_disabled_account_returns_401() {
         .await
         .expect("test setup");
     let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
-    assert_eq!(json["error"]["message"], "unauthorized: invalid credentials");
+    assert_eq!(
+        json["error"]["message"],
+        "unauthorized: invalid credentials"
+    );
 }
 
 #[tokio::test]
@@ -649,16 +652,37 @@ async fn test_viewer_reads_settings_without_the_log_pipeline_topology() {
     )
     .await;
 
-    let resp = send(&state, &session_store, &rate_limiter, "GET", "/api/v1/settings", &viewer, None).await;
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/settings",
+        &viewer,
+        None,
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK, "the floor stays Viewer");
     let body = body_json(resp).await;
     assert!(body["data"]["syslog_endpoint"].is_null());
     assert!(body["data"]["syslog_extra_sd"].is_null());
     assert!(body["data"]["otlp_endpoint"].is_null());
 
-    let resp = send(&state, &session_store, &rate_limiter, "GET", "/api/v1/settings", &admin, None).await;
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/settings",
+        &admin,
+        None,
+    )
+    .await;
     let body = body_json(resp).await;
-    assert_eq!(body["data"]["syslog_endpoint"], "siem.internal.example.org:6514");
+    assert_eq!(
+        body["data"]["syslog_endpoint"],
+        "siem.internal.example.org:6514"
+    );
 }
 
 #[tokio::test]
@@ -682,7 +706,16 @@ async fn test_fleet_audit_trail_is_super_admin_and_the_local_chain_stays_operato
         ("/api/v1/audit?node=some-other-node", StatusCode::FORBIDDEN),
         ("/api/v1/audit?node=", StatusCode::OK),
     ] {
-        let resp = send(&state, &session_store, &rate_limiter, "GET", uri, &operator, None).await;
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            uri,
+            &operator,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), expected, "{uri}");
     }
 }
@@ -809,7 +842,10 @@ async fn test_users_crud_super_admin_flow() {
         .await
         .expect("test setup");
     let created: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
-    let ops_id = created["data"]["id"].as_str().expect("test setup").to_string();
+    let ops_id = created["data"]["id"]
+        .as_str()
+        .expect("test setup")
+        .to_string();
     assert_eq!(created["data"]["role"], "operator");
     assert!(created["data"].get("password_hash").is_none());
 
@@ -1653,7 +1689,9 @@ async fn test_certificate_update_cert_only_with_mismatched_keypair_returns_400()
         .expect("test setup")
         .to_lowercase();
     assert!(
-        msg.contains("matching") || msg.contains("mismatch") || msg.contains("subjectpublickeyinfo"),
+        msg.contains("matching")
+            || msg.contains("mismatch")
+            || msg.contains("subjectpublickeyinfo"),
         "expected SPKI-mismatch diagnostic, got: {msg}"
     );
 }
@@ -1922,24 +1960,22 @@ async fn test_logs_endpoint_with_entries() {
     // Push some log entries
     use crate::logs::LogEntry;
     for i in 1..=3 {
-        state
-            .log_buffer
-            .push(LogEntry {
-                id: 0,
-                timestamp: format!("2026-01-0{i}T00:00:00Z"),
-                method: "GET".into(),
-                path: format!("/path{i}"),
-                host: "example.com".into(),
-                status: 200,
-                latency_ms: 10,
-                backend: "10.0.0.1:8080".into(),
-                error: None,
-                client_ip: String::new(),
-                is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
-            });
+        state.log_buffer.push(LogEntry {
+            id: 0,
+            timestamp: format!("2026-01-0{i}T00:00:00Z"),
+            method: "GET".into(),
+            path: format!("/path{i}"),
+            host: "example.com".into(),
+            status: 200,
+            latency_ms: 10,
+            backend: "10.0.0.1:8080".into(),
+            error: None,
+            client_ip: String::new(),
+            is_xff: false,
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
+        });
     }
 
     let router = app(state, session_store, rate_limiter);
@@ -1973,42 +2009,38 @@ async fn test_logs_endpoint_filtering() {
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
-    state
-        .log_buffer
-        .push(LogEntry {
-            id: 0,
-            timestamp: "2026-01-01T00:00:00Z".into(),
-            method: "GET".into(),
-            path: "/ok".into(),
-            host: "example.com".into(),
-            status: 200,
-            latency_ms: 10,
-            backend: "10.0.0.1:8080".into(),
-            error: None,
-            client_ip: String::new(),
-            is_xff: false,
-            xff_proxy_ip: String::new(),
-            source: String::new(),
-            request_id: String::new(),
-        });
-    state
-        .log_buffer
-        .push(LogEntry {
-            id: 0,
-            timestamp: "2026-01-01T00:00:01Z".into(),
-            method: "POST".into(),
-            path: "/error".into(),
-            host: "other.com".into(),
-            status: 500,
-            latency_ms: 50,
-            backend: "10.0.0.2:8080".into(),
-            error: Some("internal error".into()),
-            client_ip: String::new(),
-            is_xff: false,
-            xff_proxy_ip: String::new(),
-            source: String::new(),
-            request_id: String::new(),
-        });
+    state.log_buffer.push(LogEntry {
+        id: 0,
+        timestamp: "2026-01-01T00:00:00Z".into(),
+        method: "GET".into(),
+        path: "/ok".into(),
+        host: "example.com".into(),
+        status: 200,
+        latency_ms: 10,
+        backend: "10.0.0.1:8080".into(),
+        error: None,
+        client_ip: String::new(),
+        is_xff: false,
+        xff_proxy_ip: String::new(),
+        source: String::new(),
+        request_id: String::new(),
+    });
+    state.log_buffer.push(LogEntry {
+        id: 0,
+        timestamp: "2026-01-01T00:00:01Z".into(),
+        method: "POST".into(),
+        path: "/error".into(),
+        host: "other.com".into(),
+        status: 500,
+        latency_ms: 50,
+        backend: "10.0.0.2:8080".into(),
+        error: Some("internal error".into()),
+        client_ip: String::new(),
+        is_xff: false,
+        xff_proxy_ip: String::new(),
+        source: String::new(),
+        request_id: String::new(),
+    });
 
     // Filter by route
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -2050,24 +2082,22 @@ async fn test_clear_logs_endpoint() {
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
-    state
-        .log_buffer
-        .push(LogEntry {
-            id: 0,
-            timestamp: "2026-01-01T00:00:00Z".into(),
-            method: "GET".into(),
-            path: "/".into(),
-            host: "example.com".into(),
-            status: 200,
-            latency_ms: 5,
-            backend: "10.0.0.1:8080".into(),
-            error: None,
-            client_ip: String::new(),
-            is_xff: false,
-            xff_proxy_ip: String::new(),
-            source: String::new(),
-            request_id: String::new(),
-        });
+    state.log_buffer.push(LogEntry {
+        id: 0,
+        timestamp: "2026-01-01T00:00:00Z".into(),
+        method: "GET".into(),
+        path: "/".into(),
+        host: "example.com".into(),
+        status: 200,
+        latency_ms: 5,
+        backend: "10.0.0.1:8080".into(),
+        error: None,
+        client_ip: String::new(),
+        is_xff: false,
+        xff_proxy_ip: String::new(),
+        source: String::new(),
+        request_id: String::new(),
+    });
 
     // Clear logs
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -2105,24 +2135,22 @@ async fn test_logs_endpoint_status_range() {
 
     use crate::logs::LogEntry;
     for (status, path) in [(200, "/ok"), (301, "/redir"), (404, "/miss"), (500, "/err")] {
-        state
-            .log_buffer
-            .push(LogEntry {
-                id: 0,
-                timestamp: "2026-01-01T00:00:00Z".into(),
-                method: "GET".into(),
-                path: path.into(),
-                host: "test.com".into(),
-                status,
-                latency_ms: 5,
-                backend: "10.0.0.1:80".into(),
-                error: None,
-                client_ip: String::new(),
-                is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
-            });
+        state.log_buffer.push(LogEntry {
+            id: 0,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            method: "GET".into(),
+            path: path.into(),
+            host: "test.com".into(),
+            status,
+            latency_ms: 5,
+            backend: "10.0.0.1:80".into(),
+            error: None,
+            client_ip: String::new(),
+            is_xff: false,
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
+        });
     }
 
     // Filter 4xx-5xx
@@ -2148,42 +2176,38 @@ async fn test_logs_endpoint_time_range() {
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
-    state
-        .log_buffer
-        .push(LogEntry {
-            id: 0,
-            timestamp: "2026-01-01T10:00:00Z".into(),
-            method: "GET".into(),
-            path: "/old".into(),
-            host: "test.com".into(),
-            status: 200,
-            latency_ms: 5,
-            backend: "10.0.0.1:80".into(),
-            error: None,
-            client_ip: String::new(),
-            is_xff: false,
-            xff_proxy_ip: String::new(),
-            source: String::new(),
-            request_id: String::new(),
-        });
-    state
-        .log_buffer
-        .push(LogEntry {
-            id: 0,
-            timestamp: "2026-01-01T15:00:00Z".into(),
-            method: "GET".into(),
-            path: "/new".into(),
-            host: "test.com".into(),
-            status: 200,
-            latency_ms: 5,
-            backend: "10.0.0.1:80".into(),
-            error: None,
-            client_ip: String::new(),
-            is_xff: false,
-            xff_proxy_ip: String::new(),
-            source: String::new(),
-            request_id: String::new(),
-        });
+    state.log_buffer.push(LogEntry {
+        id: 0,
+        timestamp: "2026-01-01T10:00:00Z".into(),
+        method: "GET".into(),
+        path: "/old".into(),
+        host: "test.com".into(),
+        status: 200,
+        latency_ms: 5,
+        backend: "10.0.0.1:80".into(),
+        error: None,
+        client_ip: String::new(),
+        is_xff: false,
+        xff_proxy_ip: String::new(),
+        source: String::new(),
+        request_id: String::new(),
+    });
+    state.log_buffer.push(LogEntry {
+        id: 0,
+        timestamp: "2026-01-01T15:00:00Z".into(),
+        method: "GET".into(),
+        path: "/new".into(),
+        host: "test.com".into(),
+        status: 200,
+        latency_ms: 5,
+        backend: "10.0.0.1:80".into(),
+        error: None,
+        client_ip: String::new(),
+        is_xff: false,
+        xff_proxy_ip: String::new(),
+        source: String::new(),
+        request_id: String::new(),
+    });
 
     // Filter: only entries from 12:00 onwards
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -2210,24 +2234,22 @@ async fn test_logs_endpoint_limit_and_after_id() {
 
     use crate::logs::LogEntry;
     for i in 1..=10 {
-        state
-            .log_buffer
-            .push(LogEntry {
-                id: 0,
-                timestamp: format!("2026-01-01T00:00:{:02}Z", i),
-                method: "GET".into(),
-                path: format!("/p{i}"),
-                host: "test.com".into(),
-                status: 200,
-                latency_ms: 5,
-                backend: "10.0.0.1:80".into(),
-                error: None,
-                client_ip: String::new(),
-                is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
-            });
+        state.log_buffer.push(LogEntry {
+            id: 0,
+            timestamp: format!("2026-01-01T00:00:{:02}Z", i),
+            method: "GET".into(),
+            path: format!("/p{i}"),
+            host: "test.com".into(),
+            status: 200,
+            latency_ms: 5,
+            backend: "10.0.0.1:80".into(),
+            error: None,
+            client_ip: String::new(),
+            is_xff: false,
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
+        });
     }
 
     // Limit to 3
@@ -2417,7 +2439,9 @@ async fn test_get_settings_scrubs_bot_hmac_secret_hex_when_set() {
         "non-empty secret must surface the REDACTED sentinel"
     );
     assert!(
-        !body.windows(secret_hex.len()).any(|w| w == secret_hex.as_bytes()),
+        !body
+            .windows(secret_hex.len())
+            .any(|w| w == secret_hex.as_bytes()),
         "raw hex must not appear anywhere in the response body"
     );
     // Sanity : an unrelated field is still present.
@@ -2592,7 +2616,10 @@ async fn test_update_settings_scrape_token_sentinel_round_trip() {
     };
 
     // Echoing the sentinel leaves the token unchanged.
-    assert_eq!(put_token(serde_json::json!("**REDACTED**")).await, StatusCode::OK);
+    assert_eq!(
+        put_token(serde_json::json!("**REDACTED**")).await,
+        StatusCode::OK
+    );
     {
         let s = state.store.lock().await;
         assert_eq!(
@@ -2605,7 +2632,10 @@ async fn test_update_settings_scrape_token_sentinel_round_trip() {
     }
 
     // A fresh value overwrites.
-    assert_eq!(put_token(serde_json::json!("rotated-token")).await, StatusCode::OK);
+    assert_eq!(
+        put_token(serde_json::json!("rotated-token")).await,
+        StatusCode::OK
+    );
     {
         let s = state.store.lock().await;
         assert_eq!(
@@ -2725,7 +2755,9 @@ async fn test_dns_provider_credentials_never_returned() {
         .await
         .expect("test setup");
     assert!(
-        !created.windows(secret.len()).any(|w| w == secret.as_bytes()),
+        !created
+            .windows(secret.len())
+            .any(|w| w == secret.as_bytes()),
         "create response must not echo the raw credential"
     );
 
@@ -3532,7 +3564,13 @@ async fn test_session_purge_expired() {
     let store = SessionStore::new(Arc::new(Mutex::new(db))).await;
 
     // Create a session
-    let sid = store.create("user1".into(), "admin".into(), lorica_config::models::Role::SuperAdmin).await;
+    let sid = store
+        .create(
+            "user1".into(),
+            "admin".into(),
+            lorica_config::models::Role::SuperAdmin,
+        )
+        .await;
 
     // Nothing expired yet
     assert_eq!(store.purge_expired().await, 0);
@@ -6101,10 +6139,17 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let minted = body_json(resp).await;
     let token_value = minted["data"]["token"].as_str().expect("token").to_string();
-    let public_id = minted["data"]["public_id"].as_str().expect("public id").to_string();
+    let public_id = minted["data"]["public_id"]
+        .as_str()
+        .expect("public id")
+        .to_string();
     assert!(token_value.starts_with(&format!("{public_id}.")));
     assert_eq!(minted["data"]["bound_node_name"], "edge-1");
-    assert_eq!(*liveness.borrow_and_update(), 1, "the enrollment window opened");
+    assert_eq!(
+        *liveness.borrow_and_update(),
+        1,
+        "the enrollment window opened"
+    );
     // The token pins the control plane's leaf SPKI.
     let parsed = lorica_cluster::token::parse(&token_value).expect("parse");
     assert_eq!(
@@ -6164,7 +6209,11 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(*liveness.borrow_and_update(), 0, "the enrollment window closed");
+    assert_eq!(
+        *liveness.borrow_and_update(),
+        0,
+        "the enrollment window closed"
+    );
     let resp = send(
         &state,
         &session_store,
@@ -6233,7 +6282,11 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["data"]["status"], "active");
     assert_eq!(
-        control.control.roster.lookup(&"ab".repeat(32)).map(|n| n.state),
+        control
+            .control
+            .roster
+            .lookup(&"ab".repeat(32))
+            .map(|n| n.state),
         Some(lorica_cluster::NodeState::Active),
         "the roster is reloaded after activation"
     );
@@ -6267,7 +6320,11 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
         "a revocation names the keys it cannot take back: {body}"
     );
     assert_eq!(
-        control.control.roster.lookup(&"ab".repeat(32)).map(|n| n.state),
+        control
+            .control
+            .roster
+            .lookup(&"ab".repeat(32))
+            .map(|n| n.state),
         Some(lorica_cluster::NodeState::Revoked)
     );
     let resp = send(
@@ -6298,7 +6355,10 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
         "revoking twice is idempotent (re-runs CRL rebuild and session kill)"
     );
     let body = body_json(resp).await;
-    assert_eq!(body["data"]["newly_revoked"], false, "the row had already flipped");
+    assert_eq!(
+        body["data"]["newly_revoked"], false,
+        "the row had already flipped"
+    );
     {
         let store = state.store.lock().await;
         let serials: Vec<String> = store
@@ -6481,7 +6541,11 @@ async fn test_follower_read_only_gate_and_break_glass_window() {
             Some(serde_json::json!({ "duration_s": duration })),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "duration {duration}");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "duration {duration}"
+        );
     }
 
     // Open it: the response says so, and it is persisted so a restart

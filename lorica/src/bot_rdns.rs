@@ -118,8 +118,8 @@ impl RdnsResolver {
         // own `NetError` instead of `std::io::Error` ; map back
         // to `io::Error::other` so the public signature stays
         // stable for callers (audit L-15 dep bump).
-        let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()
-            .map_err(std::io::Error::other)?;
+        let (config, mut opts) =
+            hickory_resolver::system_conf::read_system_conf().map_err(std::io::Error::other)?;
         // Short timeouts — a stuck DNS server must not wedge the
         // background populate task. Two retries + 2 s each = ≤ 6 s
         // end-to-end per lookup, well inside the tokio spawn's
