@@ -602,6 +602,21 @@ pub(crate) fn validate_cluster_listen(
                     "--cluster-advertise `{name}`: expected a hostname or IP address"
                 ));
             }
+            // A `host:port` here is the mistake worth catching, because
+            // nothing downstream catches it: the value becomes the SAN
+            // of the control-plane leaf, a joining node checks that SAN
+            // against the host it dialled, and the two can never match.
+            // The fleet then refuses every join with a TLS verification
+            // failure that names neither the cause nor this flag.
+            //
+            // An IPv6 literal is full of colons, so the test is "does
+            // it parse as an address" first, and only then "does it
+            // look like someone appended a port".
+            if name.parse::<std::net::IpAddr>().is_err() && name.contains(':') {
+                return Err(format!(
+                    "--cluster-advertise `{name}`: expected a host, without a port.                      This value becomes the control-plane certificate's SAN and is                      matched against the host a joining node dials"
+                ));
+            }
             name.to_string()
         }
         None => operational.ip().to_string(),
@@ -1135,5 +1150,34 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    /// The first run of the `cluster` e2e profile passed
+    /// `--cluster-advertise lorica-cp:9444`. It was accepted, became the
+    /// control-plane leaf's SAN, and every join then failed with a TLS
+    /// verification error that named neither the cause nor the flag.
+    #[test]
+    fn advertise_name_refuses_a_port_but_not_an_ipv6_literal() {
+        let err = validate_cluster_listen(
+            "192.0.2.10:9444",
+            None,
+            Some("cp.example.com:9444"),
+            RESERVED,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("without a port"), "{err}");
+        assert!(err.contains("SAN"), "the message names the consequence: {err}");
+
+        // An IPv6 literal is full of colons and is a valid SAN.
+        let binds = validate_cluster_listen(
+            "192.0.2.10:9444",
+            None,
+            Some("2001:db8::10"),
+            RESERVED,
+            false,
+        )
+        .expect("an IPv6 literal is an address, not a host:port");
+        assert_eq!(binds.advertise_host, "2001:db8::10");
     }
 }
