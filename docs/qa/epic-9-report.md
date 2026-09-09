@@ -16,13 +16,14 @@ fan-in with one verifiable chain per node, a fleet dashboard, and the
 two log sinks (RFC 5424 syslog, OTLP logs) that were the other half of
 the PRD.
 
-Overall gate: **PASS.** Every story is Done. One acceptance criterion
-is knowingly short and is put to the operator in section 7 rather than
-hidden: Story 9.7 AC #5 asks for the node filter on the SLA page too,
-and it is deliberately not built (decision D17), because no SLA data
-fans in and a fleet percentile cannot be computed from minute buckets.
-Everything else in the PRD is implemented, audited per story, audited
-again as one system at the close, and verified end to end.
+Overall gate: **PASS.** Every story is Done and every acceptance
+criterion is met. The one that was short at the first close, Story
+9.7 AC #5 on the SLA page, was put to the operator with its options
+(section 7) and delivered on their decision as a per-node read rather
+than a fleet aggregate, because no SLA data fans in and a fleet
+percentile cannot be computed from minute buckets. Everything in the
+PRD is implemented, audited per story, audited again as one system at
+the close, and verified end to end.
 
 The epic's Integration Verification ran for the first time only at the
 close, in a new `cluster` Docker e2e profile (control plane plus two
@@ -44,7 +45,7 @@ Story status:
 | 9.4 | Configuration replication | Done |
 | 9.5 | Control-plane certificate issuance | Done |
 | 9.6 | Telemetry fan-in | Done |
-| 9.7 | Fleet dashboard | Done (AC #5 short on SLA, see section 7) |
+| 9.7 | Fleet dashboard | Done (AC #5 on SLA delivered as a per-node read, section 7) |
 | 9.8 | Syslog sink and OTLP logs signal | Done |
 | 9.9 | Fleet-wide audit trail | Done |
 
@@ -100,7 +101,7 @@ Top findings across the epic, ranked by what they would have cost:
 | Frontend `npm audit` (production) | node:22 Docker | 0 vulnerabilities (vite bumped for the dev-only advisories) |
 | Docker e2e, base + workers suites | `tests-e2e-docker/run.sh --build` | 348/348 (single-process) and 90/90 (workers), green |
 | Docker e2e, profiles (bot, cert-export, geoip, otel, rdns, ai-bot, rbac, audit, hot-upgrade, log-sinks, acme) | same run | cert-export 39, ai-bot 52 + 49 (workers), rbac 37 + 37 (workers), audit 17, hot-upgrade 29, log-sinks 23, acme 15, all green |
-| Docker e2e, `cluster` profile (Epic 9 IV) | same run | 47/47: enrolment, activation, gauges, replication, follower 409, telemetry fan-in, a real HTTP-01 order validated through the selected follower, need-to-know key distribution (installed on edge-a, absent on edge-b), audit fan-in with three verified chains, break-glass open/close, revocation of both followers with `certificates_to_reissue` |
+| Docker e2e, `cluster` profile (Epic 9 IV) | same run | final run 63/63 (the load phase, the per-node SLA read on both followers, and the end-to-end 200s through the replicated route added); first close 47/47: enrolment, activation, gauges, replication, follower 409, telemetry fan-in, a real HTTP-01 order validated through the selected follower, need-to-know key distribution (installed on edge-a, absent on edge-b), audit fan-in with three verified chains, break-glass open/close, revocation of both followers with `certificates_to_reissue` |
 
 ## 3. Per-story results
 
@@ -223,6 +224,9 @@ applied without exception across nine stories.
 | `--data-dir` after the subcommand, a `tee` pipeline swallowing a failed join, a missing `COPY` in the runner image, shared-volume permissions | e2e | harness | first runs |
 | The audit profile read verify's pre-9.9 shape; the cluster smoke bound the certificate to a route id the API ignores; `run.sh`'s readiness probe passed `/shared/...` through Git Bash path conversion and never succeeded on a Windows host | e2e | harness | the close's full runs |
 | Cluster reads on the 30-per-minute mutation bucket answered 429 to the dashboard and the smoke within a minute (a regression of the close's own limiter fix) | api | product | cluster smoke, second run |
+| Every `lorica_cluster_*` metric family was exported as `lorica_lorica_cluster_*` (registered with the prefix the registry already adds), since Story 9.2; the documented names never matched a scrape | 9.2-9.6 | product | the load phase, the first test to read a fleet metric |
+| The smoke referenced its backend by a made-up id the API does not honour, so the replicated route had no backend and answered 502 everywhere; nothing asserted a request's status through it | e2e | test | the load phase's SLA read (zero successful requests) |
+| The session cookie is `Path=/api`, so a cookie jar (and a browser) never sends it to `/metrics`; the documented "session or bearer" holds only for an explicit header (backlog #80) | 8.8 | product doc | the load phase's counter read |
 
 ## 6. Cross-cutting findings
 
@@ -249,11 +253,12 @@ applied without exception across nine stories.
   convergence resting on a follower's own claim; revocation cutting
   access and not possession. Each is in `docs/cluster.md` as it holds.
 
-## 7. Decision for the operator: Story 9.7 AC #5 on the SLA page
+## 7. Story 9.7 AC #5 on the SLA page: the decision and what was built
 
-AC #5 asks for the node filter on Access Logs, Security AND SLA. It is
-built on the first two and deliberately not on SLA. Three reasons,
-arbitrated between a web-practices agent and a code agent (D17):
+AC #5 asks for the node filter on Access Logs, Security AND SLA. At
+the first close it was built on the first two and deliberately not on
+SLA. Three reasons, arbitrated between a web-practices agent and a
+code agent (D17):
 
 1. No SLA data fans in. Buckets are mutable (a minute's row is updated
    until the minute closes), which does not fit the id-cursor drain
@@ -267,14 +272,42 @@ arbitrated between a web-practices agent and a code agent (D17):
    follower's SLA history; #68: passive SLA is last-writer-wins across
    workers). Fixing those comes before fanning the data in.
 
-Options, in the order recommended: (a) accept the criterion as short
-and record it in the PRD as deferred with #67/#68 as prerequisites;
-(b) build a per-node (never aggregated) SLA view in v1.8.0 once the
-buckets ship over a snapshot-class channel; (c) insist on v1.7.0
-scope, in which case the honest deliverable is a per-node picker that
-shows one node's own SLA fetched from that node, which needs a
-control-plane-to-follower read proxy that does not exist. The release
-does not wait on this decision.
+The options put to the operator were (a) accept the criterion as
+short and defer with #67/#68 as prerequisites, (b) a per-node SLA view
+in v1.8.0 over a snapshot-class channel, (c) a per-node picker in
+v1.7.0 reading one node's own SLA through a control-plane-to-follower
+read. **The operator chose (c)**, and it is built (D22): a `SlaPull` /
+`SlaPullAck` pair on protocol tag 42, served by the follower from its
+own store through the same code the local handlers run; `?node=` on
+the four SLA reads at the Operator floor, 409 when the node holds no
+session; the node filter in single-node mode on the SLA page (`''` is
+this node, no "all nodes" because there is no aggregate); the wire
+corpus, the tag test and the `cluster` e2e (overview, per-route
+windows and raw buckets of a follower read through the control plane
+after the load phase, and the control plane's own figure left
+untouched) pin it. Nothing is aggregated, and the page says so.
+
+### The fan-in envelope, measured (backlog #64)
+
+The cluster profile now ends its telemetry section with a load phase:
+both followers drive their own proxy with the built-in load-test engine
+at 300 requests a second for 60 seconds (about 18 000 access rows each;
+the workers-mode follower answers 404 because the route selects the
+other node, which changes nothing for fan-in). Across the close's runs
+on the development workstation the control plane had ingested between
+95 % and 100 % of each node's rows at the moment the load stopped and
+was caught up within 7 seconds, with zero rows shed by the per-node
+quota. `docs/cluster.md` quotes this as one data point at the
+envelope's per-node rate, not as the ceiling; #64 stays open for a run
+on production-class hardware.
+
+That phase also found three things no other test had: the fifteen
+`lorica_cluster_*` metric families were exported with the namespace
+twice (a product defect since Story 9.2), the session cookie never
+reaches `/metrics` from a cookie jar or a browser (backlog #80), and
+the profile's own route had had no backend since its first run
+(`backends` instead of `backend_ids`), so every request through it was
+a 502 that nothing asserted on.
 
 ## 8. Backlog raised by the epic
 
@@ -285,9 +318,13 @@ fan-in on the shared `access-log.db` connection, measure first), #76
 quota), #78 (the drift alert takes a follower's break-glass claim at
 its word), #79 (`refresh_control_plane` under the store lock). Resolved
 at the close: #62 (version line), #61(f) (rate limiter on the cluster
-reads), #66 (the profile, with the Pebble caveat closed). Rewritten:
-#52 (`lorica-fleet` before `lorica-obs`), #64 (the instrument), #72
-(the two mitigations that did not exist).
+reads), #66 (the profile, with the Pebble caveat closed), #64 (the
+envelope measured by the load phase), and the three policy entries
+decided as one set on the operator's call: #54 (sink topology withheld
+from a Viewer), #69 (fleet reads at Operator), #73 (fleet audit trail
+at SuperAdmin, the node's own chain unchanged). Rewritten: #52
+(`lorica-fleet` before `lorica-obs`), #72 (the two mitigations that did
+not exist).
 
 ## 9. Recommendations
 
@@ -299,8 +336,10 @@ reads), #66 (the profile, with the Pebble caveat closed). Rewritten:
 - **Operator spot-checks:** the dashboard's Cluster page against a
   real fleet in a browser (the e2e drives the API, not the DOM), and
   the revocation banner after revoking a node that held a key.
+- **Migration note, second:** fleet reads need Operator and the
+  fleet audit trail SuperAdmin from 1.7.0; a Viewer account that
+  scripted the roster or the fan-in views needs Operator.
 - **Next cycle, in order:** the restart phase in the `cluster` profile
   (#77), the `lorica-fleet` extraction at the top of the cycle (#52),
-  the load phase that turns the fan-in ceiling from derived into
-  measured (#64), then the policy decisions deferred as one set
-  (#54/#69/#73).
+  then the measurement on production-class hardware to replace the
+  workstation figure below (#64's second half).
