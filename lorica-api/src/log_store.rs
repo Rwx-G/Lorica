@@ -227,6 +227,17 @@ impl LogStore {
             "ALTER TABLE audit_log ADD COLUMN origin_id INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // When a fanned-in row ARRIVED, set by this store, never by the
+        // origin. Retention cuts fanned-in chains on it rather than on
+        // `timestamp`, which is a string the origin node chose: a
+        // node stamping its rows in the far future would otherwise
+        // hold them here forever (Epic 9 close, security audit). Empty
+        // on local rows and on rows written before the column existed;
+        // retention falls back to `timestamp` for those.
+        let _ = conn.execute(
+            "ALTER TABLE audit_log ADD COLUMN received_at TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_audit_log_node ON audit_log(node_id, origin_id)",
             [],
@@ -237,7 +248,7 @@ impl LogStore {
         // fan-in insert idempotent, so a batch re-sent after a lost
         // acknowledgement stores nothing twice.
         let _ = conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_log_origin              ON audit_log(node_id, origin_id) WHERE node_id != ''",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_log_origin ON audit_log(node_id, origin_id) WHERE node_id != ''",
             [],
         );
 
@@ -1378,6 +1389,7 @@ impl LogStore {
         let tx = conn
             .transaction()
             .map_err(|e| format!("failed to open the audit fan-in transaction: {e}"))?;
+        let received_at = chrono::Utc::now().to_rfc3339();
         let mut stored = 0u64;
         {
             let mut stmt = tx
@@ -1385,8 +1397,8 @@ impl LogStore {
                     "INSERT OR IGNORE INTO audit_log (timestamp, operator_username,
                         operator_role, action, target_type, target_id,
                         before_payload_hash, after_payload_hash, ip, user_agent,
-                        prev_chain_hash, chain_hash, node_id, origin_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        prev_chain_hash, chain_hash, node_id, origin_id, received_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 )
                 .map_err(|e| format!("failed to prepare the audit fan-in insert: {e}"))?;
             for row in rows {
@@ -1406,6 +1418,7 @@ impl LogStore {
                         row.chain_hash,
                         node_id,
                         row.origin_id,
+                        received_at,
                     ])
                     .map_err(|e| format!("failed to store a fanned-in audit row: {e}"))?
                     as u64;
@@ -1612,6 +1625,19 @@ impl LogStore {
 
     /// Every node id that has rows in the aggregate, `""` included.
     ///
+    /// Test-only: rewrite when a fanned-in row arrived, so retention
+    /// tests can age rows without sleeping through a retention window.
+    #[cfg(test)]
+    pub(crate) fn backdate_arrival(&self, node_id: &str, origin_id: i64, received_at: &str) {
+        self.conn
+            .lock()
+            .execute(
+                "UPDATE audit_log SET received_at = ?1 WHERE node_id = ?2 AND origin_id = ?3",
+                params![received_at, node_id, origin_id],
+            )
+            .expect("test setup: backdate a fanned-in row");
+    }
+
     /// The input to a verify that reports per node: an operator asking
     /// "is the fleet's audit trail intact" needs one answer per chain,
     /// and there is no other list of which chains exist.
@@ -1644,9 +1670,15 @@ impl LogStore {
         use rusqlite::OptionalExtension;
         let conn = self.conn.lock();
 
+        // A row's age is when THIS store received it, for a fanned-in
+        // row, and its own timestamp for a local one (the same clock).
+        // `received_at` is empty on rows older than the column, which
+        // fall back to `timestamp`; both are RFC 3339 UTC, so the
+        // string comparison is chronological.
+        const AGE: &str = "COALESCE(NULLIF(received_at, ''), timestamp)";
         let doomed: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM audit_log WHERE timestamp < ?1",
+                &format!("SELECT COUNT(*) FROM audit_log WHERE {AGE} < ?1"),
                 params![cutoff_timestamp],
                 |row| row.get(0),
             )
@@ -1702,7 +1734,7 @@ impl LogStore {
             let cut: Option<i64> = conn
                 .query_row(
                     &format!(
-                        "SELECT MAX({position}) FROM audit_log WHERE node_id = ?1 AND timestamp < ?2"
+                        "SELECT MAX({position}) FROM audit_log WHERE node_id = ?1 AND {AGE} < ?2"
                     ),
                     params![node_id, cutoff_timestamp],
                     |row| row.get(0),
@@ -2015,17 +2047,49 @@ mod fleet_audit_tests {
     }
 
     #[test]
-    fn retention_cuts_a_chain_as_a_prefix_of_its_own_order() {
-        // A fanned-in chain is ordered by the origin's id; its
-        // timestamps are that node's own. When the two disagree,
-        // deleting by timestamp alone takes a row out of the MIDDLE and
-        // verify then reports tampering caused by a retention pass.
+    fn a_far_future_timestamp_does_not_keep_a_fanned_in_row_forever() {
+        // The origin chooses `timestamp`; this store chooses when the
+        // row arrived. Retention ages a fanned-in row by the latter,
+        // so a node stamping its rows in 2999 cannot hold the control
+        // plane's database hostage.
         let (store, _dir) = store();
-        let mut rows = origin_chain(&["a.one", "a.two", "a.three"]);
-        // That node's clock stepped: the SECOND row is the old one.
-        rows[1].timestamp = "2026-01-01T00:00:00Z".to_string();
+        let mut rows = origin_chain(&["a.one", "a.two"]);
+        for row in &mut rows {
+            row.timestamp = "2999-01-01T00:00:00Z".to_string();
+        }
         let rebuilt = rechain(rows);
         store.insert_fanned_in_audit("node-a", &rebuilt).expect("fan-in");
+
+        // A cutoff a minute from now is after the arrival time of
+        // every row and before their own stamp.
+        let cutoff = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+        let deleted = store.enforce_audit_retention(&cutoff).expect("retention");
+        assert_eq!(deleted, 2, "both rows aged out by arrival time");
+        assert_eq!(
+            store.audit_node_ids().expect("chains"),
+            Vec::<String>::new(),
+            "nothing of that chain survives"
+        );
+    }
+
+    #[test]
+    fn retention_cuts_a_chain_as_a_prefix_of_its_own_order() {
+        // A fanned-in chain is ordered by the origin's id and aged by
+        // when each row ARRIVED here; its timestamps are that node's
+        // own and play no part. Deleting by any per-row predicate
+        // would take a row out of the MIDDLE and verify would then
+        // report tampering caused by a retention pass, so the cut is
+        // a prefix: the last expired row and everything before it.
+        let (store, _dir) = store();
+        let mut rows = origin_chain(&["a.one", "a.two", "a.three"]);
+        // The origin stamps its FIRST row in the far future; that
+        // must not keep it.
+        rows[0].timestamp = "2999-01-01T00:00:00Z".to_string();
+        let rebuilt = rechain(rows);
+        store.insert_fanned_in_audit("node-a", &rebuilt).expect("fan-in");
+        // The first two rows arrived long ago, the third just now.
+        store.backdate_arrival("node-a", 1, "2026-01-01T00:00:00Z");
+        store.backdate_arrival("node-a", 2, "2026-01-01T00:00:01Z");
 
         store
             .enforce_audit_retention("2026-06-01T00:00:00Z")
@@ -2207,10 +2271,9 @@ mod fleet_audit_tests {
         store.insert_audit(&old).expect("local old");
         store.insert_audit(&local_entry("route.delete")).expect("local new");
 
-        let mut rows = origin_chain(&["a.one", "a.two"]);
-        rows[0].timestamp = "2026-01-01T00:00:00Z".to_string();
-        let rebuilt = rechain(rows);
-        store.insert_fanned_in_audit("node-a", &rebuilt).expect("fan-in");
+        let rows = origin_chain(&["a.one", "a.two"]);
+        store.insert_fanned_in_audit("node-a", &rows).expect("fan-in");
+        store.backdate_arrival("node-a", 1, "2026-01-01T00:00:00Z");
 
         let deleted = store
             .enforce_audit_retention("2026-06-01T00:00:00Z")
