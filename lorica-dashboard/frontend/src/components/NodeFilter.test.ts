@@ -21,18 +21,17 @@ function status(role: ClusterStatus['role']): ClusterStatus {
 }
 
 function node(id: string, name: string, state: 'pending' | 'active' | 'revoked') {
+  // FLAT, matching `#[serde(flatten)]` on the server's registry row.
   return {
-    node: {
-      node_id: id,
-      name,
-      status: state,
-      version: '1.7.0',
-      schema_version: 1,
-      applied_config_generation: 4,
-      applied_config_hash: 'abc',
-      last_seen_at: null,
-      enrolled_at: '2026-09-09T00:00:00Z',
-    },
+    node_id: id,
+    name,
+    status: state,
+    version: '1.7.0',
+    schema_version: 1,
+    applied_config_generation: 4,
+    applied_config_hash: 'abc',
+    last_seen_at: null,
+    enrolled_at: '2026-09-09T00:00:00Z',
     connected: true,
     session_peer: null,
     session_last_seen_unix: null,

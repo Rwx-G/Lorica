@@ -70,7 +70,7 @@
   }
 
   $effect(() => {
-    const id = selected?.node.node_id ?? null;
+    const id = selected?.node_id ?? null;
     if (id === null) {
       drawerLoadedFor = null;
       return;
@@ -200,7 +200,7 @@
       // Keep the open drawer pointing at fresh data rather than a
       // snapshot from whenever it was opened.
       if (selected) {
-        selected = nodes.find((n) => n.node.node_id === selected?.node.node_id) ?? null;
+        selected = nodes.find((n) => n.node_id === selected?.node_id) ?? null;
       }
     }
     loading = false;
@@ -217,12 +217,12 @@
   });
 
   async function activate(node: ClusterNodeResponse) {
-    const res = await api.activateClusterNode(node.node.node_id);
+    const res = await api.activateClusterNode(node.node_id);
     if (res.error) {
       showToast(res.error.message, 'error');
       return;
     }
-    showToast(`${node.node.name} activated`);
+    showToast(`${node.name} activated`);
     await load();
   }
 
@@ -230,13 +230,13 @@
     const node = revoking;
     revoking = null;
     if (!node) return;
-    const res = await api.revokeClusterNode(node.node.node_id);
+    const res = await api.revokeClusterNode(node.node_id);
     if (res.error) {
       showToast(res.error.message, 'error');
       return;
     }
-    showToast(`${node.node.name} revoked`);
-    if (selected?.node.node_id === node.node.node_id) selected = null;
+    showToast(`${node.name} revoked`);
+    if (selected?.node_id === node.node_id) selected = null;
     await load();
   }
 
@@ -272,8 +272,8 @@
   }
 
   function driftedFrom(node: ClusterNodeResponse): boolean {
-    if (!status || node.node.status !== 'active') return false;
-    return node.node.applied_config_generation !== status.applied_config_generation;
+    if (!status || node.status !== 'active') return false;
+    return node.applied_config_generation !== status.applied_config_generation;
   }
 
   function relative(iso: string | null): string {
@@ -338,14 +338,14 @@
         </tr>
       </thead>
       <tbody>
-        {#each nodes as n (n.node.node_id)}
+        {#each nodes as n (n.node_id)}
           <tr class="row" onclick={() => (selected = n)}>
             <td>
               <button class="link-btn" onclick={(e) => { e.stopPropagation(); selected = n; }}>
-                {n.node.name}
+                {n.name}
               </button>
             </td>
-            <td><span class="pill pill-{n.node.status}">{n.node.status}</span></td>
+            <td><span class="pill pill-{n.status}">{n.status}</span></td>
             <td>
               {#if n.connected}
                 <span class="pill pill-ok">connected</span>
@@ -353,17 +353,17 @@
                 <span class="pill pill-off">offline</span>
               {/if}
             </td>
-            <td>{n.node.version || '-'}</td>
-            <td>{n.node.schema_version}</td>
+            <td>{n.version || '-'}</td>
+            <td>{n.schema_version}</td>
             <td>
-              {n.node.applied_config_generation}
+              {n.applied_config_generation}
               {#if driftedFrom(n)}
                 <span class="pill pill-warn" title="Behind the control plane's generation">
                   drift
                 </span>
               {/if}
             </td>
-            <td>{relative(n.node.last_seen_at)}</td>
+            <td>{relative(n.last_seen_at)}</td>
           </tr>
         {/each}
       </tbody>
@@ -375,35 +375,35 @@
   {@const node = selected}
   <aside class="drawer" aria-label="Node detail">
     <header class="drawer-header">
-      <h2>{node.node.name}</h2>
+      <h2>{node.name}</h2>
       <button class="icon-btn" aria-label="Close" onclick={() => (selected = null)}>x</button>
     </header>
 
     <dl class="detail">
       <dt>Node id</dt>
-      <dd class="mono">{node.node.node_id}</dd>
+      <dd class="mono">{node.node_id}</dd>
       <dt>Status</dt>
-      <dd><span class="pill pill-{node.node.status}">{node.node.status}</span></dd>
+      <dd><span class="pill pill-{node.status}">{node.status}</span></dd>
       <dt>Session</dt>
       <dd>{node.connected ? (node.session_peer ?? 'connected') : 'not connected'}</dd>
       <dt>Version</dt>
-      <dd>{node.node.version || '-'} (schema {node.node.schema_version})</dd>
+      <dd>{node.version || '-'} (schema {node.schema_version})</dd>
       <dt>Applied generation</dt>
-      <dd>{node.node.applied_config_generation}</dd>
+      <dd>{node.applied_config_generation}</dd>
       <dt>Applied hash</dt>
-      <dd class="mono">{node.node.applied_config_hash || '-'}</dd>
+      <dd class="mono">{node.applied_config_hash || '-'}</dd>
       <dt>Enrolled</dt>
-      <dd>{node.node.enrolled_at}</dd>
+      <dd>{node.enrolled_at}</dd>
       <dt>Last seen</dt>
-      <dd>{relative(node.node.last_seen_at)}</dd>
+      <dd>{relative(node.last_seen_at)}</dd>
     </dl>
 
-    {#if node.node.status === 'pending'}
+    {#if node.status === 'pending'}
       <section class="approve">
         <h3>Approve this node</h3>
         {#if node.selected_for_hostnames.length > 0}
           <p class="warn-text">
-            Route selectors already name <strong>{node.node.name}</strong>. Activating
+            Route selectors already name <strong>{node.name}</strong>. Activating
             it will start sending it the private keys for these hostnames:
           </p>
           <ul class="hostnames">
@@ -419,7 +419,7 @@
         {/if}
         {#if superAdmin}
           <button class="btn-primary" onclick={() => void activate(node)}>
-            Activate {node.node.name}
+            Activate {node.name}
           </button>
         {/if}
       </section>
@@ -570,7 +570,7 @@
       {/if}
     </section>
 
-    {#if superAdmin && node.node.status !== 'revoked'}
+    {#if superAdmin && node.status !== 'revoked'}
       <footer class="drawer-footer">
         <button class="btn-danger" onclick={() => (revoking = node)}>Revoke node</button>
       </footer>
@@ -580,7 +580,7 @@
 
 {#if revoking}
   <ConfirmDialog
-    title="Revoke {revoking.node.name}?"
+    title="Revoke {revoking.name}?"
     message="Its certificate goes on the revocation list and its session is dropped immediately. The node keeps serving the configuration it already has until it is stopped, and it cannot rejoin without a new token."
     confirmLabel="Revoke"
     onconfirm={() => void confirmRevoke()}

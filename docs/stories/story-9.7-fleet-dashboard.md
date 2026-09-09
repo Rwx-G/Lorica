@@ -451,6 +451,32 @@ tests at all, which is why both of this story's shipped defects were in
 it; it now has six, including the drawer race and the break-glass
 controls.
 
+**D21: the roster type was wrong, every test passed, and the first
+real fleet showed no node names.**
+
+Found by the first run of the `cluster` e2e profile (backlog #66),
+which is the point of having one. `NodeResponse` on the server carries
+`#[serde(flatten)]` on its registry row, so the JSON is flat: the
+roster columns and the live session facts are siblings. The dashboard's
+`ClusterNodeResponse` nested them under `node`, so `Cluster.svelte`
+read `n.node.name`, `NodeFilter.svelte` read `n.node.node_id`, and the
+audit tab's node names went through the same path. On a real fleet the
+Cluster page rendered a table of empty names and the node filter
+offered empty options.
+
+Every unit test on those components passed. Their fixtures encoded the
+same nested shape, so they were asserting the components against a
+response the API never sends. `openapi.yaml` had it right all along;
+the type was transcribed from memory rather than from the contract.
+
+Three lessons worth writing down because they are the same lesson the
+epic keeps teaching. A fixture that models a shape nobody verified is
+counted as coverage and is worth less than none. A unit test cannot
+tell you the API's shape; only the API can. And the "gates green" line
+this story kept writing covered, once again, less than it claimed: the
+real gate for a frontend type is a request against a running server,
+which this project now has for the fleet.
+
 ### Completion Notes
 
 Every acceptance criterion is implemented except one leg of AC #5, and

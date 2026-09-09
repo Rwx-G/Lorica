@@ -64,19 +64,27 @@ export function gaugePercent(used: number, total: number): number | null {
   return Math.min(100, Math.round((used / total) * 100));
 }
 
-/** One node in the roster, as `GET /api/v1/cluster/nodes` reports it. */
+/**
+ * One node in the roster, as `GET /api/v1/cluster/nodes` reports it.
+ *
+ * FLAT, because the server's `NodeResponse` carries `#[serde(flatten)]`
+ * on its registry row: the roster row's columns and the live session
+ * facts arrive as siblings, not as a `node` sub-object. The first
+ * version of this type nested them, so the Cluster page read
+ * `n.node.name` and rendered nothing on a real fleet. The unit tests
+ * did not catch it because their fixtures encoded the same fiction;
+ * the `cluster` e2e profile did, on its first run.
+ */
 export interface ClusterNodeResponse {
-  node: {
-    node_id: string;
-    name: string;
-    status: 'pending' | 'active' | 'revoked';
-    version: string;
-    schema_version: number;
-    applied_config_generation: number;
-    applied_config_hash: string;
-    last_seen_at: string | null;
-    enrolled_at: string;
-  };
+  node_id: string;
+  name: string;
+  status: 'pending' | 'active' | 'revoked';
+  version: string;
+  schema_version: number;
+  applied_config_generation: number;
+  applied_config_hash: string;
+  last_seen_at: string | null;
+  enrolled_at: string;
   connected: boolean;
   session_peer: string | null;
   session_last_seen_unix: number | null;

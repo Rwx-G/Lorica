@@ -38,8 +38,8 @@
         return;
       }
       names = res.data
-        .filter((n) => n.node.status !== 'revoked')
-        .map((n) => ({ id: n.node.node_id, label: n.node.name }));
+        .filter((n) => n.status !== 'revoked')
+        .map((n) => ({ id: n.node_id, label: n.name }));
     })();
   });
 </script>

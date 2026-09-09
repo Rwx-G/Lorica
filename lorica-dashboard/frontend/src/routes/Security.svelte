@@ -381,9 +381,9 @@
     const res = await api.listClusterNodes();
     if (!res.data) return;
     auditNodeNames = Object.fromEntries(
-      res.data.map((n) => [n.node.node_id, n.node.name]),
+      res.data.map((n) => [n.node_id, n.name]),
     );
-    auditNodeIds = ['', ...res.data.map((n) => n.node.node_id)];
+    auditNodeIds = ['', ...res.data.map((n) => n.node_id)];
   }
 
   async function verifyAuditChain() {
