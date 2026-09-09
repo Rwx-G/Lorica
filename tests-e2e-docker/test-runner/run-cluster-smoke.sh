@@ -29,8 +29,9 @@
 #   9.6  AC #4 (backlog #64): both followers under a sustained load from
 #        their own load-test engine; the fan-in keeps up with zero quota
 #        drops and the measured throughput is printed
-#   9.3  revocation ends the session, and names the keys it cannot
-#        take back
+#
+# Revocation is NOT here: it is terminal for a node, so it runs after
+# the restart phase, in `run-cluster-revocation-smoke.sh` (backlog #77).
 #
 # Pre-requisite: the `cluster` compose profile is up, Pebble included.
 # =============================================================================
@@ -634,35 +635,5 @@ assert_json_gt "$BUCKETS" '.data | length' 0 "one route's raw minute buckets for
 OWN=$(api_get "/api/v1/sla/overview")
 assert_json "$OWN" '[.data[] | select(.route_id == "'"$ROUTE_ID"'" and .total_requests > 0)] | length' '0' \
     "the control plane's own SLA is not the follower's"
-
-# ---------------------------------------------------------------------
-# Story 9.3 AC #7: revocation ends the session at once, and names the
-# keys it cannot take back (Epic 9 close, security audit).
-# ---------------------------------------------------------------------
-log "=== 9.3: revocation ==="
-
-EDGE_B_ID=$(api_get /api/v1/cluster/nodes | jq -r '.data[] | select(.name == "edge-b") | .node_id')
-REVOKE_B=$(api_del "/api/v1/cluster/nodes/$EDGE_B_ID")
-assert_json "$REVOKE_B" '.data.newly_revoked' 'true' "edge-b revoked"
-assert_json "$REVOKE_B" '.data.session_ended' 'true' "edge-b's live session was ended synchronously"
-assert_json "$REVOKE_B" '.data.certificates_to_reissue | length' '0' \
-    "edge-b held no key, so nothing is to re-issue"
-
-for attempt in $(seq 1 15); do
-    NODES=$(api_get /api/v1/cluster/nodes)
-    B_CONNECTED=$(echo "$NODES" | jq -r '.data[] | select(.name == "edge-b") | .connected')
-    [ "$B_CONNECTED" = "false" ] && break
-    sleep 2
-done
-assert_json "$NODES" '.data[] | select(.name == "edge-b") | .status' 'revoked' \
-    "edge-b is revoked in the roster"
-assert_json "$NODES" '.data[] | select(.name == "edge-b") | .connected' 'false' \
-    "edge-b holds no session any more"
-
-# edge-a holds the fleet certificate's key: revoking it must say so.
-REVOKE_A=$(api_del "/api/v1/cluster/nodes/$EDGE_A_ID")
-assert_json "$REVOKE_A" '.data.newly_revoked' 'true' "edge-a revoked"
-assert_json "$REVOKE_A" '[.data.certificates_to_reissue[] | select(. == "'"$CERT_ID"'")] | length' '1' \
-    "revoking edge-a names the certificate whose key it keeps, for re-issue"
 
 print_results

@@ -31,6 +31,13 @@
 # NODE_NAME and WORKERS come from compose, so the same script serves
 # both the single-process and the workers-mode follower.
 #
+# The enrolment half runs ONCE per data volume. A node that already
+# holds a fleet identity refuses a second join (correctly: a join is
+# an enrolment, not a reconnect), so a `docker compose restart` would
+# otherwise kill the container instead of exercising the restart the
+# cluster e2e phase is there to observe (backlog #77). The marker sits
+# in the data volume, so it lives exactly as long as the identity does.
+#
 # Every step also prints to stdout, so a container that dies leaves
 # something in `docker logs`.
 # =============================================================================
@@ -44,16 +51,22 @@ LOGFILE="/shared/${NODE_NAME}.log"
 
 say() { echo "[$NODE_NAME] $*" | tee -a "$LOGFILE"; }
 
-say "waiting for the control plane"
-for i in $(seq 1 120); do
-    [ -f /shared/cp_ready ] && break
-    sleep 1
-done
-if [ ! -f /shared/cp_ready ]; then
-    say "the control plane never became ready"
-    exit 1
+JOINED_MARKER="$DATA_DIR/.e2e-enrolled"
+if [ -f "$JOINED_MARKER" ]; then
+    say "already enrolled; skipping the join and starting (restart)"
+else
+    say "waiting for the control plane"
+    for i in $(seq 1 120); do
+        [ -f /shared/cp_ready ] && break
+        sleep 1
+    done
+    if [ ! -f /shared/cp_ready ]; then
+        say "the control plane never became ready"
+        exit 1
+    fi
 fi
 
+if [ ! -f "$JOINED_MARKER" ]; then
 umask 077
 
 # Log in to the control plane's management API and mint a token bound to
@@ -107,6 +120,8 @@ else
     exit 1
 fi
 rm -f "$TOKEN_FILE"
+touch "$JOINED_MARKER"
+fi
 
 # Harness only: exposes the loopback management API to the runner
 # container. See the header; never do this on an operator's node.

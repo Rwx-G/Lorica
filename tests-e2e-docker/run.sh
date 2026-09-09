@@ -416,6 +416,12 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
                 || EXIT_CODE=$?
         fi
     fi
+
+    # ---- Revocation, last: it is terminal for a node, so everything
+    # that needs a live follower has already run.
+    if [ "$EXIT_CODE" = "0" ]; then
+        docker compose --profile cluster run --rm cluster-revocation-smoke || EXIT_CODE=$?
+    fi
 fi
 
 # Cleanup unless --keep
