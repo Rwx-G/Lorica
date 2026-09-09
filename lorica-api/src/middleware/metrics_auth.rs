@@ -8,7 +8,8 @@
 //!
 //! - a valid dashboard session cookie sent explicitly by an API client
 //!   (the cookie is scoped `Path=/api`, so a browser does NOT send it
-//!   to `/metrics`; backlog #80 holds the question of widening it), or
+//!   to `/metrics`; a browser reads the same document at
+//!   `/api/v1/metrics`, behind the ordinary session gate), or
 //! - the static bearer token in `prometheus_scrape_token` (or its
 //!   environment override `LORICA_PROMETHEUS_SCRAPE_TOKEN`), supplied
 //!   as `Authorization: Bearer <token>`.

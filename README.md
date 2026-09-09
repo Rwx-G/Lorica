@@ -622,6 +622,7 @@ Fleet reads are Operator+, fleet mutations SuperAdmin; every one of them answers
 | `GET` | `/api/v1/status` | System status summary |
 | `GET` | `/api/v1/system` | CPU, memory, disk usage |
 | `POST` | `/api/v1/system/upgrade` | Hot binary upgrade (signature-verified, zero-downtime) |
+| `GET` | `/api/v1/metrics` | The `/metrics` document behind the dashboard session, for a browser (the session cookie is scoped to `/api`) |
 | `GET` | `/api/v1/workers` | Worker heartbeat metrics |
 | `GET` | `/api/v1/logs` | Access logs |
 | `DELETE` | `/api/v1/logs` | Clear logs |

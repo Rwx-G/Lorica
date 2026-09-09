@@ -1623,6 +1623,26 @@ paths:
   # ---------------------------------------------------------------------------
   # SLA
   # ---------------------------------------------------------------------------
+  /api/v1/metrics:
+    get:
+      tags: [System]
+      summary: Prometheus metrics, behind the dashboard session (Viewer+)
+      description: >-
+        The same text `/metrics` serves, on a path the session cookie
+        (scoped to `/api`) reaches: an operator's browser reads it here,
+        a scraper uses `/metrics` with the bearer token.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /api/v1/sla/overview:
     get:
       tags: [SLA]

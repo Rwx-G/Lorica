@@ -503,6 +503,12 @@ pub fn build_router(
 
     // Protected routes (auth required)
     let protected_routes = Router::new()
+        // The same document as `/metrics`, behind the session like
+        // every other read here (backlog #80): the session cookie is
+        // scoped `Path=/api`, so a browser reaches the metrics through
+        // this path and a scraper through `/metrics` with the bearer
+        // token. One handler, two doors.
+        .route("/api/v1/metrics", get(crate::metrics::get_metrics))
         .route(
             "/api/v1/auth/password",
             put(crate::auth::change_password).layer(rl(
