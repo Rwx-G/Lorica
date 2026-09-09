@@ -61,23 +61,34 @@ impl ConfigStore {
         Ok((generation, hash))
     }
 
-    /// Record the generation and canonical hash just applied (Story 9.4
-    /// D12: written in the same commit sequence as the replica itself,
-    /// so a crash between the two can only under-report and trigger a
-    /// re-apply, never claim a generation this node does not hold).
+    /// Record the generation and canonical hash just applied, in a
+    /// transaction of its own. [`ConfigStore::apply_replica`] writes
+    /// the same marker inside the apply transaction instead; this
+    /// entry point is for the paths that record a generation without
+    /// applying tables (the join bootstrap, tests).
     pub fn set_cluster_applied_config(&self, generation: u64, hash: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        self.record_applied_config(generation, hash)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The two marker writes, on the connection's CURRENT transaction
+    /// (Story 9.4 D12: in the same commit as the replica itself, so a
+    /// crash can only under-report and trigger a re-apply, never claim
+    /// a generation this node does not hold). Callers own the
+    /// transaction.
+    pub(crate) fn record_applied_config(&self, generation: u64, hash: &str) -> Result<()> {
+        self.conn.execute(
             "INSERT INTO cluster_replica (key, value) VALUES ('applied_config_generation', ?1) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![generation.to_string()],
         )?;
-        tx.execute(
+        self.conn.execute(
             "INSERT INTO cluster_replica (key, value) VALUES ('applied_config_hash', ?1) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![hash],
         )?;
-        tx.commit()?;
         Ok(())
     }
 

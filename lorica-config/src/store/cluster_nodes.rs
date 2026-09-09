@@ -686,23 +686,51 @@ impl ConfigStore {
     /// review: this is an advisory surface, and refusing to render it
     /// would be worse than rendering it incompletely.
     pub fn hostnames_selecting_node_name(&self, name: &str) -> Result<Vec<String>> {
+        Ok(self
+            .hostnames_by_selected_name()?
+            .remove(name)
+            .unwrap_or_default())
+    }
+
+    /// The same answer as [`ConfigStore::hostnames_selecting_node_name`]
+    /// for EVERY name any route selector mentions, from one pass over
+    /// the route table.
+    ///
+    /// The roster endpoint asks for the whole fleet at once. Answering
+    /// it name by name meant one full route walk, with one JSON parse
+    /// per selector, per distinct node name, all under the store lock
+    /// (Epic 9 close, performance audit): O(nodes x routes) where
+    /// O(routes) was available, and the comment at the call site
+    /// claimed the single pass this function now actually is.
+    ///
+    /// Names that appear only in fleet-wide (empty) selectors are
+    /// absent from the map, for the reason the per-name resolver
+    /// gives: this is the "what would approving this name hand over"
+    /// view, and a fleet-wide route hands the same thing to everyone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a read failure. A selector
+    /// that does not parse is skipped, as in the per-name resolver.
+    pub fn hostnames_by_selected_name(&self) -> Result<BTreeMap<String, Vec<String>>> {
         let mut stmt = self.conn.prepare(ROUTE_HOSTS_AND_SELECTORS)?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(1)?, row.get::<_, String>(3)?))
         })?;
-        let mut hostnames: Vec<String> = Vec::new();
+        let mut by_name: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for row in rows {
             let (hostname, raw_selector) = row?;
             let Ok(selector) = serde_json::from_str::<Vec<String>>(&raw_selector) else {
                 continue;
             };
-            if selector.iter().any(|entry| entry == name) {
-                hostnames.push(hostname);
+            for name in selector {
+                by_name.entry(name).or_default().insert(hostname.clone());
             }
         }
-        hostnames.sort();
-        hostnames.dedup();
-        Ok(hostnames)
+        Ok(by_name
+            .into_iter()
+            .map(|(name, hosts)| (name, hosts.into_iter().collect()))
+            .collect())
     }
 
     /// Turn a folded [`SelectorUnion`] into the Active node ids it

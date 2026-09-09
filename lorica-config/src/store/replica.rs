@@ -162,6 +162,15 @@ impl ConfigStore {
     /// whole apply back, so the node either serves the new generation
     /// whole or keeps the previous one whole.
     ///
+    /// `generation` and `hash` are the applied-configuration marker,
+    /// written INSIDE the same transaction. It used to be a second
+    /// write after the commit, with a comment promising that a failed
+    /// marker would "re-apply on the next pull"; it did not, because
+    /// the pull compared against the in-memory copy that had already
+    /// moved on (Epic 9 close, architecture review). Now the tables
+    /// and the marker move together or not at all, and there is no
+    /// second state to reconcile.
+    ///
     /// # Errors
     ///
     /// [`ReplicaError::Store`] on any store failure. The blob was
@@ -171,6 +180,8 @@ impl ConfigStore {
         &self,
         config: &CanonicalConfig,
         local_node_name: &str,
+        generation: u64,
+        hash: &str,
     ) -> std::result::Result<ReplicaOutcome, ReplicaError> {
         let tx = self.conn.unchecked_transaction().map_err(ConfigError::from)?;
         // Every helper below writes through `self.conn`, the same
@@ -178,6 +189,7 @@ impl ConfigStore {
         // inside this transaction. Returning early drops `tx`, which
         // rolls back.
         let outcome = self.apply_replica_tables(config, local_node_name)?;
+        self.record_applied_config(generation, hash)?;
         tx.commit().map_err(ConfigError::from)?;
         Ok(outcome)
     }
@@ -800,7 +812,7 @@ mod tests {
             .expect("target holds the key");
 
         let config = prepared(&source, &target).expect("prepare");
-        let outcome = target.apply_replica(&config, "edge-1").expect("apply");
+        let outcome = target.apply_replica(&config, "edge-1", 1, "h1").expect("apply");
 
         assert_eq!(outcome.routes, 2);
         assert_eq!(outcome.routes_skipped_by_selector, 0);
@@ -856,7 +868,7 @@ mod tests {
         seed_source(&source);
 
         let config = prepared(&source, &target).expect("prepare");
-        let outcome = target.apply_replica(&config, "edge-1").expect("apply");
+        let outcome = target.apply_replica(&config, "edge-1", 1, "h1").expect("apply");
 
         assert_eq!(outcome.certificates, 1);
         assert_eq!(outcome.certificates_without_key, 1);
@@ -878,7 +890,7 @@ mod tests {
         seed_source(&source);
 
         let config = prepared(&source, &target).expect("prepare");
-        let outcome = target.apply_replica(&config, "edge-2").expect("apply");
+        let outcome = target.apply_replica(&config, "edge-2", 1, "h1").expect("apply");
 
         assert_eq!(outcome.routes, 1);
         assert_eq!(outcome.routes_skipped_by_selector, 1);
@@ -961,7 +973,7 @@ mod tests {
         seed_source(&source);
         seed_target_node_local(&target);
         let config = prepared(&source, &target).expect("prepare");
-        target.apply_replica(&config, "edge-1").expect("first apply");
+        target.apply_replica(&config, "edge-1", 1, "h1").expect("first apply");
         let baseline = canonical_hash(&target).expect("baseline hash");
 
         // A second generation that drops every certificate while a
@@ -972,7 +984,7 @@ mod tests {
         broken.certificates.clear();
         broken.routes.push(make_route("route-broken", "broken.example.com", &[]));
         let err = target
-            .apply_replica(&broken, "edge-1")
+            .apply_replica(&broken, "edge-1", 2, "h2")
             .expect_err("a foreign-key violation must fail the apply");
         assert!(matches!(err, ReplicaError::Store(_)));
 
@@ -998,9 +1010,9 @@ mod tests {
             .expect("target holds the key");
 
         let config = prepared(&source, &target).expect("prepare");
-        let first = target.apply_replica(&config, "edge-1").expect("first apply");
+        let first = target.apply_replica(&config, "edge-1", 1, "h1").expect("first apply");
         let after_first = canonical_hash(&target).expect("hash");
-        let second = target.apply_replica(&config, "edge-1").expect("second apply");
+        let second = target.apply_replica(&config, "edge-1", 1, "h1").expect("second apply");
 
         assert_eq!(after_first, canonical_hash(&target).expect("hash"));
         assert_eq!(first.routes, second.routes);
@@ -1022,7 +1034,7 @@ mod tests {
             .create_certificate(&make_certificate("cert-1", CERT_KEY))
             .expect("target holds the key");
         let config = prepared(&source, &target).expect("prepare");
-        target.apply_replica(&config, "edge-1").expect("first apply");
+        target.apply_replica(&config, "edge-1", 1, "h1").expect("first apply");
 
         // The control plane deletes a route, a backend, the ACL and the
         // crawler, then republishes.
@@ -1040,7 +1052,7 @@ mod tests {
             .expect("delete crawler");
 
         let config = prepared(&source, &target).expect("prepare");
-        target.apply_replica(&config, "edge-1").expect("second apply");
+        target.apply_replica(&config, "edge-1", 1, "h1").expect("second apply");
 
         assert!(target.get_route("route-edge").expect("route").is_none());
         assert!(target.get_backend("backend-2").expect("backend").is_none());

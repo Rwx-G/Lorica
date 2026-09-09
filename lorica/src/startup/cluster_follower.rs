@@ -439,33 +439,22 @@ impl ReplicaHandler {
         let node_name = self.node_name.clone();
         let hash = staged.hash.clone();
         let applied_hash = staged.hash.clone();
-        // The apply is one transaction; the marker write that follows
-        // is not part of it, so the two failures are reported
-        // differently. The apply failing means this node still serves
-        // the previous generation. The MARKER failing means it already
-        // serves the new one and merely under-reports, so calling that
-        // a refusal would tell an operator the opposite of what
-        // happened. Re-applying on the next pull is harmless: every
-        // write is an upsert keyed on the blob's ids.
+        // The apply and the applied-generation marker are ONE
+        // transaction: this node either serves the new generation and
+        // says so, or keeps the previous one and says that. The marker
+        // used to be a second write whose failure was reported as
+        // "re-applies on its next pull", which never happened because
+        // the pull compared against the in-memory copy updated below
+        // (Epic 9 close, architecture review).
         let outcome = db_blocking(&self.store, move |store| {
-            let outcome = match store.apply_replica(&staged.config, &node_name) {
-                Ok(outcome) => outcome,
-                Err(e) => return Ok::<_, ApiError>(Err(e.to_string())),
-            };
-            let recorded = store.set_cluster_applied_config(generation, &hash);
-            Ok(Ok((outcome, recorded.err())))
+            Ok::<_, ApiError>(
+                store
+                    .apply_replica(&staged.config, &node_name, generation, &hash)
+                    .map_err(|e| e.to_string()),
+            )
         })
         .await
         .map_err(|e| e.to_string())??;
-        let (outcome, marker_error) = outcome;
-        if let Some(e) = marker_error {
-            warn!(
-                generation,
-                error = %e,
-                "the configuration was applied but the applied-generation marker could not be \
-                 written; this node serves the new generation and re-applies it on its next pull"
-            );
-        }
 
         let applied = AppliedConfig {
             generation,
