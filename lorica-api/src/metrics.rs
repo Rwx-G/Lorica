@@ -290,6 +290,32 @@ pub fn inc_cluster_telemetry_ingested(node_id: &str, rows: u64) {
         .inc_by(rows);
 }
 
+/// Local rows retention deleted before the fan-in drain had sent them
+/// (backlog #76).
+///
+/// A follower that cannot reach its control plane keeps serving and
+/// keeps logging, and its local retention keeps trimming. Rows below
+/// the drain cursor are gone from the fleet view for good, and the
+/// fleet page cannot tell a quiet edge from a truncated one. This is
+/// the counter that says which it was.
+static CLUSTER_TELEMETRY_LOST_TO_RETENTION_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "cluster_telemetry_lost_to_retention_total",
+        "Local telemetry rows retention removed before the fan-in drain sent them, by kind",
+        &["kind"],
+    )
+});
+
+/// Count `rows` of `kind` (`access` or `waf`) lost to local retention.
+pub fn inc_cluster_telemetry_lost_to_retention(kind: &str, rows: u64) {
+    if rows == 0 {
+        return;
+    }
+    CLUSTER_TELEMETRY_LOST_TO_RETENTION_TOTAL
+        .with_label_values(&[kind])
+        .inc_by(rows);
+}
+
 /// Publish the number of drifted nodes (Story 9.4 AC #12).
 pub fn set_cluster_drift_nodes(count: usize) {
     CLUSTER_DRIFT_NODES.set(i64::try_from(count).unwrap_or(i64::MAX));
@@ -2086,6 +2112,7 @@ mod tests {
     fn cluster_metric_families_carry_the_namespace_once() {
         inc_cluster_config_apply("node-namespace-test", "committed");
         inc_cluster_telemetry_ingested("node-namespace-test", 1);
+        inc_cluster_telemetry_lost_to_retention("access", 1);
         let names: Vec<String> = REGISTRY
             .gather()
             .iter()
@@ -2094,6 +2121,7 @@ mod tests {
         for expected in [
             "lorica_cluster_config_apply_total",
             "lorica_cluster_telemetry_ingested_total",
+            "lorica_cluster_telemetry_lost_to_retention_total",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),

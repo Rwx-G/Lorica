@@ -771,7 +771,7 @@ of a global one.
 
 A global cap would make the fleet view shallower than each node's own
 local log, and would let one noisy edge evict every quiet edge's rows
-— exactly the incident-correlation case fan-in exists for. Retention
+- exactly the incident-correlation case fan-in exists for. Retention
 deletes in chunks and releases the database lock between them, so a
 large reclaim does not stall ingest.
 
@@ -806,6 +806,19 @@ one node over its budget (`node_quota`) from the watermark shedding
 everyone (`storage_watermark`), and
 `lorica_cluster_telemetry_ingested_total{node_id}` is the denominator
 without which a drop count says nothing.
+
+A third counter answers the question those two cannot. A follower cut
+off from its control plane keeps serving and keeps logging, and its
+OWN retention keeps trimming: rows the drain had not sent yet are
+deleted locally and will never reach the fleet view. Nothing is
+dropped at the control plane, so neither counter above moves, and a
+quiet edge reads exactly like a truncated one.
+`lorica_cluster_telemetry_lost_to_retention_total{kind}` (`access` or
+`waf`) is counted on the follower, where the delete happens, over
+exactly the rows retention took from above the drain cursor. A
+non-zero value means the fleet view has a hole for that node and the
+node's own log is the only place that period still exists. The
+retention pass also logs it at WARN.
 
 ### Reading it
 
