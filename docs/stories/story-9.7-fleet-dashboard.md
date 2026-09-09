@@ -370,6 +370,87 @@ collapsing them means every consumer inherits an answer nobody checked
 against the server. The server's allow-list is the specification; the
 dashboard has to be read against it, not guessed at.
 
+**D20: the audit, and what it found.**
+
+Four auditors (security, quality, architecture, performance) on the
+story as it stood at `8615a2e5`. One Critical, four High, eight Medium.
+Every finding below was verified against the code before acting on it,
+because an auditor can be wrong too; two were downgraded on that
+reading and are recorded as such.
+
+**Critical, and it was a comment asserting a safety the code did not
+have, again.** The drawer derived its certificate inventory by
+intersecting `selected_for_hostnames` with each certificate's subject
+names, and said in a doc comment that this "reproduces the same rule
+the push path applies". Read side by side, the two resolvers answer
+opposite questions about a fleet-wide route:
+`hostnames_selecting_node_name` deliberately EXCLUDES an empty
+selector, because it answers what approving one NAME would hand over
+and a route that entitles everyone is not a per-node decision;
+`cert_key_recipients` treats an empty selector as fleet-wide and
+entitles every Active node. So a node holding every fleet-wide
+certificate was shown as holding none, under the words "it receives no
+certificate keys", on the page built to answer exactly that question.
+Fixed server-side with `certificates_by_node`, the stated inverse, and
+a test that walks every node against every certificate asserting the
+two agree in both directions.
+
+**The one only the security auditor found, and the one that matters
+most, because this story caused it.** AC #4 hid every mutation control
+on a follower. `isSuperAdminRole`'s own doc says it exists "for the
+controls that must stay available on a follower: the two that are how
+an operator gets OUT of read-only mode (opening a break-glass window,
+leaving the fleet)". Neither control existed anywhere in the dashboard,
+and `api.ts` had no method for either. Before this story a SuperAdmin
+on a follower saw the mutation controls and got a 409 naming the
+break-glass endpoint; after it, an operator on an edge whose control
+plane is unreachable gets a banner explaining that local edits would be
+overwritten, and no way to act. AC #7 shipped the alarm without the
+lever. Both controls now exist, gated on the role alone.
+
+That the defect took the form of a doc comment describing call sites
+nobody had written, in a doc comment written to explain a fix, is worth
+stating plainly: this is the fourth instance of the same class in this
+epic.
+
+**Also fixed:** the drawer showed the wrong node's data when two were
+opened in quick succession; a failed drawer read rendered identically
+to a quiet node; the live tail leaked this node's rows into the fleet
+table under an unknown-origin label; `NodeFilter` populated only if the
+cluster status happened to arrive before it mounted, and the test
+written for it had encoded that early return as intended behaviour;
+`clusterStatus` had two writers where `Dashboard.svelte` claims in a
+comment to be the only one; the resource sampler ran `sysinfo` and a
+`statvfs(2)` inline on the heartbeat's async task, where a stalled
+mount could cost the node its session; the CPU gauge's only bound was
+in another crate; and the resource gauges sat at the Viewer floor.
+
+**Downgraded on verification.** The architecture auditor rated the
+blocking sampler "no change now" while the performance auditor rated it
+Medium; the tail-latency argument decides it, because the failure is a
+false fleet disconnect caused by a slow disk, and the fix is contained.
+The `NodeResources` domain-type duplication was left alone: three lines
+and no invariant, per the auditor's own recommendation.
+
+**Raised rather than fixed here**, because each belongs to another
+story's acceptance criteria or needs measurement first: backlog #69
+(the Viewer floor on fleet telemetry as a whole, to decide with #54 in
+one pass rather than one field per story), #70 (the unindexed
+`category` filter, `EXPLAIN QUERY PLAN` before indexing), #71 (the
+drift pill reimplementing the server's predicate against a column
+flushed on a 30 s timer). Recorded on existing entries: #52's stated
+trigger has fired, and #59's hazard did not materialise.
+
+**Pinned so it cannot drift back.** The dashboard's four auth
+predicates depend on a Rust allow-list nothing cross-checked, and one
+manual pass found four controls hidden that the list admits; a test now
+asserts every path the dashboard offers on a follower is still
+admitted, naming the `.svelte` file on each line and stating in its own
+comment which direction it does not catch. `Cluster.svelte` had no
+tests at all, which is why both of this story's shipped defects were in
+it; it now has six, including the drawer race and the break-glass
+controls.
+
 ### Completion Notes
 
 Every acceptance criterion is implemented except one leg of AC #5, and
