@@ -253,6 +253,86 @@ than the origin's, and the origin's own tracing event shipped to a WORM
 sink remains the anchor. Signed checkpoints are the real fix and are
 out of scope by the PRD.
 
+**D7: the audit, and the two ways this would have failed in the
+field.**
+
+Three auditors. Two Criticals, both found independently by more than
+one of them, both in code this story added, and neither reachable by a
+unit test as the fixtures were written. Every finding was verified
+against the code before acting on it.
+
+**The acknowledgement froze every cursor on the first shed.**
+`insert_fanned_in_audit` returned the rows NEWLY written by its
+`INSERT OR IGNORE`, and the drain advances its cursors only when the
+acknowledgement matches what it sent. So the first storage-watermark
+shed, the first quota verdict or the first push timeout, three
+ordinary and designed events, would re-offer the batch, get zero back,
+and freeze the access, WAF and audit cursors for the life of the
+process. Fan-in stops silently for that node and local retention then
+evicts the rows it never shipped, on the one table this story argues
+must not lose any. The mistake was conflating two numbers:
+deduplication is how idempotency is implemented, it is not an
+acceptance signal. The acknowledgement now means the store durably
+holds the batch.
+
+Worth noting where the gap was. The store-side test asserted the
+dedup, from one side only; neither the drain nor the control-plane
+handler has any test, and that is exactly where the defect lived.
+
+**Every fanned-in chain would have verified as broken, forever.** Fan-in
+starts at a node's present, not its history, so the first row the
+control plane receives names a predecessor it will never hold. Verify
+fell back to genesis and reported `prev_hash_mismatch` on that first
+row, on every healthy fleet, permanently. The dashboard renders that as
+an alert. An operator who sees red on every node stops reading the
+panel, which is precisely the failure AC #1 is written against, arriving
+by a route AC #1 did not anticipate. The first batch for a chain now
+writes an arrival seal from that row's own `prev_chain_hash`.
+
+The tests missed it because `origin_chain` built every fixture from
+genesis, which is the one state the drain guarantees will not occur in
+production. A fixture that models only the easy case is worse than no
+fixture, because it is counted as coverage.
+
+**Also fixed, each a real defect:**
+
+- Audit rows were taken out of the batch BEFORE the quota was computed,
+  so a node was charged nothing, while `docs/cluster.md`, the proto
+  comment and this story's own D3 all said they were counted. Exempt
+  from the shedding VERDICT and exempt from the ACCOUNTING are
+  different things and only the first was intended. This was an
+  overclaim in the story whose AC #1 is about not overclaiming.
+- The eleven peer-supplied strings crossed the decode boundary
+  unvalidated, alone among this crate's wire types.
+  `telemetry_audit_row_defect` bounds them at the bridge, which matters
+  more here than elsewhere because these rows are exempt from shedding
+  and retention deletes by a timestamp the sender chose.
+- Retention deleted by timestamp while verify walks by `origin_id`, so
+  a node whose clock stepped lost a row from the MIDDLE of its chain
+  and verify reported tampering caused by a retention pass. A chain is
+  now cut as a prefix of its own order.
+- A re-enrolled node kept its telemetry cursors under a fresh node id,
+  orphaning a chain that could never verify.
+- `origin_id` was clamped rather than refused on an out-of-range value,
+  and saturated to zero outbound, which is the local-row marker.
+- The dashboard's verify button ignored the node filter beside it, and
+  the local chain was labelled with a name a follower can enrol under.
+
+**Downgraded or declined on verification.** The worker-mode trap this
+story's own Dev Notes name does NOT fire: the cluster runtime starts in
+the supervisor, which holds the `LogStore` and threads it to both
+planes, so `cluster.config.apply` is persisted in `--workers` mode. The
+architecture auditor's recommendation to move `log_store` out under
+backlog #52 is declined and recorded on that entry instead: `LogStore`
+carries a domain invariant, not a mechanism, and filing an unkeyed hash
+chain with a compliance claim under "observability" is the wrong home.
+
+**Raised rather than fixed here:** backlog #72 (a per-node row budget
+for fanned-in audit rows, so "never shed" cannot come to mean "never
+bounded"), #73 (`/api/v1/audit` inherited a single-node Operator floor
+while its data became fleet-wide, to decide with #69), #74 (two
+processes can write the local chain concurrently through the CLI).
+
 ### Completion Notes
 
 **The test that mattered caught a defect in code I had just written.**
@@ -303,5 +383,6 @@ Anticipated:
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-09-09 | 1.1 | Audit and remediation (D7). Three auditors, two Criticals, both in code this story added and both invisible to its unit tests. The acknowledgement returned newly-written rows rather than rows durably held, so the first ordinary shed would have frozen every one of that node's fan-in cursors permanently and silently. Fanned-in chains had no arrival genesis, so verify would have reported tampering on every healthy fleet, forever, which is the exact failure AC #1 exists to prevent arriving by a route AC #1 did not anticipate. Also fixed: audit rows were not charged to the quota although three documents said they were; the eleven peer-supplied strings crossed the decode boundary unvalidated; retention deleted by timestamp while verify walks by origin id, so a stepped clock read as tampering; a re-enrolled node orphaned its chain; `origin_id` was clamped rather than refused; and the dashboard ignored its own node filter and labelled the local chain with a forgeable name. Three findings raised to the backlog as #72, #73 and #74. Gates: three clippy gates, 609 + 286 + cluster Rust tests, 419 Vitest, all green. | Romain G. |
 | 2026-09-09 | 1.0 | Implemented. Audit rows fan in over the Story 9.6 telemetry channel and the aggregated table holds one chain per node: separate insert path writing both hashes verbatim, per-node retention seals, partitioned verify reporting per chain, node filter on the list and the verify endpoints, node column and per-chain results in the dashboard. `insert_audit` was reading the global tail and now reads the local one, a defect the tests for the separate path caught. Audit rows are counted against the ingest quota and exempt from its shedding verdict, because a compliance feature that drops rows silently under load is worse than one that does not exist. AC #4 turned out to be nine tenths delivered by stories 9.3 to 9.7; the missing tenth is the node-scoped apply, now recorded on both outcomes. The security property is stated as it actually is, in the doc, the API contract and the dashboard: the aggregated copy is strictly weaker than each origin node's, and the anchor is each node's own audit stream. Status Review. | Romain G. |
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Security property restated accurately after the first draft overclaimed fan-in verification; separate insert path and per-node seals added. Status Draft. | Romain G. |
