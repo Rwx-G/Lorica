@@ -40,9 +40,32 @@ export function sanitizeFilenameFromHeader(
   return cleaned.length > 0 ? cleaned : fallback;
 }
 
+import type { ClusterNodeResponse, ClusterStatus } from './cluster';
+
 export interface ApiError {
   code: string;
   message: string;
+}
+
+/** Body of `POST /api/v1/cluster/tokens` (Story 9.3, 9.5 D15). */
+export interface MintTokenRequest {
+  ttl_seconds?: number;
+  /**
+   * Mandatory since Story 9.5 D15. A route's `node_selector` names
+   * nodes, and that name decides which private keys a node receives,
+   * so the token, not the joining machine, chooses it.
+   */
+  node_name: string;
+  source_cidr?: string;
+}
+
+/** The token, shown once and never recoverable. */
+export interface MintedTokenResponse {
+  token: string;
+  public_id: string;
+  expires_at: string;
+  bound_node_name: string | null;
+  bound_source_cidr: string | null;
 }
 
 export interface ApiResponse<T> {
@@ -1135,6 +1158,27 @@ export const api = {
     request<{ message: string }>('DELETE', `/users/${id}`),
 
   getStatus: () => request<StatusResponse>('GET', '/status'),
+
+  // ---- Cluster (Stories 9.3-9.7) ----
+
+  getClusterStatus: () => request<ClusterStatus>('GET', '/cluster/status'),
+
+  listClusterNodes: () => request<ClusterNodeResponse[]>('GET', '/cluster/nodes'),
+
+  getClusterNode: (id: string) =>
+    request<ClusterNodeResponse>('GET', `/cluster/nodes/${encodeURIComponent(id)}`),
+
+  activateClusterNode: (id: string) =>
+    request<ClusterNodeResponse>(
+      'POST',
+      `/cluster/nodes/${encodeURIComponent(id)}/activate`,
+    ),
+
+  revokeClusterNode: (id: string) =>
+    request<{ message: string }>('DELETE', `/cluster/nodes/${encodeURIComponent(id)}`),
+
+  mintClusterToken: (body: MintTokenRequest) =>
+    request<MintedTokenResponse>('POST', '/cluster/tokens', body),
 
   listRoutes: () =>
     request<{ routes: RouteResponse[] }>('GET', '/routes'),
