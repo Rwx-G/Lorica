@@ -721,9 +721,19 @@ The supported envelope for access-log fan-in is **up to five nodes at
 a sustained few hundred requests per second each**. This figure is
 derived from the write ceiling the log-writer module documents for
 SQLite with batched inserts, halved for the retention passes and
-dashboard queries that contend for the same connection. It has not
-been measured on production hardware, and that is stated plainly here
-rather than implied by a number that looks measured.
+dashboard queries that contend for the same connection.
+
+It has been measured once, on a development workstation rather than
+production hardware, by the `cluster` e2e profile's load phase
+(backlog #64): two followers, one of them in workers mode, each driven
+at 300 requests a second for 60 seconds by its own load-test engine
+(about 18 000 access rows per node). At the moment the load stopped
+the control plane had already ingested 97 % of each node's rows, with
+no row shed by the per-node quota; the remainder is the last drain
+tick. That is one data point at the documented envelope's per-node
+rate, not its ceiling; the phase prints its figures on a
+`FAN_IN_MEASUREMENT` line so the next run on real hardware replaces
+this paragraph with a number and the machine it came from.
 
 The drain is not the binding constraint, though it was: it used to
 ship one batch per ten-second tick, about fifty rows a second, so a

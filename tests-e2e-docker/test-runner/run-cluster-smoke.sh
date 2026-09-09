@@ -597,15 +597,18 @@ SESSION="$CP_SESSION"
 # ---------------------------------------------------------------------
 log "=== 9.7 AC #5: per-node SLA through the control plane ==="
 
-for attempt in $(seq 1 60); do
+# Each node's collector flushes on its own 60 s tick (each WORKER's,
+# on edge-b), so both are polled rather than read once.
+for attempt in $(seq 1 75); do
     SLA_A=$(api_get "/api/v1/sla/overview?node=$EDGE_A_ID")
-    N=$(echo "$SLA_A" | jq '[(.data // [])[] | select(.total_requests > 0)] | length')
-    [ "$N" != "0" ] && [ -n "$N" ] && break
+    SLA_B=$(api_get "/api/v1/sla/overview?node=$EDGE_B_ID")
+    NA=$(echo "$SLA_A" | jq '[(.data // [])[] | select(.total_requests > 0)] | length')
+    NB=$(echo "$SLA_B" | jq '[(.data // [])[] | select(.total_requests > 0)] | length')
+    [ "${NA:-0}" != "0" ] && [ "${NB:-0}" != "0" ] && break
     sleep 2
 done
 assert_json_gt "$SLA_A" '[.data[] | select(.total_requests > 0)] | length' 0 \
     "edge-a's SLA overview, computed on edge-a, served by the control plane"
-SLA_B=$(api_get "/api/v1/sla/overview?node=$EDGE_B_ID")
 assert_json_gt "$SLA_B" '[.data[] | select(.total_requests > 0)] | length' 0 \
     "edge-b's SLA overview (workers mode) through the control plane"
 ROUTE_SLA=$(api_get "/api/v1/sla/routes/$ROUTE_ID?node=$EDGE_A_ID")
