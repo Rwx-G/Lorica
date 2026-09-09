@@ -161,9 +161,12 @@ BACKEND_ID=$(echo "$BACKEND" | jq -r '.data.id')
 # entitled to this route's certificate key.
 ROUTE=$(api_post /api/v1/routes \
     '{"id":"cluster-route","hostname":"fleet.example.com","path_prefix":"/",
-      "backends":["'"$BACKEND_ID"'"],"load_balancing":"round_robin",
+      "backend_ids":["'"$BACKEND_ID"'"],"load_balancing":"round_robin",
       "waf_enabled":true,"enabled":true,"node_selector":["edge-a"]}')
 assert_json_exists "$ROUTE" '.data.id' "the selected route was created"
+# The field is `backend_ids`, not `backends`: the first runs sent the
+# latter, the API ignored it, and every request answered 502.
+assert_json_gt "$ROUTE" '.data.backends | length' 0 "the route binds its backend"
 # The id in the body is not honoured; routes get a server-assigned id.
 ROUTE_ID=$(echo "$ROUTE" | jq -r '.data.id')
 
