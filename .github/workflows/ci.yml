@@ -172,7 +172,7 @@ jobs:
           npm run build
 
       - name: Run Rust unit tests (product crates)
-        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command
+        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-tls -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem
         env:
           SKIP_FRONTEND_BUILD: ""
 
@@ -214,12 +214,19 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Collect coverage (product crates)
+      - name: Collect coverage (every crate with tests)
         run: |
+          # Every crate whose tests run in CI, product and forked alike:
+          # a crate that is compiled as a dependency but whose own tests
+          # are not run shows up at 0% and makes the total meaningless
+          # (the v1.7.0 report read 52% with 14k such lines).
           cargo llvm-cov --no-report \
             -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify \
             -p lorica-bench -p lorica-command -p lorica-metrics -p lorica-acme \
-            -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker
+            -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker \
+            -p lorica-cluster -p lorica-tls \
+            -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \
+            -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
 
       - name: Report coverage summary
         run: |
