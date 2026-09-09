@@ -6634,3 +6634,81 @@ async fn test_follower_read_only_gate_and_break_glass_window() {
         assert_eq!(resp.status(), StatusCode::CONFLICT, "{path}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 1.7.0 hygiene pass: the OTLP signal-path helper (#55 c) and the metrics
+// document behind the session (#80).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn otlp_signal_url_appends_the_signal_path_exactly_once() {
+    use crate::settings::otlp_signal_url;
+    assert_eq!(
+        otlp_signal_url("http://otel.internal.example.org:4318", "/v1/traces"),
+        "http://otel.internal.example.org:4318/v1/traces"
+    );
+    // A trailing slash on the endpoint does not double the separator.
+    assert_eq!(
+        otlp_signal_url("http://otel.internal.example.org:4318/", "/v1/logs"),
+        "http://otel.internal.example.org:4318/v1/logs"
+    );
+    // An endpoint that already names the signal is left alone, slash or not.
+    assert_eq!(
+        otlp_signal_url(
+            "http://otel.internal.example.org:4318/v1/traces",
+            "/v1/traces"
+        ),
+        "http://otel.internal.example.org:4318/v1/traces"
+    );
+    assert_eq!(
+        otlp_signal_url(
+            "http://otel.internal.example.org:4318/v1/traces/",
+            "/v1/traces"
+        ),
+        "http://otel.internal.example.org:4318/v1/traces"
+    );
+    // A different signal on a suffixed endpoint still gets its own path.
+    assert_eq!(
+        otlp_signal_url(
+            "http://otel.internal.example.org:4318/v1/traces",
+            "/v1/logs"
+        ),
+        "http://otel.internal.example.org:4318/v1/traces/v1/logs"
+    );
+}
+
+// The handler refreshes system counters under `block_in_place`, which
+// needs the multi-threaded runtime Lorica runs on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_api_v1_metrics_is_the_metrics_document_behind_the_session() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let router = app(state, session_store, rate_limiter);
+
+    // No session: the ordinary API gate answers, not the metrics one.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/metrics")
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.clone().oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // With the session cookie: the Prometheus exposition, same as /metrics.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/metrics")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("# HELP lorica_") || text.contains("lorica_"),
+        "expected a Prometheus exposition, got: {text}"
+    );
+}

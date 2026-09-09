@@ -2424,6 +2424,27 @@ mod audit_tests {
     }
 
     #[test]
+    fn two_handles_on_one_file_extend_one_chain() {
+        // Backlog #74: `lorica cluster leave` opens its own `LogStore` on
+        // the daemon's file. Alternating writers on two handles must
+        // extend a single chain; a forked chain fails verification.
+        let (store_a, dir) = tmp_store();
+        let store_b = LogStore::open(dir.path()).expect("second handle");
+        for n in 1..=6 {
+            let writer = if n % 2 == 0 { &store_b } else { &store_a };
+            writer
+                .insert_audit(&entry(n, "cluster.leave", "cli"))
+                .expect("insert");
+        }
+        for store in [&store_a, &store_b] {
+            let result = store.verify_audit_chain().expect("verify");
+            assert!(result.verified);
+            assert_eq!(result.total_rows, 6);
+            assert!(result.first_break_id.is_none());
+        }
+    }
+
+    #[test]
     fn tampering_breaks_at_the_modified_row() {
         let (store, _dir) = tmp_store();
         for n in 1..=4 {
