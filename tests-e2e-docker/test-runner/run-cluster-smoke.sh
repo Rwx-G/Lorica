@@ -617,7 +617,11 @@ assert_json_gt "$SLA_A" '[.data[] | select(.total_requests > 0)] | length' 0 \
 # logged, not asserted, until #68 is fixed.
 assert_json_gt "$SLA_B" '[.data[] | select(.route_id == "'"$ROUTE_ID"'")] | length' 0 \
     "edge-b's SLA overview (workers mode) is served through the control plane"
-log "edge-b reports $(echo "$SLA_B" | jq '[.data[] | select(.window == "1h") | .total_requests] | add // 0') requests over 1h for the route (backlog #68: undercounted in workers mode)"
+# The body, so a refusal (no session, a follower error) is readable
+# in the run log rather than folded into a zero.
+log "edge-b proxied overview: $(echo "$SLA_B" | head -c 240)"
+log "edge-b reports $(echo "$SLA_B" | jq '[(.data // [])[] | select(.window == "1h") | .total_requests] | add // 0') requests over 1h for the route (backlog #68: undercounted in workers mode)"
+log "edge-b roster row: $(api_get /api/v1/cluster/nodes | jq -c --arg id "$EDGE_B_ID" '.data[] | select(.node_id == $id) | {status, connected, applied_config_generation}')"
 ROUTE_SLA=$(api_get "/api/v1/sla/routes/$ROUTE_ID?node=$EDGE_A_ID")
 assert_json_gt "$ROUTE_SLA" '[.data[] | select(.window == "1h" and .total_requests > 0)] | length' 0 \
     "one route's windows for one node"
