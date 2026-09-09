@@ -188,7 +188,7 @@ done
 hu_counter() {
     # lorica_hot_upgrade_total{outcome="<arg>"} value, or 0 if absent.
     local outcome="$1" v
-    v=$(curl -sf "$API/metrics" 2>/dev/null \
+    v=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null \
         | grep "^lorica_hot_upgrade_total{" \
         | grep "outcome=\"$outcome\"" \
         | awk '{print $NF}' | head -1)

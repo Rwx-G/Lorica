@@ -648,14 +648,16 @@ fi
 # =============================================================================
 log "=== 10. Prometheus Metrics ==="
 
-METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics" 2>/dev/null || true)
+# Authenticated with the dashboard session: `metrics_require_auth` is
+# on by default since v1.7.0, and the base suite owns the 401 assertion.
+METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" "$API/metrics" 2>/dev/null || true)
 if [ "$METRICS_STATUS" = "200" ]; then
     ok "Prometheus /metrics accessible in worker mode"
 else
     fail "Prometheus /metrics should return 200 (got $METRICS_STATUS)"
 fi
 
-METRICS_BODY=$(curl -sf "$API/metrics" 2>/dev/null || echo "")
+METRICS_BODY=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null || echo "")
 if echo "$METRICS_BODY" | grep -q "lorica_http_requests_total" 2>/dev/null; then
     ok "Workers: metrics contain request counters"
 else
@@ -1083,7 +1085,7 @@ for i in $(seq 1 5); do
 done
 sleep 2
 
-METRICS_BODY=$(curl -sf "$API/metrics" 2>/dev/null || echo "")
+METRICS_BODY=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null || echo "")
 
 if echo "$METRICS_BODY" | grep -q "lorica_requests_total" 2>/dev/null; then
     ok "Worker metrics: lorica_requests_total present"

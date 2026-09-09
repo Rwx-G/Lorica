@@ -138,7 +138,7 @@ sleep 2
 get_counter() {
     local route_id="$1" mode="$2" outcome="$3"
     local v
-    v=$(curl -sf "$API/metrics" 2>/dev/null \
+    v=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null \
         | grep "^lorica_bot_challenge_total{" \
         | grep "route_id=\"$route_id\"" \
         | grep "mode=\"$mode\"" \

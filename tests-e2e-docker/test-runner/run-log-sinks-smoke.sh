@@ -284,7 +284,7 @@ fi
 # Dropped-message accounting: the syslog consumer counts every message
 # it sheds while the collector is unreachable.
 sleep 2
-DROPPED=$(curl -sf "$API/metrics" 2>/dev/null \
+DROPPED=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null \
     | grep '^lorica_log_sink_dropped_total' \
     | grep 'sink="syslog"' \
     | awk '{sum += $NF} END {printf "%d", sum}' || echo "0")

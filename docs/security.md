@@ -171,12 +171,11 @@ Clients reach the API over `https://`; the bundled `lorica` CLI uses
 `https://127.0.0.1` and accepts the self-signed certificate, since the
 target is always loopback (no MITM surface to defend).
 
-**`/metrics` authentication (opt-in).** By default `/metrics` is
-served without authentication so existing Prometheus scrapes keep
-working. On a shared / multi-tenant host any local user can otherwise
-read the full backend topology and certificate inventory from the
-endpoint. Set the global setting `metrics_require_auth = true` to
-require, on every scrape, ONE of:
+**`/metrics` authentication (on by default since v1.7.0).** The
+endpoint exposes the full backend topology and certificate inventory,
+which on a shared or multi-tenant host any local user could otherwise
+read. Since v1.7.0 the global setting `metrics_require_auth` defaults
+to `true` and every scrape must present ONE of:
 
 - a valid dashboard session cookie (an operator viewing `/metrics` in
   the browser), or
@@ -191,10 +190,16 @@ not leak how many leading bytes matched. A rejected scrape returns
 token is masked (`**REDACTED**`) in `GET /api/v1/settings` responses
 and is never written to the reload diff.
 
-> Migration note: `metrics_require_auth` defaults to `false` in v1.6.0
-> for back-compat and is planned to default to `true` in v1.7.0.
-> Configure `prometheus_scrape_token` and update your scraper's
-> `Authorization` header before upgrading to v1.7.0.
+> Migration note (v1.6.0 to v1.7.0): v1.6.0 shipped this setting off
+> for back-compat. An install that never changed it has no stored
+> value, so it takes the new default on upgrade and its unauthenticated
+> scrapes answer `401` from the first boot on v1.7.0. Before upgrading,
+> either configure `prometheus_scrape_token` (or set
+> `LORICA_PROMETHEUS_SCRAPE_TOKEN` in the unit's environment) and add
+> the `Authorization: Bearer` header to the scrape job, or set
+> `metrics_require_auth = false` explicitly to keep the v1.6.0
+> behaviour. An install that had already set the value either way is
+> unaffected: a stored value always wins over the default.
 
 **Dashboard CSP.** The dashboard document carries a strict CSP3 policy
 (built in `lorica-dashboard/src/csp.rs`): `default-src 'self'`,

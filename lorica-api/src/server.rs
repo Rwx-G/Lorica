@@ -476,9 +476,10 @@ pub fn build_router(
         .route("/api/v1/auth/login", post(crate::auth::login))
         .route("/api/v1/auth/logout", post(crate::auth::logout));
 
-    // `/metrics` carries an opt-in auth gate (Story 8.8 AC #4/#5):
-    // pass-through when `metrics_require_auth` is off (the default),
-    // else a session cookie OR the bearer scrape token is required. The
+    // `/metrics` carries an auth gate (Story 8.8 AC #4/#5, on by
+    // default since v1.7.0): pass-through when `metrics_require_auth`
+    // is off, else a session cookie OR the bearer scrape token is
+    // required. The
     // ACME challenge stays fully public (the CA reaches it un
     // authenticated), so the two endpoints are split into separate
     // sub-routers and only `/metrics` gets the layer.

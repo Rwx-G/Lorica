@@ -391,12 +391,23 @@ pub struct GlobalSettings {
     pub upgrade_signing_pubkey_path: Option<String>,
 
     /// Require authentication on the `/metrics` endpoint (Story 8.8
-    /// AC #4). Default `false` in v1.6.0 for back-compat: existing
-    /// Prometheus scrapers keep working unauthenticated. When `true`,
-    /// `/metrics` demands either a valid dashboard session cookie OR
-    /// the static bearer token in `prometheus_scrape_token`. Flips to
-    /// `true` in v1.7.0 with a release-note migration paragraph.
-    #[serde(default)]
+    /// AC #4). When `true`, `/metrics` demands either a valid dashboard
+    /// session cookie OR the static bearer token in
+    /// `prometheus_scrape_token`.
+    ///
+    /// Default `true` since v1.7.0, the flip v1.6.0's field doc
+    /// promised. v1.6.0 shipped `false` for back-compat and said so in
+    /// its release note. An install that never wrote this key takes the
+    /// new default on upgrade, so its unauthenticated scrapes answer
+    /// 401 from the first boot; the v1.7.0 release note and
+    /// `docs/security.md` carry the migration paragraph. A stored value
+    /// always wins over the default, so an install that had set it
+    /// either way is unaffected.
+    ///
+    /// One default function serves both the serde attribute and
+    /// `Default`, so a TOML import omitting the field and a fresh
+    /// store cannot disagree.
+    #[serde(default = "default_metrics_require_auth")]
     pub metrics_require_auth: bool,
 
     /// Static bearer token accepted on `/metrics` when
@@ -496,6 +507,12 @@ pub struct GlobalSettings {
     /// responses and TOML export (Story 9.8 AC #8).
     #[serde(default)]
     pub otlp_logs_auth_header: Option<String>,
+}
+
+/// `true` since v1.7.0. See the field doc on
+/// [`GlobalSettings::metrics_require_auth`] for the migration.
+fn default_metrics_require_auth() -> bool {
+    true
 }
 
 fn default_header_timeout_s() -> u32 {
@@ -693,7 +710,7 @@ impl Default for GlobalSettings {
             ai_bot_treat_spoofed_as: SpoofedFallback::default(),
             ai_bot_inject_headers: default_ai_bot_inject_headers(),
             upgrade_signing_pubkey_path: None,
-            metrics_require_auth: false,
+            metrics_require_auth: default_metrics_require_auth(),
             prometheus_scrape_token: None,
             management_cert_pem_path: None,
             management_key_pem_path: None,

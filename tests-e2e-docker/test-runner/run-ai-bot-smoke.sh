@@ -261,7 +261,7 @@ echo_header() {
 get_ai_counter() {
     local crawler="$1" action="$2" route="${3:-$ROUTE_ID}"
     local v
-    v=$(curl -sf "$API/metrics" 2>/dev/null \
+    v=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null \
         | grep "^lorica_ai_bot_total{" \
         | grep "crawler=\"$crawler\"" \
         | grep "route_id=\"$route\"" \

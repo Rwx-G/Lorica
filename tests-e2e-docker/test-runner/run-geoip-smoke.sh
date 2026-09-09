@@ -151,7 +151,7 @@ fi
 get_geoip_counter() {
     local route_id="$1" country="$2" mode="$3"
     local val
-    val=$(curl -sf "$API/metrics" 2>/dev/null \
+    val=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null \
         | grep "^lorica_geoip_block_total{" \
         | grep "route_id=\"$route_id\"" \
         | grep "country=\"$country\"" \

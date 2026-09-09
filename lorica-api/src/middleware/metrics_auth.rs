@@ -2,9 +2,9 @@
 //! AC #4 / AC #5).
 //!
 //! When the global setting `metrics_require_auth` is `false` (the
-//! v1.6.0 default) this middleware is a straight pass-through, so
-//! existing unauthenticated Prometheus scrapes keep working. When it is
-//! `true`, a scrape must present ONE of:
+//! v1.6.0 default, kept by any install that stored it) this middleware
+//! is a straight pass-through. Since v1.7.0 the default is `true`, and
+//! a scrape must present ONE of:
 //!
 //! - a valid dashboard session cookie (an operator viewing `/metrics`
 //!   in the browser), or
@@ -37,9 +37,8 @@ const METRICS_REALM: &str = "lorica-metrics";
 /// How long a cached auth-settings snapshot is reused before re-reading
 /// the store. Bounds the settings DB read to at most once per this window
 /// regardless of scrape rate (performance: a Prometheus scrape must not
-/// pay a blocking SQLite read every time, especially in the default
-/// `metrics_require_auth = false` configuration). A change to the toggle
-/// or token takes effect within one TTL.
+/// pay a blocking SQLite read every time, whichever way the toggle is
+/// set). A change to the toggle or token takes effect within one TTL.
 const AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The two settings the middleware needs, cached to keep `/metrics`

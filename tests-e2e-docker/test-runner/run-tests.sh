@@ -901,15 +901,25 @@ if [ -n "$SESSION" ]; then
 # =============================================================================
     log "=== 19. Prometheus Metrics ==="
 
-    # /metrics endpoint should be accessible without auth
+    # v1.7.0 flipped `metrics_require_auth` to `true` by default (the
+    # migration v1.6.0's release note announced). This is that flip's
+    # regression test: a bare scrape is refused, and a scrape carrying
+    # one of the two accepted credentials (here the dashboard session)
+    # is served. Before v1.7.0 this block asserted the opposite.
     METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics" 2>/dev/null || true)
-    if [ "$METRICS_STATUS" = "200" ]; then
-        ok "Prometheus /metrics endpoint accessible (no auth)"
+    if [ "$METRICS_STATUS" = "401" ]; then
+        ok "Prometheus /metrics refuses an unauthenticated scrape by default (401)"
     else
-        fail "Prometheus /metrics should return 200 (got $METRICS_STATUS)"
+        fail "Prometheus /metrics should be 401 without auth since v1.7.0 (got $METRICS_STATUS)"
+    fi
+    METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" "$API/metrics" 2>/dev/null || true)
+    if [ "$METRICS_STATUS" = "200" ]; then
+        ok "Prometheus /metrics accepts a dashboard session (200)"
+    else
+        fail "Prometheus /metrics should return 200 with a session (got $METRICS_STATUS)"
     fi
 
-    METRICS_BODY=$(curl -sf "$API/metrics" 2>/dev/null || echo "")
+    METRICS_BODY=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null || echo "")
     if echo "$METRICS_BODY" | grep -q "lorica_http_requests_total" 2>/dev/null; then
         ok "Metrics contain lorica_http_requests_total"
     else
@@ -2317,7 +2327,7 @@ if [ -n "$SESSION" ]; then
 # =============================================================================
     log "=== 45. Prometheus Metrics Detail ==="
 
-    METRICS=$(curl -sf "$API/metrics" 2>/dev/null || echo "")
+    METRICS=$(curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null || echo "")
 
     if echo "$METRICS" | grep -q "lorica_http_requests_total" 2>/dev/null; then
         ok "Metrics contain lorica_http_requests_total"
