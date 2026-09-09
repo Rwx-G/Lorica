@@ -11,6 +11,18 @@ Author: Rwx-G
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Security
+
+## [1.7.0] - 2026-09-09
+
+### Added
+
 - Multi-node cluster (Epic 9, stories 9.1 to 9.7 and 9.9): one designated control plane and any number of followers, joined over mutual TLS with a fleet certificate authority the control plane mints (`lorica cluster init`), enrolled with short-lived join tokens bound to a node name and optionally a source CIDR (`lorica cluster token`, `lorica cluster join --token-file`), and approved by a SuperAdmin before anything flows to them. The control plane replicates the fleet's configuration in two phases (all-or-none prepare, then commit; a slow node is evicted from the round rather than vetoing the fleet), targets routes to a subset of nodes with `node_selector`, issues and renews certificates for the whole fleet and distributes each private key only to the nodes whose routes select it (HTTP-01 challenges fan out to the same nodes), and aggregates every follower's access logs, WAF events, live bans and audit trail into a fleet view with per-node quotas, one hash chain per node and per-chain verification. Followers are read-only (409 on a configuration mutation) with an audited, time-boxed break-glass window; revocation ends a node's session synchronously and names the certificates whose keys it keeps, for re-issue. New dashboard page `Cluster` (roster, resource gauges, node drawer, join dialog, break-glass and leave on a follower) and a fleet-wide node filter on Access Logs, Security and Audit; new `lorica_cluster_*` Prometheus families; `docs/cluster.md` documents the trust model, every guarantee as it actually holds, the failure modes and the mixed-version upgrade order (followers first). Verified end to end by a new `cluster` Docker e2e profile: a control plane and two followers, one in workers mode, with a real ACME issuance through the Pebble fixture.
 - Syslog export sink (Epic 9 Story 9.8): access logs, WAF events and audit entries can be shipped to an operator SIEM as RFC 5424 messages, implemented in-tree (no new dependency) over UDP, TCP (RFC 6587 octet-counting framing) and TCP+TLS with optional mutual TLS towards the collector (PEM CA / client cert / client key settings; the client key is secret-masked on `GET /settings` and redacted from TOML export, with import rejecting the placeholder). Configurable facility (default `local0`), per-event-kind severity mapping (access=info, waf=warning, audit=notice), independent per-kind toggles, and static structured-data parameters (`syslog_extra_sd`, e.g. `env=prod,dc=eu-west`) carried in a `[lorica@32473 ...]` SD element alongside the event kind and the request `trace_id` / `span_id`. Delivery is fire-and-forget through a bounded queue drained by a dedicated OS thread owning its own tokio runtime (identical behaviour in supervisor, worker and single-process modes): an unreachable collector backs off exponentially (1 s to 30 s) and sheds messages into `lorica_log_sink_dropped_total{sink,kind}` instead of ever touching the request path. `POST /api/v1/settings/syslog/test` sends a synthetic test message and reports success, failure reason and round-trip time.
 - Password sources for the management CLI (Epic 9 Story 9.3): `lorica unban` and `lorica upgrade` read the admin password from `--password-file`, `--password-stdin` or `LORICA_ADMIN_PASSWORD` like the new `cluster` commands; `--password` on the command line still works but prints a warning (argv is readable by every local process and lands in shell history). An explicit source wins over the environment variable.
