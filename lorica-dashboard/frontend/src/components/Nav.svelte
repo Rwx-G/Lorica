@@ -2,8 +2,13 @@
   import { currentPath, navigate } from '../lib/router';
   import { api } from '../lib/api';
   import { auth } from '../lib/auth';
+  import { clusterStatus, isClustered } from '../lib/cluster';
 
-  type NavItem = { path: string; label: string; icon: string } | { section: string };
+  // `cluster: true` hides the entry on a standalone install: an
+  // operator who never clustered must not see fleet navigation.
+  type NavItem =
+    | { path: string; label: string; icon: string; cluster?: boolean }
+    | { section: string; cluster?: boolean };
 
   const navItems: NavItem[] = [
     { path: '/', label: 'Overview', icon: 'grid' },
@@ -18,12 +23,16 @@
     { path: '/sla', label: 'SLA', icon: 'activity' },
     { path: '/logs', label: 'Logs', icon: 'list' },
     { path: '/loadtest', label: 'Load Test', icon: 'zap' },
+    { section: 'Fleet', cluster: true },
+    { path: '/cluster', label: 'Cluster', icon: 'cluster', cluster: true },
     { section: 'System' },
     { path: '/system', label: 'System', icon: 'cpu' },
     { path: '/settings', label: 'Settings', icon: 'settings' },
   ];
 
   let path = $state('/');
+  const clustered = $derived(isClustered($clusterStatus));
+  const visibleItems = $derived(navItems.filter((i) => !i.cluster || clustered));
 
   currentPath.subscribe((v) => {
     path = v;
@@ -42,7 +51,7 @@
   </div>
 
   <ul class="nav-list">
-    {#each navItems as item, i (i)}
+    {#each visibleItems as item, i (i)}
       {#if 'section' in item}
         <li class="nav-section">{item.section}</li>
       {:else}
@@ -84,6 +93,7 @@
       radio: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg>',
       zap: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
       settings: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+      cluster: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 7v4M12 11l-6 6M12 11l6 6"/></svg>',
       logout: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
     };
     return icons[name] ?? '';
