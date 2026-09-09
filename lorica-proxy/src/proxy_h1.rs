@@ -42,24 +42,23 @@ where
         // phase 2 send to upstream
 
         let mut req = session.req_header().clone();
+        req.set_version(Version::HTTP_11);
 
-        // Convert HTTP2 headers to H1
-        if req.version == Version::HTTP_2 {
-            req.set_version(Version::HTTP_11);
-            // if client has body but has no content length, add chunked encoding
-            // https://datatracker.ietf.org/doc/html/rfc9112#name-message-body
-            // "The presence of a message body in a request is signaled by a Content-Length or Transfer-Encoding header field."
-            if !session.is_body_empty() && session.get_header(header::CONTENT_LENGTH).is_none() {
-                req.insert_header(header::TRANSFER_ENCODING, "chunked")
-                    .unwrap();
-            }
-            if session.get_header(header::HOST).is_none() {
-                // H2 is required to set :authority, but no necessarily header
-                // most H1 server expect host header, so convert
-                let host = req.uri.authority().map_or("", |a| a.as_str()).to_owned();
-                req.insert_header(header::HOST, host).unwrap();
-            }
-            // TODO: Add keepalive header for connection reuse, but this is not required per RFC
+        // H2 is required to set :authority, but not necessarily Host; most H1 servers expect a
+        // Host header, so convert it when sending to H1.
+        if session.req_header().version == Version::HTTP_2
+            && session.get_header(header::HOST).is_none()
+        {
+            let host = req.uri.authority().map_or("", |a| a.as_str()).to_owned();
+            req.insert_header(header::HOST, host).unwrap();
+        }
+
+        if let Err(e) = sanitize_h1_upstream_request(
+            &mut req,
+            peer.options.http_upstream_request_policy,
+            session.req_header().version == Version::HTTP_11,
+        ) {
+            return (false, true, Some(e.into_down()));
         }
 
         if session.cache.enabled() {
@@ -80,6 +79,13 @@ where
                 return (false, true, Some(e));
             }
         }
+
+        if let Err(e) = finalize_h1_upstream_request_framing(&mut req, !session.is_body_empty()) {
+            return (false, true, Some(e));
+        }
+
+        session.upstream_h1_upgrade_status_mismatch = session.downstream_session.is_upgrade_req()
+            != req.headers.get(header::UPGRADE).is_some();
 
         session.upstream_compression.request_filter(&req);
 
@@ -127,7 +133,9 @@ where
         }
 
         match ret {
-            Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, true, None),
+            Ok((downstream_can_reuse, upstream_can_reuse)) => {
+                (downstream_can_reuse, upstream_can_reuse, None)
+            }
             Err(e) => (false, false, Some(e)),
         }
     }
@@ -184,13 +192,14 @@ where
         client_session: &mut HttpSessionV1,
         tx: mpsc::Sender<HttpTask>,
         mut rx: mpsc::Receiver<HttpTask>,
-    ) -> Result<()>
+    ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
         let mut request_done = false;
         let mut response_done = false;
+        let mut upstream_can_reuse = true;
         let mut send_error = None;
         let mut upgraded = false;
 
@@ -222,7 +231,7 @@ where
                             // So that this function could read the rest events from rx including
                             // the closure, then exit.
                             if result.is_err() && !client_session.was_upgraded() {
-                                return result;
+                                return result.map(|_| upstream_can_reuse);
                             }
                         },
                         Err(e) => {
@@ -230,7 +239,7 @@ where
                             // Don't care if send fails: downstream already gone
                             let _ = tx.send(HttpTask::Failed(send_error.unwrap_or(e).into_up())).await;
                             // Downstream should consume all remaining data and handle the error
-                            return Ok(())
+                            return Ok(upstream_can_reuse)
                         }
                     }
                 },
@@ -248,6 +257,13 @@ where
                            warn!("send error, draining read buf: {e}");
                            request_done = true;
 
+                           // Built-in HTTP downstream sessions are expected to reject
+                           // incomplete bodies before reaching this state. A downstream
+                           // session that does not report such an error or an upstream request
+                           // mutation that creates inconsistent framing can still reach it.
+                           // A complete response can be forwarded, but the partially written
+                           // HTTP/1 request makes this connection unsafe to reuse.
+                           upstream_can_reuse = false;
                            send_error = Some(e);
                            continue
                         }
@@ -261,7 +277,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(upstream_can_reuse)
     }
 
     // todo use this function to replace bidirection_1to2()
@@ -616,6 +632,23 @@ where
             if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
                 trace!("delaying upstream response for {duration:?}");
                 time::sleep(duration).await;
+            }
+
+            if matches!(
+                &task,
+                HttpTask::Header(header, _)
+                    if header.status == http::StatusCode::SWITCHING_PROTOCOLS
+                        && session.upstream_h1_upgrade_status_mismatch
+            ) {
+                // Upstream and downstream must agree that this request is an upgrade before
+                // a 101 can establish a tunnel. Otherwise one side changes protocol while
+                // the other stays in HTTP handling, allowing tunneled traffic to bypass the
+                // intended request processing or corrupting the connection state.
+                return Error::e_explain(
+                    InvalidHTTPHeader,
+                    "received 101 response with mismatched upstream/downstream upgrade status",
+                )
+                .map_err(|e| e.into_up());
             }
 
             // cache the original response before any downstream transformation

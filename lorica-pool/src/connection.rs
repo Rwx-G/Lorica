@@ -194,27 +194,16 @@ impl<S> ConnectionPool<S> {
         }
     }
 
-    /* get or create and insert a pool node for the hash key */
-    fn get_pool_node(&self, key: GroupKey) -> Arc<PoolNode<PoolConnection<S>>> {
-        {
-            let pool = self.pool.read();
-            if let Some(v) = pool.get(&key) {
-                return (*v).clone();
-            }
-        } // read lock released here
-
-        {
-            // write lock section
-            let mut pool = self.pool.write();
-            // check again since another task might have already added it
-            if let Some(v) = pool.get(&key) {
-                return (*v).clone();
-            }
-            let node = Arc::new(PoolNode::new());
-            let node_ret = node.clone();
-            pool.insert(key, node); // TODO: check dup
-            node_ret
-        }
+    /// Insert a connection under `key` while the pool write lock is held.
+    ///
+    /// Holding the lock through [`PoolNode::insert`] prevents empty-node cleanup
+    /// from removing the map entry between looking it up and repopulating it.
+    fn insert_pool_connection(&self, key: GroupKey, id: ID, connection: PoolConnection<S>) {
+        let mut pool = self.pool.write();
+        let pool_node = pool
+            .entry(key)
+            .or_insert_with(|| Arc::new(PoolNode::new()));
+        pool_node.insert(id, connection);
     }
 
     /// Attempt to remove an empty [`PoolNode`] entry from the pool `HashMap`.
@@ -228,18 +217,10 @@ impl<S> ConnectionPool<S> {
     /// removing a node that was concurrently repopulated between the caller's
     /// initial `is_empty()` hint and this write-lock acquisition.
     ///
-    /// # Race window
-    ///
-    /// There is a narrow window where another thread could have called
-    /// [`get_pool_node`] (obtaining a clone of the `Arc<PoolNode>`) just before
-    /// we remove the entry. If that thread then inserts a connection into the
-    /// now-orphaned node, the connection is dropped when the last `Arc` reference
-    /// goes away. This is benign: the `oneshot::Sender` inside the dropped
-    /// `PoolConnection` is also dropped, which resolves the corresponding
-    /// `watch_use` receiver in `idle_poll`/`idle_timeout`, causing a clean exit.
-    /// The next request to the same upstream simply creates a fresh connection.
-    /// This trade-off matches the existing concurrency model of the pool and is
-    /// consistent with how hyper-util and Go's `net/http` handle this case.
+    /// Insertions go through [`Self::insert_pool_connection`], which holds the
+    /// pool write lock until the connection is in the node. That prevents this
+    /// cleanup from removing a node between an inserter's entry lookup and its
+    /// [`PoolNode::insert`] call.
     fn try_remove_empty_node(&self, key: GroupKey) {
         let mut pool = self.pool.write();
         if let Some(node) = pool.get(&key) {
@@ -322,10 +303,9 @@ impl<S> ConnectionPool<S> {
         if let Some(meta) = replaced {
             self.pop_evicted(&meta);
         };
-        let pool_node = self.get_pool_node(meta.key);
         let (notify_use, watch_use) = oneshot::channel();
         let connection = PoolConnection::new(notify_use, connection);
-        pool_node.insert(meta.id, connection);
+        self.insert_pool_connection(meta.key, meta.id, connection);
         (notify_close, watch_use)
     }
 
@@ -796,5 +776,36 @@ mod tests {
             0,
             "node should be cleaned up again after get"
         );
+    }
+
+    #[test]
+    fn test_concurrent_empty_node_cleanup_does_not_orphan_put() {
+        const KEY: GroupKey = 101;
+        let cp = Arc::new(ConnectionPool::new(2_000));
+        let start = Arc::new(std::sync::Barrier::new(2));
+
+        let cleanup_cp = cp.clone();
+        let cleanup_start = start.clone();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_start.wait();
+            for _ in 0..10_000 {
+                cleanup_cp.try_remove_empty_node(KEY);
+                std::thread::yield_now();
+            }
+        });
+
+        start.wait();
+        for id in 1..=1_000 {
+            let value = format!("v{id}");
+            cp.put(&ConnectionMeta::new(KEY, id), value.clone());
+            assert_eq!(
+                cp.get(&KEY),
+                Some(value),
+                "put connection should remain reachable during empty-node cleanup"
+            );
+            std::thread::yield_now();
+        }
+
+        cleanup.join().unwrap();
     }
 }
