@@ -27,7 +27,7 @@ When bumping the version, update ALL of these files:
 
 ## Frontend and API spec
 - [ ] `lorica-dashboard/frontend/package.json` - `version`
-- [ ] `lorica-dashboard/frontend/package-lock.json` - the root `version`, twice (`pnpm-lock.yaml` does not record it)
+- [ ] `lorica-dashboard/frontend/package-lock.json` - the root `version`, twice: once at the top of the file and once in the `packages.""` entry (`pnpm-lock.yaml` does not record it). **Do not blind-replace**: a dependency can carry the same version string (at 1.7.0 it was `node_modules/esquery`), so replace the two root entries and leave the rest.
 - [ ] `lorica-api/openapi.yaml` - `version`
 
 ## Documentation
