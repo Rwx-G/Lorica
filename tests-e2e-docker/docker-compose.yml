@@ -966,6 +966,94 @@ services:
     networks:
       - e2e
 
+  # ---------------------------------------------------------------
+  # Cluster profile (Epic 9 Integration Verification, backlog #66).
+  #
+  # One control plane and two followers, one single-process and one in
+  # workers mode. This is the profile stories 9.2 through 9.9 were all
+  # written against and none of them could run: every one of those
+  # story files records that it shipped on unit tests alone.
+  #
+  # Run with:
+  #   docker compose --profile cluster up --build
+  #   docker compose --profile cluster run --rm cluster-smoke
+  # ---------------------------------------------------------------
+  lorica-cp:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-cluster-cp.sh"]
+    profiles: ["cluster"]
+    volumes:
+      - lorica-cp-data:/var/lib/lorica
+      - shared-cluster:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  lorica-edge-a:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-cluster-follower.sh"]
+    profiles: ["cluster"]
+    environment:
+      - NODE_NAME=edge-a
+    volumes:
+      - lorica-edge-a-data:/var/lib/lorica
+      - shared-cluster:/shared
+    depends_on:
+      - lorica-cp
+      - backend1
+    networks:
+      - e2e
+
+  # The same follower in workers mode, so the supervisor path is
+  # exercised: the cluster plane runs in the supervisor and the audit
+  # log only exists there, which is the trap Story 9.9's Dev Notes name.
+  lorica-edge-b:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-cluster-follower.sh"]
+    profiles: ["cluster"]
+    environment:
+      - NODE_NAME=edge-b
+      - WORKERS=1
+    volumes:
+      - lorica-edge-b-data:/var/lib/lorica
+      - shared-cluster:/shared
+    depends_on:
+      - lorica-cp
+      - backend1
+    networks:
+      - e2e
+
+  cluster-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["cluster"]
+    # Root because the shared volume is initialised owned by the
+    # unprivileged lorica user and this runner reads the bootstrap
+    # passwords out of it (same rationale as audit-smoke).
+    user: "0:0"
+    entrypoint: ["bash", "run-cluster-smoke.sh"]
+    depends_on:
+      - lorica-cp
+      - lorica-edge-a
+      - lorica-edge-b
+    volumes:
+      - shared-cluster:/shared:ro
+    environment:
+      - CP_API=https://lorica-cp:9443
+      - EDGE_A_API=https://lorica-edge-a:9443
+      - EDGE_A_PROXY=http://lorica-edge-a:8080
+      - BACKEND1_ADDR=backend1:80
+      - SHARED_DIR=/shared
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
@@ -999,6 +1087,10 @@ volumes:
   shared-audit:
   lorica-log-sinks-data:
   shared-log-sinks:
+  lorica-cp-data:
+  lorica-edge-a-data:
+  lorica-edge-b-data:
+  shared-cluster:
   lorica-acme-data:
   shared-acme:
 
