@@ -529,8 +529,27 @@ pub struct AuditListParams {
 /// mode, tests) reads as an empty log.
 pub async fn list_audit(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Query(params): Query<AuditListParams>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // On a control plane the table aggregates every follower's
+    // operators, roles, addresses and user agents (Story 9.9), and
+    // the Operator floor was set when it held one node's rows. The
+    // fleet's trail (`node` absent, or naming another node) is
+    // SuperAdmin; `node=` with the empty string is this node's own
+    // chain and keeps the single-node floor exactly (Epic 9 close,
+    // backlog #73 decided). A standalone install or a follower holds
+    // one chain, so nothing changes there.
+    let aggregates = matches!(state.cluster, crate::cluster::ClusterRuntime::ControlPlane(_));
+    if aggregates
+        && params.node.as_deref() != Some("")
+        && session.role < lorica_config::models::Role::SuperAdmin
+    {
+        return Err(ApiError::Forbidden(
+            "the fleet's audit trail is SuperAdmin; pass node= (empty) for this node's own"
+                .into(),
+        ));
+    }
     let Some(log_store) = state.log_store.clone() else {
         return Ok(json_data(serde_json::json!({ "entries": [], "total": 0 })));
     };

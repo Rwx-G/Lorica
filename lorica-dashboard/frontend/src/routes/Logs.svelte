@@ -4,7 +4,7 @@
   import { api, type LogEntry, type LogsQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
-  import { canWrite } from '../lib/auth';
+  import { canWrite, canWriteRole } from '../lib/auth';
   import { clusterStatus, isFleetView } from '../lib/cluster';
 
   let entries: LogEntry[] = $state([]);
@@ -26,7 +26,9 @@
    * Whether this page is showing the FAN-IN store rather than this
    * node's own log. Only a control plane holds fanned-in rows.
    */
-  const fleetView = $derived(isFleetView($clusterStatus));
+  // The fleet view reads Operator-floor endpoints; a Viewer on the
+  // control plane sees this node's own data, as on a standalone.
+  const fleetView = $derived(isFleetView($clusterStatus) && $canWriteRole);
   /**
    * Row id to the node that produced it, for the fleet view's Node
    * column.

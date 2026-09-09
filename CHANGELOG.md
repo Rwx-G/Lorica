@@ -34,6 +34,7 @@ Author: Rwx-G
 - Revoking a cluster node names the certificates whose private key it was entitled to (`certificates_to_reissue`, in the response, the audit row and the alert): revocation cuts access, it cannot recall a key the node already holds.
 - The follower read-only gate admits exactly the three cluster commands a follower owns (`leave`, `break-glass`, `status`) instead of the whole `/api/v1/cluster/` prefix, so a fleet mutation is refused by the gate rather than by each handler's own check.
 - Every `/api/v1/cluster/*` read carries the cluster rate limiter; the two fan-in queries take the telemetry store's connection away from ingest for their duration and sat at the Viewer floor with no limiter.
+- Fleet reads sit at the Operator floor (`/api/v1/cluster/nodes*`, `replication`, `drift`, `logs`, `waf-events`, `bans`), the aggregated audit trail at SuperAdmin unless `node=` names the node's own chain, and `GET /settings` withholds the log pipeline's topology from a Viewer. On a single node nothing a Viewer could see changes; on a control plane the fleet's client addresses, operators and key entitlements no longer reach the least-trusted role. **Migration:** a Viewer account that scripted the roster or the fan-in views needs Operator.
 - Fanned-in audit rows are retained by the time they arrived on the control plane rather than by the timestamp the origin node chose, and a session may push at most 240 telemetry batches a minute, so a follower cannot fill the control plane's audit table with rows retention never reclaims.
 
 ### Changed

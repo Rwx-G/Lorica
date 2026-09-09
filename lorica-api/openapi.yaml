@@ -3659,7 +3659,7 @@ paths:
   /api/v1/cluster/nodes:
     get:
       tags: [Cluster]
-      summary: The fleet roster with live session facts (Viewer+)
+      summary: The fleet roster with live session facts (Operator+)
       security:
         - sessionCookie: []
       responses:
@@ -3687,7 +3687,7 @@ paths:
           type: string
     get:
       tags: [Cluster]
-      summary: One enrolled node (Viewer+)
+      summary: One enrolled node (Operator+)
       security:
         - sessionCookie: []
       responses:
@@ -3829,7 +3829,7 @@ paths:
   /api/v1/cluster/replication:
     get:
       tags: [Cluster]
-      summary: Last configuration replication round (Viewer+, control plane)
+      summary: Last configuration replication round (Operator+, control plane)
       description: >-
         Story 9.4 AC #8. The completion channel is a report, not a blocking
         response: a mutation answers as soon as it is committed locally, and
@@ -3858,7 +3858,7 @@ paths:
   /api/v1/cluster/drift:
     get:
       tags: [Cluster]
-      summary: Nodes whose applied configuration differs (Viewer+, control plane)
+      summary: Nodes whose applied configuration differs (Operator+, control plane)
       description: >-
         Story 9.4 AC #12. Every `active` node is compared to the control
         plane's current generation and hash, using the live session's report
@@ -3885,7 +3885,7 @@ paths:
   /api/v1/cluster/bans:
     get:
       tags: [Cluster]
-      summary: Every node's live bans, as last reported (Viewer+, control plane)
+      summary: Every node's live bans, as last reported (Operator+, control plane)
       description: >-
         Story 9.6 AC #10, the visibility half. A snapshot of what each node
         last reported, not a history: bans are in-memory state on each node,
@@ -3965,7 +3965,7 @@ paths:
   /api/v1/cluster/logs:
     get:
       tags: [Cluster]
-      summary: The fleet's access logs (Viewer+, control plane)
+      summary: The fleet's access logs (Operator+, control plane)
       description: >-
         Story 9.6 AC #9. Rows fanned in from every node, newest first, each
         stamped with the `node_id` the mutual-TLS session proved rather than
@@ -4018,7 +4018,7 @@ paths:
   /api/v1/cluster/waf-events:
     get:
       tags: [Cluster]
-      summary: The fleet's WAF events (Viewer+, control plane)
+      summary: The fleet's WAF events (Operator+, control plane)
       description: >-
         Story 9.6 AC #9. The WAF counterpart of `/api/v1/cluster/logs`, with
         the same cursor pagination and the same rule that `node_id` comes from

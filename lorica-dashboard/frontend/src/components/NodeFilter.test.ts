@@ -2,6 +2,7 @@ import { render, screen, waitFor } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { api } from '../lib/api';
+import { auth } from '../lib/auth';
 import { clusterStatus, type ClusterStatus } from '../lib/cluster';
 import NodeFilter from './NodeFilter.svelte';
 
@@ -43,13 +44,29 @@ function node(id: string, name: string, state: 'pending' | 'active' | 'revoked')
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  auth.set({ status: 'authenticated', username: 'admin', role: 'super_admin' });
 });
 
 afterEach(() => {
   clusterStatus.set(null);
+  auth.set({ status: 'unauthenticated' });
 });
 
 describe('NodeFilter', () => {
+  it('renders nothing for a viewer, whose roster read is 403', async () => {
+    // Fleet reads sit at the Operator floor since the Epic 9 close;
+    // a select that cannot be populated is worse than none.
+    auth.set({ status: 'authenticated', username: 'v', role: 'viewer' });
+    const list = vi.spyOn(api, 'listClusterNodes');
+    clusterStatus.set(status('control_plane'));
+    const { container } = render(NodeFilter, {
+      props: { value: '', onchange: () => {} },
+    });
+    await Promise.resolve();
+    expect(container.querySelector('select')).toBeNull();
+    expect(list).not.toHaveBeenCalled();
+  });
+
   it('renders nothing at all on a standalone install', async () => {
     // AC #5 says hidden entirely, not disabled: a select with one
     // option would suggest a cluster that is not there.

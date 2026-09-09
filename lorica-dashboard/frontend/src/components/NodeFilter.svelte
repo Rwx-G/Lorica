@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api } from '../lib/api';
+  import { canWriteRole } from '../lib/auth';
   import { clusterStatus, isClustered } from '../lib/cluster';
 
   interface Props {
@@ -14,8 +15,9 @@
   let names = $state<{ id: string; label: string }[]>([]);
 
   // Hidden entirely on a standalone install (AC #5): an operator who
-  // never clustered must not see a filter with one option in it.
-  const clustered = $derived(isClustered($clusterStatus));
+  // never clustered must not see a filter with one option in it. Also
+  // hidden from a Viewer, for whom the roster it lists is 403.
+  const clustered = $derived(isClustered($clusterStatus) && $canWriteRole);
 
   /** Whether the roster has been fetched, so it is fetched once. */
   let loaded = false;
@@ -27,7 +29,7 @@
   // option, on a real cluster, until the page was navigated away from
   // and back.
   $effect(() => {
-    if (loaded || !isClustered($clusterStatus)) return;
+    if (loaded || !isClustered($clusterStatus) || !$canWriteRole) return;
     loaded = true;
     void (async () => {
       const res = await api.listClusterNodes();

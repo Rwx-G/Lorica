@@ -1,7 +1,7 @@
 <script lang="ts">
   import { currentPath, navigate } from '../lib/router';
   import { api } from '../lib/api';
-  import { auth } from '../lib/auth';
+  import { auth, canWriteRole } from '../lib/auth';
   import { clusterStatus, isClustered } from '../lib/cluster';
 
   // `cluster: true` hides the entry on a standalone install: an
@@ -32,7 +32,12 @@
 
   let path = $state('/');
   const clustered = $derived(isClustered($clusterStatus));
-  const visibleItems = $derived(navItems.filter((i) => !i.cluster || clustered));
+  // Fleet entries need a cluster AND an Operator: every fleet read
+  // sits at that floor since the Epic 9 close, so a Viewer would open
+  // a page of 403s.
+  const visibleItems = $derived(
+    navItems.filter((i) => !i.cluster || (clustered && $canWriteRole)),
+  );
 
   currentPath.subscribe((v) => {
     path = v;

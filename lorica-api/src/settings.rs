@@ -249,10 +249,30 @@ pub async fn get_settings_schema() -> Json<serde_json::Value> {
 /// so the secret stays inside the store + cookie-signing code.
 pub async fn get_settings(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut settings = db_blocking(&state.store, move |store| store.get_global_settings()).await?;
     mask_settings_secrets(&mut settings);
+    if session.role < lorica_config::models::Role::Operator {
+        withhold_sink_topology(&mut settings);
+    }
     Ok(json_data(settings))
+}
+
+/// Blank the log pipeline's topology for a Viewer (Epic 9 close,
+/// backlog #54 decided): where the SIEM and the OTLP collector are,
+/// the CA and client certificate the syslog sink presents, and the
+/// static structured-data parameters, which name environments and
+/// sites. None of it is a secret in the credential sense, all of it is
+/// reconnaissance for the least-trusted role, and a Viewer edits
+/// nothing here. The floor of `GET /settings` itself stays Viewer:
+/// the dashboard reads it for every role.
+fn withhold_sink_topology(settings: &mut lorica_config::models::GlobalSettings) {
+    settings.syslog_endpoint = None;
+    settings.syslog_tls_ca_pem = None;
+    settings.syslog_tls_client_cert_pem = None;
+    settings.syslog_extra_sd = None;
+    settings.otlp_endpoint = None;
 }
 
 /// Replace every secret field of a settings row with the

@@ -4,7 +4,7 @@
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
   import { showToast } from '../lib/toast';
-  import { canWrite, isSuperAdmin, isSuperAdminRole } from '../lib/auth';
+  import { canWrite, canWriteRole, isSuperAdmin, isSuperAdminRole } from '../lib/auth';
   import { clusterStatus, isFleetView, type FleetBanRow } from '../lib/cluster';
 
   /**
@@ -34,7 +34,9 @@
    * Whether this page is reading the FAN-IN store rather than this
    * node's own tables. Only a control plane holds fanned-in rows.
    */
-  const fleetView = $derived(isFleetView($clusterStatus));
+  // The fleet view reads Operator-floor endpoints; a Viewer on the
+  // control plane sees this node's own data, as on a standalone.
+  const fleetView = $derived(isFleetView($clusterStatus) && $canWriteRole);
   let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' | 'bans' | 'audit' = $state('events');
   let showClearConfirm = $state(false);
   let bans: BanEntry[] = $state([]);

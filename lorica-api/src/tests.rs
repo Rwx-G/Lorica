@@ -627,6 +627,67 @@ async fn send(
 }
 
 #[tokio::test]
+async fn test_viewer_reads_settings_without_the_log_pipeline_topology() {
+    // Backlog #54, decided at the Epic 9 close: where the SIEM and the
+    // collector are is reconnaissance for the least-trusted role.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    {
+        let store = state.store.lock().await;
+        let mut s = store.get_global_settings().expect("test setup");
+        s.syslog_endpoint = Some("siem.internal.example.org:6514".to_string());
+        s.syslog_extra_sd = Some("env=prod,dc=eu-west".to_string());
+        s.otlp_endpoint = Some("http://otel.internal.example.org:4318".to_string());
+        store.update_global_settings(&s).expect("test setup");
+    }
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "viewer-topo",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    let resp = send(&state, &session_store, &rate_limiter, "GET", "/api/v1/settings", &viewer, None).await;
+    assert_eq!(resp.status(), StatusCode::OK, "the floor stays Viewer");
+    let body = body_json(resp).await;
+    assert!(body["data"]["syslog_endpoint"].is_null());
+    assert!(body["data"]["syslog_extra_sd"].is_null());
+    assert!(body["data"]["otlp_endpoint"].is_null());
+
+    let resp = send(&state, &session_store, &rate_limiter, "GET", "/api/v1/settings", &admin, None).await;
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["syslog_endpoint"], "siem.internal.example.org:6514");
+}
+
+#[tokio::test]
+async fn test_fleet_audit_trail_is_super_admin_and_the_local_chain_stays_operator() {
+    // Backlog #73, decided at the Epic 9 close, the narrow option.
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    let (control, _liveness) = test_control_plane();
+    state.cluster = crate::cluster::ClusterRuntime::ControlPlane(std::sync::Arc::clone(&control));
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "op-audit",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+
+    for (uri, expected) in [
+        ("/api/v1/audit", StatusCode::FORBIDDEN),
+        ("/api/v1/audit?node=some-other-node", StatusCode::FORBIDDEN),
+        ("/api/v1/audit?node=", StatusCode::OK),
+    ] {
+        let resp = send(&state, &session_store, &rate_limiter, "GET", uri, &operator, None).await;
+        assert_eq!(resp.status(), expected, "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn test_viewer_can_read_but_not_mutate() {
     let (state, session_store, rate_limiter) = test_state().await;
     let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;

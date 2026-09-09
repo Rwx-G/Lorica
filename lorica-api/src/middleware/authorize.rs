@@ -86,6 +86,24 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
     {
         return Role::SuperAdmin;
     }
+    // Fleet READS sit at the Operator floor (Epic 9 close, backlog
+    // #69 decided). The roster discloses each follower's source
+    // address and the hostnames whose private keys it holds; the
+    // fan-in views return every node's client addresses, paths and
+    // matched payloads; the replication and drift reports name which
+    // node runs what. On a delegated fleet that is cross-node data in
+    // the least-trusted role's hands. `status` stays Viewer: it
+    // carries no address, no selector and no row, and the header
+    // badge every role sees is built from it.
+    if path.starts_with("/api/v1/cluster/nodes")
+        || path == "/api/v1/cluster/replication"
+        || path == "/api/v1/cluster/drift"
+        || path == "/api/v1/cluster/logs"
+        || path == "/api/v1/cluster/waf-events"
+        || path == "/api/v1/cluster/bans"
+    {
+        return Role::Operator;
+    }
 
     if method == http::Method::GET || method == http::Method::HEAD {
         // `format=key` / `format=full` return the private key; the
@@ -324,13 +342,15 @@ mod tests {
             required_role(&Method::GET, "/api/v1/cluster/break-glass"),
             Role::SuperAdmin
         );
+        // Operator since the Epic 9 close (#69): both name which node
+        // runs what.
         assert_eq!(
             required_role(&Method::GET, "/api/v1/cluster/drift"),
-            Role::Viewer
+            Role::Operator
         );
         assert_eq!(
             required_role(&Method::GET, "/api/v1/cluster/replication"),
-            Role::Viewer
+            Role::Operator
         );
     }
 
@@ -352,14 +372,19 @@ mod tests {
             required_role(&Method::POST, "/api/v1/cluster/leave"),
             Role::SuperAdmin
         );
-        assert_eq!(
-            required_role(&Method::GET, "/api/v1/cluster/nodes"),
-            Role::Viewer
-        );
-        assert_eq!(
-            required_role(&Method::GET, "/api/v1/cluster/nodes/abc"),
-            Role::Viewer
-        );
+        // Fleet reads are Operator since the Epic 9 close (#69); the
+        // status the header badge is built from stays Viewer.
+        for path in [
+            "/api/v1/cluster/nodes",
+            "/api/v1/cluster/nodes/abc",
+            "/api/v1/cluster/replication",
+            "/api/v1/cluster/drift",
+            "/api/v1/cluster/logs",
+            "/api/v1/cluster/waf-events",
+            "/api/v1/cluster/bans",
+        ] {
+            assert_eq!(required_role(&Method::GET, path), Role::Operator, "{path}");
+        }
         assert_eq!(
             required_role(&Method::GET, "/api/v1/cluster/status"),
             Role::Viewer
