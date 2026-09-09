@@ -629,6 +629,15 @@ dashboard queries that contend for the same connection. It has not
 been measured on production hardware, and that is stated plainly here
 rather than implied by a number that looks measured.
 
+The drain is not the binding constraint, though it was: it used to
+ship one batch per ten-second tick, about fifty rows a second, so a
+node at the envelope above would never have caught up and its backlog
+would have grown until local retention silently dropped rows the
+control plane had not yet seen. A tick now keeps shipping while
+batches come back full, so the drain sustains roughly a thousand rows
+a second per node and yields as soon as it is caught up or the
+control plane asks it to back off.
+
 Beyond that envelope, the supported topology is: **fan in WAF events,
 bans and health, and send access logs to the Story 9.8 syslog or OTLP
 sinks instead.** WAF events are orders of magnitude rarer than access

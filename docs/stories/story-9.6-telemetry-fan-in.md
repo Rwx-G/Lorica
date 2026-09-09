@@ -1,7 +1,7 @@
 # Story 9.6: Telemetry Fan-In
 
 **Epic:** 9 (v1.7.0)
-**Status:** InProgress
+**Status:** Review
 **Author:** Romain G.
 
 **Depends on:** Stories 9.1, 9.2, 9.3.
@@ -94,6 +94,8 @@ the original tasks are smaller than drafted and one is larger.
       ban rationale), replacing the Story 9.8 stub.
 - [ ] D12: the `cluster` e2e profile, which covers Stories 9.2-9.6.
       Tracked apart from the code tasks so a partial outcome shows.
+      NOT DONE: this is the one piece of the story that did not land,
+      and it is inherited debt rather than new. Backlog #66.
 
 Explicitly NOT in this story, with the reason recorded:
 
@@ -393,6 +395,52 @@ worked federation config in AC #11.
     it, so labelling `node` at fleet level would invert its own
     precedent) is unaffected and still correct.
 
+  - **D13 (audit iteration 1) - two Critical findings, and both were
+    the same class of mistake: a rule that was right somewhere else,
+    copied to a place where its premise did not hold.**
+
+    The per-node retention quota sized a node's overflow with
+    `MAX(id) - MIN(id) + 1`, lifted from `log_store.rs`. That estimate
+    is correct there, on a single-writer table where the only id gaps
+    come from earlier deletes. On the fan-in table `id` is ONE
+    autoincrement shared by every node, so a node's span is inflated
+    by every interleaved row from every other node and the estimate
+    overstates by roughly the fleet size. The quota therefore pruned
+    nodes that were comfortably inside their allowance: the exact
+    "a noisy edge evicts a quiet edge's rows" failure AC #3 exists to
+    prevent, reintroduced by the mechanism meant to prevent it, and
+    live in the only condition that matters, a fleet with more than
+    one active node.
+
+    It now seeks the exact cut through a new `(node_id, id)` index.
+    The test that missed it wrote all of one node's rows before any of
+    the other's, so ids never interleaved and the estimate happened to
+    be right; there is now one that interleaves three nodes.
+
+    The drain shipped one batch per tick, 512 rows per ten seconds,
+    about 51 rows a second, against an envelope this story itself
+    documented as a few hundred rps per node. A node above that could
+    never catch up, and the backlog grew until local retention evicted
+    rows the cursor had not reached, which is silent permanent loss
+    rather than lag. Worth noting that the story wrote the ceiling and
+    the drain cadence in separate commits and never multiplied them
+    together; the arithmetic that exposes it takes one line.
+
+    The remaining findings, all fixed: ban rows bypassed the ingest
+    quota entirely (storage stayed bounded because snapshots replace,
+    but the WORK did not); the storage watermark shed bans silently
+    while a comment three lines below claimed bans are never shed; the
+    drain called SQLite synchronously on the async executor for every
+    cursor and row read, which is the discipline D5-D7 spend three
+    decisions establishing; `BanPush.duration_s` was bounded at the
+    API but not at the wire decode boundary where this crate bounds
+    everything else; `IngestQuota::forget` existed, was tested, and
+    was never called, leaking one entry per historical node id;
+    AC #10's visibility half had storage, ingest and retention but no
+    read path; `FleetAccessRow.status` truncated `u32` to `u16` on the
+    round trip; and ingest compiled a fresh statement per row, up to
+    1024 per batch, under the lock every other node waits on.
+
   - **D12 - the `cluster` e2e profile does not exist, and that is an
     epic-level debt this story inherits rather than creates.**
     `tests-e2e-docker/run.sh:51` lists fifteen profiles; none is
@@ -421,5 +469,6 @@ Anticipated:
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-09-09 | 1.0 | Implementation and audit iteration 1. Telemetry rides tags 40-41; the fan-in database, the per-node quota, the drain, the ingest path, both fleet query endpoints, the fleet-wide ban and the documentation all landed. Four auditors returned two Criticals, both cases of a rule that was right elsewhere being copied where its premise did not hold: the per-node retention estimate assumed a single-writer id space and so pruned nodes that were inside their quota, and the drain shipped one batch per tick, capping it at roughly a fifth of the throughput this story documented as supported. Both fixed, with the interleaving test that would have caught the first. Also fixed: bans bypassed the ingest quota, the watermark shed bans while a comment denied it, the drain blocked the async executor on SQLite, `duration_s` was unbounded at the wire, `IngestQuota::forget` was never called, AC #10 had no read path, and `status` truncated on the round trip. Three clippy gates and the full suite clean. The `cluster` e2e profile did NOT land (backlog #66) and the fan-in ceiling is derived rather than measured (backlog #64), so both are marked partial rather than done. Status Review. | Romain G. |
 | 2026-09-09 | 0.2 | Phase 1 review: twelve decisions recorded, every Dev Notes claim re-verified against the current tree first (all substantive claims held; every line number was stale, and the cross-worker counter list is 16 not 13 since Story 9.8). Four AC corrections. AC #1's six migrations become zero on the hot-path tables: node_id belongs to the telemetry schema only and is stamped by the control plane from the mutual-TLS session, never taken from the payload (the Story 9.5 D15 lesson). AC #1 counts bans among the migrations, but bans have no table (in-memory DashMap), so AC #10 is a live-state snapshot. AC #1 counts audit entries, which are Story 9.9's. AC #11 says "new docs/cluster.md", which has existed since 9.3 and now has eight sections. The story's centre of gravity: AC #5, #6 and #7 collapse into one design where the shared access-log store IS the ring buffer and a supervisor-side tokio task drains it by rowid cursor, leaving the request path untouched. Also inherits the epic-level debt that the `cluster` e2e profile has never existed, so 9.2-9.5 Integration Verification has never run. Status InProgress. | Romain G. |
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Separate telemetry store, per-node quotas and a documented fan-in ceiling replace the first draft's reuse of the single-node retention plumbing; fleet /metrics aggregation dropped in favour of federation. Status Draft. | Romain G. |
