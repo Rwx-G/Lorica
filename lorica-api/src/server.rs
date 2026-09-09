@@ -559,6 +559,14 @@ pub fn build_router(
             get(crate::cluster::get_replication),
         )
         .route("/api/v1/cluster/drift", get(crate::cluster::get_drift))
+        // Telemetry fan-in (Story 9.6 AC #9). Cursor-paginated with no
+        // total: a COUNT(*) per page on an aggregated table is a full
+        // scan under the store lock, which would stall ingest.
+        .route("/api/v1/cluster/logs", get(crate::cluster::fleet_logs))
+        .route(
+            "/api/v1/cluster/waf-events",
+            get(crate::cluster::fleet_waf_events),
+        )
         .route(
             "/api/v1/cluster/break-glass",
             get(crate::cluster::get_break_glass)

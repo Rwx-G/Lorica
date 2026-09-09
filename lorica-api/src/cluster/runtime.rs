@@ -87,14 +87,34 @@ pub struct ControlPlaneRuntime {
     pub control: Arc<ControlPlane>,
     /// Drift bookkeeping.
     pub drift: DriftTracker,
+    /// The fan-in database (Story 9.6 AC #2), shared with the
+    /// listener's ingest handler so the rows an operator reads are
+    /// the rows the fleet delivered. `None` when it could not be
+    /// opened, which the fleet endpoints report rather than hide.
+    pub telemetry: Option<Arc<crate::cluster_telemetry_store::ClusterTelemetryStore>>,
 }
 
 impl ControlPlaneRuntime {
-    /// Bundle a control plane with fresh drift bookkeeping.
+    /// Bundle a control plane with fresh drift bookkeeping and no
+    /// telemetry store (the transport tests, and any caller that does
+    /// not fan telemetry in).
     pub fn new(control: Arc<ControlPlane>) -> Self {
         Self {
             control,
             drift: DriftTracker::default(),
+            telemetry: None,
+        }
+    }
+
+    /// The same, with the fan-in database attached (Story 9.6).
+    pub fn with_telemetry(
+        control: Arc<ControlPlane>,
+        telemetry: Option<Arc<crate::cluster_telemetry_store::ClusterTelemetryStore>>,
+    ) -> Self {
+        Self {
+            control,
+            drift: DriftTracker::default(),
+            telemetry,
         }
     }
 }

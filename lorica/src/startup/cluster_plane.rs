@@ -1488,7 +1488,19 @@ pub(crate) async fn spawn_cluster_plane(
             blob,
         });
     }
-    let runtime = Arc::new(ControlPlaneRuntime::new(Arc::clone(&control)));
+    let telemetry = match ClusterTelemetryStore::open(&opts.data_dir) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(e) => {
+            error!(error = %e, "could not open the cluster telemetry database; fan-in is                    refused and the fleet log endpoints report it");
+            None
+        }
+    };
+    // One store, shared: the rows an operator reads through the API
+    // must be the rows the listener's ingest handler wrote.
+    let runtime = Arc::new(ControlPlaneRuntime::with_telemetry(
+        Arc::clone(&control),
+        telemetry.clone(),
+    ));
     let drift_alerts = opts.alert_sender.clone();
     let replication_reload = opts.config_reload.subscribe();
     let handlers = Arc::new(FleetHandlers {
@@ -1497,13 +1509,7 @@ pub(crate) async fn spawn_cluster_plane(
         log_store: opts.log_store,
         alert_sender: opts.alert_sender,
         renewals: StdMutex::new(HashMap::new()),
-        telemetry: match ClusterTelemetryStore::open(&opts.data_dir) {
-            Ok(store) => Some(Arc::new(store)),
-            Err(e) => {
-                error!(error = %e, "could not open the cluster telemetry database;                        fan-in is refused until it opens");
-                None
-            }
-        },
+        telemetry,
         quota: IngestQuota::new(),
         data_dir: opts.data_dir.clone(),
     });

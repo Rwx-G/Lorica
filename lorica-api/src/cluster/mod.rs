@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Extension, Path};
+use axum::extract::{Extension, Path, Query};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -22,6 +22,7 @@ use lorica_cluster::{leaf_spki_sha256, token, ClusterRequest, ControlPlane};
 use lorica_config::models::{ClusterNode, JoinToken, NodeStatus, TokenState};
 use serde::{Deserialize, Serialize};
 
+use crate::cluster_telemetry_store::{FleetQuery, DEFAULT_PAGE, MAX_PAGE};
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
@@ -811,6 +812,106 @@ pub async fn get_drift(
     let runtime = control_plane_runtime(&state)?;
     let report = runtime::drift_report(&runtime, &state.store).await?;
     Ok(json_data(report))
+}
+
+/// Query string for the two fan-in endpoints (Story 9.6 AC #9).
+#[derive(Debug, Deserialize, Default)]
+pub struct FleetLogsQuery {
+    /// Restrict to one node id.
+    pub node: Option<String>,
+    /// Substring match on the host (logs) or route hostname (WAF).
+    pub route: Option<String>,
+    /// Inclusive lower bound on the origin timestamp, RFC 3339.
+    pub from: Option<String>,
+    /// Inclusive upper bound on the origin timestamp, RFC 3339.
+    pub to: Option<String>,
+    /// Cursor: return rows with an id strictly below this one. Take
+    /// it from `next_cursor` of the previous page.
+    pub before_id: Option<i64>,
+    /// Rows per page.
+    pub limit: Option<u32>,
+}
+
+impl FleetLogsQuery {
+    fn to_store_query(&self) -> FleetQuery {
+        FleetQuery {
+            node_id: self.node.clone(),
+            route: self.route.clone(),
+            from: self.from.clone(),
+            to: self.to.clone(),
+            before_id: self.before_id,
+            limit: self.limit.unwrap_or(0),
+        }
+    }
+}
+
+/// One page of fanned-in rows.
+///
+/// There is no total, deliberately (AC #9): the single-node logs
+/// query runs `SELECT COUNT(*)` on every page, and on an aggregated
+/// table that is a full scan per page under the store lock, so the
+/// dashboard would stall the ingest writer. `next_cursor` is `None`
+/// on the last page.
+#[derive(Debug, Serialize)]
+pub struct FleetPage<T> {
+    /// The rows, newest first.
+    pub rows: Vec<T>,
+    /// Pass as `before_id` to get the next page; `None` when this is
+    /// the last one.
+    pub next_cursor: Option<i64>,
+}
+
+/// GET /api/v1/cluster/logs - the fleet's access logs (Viewer+,
+/// Story 9.6 AC #9).
+///
+/// Control plane only: a follower holds its own rows and serves them
+/// through `/api/v1/logs`.
+pub async fn fleet_logs(
+    Extension(state): Extension<AppState>,
+    Query(params): Query<FleetLogsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let runtime = control_plane_runtime(&state)?;
+    let telemetry = runtime.telemetry.clone().ok_or_else(|| {
+        ApiError::Internal("the cluster telemetry database is not open".into())
+    })?;
+    let query = params.to_store_query();
+    let rows = tokio::task::spawn_blocking(move || telemetry.query_access(&query))
+        .await
+        .map_err(|e| ApiError::Internal(format!("fleet log query task failed: {e}")))?
+        .map_err(ApiError::Internal)?;
+    let next_cursor = next_cursor(rows.len(), params.limit, rows.last().map(|r| r.id));
+    Ok(json_data(FleetPage { rows, next_cursor }))
+}
+
+/// GET /api/v1/cluster/waf-events - the fleet's WAF events (Viewer+,
+/// Story 9.6 AC #9).
+pub async fn fleet_waf_events(
+    Extension(state): Extension<AppState>,
+    Query(params): Query<FleetLogsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let runtime = control_plane_runtime(&state)?;
+    let telemetry = runtime.telemetry.clone().ok_or_else(|| {
+        ApiError::Internal("the cluster telemetry database is not open".into())
+    })?;
+    let query = params.to_store_query();
+    let rows = tokio::task::spawn_blocking(move || telemetry.query_waf(&query))
+        .await
+        .map_err(|e| ApiError::Internal(format!("fleet WAF query task failed: {e}")))?
+        .map_err(ApiError::Internal)?;
+    let next_cursor = next_cursor(rows.len(), params.limit, rows.last().map(|r| r.id));
+    Ok(json_data(FleetPage { rows, next_cursor }))
+}
+
+/// The cursor for the next page, or `None` when this page was short.
+///
+/// A short page means the table had nothing more to give, so there is
+/// no need to spend a round trip discovering that.
+fn next_cursor(returned: usize, requested: Option<u32>, last_id: Option<i64>) -> Option<i64> {
+    let page = match requested {
+        None | Some(0) => DEFAULT_PAGE,
+        Some(n) => n.min(MAX_PAGE),
+    };
+    (returned as u32 >= page).then_some(last_id).flatten()
 }
 
 /// Body of `POST /api/v1/cluster/break-glass`.

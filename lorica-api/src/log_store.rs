@@ -886,23 +886,62 @@ impl LogStore {
         Ok(id.unwrap_or(0).max(0) as u64)
     }
 
-    /// Purge old WAF events, keeping at most `max_entries`.
-    /// Trim the WAF events table to the most recent `max_entries`. Returns the number deleted.
+    /// Trim the WAF events table to roughly the most recent
+    /// `max_entries`. Returns the number deleted.
+    ///
+    /// Sized from `MIN(id)` / `MAX(id)`, two `O(log n)` index seeks on
+    /// the rowid, for exactly the reason the access-log path already
+    /// documents: `SELECT COUNT(*)` scans the whole table and can
+    /// freeze this store's single `Mutex<Connection>` for hundreds of
+    /// milliseconds at millions of rows. This path counted until
+    /// Story 9.6, which is why a retention pass could stall the
+    /// ingest writer and fire its drop counter for a reason that had
+    /// nothing to do with load.
+    ///
+    /// The estimate over-counts when ids are sparse (earlier deletes
+    /// leave gaps), so a pass can under-delete on a table pruned
+    /// before. That is the safe direction, and the next hourly pass
+    /// catches up.
+    ///
+    /// Deleted in chunks with the lock RELEASED between them, so a
+    /// large backlog does not hold the store against the writer for
+    /// the whole pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read or delete failure.
     pub fn enforce_waf_retention(&self, max_entries: u64) -> Result<u64, String> {
-        let conn = self.conn.lock();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM waf_events", [], |row| row.get(0))
-            .map_err(|e| format!("failed to count WAF events: {e}"))?;
-        if count <= max_entries as i64 {
-            return Ok(0);
+        const CHUNK: i64 = 2_000;
+        let mut removed = 0u64;
+        loop {
+            let deleted = {
+                let conn = self.conn.lock();
+                let span: (Option<i64>, Option<i64>) = conn
+                    .query_row("SELECT MIN(id), MAX(id) FROM waf_events", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .map_err(|e| format!("failed to size WAF events: {e}"))?;
+                let (Some(min_id), Some(max_id)) = span else {
+                    return Ok(removed);
+                };
+                let estimated = (max_id - min_id + 1).max(0);
+                if estimated <= max_entries as i64 {
+                    return Ok(removed);
+                }
+                let take = (estimated - max_entries as i64).min(CHUNK);
+                conn.execute(
+                    "DELETE FROM waf_events WHERE id IN (
+                         SELECT id FROM waf_events ORDER BY id ASC LIMIT ?1
+                     )",
+                    params![take],
+                )
+                .map_err(|e| format!("failed to enforce WAF event retention: {e}"))?
+            };
+            if deleted == 0 {
+                return Ok(removed);
+            }
+            removed += deleted as u64;
         }
-        let to_delete = count - max_entries as i64;
-        conn.execute(
-            "DELETE FROM waf_events WHERE id IN (SELECT id FROM waf_events ORDER BY id ASC LIMIT ?1)",
-            params![to_delete],
-        )
-        .map_err(|e| format!("failed to enforce WAF event retention: {e}"))?;
-        Ok(to_delete as u64)
     }
 
     // ---- Notification History ----

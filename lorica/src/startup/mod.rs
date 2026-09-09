@@ -296,6 +296,7 @@ async fn purge_superseded_acme_orphans(store: &Arc<Mutex<ConfigStore>>) {
 pub(crate) fn spawn_retention_loop(
     log_store: Option<Arc<lorica_api::log_store::LogStore>>,
     config_store: Arc<Mutex<ConfigStore>>,
+    telemetry: Option<Arc<lorica_api::cluster_telemetry_store::ClusterTelemetryStore>>,
 ) {
     // The loop runs even with no log store: several of its jobs
     // (expired ACME challenges, probe results, SLA windows) live in
@@ -324,6 +325,51 @@ pub(crate) fn spawn_retention_loop(
                 if retention > 0 {
                     if let Err(e) = logs.enforce_retention(retention as u64) {
                         tracing::warn!(error = %e, "access log retention cleanup failed");
+                    }
+                }
+            }
+            // Fan-in retention (Story 9.6 AC #3): a PER-NODE quota,
+            // not a global row cap. A global cap would make the fleet
+            // view shallower than each node's own local log and let
+            // one noisy edge evict every quiet edge's rows, which is
+            // the incident-correlation case fan-in exists for. Only a
+            // control plane has this store.
+            if let Some(telemetry) = &telemetry {
+                let telemetry = Arc::clone(telemetry);
+                let pruned = tokio::task::spawn_blocking(move || {
+                    let mut total = 0u64;
+                    let nodes = telemetry.nodes_with_rows()?;
+                    for node_id in &nodes {
+                        for table in [
+                            lorica_api::cluster_telemetry_store::TelemetryTable::Access,
+                            lorica_api::cluster_telemetry_store::TelemetryTable::Waf,
+                        ] {
+                            total += telemetry.enforce_node_quota(
+                                table,
+                                node_id,
+                                lorica_api::cluster_telemetry_store::DEFAULT_ROWS_PER_NODE,
+                            )?;
+                        }
+                    }
+                    // A node that stops reporting keeps its rows until
+                    // the quota reclaims them, but its BANS are live
+                    // state: a snapshot nobody refreshed for a day is
+                    // not a ban any more.
+                    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+                    total += telemetry.prune_stale_bans(&cutoff)?;
+                    Ok::<_, String>(total)
+                })
+                .await;
+                match pruned {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(rows)) => {
+                        tracing::info!(rows, "fleet telemetry retention reclaimed rows");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "fleet telemetry retention failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "fleet telemetry retention task failed");
                     }
                 }
             }

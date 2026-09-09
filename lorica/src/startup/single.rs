@@ -399,6 +399,14 @@ pub(crate) fn run_single_process(cli: Cli) {
         )
         .await;
 
+        // Captured before `cluster_runtime` moves into the API task:
+        // only a control plane has a fan-in store, and the retention
+        // loop below needs it.
+        let fleet_telemetry = match &cluster_runtime {
+            lorica_api::cluster::ClusterRuntime::ControlPlane(runtime) => runtime.telemetry.clone(),
+            _ => None,
+        };
+
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store.clone(),
@@ -447,7 +455,13 @@ pub(crate) fn run_single_process(cli: Cli) {
         // events, SLA buckets), shared across modes (audit H-9, see
         // `startup::spawn_retention_loop`). No-op when the access-log
         // store failed to open.
-        startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
+        startup::spawn_retention_loop(
+            log_store.clone(),
+            Arc::clone(&store),
+            // Only a control plane holds a fan-in store; every other
+            // role passes `None` and the per-node quota is skipped.
+            fleet_telemetry,
+        );
 
 
         // Background OCSP-staple refresh (Story 8.5). Reload swaps cert
