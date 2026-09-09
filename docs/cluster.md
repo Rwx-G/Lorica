@@ -806,6 +806,20 @@ cross-node data a delegated fleet does not hand to its least-trusted
 role. `GET /api/v1/cluster/status` stays Viewer, because the header
 badge every role sees is built from it and it carries no row.
 
+### SLA, one node at a time
+
+SLA does not fan in, and the dashboard does not pretend it does. A
+minute bucket is rewritten until its minute closes, which does not fit
+the id-cursor drain the series use, and a fleet percentile is not a
+function of per-node percentiles: p95 across two nodes is not
+computable from each node's p95. So the SLA page on a control plane
+shows **one node at a time**: `?node=<node_id>` on the SLA reads asks
+that follower for its own figures over the cluster session the control
+plane already holds (`SlaPull`, tag 42), and serves them unchanged.
+Operator floor, like every fleet read; a node with no session answers
+409 rather than an empty chart. Export and clear stay local to the
+node you are on.
+
 ### Log sinks in a fleet
 
 The syslog and OTLP log sinks are **node-local**: each node ships its

@@ -48,8 +48,9 @@ use lorica_cluster::messages::{
     ChallengeRetract, ChallengeRetractAck, ClusterFrame, ClusterRequest, ClusterResponse,
     ConfigAbort, ConfigAbortAck, ConfigCommit, ConfigCommitAck, ConfigPrepare, ConfigPrepareAck,
     ConfigPull, ConfigPullAck, Enroll, EnrollAck, Heartbeat, HeartbeatAck, Hello, HelloAck, Leave,
-    LeaveAck, NodeResources, Renew, RenewAck, TelemetryAccessRow, TelemetryAuditRow, TelemetryBan,
-    TelemetryPush, TelemetryPushAck, TelemetryWafRow,
+    LeaveAck, NodeResources, Renew, RenewAck, SlaBucketRow, SlaPull, SlaPullAck, SlaSummaryRow,
+    TelemetryAccessRow, TelemetryAuditRow, TelemetryBan, TelemetryPush, TelemetryPushAck,
+    TelemetryWafRow,
 };
 use prost::Message;
 use std::collections::BTreeMap;
@@ -199,6 +200,43 @@ fn telemetry_push() -> TelemetryPush {
         dropped_since_last: 3,
         audit: vec![audit_row()],
         audit_cursor: 41,
+    }
+}
+
+fn sla_summary() -> SlaSummaryRow {
+    SlaSummaryRow {
+        route_id: "route-1".to_string(),
+        window: "1h".to_string(),
+        total_requests: 1200,
+        successful_requests: 1188,
+        sla_pct: 99.0,
+        avg_latency_ms: 12.5,
+        p50_latency_ms: 9,
+        p95_latency_ms: 40,
+        p99_latency_ms: 95,
+        target_pct: 99.9,
+        meets_target: true,
+    }
+}
+
+fn sla_bucket() -> SlaBucketRow {
+    SlaBucketRow {
+        route_id: "route-1".to_string(),
+        bucket_start: "2026-09-09T10:00:00Z".to_string(),
+        request_count: 20,
+        success_count: 19,
+        error_count: 1,
+        latency_sum_ms: 250,
+        latency_min_ms: 3,
+        latency_max_ms: 80,
+        latency_p50_ms: 9,
+        latency_p95_ms: 40,
+        latency_p99_ms: 75,
+        source: "passive".to_string(),
+        cfg_max_latency_ms: 500,
+        cfg_status_min: 200,
+        cfg_status_max: 399,
+        cfg_target_pct: 99.9,
     }
 }
 
@@ -372,6 +410,25 @@ fn corpus() -> Vec<Entry> {
             },
         ),
         entry("BanPushAck", BanPushAck { applied: true }),
+        entry(
+            "SlaPull",
+            SlaPull {
+                route_id: "route-1".to_string(),
+                source: "passive".to_string(),
+                from: "2026-09-09T09:00:00Z".to_string(),
+                to: "2026-09-09T10:00:00Z".to_string(),
+                buckets: true,
+            },
+        ),
+        entry("SlaSummaryRow", sla_summary()),
+        entry("SlaBucketRow", sla_bucket()),
+        entry(
+            "SlaPullAck",
+            SlaPullAck {
+                summaries: vec![sla_summary()],
+                buckets: vec![sla_bucket()],
+            },
+        ),
         entry(
             "ChallengePublish",
             ChallengePublish {

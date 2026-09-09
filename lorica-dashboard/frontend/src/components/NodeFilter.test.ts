@@ -53,6 +53,19 @@ afterEach(() => {
 });
 
 describe('NodeFilter', () => {
+  it('labels the empty choice as this node when there is no aggregate', async () => {
+    // The SLA page shows one node at a time (Story 9.7 AC #5): there
+    // is no "all nodes" figure to offer.
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [node('node-b', 'edge-02', 'active')],
+    });
+    clusterStatus.set(status('control_plane'));
+    render(NodeFilter, { props: { value: '', onchange: () => {}, allowAll: false } });
+    await waitFor(() => expect(screen.getByText('edge-02')).toBeInTheDocument());
+    expect(screen.getByText('This node')).toBeInTheDocument();
+    expect(screen.queryByText('All nodes')).toBeNull();
+  });
+
   it('renders nothing for a viewer, whose roster read is 403', async () => {
     // Fleet reads sit at the Operator floor since the Epic 9 close;
     // a select that cannot be populated is worse than none.

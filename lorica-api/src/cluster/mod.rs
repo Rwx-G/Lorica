@@ -52,6 +52,13 @@ fn control_plane_runtime(state: &AppState) -> Result<Arc<ControlPlaneRuntime>, A
 
 /// The transport crate's fleet handle, for the endpoints that need
 /// only the roster, the sessions or the CA.
+/// The control plane, for a read elsewhere in the crate (the SLA
+/// reads take `?node=`); 409 off a control plane like every handler
+/// here.
+pub(crate) fn control_plane_for_reads(state: &AppState) -> Result<Arc<ControlPlane>, ApiError> {
+    control_plane(state)
+}
+
 fn control_plane(state: &AppState) -> Result<Arc<ControlPlane>, ApiError> {
     Ok(Arc::clone(&control_plane_runtime(state)?.control))
 }

@@ -4,13 +4,20 @@
   import { clusterStatus, isClustered } from '../lib/cluster';
 
   interface Props {
-    /** Selected node id, or `''` for every node. */
+    /** Selected node id, or `''` for every node (or this node). */
     value: string;
     /** Called with the new node id (or `''`) when the operator picks one. */
     onchange: (nodeId: string) => void;
+    /**
+     * Whether `''` means every node. The SLA page has no fleet
+     * aggregate (a fleet percentile is not a function of per-node
+     * percentiles), so there `''` means THIS node and the label says
+     * so.
+     */
+    allowAll?: boolean;
   }
 
-  let { value, onchange }: Props = $props();
+  let { value, onchange, allowAll = true }: Props = $props();
 
   let names = $state<{ id: string; label: string }[]>([]);
 
@@ -53,7 +60,7 @@
     {value}
     onchange={(e) => onchange((e.currentTarget as HTMLSelectElement).value)}
   >
-    <option value="">All nodes</option>
+    <option value="">{allowAll ? 'All nodes' : 'This node'}</option>
     {#each names as n (n.id)}
       <option value={n.id}>{n.label}</option>
     {/each}

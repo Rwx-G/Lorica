@@ -1627,6 +1627,15 @@ paths:
     get:
       tags: [SLA]
       summary: Get SLA overview across all routes
+      description: >-
+        With `?node=<node_id>` on a control plane (Story 9.7 AC #5),
+        ONE follower's overview, computed on that follower over its
+        cluster session and served unchanged. Operator floor when a node
+        is named; 409 when the node holds no session. There is no fleet
+        aggregate: a fleet percentile is not a function of per-node
+        percentiles.
+      parameters:
+        - $ref: "#/components/parameters/SlaNode"
       security:
         - sessionCookie: []
       responses:
@@ -1648,6 +1657,8 @@ paths:
     get:
       tags: [SLA]
       summary: Get SLA metrics for a specific route
+      parameters:
+        - $ref: "#/components/parameters/SlaNode"
       security:
         - sessionCookie: []
       responses:
@@ -1671,6 +1682,8 @@ paths:
     get:
       tags: [SLA]
       summary: Get SLA histogram buckets for a route
+      parameters:
+        - $ref: "#/components/parameters/SlaNode"
       security:
         - sessionCookie: []
       responses:
@@ -1762,6 +1775,8 @@ paths:
     get:
       tags: [SLA]
       summary: Get active probe SLA data for a route
+      parameters:
+        - $ref: "#/components/parameters/SlaNode"
       security:
         - sessionCookie: []
       responses:
@@ -4165,6 +4180,15 @@ components:
       name: lorica_session
 
   parameters:
+    SlaNode:
+      name: node
+      in: query
+      required: false
+      schema:
+        type: string
+      description: >-
+        A follower's node id, on a control plane: the figures are then
+        that node's own (Story 9.7 AC #5). Absent or empty: this node.
     ResourceId:
       name: id
       in: path

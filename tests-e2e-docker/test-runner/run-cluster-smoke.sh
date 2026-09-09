@@ -563,6 +563,35 @@ API="$CP_API"
 SESSION="$CP_SESSION"
 
 # ---------------------------------------------------------------------
+# Story 9.7 AC #5: one follower's SLA, read through the control plane.
+# The load above is what the followers measured; the passive collector
+# flushes its minute bucket within a minute, so this polls.
+# ---------------------------------------------------------------------
+log "=== 9.7 AC #5: per-node SLA through the control plane ==="
+
+for attempt in $(seq 1 60); do
+    SLA_A=$(api_get "/api/v1/sla/overview?node=$EDGE_A_ID")
+    N=$(echo "$SLA_A" | jq '[(.data // [])[] | select(.total_requests > 0)] | length')
+    [ "$N" != "0" ] && [ -n "$N" ] && break
+    sleep 2
+done
+assert_json_gt "$SLA_A" '[.data[] | select(.total_requests > 0)] | length' 0 \
+    "edge-a's SLA overview, computed on edge-a, served by the control plane"
+SLA_B=$(api_get "/api/v1/sla/overview?node=$EDGE_B_ID")
+assert_json_gt "$SLA_B" '[.data[] | select(.total_requests > 0)] | length' 0 \
+    "edge-b's SLA overview (workers mode) through the control plane"
+ROUTE_SLA=$(api_get "/api/v1/sla/routes/$ROUTE_ID?node=$EDGE_A_ID")
+assert_json_gt "$ROUTE_SLA" '[.data[] | select(.window == "1h" and .total_requests > 0)] | length' 0 \
+    "one route's windows for one node"
+BUCKETS=$(api_get "/api/v1/sla/routes/$ROUTE_ID/buckets?node=$EDGE_A_ID")
+assert_json_gt "$BUCKETS" '.data | length' 0 "one route's raw minute buckets for one node"
+# The control plane's OWN overview is unaffected: it served no
+# fleet.example.com traffic, so its figure for the route is empty.
+OWN=$(api_get "/api/v1/sla/overview")
+assert_json "$OWN" '[.data[] | select(.route_id == "'"$ROUTE_ID"'" and .total_requests > 0)] | length' '0' \
+    "the control plane's own SLA is not the follower's"
+
+# ---------------------------------------------------------------------
 # Story 9.3 AC #7: revocation ends the session at once, and names the
 # keys it cannot take back (Epic 9 close, security audit).
 # ---------------------------------------------------------------------

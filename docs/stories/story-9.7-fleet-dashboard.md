@@ -194,7 +194,21 @@ anything is worse than no check, because it is quoted as evidence.
 Every "gates green" line recorded in this story before 2026-09-09
 covered less than it claimed.
 
-**D17: AC #5's SLA leg is not built. The filter would filter nothing.**
+**D22 (Epic close, operator's decision): AC #5's SLA leg is built as
+a per-node read, not a fleet aggregate.** D17 below stands on its
+mechanics (nothing SLA fans in, and a fleet percentile is not
+computable from per-node ones); what changed is the conclusion, which
+was the operator's to make. The SLA page on a control plane carries
+the node filter in single-node mode (`''` is this node, no "all
+nodes"), and `?node=` on the four SLA reads asks that follower for its
+own figures over its cluster session (`SlaPull` / `SlaPullAck` on tag
+42, a read the follower serves from its own store through the same
+code the local handlers run). Operator floor; 409 when the node holds
+no session. The wire corpus, the tag test and the `cluster` e2e (an
+overview, per-route windows and raw buckets read through the control
+plane after the load phase) pin it.
+
+**D17: AC #5's SLA leg is not fanned in. A fleet filter would filter nothing.**
 
 AC #5 asks for a node filter on Access Logs, Security and SLA. The
 first two have fanned-in data; SLA does not. Story 9.6's Phase 1 review
@@ -562,6 +576,7 @@ Corrected in passing:
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-09-09 | 1.3 | AC #5 SLA leg delivered as a per-node read (D22, the operator's decision at the epic close): `SlaPull`/`SlaPullAck` on tag 42, `?node=` on the four SLA reads, the node filter in single-node mode on the SLA page, corpus and e2e coverage. AC #5 is now met on all three pages. | Romain G. |
 | 2026-09-09 | 1.2 | Epic close. The one acceptance criterion knowingly short (AC #5 on SLA, D17) is carried to the epic report for the operator's decision rather than left as a Review blocker; the four epic-wide auditors raised nothing against this story's own surface beyond `STALE_AFTER_MS`'s comment ("three intervals" over a six-interval value; now derived from `HEARTBEAT_INTERVAL_MS` and the badge label reads the constant). Revocation now answers 200 with `certificates_to_reissue` and the page keeps that list on screen until dismissed, because a toast would scroll away before an operator re-issued anything. Status Done. | Romain G. |
 | 2026-09-09 | 1.1 | Audit and remediation complete (D20). Four auditors returned one Critical, four High and eight Medium; every finding was verified against the code before acting, two were downgraded on that reading. The Critical was another comment asserting a safety the code did not have: the drawer's certificate inventory omitted every fleet-wide entitlement while claiming to reproduce the push path's rule, so a node holding every fleet-wide certificate was shown as holding none. The most consequential finding is one this story caused: AC #4 hid every mutation control on a follower, including the break-glass and leave controls that `isSuperAdminRole`'s own doc claimed to exist for and which had never been written, so AC #7 shipped an alarm with no lever. Both now exist. Also fixed: the drawer race, swallowed drawer errors, the live-tail leak into the fleet table, `NodeFilter` populating only if the status arrived before it mounted, two writers on the cluster store, the blocking sampler on the heartbeat task, the unbounded CPU gauge, and the resource gauges sitting at the Viewer floor. Pinned: a test cross-checking the dashboard's follower paths against the server allow-list, and six cases on `Cluster.svelte`, which had none and is where both shipped defects were. Raised to the backlog rather than fixed here: #69, #70, #71, plus verification notes on #52 and #59. Gates: `npm run check`, `npm run lint`, 419 Vitest cases, three clippy gates, 599 + 286 + cluster Rust tests, all green. Status stays Review: one acceptance criterion is knowingly short and that is the user's call, not the author's. | Romain G. |
 | 2026-09-09 | 1.0 | Story complete and moved to Review. AC #1 (chunk measured at 7.4 KB gz against the 40 KB cap), #2, #3, #4, #6, #7 and #8 done; AC #5 done on Access Logs and Security, and deliberately NOT on SLA (D17: no fanned-in SLA data, the mutable-bucket shape does not fit the drain's id cursor, and a fleet percentile is not computable from minute buckets). Two agents were dispatched on that question as the standing instruction requires. AC #3's resource gauges needed a protocol addition, an OPTIONAL `NodeResources` on `Heartbeat` (D18), so a node with no sampler renders as unknown rather than as idle at 0%. AC #4's review pass found four follower-local controls the derivation had hidden and the server still serves (D19), fixed with `canWriteRole`. Also in this pass: the local typecheck gate was vacuous and had let two broken files through, now corrected along with the rule that described it; and two SLA defects unrelated to this story were found and filed as backlog #67 (a config apply cascade-deletes a follower's SLA history) and #68 (passive SLA is last-writer-wins across workers). Gates: `npm run check`, `npm run lint`, 412 Vitest cases, three clippy gates and the Rust suites all green. | Romain G. |

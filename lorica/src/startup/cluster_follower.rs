@@ -945,6 +945,21 @@ impl FollowerHandler for ReplicaHandler {
         })
     }
 
+    fn on_sla_pull(
+        &self,
+        pull: lorica_cluster::messages::SlaPull,
+    ) -> BoxFuture<'_, Result<lorica_cluster::messages::SlaPullAck, String>> {
+        Box::pin(async move {
+            // The same code the local SLA handlers run, over this
+            // node's own store: a read, off the request path.
+            db_blocking(&self.store, move |store| {
+                Ok::<_, ApiError>(lorica_api::sla::answer_sla_pull(store, &pull))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        })
+    }
+
     fn on_ban_push(
         &self,
         client_ip: String,

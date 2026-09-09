@@ -583,6 +583,26 @@ describe('sanitizeFilenameFromHeader', () => {
   });
 });
 
+describe('api SLA reads with a node', () => {
+  it('sends node= only when a follower is named', async () => {
+    mockFetch([]);
+    await api.getSlaOverview();
+    expect(fetch).toHaveBeenCalledWith('/api/v1/sla/overview', expect.objectContaining({ method: 'GET' }));
+    mockFetch([]);
+    await api.getSlaOverview('node-a');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/sla/overview?node=node-a',
+      expect.objectContaining({ method: 'GET' }),
+    );
+    mockFetch([]);
+    await api.getRouteSlaBuckets('r1', { source: 'passive', node: 'node-a' });
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/sla/routes/r1/buckets?source=passive&node=node-a',
+      expect.objectContaining({ method: 'GET' }),
+    );
+  });
+});
+
 describe('fleetQuery', () => {
   it('produces no query string at all when nothing is filtered', () => {
     expect(fleetQuery({})).toBe('');

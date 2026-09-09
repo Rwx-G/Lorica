@@ -754,6 +754,165 @@ pub struct BanPushAck {
     pub applied: bool,
 }
 
+/// One follower's SLA, read by the control plane on an operator's
+/// behalf (Story 9.7 AC #5, Epic 9 close). Control plane to follower.
+///
+/// Nothing fans in for this: a minute bucket is rewritten until its
+/// minute closes, which does not fit the id-cursor drain, and a fleet
+/// percentile is not a function of per-node percentiles. The dashboard
+/// therefore shows ONE node's own figures, computed on that node.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct SlaPull {
+    /// The route, or empty for the overview (every route, 1h and 24h).
+    #[prost(string, tag = "1")]
+    pub route_id: ::prost::alloc::string::String,
+    /// `passive` or `active`.
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+    /// RFC 3339, buckets only; empty means now minus 24 h.
+    #[prost(string, tag = "3")]
+    pub from: ::prost::alloc::string::String,
+    /// RFC 3339, buckets only; empty means now.
+    #[prost(string, tag = "4")]
+    pub to: ::prost::alloc::string::String,
+    /// Raw minute buckets rather than summaries.
+    #[prost(bool, tag = "5")]
+    pub buckets: bool,
+}
+
+/// One SLA summary as the follower computed it; mirrors the API's
+/// `SlaSummary` field for field so the control plane serves it as is.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SlaSummaryRow {
+    /// The route the summary is for.
+    #[prost(string, tag = "1")]
+    pub route_id: ::prost::alloc::string::String,
+    /// The window label (`1h`, `24h`, `7d`, `30d`).
+    #[prost(string, tag = "2")]
+    pub window: ::prost::alloc::string::String,
+    /// Requests seen in the window.
+    #[prost(int64, tag = "3")]
+    pub total_requests: i64,
+    /// Requests inside the route's success status range.
+    #[prost(int64, tag = "4")]
+    pub successful_requests: i64,
+    /// Successful over total, as a percentage.
+    #[prost(double, tag = "5")]
+    pub sla_pct: f64,
+    /// Mean latency over the window.
+    #[prost(double, tag = "6")]
+    pub avg_latency_ms: f64,
+    /// Median latency.
+    #[prost(int64, tag = "7")]
+    pub p50_latency_ms: i64,
+    /// 95th percentile latency.
+    #[prost(int64, tag = "8")]
+    pub p95_latency_ms: i64,
+    /// 99th percentile latency.
+    #[prost(int64, tag = "9")]
+    pub p99_latency_ms: i64,
+    /// The route's configured SLA target.
+    #[prost(double, tag = "10")]
+    pub target_pct: f64,
+    /// Whether `sla_pct` reaches `target_pct`.
+    #[prost(bool, tag = "11")]
+    pub meets_target: bool,
+}
+
+/// One raw minute bucket; mirrors the API's `SlaBucket`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SlaBucketRow {
+    /// The route the bucket is for.
+    #[prost(string, tag = "1")]
+    pub route_id: ::prost::alloc::string::String,
+    /// RFC 3339.
+    #[prost(string, tag = "2")]
+    pub bucket_start: ::prost::alloc::string::String,
+    /// Requests in the minute.
+    #[prost(int64, tag = "3")]
+    pub request_count: i64,
+    /// Requests inside the success status range.
+    #[prost(int64, tag = "4")]
+    pub success_count: i64,
+    /// Requests outside it.
+    #[prost(int64, tag = "5")]
+    pub error_count: i64,
+    /// Sum of latencies, for the mean.
+    #[prost(int64, tag = "6")]
+    pub latency_sum_ms: i64,
+    /// Fastest request.
+    #[prost(int64, tag = "7")]
+    pub latency_min_ms: i64,
+    /// Slowest request.
+    #[prost(int64, tag = "8")]
+    pub latency_max_ms: i64,
+    /// Median latency.
+    #[prost(int64, tag = "9")]
+    pub latency_p50_ms: i64,
+    /// 95th percentile latency.
+    #[prost(int64, tag = "10")]
+    pub latency_p95_ms: i64,
+    /// 99th percentile latency.
+    #[prost(int64, tag = "11")]
+    pub latency_p99_ms: i64,
+    /// `passive` (served traffic) or `active` (probes).
+    #[prost(string, tag = "12")]
+    pub source: ::prost::alloc::string::String,
+    /// The latency ceiling the route was configured with when the bucket closed.
+    #[prost(int64, tag = "13")]
+    pub cfg_max_latency_ms: i64,
+    /// Lower bound of the success status range at the time.
+    #[prost(int32, tag = "14")]
+    pub cfg_status_min: i32,
+    /// Upper bound of the success status range at the time.
+    #[prost(int32, tag = "15")]
+    pub cfg_status_max: i32,
+    /// The SLA target the route was configured with at the time.
+    #[prost(double, tag = "16")]
+    pub cfg_target_pct: f64,
+}
+
+/// The follower's answer to a [`SlaPull`]: exactly one of the two
+/// lists is populated, by `SlaPull.buckets`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SlaPullAck {
+    /// Summaries, when `buckets` was false on the pull.
+    #[prost(message, repeated, tag = "1")]
+    pub summaries: ::prost::alloc::vec::Vec<SlaSummaryRow>,
+    /// Raw minute buckets, when it was true.
+    #[prost(message, repeated, tag = "2")]
+    pub buckets: ::prost::alloc::vec::Vec<SlaBucketRow>,
+}
+
+/// Longest `route_id` a [`SlaPull`] may name: the store's ids are
+/// UUIDs, and the follower looks the value up rather than trusting it.
+pub const MAX_SLA_ROUTE_ID_BYTES: usize = 64;
+
+/// Longest `from` / `to` a [`SlaPull`] may carry; an RFC 3339 stamp
+/// with offset is 35 bytes.
+pub const MAX_SLA_TIME_BYTES: usize = 40;
+
+/// Why a [`SlaPull`] is refused at the decode boundary, if it is: the
+/// same discipline as every other peer-supplied string on this plane.
+/// The times are only bounded here; the follower parses them and
+/// falls back to its defaults on a value that does not parse.
+pub fn sla_pull_defect(pull: &SlaPull) -> Option<&'static str> {
+    if pull.route_id.len() > MAX_SLA_ROUTE_ID_BYTES
+        || pull.route_id.chars().any(char::is_control)
+    {
+        return Some("route_id");
+    }
+    if pull.source != "passive" && pull.source != "active" {
+        return Some("source");
+    }
+    for (name, value) in [("from", &pull.from), ("to", &pull.to)] {
+        if value.len() > MAX_SLA_TIME_BYTES || value.chars().any(char::is_control) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Certificate distribution (Story 9.5 AC #7), control plane to
 /// follower: install this material now, independently of any
 /// configuration commit.
@@ -892,6 +1051,8 @@ pub const BODY_KIND_CONFIG_PULL: u32 = 23;
 pub const BODY_KIND_TELEMETRY_PUSH: u32 = 40;
 /// `body_kind` value of a [`BanPush`] request (its oneof tag).
 pub const BODY_KIND_BAN_PUSH: u32 = 41;
+/// `body_kind` value of a [`SlaPull`] request (its oneof tag).
+pub const BODY_KIND_SLA_PULL: u32 = 42;
 /// `body_kind` value of a [`CertPush`] request (its oneof tag).
 pub const BODY_KIND_CERT_PUSH: u32 = 60;
 /// `body_kind` value of a [`CertPull`] request (its oneof tag).
@@ -1091,7 +1252,7 @@ pub struct ClusterRequest {
     /// Typed request body.
     #[prost(
         oneof = "cluster_request::Body",
-        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23, 40, 41, 60, 61, 62, 63"
+        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23, 40, 41, 42, 60, 61, 62, 63"
     )]
     pub body: ::core::option::Option<cluster_request::Body>,
 }
@@ -1100,7 +1261,7 @@ pub struct ClusterRequest {
 pub mod cluster_request {
     use super::{
         BanPush, CertPull, CertPush, ChallengePublish, ChallengeRetract, ConfigAbort, ConfigCommit,
-        ConfigPrepare, ConfigPull, Enroll, Heartbeat, Hello, Leave, Renew, TelemetryPush,
+        ConfigPrepare, ConfigPull, Enroll, Heartbeat, Hello, Leave, Renew, SlaPull, TelemetryPush,
     };
 
     /// Request payloads (see the tag-range note on `ClusterRequest`).
@@ -1144,6 +1305,10 @@ pub mod cluster_request {
         /// per-node auto-ban stays local.
         #[prost(message, tag = "41")]
         BanPush(BanPush),
+        /// One follower's SLA, read by the control plane (Story 9.7
+        /// AC #5). Downwards only.
+        #[prost(message, tag = "42")]
+        SlaPull(SlaPull),
         /// Certificate material (control plane to follower,
         /// Story 9.5). It travels DOWNWARDS only: a follower sending
         /// one is pushing private keys at its control plane.
@@ -1180,6 +1345,7 @@ pub mod cluster_request {
                 Body::ConfigPull(_) => super::BODY_KIND_CONFIG_PULL,
                 Body::TelemetryPush(_) => super::BODY_KIND_TELEMETRY_PUSH,
                 Body::BanPush(_) => super::BODY_KIND_BAN_PUSH,
+                Body::SlaPull(_) => super::BODY_KIND_SLA_PULL,
                 Body::CertPush(_) => super::BODY_KIND_CERT_PUSH,
                 Body::CertPull(_) => super::BODY_KIND_CERT_PULL,
                 Body::ChallengePublish(_) => super::BODY_KIND_CHALLENGE_PUBLISH,
@@ -1257,6 +1423,11 @@ impl ClusterRequest {
         Self::with_body(cluster_request::Body::BanPush(push))
     }
 
+    /// One follower's SLA (Story 9.7 AC #5), control plane to follower.
+    pub fn sla_pull(pull: SlaPull) -> Self {
+        Self::with_body(cluster_request::Body::SlaPull(pull))
+    }
+
     /// A certificate push (Story 9.5), control plane to follower.
     pub fn cert_push(push: CertPush) -> Self {
         Self::with_body(cluster_request::Body::CertPush(push))
@@ -1296,6 +1467,7 @@ impl ClusterRequest {
                 | BODY_KIND_CONFIG_PULL
                 | BODY_KIND_TELEMETRY_PUSH
                 | BODY_KIND_BAN_PUSH
+                | BODY_KIND_SLA_PULL
                 | BODY_KIND_CERT_PUSH
                 | BODY_KIND_CERT_PULL
                 | BODY_KIND_CHALLENGE_PUBLISH
@@ -1330,7 +1502,7 @@ pub struct ClusterResponse {
     /// Typed response body; `None` on refusals.
     #[prost(
         oneof = "cluster_response::Body",
-        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23, 40, 41, 60, 61, 62, 63"
+        tags = "10, 11, 12, 13, 14, 20, 21, 22, 23, 40, 41, 42, 60, 61, 62, 63"
     )]
     pub body: ::core::option::Option<cluster_response::Body>,
 }
@@ -1340,7 +1512,7 @@ pub mod cluster_response {
     use super::{
         BanPushAck, CertPullAck, CertPushAck, ChallengePublishAck, ChallengeRetractAck,
         ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, ConfigPullAck, EnrollAck, HeartbeatAck,
-        HelloAck, LeaveAck, RenewAck, TelemetryPushAck,
+        HelloAck, LeaveAck, RenewAck, SlaPullAck, TelemetryPushAck,
     };
 
     /// Response payloads (tag ranges mirror `cluster_request::Body`).
@@ -1380,6 +1552,9 @@ pub mod cluster_response {
         /// Whether the fleet-wide ban was applied (Story 9.6).
         #[prost(message, tag = "41")]
         BanPushAck(BanPushAck),
+        /// The follower's SLA figures (Story 9.7 AC #5).
+        #[prost(message, tag = "42")]
+        SlaPullAck(SlaPullAck),
         /// What the follower did with a pushed batch (Story 9.5).
         #[prost(message, tag = "60")]
         CertPushAck(CertPushAck),
@@ -1986,6 +2161,7 @@ mod tests {
                 "telemetry_push",
             ),
             (ClusterRequest::ban_push(BanPush::default()), "ban_push"),
+            (ClusterRequest::sla_pull(SlaPull::default()), "sla_pull"),
         ] {
             let mut request = request;
             request.sequence = 1;
@@ -2013,6 +2189,10 @@ mod tests {
                 cluster_response::Body::BanPushAck(BanPushAck::default()),
                 "ban_push_ack",
             ),
+            (
+                cluster_response::Body::SlaPullAck(SlaPullAck::default()),
+                "sla_pull_ack",
+            ),
         ] {
             let response = ClusterResponse::ok(body);
             assert_eq!(
@@ -2026,6 +2206,41 @@ mod tests {
             tag("ClusterRequest", "telemetry_push")
         );
         assert_eq!(BODY_KIND_BAN_PUSH, tag("ClusterRequest", "ban_push"));
+        assert_eq!(BODY_KIND_SLA_PULL, tag("ClusterRequest", "sla_pull"));
+        // The SLA rows mirror the API structs field for field.
+        assert_eq!(
+            field_numbers(
+                &SlaSummaryRow {
+                    route_id: "r".to_string(),
+                    window: "1h".to_string(),
+                    total_requests: 1,
+                    successful_requests: 1,
+                    sla_pct: 1.0,
+                    avg_latency_ms: 1.0,
+                    p50_latency_ms: 1,
+                    p95_latency_ms: 1,
+                    p99_latency_ms: 1,
+                    target_pct: 1.0,
+                    meets_target: true,
+                }
+                .encode_to_vec()
+            ),
+            (1..=11)
+                .map(|n| tag("SlaSummaryRow", match n {
+                    1 => "route_id",
+                    2 => "window",
+                    3 => "total_requests",
+                    4 => "successful_requests",
+                    5 => "sla_pct",
+                    6 => "avg_latency_ms",
+                    7 => "p50_latency_ms",
+                    8 => "p95_latency_ms",
+                    9 => "p99_latency_ms",
+                    10 => "target_pct",
+                    _ => "meets_target",
+                }))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(BODY_KIND_CERT_PUSH, tag("ClusterRequest", "cert_push"));
         assert_eq!(BODY_KIND_CERT_PULL, tag("ClusterRequest", "cert_pull"));
 
@@ -2207,9 +2422,9 @@ mod tests {
         forged.body_kind = BODY_KIND_HELLO;
         assert!(!forged.body_kind_matches());
         // Reserved ranges are unknown to this build. 20-23 are Story
-        // 9.4's, 40-41 Story 9.6's and 60-63 Story 9.5's, all now
-        // known; 24-39, 42-59 and 64-79 stay reserved.
-        for kind in [0, 15, 19, 24, 39, 42, 59, 64, 79] {
+        // 9.4's, 40-41 Story 9.6's, 42 Story 9.7's and 60-63 Story
+        // 9.5's, all now known; 24-39, 43-59 and 64-79 stay reserved.
+        for kind in [0, 15, 19, 24, 39, 43, 59, 64, 79] {
             assert!(!ClusterRequest::is_known_body_kind(kind), "{kind}");
         }
         for kind in [
@@ -2222,6 +2437,7 @@ mod tests {
             BODY_KIND_CONFIG_PULL,
             BODY_KIND_TELEMETRY_PUSH,
             BODY_KIND_BAN_PUSH,
+            BODY_KIND_SLA_PULL,
             BODY_KIND_CERT_PUSH,
             BODY_KIND_CERT_PULL,
             BODY_KIND_CHALLENGE_PUBLISH,

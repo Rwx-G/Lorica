@@ -95,6 +95,15 @@ export interface FleetPage<T> {
  * treats a present-but-empty `node` as "match the node whose id is the
  * empty string" and would return nothing.
  */
+/**
+ * `?node=` for the SLA reads (Story 9.7 AC #5): one follower's own
+ * figures, computed on that follower and served by the control plane.
+ * Empty or absent is this node, so nothing is sent.
+ */
+export function nodeQuery(node?: string): string {
+  return node ? `?node=${encodeURIComponent(node)}` : '';
+}
+
 export function fleetQuery(params: FleetQueryParams): string {
   const q = new URLSearchParams();
   if (params.node) q.set('node', params.node);
@@ -1716,20 +1725,24 @@ export const api = {
     request<{ message: string }>('DELETE', `/backends/${id}`),
 
   // SLA
-  getSlaOverview: () =>
-    request<SlaSummary[]>('GET', '/sla/overview'),
+  getSlaOverview: (node?: string) =>
+    request<SlaSummary[]>('GET', `/sla/overview${nodeQuery(node)}`),
 
-  getRouteSla: (routeId: string) =>
-    request<SlaSummary[]>('GET', `/sla/routes/${routeId}`),
+  getRouteSla: (routeId: string, node?: string) =>
+    request<SlaSummary[]>('GET', `/sla/routes/${routeId}${nodeQuery(node)}`),
 
-  getRouteSlaActive: (routeId: string) =>
-    request<SlaSummary[]>('GET', `/sla/routes/${routeId}/active`),
+  getRouteSlaActive: (routeId: string, node?: string) =>
+    request<SlaSummary[]>('GET', `/sla/routes/${routeId}/active${nodeQuery(node)}`),
 
-  getRouteSlaBuckets: (routeId: string, params?: { from?: string; to?: string; source?: string }) => {
+  getRouteSlaBuckets: (
+    routeId: string,
+    params?: { from?: string; to?: string; source?: string; node?: string },
+  ) => {
     const query = new URLSearchParams();
     if (params?.from) query.set('from', params.from);
     if (params?.to) query.set('to', params.to);
     if (params?.source) query.set('source', params.source);
+    if (params?.node) query.set('node', params.node);
     const qs = query.toString();
     return request<SlaBucket[]>('GET', `/sla/routes/${routeId}/buckets${qs ? `?${qs}` : ''}`);
   },

@@ -71,6 +71,7 @@ message ClusterRequest {
     ConfigPull config_pull = 23;
     TelemetryPush telemetry_push = 40;
     BanPush ban_push = 41;
+    SlaPull sla_pull = 42;
     CertPush cert_push = 60;
     CertPull cert_pull = 61;
     ChallengePublish challenge_publish = 62;
@@ -97,6 +98,7 @@ message ClusterResponse {
     ConfigPullAck config_pull_ack = 23;
     TelemetryPushAck telemetry_push_ack = 40;
     BanPushAck ban_push_ack = 41;
+    SlaPullAck sla_pull_ack = 42;
     CertPushAck cert_push_ack = 60;
     CertPullAck cert_pull_ack = 61;
     ChallengePublishAck challenge_publish_ack = 62;
@@ -428,6 +430,63 @@ message BanPush {
   string client_ip = 1;
   uint64 duration_s = 2;
   string reason = 3;
+}
+
+// Story 9.7 AC #5 (Epic 9 close): the control plane reads ONE
+// follower's SLA on an operator's behalf. Nothing fans in: a minute
+// bucket is rewritten until its minute closes, which does not fit the
+// id-cursor drain, and a fleet percentile is not a function of
+// per-node percentiles. So the dashboard shows one node's own figures,
+// computed on that node, over the session the control plane already
+// holds. Control plane to follower.
+message SlaPull {
+  string route_id = 1;       // Empty: the overview (every route, 1h and 24h)
+  string source = 2;         // "passive" or "active"
+  string from = 3;           // RFC 3339, buckets only; empty = now - 24h
+  string to = 4;             // RFC 3339, buckets only; empty = now
+  bool buckets = 5;          // Raw minute buckets instead of summaries
+}
+
+// One SLA summary as the follower computed it (mirrors the API's
+// `SlaSummary`, so the control plane serves it unchanged).
+message SlaSummaryRow {
+  string route_id = 1;
+  string window = 2;
+  int64 total_requests = 3;
+  int64 successful_requests = 4;
+  double sla_pct = 5;
+  double avg_latency_ms = 6;
+  int64 p50_latency_ms = 7;
+  int64 p95_latency_ms = 8;
+  int64 p99_latency_ms = 9;
+  double target_pct = 10;
+  bool meets_target = 11;
+}
+
+// One raw minute bucket (mirrors the API's `SlaBucket`).
+message SlaBucketRow {
+  string route_id = 1;
+  string bucket_start = 2;   // RFC 3339
+  int64 request_count = 3;
+  int64 success_count = 4;
+  int64 error_count = 5;
+  int64 latency_sum_ms = 6;
+  int64 latency_min_ms = 7;
+  int64 latency_max_ms = 8;
+  int64 latency_p50_ms = 9;
+  int64 latency_p95_ms = 10;
+  int64 latency_p99_ms = 11;
+  string source = 12;
+  int64 cfg_max_latency_ms = 13;
+  int32 cfg_status_min = 14;
+  int32 cfg_status_max = 15;
+  double cfg_target_pct = 16;
+}
+
+// Exactly one of the two lists is populated, by `SlaPull.buckets`.
+message SlaPullAck {
+  repeated SlaSummaryRow summaries = 1;
+  repeated SlaBucketRow buckets = 2;
 }
 
 message BanPushAck {

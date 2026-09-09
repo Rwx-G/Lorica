@@ -67,9 +67,9 @@ use crate::certs::{cert_bundle_defect, CertBundle, MAX_CERT_BUNDLES, MAX_CERT_PU
 use crate::challenge::challenge_defect;
 use crate::messages::{
     ban_duration_is_valid, ban_reason_is_valid, ban_target_is_valid, cert_id_is_valid,
-    challenge_token_is_valid,
-    cluster_request, config_hash_is_valid, telemetry_audit_row_defect, ClusterRequest,
-    NodeResources, TelemetryPush, MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
+    challenge_token_is_valid, cluster_request, config_hash_is_valid, sla_pull_defect,
+    telemetry_audit_row_defect, ClusterRequest, NodeResources, SlaPull, TelemetryPush,
+    MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
 };
 use crate::replication::{AppliedConfig, ConfigPayload};
 
@@ -192,6 +192,10 @@ pub enum FollowerAction {
         /// Reason recorded on this node.
         reason: String,
     },
+    /// Compute this node's SLA figures for the control plane, which
+    /// serves them to an operator (Story 9.7 AC #5). A read: nothing
+    /// on this node changes.
+    SlaPull(SlaPull),
 }
 
 /// Outcome of routing one control-plane-initiated request through the
@@ -337,6 +341,7 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
         | Some(cluster_request::Body::ChallengePublish(_))
         | Some(cluster_request::Body::ChallengeRetract(_))
         | Some(cluster_request::Body::BanPush(_))
+        | Some(cluster_request::Body::SlaPull(_))
         | None => BridgeOutcome::ProtocolViolation,
     }
 }
@@ -344,8 +349,9 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
 /// Route one control-plane-initiated request through the FOLLOWER's
 /// whitelist (Story 9.4 D5).
 ///
-/// The follower serves exactly six methods: three configuration
-/// pushes, one certificate push and the HTTP-01 challenge pair. Every
+/// The follower serves exactly eight methods: three configuration
+/// pushes, one certificate push, the HTTP-01 challenge pair, the
+/// fleet-wide ban and the SLA read. Every
 /// other body is a control plane out of role: a `Hello` or a
 /// `Heartbeat` (the follower is the one that opens and probes), an
 /// `Enroll` (wrong listener entirely), a `Renew` or a `Leave` (those
@@ -435,6 +441,12 @@ pub fn translate_control_plane_request(request: &ClusterRequest) -> FollowerBrid
                 duration_s: ban.duration_s,
                 reason: ban.reason.clone(),
             })
+        }
+        Some(cluster_request::Body::SlaPull(pull)) => {
+            if sla_pull_defect(pull).is_some() {
+                return FollowerBridgeOutcome::ProtocolViolation;
+            }
+            FollowerBridgeOutcome::Serve(FollowerAction::SlaPull(pull.clone()))
         }
         None if request.body_kind != 0
             && !ClusterRequest::is_known_body_kind(request.body_kind) =>

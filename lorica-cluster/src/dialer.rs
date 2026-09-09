@@ -88,7 +88,7 @@ use crate::messages::{
     cluster_response, config_hash_is_valid, BanPushAck, CertPushAck, CertRefusal,
     ChallengePublishAck, ChallengeRetractAck, ClusterFrame, ClusterRequest, ClusterResponse,
     ClusterStatus, ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, Heartbeat, HelloAck,
-    NodeResources,
+    NodeResources, SlaPull, SlaPullAck,
 };
 use crate::replication::{AppliedConfig, ConfigPayload, ConfigVersion};
 use crate::tls::{client_config, negotiated_cluster_alpn, ClusterTlsError};
@@ -155,6 +155,8 @@ pub struct DialerStats {
     pub challenges_retracted: AtomicU64,
     /// Fleet-wide bans applied on this node (Story 9.6 AC #10).
     pub bans_applied: AtomicU64,
+    /// SLA reads served to the control plane (Story 9.7 AC #5).
+    pub sla_pulls_served: AtomicU64,
     /// Times an ack revealed the control plane is on another
     /// configuration version and a pull was started (AC #7).
     pub behind_detected: AtomicU64,
@@ -266,6 +268,14 @@ pub trait FollowerHandler: Send + Sync + 'static {
         duration_s: u64,
         reason: String,
     ) -> BoxFuture<'_, Result<bool, String>>;
+
+    /// Compute this node's SLA figures for the control plane (Story
+    /// 9.7 AC #5). A read over the node's own store; the default
+    /// refuses, for a runtime that keeps no SLA.
+    fn on_sla_pull(&self, pull: SlaPull) -> BoxFuture<'_, Result<SlaPullAck, String>> {
+        let _ = pull;
+        Box::pin(async { Err("this node serves no SLA reads".to_string()) })
+    }
 }
 
 /// Inputs for [`Dialer::spawn`]. Construct with [`DialerConfig::new`];
@@ -1097,6 +1107,16 @@ async fn serve_follower_action(
                 }
             }
         }
+        FollowerAction::SlaPull(pull) => match handler.on_sla_pull(pull).await {
+            Ok(ack) => {
+                stats.sla_pulls_served.fetch_add(1, Ordering::Relaxed);
+                ClusterResponse::ok(cluster_response::Body::SlaPullAck(ack))
+            }
+            Err(reason) => {
+                tracing::warn!(%reason, "could not answer an SLA read");
+                ClusterResponse::refusal(ClusterStatus::Unspecified)
+            }
+        },
     };
     request.reply_frame(reply).await.is_ok()
 }

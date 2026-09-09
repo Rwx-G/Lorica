@@ -780,6 +780,41 @@ impl ControlPlane {
         (applied, unreachable)
     }
 
+    /// Read one follower's SLA figures over its session (Story 9.7
+    /// AC #5). The one read on this plane that travels downwards on an
+    /// operator's request; a node with no active session answers with
+    /// an error rather than a stale copy, because there is none.
+    ///
+    /// # Errors
+    ///
+    /// The reason as text: no active session for `node_id`, a refusal
+    /// from the follower, or a transport failure within the per-node
+    /// deadline.
+    pub async fn sla_pull(
+        &self,
+        node_id: &str,
+        pull: crate::messages::SlaPull,
+    ) -> Result<crate::messages::SlaPullAck, String> {
+        let mut targets = self.sessions.addressable(&[node_id.to_string()]);
+        let Some((_, endpoint)) = targets.pop() else {
+            return Err("the node holds no active session".to_string());
+        };
+        let response = endpoint
+            .request(
+                crate::messages::ClusterRequest::sla_pull(pull),
+                crate::replication::DEFAULT_PER_NODE_DEADLINE,
+            )
+            .await
+            .map_err(|e| format!("the SLA read did not complete: {e}"))?;
+        match response.body {
+            Some(crate::messages::cluster_response::Body::SlaPullAck(ack)) => Ok(ack),
+            _ => Err(format!(
+                "the node refused the SLA read (status {})",
+                response.status
+            )),
+        }
+    }
+
     /// Publish an HTTP-01 challenge token to the nodes `recipients`
     /// names, and report PER NODE (Story 9.5 AC #6).
     ///

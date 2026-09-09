@@ -7,7 +7,18 @@
     type SlaConfigResponse,
     type SlaBucket,
   } from '../lib/api';
-  import { canWrite } from '../lib/auth';
+  import { canWrite, canWriteRole } from '../lib/auth';
+  import { clusterStatus, isFleetView } from '../lib/cluster';
+  import NodeFilter from '../components/NodeFilter.svelte';
+
+  // Story 9.7 AC #5: on a control plane the page shows ONE node at a
+  // time. `''` is this node; a follower's id asks the control plane to
+  // read that follower's own figures over its session. There is no
+  // "all nodes": a fleet percentile is not a function of per-node
+  // percentiles, and nothing SLA fans in.
+  const fleetView = $derived(isFleetView($clusterStatus) && $canWriteRole);
+  let selectedNode = $state('');
+  const nodeParam = $derived(selectedNode || undefined);
 
   let routes: RouteResponse[] = $state([]);
   let overview: SlaSummary[] = $state([]);
@@ -36,7 +47,7 @@
     error = '';
     const [routesRes, overviewRes] = await Promise.all([
       api.listRoutes(),
-      api.getSlaOverview(),
+      api.getSlaOverview(nodeParam),
     ]);
     if (routesRes.data) routes = routesRes.data.routes;
     if (overviewRes.data) overview = overviewRes.data;
@@ -73,10 +84,10 @@
     // and bail out if they differ.
     const captured = routeId;
     const [passiveRes, activeRes, configRes, bucketsRes] = await Promise.all([
-      api.getRouteSla(routeId),
-      api.getRouteSlaActive(routeId),
+      api.getRouteSla(routeId, nodeParam),
+      api.getRouteSlaActive(routeId, nodeParam),
       api.getSlaConfig(routeId),
-      api.getRouteSlaBuckets(routeId, { source: 'passive' }),
+      api.getRouteSlaBuckets(routeId, { source: 'passive', node: nodeParam }),
     ]);
     if (selectedRouteId !== captured) return;
     if (passiveRes.data) passiveSla = passiveRes.data;
@@ -154,6 +165,16 @@
 <div class="sla-page">
   <div class="page-header">
     <h1>SLA Monitoring</h1>
+    {#if fleetView}
+      <NodeFilter
+        value={selectedNode}
+        allowAll={false}
+        onchange={(id) => {
+          selectedNode = id;
+          void refreshAll();
+        }}
+      />
+    {/if}
     {#if lastRefresh}
       <span class="refresh-indicator" title="Auto-refresh every 30s">
         <span class="refresh-dot"></span>
@@ -164,6 +185,12 @@
 
   {#if error}
     <div class="error-banner">{error}</div>
+  {/if}
+  {#if selectedNode}
+    <p class="text-muted">
+      Showing that node's own figures, computed on the node. Export and
+      clear act on this node's store, so they are hidden here.
+    </p>
   {/if}
 
   {#if loading}
@@ -205,7 +232,7 @@
           <div class="detail-header">
             <h2>{getRouteHostname(selectedRouteId)}</h2>
             <div class="detail-actions">
-              {#if $canWrite}
+              {#if $canWrite && !selectedNode}
                 <button class="btn btn-small" onclick={openConfigModal}>Configure</button>
               {/if}
               <button class="btn btn-small" onclick={() => handleExport('csv')}>Export CSV</button>
