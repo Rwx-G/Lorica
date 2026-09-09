@@ -26,6 +26,15 @@ const NODE_COLUMNS: &str = "node_id, name, cert_fingerprint, cert_serial, prev_c
 const ROUTE_SELECTORS_BY_CERTIFICATE: &str =
     "SELECT id, node_selector FROM routes WHERE certificate_id = ?1";
 
+/// Every route that names a certificate, with its selector, for
+/// [`ConfigStore::certificates_entitling_node`].
+///
+/// The whole table rather than a per-certificate query, because that
+/// resolver answers for one NODE across every certificate and the
+/// per-certificate shape would mean one statement per certificate.
+const ROUTE_CERTIFICATES_AND_SELECTORS: &str =
+    "SELECT certificate_id, id, node_selector FROM routes WHERE certificate_id IS NOT NULL";
+
 /// Every route's host keys and selector, for
 /// [`ConfigStore::challenge_recipients`].
 ///
@@ -478,6 +487,112 @@ impl ConfigStore {
         self.resolve_selector_union(&union)
     }
 
+    /// The certificate ids whose private key `node_id` receives.
+    ///
+    /// The inverse of [`ConfigStore::cert_key_recipients`], and it has
+    /// to stay the inverse: the dashboard's node drawer answers "what
+    /// key material does this node hold" with it, and an answer that
+    /// disagrees with the push path is worse than no answer.
+    ///
+    /// So it applies exactly the same two rules. An empty
+    /// `node_selector` means the route is fleet-wide and entitles every
+    /// Active node, which is why this cannot be derived from
+    /// [`ConfigStore::hostnames_selecting_node_name`]: that one
+    /// deliberately EXCLUDES fleet-wide routes, because it answers the
+    /// different question of what approving a pending node would hand
+    /// over that is specific to its name. Deriving one from the other
+    /// silently omits every fleet-wide certificate.
+    ///
+    /// A node that is not `Active` receives nothing, matching
+    /// [`ConfigStore::resolve_selector_union`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a read failure, and
+    /// [`ConfigError::Validation`] when a stored `node_selector` is not
+    /// a JSON array of strings, failing closed for the same reason
+    /// [`ConfigStore::cert_key_recipients`] does.
+    pub fn certificates_entitling_node(&self, node_id: &str) -> Result<Vec<String>> {
+        Ok(self
+            .certificates_by_node()?
+            .remove(node_id)
+            .unwrap_or_default())
+    }
+
+    /// Every Active node's certificate entitlement, in one pass.
+    ///
+    /// The roster endpoint answers for the whole fleet at once, so this
+    /// reads the route table once rather than once per node, the same
+    /// reason [`ConfigStore::hostnames_selecting_node_name`] is folded
+    /// into a single pass by its caller.
+    ///
+    /// This is the one place the entitlement rule is written;
+    /// [`ConfigStore::certificates_entitling_node`] delegates to it so
+    /// the single-node and fleet views cannot drift apart.
+    ///
+    /// Nodes that are not `Active` are absent from the map rather than
+    /// present with an empty list: they receive nothing at all, which
+    /// is a different statement from "nothing is bound to them".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a read failure, and
+    /// [`ConfigError::Validation`] when a stored `node_selector` is not
+    /// a JSON array of strings, failing closed for the same reason
+    /// [`ConfigStore::cert_key_recipients`] does.
+    pub fn certificates_by_node(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        let mut names: Vec<(String, String)> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT node_id, name FROM cluster_nodes WHERE status = ?1")?;
+            let rows = stmt.query_map(params![NodeStatus::Active.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                names.push(row?);
+            }
+        }
+        if names.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let mut fleet_wide: BTreeSet<String> = BTreeSet::new();
+        let mut scoped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        {
+            let mut stmt = self.conn.prepare(ROUTE_CERTIFICATES_AND_SELECTORS)?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (cert_id, route_id, raw_selector) = row?;
+                let mut union = SelectorUnion::default();
+                union.add(&route_id, &raw_selector)?;
+                if union.fleet_wide {
+                    fleet_wide.insert(cert_id);
+                } else {
+                    for name in union.names {
+                        scoped.entry(name).or_default().insert(cert_id.clone());
+                    }
+                }
+            }
+        }
+
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (node_id, name) in names {
+            let mut certs = fleet_wide.clone();
+            if let Some(named) = scoped.get(&name) {
+                certs.extend(named.iter().cloned());
+            }
+            out.insert(node_id, certs.into_iter().collect());
+        }
+        Ok(out)
+    }
+
     /// The node ids that plausibly serve `hostname`, for HTTP-01
     /// challenge distribution (Story 9.5 AC #6).
     ///
@@ -862,6 +977,114 @@ mod tests {
                 .cert_key_recipients("cert-1")
                 .expect("recipients resolve"),
             vec!["node-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_node_view_of_entitlement_agrees_with_the_certificate_view() {
+        // The two resolvers answer the same question from opposite
+        // ends. The dashboard's node drawer reads one and the push path
+        // reads the other, so a disagreement is a false statement to an
+        // operator about who holds which private key.
+        let store = fleet_of_three();
+        issue_certificate(&store, "cert-2", "api.example.com");
+        // Fleet-wide: nobody is named, everybody is entitled.
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &[]);
+        // Scoped to one node.
+        bind_route(&store, "r2", "api.example.com", "cert-2", &["edge-b"]);
+
+        for (node_id, expected) in [
+            ("node-a", vec!["cert-1".to_string()]),
+            ("node-b", vec!["cert-1".to_string(), "cert-2".to_string()]),
+            ("node-c", vec!["cert-1".to_string()]),
+        ] {
+            assert_eq!(
+                store
+                    .certificates_entitling_node(node_id)
+                    .expect("entitlement resolves"),
+                expected,
+                "{node_id} sees the certificates it actually receives"
+            );
+        }
+
+        for cert_id in ["cert-1", "cert-2"] {
+            for node_id in ["node-a", "node-b", "node-c"] {
+                let from_cert = store
+                    .cert_key_recipients(cert_id)
+                    .expect("recipients resolve")
+                    .contains(&node_id.to_string());
+                let from_node = store
+                    .certificates_entitling_node(node_id)
+                    .expect("entitlement resolves")
+                    .contains(&cert_id.to_string());
+                assert_eq!(
+                    from_cert, from_node,
+                    "the two resolvers disagree on {node_id} and {cert_id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fleet_wide_certificate_is_not_lost_by_the_node_view() {
+        // The bug this test exists for: the drawer used to derive its
+        // certificate list from `hostnames_selecting_node_name`, which
+        // deliberately excludes fleet-wide routes, and so told an
+        // operator a node held no keys while it held every fleet-wide
+        // one.
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &[]);
+
+        assert!(
+            store
+                .hostnames_selecting_node_name("edge-a")
+                .expect("review list resolves")
+                .is_empty(),
+            "the approval review deliberately says nothing about fleet-wide routes"
+        );
+        assert_eq!(
+            store
+                .certificates_entitling_node("node-a")
+                .expect("entitlement resolves"),
+            vec!["cert-1".to_string()],
+            "but the node really does receive that certificate's key"
+        );
+    }
+
+    #[test]
+    fn a_node_that_is_not_active_is_entitled_to_nothing() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        enrol(&store, "node-p", "edge-p", NodeStatus::Pending);
+        enrol(&store, "node-r", "edge-r", NodeStatus::Revoked);
+        issue_certificate(&store, "cert-1", "shop.example.com");
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &[]);
+
+        for node_id in ["node-p", "node-r", "node-absent"] {
+            assert!(
+                store
+                    .certificates_entitling_node(node_id)
+                    .expect("entitlement resolves")
+                    .is_empty(),
+                "{node_id} holds no key material"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_selector_fails_closed_in_the_node_view_too() {
+        let store = fleet_of_three();
+        bind_route(&store, "r1", "shop.example.com", "cert-1", &["edge-a"]);
+        store
+            .conn
+            .execute(
+                "UPDATE routes SET node_selector = 'not json' WHERE id = 'r1'",
+                [],
+            )
+            .expect("test setup: corrupt the selector");
+
+        assert!(
+            store.certificates_entitling_node("node-a").is_err(),
+            "a selector that will not parse must not degrade to fleet-wide here either"
         );
     }
 

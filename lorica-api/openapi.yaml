@@ -4132,6 +4132,17 @@ components:
             would bury the entries an approval decision turns on.
           items:
             type: string
+        certificate_ids:
+          type: array
+          description: >-
+            The certificates whose private key this node receives, resolved by
+            the stated inverse of the push path's own resolver. Deliberately
+            NOT derivable from `selected_for_hostnames`: that field omits
+            fleet-wide routes, which entitle every Active node, so deriving
+            from it reports no key material on a node holding every fleet-wide
+            certificate. Empty on a node that is not Active.
+          items:
+            type: string
         resources:
           nullable: true
           allOf:

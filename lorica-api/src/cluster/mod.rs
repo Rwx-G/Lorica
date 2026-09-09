@@ -9,7 +9,7 @@
 
 pub mod runtime;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -320,6 +320,17 @@ pub struct NodeResponse {
     /// attached. Fleet-wide routes are excluded; they apply to every
     /// node and would bury the entries that need thought.
     pub selected_for_hostnames: Vec<String>,
+    /// The certificates whose private key this node receives.
+    ///
+    /// Resolved by `certificates_by_node`, the stated inverse of the
+    /// push path's own `cert_key_recipients`, and NOT derived from
+    /// `selected_for_hostnames`: that field deliberately omits
+    /// fleet-wide routes, which entitle every Active node, so deriving
+    /// from it would tell an operator a node holds no key material
+    /// while it holds every fleet-wide certificate.
+    ///
+    /// Empty on a node that is not `Active`, which receives nothing.
+    pub certificate_ids: Vec<String>,
     /// What the node last reported it is using, or `null` from a node
     /// that has sent no reading on its current session.
     ///
@@ -334,6 +345,7 @@ fn node_responses(
     control: &ControlPlane,
     nodes: Vec<ClusterNode>,
     selected: &HashMap<String, Vec<String>>,
+    certificates: &BTreeMap<String, Vec<String>>,
 ) -> Vec<NodeResponse> {
     let live: HashMap<String, LiveSessionSnapshot> = control
         .sessions
@@ -353,6 +365,7 @@ fn node_responses(
                     .and_then(|s| s.resources.as_ref())
                     .map(NodeResourcesResponse::from),
                 selected_for_hostnames: selected.get(&node.name).cloned().unwrap_or_default(),
+                certificate_ids: certificates.get(&node.node_id).cloned().unwrap_or_default(),
                 node,
             }
         })
@@ -387,15 +400,27 @@ pub async fn list_nodes(
     Extension(state): Extension<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
-    let (nodes, selected) = db_blocking(&state.store, |store| {
+    let (nodes, selected, certificates) = db_blocking(&state.store, |store| {
         let nodes = store
             .list_cluster_nodes()
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         let selected = selected_hostnames(store, &nodes);
-        Ok::<_, ApiError>((nodes, selected))
+        // A read failure degrades the drawer's certificate list to
+        // empty rather than failing the roster, matching what
+        // `selected_hostnames` does and for the same reason: an
+        // operator who cannot list the fleet is worse off than one
+        // whose advisory column is short. The list is advisory; the
+        // push path resolves entitlement itself.
+        let certificates = store.certificates_by_node().unwrap_or_default();
+        Ok::<_, ApiError>((nodes, selected, certificates))
     })
     .await?;
-    Ok(json_data(node_responses(&control, nodes, &selected)))
+    Ok(json_data(node_responses(
+        &control,
+        nodes,
+        &selected,
+        &certificates,
+    )))
 }
 
 /// GET /api/v1/cluster/nodes/{id} - one node (Viewer+).
@@ -404,16 +429,17 @@ pub async fn get_node(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
-    let (node, selected) = db_blocking(&state.store, move |store| {
+    let (node, selected, certificates) = db_blocking(&state.store, move |store| {
         let node = store
             .get_cluster_node(&id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
         let selected = selected_hostnames(store, std::slice::from_ref(&node));
-        Ok::<_, ApiError>((node, selected))
+        let certificates = store.certificates_by_node().unwrap_or_default();
+        Ok::<_, ApiError>((node, selected, certificates))
     })
     .await?;
-    let mut responses = node_responses(&control, vec![node], &selected);
+    let mut responses = node_responses(&control, vec![node], &selected, &certificates);
     Ok(json_data(responses.remove(0)))
 }
 
@@ -428,7 +454,7 @@ pub async fn activate_node(
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
     let node_id = id.clone();
-    let (node, selected) = db_blocking(&state.store, move |store| {
+    let (node, selected, certificates) = db_blocking(&state.store, move |store| {
         let before = store
             .get_cluster_node(&node_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
@@ -447,7 +473,8 @@ pub async fn activate_node(
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
         let selected = selected_hostnames(store, std::slice::from_ref(&node));
-        Ok::<_, ApiError>((node, selected))
+        let certificates = store.certificates_by_node().unwrap_or_default();
+        Ok::<_, ApiError>((node, selected, certificates))
     })
     .await?;
     runtime::refresh_control_plane(&control, &state.store).await?;
@@ -461,7 +488,7 @@ pub async fn activate_node(
         Some(&serde_json::json!({ "status": "active", "name": node.name })),
     )
     .await;
-    let mut responses = node_responses(&control, vec![node], &selected);
+    let mut responses = node_responses(&control, vec![node], &selected, &certificates);
     Ok(json_data(responses.remove(0)))
 }
 
@@ -608,9 +635,10 @@ pub async fn get_status(
                     .map_err(|e| ApiError::Internal(e.to_string()))
             })
             .await?;
-            // `FleetEntry` carries no selector column, so the status
-            // summary skips the per-node store pass the roster does.
-            let fleet = node_responses(control, nodes, &HashMap::new())
+            // `FleetEntry` carries neither a selector nor a certificate
+            // column, so the status summary skips the store passes the
+            // roster does.
+            let fleet = node_responses(control, nodes, &HashMap::new(), &BTreeMap::new())
                 .into_iter()
                 .map(|n| FleetEntry {
                     node_id: n.node.node_id,
