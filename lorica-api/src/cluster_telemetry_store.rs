@@ -575,6 +575,59 @@ impl ClusterTelemetryStore {
         }
     }
 
+    /// Drop everything one node ever fanned in: both series and its
+    /// ban snapshot. For a node that is no longer in the roster, or
+    /// was revoked long enough ago that its last hours are no longer
+    /// an incident to review (Epic 9 close, architecture review).
+    ///
+    /// Without this, a retired node's rows sat at up to twice the
+    /// per-node quota for the life of the database, counting toward
+    /// the storage watermark whose breach sheds EVERY node: a fleet
+    /// that churns hardware slowly walked its own watermark down.
+    ///
+    /// Chunked like [`ClusterTelemetryStore::enforce_node_quota`], and
+    /// for the same reason: ingest gets the lock back between chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a delete failure.
+    pub fn forget_node(&self, node_id: &str) -> Result<u64, String> {
+        let mut removed = 0u64;
+        for table in [TelemetryTable::Access, TelemetryTable::Waf] {
+            let table = table.as_str();
+            loop {
+                let chunk = {
+                    let conn = self.conn.lock();
+                    conn.execute(
+                        &format!(
+                            "DELETE FROM {table} WHERE id IN (
+                                 SELECT id FROM {table} WHERE node_id = ?1 LIMIT ?2
+                             )"
+                        ),
+                        rusqlite::params![
+                            node_id,
+                            i64::try_from(RETENTION_CHUNK).unwrap_or(i64::MAX)
+                        ],
+                    )
+                    .map_err(|e| format!("failed to reclaim {table} for a retired node: {e}"))?
+                };
+                if chunk == 0 {
+                    break;
+                }
+                removed += chunk as u64;
+            }
+        }
+        let conn = self.conn.lock();
+        removed += conn
+            .execute(
+                "DELETE FROM fleet_bans WHERE node_id = ?1",
+                rusqlite::params![node_id],
+            )
+            .map_err(|e| format!("failed to reclaim the bans of a retired node: {e}"))?
+            as u64;
+        Ok(removed)
+    }
+
     /// Drop ban rows nobody has refreshed since `cutoff`.
     ///
     /// # Errors

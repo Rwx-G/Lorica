@@ -225,6 +225,16 @@ impl IngestQuota {
         let now = Instant::now();
         let offered = (access + waf) as u64;
         let mut spend = self.spend.lock().unwrap_or_else(|p| p.into_inner());
+        // An entry whose window has rolled over is indistinguishable
+        // from no entry: `roll` would zero it on its next use. Dropping
+        // those here bounds the map by the nodes that pushed within
+        // the last window, whatever removed the others (leave, which
+        // calls `forget`, but also revocation, re-enrolment under a
+        // fresh id, or a node that simply died), without threading a
+        // hook through every removal path. O(nodes) per batch, on a
+        // map that is small by construction.
+        let window = self.window;
+        spend.retain(|_, s| now.duration_since(s.window_started) < window);
         let entry = spend
             .entry(node_id.to_string())
             .or_insert_with(|| NodeSpend::new(now));
@@ -286,7 +296,9 @@ impl IngestQuota {
         }
     }
 
-    /// Forget a node's spend, for a node that has left the fleet.
+    /// Forget a node's spend at once, for a node that has left the
+    /// fleet. A node removed any other way is swept by the next
+    /// [`IngestQuota::admit`] once its window has rolled over.
     pub fn forget(&self, node_id: &str) {
         self.spend
             .lock()
@@ -447,5 +459,23 @@ mod tests {
         assert_eq!(quota.tracked_nodes(), 1);
         quota.forget("node-a");
         assert_eq!(quota.tracked_nodes(), 0);
+    }
+
+    #[test]
+    fn a_node_nobody_forgot_is_swept_once_its_window_rolled() {
+        // Revocation, re-enrolment and a plain crash never call
+        // `forget`; the sweep is what keeps the map from holding one
+        // entry per node that ever existed for the life of the
+        // process.
+        let quota = IngestQuota::with_budget(100, u64::MAX, Duration::from_millis(20));
+        quota.admit("node-gone", 1, 0, 1);
+        assert_eq!(quota.tracked_nodes(), 1);
+        std::thread::sleep(Duration::from_millis(30));
+        quota.admit("node-here", 1, 0, 1);
+        assert_eq!(quota.tracked_nodes(), 1, "only the node that pushed inside the window");
+        // The sweep is lossless: a swept entry had a rolled window,
+        // which `roll` would have zeroed anyway, so the node's budget
+        // is the full one either way.
+        assert_eq!(quota.admit("node-gone", 100, 0, 1), IngestVerdict::Accept);
     }
 }

@@ -372,31 +372,49 @@ async fn drain_once(
         }
     };
 
-    // Advance only past what was ACCEPTED. A quota that shed part of
-    // the batch must not silently lose those rows: leaving the cursor
-    // behind means the next tick offers them again.
+    // Advance each cursor only past what was ACCEPTED of ITS class. A
+    // quota that shed part of the batch must not silently lose those
+    // rows: leaving that cursor behind means the next tick offers them
+    // again.
+    //
+    // The three classes advance independently, not on one conjunction
+    // (Epic 9 close, architecture review). Gated together, a class the
+    // peer did not acknowledge would freeze the other two as well: a
+    // control plane one release behind this node drops a class it
+    // does not know at decode, answers zero for it, and access, WAF and
+    // audit would all re-send the same batch every tick, forever,
+    // while the control plane believed it had accepted everything it
+    // understood. A class the peer did not take blocks only itself.
+    //
     // Audit rows are exempt from shedding, so a short audit count is
     // never a quota decision: it means the control plane could not
-    // store them. The cursor stays put and the rows are offered again,
+    // store them. That cursor stays put and the rows are offered again,
     // which is what the fan-in insert's idempotency is for.
-    let accepted_all = ack.accepted_access as usize == sent_access
-        && ack.accepted_waf as usize == sent_waf
-        && ack.accepted_audit as usize == sent_audit;
-    if accepted_all {
-        let (access_to, waf_to, audit_to) =
-            (ack.access_cursor, ack.waf_cursor, ack.audit_cursor);
+    let access_ok = ack.accepted_access as usize == sent_access;
+    let waf_ok = ack.accepted_waf as usize == sent_waf;
+    let audit_ok = ack.accepted_audit as usize == sent_audit;
+    let advances: Vec<(TelemetryCursor, u64)> = [
+        (TelemetryCursor::Access, access_ok, ack.access_cursor),
+        (TelemetryCursor::Waf, waf_ok, ack.waf_cursor),
+        (TelemetryCursor::Audit, audit_ok, ack.audit_cursor),
+    ]
+    .into_iter()
+    .filter(|(_, ok, _)| *ok)
+    .map(|(cursor, _, to)| (cursor, to))
+    .collect();
+    if !advances.is_empty() {
         cursor_write(config_store, move |store| {
-            store
-                .advance_telemetry_cursor(TelemetryCursor::Access, access_to)
-                .map_err(|e| e.to_string())?;
-            store
-                .advance_telemetry_cursor(TelemetryCursor::Waf, waf_to)
-                .map_err(|e| e.to_string())?;
-            store
-                .advance_telemetry_cursor(TelemetryCursor::Audit, audit_to)
-                .map_err(|e| e.to_string())
+            for (cursor, to) in advances {
+                store
+                    .advance_telemetry_cursor(cursor, to)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
         })
         .await?;
+    }
+    let accepted_all = access_ok && waf_ok && audit_ok;
+    if accepted_all {
         debug!(
             access = sent_access,
             waf = sent_waf,
@@ -407,11 +425,13 @@ async fn drain_once(
         info!(
             sent_access,
             sent_waf,
+            sent_audit,
             accepted_access = ack.accepted_access,
             accepted_waf = ack.accepted_waf,
+            accepted_audit = ack.accepted_audit,
             retry_after_s = ack.retry_after_s,
-            "the control plane accepted part of the telemetry batch; the cursor stays put so \
-             nothing is lost, and the rest is offered again"
+            "the control plane accepted part of the telemetry batch; the cursor of each short \
+             class stays put so nothing is lost, and the rest is offered again"
         );
     }
 

@@ -47,7 +47,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, TcpStream};
@@ -66,7 +66,7 @@ use crate::handshake::{serve_hello, HandshakeConfig};
 use crate::limits::cluster_rpc_limits;
 use crate::messages::{
     cluster_response, CertPullAck, ClusterFrame, ClusterResponse, ClusterStatus, ConfigPullAck,
-    HeartbeatAck, LeaveAck, RenewAck,
+    HeartbeatAck, LeaveAck, RenewAck, TelemetryPushAck,
 };
 use crate::preauth::{accept_error_pause, PreAuthBudgets, SourceGate, SourceSlot};
 use crate::replication::{AppliedConfig, ConfigVersion};
@@ -122,6 +122,26 @@ const MAX_CERT_PULLS_PER_SESSION: u32 = 240;
 /// What a node past its per-node session rate is told to wait, in
 /// seconds (the sliding window itself).
 const SESSION_RATE_RETRY_AFTER_S: u32 = SESSION_RATE_WINDOW.as_secs() as u32;
+
+/// Telemetry pushes one session may make per [`TELEMETRY_PUSH_WINDOW`]
+/// (Epic 9 close, security audit). The follower's drain ticks every
+/// ten seconds and ships at most twenty batches per tick, so a node
+/// catching up after a partition legitimately reaches 120 pushes a
+/// minute; the cap is twice that. Above it a node is looping or
+/// hostile, and each push it makes is a durable write into the control
+/// plane's databases: the audit share into `access-log.db`, whose one
+/// connection the dashboard and the local audit chain share. The other
+/// two expensive methods (`CertPull`, `Renew`) have had per-session
+/// caps since their stories; this was the one left uncapped.
+///
+/// A node over the rate is not dropped: it is answered an
+/// acknowledgement accepting nothing with `retry_after_s` set to the
+/// window, which the drain honours by sleeping, the same signal the
+/// ingest quota sends. Its cursors stay put, so nothing is lost.
+const MAX_TELEMETRY_PUSHES_PER_WINDOW: u32 = 240;
+
+/// The window [`MAX_TELEMETRY_PUSHES_PER_WINDOW`] counts over.
+const TELEMETRY_PUSH_WINDOW: Duration = Duration::from_secs(60);
 
 /// Operational-listener counters (bridged to Prometheus by the
 /// binary, AC #12). All monotonic.
@@ -718,6 +738,28 @@ struct SessionTally {
     renewals_granted: u32,
     renewals_refused: u32,
     cert_pulls: u32,
+    telemetry_pushes: u32,
+    telemetry_window_started: Option<Instant>,
+}
+
+impl SessionTally {
+    /// Charge one telemetry push against the session's window and say
+    /// whether it is over the rate. The window is fixed, not sliding:
+    /// a push that opens a new window resets the count, which lets a
+    /// burst of at most twice the cap straddle a boundary and costs
+    /// nothing worth a ring buffer per session.
+    fn telemetry_push_over_rate(&mut self, now: Instant) -> bool {
+        let fresh = match self.telemetry_window_started {
+            Some(started) => now.duration_since(started) >= TELEMETRY_PUSH_WINDOW,
+            None => true,
+        };
+        if fresh {
+            self.telemetry_window_started = Some(now);
+            self.telemetry_pushes = 0;
+        }
+        self.telemetry_pushes += 1;
+        self.telemetry_pushes > MAX_TELEMETRY_PUSHES_PER_WINDOW
+    }
 }
 
 /// Whether the node behind this session is `Active` NOW.
@@ -869,6 +911,30 @@ async fn serve_request(
                 );
                 return request
                     .reply_frame(ClusterResponse::refusal(ClusterStatus::Unspecified))
+                    .await
+                    .err()
+                    .map(|_| SessionEnd::Closed);
+            }
+            if tally.telemetry_push_over_rate(Instant::now()) {
+                stats.telemetry_push_refusals.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    peer = %ctx.peer_addr,
+                    node_id,
+                    cap = MAX_TELEMETRY_PUSHES_PER_WINDOW,
+                    window_s = TELEMETRY_PUSH_WINDOW.as_secs(),
+                    "telemetry push refused: the session is over its push rate; told to back off"
+                );
+                let ack = TelemetryPushAck {
+                    retry_after_s: TELEMETRY_PUSH_WINDOW.as_secs() as u32,
+                    access_cursor: batch.access_cursor,
+                    waf_cursor: batch.waf_cursor,
+                    audit_cursor: batch.audit_cursor,
+                    ..TelemetryPushAck::default()
+                };
+                return request
+                    .reply_frame(ClusterResponse::ok(cluster_response::Body::TelemetryPushAck(
+                        ack,
+                    )))
                     .await
                     .err()
                     .map(|_| SessionEnd::Closed);

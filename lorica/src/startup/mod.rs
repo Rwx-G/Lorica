@@ -194,7 +194,7 @@ pub(crate) async fn run_api_server(
     );
     if is_follower {
         info!(
-            "follower mode: certificate issuance, renewal and expiry alerting are the control              plane's job; this node installs what it is sent and keeps stapling its own certs"
+            "follower mode: certificate issuance, renewal and expiry alerting are the control plane's job; this node installs what it is sent and keeps stapling its own certs"
         );
     } else {
         // One-shot startup purge of superseded orphan ACME certs (fix
@@ -336,10 +336,44 @@ pub(crate) fn spawn_retention_loop(
             // control plane has this store.
             if let Some(telemetry) = &telemetry {
                 let telemetry = Arc::clone(telemetry);
+                // The roster decides which node ids still own their
+                // rows. A node id absent from the registry (deleted,
+                // or superseded by a re-enrolment under a fresh id)
+                // owns nothing; a revoked node keeps its rows for a
+                // day, because the hours before a revocation are
+                // exactly what an operator reviews after one. Without
+                // this, retired ids held up to twice their quota
+                // forever and counted toward the watermark that sheds
+                // the whole fleet (Epic 9 close, architecture review).
+                let roster = {
+                    let s = retention_config_store.lock().await;
+                    s.list_cluster_nodes().unwrap_or_default()
+                };
                 let pruned = tokio::task::spawn_blocking(move || {
                     let mut total = 0u64;
+                    let retired_cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
                     let nodes = telemetry.nodes_with_rows()?;
                     for node_id in &nodes {
+                        let owner = roster.iter().find(|n| &n.node_id == node_id);
+                        let retired = match owner {
+                            None => true,
+                            Some(n) => {
+                                n.status == lorica_config::models::NodeStatus::Revoked
+                                    && n.revoked_at.is_some_and(|at| at < retired_cutoff)
+                            }
+                        };
+                        if retired {
+                            let reclaimed = telemetry.forget_node(node_id)?;
+                            if reclaimed > 0 {
+                                tracing::info!(
+                                    node_id,
+                                    rows = reclaimed,
+                                    "fleet telemetry of a retired node reclaimed"
+                                );
+                            }
+                            total += reclaimed;
+                            continue;
+                        }
                         for table in [
                             lorica_api::cluster_telemetry_store::TelemetryTable::Access,
                             lorica_api::cluster_telemetry_store::TelemetryTable::Waf,
