@@ -783,10 +783,7 @@ mod tests {
             .expect("test setup: user");
     }
 
-    fn prepared(
-        source: &ConfigStore,
-        target: &ConfigStore,
-    ) -> std::result::Result<CanonicalConfig, ReplicaError> {
+    fn prepared(source: &ConfigStore) -> std::result::Result<CanonicalConfig, ReplicaError> {
         let blob = canonical_bytes(source).expect("encode");
         let hash = canonical_hash(source).expect("hash");
         ConfigStore::prepare_replica(&blob, &hash)
@@ -804,7 +801,7 @@ mod tests {
             .create_certificate(&make_certificate("cert-1", CERT_KEY))
             .expect("target holds the key");
 
-        let config = prepared(&source, &target).expect("prepare");
+        let config = prepared(&source).expect("prepare");
         let outcome = target
             .apply_replica(&config, "edge-1", 1, "h1")
             .expect("apply");
@@ -868,7 +865,7 @@ mod tests {
         let target = ConfigStore::open_in_memory().expect("target opens");
         seed_source(&source);
 
-        let config = prepared(&source, &target).expect("prepare");
+        let config = prepared(&source).expect("prepare");
         let outcome = target
             .apply_replica(&config, "edge-1", 1, "h1")
             .expect("apply");
@@ -892,7 +889,7 @@ mod tests {
         let target = ConfigStore::open_in_memory().expect("target opens");
         seed_source(&source);
 
-        let config = prepared(&source, &target).expect("prepare");
+        let config = prepared(&source).expect("prepare");
         let outcome = target
             .apply_replica(&config, "edge-2", 1, "h1")
             .expect("apply");
@@ -917,7 +914,6 @@ mod tests {
     #[test]
     fn a_wrong_hash_or_a_tampered_blob_is_refused() {
         let source = ConfigStore::open_in_memory().expect("source opens");
-        let target = ConfigStore::open_in_memory().expect("target opens");
         seed_source(&source);
         let blob = canonical_bytes(&source).expect("encode");
         let hash = canonical_hash(&source).expect("hash");
@@ -955,7 +951,6 @@ mod tests {
     #[test]
     fn a_route_with_an_invalid_node_selector_is_refused() {
         let source = ConfigStore::open_in_memory().expect("source opens");
-        let target = ConfigStore::open_in_memory().expect("target opens");
         seed_source(&source);
         let blob = canonical_bytes(&source).expect("encode");
         let mut root: serde_json::Value = serde_json::from_slice(&blob).expect("json");
@@ -976,7 +971,7 @@ mod tests {
         let target = ConfigStore::open_in_memory().expect("target opens");
         seed_source(&source);
         seed_target_node_local(&target);
-        let config = prepared(&source, &target).expect("prepare");
+        let config = prepared(&source).expect("prepare");
         target
             .apply_replica(&config, "edge-1", 1, "h1")
             .expect("first apply");
@@ -1020,7 +1015,7 @@ mod tests {
             .create_certificate(&make_certificate("cert-1", CERT_KEY))
             .expect("target holds the key");
 
-        let config = prepared(&source, &target).expect("prepare");
+        let config = prepared(&source).expect("prepare");
         let first = target
             .apply_replica(&config, "edge-1", 1, "h1")
             .expect("first apply");
@@ -1048,7 +1043,7 @@ mod tests {
         target
             .create_certificate(&make_certificate("cert-1", CERT_KEY))
             .expect("target holds the key");
-        let config = prepared(&source, &target).expect("prepare");
+        let config = prepared(&source).expect("prepare");
         target
             .apply_replica(&config, "edge-1", 1, "h1")
             .expect("first apply");
@@ -1068,7 +1063,7 @@ mod tests {
             .delete_custom_crawler(crawler_id)
             .expect("delete crawler");
 
-        let config = prepared(&source, &target).expect("prepare");
+        let config = prepared(&source).expect("prepare");
         target
             .apply_replica(&config, "edge-1", 1, "h1")
             .expect("second apply");

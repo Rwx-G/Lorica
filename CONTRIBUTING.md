@@ -60,9 +60,13 @@ We use [Conventional Commits](https://www.conventionalcommits.org/):
 
 Before submitting, run the same gates as CI (`.github/workflows/ci.yml`),
 on Linux or inside the `rust:1-bookworm` image with `cmake` and
-`protobuf-compiler` installed:
+`protobuf-compiler` installed. CI exports `RUSTFLAGS="-D warnings"`
+(set by `actions-rust-lang/setup-rust-toolchain`), so a rustc warning in
+a test target fails the Test and Coverage jobs even when clippy is clean:
+export it locally too.
 
 ```bash
+export RUSTFLAGS="-D warnings"
 cargo fmt --all -- --check
 cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings
 cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings
