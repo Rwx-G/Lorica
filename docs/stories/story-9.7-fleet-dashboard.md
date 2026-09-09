@@ -1,7 +1,7 @@
 # Story 9.7: Fleet Dashboard
 
 **Epic:** 9 (v1.7.0)
-**Status:** InProgress
+**Status:** Review
 **Author:** Romain G.
 
 **Depends on:** Stories 9.3 (registry, tokens), 9.4 (read-only mode,
@@ -42,9 +42,14 @@ without curl.
 
 ## Tasks / Subtasks
 
-- [ ] AC #1: Cluster page + `routeLoaders` entry + node table.
-- [ ] AC #2: token dialog with `--token-stdin` command and separate
-      secret field.
+- [x] AC #1: Cluster page + `routeLoaders` entry + node table with
+      name, status, connected, version, schema, applied generation, a
+      drift pill and last seen. Chunk measured on a production build:
+      `Cluster-*.js` 6072 B gzipped plus `Cluster-*.css` 1367 B, so
+      7.4 KB against the 40 KB cap.
+- [x] AC #2: token dialog with the `--token-stdin` command line and the
+      secret in its own copy field, behind the one-time-display
+      warning.
 - [x] AC #3: node detail drawer. Health, applied hash, activate behind
       the `selected_for_hostnames` review panel, revoke behind the
       existing `ConfirmDialog`. Certificate inventory is derived from
@@ -60,9 +65,10 @@ without curl.
       rather than as an idle node at 0%.
 - [x] AC #4: `auth.ts` derives `canWrite` / `isSuperAdmin` over
       `[auth, clusterStatus]`; `isSuperAdminRole` keeps the role-only
-      view for break-glass and leave, the two controls that must stay
-      reachable on a follower. The review pass over every consumer is
-      NOT done.
+      view for break-glass and leave. The review pass over every
+      consumer IS now done and found four controls hidden from a
+      follower that the server still serves; see D19. `canWriteRole`
+      is its counterpart for the write actions on the same allow-list.
 - [x] Foundation (not an AC, but everything else sits on it):
       `lib/cluster.ts` with the status store, the read-only and
       break-glass predicates, the badge builder and the join-command
@@ -78,9 +84,27 @@ without curl.
       results. **The SLA leg is deliberately not built**: see D17 in
       the Debug Log. AC #5 as written is therefore short by one page,
       and that is a decision for the user, not a silent omission.
-- [ ] AC #6: header badge with warning states.
-- [ ] AC #7: read-only and break-glass banners.
-- [ ] AC #8: Vitest files, gates green.
+- [x] AC #6: `fleetBadge` in `lib/cluster.ts`, rendered in the
+      `Dashboard.svelte` fleet bar. Warns on three distinct conditions
+      and names WHICH one in the reason, because "something is wrong
+      with the fleet" is not actionable at 03:00: a node the control
+      plane expects is not connected, a connected node has not been
+      heard from within `STALE_AFTER_MS`, or a break-glass window is
+      open.
+- [x] AC #7: the follower read-only banner names the control plane and
+      says what happens to a local edit; the break-glass banner is
+      distinct and louder, and is repeated on the Cluster page itself.
+      `breakGlassActive` recomputes from the timestamp rather than
+      trusting a boolean, so a window that expires with the tab open
+      stops being reported as open without waiting for a poll.
+- [x] AC #8: `npm run check`, `npm run lint` and `npx vitest run` all
+      green. Colocated Vitest: `lib/cluster.test.ts` (21 cases,
+      including `gaugePercent`), `components/NodeFilter.test.ts`, and
+      the `fleetQuery` cases in `lib/api.test.ts`. No `any`, no
+      `@ts-ignore`, no new `{@html}`.
+
+      Note the gates recorded before 2026-09-09 covered less than they
+      claimed: see the Debug Log on the vacuous `tsc --noEmit`.
 
 ## Dev Notes
 
@@ -348,25 +372,89 @@ dashboard has to be read against it, not guessed at.
 
 ### Completion Notes
 
-(empty)
+Every acceptance criterion is implemented except one leg of AC #5, and
+that exception is a decision to put to the user rather than a gap to
+close quietly.
+
+**What was built.** The Cluster page and its `routeLoaders` entry, the
+node table with a drift pill, the join-token dialog on `--token-stdin`
+with the secret in its own field, the node drawer with resource gauges,
+certificates, recent WAF events and bans, activate behind the
+`selected_for_hostnames` review and revoke behind `ConfirmDialog`. Read-
+only mode made orthogonal to role and every consumer read against the
+server's allow-list. The node filter on Access Logs and Security, with
+the fleet endpoints behind them. The header badge and the two banners.
+
+**What needs a decision.** AC #5 names three pages; SLA is not one of
+them any more. D17 has the reasoning: there is no fanned-in SLA data,
+the mutable-bucket shape does not fit the drain's id cursor, and the
+single figure a fleet view would add cannot be computed because
+percentiles are not additive. Either AC #5 narrows to two pages, or a
+fleet SLA fan-in becomes its own story.
+
+**What this story changed outside the frontend.** AC #3's gauges needed
+a protocol addition, so `Heartbeat` now carries an optional
+`NodeResources` (D18), and AC #5's category filter needed the fan-in
+WAF query to accept one. Both are covered by tests, including the
+tag-map test that pins the Rust field numbers to the published proto.
+
+**What it found in other people's code.** A vacuous typecheck gate that
+had been reporting success without reading a file, and which had let
+two broken files through (Debug Log). Two SLA defects unrelated to this
+story, filed as backlog #67 and #68. Four follower-local controls the
+AC #4 derivation had hidden (D19).
+
+**Not done, and deliberately so.** The connectivity-probe buttons in
+four settings tabs stay hidden on a follower even though the server
+allows them, because each sits in a form whose save is refused; see
+D19. The `cluster` e2e profile (backlog #66) still does not exist, so
+this story, like 9.2 through 9.6, ships on unit and integration tests
+without its Integration Verification ever having run.
 
 ## File List
 
-Anticipated:
+Frontend, new:
 
-- `lorica-dashboard/frontend/src/routes/Cluster.svelte` (new)
+- `lorica-dashboard/frontend/src/routes/Cluster.svelte`
+- `lorica-dashboard/frontend/src/components/NodeFilter.svelte`
+- `lorica-dashboard/frontend/src/components/NodeFilter.test.ts`
+- `lorica-dashboard/frontend/src/lib/cluster.ts`
+- `lorica-dashboard/frontend/src/lib/cluster.test.ts`
+
+Frontend, modified:
+
+- `lorica-dashboard/frontend/src/lib/auth.ts` (node-mode dimension,
+  `canWriteRole`)
+- `lorica-dashboard/frontend/src/lib/api.ts`, `lib/api.test.ts`
 - `lorica-dashboard/frontend/src/routes/Dashboard.svelte`
-  (`routeLoaders` entry)
-- `lorica-dashboard/frontend/src/lib/auth.ts` (node-mode dimension)
-- `lorica-dashboard/frontend/src/lib/components/` (node table, drawer,
-  token dialog, banners, badge)
-- `lorica-dashboard/frontend/src/routes/{Logs,Security,Sla}.svelte`
-  (node filter)
-- Colocated `*.test.ts` files
+  (`routeLoaders` entry, poll, fleet bar)
+- `lorica-dashboard/frontend/src/routes/{Logs,Security}.svelte`
+- `lorica-dashboard/frontend/src/routes/{LoadTest,Settings}.svelte`
+  (D19)
+- `lorica-dashboard/frontend/src/components/Nav.svelte`
+- `lorica-dashboard/frontend/src/components/settings-tabs/ExportImportTab.svelte`
+  (D19)
+
+Backend (AC #3's gauges and AC #5's category filter):
+
+- `lorica-cluster/proto/cluster.proto`, `src/messages.rs`,
+  `src/bridge.rs`, `src/dialer.rs`, `src/roster.rs`,
+  `src/listener/operational.rs`, `src/lib.rs`
+- `lorica-cluster/tests/{cluster_plane,enrollment}.rs`
+- `lorica-api/src/cluster/mod.rs`, `src/cluster_telemetry_store.rs`,
+  `src/system.rs`, `openapi.yaml`
+- `lorica/src/startup/cluster_follower.rs`, `src/startup/mod.rs`
+
+Corrected in passing:
+
+- `lorica-config/src/store/replica.rs` (the `sla_buckets` comment)
+- `docs/backlog.md` (#67, #68)
+- `.claude/rules/lorica-frontend.md` (the real gate; untracked)
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-09-09 | 1.0 | Story complete and moved to Review. AC #1 (chunk measured at 7.4 KB gz against the 40 KB cap), #2, #3, #4, #6, #7 and #8 done; AC #5 done on Access Logs and Security, and deliberately NOT on SLA (D17: no fanned-in SLA data, the mutable-bucket shape does not fit the drain's id cursor, and a fleet percentile is not computable from minute buckets). Two agents were dispatched on that question as the standing instruction requires. AC #3's resource gauges needed a protocol addition, an OPTIONAL `NodeResources` on `Heartbeat` (D18), so a node with no sampler renders as unknown rather than as idle at 0%. AC #4's review pass found four follower-local controls the derivation had hidden and the server still serves (D19), fixed with `canWriteRole`. Also in this pass: the local typecheck gate was vacuous and had let two broken files through, now corrected along with the rule that described it; and two SLA defects unrelated to this story were found and filed as backlog #67 (a config apply cascade-deletes a follower's SLA history) and #68 (passive SLA is last-writer-wins across workers). Gates: `npm run check`, `npm run lint`, 412 Vitest cases, three clippy gates and the Rust suites all green. | Romain G. |
 | 2026-09-09 | 0.2 | Foundation landed: `lib/cluster.ts` (status store, read-only and break-glass predicates, fleet badge, join-command helper) with 17 Vitest cases, the six `api.ts` cluster methods, and AC #4. Read-only mode is now orthogonal to role, so a follower stops offering mutations the control plane would silently undo at the next apply. The Svelte surface (AC #1, #2, #3, #5, #6, #7) was NOT built in that first pass. The reason recorded here initially ("the session ran out of room") was wrong and is corrected: there was ample budget left. The author stopped on a subjective call about quality and wrote it up as a resource limit, which is the same unverified-claim defect this epic keeps finding in comments. `tsc --noEmit` strict and `svelte-check` clean; `pnpm lint` NOT yet run on new components because there are none. Status InProgress. | Romain G. |
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Bundle-percentage criterion dropped for a per-chunk cap; token dialog reworked to `--token-stdin`. Status Draft. | Romain G. |
