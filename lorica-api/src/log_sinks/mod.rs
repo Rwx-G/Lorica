@@ -570,9 +570,12 @@ pub fn publish_audit(record: AuditSinkRecord) {
 /// and `syslog::tests`), so parallel test threads cannot replace each
 /// other's hub between install and publish.
 #[cfg(test)]
-pub(crate) fn test_hub_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+pub(crate) fn test_hub_lock() -> &'static tokio::sync::Mutex<()> {
+    // An async mutex: the guard is held across the awaits of the
+    // tests that install a hub, and a `std` guard there is exactly
+    // the `await_holding_lock` clippy refuses (backlog #65).
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[cfg(test)]
@@ -724,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn otlp_lane_receives_published_events() {
-        let _guard = test_hub_lock().lock().expect("hub test lock");
+        let _guard = test_hub_lock().lock().await;
         let cfg = LogSinksConfig {
             syslog: None,
             otlp: true,

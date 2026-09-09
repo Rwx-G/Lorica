@@ -697,7 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_sink_delivers_datagram_end_to_end() {
-        let _guard = super::super::test_hub_lock().lock().expect("hub test lock");
+        let _guard = super::super::test_hub_lock().lock().await;
         let listener = UdpSocket::bind("127.0.0.1:0").await.expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
         let sinks = LogSinksConfig {
