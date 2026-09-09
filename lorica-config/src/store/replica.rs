@@ -25,10 +25,21 @@
 //! autoincrement id), probe_configs and sla_configs. Rows absent from
 //! the blob are deleted in exactly those tables.
 //!
-//! Never touched: `users`, `user_preferences`, `sessions`,
+//! Never written: `users`, `user_preferences`, `sessions`,
 //! `notification_configs`, `dns_providers`, every `cluster_*` table,
 //! load tests and all telemetry (`sla_buckets`, `probe_results`,
-//! access and WAF logs). Notification channels and DNS providers DO
+//! access and WAF logs).
+//!
+//! Not written is not the same as not affected. `sla_buckets.route_id`
+//! is `REFERENCES routes(id) ON DELETE CASCADE` and `PRAGMA
+//! foreign_keys` is ON, so every route this path deletes takes that
+//! route's local SLA history with it. On a standalone install that is
+//! an operator deleting their own route; on a follower it also fires
+//! when a `node_selector` change de-selects the node, which destroys
+//! up to `sla_purge_retention_days` of that node's history without
+//! anyone touching that node, and re-selecting it later does not bring
+//! the history back. Tracked as backlog #67. `probe_results` carries
+//! no foreign key and is genuinely untouched. Notification channels and DNS providers DO
 //! ride the blob (their secret payload as a digest) because fleet
 //! drift detection must notice a changed credential, but they are
 //! control-plane concerns and are not applied here: a fleet that
