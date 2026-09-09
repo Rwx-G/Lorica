@@ -4312,10 +4312,12 @@ cert_critical_days = 3
         // dropped a working key on a path that runs on every config change.
         use crate::canonical::{key_material_digest, secret_digest};
 
-        let base = "-----BEGIN PRIVATE KEY-----\nTUlJQ2R3SUJBREFOQmdrcQ==\n-----END PRIVATE KEY-----\n";
+        let base =
+            "-----BEGIN PRIVATE KEY-----\nTUlJQ2R3SUJBREFOQmdrcQ==\n-----END PRIVATE KEY-----\n";
         let crlf = base.replace('\n', "\r\n");
         let no_trailing_newline = base.trim_end().to_string();
-        let rewrapped = "-----BEGIN PRIVATE KEY-----\nTUlJQ2R3SU\nJBREFOQmdrcQ==\n-----END PRIVATE KEY-----\n";
+        let rewrapped =
+            "-----BEGIN PRIVATE KEY-----\nTUlJQ2R3SU\nJBREFOQmdrcQ==\n-----END PRIVATE KEY-----\n";
 
         let want = key_material_digest(base);
         assert!(want.starts_with("sha256:"));
@@ -4334,7 +4336,8 @@ cert_critical_days = 3
         }
 
         // A different key is still a different digest.
-        let other = "-----BEGIN PRIVATE KEY-----\nQkJCQkJCQkJCQkJCQkJCQg==\n-----END PRIVATE KEY-----\n";
+        let other =
+            "-----BEGIN PRIVATE KEY-----\nQkJCQkJCQkJCQkJCQkJCQg==\n-----END PRIVATE KEY-----\n";
         assert_ne!(key_material_digest(other), want);
 
         // Anything that is not PEM falls back to the text digest, so a value
@@ -4346,5 +4349,4 @@ cert_critical_days = 3
         );
         assert_eq!(key_material_digest(""), secret_digest(""));
     }
-
 }

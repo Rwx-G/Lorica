@@ -711,6 +711,7 @@ runs them all in sequence; each `--skip-<profile>` flag drops one.
 | log-sinks | 23 | RFC 5424 syslog over TCP and OTLP logs, delivered to real collectors |
 | acme | 15 | HTTP-01 and manual DNS-01 issuance against the Pebble fixture |
 | cluster | 63 | a control plane and two followers (one in workers mode): enrollment, activation, replication, an HTTP-01 order validated through the selected follower, need-to-know key distribution, telemetry and audit fan-in, a load phase at 300 rps per follower, per-node SLA reads, break-glass, revocation |
+| cluster restart | 8 | the same fleet across a process boundary: a follower re-opens its session unaided and keeps its generation, SLA history and served certificate; a restarted control plane reports its policy-state reset, takes its followers back and clears the flag after a round |
 | bot, bot-workers, geoip, rdns, otel, otel-workers | 29, 29, 16, 7, 16, 16 | bot challenges, country policy, rDNS bypass, OTLP traces; run individually with `docker compose --profile <name> run --rm <name>-smoke` |
 
 The two intentional gaps in the Docker harness are:

@@ -398,7 +398,10 @@ fn pem_blocks_der(text: &str) -> Option<Vec<u8>> {
     let mut der = Vec::new();
     let mut rest = text;
     while let Some(begin) = rest.find("-----BEGIN ") {
-        let after_begin = match rest[begin..].find("-----\n").or_else(|| rest[begin..].find("-----\r\n")) {
+        let after_begin = match rest[begin..]
+            .find("-----\n")
+            .or_else(|| rest[begin..].find("-----\r\n"))
+        {
             Some(offset) => begin + offset + "-----".len(),
             None => return None,
         };
@@ -407,9 +410,13 @@ fn pem_blocks_der(text: &str) -> Option<Vec<u8>> {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        let decoded = base64::engine::general_purpose::STANDARD.decode(body).ok()?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .ok()?;
         der.extend_from_slice(&decoded);
-        let close = rest[end..].find("-----\n").map(|o| end + o + "-----\n".len());
+        let close = rest[end..]
+            .find("-----\n")
+            .map(|o| end + o + "-----\n".len());
         rest = match close {
             Some(next) => &rest[next..],
             None => "",

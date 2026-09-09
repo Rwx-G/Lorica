@@ -56,8 +56,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use lorica_api::audit::{record_with_store, AuditContext};
-use lorica_api::cluster::runtime::{publish_token_liveness, refresh_control_plane, revoke_node};
 use lorica_api::cluster::runtime::MAX_BREAK_GLASS_SECS;
+use lorica_api::cluster::runtime::{publish_token_liveness, refresh_control_plane, revoke_node};
 use lorica_api::cluster::ControlPlaneRuntime;
 use lorica_api::cluster_telemetry_store::ClusterTelemetryStore;
 use lorica_api::db::db_blocking;
@@ -1375,8 +1375,8 @@ fn spawn_drift_watch(
                 // node could otherwise keep itself out of every commit
                 // round and have the drift paged as operator action
                 // (backlog #78).
-                let corroborated = entry.break_glass
-                    && break_glass_is_corroborated(&log_store, &node_id).await;
+                let corroborated =
+                    entry.break_glass && break_glass_is_corroborated(&log_store, &node_id).await;
                 let summary = if entry.break_glass && corroborated {
                     format!(
                         "cluster node {} ({}) is in break-glass and diverges from generation {}",
@@ -2156,5 +2156,4 @@ mod tests {
         drop(log_store);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

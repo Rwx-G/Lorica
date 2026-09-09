@@ -15,6 +15,36 @@ Author: Rwx-G
 
 ### Fixed
 
+### Removed
+
+### Security
+
+## [1.7.1] - 2026-09-10
+
+Patch release: six deferred defects from the Epic 9 backlog, the e2e restart phase that covers them, and the SBOM the release job never produced. No new features, no configuration changes, one schema migration.
+
+### Fixed
+
+- **SLA under-reported request volume on a multi-worker node (#68).** A bucket is keyed by `(route_id, bucket_start, source)` and several writers reach the same key: every forked worker flushes its own slice of the minute into the one database, and an active probe writes the currently open minute once per probe. The row was an `INSERT OR REPLACE`, so it held whichever writer wrote last. An N-worker node therefore reported roughly 1/N of its traffic (30 requests persisted as 6 on a two-worker node) and an active bucket held a single probe instead of the minute. Slices now add up: counters and the latency sum accumulate, the minimum and maximum take the extreme, the configuration snapshot follows the newest writer, and the three percentiles take the maximum, because a percentile cannot be rebuilt from per-slice percentiles and a tail figure a quiet worker can average away is worse than one that reads slightly high. **Buckets recorded before this release keep the figures they were stored with; they are not recomputed.**
+- **A configuration change destroyed a follower's SLA history (#67).** `sla_buckets.route_id` was `REFERENCES routes(id) ON DELETE CASCADE` with foreign keys enforced, and the replica apply deletes every local route the blob no longer carries or a `node_selector` no longer selects. Narrowing a selector on the control plane therefore erased up to `sla_purge_retention_days` (90 by default) of that node's measurements, with no operator action on that node and no way to get them back by re-selecting it. Schema migration 55 rebuilds the table without the constraint; SLA history is retained by time only, the rule `probe_results` has always followed.
+- **A follower's certificate key could be dropped by a formatting difference (#60).** The replica apply kept a private key when the digest of its PEM text matched the digest the blob announced. The two sides hold their own copy of the same key, so a trailing newline or a CRLF line ending read as a different key and the apply dropped a working key, leaving the route on the default certificate, on a path that runs on every configuration change. The digest now covers the DER material rather than the PEM text; the raw-text form is still accepted so a followers-first rollout does not see every certificate as changed while the control plane is still on 1.7.0.
+- **A restart silently released every quarantined node (#58).** Eviction streaks, quarantine and the last replication report live in the control-plane process, so a restart or a hot upgrade released them and reported "no round yet" for a fleet converged for weeks. The circuit breaker stays in memory, a restart being a fair reason to re-probe, but the control plane now logs the reset at WARN and `GET /api/v1/cluster/replication` carries `policy_state_reset_by_restart`.
+
+### Security
+
+- **The drift alert took a follower's break-glass claim at its word (#78).** The alert softened to "is in break-glass and diverges" on the peer-supplied bit alone, so a compromised follower could keep itself out of every commit round and have the resulting drift paged as the operator's doing. The control plane now looks for that node's own fanned-in `cluster.break_glass.open` audit row before softening; without it the node *claims* break-glass and the event carries `break_glass_corroborated: false`. A window opened seconds ago can read uncorroborated for one telemetry drain.
+
+### Added
+
+- `lorica_cluster_telemetry_lost_to_retention_total{kind}` (#76): a follower cut off from its control plane keeps logging while its own retention keeps trimming, and rows above the fan-in drain cursor are gone from the fleet view for good. Nothing was dropped at the control plane, so no existing counter moved and a quiet edge read exactly like a truncated one. The follower now counts those rows where the delete happens and logs them at WARN.
+- A restart phase in the `cluster` e2e profile (#77): a restarted follower must re-open its session unaided, return on the control plane's generation, not read as drifted, keep its SLA history and still serve the certificate it was pushed; a restarted control plane must report its policy-state reset, take its followers back and clear the flag once a round has run.
+
+### Changed
+
+- `docs/BUMP-CHECKLIST.md` warns that `package-lock.json` carries the root version twice and that a dependency can hold the same string, so a blind replace corrupts the lock file.
+
+### Fixed
+
 - The release job now attaches the CycloneDX SBOM it has promised since the SBOM step was added: `cargo cyclonedx` has no `--output-file` flag, the invocation failed on every tag and `|| true` hid it, so the v1.6.0 and v1.7.0 releases carry no SBOM. The step writes `lorica-sbom.cdx.json` (spec 1.5, one document for the `lorica` binary and its 429 dependencies) and fails the job if the document is empty.
 ### Removed
 
