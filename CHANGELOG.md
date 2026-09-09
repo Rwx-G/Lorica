@@ -15,6 +15,7 @@ Author: Rwx-G
 
 ### Fixed
 
+- The release job now attaches the CycloneDX SBOM it has promised since the SBOM step was added: `cargo cyclonedx` has no `--output-file` flag, the invocation failed on every tag and `|| true` hid it, so the v1.6.0 and v1.7.0 releases carry no SBOM. The step writes `lorica-sbom.cdx.json` (spec 1.5, one document for the `lorica` binary and its 429 dependencies) and fails the job if the document is empty.
 ### Removed
 
 ### Security
