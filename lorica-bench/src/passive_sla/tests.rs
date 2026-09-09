@@ -243,7 +243,7 @@ fn test_store_sla_bucket_insert_and_query() {
         cfg_target_pct: 99.9,
     };
     store
-        .insert_sla_bucket(&bucket)
+        .merge_sla_bucket(&bucket)
         .expect("test setup: insert sla bucket");
 
     let from = now - chrono::Duration::minutes(1);
@@ -360,7 +360,7 @@ fn test_store_sla_summary() {
             cfg_target_pct: 99.9,
         };
         store
-            .insert_sla_bucket(&bucket)
+            .merge_sla_bucket(&bucket)
             .expect("test setup: insert sla bucket");
     }
 
@@ -495,7 +495,7 @@ fn test_store_prune_buckets() {
         };
         // Use different source to avoid UNIQUE constraint
         store
-            .insert_sla_bucket(&bucket)
+            .merge_sla_bucket(&bucket)
             .expect("test setup: insert sla bucket");
     }
 
@@ -711,7 +711,7 @@ fn test_store_export_sla_data() {
         cfg_target_pct: 99.9,
     };
     store
-        .insert_sla_bucket(&bucket)
+        .merge_sla_bucket(&bucket)
         .expect("test setup: insert sla bucket");
 
     let from = now - chrono::Duration::hours(1);

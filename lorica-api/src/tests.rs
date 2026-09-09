@@ -6812,10 +6812,10 @@ async fn sla_reads_report_the_inserted_buckets_per_window_and_source() {
     {
         let store = state.store.lock().await;
         store
-            .insert_sla_bucket(&sla_bucket(&route_id, "passive", 10))
+            .merge_sla_bucket(&sla_bucket(&route_id, "passive", 10))
             .expect("passive bucket");
         store
-            .insert_sla_bucket(&sla_bucket(&route_id, "active", 10))
+            .merge_sla_bucket(&sla_bucket(&route_id, "active", 10))
             .expect("active bucket");
     }
 
@@ -7043,7 +7043,7 @@ async fn sla_export_serves_json_and_csv_and_clear_empties_the_route() {
     {
         let store = state.store.lock().await;
         store
-            .insert_sla_bucket(&sla_bucket(&route_id, "passive", 30))
+            .merge_sla_bucket(&sla_bucket(&route_id, "passive", 30))
             .expect("bucket");
     }
 
@@ -7195,7 +7195,7 @@ async fn answer_sla_pull_serves_what_a_follower_measures_and_round_trips_the_wir
     .await;
     let bucket = sla_bucket(&route_id, "passive", 15);
     let store = state.store.lock().await;
-    store.insert_sla_bucket(&bucket).expect("bucket");
+    store.merge_sla_bucket(&bucket).expect("bucket");
 
     // No route id: the overview, two windows per route.
     let ack = answer_sla_pull(

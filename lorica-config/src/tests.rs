@@ -3,7 +3,7 @@
 mod tests {
     use std::str::FromStr;
 
-    use chrono::Utc;
+    use chrono::{Timelike, Utc};
     use tempfile::NamedTempFile;
 
     use crate::export::export_to_toml;
@@ -4125,4 +4125,137 @@ cert_critical_days = 3
         let store = ConfigStore::open_in_memory().expect("store");
         assert!(!store.delete_cluster_identity().expect("delete absent"));
     }
+    /// One writer's slice of a minute, for `merge_sla_bucket` tests.
+    fn sla_slice(
+        route_id: &str,
+        source: &str,
+        bucket_start: chrono::DateTime<Utc>,
+        requests: i64,
+        successes: i64,
+        latency: i64,
+    ) -> SlaBucket {
+        SlaBucket {
+            id: None,
+            route_id: route_id.to_string(),
+            bucket_start,
+            request_count: requests,
+            success_count: successes,
+            error_count: requests - successes,
+            latency_sum_ms: latency * requests,
+            latency_min_ms: latency,
+            latency_max_ms: latency,
+            latency_p50_ms: latency,
+            latency_p95_ms: latency,
+            latency_p99_ms: latency,
+            source: source.to_string(),
+            cfg_max_latency_ms: 500,
+            cfg_status_min: 200,
+            cfg_status_max: 399,
+            cfg_target_pct: 99.9,
+        }
+    }
+
+    #[test]
+    fn sla_slices_of_one_minute_add_up_instead_of_overwriting() {
+        // Backlog #68: every forked worker flushes its own slice of the same
+        // minute into this one database, and an active probe writes the open
+        // minute once per probe. The row used to be whichever writer wrote
+        // last, so an N-worker node under-reported its volume by roughly N.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let mut route = make_route();
+        route.id = "r-sla-merge".into();
+        store.create_route(&route).expect("test setup");
+        let minute = Utc::now()
+            .with_timezone(&Utc)
+            .with_nanosecond(0)
+            .expect("test setup")
+            .with_second(0)
+            .expect("test setup");
+
+        store
+            .merge_sla_bucket(&sla_slice("r-sla-merge", "passive", minute, 10, 9, 40))
+            .expect("first slice");
+        store
+            .merge_sla_bucket(&sla_slice("r-sla-merge", "passive", minute, 20, 20, 90))
+            .expect("second slice");
+        store
+            .merge_sla_bucket(&sla_slice("r-sla-merge", "passive", minute, 5, 4, 10))
+            .expect("third slice");
+
+        let buckets = store
+            .query_sla_buckets(
+                "r-sla-merge",
+                &(minute - chrono::Duration::minutes(1)),
+                &(minute + chrono::Duration::minutes(1)),
+                "passive",
+            )
+            .expect("query");
+        assert_eq!(buckets.len(), 1, "one row per minute and source");
+        let b = &buckets[0];
+        assert_eq!(b.request_count, 35);
+        assert_eq!(b.success_count, 33);
+        assert_eq!(b.error_count, 2);
+        assert_eq!(b.latency_sum_ms, 10 * 40 + 20 * 90 + 5 * 10);
+        assert_eq!(b.latency_min_ms, 10, "the lowest slice minimum");
+        assert_eq!(b.latency_max_ms, 90, "the highest slice maximum");
+        // A percentile cannot be rebuilt from per-slice percentiles, so the
+        // merge keeps the highest rather than diluting a bad worker's tail.
+        assert_eq!(b.latency_p50_ms, 90);
+        assert_eq!(b.latency_p95_ms, 90);
+        assert_eq!(b.latency_p99_ms, 90);
+
+        // The summary reads the merged figures, not one writer's slice.
+        let summary = store
+            .compute_sla_summary(
+                "r-sla-merge",
+                &(minute - chrono::Duration::minutes(1)),
+                &(minute + chrono::Duration::minutes(1)),
+                "1h",
+                "passive",
+            )
+            .expect("summary");
+        assert_eq!(summary.total_requests, 35);
+        assert_eq!(summary.successful_requests, 33);
+    }
+
+    #[test]
+    fn sla_slices_stay_separate_per_minute_and_per_source() {
+        // The merge is keyed: a different minute or a different source is a
+        // different row, so active probes never inflate passive traffic.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let mut route = make_route();
+        route.id = "r-sla-keys".into();
+        store.create_route(&route).expect("test setup");
+        let minute = Utc::now()
+            .with_nanosecond(0)
+            .expect("test setup")
+            .with_second(0)
+            .expect("test setup");
+        let previous = minute - chrono::Duration::minutes(1);
+
+        store
+            .merge_sla_bucket(&sla_slice("r-sla-keys", "passive", minute, 4, 4, 20))
+            .expect("passive now");
+        store
+            .merge_sla_bucket(&sla_slice("r-sla-keys", "passive", previous, 7, 7, 20))
+            .expect("passive previous");
+        store
+            .merge_sla_bucket(&sla_slice("r-sla-keys", "active", minute, 3, 3, 20))
+            .expect("active now");
+
+        let from = previous - chrono::Duration::minutes(1);
+        let to = minute + chrono::Duration::minutes(1);
+        let passive = store
+            .query_sla_buckets("r-sla-keys", &from, &to, "passive")
+            .expect("query passive");
+        assert_eq!(passive.len(), 2);
+        assert_eq!(passive[0].request_count, 7, "oldest minute first");
+        assert_eq!(passive[1].request_count, 4);
+        let active = store
+            .query_sla_buckets("r-sla-keys", &from, &to, "active")
+            .expect("query active");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].request_count, 3);
+    }
+
 }
