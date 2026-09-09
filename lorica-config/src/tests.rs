@@ -2671,6 +2671,34 @@ cert_critical_days = 3
     }
 
     #[test]
+    fn test_export_redacts_the_scrape_token_and_import_rejects_it() {
+        // The `/metrics` bearer token is the endpoint's only
+        // authentication since v1.7.0, and the export is served on
+        // every follower at the Operator floor.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut s = store.get_global_settings().expect("test setup");
+        s.prometheus_scrape_token = Some("scrape-token-42".to_string());
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        assert!(
+            toml_str.contains("prometheus_scrape_token = \"**REDACTED**\""),
+            "the scrape token must be replaced with the REDACTED placeholder"
+        );
+        assert!(
+            !toml_str.contains("scrape-token-42"),
+            "the raw token must not appear anywhere in the export"
+        );
+        let err = parse_toml(&toml_str).expect_err("parse must reject the REDACTED placeholder");
+        assert!(
+            err.to_string().contains("prometheus_scrape_token"),
+            "error message must name the field, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_import_rejects_redacted_log_sink_secrets() {
         // Story 9.8 AC #8: a round-trip of an export holding redacted
         // sink secrets must fail loudly instead of silently clearing

@@ -160,6 +160,13 @@ fn validate(data: &ImportData) -> Result<()> {
                 .into(),
         ));
     }
+    if data.global_settings.prometheus_scrape_token.as_deref() == Some("**REDACTED**") {
+        return Err(ConfigError::Validation(
+            "global_settings.prometheus_scrape_token is redacted (from export); \
+             set the real token or clear the field"
+                .into(),
+        ));
+    }
 
     // Validate certificate references in routes
     for route in &data.routes {

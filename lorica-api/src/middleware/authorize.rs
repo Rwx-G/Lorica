@@ -158,17 +158,26 @@ pub fn follower_local_request(method: &http::Method, path: &str) -> bool {
     // `starts_with` would also admit a future `/api/v1/users-export`
     // or `/api/v1/audit-archive`, which is the open-ended matching the
     // probe list below already refuses to rely on.
+    //
+    // The cluster commands a follower owns are spelled out for the
+    // same reason. A bare `/api/v1/cluster/` prefix admitted every
+    // fleet mutation (mint a token, activate, revoke, fleet ban) and
+    // left each handler's own `control_plane(&state)?` check as the
+    // only thing standing between a follower and a 409; the doc
+    // comment above described a list of three while the code
+    // admitted the prefix (Epic 9 close, security audit).
     const PREFIXES: &[&str] = &[
         "/api/v1/auth/",
         "/api/v1/users/",
         "/api/v1/audit/",
-        "/api/v1/cluster/",
         "/api/v1/validate/",
         "/api/v1/loadtest/start/",
     ];
     const EXACT: &[&str] = &[
         "/api/v1/users",
         "/api/v1/audit",
+        "/api/v1/cluster/leave",
+        "/api/v1/cluster/break-glass",
         "/api/v1/config/export",
         "/api/v1/config/import/preview",
         "/api/v1/loadtest/abort",
@@ -251,6 +260,14 @@ mod tests {
             (Method::POST, "/api/v1/config/import"),
             (Method::POST, "/api/v1/waf/rules/custom"),
             (Method::POST, "/api/v1/certificates"),
+            // Fleet mutations are the control plane's, whatever node
+            // the request lands on; the handler's own 409 is the
+            // second line, not the first.
+            (Method::POST, "/api/v1/cluster/tokens"),
+            (Method::DELETE, "/api/v1/cluster/tokens/t1"),
+            (Method::POST, "/api/v1/cluster/nodes/n1/activate"),
+            (Method::DELETE, "/api/v1/cluster/nodes/n1"),
+            (Method::POST, "/api/v1/cluster/bans"),
         ] {
             assert!(!follower_local_request(&method, path), "{method} {path}");
         }
@@ -292,7 +309,7 @@ mod tests {
         ] {
             assert!(
                 follower_local_request(&method, path),
-                "{offered_by} offers {method} {path} on a follower, but this                  gate now refuses it: either restore the path or change that                  control to `canWrite` / `isSuperAdmin`"
+                "{offered_by} offers {method} {path} on a follower, but this gate now refuses it: either restore the path or change that control to `canWrite` / `isSuperAdmin`"
             );
         }
     }

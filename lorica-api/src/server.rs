@@ -527,7 +527,14 @@ pub fn build_router(
         // Cluster registry (Story 9.3). Role floors live in the
         // authorize middleware: tokens and every mutation are
         // SuperAdmin, reads are Viewer+.
-        .route("/api/v1/cluster/status", get(crate::cluster::get_status))
+        // The reads carry the limiter too (Epic 9 close, security
+        // audit): the two fan-in queries take the telemetry store's
+        // one connection away from ingest for the duration, and every
+        // one of these is at the Viewer floor.
+        .route(
+            "/api/v1/cluster/status",
+            get(crate::cluster::get_status).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
         .route(
             "/api/v1/cluster/tokens",
             get(crate::cluster::list_tokens)
@@ -538,7 +545,10 @@ pub fn build_router(
             "/api/v1/cluster/tokens/{public_id}",
             delete(crate::cluster::revoke_token).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
         )
-        .route("/api/v1/cluster/nodes", get(crate::cluster::list_nodes))
+        .route(
+            "/api/v1/cluster/nodes",
+            get(crate::cluster::list_nodes).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
         .route(
             "/api/v1/cluster/nodes/{id}",
             get(crate::cluster::get_node)
@@ -557,9 +567,12 @@ pub fn build_router(
         // report, the drift view, and the follower's break-glass window.
         .route(
             "/api/v1/cluster/replication",
-            get(crate::cluster::get_replication),
+            get(crate::cluster::get_replication).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
         )
-        .route("/api/v1/cluster/drift", get(crate::cluster::get_drift))
+        .route(
+            "/api/v1/cluster/drift",
+            get(crate::cluster::get_drift).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
         // Telemetry fan-in (Story 9.6 AC #9). Cursor-paginated with no
         // total: a COUNT(*) per page on an aggregated table is a full
         // scan under the store lock, which would stall ingest.
@@ -569,10 +582,13 @@ pub fn build_router(
                 .post(crate::cluster::fleet_ban)
                 .layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
         )
-        .route("/api/v1/cluster/logs", get(crate::cluster::fleet_logs))
+        .route(
+            "/api/v1/cluster/logs",
+            get(crate::cluster::fleet_logs).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
+        )
         .route(
             "/api/v1/cluster/waf-events",
-            get(crate::cluster::fleet_waf_events),
+            get(crate::cluster::fleet_waf_events).layer(rl("cluster", RL_CLUSTER, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/cluster/break-glass",

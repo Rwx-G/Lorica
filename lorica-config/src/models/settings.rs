@@ -416,9 +416,10 @@ pub struct GlobalSettings {
     /// environment variable `LORICA_PROMETHEUS_SCRAPE_TOKEN` overrides
     /// this value at request time so operators can inject the token
     /// out of band without persisting it in the database. Compared in
-    /// constant time (AC #5). Never serialised back over the API: the
+    /// constant time (AC #5). Never serialised back in the clear: the
     /// `GET /api/v1/settings` handler masks it like the bot HMAC
-    /// secret.
+    /// secret, and the TOML export redacts it (import rejects the
+    /// placeholder).
     #[serde(default)]
     pub prometheus_scrape_token: Option<String>,
 

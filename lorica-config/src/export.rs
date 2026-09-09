@@ -126,6 +126,14 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
     if global_settings.otlp_logs_auth_header.is_some() {
         global_settings.otlp_logs_auth_header = Some(REDACTED.into());
     }
+    // The `/metrics` bearer token (Story 8.8), missed when the API
+    // mask was written and found at the Epic 9 close: the export is
+    // the second serialisation route, and since v1.7.0 it is served
+    // on every follower at the Operator floor while the token is the
+    // only authentication `/metrics` has.
+    if global_settings.prometheus_scrape_token.is_some() {
+        global_settings.prometheus_scrape_token = Some(REDACTED.into());
+    }
 
     let data = ExportData {
         version: EXPORT_FORMAT_VERSION,
