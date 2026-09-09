@@ -1,7 +1,7 @@
 # Story 9.9: Fleet-Wide Audit Trail
 
 **Epic:** 9 (v1.7.0)
-**Status:** Review
+**Status:** Done
 **Author:** Romain G.
 
 **Depends on:** Stories 9.3 (node identity), 9.6 (fan-in transport,
@@ -383,6 +383,7 @@ Anticipated:
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-09-09 | 1.2 | Integration Verification ran, for the first time, in the `cluster` e2e profile (backlog #66) against a control plane and two followers, one in workers mode: a follower's audit rows reached the control plane, the `cluster.config.apply` row was among them, every fanned-in row carried its origin id, and verify reported three chains, each intact, the control plane's own included. That run is what the two Criticals D7 fixed would have failed on, and it passed after them. Status Done. | Romain G. |
 | 2026-09-09 | 1.1 | Audit and remediation (D7). Three auditors, two Criticals, both in code this story added and both invisible to its unit tests. The acknowledgement returned newly-written rows rather than rows durably held, so the first ordinary shed would have frozen every one of that node's fan-in cursors permanently and silently. Fanned-in chains had no arrival genesis, so verify would have reported tampering on every healthy fleet, forever, which is the exact failure AC #1 exists to prevent arriving by a route AC #1 did not anticipate. Also fixed: audit rows were not charged to the quota although three documents said they were; the eleven peer-supplied strings crossed the decode boundary unvalidated; retention deleted by timestamp while verify walks by origin id, so a stepped clock read as tampering; a re-enrolled node orphaned its chain; `origin_id` was clamped rather than refused; and the dashboard ignored its own node filter and labelled the local chain with a forgeable name. Three findings raised to the backlog as #72, #73 and #74. Gates: three clippy gates, 609 + 286 + cluster Rust tests, 419 Vitest, all green. | Romain G. |
 | 2026-09-09 | 1.0 | Implemented. Audit rows fan in over the Story 9.6 telemetry channel and the aggregated table holds one chain per node: separate insert path writing both hashes verbatim, per-node retention seals, partitioned verify reporting per chain, node filter on the list and the verify endpoints, node column and per-chain results in the dashboard. `insert_audit` was reading the global tail and now reads the local one, a defect the tests for the separate path caught. Audit rows are counted against the ingest quota and exempt from its shedding verdict, because a compliance feature that drops rows silently under load is worse than one that does not exist. AC #4 turned out to be nine tenths delivered by stories 9.3 to 9.7; the missing tenth is the node-scoped apply, now recorded on both outcomes. The security property is stated as it actually is, in the doc, the API contract and the dashboard: the aggregated copy is strictly weaker than each origin node's, and the anchor is each node's own audit stream. Status Review. | Romain G. |
 | 2026-08-23 | 0.1 | Story drafted from the revised Epic 9 PRD. Security property restated accurately after the first draft overclaimed fan-in verification; separate insert path and per-node seals added. Status Draft. | Romain G. |
