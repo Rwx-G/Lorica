@@ -356,13 +356,6 @@ message TelemetryBan {
   string reason = 3;        // BanReason::as_str
 }
 
-// A batch of telemetry. At most 512 access rows and 512 WAF events
-// per push; a longer batch is a PROTOCOL_VIOLATION.
-//
-// The cursors are the sender's local rowids for the last row in each
-// list. The control plane echoes them back so the follower knows what
-// to advance past; it never interprets them as anything but opaque
-// progress markers belonging to that node.
 // One audit row as the ORIGIN node wrote it (Story 9.9 AC #2).
 //
 // Both chain hashes ride verbatim and the control plane stores them
@@ -389,6 +382,13 @@ message TelemetryAuditRow {
   string chain_hash = 13;
 }
 
+// A batch of telemetry. At most 512 access rows and 512 WAF events
+// per push; a longer batch is a PROTOCOL_VIOLATION.
+//
+// The cursors are the sender's local rowids for the last row in each
+// list. The control plane echoes them back so the follower knows what
+// to advance past; it never interprets them as anything but opaque
+// progress markers belonging to that node.
 message TelemetryPush {
   repeated TelemetryAccessRow access = 1;
   repeated TelemetryWafRow waf = 2;

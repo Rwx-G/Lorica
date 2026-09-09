@@ -19,6 +19,16 @@
 //! follower one patch apart could never talk. Each side advertises the
 //! [minimum, maximum] protocol versions it speaks and the session runs
 //! at the highest version both ranges contain.
+//!
+//! Until [`PROTOCOL_VERSION`] moves, this negotiation cannot fail
+//! between two shipped builds: both bounds are 1, so every build
+//! overlaps every other and `INCOMPATIBLE_VERSION` is unreachable in
+//! practice. The gate that actually binds a mixed-version fleet is the
+//! SCHEMA check in the handshake (`SCHEMA_TOO_OLD`), and it is
+//! asymmetric: a follower whose database schema is AHEAD of the control
+//! plane's is admitted, one BEHIND it is refused. Hence the upgrade
+//! order `docs/cluster.md` states: followers first, control plane last.
+//! Diagnosing a refused session should start there, not here.
 
 /// Highest cluster protocol version this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
