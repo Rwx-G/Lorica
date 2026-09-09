@@ -770,21 +770,33 @@ bans and audit trail back in. Followers are read-only (a mutation answers
 `409`) until a SuperAdmin opens a bounded, audited break-glass window.
 
 ```bash
-# On the control plane: generate the fleet CA, then serve the cluster plane.
+# On the control plane: generate the fleet CA (once, service stopped), then
+# serve the cluster plane. On a packaged install the two flags go in the
+# systemd drop-in (`sudo systemctl edit lorica`, see "systemd Service" below).
 lorica --data-dir /var/lib/lorica cluster init
 lorica --data-dir /var/lib/lorica --cluster-listen 10.0.0.10:9444 --cluster-advertise cp.internal.example.org
 
-# Mint a token bound to the node name the route selectors will use.
+# Mint a token bound to the node name the route selectors will use
+# (or use the join dialog on the dashboard's Cluster page).
 lorica cluster token --node-name edge-01 --password-file /root/.lorica-admin
 
-# On the new node: redeem it (the token never touches argv), then start.
+# On the new node, service stopped: redeem it (the token never touches argv), then start.
 lorica --data-dir /var/lib/lorica cluster join \
   --control-plane cp.internal.example.org:9444 --name edge-01 --token-file /root/join-token
-lorica --data-dir /var/lib/lorica
+systemctl start lorica
 
-# Back on the control plane: approve it. Nothing flows before activation.
+# Back on the control plane: approve it, from the Cluster page or the API.
+# Nothing flows before activation.
 curl -sk -b "lorica_session=$TOKEN" -X POST https://127.0.0.1:9443/api/v1/cluster/nodes/<node-id>/activate
 ```
+
+Everything after enrollment is day-to-day dashboard work on the control
+plane: routes, backends, certificates, WAF and settings are edited there as
+on a single node and replicate to the fleet; the Cluster page holds the
+roster, activation, revocation, drift, replication reports, fleet bans and
+the break-glass switch. Only `join`, `leave`, `status` and `break-glass`
+belong to the node's own CLI, because they must work with the control plane
+unreachable.
 
 What every node keeps as its own: listening addresses, data directory, log
 sinks' endpoints, export zone and master key. Everything else replicates.
