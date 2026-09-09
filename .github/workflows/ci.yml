@@ -37,8 +37,18 @@ jobs:
           npm run check
           npm run lint
 
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      # Same four gates as the local Docker recipe (see CONTRIBUTING.md).
       - name: Clippy (product crates)
         run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings
+
+      - name: Clippy (tests and benches of the API and cluster crates)
+        run: cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings
+
+      - name: Clippy (binary crate with the otel feature)
+        run: cargo clippy -p lorica --all-targets --features otel -- -D warnings
 
       - name: Cargo audit
         run: |
@@ -167,7 +177,7 @@ jobs:
           SKIP_FRONTEND_BUILD: ""
 
       - name: Run Rust unit tests (forked crates)
-        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb || true
+        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
         env:
           SKIP_FRONTEND_BUILD: "1"
 
