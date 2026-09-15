@@ -141,6 +141,83 @@ Story 8.9 hardening knobs, all live-reloadable via settings:
   net, so one slow shadow target cannot starve every other route's
   mirrors.
 
+### WAF body inspection (v1.7.2)
+
+The WAF buffers a request body only when it can parse it, and the
+decision is taken on the declared `Content-Type` before the first
+chunk is buffered.
+
+**What is inspected.** `application/json`,
+`application/x-www-form-urlencoded`, `application/xml`, `text/xml`,
+every `text/` subtype, and the RFC 6839 structured suffixes `+json`
+and `+xml` (so `application/activity+json` and
+`application/atom+xml`). The media type is read up to the first `;`,
+so `charset` parameters do not matter, and the comparison is
+case-insensitive. Everything else, **an absent or malformed
+`Content-Type` included**, is not inspected.
+
+**Why the list is that list.** The engine scans text. A body that
+does not decode as UTF-8 returns a Pass on the first byte, so every
+byte buffered for a binary upload was wasted work, and on a
+WAF-Blocking route the `413` that followed was a rejection with no
+rule behind it. That is the choice this removes: a route serving
+Nextcloud, ownCloud, Seafile, WebDAV or any S3-style upload endpoint
+no longer has to pick between "WAF on the route" and "uploads work".
+
+**`multipart/form-data` is not inspected.** Lorica has no multipart
+parser, so scanning it would mean running SQL and XSS signatures over
+the raw envelope, base64 and binary part payloads included: high
+false-positive, low value. A parser with a separate limit for the
+non-file parts (the ModSecurity `SecRequestBodyNoFilesLimit` model)
+is tracked in `docs/backlog.md`.
+
+**The residual risk, stated plainly.** A client that declares
+`application/octet-stream` skips inspection, whatever the bytes
+actually are. The mitigating argument is that the upstream will also
+treat the body as an opaque blob, so a SQL payload declared as a
+binary blob reaches an application that was never going to parse it
+as SQL. **The argument does not hold for an application that ignores
+the declared type and sniffs the body instead.** If that describes
+your upstream, the WAF is not the control to rely on for its request
+bodies: the application's own input handling is.
+
+A second gap of the same family: a `Content-Encoding: gzip` body is
+not valid UTF-8, so it was already passing uninspected before this
+change. Decompressing before inspection needs a decompression-bomb
+budget of its own and is backlog, not shipped.
+
+**The caps and how they interact.** Two ceilings apply to a request
+body, and only one of them moved:
+
+| Cap | Scope | Applies to | Over the cap |
+|-----|-------|-----------|--------------|
+| `max_request_body_bytes` | per route, operator-set | every body | `413`, always |
+| WAF scan window (1 MiB, compiled in) | per route, fixed | inspectable bodies only | `413` in Blocking, `BodyTruncated` event plus a partial scan in Detection |
+
+So an inspectable body is bounded by both, and a non-inspectable body
+by `max_request_body_bytes` alone. Set it: with the WAF no longer
+bounding large uploads, it is the only thing standing between a route
+and an unbounded `PUT`.
+
+The v1.5.1 audit H-2 padding bypass stays closed. An attacker who
+prefixes a megabyte of inert text to a JSON payload is sending a body
+that IS inspectable, so the scan window still applies and a Blocking
+route still answers `413`.
+
+**A Nextcloud route.**
+
+```
+max_request_body_bytes = 17179869184   # 16 GiB, your largest upload
+waf_enabled            = true
+waf_mode               = blocking
+```
+
+`PUT /remote.php/dav/files/user01/big.iso` with
+`Content-Type: application/octet-stream` now streams through
+untouched. The JSON and form endpoints on the same host keep full
+WAF coverage, because those bodies are inspectable and under the scan
+window.
+
 ### Database
 - SQLite with WAL mode for crash safety
 - `PRAGMA busy_timeout=5000` for concurrent worker access
