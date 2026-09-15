@@ -31,6 +31,7 @@ use std::task::ready;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+use crate::protocols::http::authority::validate_request_authority_fields;
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::{
@@ -308,17 +309,33 @@ pub enum H2Accept {
     Rejected,
 }
 
-fn authority_host_mismatch(request: &RequestHeader) -> bool {
-    let Some(authority) = request.uri.authority() else {
-        return false;
-    };
-
-    let mut hosts = request.headers.get_all(header::HOST).iter();
-    match (hosts.next(), hosts.next()) {
-        (Some(host), None) => host.as_bytes() != authority.as_str().as_bytes(),
-        (Some(_), Some(_)) => true,
-        (None, _) => false,
+/// Whether this stream carries more than one answer to "which host is
+/// this for".
+///
+/// The comparison itself lives in
+/// [`validate_request_authority_fields`](crate::protocols::http::authority::validate_request_authority_fields),
+/// shared with HTTP/1 ingress, so the two protocols cannot drift into
+/// two definitions of an ambiguous authority. It replaces a local
+/// mismatch check that only ran when `:authority` was present, which
+/// left duplicate `Host` unexamined on a request that carried none, and
+/// looked at neither field for userinfo.
+///
+/// Userinfo matters because [`http::Uri::host`] strips it, so a
+/// `Host: evil.example@target.example` reads as one host to anything
+/// comparing bytes and another to anything parsing the authority.
+///
+/// A request with no authority at all is also rejected here rather than
+/// left to route on an empty host.
+fn invalid_request_authority(request: &RequestHeader) -> bool {
+    if let Err(error) = validate_request_authority_fields(request) {
+        debug!("rejecting downstream h2 request: {error}");
+        return true;
     }
+    if request.uri.authority().is_none() && !request.headers.contains_key(header::HOST) {
+        debug!("rejecting downstream h2 request: missing authority");
+        return true;
+    }
+    false
 }
 
 fn account_malformed_stream(malformed_streams: &mut usize) -> Result<()> {
@@ -427,7 +444,7 @@ impl HttpSession {
             return Ok(Some(H2Accept::Rejected));
         }
 
-        if authority_host_mismatch(&request_header) {
+        if invalid_request_authority(&request_header) {
             // RFC 9113 section 8.3.1 says a server SHOULD treat a request as
             // malformed when Host does not match :authority after
             // normalization. Until shared authority normalization exists,
@@ -435,9 +452,9 @@ impl HttpSession {
             // https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
             //
             // RFC 9112 section 3.2 requires HTTP/1.1 servers to reject more
-            // than one Host field. When :authority is present, reject
-            // duplicates that cannot be compared unambiguously before a
-            // possible H1 downgrade:
+            // than one Host field. Duplicates are rejected here whether or
+            // not :authority is present, since this request may be
+            // downgraded to H1 upstream:
             // https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2
             debug!("rejecting downstream h2 request: conflicting :authority and Host fields");
             let mut response = Response::new(());
@@ -945,8 +962,8 @@ mod test {
     }
 
     #[test]
-    fn test_authority_host_mismatch() {
-        let request = |hosts: &[&str]| {
+    fn test_invalid_request_authority() {
+        let with_authority = |hosts: &[&str]| {
             let mut request = Request::builder()
                 .uri("https://authority.example/test")
                 .body(())
@@ -959,32 +976,58 @@ mod test {
             RequestHeader::from(request.into_parts().0)
         };
 
-        assert!(!authority_host_mismatch(&request(&[])));
-        assert!(!authority_host_mismatch(&request(&["authority.example"])));
-        assert!(authority_host_mismatch(&request(&["other.example"])));
-        assert!(authority_host_mismatch(&request(&["AUTHORITY.EXAMPLE"])));
-        assert!(authority_host_mismatch(&request(&[
+        assert!(!invalid_request_authority(&with_authority(&[])));
+        assert!(!invalid_request_authority(&with_authority(&[
+            "authority.example"
+        ])));
+        assert!(invalid_request_authority(&with_authority(&[
+            "other.example"
+        ])));
+        assert!(invalid_request_authority(&with_authority(&[
+            "AUTHORITY.EXAMPLE"
+        ])));
+        assert!(invalid_request_authority(&with_authority(&[
             "authority.example:443"
         ])));
-        assert!(authority_host_mismatch(&request(&[
+        assert!(invalid_request_authority(&with_authority(&[
             "authority.example",
             "authority.example",
         ])));
-        assert!(authority_host_mismatch(&request(&[
+        assert!(invalid_request_authority(&with_authority(&[
             "authority.example",
             "other.example",
         ])));
 
-        let request = RequestHeader::from(
+        let origin_form = |hosts: &[&str]| {
+            let mut request = Request::builder().uri("/test").body(()).unwrap();
+            for host in hosts {
+                request
+                    .headers_mut()
+                    .append(header::HOST, HeaderValue::from_str(host).unwrap());
+            }
+            RequestHeader::from(request.into_parts().0)
+        };
+
+        assert!(!invalid_request_authority(&origin_form(&["host.example"])));
+        // Three cases the previous local check did not cover: duplicate
+        // Host with no :authority to compare against, userinfo in either
+        // field, and a request that names no host at all.
+        assert!(invalid_request_authority(&origin_form(&[
+            "host.example",
+            "other.example"
+        ])));
+        assert!(invalid_request_authority(&origin_form(&[
+            "user@host.example"
+        ])));
+        assert!(invalid_request_authority(&origin_form(&[])));
+        assert!(invalid_request_authority(&RequestHeader::from(
             Request::builder()
-                .uri("/test")
-                .header(header::HOST, "host.example")
+                .uri("https://user@authority.example/test")
                 .body(())
                 .unwrap()
                 .into_parts()
                 .0,
-        );
-        assert!(!authority_host_mismatch(&request));
+        )));
     }
 
     #[tokio::test]

@@ -33,7 +33,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
-use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask};
+use crate::protocols::http::{
+    authority::validate_request_authority, body_buffer::FixedBuffer, date, HttpTask,
+};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
 
@@ -333,6 +335,9 @@ impl HttpSession {
     /// this function and most other functions will panic if called before [`Self::read_request()`]
     pub fn validate_request(&self) -> Result<()> {
         let req_header = self.req_header();
+
+        // Reject an ambiguous authority before anything routes on it.
+        validate_request_authority(req_header)?;
 
         // Validate/reconcile Content-Length per RFC 9110 section 8.6 (hyper
         // parity): identical duplicates and comma-combined identical values are
