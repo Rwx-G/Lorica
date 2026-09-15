@@ -2064,12 +2064,17 @@ impl LoricaProxy {
 
     /// Stage: request body limits on the advertised Content-Length.
     /// Covers the per-route `max_request_body_bytes` cap and the WAF
-    /// body-scan cap (v1.5.1 audit H-2): when WAF is enabled and the
-    /// advertised Content-Length exceeds the scan window, Blocking mode
-    /// rejects and Detection mode records a `BodyTruncated` event and
-    /// proceeds (mirrors ModSecurity `SecRequestBodyLimitAction` and
-    /// AWS WAF oversize handling). The chunked / no-Content-Length case
-    /// is caught downstream in `request_body_filter` by the same caps.
+    /// body-scan cap (v1.5.1 audit H-2): when the WAF is going to
+    /// inspect this body and the advertised Content-Length exceeds the
+    /// scan window, Blocking mode rejects and Detection mode records a
+    /// `BodyTruncated` event and proceeds (mirrors ModSecurity
+    /// `SecRequestBodyLimitAction` and AWS WAF oversize handling). The
+    /// chunked / no-Content-Length case is caught downstream in
+    /// `request_body_filter` by the same caps.
+    ///
+    /// This is also where `ctx.waf_body_inspect` is decided, because
+    /// it is the last stage that holds the request header, and the
+    /// decision has to be made before the first body chunk arrives.
     /// Terminal: 413.
     pub(super) async fn check_body_limits(
         &self,
@@ -2094,10 +2099,25 @@ impl LoricaProxy {
             }
         }
 
+        // Whether the WAF looks at this body at all. The engine
+        // passes on anything that does not decode as UTF-8, so a
+        // binary upload is buffered, capped and possibly rejected for
+        // a scan that was never going to fire. Deciding on the
+        // declared media type moves that verdict in front of the
+        // buffer: a 500 MB `application/octet-stream` PUT now flows
+        // through a WAF-Blocking route untouched, bounded by
+        // `max_request_body_bytes` alone.
+        ctx.waf_body_inspect = entry.route.waf_enabled
+            && lorica_waf::body_is_inspectable(
+                req.headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok()),
+            );
+
         // WAF body-scan cap on the advertised Content-Length.
         // Fail-fast here avoids buffering bytes we would reject
         // anyway in `request_body_filter`.
-        if entry.route.waf_enabled {
+        if ctx.waf_body_inspect {
             if let Some(cl) = req.headers.get("content-length") {
                 if let Ok(len) = cl.to_str().unwrap_or("0").parse::<u64>() {
                     if len > WAF_BODY_SCAN_MAX as u64 {
