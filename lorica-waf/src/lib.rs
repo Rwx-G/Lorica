@@ -28,12 +28,17 @@
 //! - [`ip_blocklist::IpBlocklist`] - a separate O(1) IP blocklist that
 //!   pulls from an external feed and short-circuits requests before
 //!   the regex pipeline runs.
+//! - [`body_types::body_is_inspectable`] - whether a declared
+//!   `Content-Type` is one the engine can parse, so a caller can skip
+//!   buffering a body the scan would pass on anyway.
 
+pub mod body_types;
 pub mod engine;
 pub mod ip_blocklist;
 pub mod prefilter;
 pub mod rules;
 
+pub use body_types::{body_is_inspectable, INSPECTABLE_BODY_CONTENT_TYPES};
 pub use engine::{RuleSummary, WafEngine, WafEvent, WafMode, WafVerdict};
 pub use ip_blocklist::IpBlocklist;
 pub use rules::{HeaderScopedRule, RuleCategory, RuleSet, WafRule};
