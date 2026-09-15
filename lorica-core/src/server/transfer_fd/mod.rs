@@ -27,6 +27,8 @@ use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{IoSlice, IoSliceMut};
 #[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
@@ -160,6 +162,18 @@ where
         }
     };
 
+    // The accepted connection is needed for this transfer only. Take
+    // ownership so it closes on every path out of this function,
+    // including the early return below; otherwise every completed hot
+    // binary upgrade leaks one connected unix socket for the life of
+    // the process (upstream b2b35fda; the MSG_CMSG_CLOEXEC half of that
+    // commit is already in, see the comment below).
+    //
+    // SAFETY: `fd` was just returned by accept(2) above and is owned by
+    // nobody else; the only other use of it in this function is through
+    // `conn` from here on.
+    let conn = unsafe { OwnedFd::from_raw_fd(fd) };
+
     let mut io_vec = [IoSliceMut::new(payload); 1];
     let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
     // MSG_CMSG_CLOEXEC: descriptors received over SCM_RIGHTS arrive
@@ -168,7 +182,7 @@ where
     // cluster control plane's). Freshly bound sockets already carry
     // the flag; this makes inherited ones match.
     let msg = socket::recvmsg::<SockaddrStorage>(
-        fd,
+        conn.as_raw_fd(),
         &mut io_vec,
         Some(&mut cmsg_buf),
         socket::MsgFlags::MSG_CMSG_CLOEXEC,
