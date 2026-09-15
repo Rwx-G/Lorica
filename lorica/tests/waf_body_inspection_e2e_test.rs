@@ -31,6 +31,9 @@
 //!    inspection no longer bounds.
 //! 5. Chunked parity: the same verdicts through `request_body_filter`
 //!    with no `Content-Length`.
+//! 6. Detection mode over the window forwards the whole body after
+//!    scanning the prefix, which is the half of audit H-2 that
+//!    shipped without a test.
 
 #![cfg(unix)]
 
@@ -614,6 +617,32 @@ async fn chunked_json_past_the_scan_window_is_still_rejected() {
         received.load(Ordering::SeqCst),
         0,
         "nothing reaches upstream"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detection_mode_scans_the_prefix_and_forwards_the_whole_body() {
+    // The other half of the v1.5.1 audit H-2 stance, which shipped
+    // without a test: an INSPECTABLE body past the window is not
+    // rejected in Detection mode. The scan runs on the buffered
+    // prefix, one `BodyTruncated` event is emitted, and every byte
+    // still reaches the upstream. The payload sits at the front so it
+    // falls inside the prefix that is actually scanned.
+    let (harness, received) = harness(WafMode::Detection).await;
+    let mut body = sqli_json();
+    body.resize(SCAN_WINDOW + 4096, b'a');
+
+    let status = send_request(
+        harness.port,
+        sized_request(harness.port, "application/json", &body),
+    )
+    .await;
+
+    assert_eq!(status, 200, "Detection never rejects on the window");
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        body.len() as u64,
+        "the body past the window still goes upstream untouched"
     );
 }
 
