@@ -141,6 +141,34 @@ Story 8.9 hardening knobs, all live-reloadable via settings:
   net, so one slow shadow target cannot starve every other route's
   mirrors.
 
+### Request authority validation
+
+Lorica routes, matches WAF rules, and applies per-route IP lists and
+Basic-auth on one value: the request's authority. A request that
+carries two of them is refused rather than resolved, because any
+resolution rule the proxy picks can differ from the one the upstream
+picks, and the gap between the two is a policy bypass.
+
+Refused on HTTP/1 and HTTP/2 alike:
+
+- more than one `Host` header field (RFC 9112 section 3.2);
+- userinfo in `Host` or in the URI authority, for example
+  `Host: evil.example@target.example`. `http::Uri::host` strips
+  userinfo, so a check comparing raw bytes and a router parsing the
+  authority disagree about which host this is;
+- a `Host` that differs from the URI authority (`:authority` on
+  HTTP/2). This is stricter than RFC 9112 section 3.2.2, which says to
+  replace the conflicting `Host`.
+
+HTTP/2 additionally answers 400 to a stream that carries neither
+`:authority` nor `Host`, and keeps its per-connection budget for
+malformed streams: a client that sends enough of them has the
+connection torn down rather than the rejections running unbounded.
+
+An absolute-form request target (`GET http://host/path HTTP/1.1`) is
+refused earlier still, when the request header is parsed, so it never
+reaches routing. Legitimate clients do not send one to a reverse proxy.
+
 ### WAF body inspection (v1.7.2)
 
 The WAF buffers a request body only when it can parse it, and the
