@@ -506,6 +506,15 @@ pub trait ProxyHttp {
 
     /// This filter is called when there is an error **after** a connection is established (or reused)
     /// to the upstream.
+    ///
+    /// By default this hook forces retry to false, whatever the incoming
+    /// retry state, when the request method is non-idempotent or the body
+    /// retry buffer was truncated. For eligible requests,
+    /// [`lorica_error::RetryType::ReusedOnly`] errors are retried only on a
+    /// reused connection.
+    ///
+    /// An implementation that overrides this hook replaces the policy and
+    /// owns the decision of when a retry is safe.
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,
@@ -515,9 +524,15 @@ pub trait ProxyHttp {
         client_reused: bool,
     ) -> Box<Error> {
         let mut e = e.more_context(format!("Peer: {}", peer));
-        // only reused client connections where retry buffer is not truncated
-        e.retry
-            .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+        // A non-idempotent request must not be replayed upstream after a
+        // mid-proxy error: the origin may already have applied it, and the
+        // client cannot see that it ran twice (upstream 6fa38359).
+        if !session.req_header().method.is_idempotent() || session.as_ref().retry_buffer_truncated()
+        {
+            e.set_retry(false);
+        } else {
+            e.retry.decide_reuse(client_reused);
+        }
         e
     }
 
