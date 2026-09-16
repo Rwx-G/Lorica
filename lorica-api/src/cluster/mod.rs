@@ -382,13 +382,13 @@ fn node_responses(
         .into_iter()
         .map(|s| (s.node_id.clone(), s))
         .collect();
-    let current = control.config_version();
     nodes
         .into_iter()
         .map(|node| {
             let session = live.get(&node.node_id);
+            let expected = control.expected_config_version(&node.node_id);
             let drift = crate::cluster::runtime::evaluate_drift(
-                &current,
+                &expected,
                 node.applied_config_generation,
                 &node.applied_config_hash,
                 session.map(|s| &s.applied),

@@ -447,11 +447,18 @@ pub struct DriftVerdict {
 
 /// Form the verdict for one node.
 ///
+/// `expected` is what THIS node should be holding: the fleet's
+/// generation with the hash of the payload the control plane cut for
+/// it (Story 10.0). Comparing against the fleet's own hash instead
+/// would mark every node in a fleet that uses `node_selector` as
+/// permanently drifted, since no follower ever receives the control
+/// plane's full view.
+///
 /// `live` is the node's own report from its open session, when it has
 /// one; otherwise the registry row is all there is. Both call sites,
 /// the drift endpoint and the fleet node list, go through here.
 pub fn evaluate_drift(
-    current: &ConfigVersion,
+    expected: &ConfigVersion,
     registry_generation: i64,
     registry_hash: &str,
     live: Option<&AppliedConfig>,
@@ -465,7 +472,7 @@ pub fn evaluate_drift(
         ),
     };
     DriftVerdict {
-        drifted: !(generation == current.generation && hash == current.hash),
+        drifted: !(generation == expected.generation && hash == expected.hash),
         applied_generation: generation,
         applied_hash: hash,
         from_live_session,
@@ -480,6 +487,10 @@ pub async fn drift_report(
     store: &Arc<Mutex<ConfigStore>>,
 ) -> Result<DriftReport, ClusterRuntimeError> {
     let nodes = store_op(store, |store| store.list_cluster_nodes()).await?;
+    // The report's header is the FLEET's identity, which is what an
+    // operator reads as "where the fleet is". Each node is judged
+    // against its own expected version below, because since Story 10.0
+    // no follower holds the bytes this hash covers.
     let current: ConfigVersion = runtime.control.config_version();
     let live: HashMap<String, (AppliedConfig, bool)> = runtime
         .control
@@ -493,8 +504,9 @@ pub async fn drift_report(
     let mut in_sync = 0usize;
     for node in nodes.into_iter().filter(|n| n.status == NodeStatus::Active) {
         let session = live.get(&node.node_id);
+        let expected = runtime.control.expected_config_version(&node.node_id);
         let verdict = evaluate_drift(
-            &current,
+            &expected,
             node.applied_config_generation,
             &node.applied_config_hash,
             session.map(|(applied, _)| applied),
@@ -750,6 +762,73 @@ mod tests {
         assert!(roster["fp-b-old"].via_previous_certificate);
         assert_eq!(roster["fp-b-old"].node_id, "b");
         assert_eq!(roster["fp-c"].state, NodeState::Revoked);
+    }
+
+    // -----------------------------------------------------------------
+    // Story 10.0 AC #4: the verdict is formed against what THIS node
+    // was offered, not against the control plane's own view.
+    // -----------------------------------------------------------------
+
+    fn expected(generation: u64, hash: &str) -> ConfigVersion {
+        ConfigVersion {
+            generation,
+            hash: hash.to_string(),
+        }
+    }
+
+    fn reported(generation: u64, hash: &str) -> AppliedConfig {
+        AppliedConfig {
+            generation,
+            hash: hash.to_string(),
+            break_glass: false,
+        }
+    }
+
+    #[test]
+    fn a_node_reporting_its_own_payload_at_the_current_generation_is_in_sync() {
+        let verdict = evaluate_drift(&expected(7, "cut-a"), 0, "", Some(&reported(7, "cut-a")));
+        assert!(!verdict.drifted);
+        assert!(verdict.from_live_session);
+    }
+
+    #[test]
+    fn a_node_a_generation_behind_is_drifted() {
+        let verdict = evaluate_drift(&expected(7, "cut-a"), 0, "", Some(&reported(6, "cut-a")));
+        assert!(verdict.drifted);
+        assert_eq!(verdict.applied_generation, 6);
+    }
+
+    #[test]
+    fn a_node_at_the_current_generation_with_the_wrong_bytes_is_drifted() {
+        // The case a generation-only comparison misses (backlog #71),
+        // and the one per-recipient payloads make easy to get wrong in
+        // the other direction.
+        let verdict = evaluate_drift(&expected(7, "cut-a"), 0, "", Some(&reported(7, "cut-b")));
+        assert!(verdict.drifted);
+    }
+
+    #[test]
+    fn a_node_that_never_connected_is_drifted_from_its_registry_row() {
+        let verdict = evaluate_drift(&expected(7, "cut-a"), 0, "", None);
+        assert!(verdict.drifted);
+        assert!(!verdict.from_live_session);
+        assert_eq!(verdict.applied_generation, 0);
+    }
+
+    #[test]
+    fn two_nodes_at_one_generation_with_different_bytes_are_both_in_sync() {
+        // The regression this story is most likely to introduce: judge
+        // either node against the fleet's own hash and a fleet that
+        // uses `node_selector` reads as entirely drifted, forever.
+        let a = evaluate_drift(&expected(9, "cut-a"), 0, "", Some(&reported(9, "cut-a")));
+        let b = evaluate_drift(&expected(9, "cut-b"), 0, "", Some(&reported(9, "cut-b")));
+        assert!(!a.drifted && !b.drifted);
+
+        let fleet = expected(9, "fleet-wide");
+        assert!(
+            evaluate_drift(&fleet, 0, "", Some(&reported(9, "cut-a"))).drifted,
+            "this is what the old fleet-wide comparison would have said about a converged node"
+        );
     }
 
     #[test]
