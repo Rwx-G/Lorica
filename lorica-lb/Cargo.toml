@@ -33,7 +33,18 @@ http = { workspace = true }
 derivative.workspace = true
 
 [dev-dependencies]
-rustls = "0.23"
+# The tests install the ring provider explicitly
+# (`rustls::crypto::ring::default_provider()`), so the aws_lc_rs default
+# is not only unused here, it unifies onto the rustls node the whole
+# workspace shares and drags aws-lc-sys (~69 MB of vendored C, built
+# through cmake) into every `cargo test`. Same entry, same reason, as the
+# one fixed in lorica-core (upstream 5396a1fa).
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+] }
 
 [features]
 default = []

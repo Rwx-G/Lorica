@@ -13,11 +13,15 @@ Author: Rwx-G
 
 ### Changed
 
+- **`aws-lc-sys` no longer builds during `cargo test` (backlog #87).** v1.7.3 pinned the `rustls` dev-dependency upstream `5396a1fa` names, in `lorica-core`, and the crate still turned up in the test graph afterwards. The remaining contributor was the same declaration in `lorica-lb`, whose tests install the ring provider explicitly and never needed the `aws_lc_rs` default; left on default features it unified onto the rustls node the whole workspace shares. `cargo tree --workspace --target x86_64-unknown-linux-gnu -e normal,dev -i aws-lc-rs` now answers that no package matches, so roughly 69 MB of vendored C and its cmake step leave every local and CI test build. It still appears under `--all-features`, through the AWS SDK chain behind the optional `route53` feature, which is a separate and documented dependency island.
+
 ### Fixed
 
 ### Removed
 
 ### Security
+
+- **The v1.7.2 authority rejection is now covered end to end.** That release changed what a request carrying two answers to "which host is this for" receives, and shipped with unit tests on the predicate alone. Four cases now run against a real proxy and a real origin: duplicate `Host` and userinfo in `Host` are answered 400 with nothing reaching the upstream, an absolute-form request target dies at parse time for the same result, and one unambiguous authority still reaches the upstream. That last case matters as much as the others: the gate runs on the ingress path of every request, so a false positive would be an outage rather than an inconvenience.
 
 ## [1.7.3] - 2026-09-16
 
