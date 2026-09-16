@@ -10,7 +10,7 @@
 
 **The security boundary this epic does move, and must document:** `docs/security/threat-model.md` gains a trust boundary and an actor for the automation plane (a CI runner holding a scoped token, which is a machine identity that will leak into pipeline logs sooner or later). `docs/security/hardening-guide.md` gains a firewall stanza for the automation port with a default-deny, allow-runner-subnets-only policy, and a paragraph on capture-rule hygiene.
 
-**Integration Requirements:** All work lands on a single `feat/v1.8.0` branch with one final PR to `main`. Stories 10.1 and 10.2 (capture) are independent of 10.3 to 10.5 (automation); the two tracks can land in either order and 10.1 should land first to de-risk the release. Worker-mode parity is mandatory: capture rules are evaluated inside worker processes and every story must answer "which process does this run in, and how does the state get there". The data plane is sacred: an active capture rule may cost memory on the matched route and nothing else; a capture sink outage, a full capture directory or an automation listener under attack may never block, slow, or fail a proxied request. In a cluster, the automation API runs on the control plane only and mutations flow through the Story 9.4 replication path unchanged. `cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo audit`, `pnpm lint`, `pnpm tsc --noEmit` and `pnpm exec svelte-check` must stay green at every commit.
+**Integration Requirements:** All work lands on a single `feat/v1.8.0` branch with one final PR to `main`. Story 10.0 lands first and blocks 10.4. Stories 10.1 and 10.2 (capture) are independent of 10.3 to 10.5 (automation); the two tracks can land in either order and 10.1 should land first of the two to de-risk the release. Worker-mode parity is mandatory: capture rules are evaluated inside worker processes and every story must answer "which process does this run in, and how does the state get there". The data plane is sacred: an active capture rule may cost memory on the matched route and nothing else; a capture sink outage, a full capture directory or an automation listener under attack may never block, slow, or fail a proxied request. In a cluster, the automation API runs on the control plane only and mutations flow through the Story 9.4 replication path unchanged. `cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo audit`, `pnpm lint`, `pnpm tsc --noEmit` and `pnpm exec svelte-check` must stay green at every commit.
 
 **Cross-cutting deliverables** (no single story owns them, all are release-blocking): `lorica-api/openapi.yaml` updated for every new endpoint and kept green against `lorica-api/tests/openapi_contract.rs`; threat model and hardening guide as above; `docs/capture.md` and `docs/automation.md` as user-facing references; `dist/build-deb.sh` and `dist/rpm/lorica.spec` post-install banners mention the automation port when enabled; `CHANGELOG.md` `[Unreleased]` under Added and Security.
 
@@ -54,6 +54,24 @@ Sources: Caddy API reference and "Automatic HTTPS" (On-Demand TLS section); HAPr
 GitLab-side facts that shape the design: `CI_ENVIRONMENT_SLUG` is already RFC 1123-safe and at most 24 characters; `environment.url` can be set statically or from a `dotenv` artifact; `auto_stop_in` triggers the `on_stop` job on a timer but only if the runner and the branch still exist; `id_tokens:` issues a per-job OIDC JWT (RS256, issuer = the GitLab instance URL, JWKS at `/oauth/discovery/keys`, lifetime = job timeout or 5 minutes) with claims `project_path`, `namespace_path`, `ref`, `ref_protected`, `environment`, `environment_protected`, `pipeline_id`, `job_id`, `user_login`, and an `aud` chosen in the job. HashiCorp Vault consumes exactly that token with `bound_claims`, which is the model for Story 10.5.
 
 What Lorica borrows: a composite resource addressed by name with upsert semantics (Caddy `@id`, Kong `PUT` by name), atomic apply of backend + route + certificate binding (HAProxy transactions), certificate resolution by hostname against existing wildcard certificates (Kong and APISIX SNI objects, Caddy's `ask` endpoint reinterpreted as a per-token hostname allowlist), and a lifetime on the resource as a safety net under GitLab's `auto_stop_in`. What Lorica refuses: on-demand ACME issuance per environment. A review environment appears and disappears in minutes, Let's Encrypt rate-limits per registered domain, and a held TLS handshake on first connection is a bad first impression for a reviewer. A wildcard certificate issued once through the existing DNS-01 path covers every environment.
+
+---
+
+## Story 10.0: Per-Recipient Replication Payload
+
+Added to this epic after it was written, and placed first. Backlog #56:
+the replicated blob is fleet-wide, so every follower holds every other
+node's routes, upstream addresses, IP lists, mTLS configuration and
+Basic-auth hashes. Story 10.4 makes a CI pipeline a writer on that same
+path, at pipeline rate, so the disclosure has to close before the
+automation API is built on top of it rather than after.
+
+Full story: [docs/stories/story-10.0-per-recipient-replication.md](../stories/story-10.0-per-recipient-replication.md).
+
+The consequence that makes it a story rather than a fix: two nodes
+correctly converged on the same generation legitimately hold different
+bytes, which ends the single fleet-wide hash the convergence design
+rests on. Every comparison of a hash moves with it.
 
 ---
 
