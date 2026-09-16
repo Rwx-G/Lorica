@@ -84,8 +84,8 @@ offered. See AC #10.
 
 - [x] AC #1: the model, the migration (56), the store CRUD, the replication allowlist entry, and the `CanonicalConfig` field. A capture rule is cut with its route, and its two counters stay out of the blob.
 - [x] AC #10: `CANONICAL_FORMAT_VERSION` to 2 with the refusal test. The `docs/cluster.md` paragraph rides the documentation slice.
-- [ ] AC #2/#3: the predicate types and their evaluation, unit-tested away from the proxy.
-- [ ] AC #7: compilation into the `ProxyConfig` snapshot.
+- [x] AC #2/#3: the predicate types and their evaluation, unit-tested away from the proxy.
+- [x] AC #7: compilation into a `CompiledCaptureRules` set keyed by route. Wiring it into the `ProxyConfig` snapshot rides the proxy slice.
 - [ ] AC #4: the two buffering seams and the overflow stance.
 - [ ] AC #5/#6: the budgets, the sliding window, the global ceiling, the self-disable and its audit.
 - [ ] AC #8: the API surface with the 422 cases.
@@ -136,6 +136,14 @@ deliberate. A follower stricter than its control plane aborts the round
 for the whole fleet, which is the failure mode Story 9.4 AC #5 exists to
 avoid. The defence is on the apply instead: a rule naming a route this
 node does not serve is dropped and counted.
+
+**A bad `source_cidrs` entry fails the whole rule**, which is the
+opposite of what `connection_filter::parse_cidrs` does with the same
+input. That one skips the entry and warns. Here skipping can empty the
+list, and an empty list means every client, so a typo would widen a
+capture rather than narrow it. The connection filter has the same shape
+and the same risk on a path where an empty list is the documented
+default; that is backlog #88, found while writing this.
 
 **`StatusMatch::ClientError` excludes 499.** 499 is the client-abort
 marker, not a status a backend returned; folding it into the 4xx class
