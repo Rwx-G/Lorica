@@ -825,6 +825,14 @@ curl -fsSL https://github.com/Rwx-G/Lorica/raw/main/docs/lorica-signing-key.asc 
 gpg --verify lorica.deb.asc lorica.deb
 ```
 
+From v1.7.3 on, the release tag is signed with the same key, so the chain runs
+from the package back to the commit it was built from. Earlier tags are
+unsigned; verify those releases by their package signature.
+
+```bash
+git verify-tag v1.7.3
+```
+
 ## Roadmap
 
 | Version | Features | Status |

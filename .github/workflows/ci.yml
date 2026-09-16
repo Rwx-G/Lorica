@@ -125,6 +125,35 @@ jobs:
             semgrep-trailofbits.sarif
           retention-days: 30
 
+  verify-tag:
+    name: Verify tag signature
+    # Only a tag push reaches this. A branch build has no tag to verify.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The annotated tag object itself is needed, not just the commit.
+          fetch-depth: 0
+      - name: Import the published signing key
+        # The same file operators are told to import in the README to verify
+        # the .deb and .rpm. If it cannot verify the tag, it is the wrong key
+        # or the tag was signed by something else, and both are release blockers.
+        run: gpg --import docs/lorica-signing-key.asc
+      - name: The tag must carry a good signature from that key
+        env:
+          SIGNING_KEY: B6E37EA916841674
+        run: |
+          set -o pipefail
+          if ! git cat-file -t "$GITHUB_REF_NAME" | grep -qx tag; then
+            echo "::error::$GITHUB_REF_NAME is a lightweight tag; releases carry a signed annotated tag"
+            exit 1
+          fi
+          git verify-tag --raw "$GITHUB_REF_NAME" 2>&1 | tee verify.txt
+          grep -q "VALIDSIG" verify.txt
+          grep -q "$SIGNING_KEY" verify.txt
+          echo "$GITHUB_REF_NAME is signed by $SIGNING_KEY"
+
   test:
     name: Test
     needs: lint
@@ -446,7 +475,7 @@ jobs:
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test-deb-install, test-rpm-install]
+    needs: [verify-tag, test-deb-install, test-rpm-install]
     runs-on: ubuntu-latest
     permissions:
       contents: write
