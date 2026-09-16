@@ -221,6 +221,19 @@ const STREAM_CONTENT_TYPE_PREFIXES: &[&str] = &[
     "application/grpc",
 ];
 
+/// Whether `content_type` names one of the stream-by-design wire
+/// formats above.
+///
+/// Shared with traffic capture (Story 10.1), which has the same reason
+/// to refuse the body: buffering a stream with no end holds the client's
+/// bytes for as long as the stream lives. One list, so the two features
+/// cannot drift apart on what counts as a stream.
+pub(crate) fn is_stream_content_type(content_type: &str) -> bool {
+    STREAM_CONTENT_TYPE_PREFIXES
+        .iter()
+        .any(|p| starts_with_ignore_ascii_case(content_type, p))
+}
+
 /// ASCII case-insensitive `starts_with`, allocation-free. Replaces the
 /// previous `to_ascii_lowercase()` of the Content-Type plus a per-prefix
 /// lowercase of the configured list on every response (audit #41e);
@@ -254,10 +267,7 @@ pub(crate) fn should_rewrite_response(
     // a protocol-breaking bug (SSE long-poll never delivers a chunk;
     // gRPC framing is corrupted), so the operator's prefix list cannot
     // opt back in.
-    if STREAM_CONTENT_TYPE_PREFIXES
-        .iter()
-        .any(|p| starts_with_ignore_ascii_case(content_type, p))
-    {
+    if is_stream_content_type(content_type) {
         return false;
     }
     // Default to text/* when the operator list is empty. A typo-proof

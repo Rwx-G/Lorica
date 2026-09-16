@@ -183,4 +183,23 @@ pub struct RequestCtx {
     /// field starts as `tracing::Span::none()` in `new_ctx` and is
     /// replaced at the top of `request_filter`.
     pub root_tracing_span: tracing::Span,
+    /// Traffic capture state (Story 10.1). `Some` only for a request at
+    /// least one capture rule considered, decided once in
+    /// `request_filter` and never revisited per body chunk.
+    ///
+    /// `Box` so the overwhelmingly common case - no capture rule on the
+    /// route - costs one null pointer check per hook and no allocation,
+    /// instead of widening every `RequestCtx` by the buffers, the rule
+    /// ids and the budget reservation.
+    ///
+    /// Separate from `waf_body_buffer` on purpose: the WAF reads the
+    /// request body while the request is still being forwarded and has
+    /// no use for it afterwards, while a capture is only decided once
+    /// the response is known. The two buffers have different caps,
+    /// different lifetimes, and different contents (the WAF skips a
+    /// body it cannot parse).
+    ///
+    /// Released in `logging`, which moves it out of the context; see the
+    /// comment there.
+    pub capture: Option<Box<crate::capture::CaptureState>>,
 }

@@ -292,6 +292,15 @@ impl CompiledCaptureRules {
         self.by_route.contains_key(route_id)
     }
 
+    /// Every rule on `route_id`, or an empty slice.
+    ///
+    /// The response side uses this with the rule ids a request recorded
+    /// at `request_filter`, so `emit` is evaluated without running the
+    /// `match` predicates a second time on a request already admitted.
+    pub fn rules_for_route(&self, route_id: &str) -> &[CompiledCaptureRule] {
+        self.by_route.get(route_id).map_or(&[][..], Vec::as_slice)
+    }
+
     /// The rules on `route_id` that consider this request.
     ///
     /// `now` is a parameter rather than a `Utc::now()` call inside, so

@@ -14,12 +14,21 @@
 
 //! Traffic capture (Story 10.1).
 //!
+//! Three pieces: the compiled predicates a request is measured against
+//! ([`rules`]), the per-request buffers a matched request fills
+//! ([`buffers`]), and the node-wide ceiling those buffers reserve from
+//! ([`budget`]).
+//!
 //! `lorica-config` owns the stored shape of a capture rule; this module
 //! owns the matcher built from it. The split follows where the `regex`
 //! dependency lives: the config crate deliberately has none, so it caps
 //! the source length of an operator pattern and this crate applies the
 //! compile-time budget and holds the compiled automaton.
 
+mod budget;
+mod buffers;
 mod rules;
 
+pub use budget::{node_budget, CaptureBudget, CaptureReservation, CAPTURE_MAX_INFLIGHT_BYTES};
+pub use buffers::{CaptureBody, CaptureSkip, CaptureState};
 pub use rules::{CompiledCaptureRule, CompiledCaptureRules, CAPTURE_REGEX_SIZE_LIMIT};

@@ -45,6 +45,16 @@ redaction list and may never remove one. An operator who can create a
 capture rule can already see the traffic; the point is that the RECORD,
 which travels further than they do, carries less.
 
+**The captured response body is the UPSTREAM's, before any rewrite this
+proxy applied.** Story 10.1's buffering runs ahead of the response-rewrite
+path on purpose: the story's own motivation is a backend returning
+something wrong, and for that the raw upstream bytes are the evidence. The
+consequence is that a capture can disagree with what the client received
+on a route that rewrites bodies, and an operator comparing the two would
+be right to be confused. `docs/capture.md` has to say this plainly, and
+the record's own documentation with it. This is a semantic choice, not an
+implementation detail.
+
 **Bodies are deliberately not redacted**, and that has to be said out
 loud rather than left as an omission. The body is the thing the operator
 asked to see. A body-level redaction pass that an operator can trust is a
@@ -82,7 +92,7 @@ it.
 - [ ] AC #4: the drop path and its counter.
 - [ ] AC #5: the dashboard page, the ring, and the three frontend gates.
 - [ ] AC #6: the audit rows.
-- [ ] AC #7: `docs/capture.md`.
+- [ ] AC #7: `docs/capture.md`, including two things an operator will otherwise discover the hard way: the response body is the upstream's and predates any rewrite, and a capture rule cannot be disabled on a follower without break-glass because it arrives by replication and a local change would be overwritten on the next round.
 - [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, and the frontend three (`npm run check`, `npm run lint`, `npx vitest run`).
 
 ## Dev Notes

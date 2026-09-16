@@ -243,6 +243,11 @@ pub struct ProxyConfig {
     /// Story 8.9 AC #7 - coarse global safety net across all routes'
     /// mirror sub-requests.
     pub mirror_max_concurrent_global: u32,
+    /// Story 10.1 - capture predicates, compiled when this snapshot is
+    /// built and only read from there on. `Arc` so swapping a snapshot
+    /// (and the `Clone` a prepared reload takes) stays a pointer bump
+    /// rather than a re-compile of every operator regex.
+    pub capture_rules: Arc<crate::capture::CompiledCaptureRules>,
 }
 
 /// Global settings extracted from the config store for ProxyConfig construction.
@@ -267,6 +272,9 @@ pub struct ProxyConfigGlobals {
     pub bot_stash_per_prefix_max: u32,
     pub mirror_max_concurrent_per_route: u32,
     pub mirror_max_concurrent_global: u32,
+    /// Story 10.1. The stored capture rules, compiled once by
+    /// `from_store`.
+    pub capture_rules: Vec<lorica_config::models::CaptureRule>,
 }
 
 impl Default for ProxyConfigGlobals {
@@ -297,6 +305,7 @@ impl Default for ProxyConfigGlobals {
             bot_stash_per_prefix_max: 0,
             mirror_max_concurrent_per_route: 32,
             mirror_max_concurrent_global: 4096,
+            capture_rules: Vec::new(),
         }
     }
 }
@@ -330,6 +339,7 @@ impl ProxyConfig {
             bot_stash_per_prefix_max,
             mirror_max_concurrent_per_route,
             mirror_max_concurrent_global,
+            capture_rules,
         } = globals;
         let backend_map: HashMap<String, Backend> = backends
             .into_iter()
@@ -647,6 +657,13 @@ impl ProxyConfig {
             })
             .collect();
 
+        // Story 10.1 AC #7: every operator pattern in a capture rule is
+        // compiled here, with the snapshot, so a request only ever reads
+        // an automaton it did not build.
+        let capture_rules = Arc::new(crate::capture::CompiledCaptureRules::compile(
+            &capture_rules,
+        ));
+
         ProxyConfig {
             routes_by_host,
             wildcard_routes,
@@ -665,6 +682,7 @@ impl ProxyConfig {
             bot_stash_per_prefix_max,
             mirror_max_concurrent_per_route,
             mirror_max_concurrent_global,
+            capture_rules,
         }
     }
 

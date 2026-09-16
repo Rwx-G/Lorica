@@ -872,6 +872,17 @@ async fn build_proxy_config_inner(
         .map(|s| s.ai_bot_inject_headers)
         .unwrap_or(true);
 
+    // Story 10.1. Read with the rest of the snapshot, under the same
+    // store lock, so the compiled rules a request sees belong to the
+    // same configuration generation as the routes it matched. A store
+    // read that fails leaves the node with no capture rules rather than
+    // failing the reload: capture is a diagnostic, and the snapshot
+    // being built also carries routes, backends and certificates.
+    let capture_rules = store.list_capture_rules().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "capture rules unreadable, this snapshot captures nothing");
+        Vec::new()
+    });
+
     let links: Vec<(String, String)> = route_backends
         .into_iter()
         .map(|rb| (rb.route_id, rb.backend_id))
@@ -910,6 +921,7 @@ async fn build_proxy_config_inner(
                 .as_ref()
                 .map(|s| s.mirror_max_concurrent_global)
                 .unwrap_or(4096),
+            capture_rules,
         },
     );
 

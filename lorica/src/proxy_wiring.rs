@@ -266,9 +266,9 @@ pub mod mirror_rewrite;
 #[cfg(test)]
 pub(crate) use mirror_rewrite::build_mirror_url;
 pub(crate) use mirror_rewrite::{
-    apply_response_rewrites, build_mirror_forward_headers, compile_rewrite_rule, mirror_sample_hit,
-    request_has_body, should_rewrite_response, spawn_mirrors, CompiledRewriteRule, MirrorBodyState,
-    MirrorPending, ResponseRewriteState,
+    apply_response_rewrites, build_mirror_forward_headers, compile_rewrite_rule,
+    is_stream_content_type, mirror_sample_hit, request_has_body, should_rewrite_response,
+    spawn_mirrors, CompiledRewriteRule, MirrorBodyState, MirrorPending, ResponseRewriteState,
 };
 
 pub mod helpers;
@@ -634,6 +634,7 @@ impl ProxyHttp for LoricaProxy {
             incoming_traceparent: None,
             traceparent_from_client: false,
             root_tracing_span: tracing::Span::none(),
+            capture: None,
         }
     }
 
@@ -830,6 +831,38 @@ impl ProxyHttp for LoricaProxy {
             ctx.route_snapshot = Some(Arc::clone(&entry.route));
             ctx.path_rewrite_regex = entry.path_rewrite_regex.clone(); // Arc::clone, cheap
             ctx.access_log_enabled = entry.route.access_log_enabled;
+
+            // Traffic capture, phase one (Story 10.1). A node with no
+            // capture rule at all pays one length check; a node that has
+            // some, but none on this route, pays one hash lookup. Either
+            // way the request allocates nothing and the body filters see
+            // one `None` check per chunk. The decision is taken once
+            // here and never re-evaluated per chunk.
+            if !config.capture_rules.is_empty()
+                && config.capture_rules.has_rules_for_route(&entry.route.id)
+            {
+                // The access log's address, not the TCP peer: behind a
+                // trusted proxy those differ, and a rule's `source_cidrs`
+                // has to name the same client an operator reading the log
+                // sees. An address that did not resolve reads as
+                // 0.0.0.0, which satisfies no narrowing CIDR - the same
+                // stance the header matcher takes on a value it cannot
+                // read.
+                let client_ip = ctx
+                    .client_ip_addr
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                let candidates = config.capture_rules.candidates_for_request(
+                    &entry.route.id,
+                    req.method.as_str(),
+                    path,
+                    &req.headers,
+                    client_ip,
+                    chrono::Utc::now(),
+                );
+                ctx.capture =
+                    crate::capture::CaptureState::new(crate::capture::node_budget(), &candidates)
+                        .map(Box::new);
+            }
 
             // Block WebSocket upgrades if disabled on this route
             if let Some(handled) = self.check_websocket_gate(session, ctx, entry).await? {
@@ -1090,6 +1123,15 @@ impl ProxyHttp for LoricaProxy {
                     let to_copy = chunk.len().min(remaining);
                     buf.extend_from_slice(&chunk[..to_copy]);
                 }
+            }
+
+            // Traffic capture, request side (Story 10.1). The chunk is
+            // read, never replaced: a request being captured reaches the
+            // upstream byte for byte, including the bytes past the
+            // rule's cap. Buffering stops at the cap and at the
+            // node-wide ceiling; both are decided inside `push_request`.
+            if let Some(ref mut capture) = ctx.capture {
+                capture.push_request(chunk);
             }
 
             // Buffer body for mirror sub-request. Independent of WAF
@@ -2019,6 +2061,24 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
+        // Traffic capture, response side (Story 10.1). A stream-by-design
+        // body is never buffered, for the reason
+        // `STREAM_CONTENT_TYPE_PREFIXES` exists: it has no end, so
+        // holding it would hold the client's bytes forever. Recorded as
+        // a skip rather than left as an empty body so the record can say
+        // which of the two it was. Runs before `route` is borrowed out of
+        // the context so the capture state can be taken mutably.
+        if let Some(ref mut capture) = ctx.capture {
+            let content_type = upstream_response
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if is_stream_content_type(content_type) {
+                capture.skip_response(crate::capture::CaptureSkip::Streaming);
+            }
+        }
+
         let route = match ctx.route_snapshot {
             Some(ref r) => r,
             None => return Ok(()),
@@ -2177,6 +2237,17 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Traffic capture, response side (Story 10.1). Ahead of the
+        // rewrite fast path for two reasons: a route with no rewrite
+        // rule still captures, and the bytes recorded are the ones the
+        // upstream sent, before any rewrite rule edits them. The chunk
+        // is read, never replaced.
+        if let Some(ref mut capture) = ctx.capture {
+            if let Some(ref chunk) = *body {
+                capture.push_response(chunk);
+            }
+        }
+
         // Fast path: feature off for this response.
         if ctx.response_rewrite_state.is_none() {
             return Ok(None);
@@ -2307,6 +2378,18 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Traffic capture release (Story 10.1). The buffers leave the
+        // context on the first line of `logging`, on every path into it:
+        // a normal response, an early return from any filter, a WAF
+        // block, `fail_to_proxy`. What guarantees the release is
+        // ownership, not a call: `capture` is a local from here on, the
+        // compiler drops it however this function returns (including a
+        // panic unwind), and dropping it returns its bytes to the
+        // node-wide budget through the reservation's `Drop`. There is no
+        // release function anyone could forget to call, and no path that
+        // can carry the bytes past this hook.
+        let mut capture = ctx.capture.take();
+
         let elapsed = ctx.start_time.elapsed();
         let downstream = session.as_downstream();
         let req = downstream.req_header();
@@ -2412,6 +2495,37 @@ impl ProxyHttp for LoricaProxy {
             if let Some(ref err) = error_str {
                 span.record("error.message", err.as_str());
             }
+        }
+
+        // Story 10.1 phase two, stopping short of the record itself:
+        // decide whether the buffers WOULD have produced one. Story 10.2
+        // builds it from the same state. The `emit` predicates are read
+        // by the rule ids the request recorded at `request_filter`, so
+        // the `match` block is not evaluated a second time.
+        if let Some(state) = capture.as_mut() {
+            let upstream_error = e.is_some_and(|err| err.esource() == &ErrorSource::Upstream);
+            let config = self.config.load();
+            let rules = ctx
+                .route_id
+                .as_deref()
+                .map(|route_id| config.capture_rules.rules_for_route(route_id))
+                .unwrap_or_default();
+            let would_emit = rules
+                .iter()
+                .filter(|rule| state.rule_ids.iter().any(|id| id == &rule.rule.id))
+                .any(|rule| rule.should_emit(status, latency_ms, upstream_error));
+            state.would_emit = would_emit;
+            tracing::debug!(
+                request_id = %ctx.request_id,
+                capture_rules = state.rule_ids.len(),
+                request_body_bytes = state.request.len(),
+                request_body_truncated = state.request.truncated(),
+                response_body_bytes = state.response.len(),
+                response_body_truncated = state.response.truncated(),
+                held_bytes = state.held_bytes(),
+                would_emit,
+                "traffic capture buffered this exchange"
+            );
         }
 
         // Decrement per-route connection counter (max_connections enforcement)

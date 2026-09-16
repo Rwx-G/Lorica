@@ -86,9 +86,10 @@ offered. See AC #10.
 - [x] AC #10: `CANONICAL_FORMAT_VERSION` to 2 with the refusal test. The `docs/cluster.md` paragraph rides the documentation slice.
 - [x] AC #2/#3: the predicate types and their evaluation, unit-tested away from the proxy.
 - [x] AC #7: compilation into a `CompiledCaptureRules` set keyed by route. Wiring it into the `ProxyConfig` snapshot rides the proxy slice.
-- [ ] AC #4: the two buffering seams and the overflow stance.
-- [ ] AC #5/#6: the budgets, the sliding window, the global ceiling, the self-disable and its audit.
-- [ ] AC #8: the API surface with the 422 cases.
+- [x] AC #4: the two buffering seams and the overflow stance. The response body captured is the upstream's, before any rewrite; see Story 10.2 for why that has to be documented.
+- [x] AC #6: the node-wide ceiling, as a process-wide counter released by `Drop`.
+- [ ] AC #5: the per-rule budgets, the sliding window, the self-disable and its audit.
+- [x] AC #8: the API surface with the 422 cases.
 - [ ] AC #9: the metrics.
 - [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, and the frontend three once Story 10.2 adds the page.
 
@@ -106,7 +107,12 @@ mistake costs latency on traffic that has nothing to do with capture.
 
 ### The thing most likely to go wrong
 
-Holding a body past `logging`. The buffer is attached to the request
+Holding a body past `logging`. Closed by ownership rather than
+discipline: `logging` takes the state out of the context into a local on
+its first line, so the drop happens however that function returns. There
+is no release call to forget.
+
+Originally stated as: The buffer is attached to the request
 context and the context outlives the callback in exactly one direction;
 every early-return path in `response_body_filter` has to release it. The
 WAF buffer already solved this once and the answer should look the same.
