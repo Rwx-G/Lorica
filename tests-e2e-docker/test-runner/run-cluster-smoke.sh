@@ -184,14 +184,134 @@ done
 assert_json "$NODES" '[.data[] | select(.applied_config_generation > '"$GEN"')] | length' '2' \
     "both followers applied a newer generation"
 
-# Every node must agree on the hash, not merely on the number: a
-# matching generation with a different hash is the divergence the drift
-# endpoint exists to catch.
-HASHES=$(echo "$NODES" | jq -r '[.data[].applied_config_hash] | unique | length')
-if [ "$HASHES" = "1" ]; then
-    ok "both followers applied the same configuration hash"
+# ---------------------------------------------------------------------
+# Story 10.0 IV2: one generation, two hashes, and neither is drift.
+#
+# The control plane resolves `node_selector` itself and hands each
+# follower only what it is selected for, so edge-a (which serves the
+# route above) and edge-b (which does not) legitimately hold different
+# bytes. The generation stays fleet-wide, the hash is per recipient.
+# This replaces a fleet-wide hash comparison that demanded one hash
+# across the fleet: from the moment a selector was used it would have
+# called both followers drifted, forever.
+# ---------------------------------------------------------------------
+log "=== 10.0 IV2: one generation, two payloads ==="
+
+GEN_A=$(echo "$NODES" | jq -r '[.data[] | select(.name == "edge-a")] | .[0].applied_config_generation')
+GEN_B=$(echo "$NODES" | jq -r '[.data[] | select(.name == "edge-b")] | .[0].applied_config_generation')
+HASH_A=$(echo "$NODES" | jq -r '[.data[] | select(.name == "edge-a")] | .[0].applied_config_hash')
+HASH_B=$(echo "$NODES" | jq -r '[.data[] | select(.name == "edge-b")] | .[0].applied_config_hash')
+if [ "$GEN_A" = "$GEN_B" ]; then
+    ok "both followers converged on the same generation ($GEN_A)"
 else
-    fail "the followers disagree on the applied hash"
+    fail "the followers disagree on the generation: edge-a '$GEN_A', edge-b '$GEN_B'"
+fi
+# A missing field reads as `null` through `jq -r`, which would satisfy
+# a bare inequality and prove nothing, so both are required to be real.
+if [ "$HASH_A" != "null" ] && [ "$HASH_B" != "null" ] && \
+   [ -n "$HASH_A" ] && [ -n "$HASH_B" ] && [ "$HASH_A" != "$HASH_B" ]; then
+    ok "the two payloads differ at one generation (edge-a $(echo "$HASH_A" | cut -c1-8), edge-b $(echo "$HASH_B" | cut -c1-8))"
+else
+    fail "edge-a and edge-b report the same hash '$HASH_A'; the payload was not cut per recipient"
+fi
+
+# Each node is judged against its OWN expected hash, so two converged
+# followers holding different bytes must BOTH read as in sync.
+for attempt in $(seq 1 30); do
+    DRIFT=$(api_get /api/v1/cluster/drift)
+    NAMED=$(echo "$DRIFT" | jq '[(.data.drifted // [])[] | select(.name == "edge-a" or .name == "edge-b")] | length')
+    IN_SYNC=$(echo "$DRIFT" | jq -r '.data.in_sync // 0')
+    [ "${NAMED:-1}" = "0" ] && [ "${IN_SYNC:-0}" -ge 2 ] && break
+    sleep 2
+done
+if [ "${NAMED:-1}" = "0" ]; then
+    ok "neither follower is named in the drift report"
+else
+    fail "the drift report names a converged follower: $(echo "$DRIFT" | head -c 240)"
+fi
+if [ "${IN_SYNC:-0}" -ge 2 ] 2>/dev/null; then
+    ok "the drift report counts both followers in sync (in_sync=$IN_SYNC)"
+else
+    fail "the drift report counts $IN_SYNC nodes in sync, expected at least 2"
+fi
+
+# ---------------------------------------------------------------------
+# Story 10.0 IV1: what a node does not serve is absent from the wire,
+# not filtered on arrival.
+#
+# Before Story 10.0 the control plane shipped one fleet-wide blob and
+# the recipient dropped the routes it was not selected for. That older
+# behaviour would still pass the route half of this check, because the
+# route really was deleted locally: it is the BACKEND that gives it
+# away. The backend travelled with the route and the recipient kept
+# the rows it had been sent, so finding no backend either is what
+# proves the cut happened on the sender's side.
+# ---------------------------------------------------------------------
+log "=== 10.0 IV1: edge-b never receives the route it is not selected for ==="
+
+CP_SESSION="$SESSION"
+API="$EDGE_B_API"
+wait_for_api 60 || { fail "edge-b's API never answered"; print_results; }
+login "$(cat "$SHARED/edge-b_admin_password")"
+
+B_ROUTES=$(api_get /api/v1/routes)
+HAS_ROUTE=$(echo "$B_ROUTES" | jq --arg r "$ROUTE_ID" \
+    '[(.data.routes // [])[] | select(.id == $r)] | length')
+if [ "$HAS_ROUTE" = "0" ]; then
+    ok "edge-b holds no route for the selector that names edge-a"
+else
+    fail "edge-b holds the route $ROUTE_ID it was never selected for"
+fi
+
+B_BACKENDS=$(api_get /api/v1/backends)
+HAS_BACKEND=$(echo "$B_BACKENDS" | jq --arg b "$BACKEND_ID" \
+    '[(.data.backends // [])[] | select(.id == $b)] | length')
+if [ "$HAS_BACKEND" = "0" ]; then
+    ok "the route's backend is absent from edge-b too, so the cut happened before the wire"
+else
+    fail "edge-b holds the backend $BACKEND_ID of a route it does not serve"
+fi
+
+API="$CP_API"
+SESSION="$CP_SESSION"
+
+# ---------------------------------------------------------------------
+# Story 10.0 IV4: a selector naming nobody is refused at write time.
+#
+# Only the control plane owns an authoritative roster, so only it can
+# tell "not enrolled" from "not replicated here yet". A selector that
+# resolves to no node would otherwise be stored happily and deliver the
+# route to nobody at all.
+# ---------------------------------------------------------------------
+log "=== 10.0 IV4: an unknown selector name is refused ==="
+
+GHOST_BODY=$(mktemp)
+GHOST_CODE=$(curl -sk -o "$GHOST_BODY" -w '%{http_code}' -b "$SESSION" \
+    -X POST -H 'Content-Type: application/json' \
+    -d '{"hostname":"ghost.example.com","path_prefix":"/",
+         "backend_ids":["'"$BACKEND_ID"'"],"load_balancing":"round_robin",
+         "enabled":true,"node_selector":["edge-does-not-exist"]}' \
+    "$API/api/v1/routes")
+case "$GHOST_CODE" in
+    4??) ok "a route naming an unenrolled node is refused (HTTP $GHOST_CODE)" ;;
+    *)   fail "a route naming an unenrolled node answered $GHOST_CODE, expected a 4xx" ;;
+esac
+# The API wraps the message with its own bad-request prefix, so the
+# offending entry is matched as a substring, not as the whole body.
+if grep -qF 'node_selector entry `edge-does-not-exist` matches no enrolled cluster node' "$GHOST_BODY"; then
+    ok "the refusal names the offending selector entry"
+else
+    fail "the refusal does not name the offending entry: $(head -c 240 "$GHOST_BODY")"
+fi
+rm -f "$GHOST_BODY"
+
+CP_ROUTES=$(api_get /api/v1/routes)
+GHOST_ROUTES=$(echo "$CP_ROUTES" | jq \
+    '[(.data.routes // [])[] | select(.hostname == "ghost.example.com")] | length')
+if [ "$GHOST_ROUTES" = "0" ]; then
+    ok "the refused route was not created"
+else
+    fail "the refused route exists on the control plane anyway"
 fi
 
 log "=== 9.4: a follower refuses a local mutation ==="

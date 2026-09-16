@@ -63,6 +63,27 @@ wait_for_edge_a_session() {
     return 1
 }
 
+wait_for_both_sessions() {
+    for _ in $(seq 1 60); do
+        NODES=$(api_get /api/v1/cluster/nodes)
+        CONNECTED=$(echo "$NODES" | jq -r '[(.data // [])[] | select(.connected == true)] | length')
+        [ "$CONNECTED" = "2" ] && return 0
+        sleep 2
+    done
+    return 1
+}
+
+# The generation and the per-recipient hash a named node last reported,
+# as the control plane's roster holds them. $1 = node name.
+roster_generation() {
+    api_get /api/v1/cluster/nodes \
+        | jq -r --arg n "$1" '[(.data // [])[] | select(.name == $n)] | .[0].applied_config_generation // "none"'
+}
+roster_hash() {
+    api_get /api/v1/cluster/nodes \
+        | jq -r --arg n "$1" '[(.data // [])[] | select(.name == $n)] | .[0].applied_config_hash // "none"'
+}
+
 if [ "$PHASE" = "follower" ]; then
     log "=== restart: a follower comes back on its own (#77) ==="
 
@@ -132,6 +153,18 @@ if [ "$PHASE" = "follower" ]; then
 fi
 
 if [ "$PHASE" = "control-plane" ]; then
+    # Read first, assert later: the roster rows still carry what each
+    # follower reported BEFORE the restart. Neither follower was
+    # restarted, this process has replicated nothing yet (the flag
+    # asserted just below says exactly that), and nothing here has
+    # mutated the store, so these are the pre-restart values.
+    # run.sh owns the restart, so this runner cannot read them any
+    # earlier than its own first API call.
+    BEFORE_GEN_A=$(roster_generation edge-a)
+    BEFORE_GEN_B=$(roster_generation edge-b)
+    BEFORE_HASH_A=$(roster_hash edge-a)
+    BEFORE_HASH_B=$(roster_hash edge-b)
+
     log "=== restart: the control plane says its policy state started empty (#58) ==="
 
     REPL=$(api_get /api/v1/cluster/replication)
@@ -146,6 +179,69 @@ if [ "$PHASE" = "control-plane" ]; then
     else
         fail "edge-a did not reconnect to the restarted control plane within 120s"
     fi
+
+    # -----------------------------------------------------------------
+    # Story 10.0 IV3: a control-plane restart raises no drift.
+    #
+    # Each node's expected version is derived from the payload the
+    # control plane cut for it, never stored in a column, so a restart
+    # has to rebuild every follower's expected hash from the store
+    # alone. That recomputation is the thing under test: if it were not
+    # byte-for-byte deterministic, every follower would read as drifted
+    # the moment the process came back, and an operator would be handed
+    # a fleet-wide alert caused by nothing but a restart.
+    # -----------------------------------------------------------------
+    log "=== 10.0 IV3: the rebuilt expectation raises no drift ==="
+
+    # A vacuous run is worse than a failing one: if the fleet holds no
+    # `node_selector`-scoped route, both followers carry identical bytes
+    # and this phase would pass without exercising the per-recipient
+    # recomputation at all. The main smoke creates that route; say so
+    # loudly if it is missing rather than reporting a green run.
+    if [ "$BEFORE_HASH_A" != "$BEFORE_HASH_B" ] && [ "$BEFORE_HASH_A" != "none" ]; then
+        ok "the followers went into the restart holding different payloads"
+    else
+        fail "both followers hold the same payload ('$BEFORE_HASH_A'); no scoped route in the fleet, so this phase proves nothing"
+    fi
+
+    if wait_for_both_sessions; then
+        ok "both followers re-opened their sessions against the restarted control plane"
+    else
+        fail "the fleet did not fully reconnect within 120s of the control-plane restart"
+    fi
+
+    for _ in $(seq 1 45); do
+        DRIFT=$(api_get /api/v1/cluster/drift)
+        DRIFTED=$(echo "$DRIFT" | jq '(.data.drifted // []) | length')
+        [ "${DRIFTED:-1}" = "0" ] && break
+        sleep 2
+    done
+    if [ "${DRIFTED:-1}" = "0" ]; then
+        ok "no node is drifted after the control plane rebuilt its expectations"
+    else
+        fail "$DRIFTED node(s) read as drifted after the restart: $(echo "$DRIFT" | head -c 240)"
+    fi
+
+    AFTER_GEN_A=$(roster_generation edge-a)
+    AFTER_GEN_B=$(roster_generation edge-b)
+    AFTER_HASH_A=$(roster_hash edge-a)
+    AFTER_HASH_B=$(roster_hash edge-b)
+    if [ "$AFTER_GEN_A" = "$AFTER_GEN_B" ]; then
+        ok "both followers still share one generation after the restart ($AFTER_GEN_A)"
+    else
+        fail "the followers split on the generation after the restart: edge-a '$AFTER_GEN_A', edge-b '$AFTER_GEN_B'"
+    fi
+    if [ "$AFTER_HASH_A" = "$BEFORE_HASH_A" ] && [ "$AFTER_HASH_B" = "$BEFORE_HASH_B" ]; then
+        ok "each follower kept its own hash across the restart"
+    else
+        fail "a hash moved across the restart: edge-a '$BEFORE_HASH_A' -> '$AFTER_HASH_A', edge-b '$BEFORE_HASH_B' -> '$AFTER_HASH_B'"
+    fi
+    if [ "$AFTER_HASH_A" != "$AFTER_HASH_B" ]; then
+        ok "the two payloads are still distinct, so the restart did not collapse them into one blob"
+    else
+        fail "the followers now report one hash; the restart lost the per-recipient cut"
+    fi
+    log "pre-restart generations: edge-a $BEFORE_GEN_A, edge-b $BEFORE_GEN_B"
 
     # A mutation drives one round, after which the flag must clear: it
     # means "this process has not replicated yet", not "no round ever".
