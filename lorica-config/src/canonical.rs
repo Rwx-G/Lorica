@@ -516,11 +516,138 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
 
 /// Encode the store's current configuration to canonical bytes.
 pub fn canonical_bytes(store: &ConfigStore) -> Result<Vec<u8>> {
-    let cfg = canonical_config(store)?;
-    let value = serde_json::to_value(&cfg)
+    encode_canonical(&canonical_config(store)?)
+}
+
+/// Encode a configuration that is already in hand.
+///
+/// Split out of [`canonical_bytes`] because a control plane building
+/// one payload per recipient reads the store once and encodes N times
+/// (Story 10.0).
+pub fn encode_canonical(cfg: &CanonicalConfig) -> Result<Vec<u8>> {
+    let value = serde_json::to_value(cfg)
         .map_err(|e| ConfigError::Validation(format!("canonical encode failed: {e}")))?;
     serde_json::to_vec(&sort_object_keys(value))
         .map_err(|e| ConfigError::Validation(format!("canonical encode failed: {e}")))
+}
+
+/// Which node id each `node_selector` name resolves to, resolved once
+/// per round against `cluster_nodes`.
+///
+/// A name is not an identity: `cluster_nodes.name` is chosen by the
+/// joining node and carries no UNIQUE constraint, so a name matching no
+/// row or more than one resolves to nothing and targets nobody. Story
+/// 9.5 decision D3 reached the same conclusion for certificate
+/// distribution; Story 10.0 applies it to the configuration payload.
+#[derive(Debug, Default, Clone)]
+pub struct SelectorResolution {
+    by_name: std::collections::HashMap<String, Option<String>>,
+}
+
+impl SelectorResolution {
+    /// Build from `(name, node_id)` rows. A name seen twice resolves to
+    /// `None` for both.
+    pub fn from_rows<I>(rows: I) -> Self
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let mut by_name: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        for (name, node_id) in rows {
+            by_name
+                .entry(name)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(node_id));
+        }
+        Self { by_name }
+    }
+
+    /// Whether a route carrying `selector` is served by `node_id`.
+    /// An empty selector is fleet-wide.
+    pub fn targets(&self, selector: &[String], node_id: &str) -> bool {
+        if selector.is_empty() {
+            return true;
+        }
+        selector
+            .iter()
+            .any(|name| self.by_name.get(name).and_then(|id| id.as_deref()) == Some(node_id))
+    }
+
+    /// Selector entries that name nobody, for the caller to log or
+    /// refuse. An entry here is either a typo or a name shared by two
+    /// rows, and both are configuration errors rather than a silent
+    /// omission at replication time (Story 10.0 AC #2).
+    pub fn unresolvable<'a>(&self, selector: &'a [String]) -> Vec<&'a str> {
+        selector
+            .iter()
+            .filter(|name| self.by_name.get(*name).and_then(|id| id.as_ref()).is_none())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// The subset of `cfg` that `node_id` is entitled to receive.
+///
+/// The recipient used to be handed the whole fleet's configuration and
+/// filter it on arrival, which scoped serving and not disclosure: a
+/// compromised edge held every other node's upstream addresses, IP
+/// lists, mTLS configuration and Basic-auth hashes. This does the
+/// filtering on the control plane instead (Story 10.0, backlog #56).
+///
+/// Restricted: routes the node serves, the links of those routes, the
+/// backends those links reference, and the certificates those routes
+/// bind. Left fleet-wide: global policy, WAF rules and disabled ids,
+/// export ACL patterns, AI crawler entries, probe and SLA definitions,
+/// notification channels and DNS providers. Those are fleet policy or
+/// carry digests only, and a node that cannot see them cannot tell
+/// whether it is behind.
+pub fn restrict_for_recipient(
+    cfg: &CanonicalConfig,
+    node_id: &str,
+    resolution: &SelectorResolution,
+) -> CanonicalConfig {
+    let routes: Vec<Route> = cfg
+        .routes
+        .iter()
+        .filter(|r| resolution.targets(&r.node_selector, node_id))
+        .cloned()
+        .collect();
+    let kept: std::collections::HashSet<&str> = routes.iter().map(|r| r.id.as_str()).collect();
+
+    let route_backends: Vec<RouteBackend> = cfg
+        .route_backends
+        .iter()
+        .filter(|rb| kept.contains(rb.route_id.as_str()))
+        .cloned()
+        .collect();
+    let backend_ids: std::collections::HashSet<&str> = route_backends
+        .iter()
+        .map(|rb| rb.backend_id.as_str())
+        .collect();
+    let backends: Vec<Backend> = cfg
+        .backends
+        .iter()
+        .filter(|b| backend_ids.contains(b.id.as_str()))
+        .cloned()
+        .collect();
+    let cert_ids: std::collections::HashSet<&str> = routes
+        .iter()
+        .filter_map(|r| r.certificate_id.as_deref())
+        .collect();
+    let certificates: Vec<Certificate> = cfg
+        .certificates
+        .iter()
+        .filter(|c| cert_ids.contains(c.id.as_str()))
+        .cloned()
+        .collect();
+
+    CanonicalConfig {
+        routes,
+        backends,
+        route_backends,
+        certificates,
+        ..cfg.clone()
+    }
 }
 
 /// SHA-256 of [`canonical_bytes`], lowercase hex. The value compared
@@ -681,6 +808,156 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Story 10.0: per-recipient payloads
+    // -----------------------------------------------------------------
+
+    fn resolution() -> SelectorResolution {
+        SelectorResolution::from_rows([
+            ("edge-a".to_string(), "id-a".to_string()),
+            ("edge-b".to_string(), "id-b".to_string()),
+            // Two rows have carried this name. A name is not an
+            // identity: it is chosen by the joining node and carries no
+            // UNIQUE constraint.
+            ("twin".to_string(), "id-c".to_string()),
+            ("twin".to_string(), "id-d".to_string()),
+        ])
+    }
+
+    #[test]
+    fn an_empty_selector_is_fleet_wide() {
+        let r = resolution();
+        assert!(r.targets(&[], "id-a"));
+        assert!(r.targets(&[], "a-node-that-just-joined"));
+    }
+
+    #[test]
+    fn a_selector_targets_the_id_its_name_resolves_to() {
+        let r = resolution();
+        let sel = vec!["edge-a".to_string()];
+        assert!(r.targets(&sel, "id-a"));
+        assert!(!r.targets(&sel, "id-b"));
+    }
+
+    #[test]
+    fn a_name_two_rows_share_targets_neither_and_is_reported() {
+        // Without this rule, a node joining under a name some selector
+        // already lists would be entitled to those routes.
+        let r = resolution();
+        let sel = vec!["twin".to_string()];
+        assert!(!r.targets(&sel, "id-c"));
+        assert!(!r.targets(&sel, "id-d"));
+        assert_eq!(r.unresolvable(&sel), vec!["twin"]);
+    }
+
+    #[test]
+    fn a_name_no_row_carries_targets_nobody_and_is_reported() {
+        let r = resolution();
+        let sel = vec!["typo".to_string()];
+        assert!(!r.targets(&sel, "id-a"));
+        assert_eq!(r.unresolvable(&sel), vec!["typo"]);
+    }
+
+    /// Three routes: one fleet-wide, one for each edge, each with its
+    /// own backend and certificate.
+    fn fleet_config() -> CanonicalConfig {
+        let mut fleet = make_route("r-fleet", "fleet.example");
+        fleet.node_selector = Vec::new();
+        fleet.certificate_id = None;
+        let mut a = make_route("r-a", "a.example");
+        a.node_selector = vec!["edge-a".to_string()];
+        a.certificate_id = Some("cert-a".to_string());
+        let mut b = make_route("r-b", "b.example");
+        b.node_selector = vec!["edge-b".to_string()];
+        b.certificate_id = Some("cert-b".to_string());
+
+        CanonicalConfig {
+            version: CANONICAL_FORMAT_VERSION,
+            global: CanonicalGlobalSettings::from(&GlobalSettings::default()),
+            routes: vec![fleet, a, b],
+            backends: vec![
+                make_backend("b-a", "10.0.0.10:8080"),
+                make_backend("b-b", "10.0.0.11:8080"),
+            ],
+            route_backends: vec![
+                RouteBackend {
+                    route_id: "r-a".to_string(),
+                    backend_id: "b-a".to_string(),
+                },
+                RouteBackend {
+                    route_id: "r-b".to_string(),
+                    backend_id: "b-b".to_string(),
+                },
+            ],
+            certificates: vec![
+                make_certificate("cert-a", "aa:bb"),
+                make_certificate("cert-b", "cc:dd"),
+            ],
+            notification_configs: Vec::new(),
+            dns_providers: Vec::new(),
+            waf_custom_rules: Vec::new(),
+            waf_disabled_rules: vec![1, 2],
+            cert_export_acls: Vec::new(),
+            ai_crawlers_custom: Vec::new(),
+            probe_configs: Vec::new(),
+            sla_configs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_recipient_receives_its_own_routes_and_the_fleet_wide_ones() {
+        let cut = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let ids: Vec<&str> = cut.routes.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["r-fleet", "r-a"]);
+    }
+
+    #[test]
+    fn what_a_recipient_does_not_serve_is_not_on_the_wire() {
+        // Backlog #56: this used to travel to every node and be
+        // filtered on arrival, which scoped serving and not disclosure.
+        let cut = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        assert!(!cut.routes.iter().any(|r| r.id == "r-b"));
+        assert!(
+            !cut.backends.iter().any(|b| b.id == "b-b"),
+            "another node's upstream address"
+        );
+        assert!(!cut.route_backends.iter().any(|rb| rb.route_id == "r-b"));
+        assert!(
+            !cut.certificates.iter().any(|c| c.id == "cert-b"),
+            "another node's certificate metadata, SANs included"
+        );
+    }
+
+    #[test]
+    fn fleet_policy_stays_fleet_wide() {
+        // A node that cannot see the policy it is judged against
+        // cannot tell whether it is behind.
+        let cfg = fleet_config();
+        let cut = restrict_for_recipient(&cfg, "id-a", &resolution());
+        assert_eq!(cut.version, cfg.version);
+        assert_eq!(cut.waf_disabled_rules, cfg.waf_disabled_rules);
+    }
+
+    #[test]
+    fn two_recipients_at_one_generation_hold_different_bytes() {
+        // The consequence that makes this a story rather than a filter
+        // moved by one hop: the single fleet-wide hash is over.
+        let cfg = fleet_config();
+        let r = resolution();
+        let a = encode_canonical(&restrict_for_recipient(&cfg, "id-a", &r)).unwrap();
+        let b = encode_canonical(&restrict_for_recipient(&cfg, "id-b", &r)).unwrap();
+        assert_ne!(sha256_hex(&a), sha256_hex(&b));
+    }
+
+    #[test]
+    fn the_same_recipient_encodes_identically_twice() {
+        let cfg = fleet_config();
+        let r = resolution();
+        let once = encode_canonical(&restrict_for_recipient(&cfg, "id-a", &r)).unwrap();
+        let twice = encode_canonical(&restrict_for_recipient(&cfg, "id-a", &r)).unwrap();
+        assert_eq!(sha256_hex(&once), sha256_hex(&twice));
     }
 
     fn make_backend(id: &str, address: &str) -> Backend {
