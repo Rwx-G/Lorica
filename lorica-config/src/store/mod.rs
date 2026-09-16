@@ -27,6 +27,7 @@ use crate::error::{ConfigError, Result};
 
 mod acme_challenges;
 mod ai_crawlers;
+mod automation_token;
 mod backends;
 pub mod bot_stash;
 mod capture;
@@ -177,6 +178,7 @@ const MIGRATIONS: &[Migration] = &[
     (54, migrate_acme_challenge_expiry),
     (55, migrate_sla_buckets_drop_route_cascade),
     (56, migrate_capture_rules),
+    (57, migrate_api_tokens),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -983,6 +985,41 @@ fn migrate_capture_rules(conn: &Connection) -> rusqlite::Result<()> {
             ON capture_rules(route_id);
         CREATE INDEX IF NOT EXISTS idx_capture_rules_expires_at
             ON capture_rules(expires_at);",
+    )
+}
+
+/// Story 10.3: scoped automation tokens.
+///
+/// No foreign key and no cascade: a token is a credential held by
+/// something outside this node, not configuration attached to a route,
+/// so nothing here should be able to delete one as a side effect.
+///
+/// The lists are JSON columns because nothing queries inside them:
+/// every read is by `public_id` (one presentation, one lookup) or is
+/// the operator's full listing. The index carries the "which tokens can
+/// still be used" question, which is the only filtered read.
+///
+/// `revoked_at` is a timestamp rather than a boolean so the listing can
+/// say when a credential was withdrawn, and the row outlives the
+/// revocation for exactly that reason.
+fn migrate_api_tokens(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS api_tokens (
+            public_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            secret_hmac TEXT NOT NULL,
+            scopes_json TEXT NOT NULL,
+            allowed_hostnames_json TEXT NOT NULL,
+            allowed_backend_cidrs_json TEXT NOT NULL,
+            max_ttl_seconds INTEGER NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_used_at TEXT,
+            revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_tokens_live
+            ON api_tokens(revoked_at, expires_at);",
     )
 }
 

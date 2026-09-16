@@ -420,7 +420,7 @@ impl CaptureRule {
     /// Source CIDRs, methods and pattern sizes.
     fn validate_match(&self) -> Result<(), String> {
         for cidr in &self.match_.source_cidrs {
-            validate_cidr(cidr)?;
+            validate_cidr(cidr, "match.source_cidrs")?;
         }
         for method in &self.match_.methods {
             if !is_uppercase_http_method(method) {
@@ -462,16 +462,20 @@ fn check_pattern_len(pattern: &str, field: &str) -> Result<(), String> {
 
 /// Accept a CIDR (`10.0.0.0/8`, `2001:db8::/32`) or a bare address,
 /// which is what the connection filter accepts for the same kind of
-/// list.
+/// list. `field` names the list in the error message.
 ///
 /// `lorica-config` has no `ipnet` dependency and gains none for this,
 /// so the check is built on `std::net::IpAddr` plus an explicit prefix
 /// bound: it accepts exactly the same shapes `ipnet` does for these two
 /// families, and rejects strictly more (an `ipnet` parse tolerates host
 /// bits set, which is fine to keep, but nothing looser).
-fn validate_cidr(entry: &str) -> Result<(), String> {
+///
+/// Visible to the whole `models` module: every operator-supplied
+/// address list in the crate answers to this one definition, so an
+/// operator who learns what Lorica accepts learns it once.
+pub(super) fn validate_cidr(entry: &str, field: &str) -> Result<(), String> {
     let trimmed = entry.trim();
-    let invalid = || format!("`{entry}` is not a valid IP or CIDR in match.source_cidrs");
+    let invalid = || format!("`{entry}` is not a valid IP or CIDR in {field}");
     let (addr, prefix) = match trimmed.split_once('/') {
         Some((addr, prefix)) => (addr, Some(prefix)),
         None => (trimmed, None),
