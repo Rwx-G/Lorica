@@ -149,7 +149,8 @@ than treated as good for any name.
 The name is mandatory because it is an authorization input, not a
 label. A route's `node_selector` lists node names, and that list is
 what decides which certificate private keys a node is entitled to
-receive. If a joining node could choose its own name it could join
+receive and, since per-recipient payloads, which routes it is sent at
+all. If a joining node could choose its own name it could join
 under a name a selector already lists and be handed those keys the
 moment an operator activates it. Binding the name to the token moves
 that choice back to the operator who mints it. The name must use the
