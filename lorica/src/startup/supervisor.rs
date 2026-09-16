@@ -1017,6 +1017,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     management: management_port,
                     http: hu_cli.http_port,
                     https: hu_cli.https_port,
+                    // These are the cluster plane's own binds, and the
+                    // automation API is not started yet, so neither
+                    // port exists for them to collide with.
+                    cluster: None,
+                    automation: None,
                 },
                 inherited_operational,
                 auto_activate: hu_cli.cluster_auto_activate,

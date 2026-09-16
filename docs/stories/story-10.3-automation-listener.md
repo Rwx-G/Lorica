@@ -1,7 +1,7 @@
 # Story 10.3: Automation Listener and Scoped API Tokens
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** nothing in this epic.
@@ -111,8 +111,8 @@ touch the other.
 
 ## Tasks
 
-- [ ] The bind validator: lift the primitives, parameterise by flag name, widen `ReservedPorts`, rewrite `validate_cluster_listen` on top of it (AC #1, #9).
-- [ ] Move the pure `ConnectionFilterPolicy` to `lorica-config`, leaving the runtime in the binary.
+- [x] The bind validator: lift the primitives, parameterise by flag name, widen `ReservedPorts`, rewrite `validate_cluster_listen` on top of it (AC #1, #9). The opt-in flag is NOT derived from the flag name: `--cluster-enrollment-listen` shares `--cluster-listen-any`, so a derivation would have named a flag that does not exist. The caller passes the flag, the opt-in and the subject.
+- [ ] Move the pure `ConnectionFilterPolicy` to `lorica-config`, leaving the runtime in the binary. That move brings `ipnet` into `lorica-config`, and when it does, Story 10.1's `validate_cidr` (written without it, because the crate had no CIDR parser) must be folded onto the same parser. Two answers to "is this a CIDR" in one crate is the drift this story exists to avoid. They differ deliberately in what they do with a bad entry, the filter warns and skips while a write-time validator refuses, but they must agree on what a bad entry IS.
 - [ ] AC #4: the token model, its migration, its own HMAC key row, mint, parse and constant-time verify.
 - [ ] AC #1/#3: the listener, its TLS, its accept loop with the source check and the pre-auth budgets.
 - [ ] AC #5/#7: the scope enum, the bearer extractor, the per-request audit and the counter.

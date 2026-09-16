@@ -382,6 +382,11 @@ pub(crate) fn run_single_process(cli: Cli) {
                     management: management_port,
                     http: http_port,
                     https: https_port,
+                    // These are the cluster plane's own binds, and the
+                    // automation API is not started yet, so neither
+                    // port exists for them to collide with.
+                    cluster: None,
+                    automation: None,
                 },
                 // Single-process mode never hot-upgrades (it binds the
                 // management port fresh), so there is nothing to adopt.
