@@ -1,0 +1,126 @@
+name: Tag Release
+
+# Cuts the signed release tag, from here rather than from a workstation.
+#
+# The release tag has to carry a good signature from the project key or the
+# `verify-tag` job in ci.yml refuses to let the Release job run. That key's
+# passphrase lives in this repository's secrets and nowhere else that anyone
+# can read, so the only place the tag can be signed is a job that can use
+# those secrets. Pushing the tag is what starts the release pipeline, which
+# builds, signs the .deb and .rpm with the same key, and publishes.
+#
+# The gate on this workflow is the `release` environment. Give it required
+# reviewers: without them, anyone who can run a workflow can mint a tag
+# signed by the project key, which is a strictly larger power than merging.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag, without the leading v (for example 1.7.4)"
+        required: true
+        type: string
+      message:
+        description: "Tag message. Defaults to the subject of the commit being tagged, minus its PR number."
+        required: false
+        type: string
+
+jobs:
+  tag:
+    name: Cut a signed release tag
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Refuse to start without a token that can trigger the pipeline
+        env:
+          TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+        run: |
+          if [ -z "$TAG_TOKEN" ]; then
+            echo "::error::RELEASE_TAG_TOKEN is not set. A tag pushed with GITHUB_TOKEN starts no workflow run (GitHub suppresses it to avoid recursion), so the tag would sit there with no release behind it. Create a fine-grained PAT with Contents: write on this repository and store it as RELEASE_TAG_TOKEN."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TAG_TOKEN }}
+
+      - name: The tree must already say this version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          in_tree=$(grep -m1 '^version = ' lorica/Cargo.toml | cut -d'"' -f2)
+          if [ "$in_tree" != "$VERSION" ]; then
+            echo "::error::lorica/Cargo.toml says $in_tree but you asked for $VERSION. Land the version bump on main first."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "::error::v$VERSION already exists. A release tag is never moved."
+            exit 1
+          fi
+          echo "TAG=v$VERSION" >> "$GITHUB_ENV"
+
+      - name: Settle the tag message
+        env:
+          GIVEN: ${{ inputs.message }}
+        run: |
+          set -euo pipefail
+          if [ -n "$GIVEN" ]; then
+            msg="$GIVEN"
+          else
+            # The convention in docs/BUMP-CHECKLIST.md: the merge commit
+            # subject without its PR number.
+            msg=$(git log -1 --pretty=%s | sed -E 's/ \(#[0-9]+\)$//')
+          fi
+          echo "TAG_MESSAGE<<EOF" >> "$GITHUB_ENV"
+          echo "$msg" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+          echo "Tagging ${{ env.TAG }} as: $msg"
+
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          echo "$GPG_PRIVATE_KEY" | base64 -d | gpg --batch --import
+          umask 077
+          printf '%s' "$GPG_PASSPHRASE" > "$RUNNER_TEMP/gpg-pass"
+          # git drives gpg without a way to pass these flags, so wrap it.
+          # The passphrase file lives only in this ephemeral runner.
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            "exec gpg --batch --pinentry-mode loopback --passphrase-file $RUNNER_TEMP/gpg-pass \"\$@\"" \
+            > "$RUNNER_TEMP/gpg-loopback"
+          chmod +x "$RUNNER_TEMP/gpg-loopback"
+
+      - name: Create the signed tag
+        run: |
+          set -euo pipefail
+          git config user.name "Rwx-G"
+          git config user.email "romain@rwx-g.fr"
+          git config user.signingkey B6E37EA916841674
+          git config gpg.program "$RUNNER_TEMP/gpg-loopback"
+          git tag -s -a "$TAG" -m "$TAG_MESSAGE"
+
+      - name: It verifies here or it never leaves
+        run: |
+          set -euo pipefail
+          # Against the published key, the same file operators import, so a
+          # tag this job cannot prove is never pushed.
+          gpg --import docs/lorica-signing-key.asc
+          git verify-tag --raw "$TAG" 2>&1 | tee verify.txt
+          grep -q "VALIDSIG" verify.txt
+          grep -q "B6E37EA916841674" verify.txt
+
+      - name: Push it, which starts the release pipeline
+        run: git push origin "$TAG"
+
+      - name: Say where to watch
+        run: |
+          echo "### $TAG pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The CI workflow runs on the tag: \`verify-tag\` first, then the build, the package signing and the release." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/${{ github.repository }}/actions?query=branch%3A$TAG" >> "$GITHUB_STEP_SUMMARY"

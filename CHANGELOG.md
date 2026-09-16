@@ -11,6 +11,8 @@ Author: Rwx-G
 
 ### Added
 
+- **A `Tag Release` workflow cuts the signed release tag.** The tag has to carry a good signature from the project key or `verify-tag` blocks the release, and that key's passphrase now exists only as a repository secret, so signing at a terminal is no longer possible for anyone. The workflow checks that `main` already carries the version being tagged, signs, verifies the result against the published public key before pushing anything, and pushes, which is what starts the release pipeline. It is gated on a `release` environment (give it required reviewers: minting a tag signed by the project key is a larger power than merging) and needs a `RELEASE_TAG_TOKEN` PAT, because a tag pushed with the default `GITHUB_TOKEN` starts no workflow run and would leave the tag standing with no release behind it.
+
 ### Changed
 
 ### Fixed
