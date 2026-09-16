@@ -686,7 +686,7 @@ cargo test -p lorica-cluster --tests
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 
-The `lorica` binary crate carries 18 end-to-end binaries under
+The `lorica` binary crate carries 19 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends
 (mTLS, response rewriting, mirroring, forward auth, stale-while-revalidate,
 the connection pre-filter, canary and header routing, config reload, rate
