@@ -204,6 +204,12 @@ impl ClusterPlane {
         )]
     }
 
+    /// The operational bind's port, so another listener family's
+    /// validator can refuse to share it (`ReservedPorts::cluster`).
+    pub fn operational_port(&self) -> u16 {
+        self.operational_bind.port()
+    }
+
     /// Stop both listeners, every established session and the
     /// background tasks.
     pub fn shutdown(self) {

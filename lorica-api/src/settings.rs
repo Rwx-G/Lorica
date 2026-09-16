@@ -364,6 +364,10 @@ pub struct UpdateSettingsRequest {
     pub connection_deny_cidrs: Option<Vec<String>>,
     /// CIDRs allowed at TCP accept time (default-deny when non-empty).
     pub connection_allow_cidrs: Option<Vec<String>>,
+    /// Source networks allowed to reach the automation API listener
+    /// (`--automation-listen`). Always default-deny: the listener
+    /// refuses to open while this is empty.
+    pub automation_allowed_cidrs: Option<Vec<String>>,
     /// OTLP collector endpoint URL.
     pub otlp_endpoint: Option<String>,
     /// OTLP transport protocol (`grpc` / `http-proto` / `http-json`).
@@ -611,6 +615,11 @@ pub async fn update_settings(
             body.connection_allow_cidrs,
             &mut settings.connection_allow_cidrs,
             "connection_allow_cidrs",
+        )?;
+        apply_cidr_list(
+            body.automation_allowed_cidrs,
+            &mut settings.automation_allowed_cidrs,
+            "automation_allowed_cidrs",
         )?;
         apply_otlp_endpoint(body.otlp_endpoint, &mut settings.otlp_endpoint)?;
         apply_string_choice(

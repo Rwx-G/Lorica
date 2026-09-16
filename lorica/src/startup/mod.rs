@@ -21,6 +21,7 @@
 //! module is the single source of truth for one such cluster;
 //! mode-specific differences are explicit parameters, never copies.
 
+pub(crate) mod automation;
 pub(crate) mod cluster_follower;
 pub(crate) mod cluster_plane;
 pub(crate) mod hot_upgrade;

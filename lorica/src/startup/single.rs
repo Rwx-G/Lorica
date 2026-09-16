@@ -249,6 +249,18 @@ pub(crate) fn run_single_process(cli: Cli) {
             Duration::from_secs(5 * 60),
         );
         let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&single_task_tracker);
+        // A capture rule that spends its total stops recording under
+        // the budget lock, but the stored `enabled` flag and the audit
+        // row are written here: the request path must never wait on a
+        // SQLite UPDATE. Without this task an operator sees a rule that
+        // still claims to be armed and no line saying why it stopped.
+        let _capture_disable = lorica::capture::spawn_capture_disable_task(
+            Arc::clone(lorica::capture::node_budgets()),
+            Arc::clone(&store),
+            log_store.clone(),
+            &single_task_tracker,
+            lorica::capture::CAPTURE_DISABLE_INTERVAL,
+        );
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
@@ -412,6 +424,14 @@ pub(crate) fn run_single_process(cli: Cli) {
             _ => None,
         };
 
+        let automation_listen = cli.automation_listen.clone();
+        let automation_listen_any = cli.automation_listen_any;
+        let automation_store = Arc::clone(&store);
+        // Read before the plane moves out of scope: the automation
+        // bind must not land on the port the cluster plane just took.
+        let cluster_operational_port: Option<u16> =
+            cluster_plane.as_ref().map(|plane| plane.operational_port());
+
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store.clone(),
@@ -448,6 +468,36 @@ pub(crate) fn run_single_process(cli: Cli) {
                 task_tracker: api_task_tracker,
                 cluster: cluster_runtime,
             };
+
+            // The automation API rides the same `AppState` as the
+            // management API and starts before it, so a refused
+            // listener stops the process instead of leaving the
+            // operator with a management API and no automation plane.
+            // Single-process mode never hot-upgrades, so it inherits
+            // nothing to adopt and nothing reads back the handoff slot
+            // it publishes into.
+            let automation = startup::automation::prepare_automation_listener(
+                startup::automation::AutomationOptions {
+                    automation_listen,
+                    listen_any: automation_listen_any,
+                    reserved: crate::cli::ReservedPorts {
+                        management: management_port,
+                        http: http_port,
+                        https: https_port,
+                        cluster: cluster_operational_port,
+                        automation: None,
+                    },
+                    inherited: Vec::new(),
+                    handoff: Arc::new(startup::automation::AutomationHandoff::default()),
+                },
+                &automation_store,
+                state.clone(),
+            )
+            .await;
+            if let Err(e) = automation {
+                error!(error = %e, "automation listener failed to start");
+                std::process::exit(1);
+            }
 
             // Session store + ACME auto-renewal + cert-expiry notifier
             // + server loop, shared with supervisor mode (audit H-9,

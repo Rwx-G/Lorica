@@ -2860,6 +2860,98 @@ async fn test_update_settings_sla_purge_retention_cap() {
 }
 
 #[tokio::test]
+async fn test_update_settings_automation_allowed_cidrs_rejects_a_typo() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    // The automation listener refuses to open on an allowlist it
+    // cannot parse, and it is read at boot. A typo caught here costs
+    // the operator one retry; the same typo stored costs them a
+    // listener that does not come back after the next restart.
+    let body = serde_json::json!({
+        "automation_allowed_cidrs": ["10.0.0.0/8", "10.0.0.0/33"]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&payload).expect("test setup");
+    let message = json["error"]["message"].as_str().unwrap_or("");
+    // The message names the field and the offending entry: an
+    // allowlist is a list, and "one of them is wrong" is not enough
+    // to act on.
+    assert!(message.contains("automation_allowed_cidrs"), "{message}");
+    assert!(message.contains("10.0.0.0/33"), "{message}");
+
+    // Nothing was stored: the write is all-or-nothing, so the good
+    // entry did not land either.
+    let stored = state
+        .store
+        .lock()
+        .await
+        .get_global_settings()
+        .expect("test setup");
+    assert!(stored.automation_allowed_cidrs.is_empty());
+}
+
+#[tokio::test]
+async fn test_update_settings_automation_allowed_cidrs_roundtrip() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    // A bare address beside a CIDR: the listener promotes it to a
+    // single-host network, so the API must accept both spellings.
+    let body = serde_json::json!({
+        "automation_allowed_cidrs": ["10.0.0.0/8", "192.0.2.10"]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&payload).expect("test setup");
+    assert_eq!(
+        json["data"]["automation_allowed_cidrs"],
+        serde_json::json!(["10.0.0.0/8", "192.0.2.10"])
+    );
+}
+
+#[tokio::test]
 async fn test_update_settings_cert_export_roundtrip() {
     let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;

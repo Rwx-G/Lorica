@@ -93,6 +93,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     // socket is only bound while a join token is
                     // live, and it rebinds on the next liveness edge).
                     cluster_listeners = i.cluster.len(),
+                    automation_listeners = i.automation.len(),
                     "hot upgrade: pulled inherited listeners from outgoing supervisor"
                 );
                 Some(i)
@@ -1049,6 +1050,33 @@ pub(crate) fn run_supervisor(cli: Cli) {
             _ => None,
         };
 
+        // The automation listener's inherited sockets, partitioned out
+        // of the pulled FD table beside the cluster ones above. Every
+        // entry is handed to `prepare_automation_listener`, which
+        // adopts or closes each by comparing it to the configured
+        // bind: a descriptor that reaches neither would leak for the
+        // process lifetime.
+        let inherited_automation: Vec<(String, RawFd)> = inherited
+            .as_ref()
+            .map(|i| i.automation.clone())
+            .unwrap_or_default();
+        let automation_listen = hu_cli.automation_listen.clone();
+        let automation_listen_any = hu_cli.automation_listen_any;
+        let automation_store = Arc::clone(&store);
+        // The listener opens inside the API task below, and the
+        // upgrade that hands its socket to the next binary runs out
+        // here, so the dup travels through this slot rather than a
+        // return value.
+        let automation_handoff = Arc::new(startup::automation::AutomationHandoff::default());
+        let task_automation_handoff = Arc::clone(&automation_handoff);
+        let automation_http_port = hu_cli.http_port;
+        let automation_https_port = hu_cli.https_port;
+        // Read before the plane moves into the API task: the
+        // automation bind must not land on the port the cluster plane
+        // just took.
+        let cluster_operational_port: Option<u16> =
+            cluster_plane.as_ref().map(|plane| plane.operational_port());
+
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -1084,6 +1112,33 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 task_tracker: api_task_tracker,
                 cluster: cluster_runtime,
             };
+            // The automation API rides the same `AppState` as the
+            // management API and starts before it, so a refused
+            // listener stops the process instead of leaving the
+            // operator with a management API and no automation plane.
+            let automation = startup::automation::prepare_automation_listener(
+                startup::automation::AutomationOptions {
+                    automation_listen,
+                    listen_any: automation_listen_any,
+                    reserved: crate::cli::ReservedPorts {
+                        management: management_port,
+                        http: automation_http_port,
+                        https: automation_https_port,
+                        cluster: cluster_operational_port,
+                        automation: None,
+                    },
+                    inherited: inherited_automation,
+                    handoff: task_automation_handoff,
+                },
+                &automation_store,
+                state.clone(),
+            )
+            .await;
+            if let Err(e) = automation {
+                error!(error = %e, "automation listener failed to start");
+                std::process::exit(1);
+            }
+
             // Session store + ACME auto-renewal + cert-expiry notifier
             // + server loop, shared with single-process mode (audit
             // H-9, see `startup::run_api_server`). The management listener
@@ -1475,6 +1530,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             .as_ref()
                             .map(|plane| plane.handoff_fds())
                             .unwrap_or_default(),
+                        // The automation listener rides the same FD
+                        // handoff. Empty when the node runs without
+                        // `--automation-listen`, in which case the new
+                        // side binds nothing either.
+                        automation_fds: automation_handoff.fds(),
                         child_argv,
                     })
                     .await;

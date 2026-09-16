@@ -1589,6 +1589,11 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             syslog_extra_sd: _,
             otlp_logs_enabled: _,
             otlp_logs_auth_header: _,
+            // The automation listener only ever runs on a control
+            // plane (a follower refuses to start it), and the set of
+            // machines allowed to reach THIS node's socket is a
+            // property of where the node sits, not of fleet policy.
+            automation_allowed_cidrs: _,
         } = GlobalSettings::default();
     }
 

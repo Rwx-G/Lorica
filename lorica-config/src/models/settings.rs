@@ -206,6 +206,16 @@ pub struct GlobalSettings {
     /// Examples: `["10.0.0.0/8", "192.168.0.0/16"]`.
     #[serde(default)]
     pub connection_allow_cidrs: Vec<String>,
+    /// Source networks allowed to reach the automation API listener
+    /// (`--automation-listen`). Mandatory and non-empty when that flag
+    /// is passed: the listener refuses to open without one, because a
+    /// network-reachable configuration API with no source allowlist is
+    /// not a default anyone should get by omission. Bare addresses are
+    /// accepted and promoted to single-host networks, as in
+    /// `connection_allow_cidrs`.
+    /// Examples: `["10.0.0.0/8", "192.0.2.10"]`.
+    #[serde(default)]
+    pub automation_allowed_cidrs: Vec<String>,
     /// Maximum simultaneous TCP connections per source IP, refused at
     /// accept() before the TLS handshake (Story 8.9 AC #5). `None` =
     /// no cap. The cap is per worker process: in multi-worker mode
@@ -692,6 +702,7 @@ impl Default for GlobalSettings {
             waf_whitelist_ips: Vec::new(),
             connection_deny_cidrs: Vec::new(),
             connection_allow_cidrs: Vec::new(),
+            automation_allowed_cidrs: Vec::new(),
             connection_limits_per_ip: None,
             otlp_endpoint: None,
             otlp_protocol: default_otlp_protocol(),

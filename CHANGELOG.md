@@ -19,6 +19,10 @@ Author: Rwx-G
 
 ### Fixed
 
+- **The automation listener survives a hot upgrade.** The FD-transfer wire format has carried the automation family since the listener shipped, but nothing was ever put in it: `start_automation_server` bound its own socket and took no inherited listener, so the new supervisor rebound the port while the outgoing one was still accepting on it. The result was `EADDRINUSE` and an automation plane that never opened after an upgrade. The listener now takes an `Option<std::net::TcpListener>` exactly as the management one does, the supervisor keeps a long-lived dup of the socket and hands it over in `HandoffArgs::automation_fds`, and the new side adopts the socket bound where it is configured to listen rather than binding a fresh one. A descriptor bound anywhere else is closed rather than served, the same guard the cluster plane applies: two binaries disagreeing about the bind is not a reason to accept on an address nothing logs.
+- **`automation_allowed_cidrs` can be set.** The setting existed in the store and the listener refuses to open without it, but no management endpoint wrote it, so the allowlist was empty on every node and `--automation-listen` could only ever refuse. `PUT /api/v1/settings` now accepts it beside `connection_allow_cidrs` and validates every entry at write time, so a typo is refused with the offending entry named instead of surfacing as a listener that does not come back after a restart.
+- **A capture rule that spends its budget is now disabled in the store.** The rule stopped recording the instant its `max_captures` was spent, but the task that persists the `enabled` flag and writes the audit row was never started in either the single-process or the worker path. An operator saw a rule that still claimed to be armed, and nothing anywhere saying why it had gone quiet. Both paths now register it with their background-task tracker.
+
 ### Removed
 
 ### Security

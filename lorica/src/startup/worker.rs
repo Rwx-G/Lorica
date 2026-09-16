@@ -724,12 +724,33 @@ pub(crate) fn run_worker(
     // route_hostname and action stamped). SQLite WAL mode allows concurrent
     // writes from multiple worker processes. Writes go through the
     // per-worker background log writer (backlog #24).
-    lorica_proxy.log_writer = match lorica_api::log_store::LogStore::open(&data_dir) {
-        Ok(s) => Some(lorica_api::log_writer::spawn_log_writer(Arc::new(s))),
-        Err(e) => {
-            warn!(error = %e, "worker: failed to open log store, WAF event persistence disabled");
-            None
-        }
+    let worker_log_store: Option<Arc<lorica_api::log_store::LogStore>> =
+        match lorica_api::log_store::LogStore::open(&data_dir) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                warn!(error = %e, "worker: failed to open log store, WAF event persistence disabled");
+                None
+            }
+        };
+    lorica_proxy.log_writer = worker_log_store
+        .as_ref()
+        .map(|store| lorica_api::log_writer::spawn_log_writer(Arc::clone(store)));
+    // The capture self-disable writer. Capture admission happens in
+    // this process, so the queue it drains is this process's; without
+    // the task a rule that spent its total keeps its stored `enabled`
+    // flag and never produces the audit row that says why it stopped.
+    // Registered here rather than beside the prunes above because it
+    // needs the log store opened just now, and `_rt_guard` is already
+    // gone by this point.
+    let _capture_disable = {
+        let _rt_guard = rt.enter();
+        lorica::capture::spawn_capture_disable_task(
+            Arc::clone(lorica::capture::node_budgets()),
+            Arc::clone(&store),
+            worker_log_store,
+            &worker_auth_prune_tracker,
+            lorica::capture::CAPTURE_DISABLE_INTERVAL,
+        )
     };
     // ACME challenge store backed by SQLite - workers can read challenges set by supervisor
     lorica_proxy.acme_challenge_store = Some(lorica_api::acme::AcmeChallengeStore::with_db_path(

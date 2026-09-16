@@ -141,6 +141,14 @@ impl ConfigStore {
                             ))
                         })?;
                 }
+                "automation_allowed_cidrs" => {
+                    settings.automation_allowed_cidrs =
+                        serde_json::from_str(&value).map_err(|e| {
+                            ConfigError::Validation(format!(
+                                "invalid automation_allowed_cidrs JSON: {e}"
+                            ))
+                        })?;
+                }
                 "otlp_endpoint" => {
                     settings.otlp_endpoint = if value.is_empty() { None } else { Some(value) };
                 }
@@ -440,6 +448,16 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('connection_allow_cidrs', ?1)",
             params![connection_allow_json],
+        )?;
+        let automation_allowed_json = serde_json::to_string(&settings.automation_allowed_cidrs)
+            .map_err(|e| {
+                ConfigError::Validation(format!(
+                    "failed to serialize automation_allowed_cidrs: {e}"
+                ))
+            })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('automation_allowed_cidrs', ?1)",
+            params![automation_allowed_json],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_endpoint', ?1)",

@@ -63,7 +63,8 @@ pub enum AutomationListenerError {
     /// The management TLS material could not be assembled.
     #[error("automation listener TLS setup failed: {0}")]
     Tls(String),
-    /// The socket could not be bound.
+    /// The socket could not be bound, or the socket inherited from an
+    /// outgoing supervisor could not be adopted.
     #[error("automation listener could not bind {addr}: {source}")]
     Bind {
         /// The address that was asked for.
@@ -140,14 +141,18 @@ impl AutomationListenerConfig {
 
 /// Start the automation API on its own socket, over TLS.
 ///
-/// Differs from [`crate::server::start_server`] in four ways: it binds
-/// the operator's address instead of loopback, it takes no
+/// Differs from [`crate::server::start_server`] in three ways: it
+/// binds the operator's address instead of loopback, it takes no
 /// `SessionStore` and no `RateLimiter` (the plane has no session and
-/// no cookie), it filters the peer address and takes the pre-auth
-/// budgets before the handshake, and it adopts no inherited socket
-/// (hot-upgrade handoff for this listener is a later slice, and
-/// pretending to support it here would leave a rebind gap nobody
-/// tested).
+/// no cookie), and it filters the peer address and takes the pre-auth
+/// budgets before the handshake.
+///
+/// `inherited_listener` follows that function's contract exactly:
+/// `Some` serves the pre-bound socket an outgoing supervisor handed
+/// over on a hot upgrade, so the automation port is served on the SAME
+/// kernel listening socket with no rebind gap and no `EADDRINUSE`
+/// during the overlap; `None` binds `config.addr` fresh. The caller
+/// sets non-blocking mode before handing the socket over.
 ///
 /// TLS material is the management plane's: the same self-signed leaf
 /// or operator-supplied pair, from
@@ -163,6 +168,7 @@ impl AutomationListenerConfig {
 pub async fn start_automation_server(
     config: AutomationListenerConfig,
     state: AppState,
+    inherited_listener: Option<std::net::TcpListener>,
 ) -> Result<(), AutomationListenerError> {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use hyper_util::server::conn::auto::Builder as HyperAutoBuilder;
@@ -195,12 +201,20 @@ pub async fn start_automation_server(
     let mut make_service = super::router::build_automation_router(state)
         .into_make_service_with_connect_info::<SocketAddr>();
 
-    let listener: tokio::net::TcpListener = tokio::net::TcpListener::bind(config.addr)
-        .await
-        .map_err(|source| AutomationListenerError::Bind {
-            addr: config.addr,
-            source,
-        })?;
+    let listener: tokio::net::TcpListener = match inherited_listener {
+        Some(std_listener) => {
+            info!(
+                addr = %config.addr,
+                "automation listener adopting the inherited socket (hot upgrade)"
+            );
+            tokio::net::TcpListener::from_std(std_listener)
+        }
+        None => tokio::net::TcpListener::bind(config.addr).await,
+    }
+    .map_err(|source| AutomationListenerError::Bind {
+        addr: config.addr,
+        source,
+    })?;
     info!(
         addr = %config.addr,
         allowed_cidrs = config.allowed_cidrs.len(),

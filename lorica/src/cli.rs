@@ -569,6 +569,12 @@ const CLUSTER_ENROLLMENT_LISTEN: ListenFlag<'static> = ListenFlag {
     subject: "the cluster plane",
 };
 
+const AUTOMATION_LISTEN: ListenFlag<'static> = ListenFlag {
+    flag: "--automation-listen",
+    any_flag: "--automation-listen-any",
+    subject: "the automation API",
+};
+
 /// The one definition of a refused listener bind, shared by every
 /// listener family Lorica exposes so the rule cannot drift between
 /// them. A bare port, an unparseable address, port 0 and a wildcard
@@ -638,6 +644,26 @@ fn refuse_reserved(
         }
         None => Ok(()),
     }
+}
+
+/// Validate `--automation-listen` (Story 10.3). Same rules as every
+/// other listener family: an explicit `host:port`, a non-zero port, a
+/// wildcard host only under `--automation-listen-any`, and no port
+/// another listener in this process already holds.
+///
+/// `reserved` describes the whole process; `reserved.automation` is
+/// cleared here because a listener does not collide with itself, so a
+/// caller can pass one `ReservedPorts` everywhere.
+pub(crate) fn validate_automation_listen(
+    value: &str,
+    reserved: ReservedPorts,
+    allow_any: bool,
+) -> Result<std::net::SocketAddr, String> {
+    let reserved = ReservedPorts {
+        automation: None,
+        ..reserved
+    };
+    validate_listen_bind(AUTOMATION_LISTEN, value, reserved, allow_any)
 }
 
 /// Validate the cluster-plane CLI per Story 9.2 AC #11. Both binds
@@ -1162,12 +1188,6 @@ mod tests {
         automation: None,
     };
 
-    const AUTOMATION_LISTEN: ListenFlag<'static> = ListenFlag {
-        flag: "--automation-listen",
-        any_flag: "--automation-listen-any",
-        subject: "the automation API",
-    };
-
     #[test]
     fn a_non_cluster_listener_is_refused_under_its_own_flag_names() {
         // The refusal matrix belongs to every listener family, and each
@@ -1220,6 +1240,38 @@ mod tests {
             on_automation.contains("the automation API port"),
             "{on_automation}"
         );
+    }
+
+    #[test]
+    fn the_automation_bind_refuses_every_port_but_its_own() {
+        // The startup path hands `validate_automation_listen` one
+        // ReservedPorts describing the whole process. The cluster and
+        // management ports must be refused by name; the automation
+        // port in that same struct is this listener's OWN bind, so it
+        // must not refuse itself.
+        let reserved = ReservedPorts {
+            cluster: Some(9444),
+            automation: Some(9600),
+            ..RESERVED
+        };
+
+        let on_cluster = validate_automation_listen("192.0.2.10:9444", reserved, false)
+            .expect_err("the cluster plane already holds 9444");
+        assert!(
+            on_cluster.contains("the cluster plane port"),
+            "{on_cluster}"
+        );
+
+        let on_management = validate_automation_listen("192.0.2.10:9443", reserved, false)
+            .expect_err("the management API already holds 9443");
+        assert!(
+            on_management.contains("the management API port"),
+            "{on_management}"
+        );
+
+        let own = validate_automation_listen("192.0.2.10:9600", reserved, false)
+            .expect("a listener does not collide with itself");
+        assert_eq!(own.port(), 9600);
     }
 
     #[test]

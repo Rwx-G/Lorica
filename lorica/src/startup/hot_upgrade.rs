@@ -106,6 +106,15 @@ const MANAGEMENT_KEY_PREFIX: &str = "management:";
 /// hot-upgrade compatibility event, not a refactor.
 const CLUSTER_KEY_PREFIX: &str = "cluster:";
 
+/// `Fds` table key prefix for the automation-API listener (Story 10.3).
+///
+/// It needs a prefix of its own for one reason: `partition_inherited_fds`
+/// files every key it does not recognise into the proxy set, because a
+/// proxy listener is keyed by its bare bind address. Without this arm
+/// the automation socket would be adopted as a proxy listener on the
+/// first hot upgrade, silently, with no error anywhere.
+const AUTOMATION_KEY_PREFIX: &str = "automation:";
+
 /// Role of a cluster-plane listener in the FD-handoff table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterListenerRole {
@@ -137,6 +146,12 @@ impl ClusterListenerRole {
 /// `bind_addr`: `cluster:<role>:<bind>`.
 pub fn cluster_fds_key(role: ClusterListenerRole, bind_addr: &str) -> String {
     format!("{CLUSTER_KEY_PREFIX}{}:{bind_addr}", role.key_part())
+}
+
+/// `Fds` table key for the automation listener bound at `bind_addr`:
+/// `automation:<bind>`.
+pub fn automation_fds_key(bind_addr: &str) -> String {
+    format!("{AUTOMATION_KEY_PREFIX}{bind_addr}")
 }
 
 /// `<data_dir>/upgrade` - the operator-only staging directory shared with
@@ -251,17 +266,22 @@ pub struct InheritedListeners {
     /// outgoing supervisor ran with `--cluster-listen` (Story 9.1
     /// AC #7; the listeners themselves land in Story 9.2).
     pub cluster: Vec<(ClusterListenerRole, String, RawFd)>,
+    /// Automation-API listeners (bind address, FD), if the outgoing
+    /// supervisor ran with `--automation-listen` (Story 10.3).
+    pub automation: Vec<(String, RawFd)>,
 }
 
 /// Build the `Fds` table the old supervisor serves: every proxy listener
 /// keyed by its bind address, the management listener under the
-/// [`MANAGEMENT_KEY_PREFIX`] key, and each cluster listener (when
-/// present) under its role-qualified [`CLUSTER_KEY_PREFIX`] key.
+/// [`MANAGEMENT_KEY_PREFIX`] key, each cluster listener (when present)
+/// under its role-qualified [`CLUSTER_KEY_PREFIX`] key, and the
+/// automation listener under its [`AUTOMATION_KEY_PREFIX`] key.
 fn build_fds_table(
     proxy: &[(String, RawFd)],
     management_fd: RawFd,
     management_port: u16,
     cluster: &[(ClusterListenerRole, String, RawFd)],
+    automation: &[(String, RawFd)],
 ) -> Fds {
     let mut fds = Fds::new();
     for (addr, fd) in proxy {
@@ -270,6 +290,9 @@ fn build_fds_table(
     fds.add(management_fds_key(management_port), management_fd);
     for (role, bind, fd) in cluster {
         fds.add(cluster_fds_key(*role, bind), *fd);
+    }
+    for (bind, fd) in automation {
+        fds.add(automation_fds_key(bind), *fd);
     }
     fds
 }
@@ -285,8 +308,9 @@ pub fn serve_listener_fds_blocking(
     management_fd: RawFd,
     management_port: u16,
     cluster: &[(ClusterListenerRole, String, RawFd)],
+    automation: &[(String, RawFd)],
 ) -> Result<(), String> {
-    let table = build_fds_table(proxy, management_fd, management_port, cluster);
+    let table = build_fds_table(proxy, management_fd, management_port, cluster, automation);
     let sock = transfer_sock_path(data_dir);
     let sock_str = sock.to_string_lossy().into_owned();
     table
@@ -316,14 +340,21 @@ pub fn pull_inherited_listeners(
     partition_inherited_fds(serialized_keys, serialized_fds, management_port)
 }
 
-/// Partition a pulled FD table into proxy / management / cluster
-/// listeners by key prefix. Pure (no socket ops), so the wire-format
-/// partitioning is unit-testable without an SCM_RIGHTS round-trip.
+/// Partition a pulled FD table into proxy / management / cluster /
+/// automation listeners by key prefix. Pure (no socket ops), so the
+/// wire-format partitioning is unit-testable without an SCM_RIGHTS
+/// round-trip.
+///
+/// The final arm is a catch-all: a proxy listener is keyed by its bare
+/// bind address, so anything without a known prefix is taken for one.
+/// Every new listener family therefore needs its arm added ABOVE that
+/// catch-all, or its socket is adopted as a proxy listener with no
+/// error raised anywhere.
 ///
 /// The table's only producer is the outgoing supervisor's own
-/// `build_fds_table`, so a duplicate management/cluster key or an
-/// unknown cluster role means the two binaries disagree about the
-/// wire format - failing the pull (which rolls the upgrade back)
+/// `build_fds_table`, so a duplicate management/cluster/automation key
+/// or an unknown cluster role means the two binaries disagree about
+/// the wire format - failing the pull (which rolls the upgrade back)
 /// beats silently dropping a descriptor.
 fn partition_inherited_fds(
     keys: Vec<String>,
@@ -334,6 +365,7 @@ fn partition_inherited_fds(
     let mut proxy: Vec<(String, RawFd)> = Vec::new();
     let mut management: Option<RawFd> = None;
     let mut cluster: Vec<(ClusterListenerRole, String, RawFd)> = Vec::new();
+    let mut automation: Vec<(String, RawFd)> = Vec::new();
     for (key, fd) in keys.into_iter().zip(fds) {
         if key.starts_with(MANAGEMENT_KEY_PREFIX) {
             if management.is_some() {
@@ -363,6 +395,13 @@ fn partition_inherited_fds(
                 ));
             }
             cluster.push((role, bind.to_string(), fd));
+        } else if let Some(bind) = key.strip_prefix(AUTOMATION_KEY_PREFIX) {
+            if automation.iter().any(|(b, _)| b == bind) {
+                return Err(format!(
+                    "inherited FD table carries a duplicate automation key `{key}`"
+                ));
+            }
+            automation.push((bind.to_string(), fd));
         } else {
             proxy.push((key, fd));
         }
@@ -371,6 +410,7 @@ fn partition_inherited_fds(
         proxy,
         management,
         cluster,
+        automation,
     })
 }
 
@@ -524,6 +564,9 @@ pub struct HandoffArgs {
     /// when the node runs with `--cluster-listen` (Story 9.1 AC #7;
     /// wired by Story 9.2, always empty until then).
     pub cluster_fds: Vec<(ClusterListenerRole, String, RawFd)>,
+    /// Automation-API listeners (bind address, FD) to hand over, when
+    /// the node runs with `--automation-listen` (Story 10.3).
+    pub automation_fds: Vec<(String, RawFd)>,
     /// Full argv for the new binary, `argv[0]` first.
     pub child_argv: Vec<String>,
 }
@@ -579,6 +622,7 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
     let serve_mgmt = args.management_fd;
     let serve_port = args.management_port;
     let serve_cluster = args.cluster_fds.clone();
+    let serve_automation = args.automation_fds.clone();
     let serve_task = tokio::task::spawn_blocking(move || {
         serve_listener_fds_blocking(
             &serve_data_dir,
@@ -586,6 +630,7 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
             serve_mgmt,
             serve_port,
             &serve_cluster,
+            &serve_automation,
         )
     });
 
@@ -671,6 +716,100 @@ mod tests {
     }
 
     #[test]
+    fn an_automation_key_never_falls_into_the_proxy_set() {
+        // The failure this guards is silent, not loud: the last arm of
+        // `partition_inherited_fds` takes every unrecognised key for a
+        // proxy listener, because that is how a proxy listener is
+        // keyed. Without the automation arm the automation socket is
+        // adopted as a proxy listener on the first hot upgrade, with
+        // no error and no log line anywhere.
+        let keys = vec![
+            "0.0.0.0:8080".to_string(),
+            management_fds_key(9443),
+            automation_fds_key("192.0.2.10:9600"),
+        ];
+        let inherited =
+            partition_inherited_fds(keys, vec![40, 41, 42], 9443).expect("partition succeeds");
+        assert_eq!(
+            inherited.automation,
+            vec![("192.0.2.10:9600".to_string(), 42)]
+        );
+        assert_eq!(inherited.proxy, vec![("0.0.0.0:8080".to_string(), 40)]);
+
+        // An unknown prefix is still a proxy listener: the catch-all is
+        // the wire format, not an oversight.
+        let inherited = partition_inherited_fds(
+            vec![
+                "0.0.0.0:8080".to_string(),
+                "mystery:192.0.2.10:1".to_string(),
+            ],
+            vec![43, 44],
+            9443,
+        )
+        .expect("partition succeeds");
+        assert!(inherited.automation.is_empty());
+        assert_eq!(inherited.proxy.len(), 2);
+
+        // A duplicate is a version disagreement, like the other
+        // families: fail the pull rather than leak a descriptor.
+        let key = automation_fds_key("192.0.2.10:9600");
+        let err = partition_inherited_fds(vec![key.clone(), key], vec![45, 46], 9443)
+            .expect_err("duplicate automation key must fail");
+        assert!(err.contains("duplicate automation key"), "{err}");
+    }
+
+    #[test]
+    fn automation_handoff_entries_round_trip_through_the_fds_table() {
+        // What the supervisor puts in `HandoffArgs::automation_fds`
+        // must come back out of the new side's partition unchanged,
+        // IPv6 binds (which carry colons of their own) included.
+        let automation = vec![
+            ("192.0.2.10:9600".to_string(), 50),
+            ("[2001:db8::1]:9600".to_string(), 51),
+        ];
+        let table = build_fds_table(
+            &[("0.0.0.0:8080".to_string(), 10)],
+            12,
+            9443,
+            &[],
+            &automation,
+        );
+        let (keys, fds) = table.serialize();
+        let mut inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
+        assert_eq!(inherited.proxy, vec![("0.0.0.0:8080".to_string(), 10)]);
+        assert_eq!(inherited.management, Some(12));
+        // The table is a map: compare order-independently.
+        inherited.automation.sort_by_key(|(_, fd)| *fd);
+        assert_eq!(inherited.automation, automation);
+    }
+
+    #[test]
+    fn an_automation_fd_produced_on_the_old_side_reaches_the_new_side() {
+        // The producer half of the automation handoff, end to end:
+        // `prepare_automation_listener` publishes a dup of the live
+        // socket in the slot, the supervisor fills
+        // `HandoffArgs::automation_fds` from it, and the new side must
+        // partition that descriptor back into the automation field -
+        // not into the proxy catch-all, and not into nothing at all,
+        // which is what an empty `automation_fds` used to guarantee.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test listener");
+        let bind = listener.local_addr().expect("test bind address");
+        let handoff = crate::startup::automation::AutomationHandoff::default();
+        handoff.publish(bind, listener.try_clone().expect("test dup"));
+
+        let produced: Vec<(String, RawFd)> = handoff.fds();
+        assert_eq!(produced.len(), 1);
+        assert_eq!(produced[0].0, bind.to_string());
+
+        let table = build_fds_table(&[], 12, 9443, &[], &produced);
+        let (keys, fds) = table.serialize();
+        let inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
+        assert_eq!(inherited.automation, produced);
+        assert_eq!(inherited.management, Some(12));
+        assert!(inherited.proxy.is_empty());
+    }
+
+    #[test]
     fn cluster_handoff_entries_round_trip_through_the_fds_table() {
         // What `ClusterPlane::handoff_fds()` produces goes through
         // `build_fds_table` on the old side and `partition_inherited_fds`
@@ -689,7 +828,7 @@ mod tests {
                 32,
             ),
         ];
-        let table = build_fds_table(&[("0.0.0.0:8080".to_string(), 10)], 12, 9443, &cluster);
+        let table = build_fds_table(&[("0.0.0.0:8080".to_string(), 10)], 12, 9443, &cluster, &[]);
         let (keys, fds) = table.serialize();
         let mut inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
         assert_eq!(inherited.proxy, vec![("0.0.0.0:8080".to_string(), 10)]);

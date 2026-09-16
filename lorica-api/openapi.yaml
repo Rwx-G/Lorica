@@ -448,6 +448,12 @@ paths:
                     type: string
                   description: When non-empty, only listed IPs are accepted at TCP accept (default-deny mode). Leave empty for default-allow.
                   example: ["10.0.0.0/8", "192.168.0.0/16"]
+                automation_allowed_cidrs:
+                  type: array
+                  items:
+                    type: string
+                  description: Source networks allowed to reach the automation API listener (--automation-listen). Always default-deny; the listener refuses to open while this is empty.
+                  example: ["10.0.0.0/8", "192.0.2.10"]
       responses:
         "200":
           description: Settings updated
