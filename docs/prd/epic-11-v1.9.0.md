@@ -2,7 +2,7 @@
 
 **Author:** Romain G.
 **Target version:** 1.9.0
-**Status:** Draft (2026-09-16, written against the Epic 10 Story 10.3 token design; the prior-art section is explicitly unverified and must be checked before Story 11.1 starts)
+**Status:** Draft (2026-09-16, written against the Epic 10 Story 10.3 token design. Revised the same day after a documentation pass on the MCP 2026-07-28 specification and on what infrastructure vendors ship: D1 reversed, the prior-art section replaced with verified material.)
 
 **Epic Goal:** Let an operator drive Lorica from an MCP client the way they drive it from the dashboard, without giving that client more authority than the task needs. Three tiers: **read** (logs, WAF events, SLA, fleet status, and the configuration as it stands), **config** (routes, backends, certificates), **admin** (settings, users, cluster mutations). A tier is not a mode the server switches between; it is the scope set of the token the server was started with, so a session that can read logs cannot write configuration by construction rather than by policy.
 
@@ -21,9 +21,17 @@ That is indirect prompt injection with a real blast radius, and it is what the t
 
 ## Decisions taken up front
 
-**D1 - Transport is stdio, and the server runs on the operator's machine.** The MCP client launches it; there is no listener, no port, no new thing to defend, and the credential is one the operator already holds. A network-reachable MCP server is a third management plane with its own exposure, and this epic does not build one. If a hosted MCP server is ever wanted, it is a separate decision with its own threat-model section, not a transport flag.
+**D1 - Streamable HTTP, mounted on the Story 10.3 automation listener, with stdio as the second transport.** The first draft of this PRD said stdio only. That was wrong on ergonomics and behind the ecosystem: it means a binary installed and configured on every machine, per tier, and the 2026-07-28 specification's remote transport is Streamable HTTP, which every hosted product in this space now speaks.
+
+What survives from the original reasoning is the part that mattered: **no third management plane**. The MCP endpoint is a path on the automation listener Story 10.3 already builds, not a new port. It inherits that listener's TLS, its mandatory source-CIDR allowlist, its connection caps and per-IP limiter, its bearer tokens with HMAC-stored secrets and immediate revocation, and its per-request audit. An operator who does not enable the automation listener gains no MCP surface, and one who does gains a path, not a port.
+
+Three properties of the current specification make this fit rather than force it: the protocol is transport-agnostic, so supporting both bindings costs one adapter; revision 2026-07-28 removed protocol-level sessions and made the protocol stateless, which matches a server whose state lives in the API behind it; and the transport's own security requirements are things this listener does or must now do anyway (see Story 11.1 AC #9).
+
+stdio stays supported for the local case, where the client launches the server as a subprocess and no listener is involved at all. It is the better answer for a workstation-only setup and for anyone who does not want the automation listener enabled.
 
 **D2 - A tier is a scope set on a Story 10.3 token.** No second authorization model. The MCP server has no notion of permission beyond "the API refused that"; it discovers its own tier by asking the API what its token can do, and exposes only the matching tools.
+
+This is the pattern the field converged on: Scalr's MCP OAuth inherits Scalr's own RBAC, and Spacelift splits its surface under `mcp:read` and `mcp:write` scopes. The counter-pattern exists too, HashiCorp gates Terraform write operations behind an `ENABLE_TF_OPERATIONS=true` environment variable, and this epic refuses it: a runtime switch is one misconfiguration away from a session that reads hostile text and holds write tools, which is precisely the failure this tiering exists to prevent.
 
 **D3 - The server is a client of the automation listener, not of the management API.** It gets the CIDR allowlist, the token lifecycle, the revocation path and the request audit for free, and the management API stays on loopback with session credentials the server never sees.
 
@@ -39,11 +47,34 @@ That is indirect prompt injection with a real blast radius, and it is what the t
 
 ## Prior Art
 
-**Unverified.** Written from general knowledge of the protocol and of infrastructure MCP servers, not from a documentation pass. Check each line before Story 11.1 starts, the way Epic 10's prior-art table was checked.
+Verified against the specification and vendor documentation on 2026-09-16.
 
-What the protocol gives: tools (callable, with a JSON schema), resources (addressable read-only content), prompts (templates), over stdio or HTTP, with the client owning the human-in-the-loop confirmation. What it does **not** give: a server-side notion of "this call needs approval". A server cannot force a confirmation; it can only make a destructive tool narrow, named unambiguously, and impossible to invoke in bulk. Any design that relies on the client asking the human first is relying on someone else's configuration.
+### The protocol as it stands
 
-Patterns worth borrowing from infrastructure MCP servers generally: read and write surfaces split into separate servers rather than separate tools; resources used for "here is the current state" and tools reserved for actions; and a dry-run or diff tool preceding any apply. Patterns worth refusing: a single server with a `--read-only` flag (a flag is a runtime switch, which D2 rejects), and tools that accept raw queries or raw configuration blobs, which turn the server into an arbitrary-execution surface with extra steps.
+The 2026-07-28 revision defines two standard bindings, [stdio and Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports), and states that protocol semantics are identical on both: a binding defines framing and delivery, not meaning. Streamable HTTP is a single endpoint accepting POST, answering either with one JSON object or a request-scoped SSE stream. That revision **removed protocol-level sessions and the standalone GET stream**, making the protocol stateless. It also mirrors selected body fields into HTTP headers (`Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version`) so intermediaries can route and inspect without parsing bodies, and requires servers to reject any mismatch between header and body with a `HeaderMismatch` error, explicitly so that a load balancer routing on the header and a server executing on the body cannot disagree.
+
+The transport page states three security requirements: servers **MUST** validate the `Origin` header and answer 403 when it is present and invalid, to prevent DNS rebinding; servers **SHOULD** bind only to localhost when running locally; servers **SHOULD** implement proper authentication. The specification also notes that custom transports over a reliable byte stream, such as a Unix domain socket, **SHOULD** reuse the stdio framing rather than inventing one, which is the cheapest future option if a socket-local binding is ever wanted.
+
+What the protocol does **not** give: a server-side notion of "this call needs approval". A server cannot force a confirmation; the client owns the human-in-the-loop. A server can only make a destructive tool narrow, unambiguously named, and impossible to invoke in bulk. Any design that leans on the client asking a human first is leaning on someone else's configuration.
+
+### What comparable products ship
+
+| Product | Transport and auth | Tiering model | What Lorica takes |
+|---|---|---|---|
+| Cloudflare | Remote, OAuth with PKCE via `workers-oauth-provider`; account-scoped and user-scoped tokens | Token scope | Confirms remote-with-OAuth as the hosted norm, and that the scope lives on the token |
+| Scalr | OAuth, **inheriting Scalr's own RBAC**; read scope covers environments, workspaces, runs, logs, policy results, drift, IAM, billing | Scope set mapped onto existing roles | The central idea of D2: the MCP tier is a projection of the product's existing authorization, not a new one |
+| Spacelift | Scoped | `mcp:read` and `mcp:write` | Read and write as distinct scopes rather than one surface with a flag |
+| HashiCorp (Terraform) | Local server | Write operations behind `ENABLE_TF_OPERATIONS=true` | The counter-pattern this epic refuses, see D2 |
+| Kong | API-to-MCP conversion at the gateway (AI Gateway) | Gateway policy | Confirms the "the gateway already has the authorization, project it" framing |
+| Grafana Cloud | Hosted MCP with per-service tokens | Per-service credential | Confirms that read-heavy observability surfaces are the ones shipped first |
+
+Sources: the MCP specification transport pages linked above; Cloudflare's MCP repository and blog; Grafana Cloud MCP documentation; Scalr's and Spacelift's MCP documentation as summarised in a 2026 comparison of Terraform-platform MCP servers; Kong AI Gateway material.
+
+### What the security literature says
+
+The consensus in 2026 guidance, including the OWASP MCP Top 10 and the OWASP GenAI secure-MCP-development guide, lands on three things this epic already does or now does: least privilege per tool rather than per server, a progressive scope model that starts read-only and widens only when a task needs it, and explicit delimiting of aggregated external content with a statement that the delimited text is data rather than instructions. The named risk classes are tool poisoning, prompt injection, memory poisoning and tool interference; NSA and CISA published formal design guidance on the same problem the same year.
+
+Lorica's position in that landscape is unusual in one way worth stating: most of these products expose an MCP surface over data their users produced. Lorica's read surface is **largely text produced by people attacking the operator**, which makes the injection path shorter and the tiering load-bearing rather than advisory.
 
 ---
 
@@ -61,8 +92,11 @@ so that I can read logs, WAF events, SLA and the current configuration without o
 4. **The read tool surface**: recent access-log rows with the filters the dashboard already offers, WAF events by category and time window, SLA windows per route, cluster and node status, and the current configuration as read-only listings (routes, backends, certificates with metadata only, never key material). Every tool is paginated with a hard cap on rows returned, because a model that asks for everything must not be able to pull a database into a context window.
 5. **Secrets never cross the boundary.** Certificate private keys, notification-channel credentials, DNS-provider credentials, Basic-auth hashes and session cookies are absent from every response, the same filtering the JSON GET surface already applies. The story adds a test that walks every tool's output for the field names that must never appear.
 6. **Audit.** Every tool call is audited with the token `public_id`, the tool name, the arguments after redaction, and a marker identifying the transport as MCP, so the chain distinguishes it from a dashboard session and from a CI call.
-7. **Prompt-injection hygiene in the output.** Log rows and WAF payloads are returned in a structured field that the tool description marks as untrusted attacker-controlled text, never interpolated into a prose summary the server generates. The server does not editorialise; it returns data.
-8. Documentation: `docs/mcp.md` with the read tier, the client configuration for it, and a plain statement of what the tier can see.
+7. **Prompt-injection hygiene in the output.** Log rows and WAF payloads are returned in a structured field that the tool description marks as untrusted attacker-controlled text, never interpolated into a prose summary the server generates. Following the OWASP guidance on aggregated external content, the field is delimited and the tool description states in terms that the delimited text is data and not instructions. The server does not editorialise; it returns data.
+8. Documentation: `docs/mcp.md` with the read tier, the client configuration for both transports, and a plain statement of what the tier can see.
+9. **Streamable HTTP on the automation listener, and the spec's security requirements met where they land.** The MCP endpoint is a path on the Story 10.3 listener, authenticated by the same bearer token. The `Origin` header is validated and an invalid one answered 403 (the specification's only MUST on this transport, against DNS rebinding); `MCP-Protocol-Version` is pinned to the revision this crate implements and an unknown version answered per the spec; the header-versus-body mirror (`Mcp-Method`, `Mcp-Name`) is validated rather than trusted, because Lorica is exactly the kind of intermediary that mismatch rule exists to protect. The listener already provides TLS, the source-CIDR allowlist, connection caps and the per-IP limiter.
+10. **stdio for the local case**, the same tool surface over a client-launched subprocess, no listener required. One adapter, one shared server core: the protocol is transport-agnostic and the two bindings must not grow separate behaviour.
+11. **A protocol-version maintenance note in `docs/mcp.md`.** The specification has moved three times in eighteen months, most recently removing sessions and the GET stream. The crate states which revision it implements and the release notes say when that changes.
 
 ### Integration Verification
 
@@ -139,7 +173,8 @@ so that I do not end up with one token that does everything because it was easie
 
 ## Out of Scope (deferred)
 
-- **A network-reachable MCP server.** D1. It is a third management plane and needs its own threat model, exposure decision and hardening story. Not a transport flag added to this work.
+- **A separate MCP port.** D1 keeps the endpoint on the Story 10.3 automation listener. A second listener would be a third management plane with its own exposure, and nothing in the protocol requires one.
+- **OAuth as an authorization server.** The specification's authorization framework and what Cloudflare or Scalr offer is an OAuth flow with user consent; Lorica issues its own scoped tokens and that is what this epic uses. Becoming an OAuth authorization server is a product decision of its own, not a side effect of shipping an MCP endpoint.
 - **User management and cluster mutations through any tier.** Story 11.3 AC #1 and #2, with reasons.
 - **Prompts and resources beyond the read tier's listings.** The protocol offers both; this epic ships tools and read-only listings and sees what is actually missing before adding surface.
 - **A tool that runs a query, a filter expression or a configuration blob.** Arbitrary execution with extra steps.
