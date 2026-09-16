@@ -689,8 +689,13 @@ impl Server {
             .map(|(rt, name)| {
                 info!("Waiting for runtimes to exit!");
                 let join = thread::spawn(move || {
+                    // `shutdown_timeout` already waits up to the timeout
+                    // and returns as soon as the runtime is done. The
+                    // `thread::sleep(shutdown_timeout)` that used to
+                    // follow made every graceful shutdown burn the whole
+                    // budget even when the runtimes exited at once
+                    // (upstream 6f15714d, cloudflare/pingora#727).
                     rt.shutdown_timeout(shutdown_timeout);
-                    thread::sleep(shutdown_timeout)
                 });
                 (join, name)
             })

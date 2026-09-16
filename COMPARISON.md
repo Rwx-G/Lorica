@@ -51,9 +51,13 @@
 | Peak EWMA | Y | Y | N | N | N | N | N | N |
 | Consistent Hash | Y | Y | N | Y | N | N | Y | Y |
 | Random | Y | Y | Y | Y | N | N | Y | Y |
-| IP Hash | N | N | N | Y | N | N | Y | Y |
+| IP Hash | Y | N | N | Y | N | N | Y | Y |
 | Health-aware filtering | Y | Y | Y | Paid | Y | Paid | Y | Y |
 | Traffic mirroring | Y | N | N | Y | Y | N | N | N |
+
+### Lorica Notes
+
+- **IP Hash** - Lorica has no algorithm under that name, and does not need one: `consistent_hash` is a ketama ring keyed on the client IP, X-Forwarded-For aware when the immediate peer is in `trusted_proxies`. The operator-visible property is the one Nginx's `ip_hash` delivers, a client that keeps reaching the same backend. What differs is the remap when the backend set changes: the ring moves roughly 1/N of the clients, a modulo over N backends moves nearly all of them. A separate modulo variant would be strictly worse and is not planned.
 
 ### Lorica Strengths
 

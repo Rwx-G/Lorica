@@ -85,8 +85,24 @@ pub struct RequestCtx {
     pub block_reason: Option<String>,
     /// Accumulated request body bytes for chunked transfer size enforcement.
     pub body_bytes_received: u64,
-    /// Buffered request body for WAF body scanning (only when WAF is enabled).
+    /// Buffered request body for WAF body scanning (only when the
+    /// WAF is enabled AND the body is one the engine can parse, see
+    /// `waf_body_inspect`).
     pub waf_body_buffer: Option<Vec<u8>>,
+    /// Whether the WAF will look at this request body at all.
+    ///
+    /// Decided once in `check_body_limits`, where the request header
+    /// is in hand: the route has the WAF on and the declared
+    /// `Content-Type` is one `lorica_waf::body_is_inspectable`
+    /// accepts. Both the Content-Length path and the chunked path
+    /// read this field instead of re-deriving the answer per chunk.
+    ///
+    /// `false` means the body is never buffered, never counted
+    /// against `WAF_BODY_SCAN_MAX`, and never handed to
+    /// `evaluate_body` - which would have returned `Pass` on it
+    /// anyway. The route's `max_request_body_bytes` is then the only
+    /// ceiling that applies.
+    pub waf_body_inspect: bool,
     /// Set to true the first time the request body crosses
     /// `WAF_BODY_SCAN_MAX` in Detection mode, so the corresponding
     /// `WafEvent` (`BodyTruncated`) is emitted once per request

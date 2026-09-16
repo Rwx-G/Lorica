@@ -80,7 +80,17 @@ tokio-stream = { version = "0.1", features = ["full"] }
 env_logger = "0.11"
 reqwest = { version = "0.12", features = ["rustls-tls-webpki-roots"], default-features = false }
 rstest = "0.23.0"
-rustls = "0.23"
+# Types only (ServerCertVerifier, CertificateDer, DigitallySignedStruct in
+# the connector tests). No provider feature: the runtime provider arrives
+# through lorica-tls, which pins ring. Left on default features this entry
+# unifies `aws_lc_rs` onto the shared rustls node and drags aws-lc-sys
+# (~69 MB of vendored C, built through cmake) into every test build, even
+# though the production binary never compiles it (upstream 5396a1fa).
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "std",
+    "tls12",
+] }
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
