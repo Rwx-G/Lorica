@@ -7477,6 +7477,182 @@ async fn probe_crud_history_and_validation() {
 }
 
 // ---------------------------------------------------------------------------
+// Story 10.0 AC #2: a node_selector is resolved at write time
+// ---------------------------------------------------------------------------
+
+/// One roster row in the shape the enrollment handler writes.
+fn enrolled_node(node_id: &str, name: &str, seed: &str) -> lorica_config::models::ClusterNode {
+    let now = chrono::Utc::now();
+    lorica_config::models::ClusterNode {
+        node_id: node_id.to_string(),
+        name: name.to_string(),
+        cert_fingerprint: seed.repeat(32),
+        cert_serial: seed.to_uppercase().repeat(16),
+        prev_cert_fingerprint: None,
+        prev_cert_serial: None,
+        address: "192.0.2.10:5000".to_string(),
+        version: "1.8.0".to_string(),
+        schema_version: 50,
+        status: lorica_config::models::NodeStatus::Active,
+        enrolled_at: now,
+        last_seen_at: None,
+        applied_config_generation: 0,
+        applied_config_hash: String::new(),
+        cert_not_after: now + chrono::Duration::days(90),
+        revoked_at: None,
+    }
+}
+
+/// A control plane whose roster holds `nodes`.
+async fn control_plane_with_roster(
+    nodes: &[lorica_config::models::ClusterNode],
+) -> (AppState, SessionStore, RateLimiter, String) {
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    let (control, _liveness) = test_control_plane();
+    state.cluster = crate::cluster::ClusterRuntime::ControlPlane(control);
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    {
+        let store = state.store.lock().await;
+        for node in nodes {
+            store.create_cluster_node(node).expect("test setup");
+        }
+    }
+    (state, session_store, rate_limiter, admin)
+}
+
+/// The `error.message` of a response the caller expects to be a 400.
+async fn bad_request_message(resp: axum::response::Response) -> String {
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    body_json(resp).await["error"]["message"]
+        .as_str()
+        .expect("test setup")
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_selector_naming_an_enrolled_node_is_accepted_on_a_control_plane() {
+    let (state, session_store, rate_limiter, admin) =
+        control_plane_with_roster(&[enrolled_node("node-a", "edge-1", "ab")]).await;
+
+    let mut body = a_valid_route("pinned.example.com");
+    body["node_selector"] = serde_json::json!(["edge-1"]);
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    assert_eq!(
+        created["data"]["node_selector"],
+        serde_json::json!(["edge-1"])
+    );
+    let route_id = created["data"]["id"]
+        .as_str()
+        .expect("test setup")
+        .to_string();
+
+    // The update handler resolves against the same roster.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{route_id}"),
+        &admin,
+        Some(serde_json::json!({ "node_selector": ["edge-1"] })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_selector_naming_no_enrolled_node_is_refused_on_a_control_plane() {
+    let (state, session_store, rate_limiter, admin) =
+        control_plane_with_roster(&[enrolled_node("node-a", "edge-1", "ab")]).await;
+
+    let mut body = a_valid_route("typo.example.com");
+    body["node_selector"] = serde_json::json!(["edge-9"]);
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        bad_request_message(resp).await,
+        "bad request: node_selector entry `edge-9` matches no enrolled cluster node"
+    );
+
+    // Same refusal on the patch path, so a fleet-wide route cannot be
+    // narrowed into oblivion after the fact.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(a_valid_route("wide.example.com")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let route_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .expect("test setup")
+        .to_string();
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{route_id}"),
+        &admin,
+        Some(serde_json::json!({ "node_selector": ["edge-9"] })),
+    )
+    .await;
+    assert_eq!(
+        bad_request_message(resp).await,
+        "bad request: node_selector entry `edge-9` matches no enrolled cluster node"
+    );
+}
+
+#[tokio::test]
+async fn a_selector_is_not_resolved_off_a_control_plane() {
+    // A standalone node has no authoritative roster, and an operator
+    // legitimately pins a route before the node it names enrolls.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let mut body = a_valid_route("unenrolled.example.com");
+    body["node_selector"] = serde_json::json!(["edge-9"]);
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        body_json(resp).await["data"]["node_selector"],
+        serde_json::json!(["edge-9"])
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Argon2 upgrade compatibility (v1.7.3 dependency pass)
 // ---------------------------------------------------------------------------
 

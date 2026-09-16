@@ -416,8 +416,18 @@ fn validate_group_name(raw: &str) -> Result<String, ApiError> {
 /// cannot exist. Each surviving entry must satisfy the same rule as
 /// `group_name`, and the list is capped at
 /// [`lorica_config::models::NODE_SELECTOR_MAX_ENTRIES`] entries.
+///
+/// `roster` carries the enrolled nodes when this node owns an
+/// authoritative registry (see [`selector_roster`]); it turns on the
+/// existence check of Story 10.0 AC #2. An entry that names nobody, or
+/// names two rows and so identifies nobody, would otherwise be stored
+/// happily and then deliver the route to no node at all.
+///
 /// Returns the normalised list.
-fn validate_node_selector(raw: &[String]) -> Result<Vec<String>, ApiError> {
+fn validate_node_selector(
+    raw: &[String],
+    roster: Option<&[lorica_config::models::ClusterNode]>,
+) -> Result<Vec<String>, ApiError> {
     let names: Vec<String> = raw
         .iter()
         .map(|n| n.trim().to_string())
@@ -429,7 +439,126 @@ fn validate_node_selector(raw: &[String]) -> Result<Vec<String>, ApiError> {
     // the follower's `prepare_replica` refuses, which aborts the round
     // for the whole fleet.
     lorica_config::models::validate_node_selector_names(&names).map_err(ApiError::BadRequest)?;
+
+    let Some(nodes) = roster else {
+        return Ok(names);
+    };
+    // Same resolver the replication path narrows a payload with, so
+    // "the API accepted it" and "somebody receives it" cannot disagree.
+    let resolution = lorica_config::canonical::SelectorResolution::from_rows(
+        nodes.iter().map(|n| (n.name.clone(), n.node_id.clone())),
+    );
+    if let Some(entry) = resolution.unresolvable(&names).first() {
+        // The resolver reports "resolves to no single node" without
+        // saying which of the two cases it is, and the operator's next
+        // move differs: fix a typo, or rename one of the two rows.
+        let matched = nodes.iter().filter(|n| n.name == **entry).count();
+        return Err(ApiError::BadRequest(if matched == 0 {
+            format!("node_selector entry `{entry}` matches no enrolled cluster node")
+        } else {
+            format!(
+                "node_selector entry `{entry}` matches more than one enrolled cluster node; \
+                 a display name is not an identity"
+            )
+        }));
+    }
     Ok(names)
+}
+
+/// The node registry a `node_selector` is checked against, or `None`
+/// when this node holds no authoritative one.
+///
+/// Only a control plane owns the roster. A standalone node has an
+/// empty `cluster_nodes` table and a follower carries whatever the
+/// last replication round left, so running the existence check there
+/// would refuse a selector naming a node that exists in the fleet.
+/// An operator also legitimately pins a route before the node it names
+/// has enrolled, and the control plane is the one place where "not in
+/// the roster" really means "nobody".
+async fn selector_roster(
+    state: &AppState,
+) -> Result<Option<Vec<lorica_config::models::ClusterNode>>, ApiError> {
+    if !matches!(
+        state.cluster,
+        crate::cluster::ClusterRuntime::ControlPlane(_)
+    ) {
+        return Ok(None);
+    }
+    db_blocking(&state.store, |store| store.list_cluster_nodes())
+        .await
+        .map(Some)
+}
+
+#[cfg(test)]
+mod node_selector_validation_tests {
+    use super::*;
+
+    /// A roster row carrying only what the resolution reads.
+    fn node(node_id: &str, name: &str) -> lorica_config::models::ClusterNode {
+        let now = Utc::now();
+        lorica_config::models::ClusterNode {
+            node_id: node_id.to_string(),
+            name: name.to_string(),
+            cert_fingerprint: String::new(),
+            cert_serial: String::new(),
+            prev_cert_fingerprint: None,
+            prev_cert_serial: None,
+            address: String::new(),
+            version: String::new(),
+            schema_version: 0,
+            status: lorica_config::models::NodeStatus::Active,
+            enrolled_at: now,
+            last_seen_at: None,
+            applied_config_generation: 0,
+            applied_config_hash: String::new(),
+            cert_not_after: now,
+            revoked_at: None,
+        }
+    }
+
+    fn expect_err(raw: &[&str], roster: &[lorica_config::models::ClusterNode]) -> String {
+        let raw: Vec<String> = raw.iter().map(|s| (*s).to_string()).collect();
+        match validate_node_selector(&raw, Some(roster)) {
+            Err(ApiError::BadRequest(msg)) => msg,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_entry_carried_by_two_roster_rows_names_nobody() {
+        // `cluster_nodes.name` is UNIQUE at the current schema head, so
+        // this shape only reaches the validator from a roster that lost
+        // the index. The resolution still refuses it, because a name
+        // two rows answer to translates to no single `node_id` and the
+        // route would reach neither node.
+        let roster = [node("node-a", "edge-1"), node("node-b", "edge-1")];
+        assert_eq!(
+            expect_err(&["edge-1"], &roster),
+            "node_selector entry `edge-1` matches more than one enrolled cluster node; \
+             a display name is not an identity"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_nothing_is_reported_as_unknown_not_ambiguous() {
+        let roster = [node("node-a", "edge-1")];
+        assert_eq!(
+            expect_err(&["edge-2"], &roster),
+            "node_selector entry `edge-2` matches no enrolled cluster node"
+        );
+    }
+
+    #[test]
+    fn normalisation_runs_before_the_existence_check() {
+        // A blank entry is dropped rather than resolved, so padding in
+        // the request body cannot turn into "matches no enrolled node".
+        let roster = [node("node-a", "edge-1")];
+        let raw = vec!["  edge-1 ".to_string(), "   ".to_string()];
+        assert_eq!(
+            validate_node_selector(&raw, Some(&roster)).expect("selector resolves"),
+            vec!["edge-1".to_string()]
+        );
+    }
 }
 
 /// Knobs for `validate_dns_hostname` (audit M-23 closure).
@@ -3482,6 +3611,14 @@ pub async fn create_route(
         Vec::new()
     };
 
+    // Read before the insert closure takes the store lock, and only
+    // when the request actually pins the route.
+    let node_roster = if body.node_selector.is_some() {
+        selector_roster(&state).await?
+    } else {
+        None
+    };
+
     let now = Utc::now();
     let route = lorica_config::models::Route {
         id: uuid::Uuid::new_v4().to_string(),
@@ -3630,7 +3767,7 @@ pub async fn create_route(
             None => String::new(),
         },
         node_selector: match body.node_selector.as_deref() {
-            Some(names) => validate_node_selector(names)?,
+            Some(names) => validate_node_selector(names, node_roster.as_deref())?,
             None => Vec::new(),
         },
         // Story 8.2 AC #2 / #3 / #10. None at the route level is the
@@ -3702,6 +3839,14 @@ pub async fn update_route(
     Path(id): Path<String>,
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Read before the update closure takes the store lock, and only
+    // when the patch actually touches the pinning.
+    let node_roster = if body.node_selector.is_some() {
+        selector_roster(&state).await?
+    } else {
+        None
+    };
+
     let (before_route, route, backend_ids) = db_blocking(&state.store, move |store| {
         let mut route = store
             .get_route(&id)?
@@ -4076,7 +4221,7 @@ pub async fn update_route(
         // Story 9.4 AC #13. An explicit empty list widens the route
         // back to fleet-wide; absent leaves the pinning alone.
         if let Some(ref names) = body.node_selector {
-            route.node_selector = validate_node_selector(names)?;
+            route.node_selector = validate_node_selector(names, node_roster.as_deref())?;
         }
         // Story 8.2 AC #2 / #3 / #10. None on the patch leaves alone ;
         // explicit Some(_) installs. The serde-derived enum guards the
