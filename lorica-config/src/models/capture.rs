@@ -57,6 +57,30 @@ pub const CAPTURE_TTL_SECONDS_CAP: u32 = 7 * 24 * 60 * 60;
 /// actually built, in the crate that owns the matcher.
 pub const CAPTURE_PATTERN_MAX_LEN: usize = 4 * 1024;
 
+/// Byte ceiling on [`CaptureRule::name`]. The name is a label a
+/// dashboard column and an audit line both render verbatim, so it is
+/// bounded for the same reason any other operator-supplied string is.
+pub const CAPTURE_NAME_MAX_LEN: usize = 200;
+
+/// Byte ceiling on [`CaptureMatch::path_prefix`]. It is compared
+/// against a request target, and a prefix longer than the longest target
+/// the proxy will ever accept cannot match anything.
+pub const CAPTURE_PATH_PREFIX_MAX_LEN: usize = 2048;
+
+/// Hard cap on [`CaptureOutput::max_dir_bytes`]: 10 GiB. The field is
+/// the only thing that makes the writer prune, so an uncapped value is
+/// "never prune" on a node whose main job is serving traffic.
+pub const CAPTURE_MAX_DIR_BYTES_CAP: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Cap on how many names one [`CaptureRedaction`] list may carry. The
+/// writer walks both lists per captured header and per captured query
+/// parameter, so the list length is a per-capture cost.
+pub const CAPTURE_REDACT_MAX_ENTRIES: usize = 64;
+
+/// Byte ceiling on one [`CaptureRedaction`] entry. Both lists hold
+/// names, and a name longer than this is not one.
+pub const CAPTURE_REDACT_ENTRY_MAX_LEN: usize = 128;
+
 /// Default body ceiling for both directions: 64 KiB, enough for an API
 /// request or an error page without holding a file upload.
 pub const CAPTURE_DEFAULT_BODY_MAX_BYTES: u32 = 64 * 1024;
@@ -259,10 +283,12 @@ impl Default for CaptureLimits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureOutput {
-    /// Override directory for this rule's captures.
+    /// Override directory for this rule's captures. Absolute, with no
+    /// `..` component.
     #[serde(default)]
     pub dir: Option<String>,
-    /// Override size budget for that directory, in bytes.
+    /// Override size budget for that directory, in bytes. Capped by
+    /// [`CAPTURE_MAX_DIR_BYTES_CAP`].
     #[serde(default)]
     pub max_dir_bytes: Option<u64>,
 }
@@ -340,11 +366,20 @@ impl CaptureRule {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when `route_id` is empty, when `emit` constrains
-    /// nothing, when `emit.always` is combined with another predicate,
-    /// when any capped limit is zero or over its cap, when a pattern
-    /// exceeds [`CAPTURE_PATTERN_MAX_LEN`], when a source CIDR does not
-    /// parse, or when a method is not an uppercase HTTP token.
+    /// Returns `Err` when `route_id` is empty, when `name` is blank or
+    /// over [`CAPTURE_NAME_MAX_LEN`], when `emit` constrains nothing,
+    /// when `emit.always` is combined with another predicate, when any
+    /// capped limit is zero or over its cap, when a pattern exceeds
+    /// [`CAPTURE_PATTERN_MAX_LEN`], when a source CIDR does not parse,
+    /// when a method is not an uppercase HTTP token, when a header
+    /// predicate names something that is not a legal header token, when
+    /// `match.path_prefix` does not start with `/` or exceeds
+    /// [`CAPTURE_PATH_PREFIX_MAX_LEN`], when `output.dir` is relative or
+    /// carries a `..` component, when `output.max_dir_bytes` is zero or
+    /// over [`CAPTURE_MAX_DIR_BYTES_CAP`], or when a redaction list is
+    /// longer than [`CAPTURE_REDACT_MAX_ENTRIES`] or holds an entry that
+    /// is empty, over [`CAPTURE_REDACT_ENTRY_MAX_LEN`], or (for headers)
+    /// not a legal header token.
     ///
     /// ```
     /// use lorica_config::models::CaptureRule;
@@ -357,12 +392,20 @@ impl CaptureRule {
     /// # }
     /// ```
     pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("capture rule must carry a name".to_string());
+        }
+        if self.name.len() > CAPTURE_NAME_MAX_LEN {
+            return Err(format!("name exceeds {CAPTURE_NAME_MAX_LEN} bytes"));
+        }
         if self.route_id.is_empty() {
             return Err("capture rule must name the route it records (route_id)".to_string());
         }
         self.validate_emit()?;
         self.validate_limits()?;
         self.validate_match()?;
+        self.validate_output()?;
+        self.validate_redaction()?;
         Ok(())
     }
 
@@ -417,7 +460,7 @@ impl CaptureRule {
         Ok(())
     }
 
-    /// Source CIDRs, methods and pattern sizes.
+    /// Source CIDRs, methods, header names and pattern sizes.
     fn validate_match(&self) -> Result<(), String> {
         for cidr in &self.match_.source_cidrs {
             validate_cidr(cidr, "match.source_cidrs")?;
@@ -429,14 +472,88 @@ impl CaptureRule {
                 ));
             }
         }
+        if let Some(prefix) = &self.match_.path_prefix {
+            // A prefix is compared against a request target, which always
+            // begins at the root. One that does not is a predicate no
+            // request can satisfy, and a rule that records nothing while
+            // the dashboard shows it armed is the worst outcome here.
+            if !prefix.starts_with('/') {
+                return Err(format!(
+                    "`{prefix}` cannot match a request target in match.path_prefix: a path \
+                     prefix starts with `/`"
+                ));
+            }
+            if prefix.len() > CAPTURE_PATH_PREFIX_MAX_LEN {
+                return Err(format!(
+                    "match.path_prefix exceeds {CAPTURE_PATH_PREFIX_MAX_LEN} bytes"
+                ));
+            }
+        }
         if let Some(pattern) = &self.match_.path_regex {
             check_pattern_len(pattern, "match.path_regex")?;
         }
         for header in &self.match_.headers {
+            check_header_name(&header.name, "match.headers[].name")?;
             if header.match_type == HeaderMatchType::Regex {
                 check_pattern_len(&header.value, "match.headers[].value")?;
             }
         }
+        Ok(())
+    }
+
+    /// The output override: an absolute directory with no traversal, and
+    /// a bounded size budget.
+    ///
+    /// Whether that directory EXISTS and is writable is the capture
+    /// writer's business at capture time (Story 10.2), not this
+    /// validator's. A rule is replicated to every node the route lives
+    /// on, and a node that has not created the directory yet does not
+    /// make the rule invalid; a validator that touched the filesystem
+    /// would refuse it there and accept it here.
+    fn validate_output(&self) -> Result<(), String> {
+        if let Some(dir) = &self.output.dir {
+            // The runtime target is Linux, so an absolute path is a
+            // leading `/`. `Path::is_absolute` would answer differently
+            // for the same operator input when the crate is compiled on
+            // a Windows development host.
+            if !dir.starts_with('/') {
+                return Err(format!(
+                    "`{dir}` is not absolute in output.dir: a relative directory resolves \
+                     against whatever working directory the node process happens to have"
+                ));
+            }
+            if dir.split('/').any(|component| component == "..") {
+                return Err(format!(
+                    "`{dir}` contains a `..` component in output.dir, which makes the \
+                     configured directory a different one from the directory written to"
+                ));
+            }
+        }
+        if let Some(budget) = self.output.max_dir_bytes {
+            if budget == 0 {
+                return Err("output.max_dir_bytes must be greater than zero".to_string());
+            }
+            if budget > CAPTURE_MAX_DIR_BYTES_CAP {
+                return Err(format!(
+                    "output.max_dir_bytes may not exceed {CAPTURE_MAX_DIR_BYTES_CAP}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Both redaction lists: bounded, non-empty entries, and header
+    /// names that a request can actually carry.
+    fn validate_redaction(&self) -> Result<(), String> {
+        check_redaction_list(&self.redact.headers, "redact.headers")?;
+        for name in &self.redact.headers {
+            // A malformed name redacts nothing while reading, in the
+            // dashboard and in the rule itself, as though it does. An
+            // operator who believes a header is redacted and is wrong is
+            // worse off than one who knows it is not.
+            check_header_name(name, "redact.headers[]")?;
+        }
+        check_redaction_list(&self.redact.query, "redact.query")?;
         Ok(())
     }
 }
@@ -456,6 +573,40 @@ fn check_cap(value: u32, cap: u32, field: &str) -> Result<(), String> {
 fn check_pattern_len(pattern: &str, field: &str) -> Result<(), String> {
     if pattern.len() > CAPTURE_PATTERN_MAX_LEN {
         return Err(format!("{field} exceeds {CAPTURE_PATTERN_MAX_LEN} bytes"));
+    }
+    Ok(())
+}
+
+/// One redaction list: how many names it may hold, and how long each
+/// one may be. `field` names the list in the error message.
+fn check_redaction_list(entries: &[String], field: &str) -> Result<(), String> {
+    if entries.len() > CAPTURE_REDACT_MAX_ENTRIES {
+        return Err(format!(
+            "{field} may not list more than {CAPTURE_REDACT_MAX_ENTRIES} names"
+        ));
+    }
+    for entry in entries {
+        if entry.trim().is_empty() {
+            return Err(format!("{field} may not contain an empty name"));
+        }
+        if entry.len() > CAPTURE_REDACT_ENTRY_MAX_LEN {
+            return Err(format!(
+                "`{entry}` exceeds {CAPTURE_REDACT_ENTRY_MAX_LEN} bytes in {field}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An operator-supplied header name, wherever one appears in a capture
+/// rule. Anything outside the token grammar is a name no request carries,
+/// so both the predicate reading and the redaction reading of such a
+/// name are silent no-ops.
+fn check_header_name(name: &str, field: &str) -> Result<(), String> {
+    if !is_http_token(name) {
+        return Err(format!(
+            "`{name}` is not a valid HTTP header name in {field}"
+        ));
     }
     Ok(())
 }
@@ -495,14 +646,13 @@ pub(super) fn validate_cidr(entry: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// An RFC 9110 method token with no lowercase letters. The uppercase
-/// requirement is ours: the proxy compares methods verbatim, so a rule
-/// written `get` would match nothing and look like a broken feature.
-fn is_uppercase_http_method(method: &str) -> bool {
-    !method.is_empty()
-        && method.chars().all(|c| {
-            c.is_ascii_uppercase()
-                || c.is_ascii_digit()
+/// A non-empty RFC 9110 section 5.6.2 `token`: ASCII letters, digits,
+/// and the fifteen `tchar` punctuation marks. Method names and header
+/// names are both this grammar, so they answer to one definition here.
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
                 || matches!(
                     c,
                     '!' | '#'
@@ -521,6 +671,13 @@ fn is_uppercase_http_method(method: &str) -> bool {
                         | '~'
                 )
         })
+}
+
+/// An RFC 9110 method token with no lowercase letters. The uppercase
+/// requirement is ours: the proxy compares methods verbatim, so a rule
+/// written `get` would match nothing and look like a broken feature.
+fn is_uppercase_http_method(method: &str) -> bool {
+    is_http_token(method) && !method.chars().any(|c| c.is_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -742,6 +899,160 @@ mod tests {
     fn uppercase_methods_are_accepted() {
         let mut rule = valid_rule();
         rule.match_.methods = vec!["GET".to_string(), "POST".to_string(), "PATCH".to_string()];
+        assert!(rule.validate().is_ok());
+    }
+
+    #[test]
+    fn a_rule_without_a_name_is_refused() {
+        let mut rule = valid_rule();
+        rule.name = "   ".to_string();
+        let err = rule.validate().expect_err("a blank name must be refused");
+        assert!(err.contains("name"), "{err}");
+    }
+
+    #[test]
+    fn a_name_over_the_length_cap_is_refused() {
+        let mut rule = valid_rule();
+        rule.name = "a".repeat(CAPTURE_NAME_MAX_LEN + 1);
+        assert!(rule.validate().is_err());
+    }
+
+    #[test]
+    fn a_header_predicate_with_a_malformed_name_is_refused() {
+        let mut rule = valid_rule();
+        rule.match_.headers = vec![HeaderMatch {
+            name: "X Trace".to_string(),
+            match_type: HeaderMatchType::Exact,
+            value: "abc".to_string(),
+        }];
+        let err = rule
+            .validate()
+            .expect_err("a space is not a header token character");
+        assert!(err.contains("match.headers[].name"), "{err}");
+    }
+
+    #[test]
+    fn a_header_predicate_with_an_empty_name_is_refused() {
+        let mut rule = valid_rule();
+        rule.match_.headers = vec![HeaderMatch::default()];
+        assert!(rule.validate().is_err());
+    }
+
+    #[test]
+    fn a_legal_header_token_is_accepted_as_a_predicate_name() {
+        let mut rule = valid_rule();
+        rule.match_.headers = vec![HeaderMatch {
+            name: "X-Trace_id.v2".to_string(),
+            match_type: HeaderMatchType::Exact,
+            value: "abc".to_string(),
+        }];
+        assert!(rule.validate().is_ok());
+    }
+
+    #[test]
+    fn a_path_prefix_without_a_leading_slash_is_refused() {
+        let mut rule = valid_rule();
+        rule.match_.path_prefix = Some("checkout".to_string());
+        let err = rule
+            .validate()
+            .expect_err("a prefix that cannot match is refused");
+        assert!(err.contains("match.path_prefix"), "{err}");
+    }
+
+    #[test]
+    fn a_path_prefix_over_the_length_cap_is_refused() {
+        let mut rule = valid_rule();
+        rule.match_.path_prefix = Some(format!("/{}", "a".repeat(CAPTURE_PATH_PREFIX_MAX_LEN)));
+        assert!(rule.validate().is_err());
+    }
+
+    #[test]
+    fn a_rooted_path_prefix_is_accepted() {
+        let mut rule = valid_rule();
+        rule.match_.path_prefix = Some("/checkout".to_string());
+        assert!(rule.validate().is_ok());
+    }
+
+    #[test]
+    fn a_relative_output_dir_is_refused() {
+        let mut rule = valid_rule();
+        rule.output.dir = Some("captures".to_string());
+        let err = rule.validate().expect_err("a relative dir is refused");
+        assert!(err.contains("output.dir"), "{err}");
+    }
+
+    #[test]
+    fn an_output_dir_with_a_traversal_component_is_refused() {
+        let mut rule = valid_rule();
+        rule.output.dir = Some("/var/lib/lorica/../../etc".to_string());
+        let err = rule.validate().expect_err("a traversal is refused");
+        assert!(err.contains("output.dir"), "{err}");
+    }
+
+    #[test]
+    fn an_absolute_output_dir_without_traversal_is_accepted() {
+        // Existence and writability belong to the writer at capture
+        // time, so a directory this node has not created yet still
+        // validates.
+        let mut rule = valid_rule();
+        rule.output.dir = Some("/var/lib/lorica/captures".to_string());
+        assert!(rule.validate().is_ok());
+    }
+
+    #[test]
+    fn a_dir_budget_over_the_hard_cap_is_refused() {
+        let mut rule = valid_rule();
+        rule.output.max_dir_bytes = Some(CAPTURE_MAX_DIR_BYTES_CAP + 1);
+        let err = rule.validate().expect_err("over the dir budget cap");
+        assert!(err.contains("output.max_dir_bytes"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_dir_budget_is_refused() {
+        let mut rule = valid_rule();
+        rule.output.max_dir_bytes = Some(0);
+        assert!(rule.validate().is_err());
+    }
+
+    #[test]
+    fn a_malformed_redaction_entry_is_refused_rather_than_silently_redacting_nothing() {
+        let mut rule = valid_rule();
+        rule.redact.headers = vec!["X-Api Key".to_string()];
+        let err = rule
+            .validate()
+            .expect_err("a name no header carries redacts nothing");
+        assert!(err.contains("redact.headers"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_redaction_entry_is_refused() {
+        let mut rule = valid_rule();
+        rule.redact.query = vec![String::new()];
+        let err = rule.validate().expect_err("an empty name is refused");
+        assert!(err.contains("redact.query"), "{err}");
+    }
+
+    #[test]
+    fn a_redaction_list_over_the_entry_count_cap_is_refused() {
+        let mut rule = valid_rule();
+        rule.redact.query = (0..=CAPTURE_REDACT_MAX_ENTRIES)
+            .map(|n| format!("token{n}"))
+            .collect();
+        assert!(rule.validate().is_err());
+    }
+
+    #[test]
+    fn a_redaction_entry_over_the_length_cap_is_refused() {
+        let mut rule = valid_rule();
+        rule.redact.headers = vec!["a".repeat(CAPTURE_REDACT_ENTRY_MAX_LEN + 1)];
+        assert!(rule.validate().is_err());
+    }
+
+    #[test]
+    fn well_formed_redaction_lists_are_accepted() {
+        let mut rule = valid_rule();
+        rule.redact.headers = vec!["X-Api-Key".to_string(), "X-Session".to_string()];
+        rule.redact.query = vec!["access_token".to_string()];
         assert!(rule.validate().is_ok());
     }
 
