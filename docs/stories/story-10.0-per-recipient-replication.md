@@ -1,7 +1,7 @@
 # Story 10.0: Per-Recipient Replication Payload
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0, first of the cycle
 **Author:** Romain G.
 **Depends on:** nothing. Blocks Story 10.4, which creates routes through the same replication path.
@@ -69,7 +69,7 @@ The generation stays fleet-wide. It is a monotonic counter over configuration ch
 - [x] AC #7: mixed-version tests both ways, in `lorica-cluster/tests/replication.rs`.
 - [x] AC #8: the measurement, in the story's Dev Agent Record.
 - [x] AC #9/#10: `docs/cluster.md` and the threat model.
-- [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, the frontend three if `NodeResponse` moves.
+- [x] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`. The frontend is untouched: it displays the hash and never compares it, so `NodeResponse` did not move.
 
 ## Dev Notes
 
@@ -183,7 +183,38 @@ anything around it, which is why it is not being made now.
 
 ### Completion Notes
 
-(in progress)
+**Done.** Every acceptance criterion is met, with AC #3 met by derivation
+rather than by the persistence the criterion describes; the Debug Log says
+why that is the better answer and not a shortcut.
+
+Gates, all green in the dev container:
+
+- the three CI clippy commands with `RUSTFLAGS=-D warnings`
+- `cargo audit`: clean, two allowed warnings, unchanged from before
+- `lorica-config` 300, `lorica-cluster` 163 (the frozen wire corpus among
+  them, passing unmodified), `lorica-api` 641, `lorica` 314, plus waf,
+  notify and bench. No failures.
+- the Docker cluster profile end to end against a real two-follower
+  fleet: smoke 64/64, restart follower 6/6, restart control plane 9/9.
+
+The frontend was not touched. It displays `applied_config_hash` and never
+compares it, so the per-node hash reaches it as data and `NodeResponse`
+keeps its shape.
+
+**One e2e assertion was deleted rather than adapted**, which is worth
+naming: the cluster smoke asserted that every node reported the same
+configuration hash. That was a correct assertion about the old design and
+is wrong by construction about this one, so it is replaced by the two
+that describe what is now true. The backend half of IV1 is the one that
+carries weight: the old recipient-side filter deleted the route it was
+not selected for but kept the backend rows it had been sent, so an
+assertion on routes alone would have passed before this change too.
+
+**What Story 10.1 inherits.** Adding a replicated table now means adding
+a field to `CanonicalConfig`, whose decode is strict and gated on
+`CANONICAL_FORMAT_VERSION`. That stamp has to move to 2 with the capture
+rules, and a mixed-version fleet notices it, which is why Story 10.1
+carries an explicit AC for it rather than discovering it in QA.
 
 ## File List
 
@@ -199,4 +230,10 @@ Anticipated, to be corrected during implementation.
 
 ## Change Log
 
+- 2026-09-16: Implemented and closed. Six commits: the round's per-recipient
+  payloads and the advertised-version change that had to come with them, the
+  drift verdict, the write-time selector check, the documentation, and the
+  e2e assertions. Two corrections to the story's own premises are recorded in
+  the Debug Log: `cluster_nodes.name` is already UNIQUE, and the per-node
+  expectation is derived rather than persisted.
 - 2026-09-16: Story drafted from backlog #56 and the `docs/cluster.md` paragraph that states the current behaviour. The per-node hash is identified as the load-bearing consequence: two correctly converged nodes at the same generation legitimately hold different bytes, which ends the single fleet-wide hash the convergence design rests on.
