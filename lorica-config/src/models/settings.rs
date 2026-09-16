@@ -486,6 +486,12 @@ pub struct GlobalSettings {
     /// Export audit entries to the syslog sink. Default `true`.
     #[serde(default = "default_true")]
     pub syslog_audit_enabled: bool,
+    /// Export traffic capture records (Story 10.2) to the syslog
+    /// sink. Default `true`: a toggle that defaulted to off would
+    /// silently stop shipping records an operator relied on the day
+    /// the setting appeared (backlog #50).
+    #[serde(default = "default_true")]
+    pub syslog_capture_enabled: bool,
     /// PEM CA bundle trusted when `syslog_transport` is `tcp-tls`.
     /// `None` = platform trust store. Not a secret (public
     /// certificates only).
@@ -518,6 +524,20 @@ pub struct GlobalSettings {
     /// responses and TOML export (Story 9.8 AC #8).
     #[serde(default)]
     pub otlp_logs_auth_header: Option<String>,
+    /// Ship access-log rows on the OTLP logs lane. Default `true`;
+    /// only meaningful while `otlp_logs_enabled` is set (backlog #50).
+    #[serde(default = "default_true")]
+    pub otlp_logs_access_enabled: bool,
+    /// Ship WAF events on the OTLP logs lane. Default `true`.
+    #[serde(default = "default_true")]
+    pub otlp_logs_waf_enabled: bool,
+    /// Ship audit entries on the OTLP logs lane. Default `true`.
+    #[serde(default = "default_true")]
+    pub otlp_logs_audit_enabled: bool,
+    /// Ship traffic capture records on the OTLP logs lane. Default
+    /// `true`.
+    #[serde(default = "default_true")]
+    pub otlp_logs_capture_enabled: bool,
 }
 
 /// `true` since v1.7.0. See the field doc on
@@ -670,6 +690,38 @@ impl GlobalSettings {
         }
         Ok(())
     }
+
+    /// Every operator-supplied address list on this struct, each paired
+    /// with its field name.
+    ///
+    /// The one place that answers "which settings hold CIDRs". Every
+    /// writer validates through it rather than naming the lists it
+    /// happens to remember, which is how
+    /// `connection_allow_cidrs` could be checked at the API and nowhere
+    /// else (backlog #88). The
+    /// `every_cidr_bearing_setting_is_enumerated` test fails when a new
+    /// list-shaped setting is added without a decision here.
+    pub fn cidr_lists(&self) -> [(&'static str, &[String]); 5] {
+        [
+            ("trusted_proxies", &self.trusted_proxies),
+            ("waf_whitelist_ips", &self.waf_whitelist_ips),
+            ("connection_deny_cidrs", &self.connection_deny_cidrs),
+            ("connection_allow_cidrs", &self.connection_allow_cidrs),
+            ("automation_allowed_cidrs", &self.automation_allowed_cidrs),
+        ]
+    }
+
+    /// Refuse the first malformed entry in any address list.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing reason, naming the setting.
+    pub fn validate_cidr_lists(&self) -> Result<(), String> {
+        for (field, entries) in self.cidr_lists() {
+            crate::connection_filter::validate_cidr_list(entries, field)?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for GlobalSettings {
@@ -742,12 +794,17 @@ impl Default for GlobalSettings {
             syslog_access_enabled: true,
             syslog_waf_enabled: true,
             syslog_audit_enabled: true,
+            syslog_capture_enabled: true,
             syslog_tls_ca_pem: None,
             syslog_tls_client_cert_pem: None,
             syslog_tls_client_key_pem: None,
             syslog_extra_sd: None,
             otlp_logs_enabled: false,
             otlp_logs_auth_header: None,
+            otlp_logs_access_enabled: true,
+            otlp_logs_waf_enabled: true,
+            otlp_logs_audit_enabled: true,
+            otlp_logs_capture_enabled: true,
         }
     }
 }
@@ -783,6 +840,91 @@ fn default_password_require_complexity() -> bool {
 #[cfg(test)]
 mod tests {
     use super::GlobalSettings;
+    use crate::connection_filter::CIDR_CORPUS;
+
+    /// List-shaped settings that hold something other than addresses.
+    /// Every OTHER list-shaped setting must be enumerated by
+    /// [`GlobalSettings::cidr_lists`], which is what
+    /// `every_cidr_bearing_setting_is_enumerated` enforces.
+    const NOT_ADDRESS_LISTS: &[&str] = &["custom_security_presets"];
+
+    /// A `GlobalSettings` whose `field` holds one malformed entry, set
+    /// by name so a test can walk every enumerated list without a
+    /// match arm per field.
+    fn with_bad_entry(field: &str) -> GlobalSettings {
+        let mut value =
+            serde_json::to_value(GlobalSettings::default()).expect("settings serialise");
+        value
+            .as_object_mut()
+            .expect("settings are a JSON object")
+            .insert(field.to_string(), serde_json::json!(["10.0.0.0/33"]));
+        serde_json::from_value(value).expect("settings deserialise")
+    }
+
+    #[test]
+    fn every_cidr_bearing_setting_is_enumerated() {
+        let settings = GlobalSettings::default();
+        let covered: Vec<&str> = settings.cidr_lists().iter().map(|(f, _)| *f).collect();
+        let value = serde_json::to_value(&settings).expect("settings serialise");
+        let object = value.as_object().expect("settings are a JSON object");
+
+        for (name, field) in object {
+            // Address settings have always been list-shaped, and a name
+            // carrying `cidr` / `_ips` announces one whatever its type.
+            let candidate = field.is_array()
+                || name.contains("cidr")
+                || name.ends_with("_ips")
+                || name.contains("allowlist");
+            if !candidate {
+                continue;
+            }
+            assert!(
+                covered.contains(&name.as_str()) || NOT_ADDRESS_LISTS.contains(&name.as_str()),
+                "`{name}` looks like an address list but `GlobalSettings::cidr_lists` does not \
+                 name it and `NOT_ADDRESS_LISTS` does not exempt it: classify it, or a malformed \
+                 entry in it reaches the store unvalidated"
+            );
+        }
+
+        for field in covered {
+            assert!(
+                object.contains_key(field),
+                "`{field}` is enumerated but is not a setting any more"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_entry_is_refused_in_every_enumerated_list() {
+        for (field, _) in GlobalSettings::default().cidr_lists() {
+            let err: String = with_bad_entry(field)
+                .validate_cidr_lists()
+                .expect_err("a /33 is not a v4 network");
+            assert!(
+                err.contains(field),
+                "the refusal does not name {field}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_validation_matches_the_shared_parser() {
+        for (entry, valid) in CIDR_CORPUS {
+            let settings = GlobalSettings {
+                connection_allow_cidrs: vec![(*entry).to_string()],
+                ..GlobalSettings::default()
+            };
+            // A blank entry is the one documented tolerance of the
+            // list-level validator: it carries no policy, so it is
+            // skipped rather than refused.
+            let expected = *valid || entry.trim().is_empty();
+            assert_eq!(
+                settings.validate_cidr_lists().is_ok(),
+                expected,
+                "settings validation disagrees with the parser on {entry:?}"
+            );
+        }
+    }
 
     fn settings(
         cert_warning_days: i32,

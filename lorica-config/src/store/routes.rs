@@ -111,6 +111,7 @@ impl ConfigStore {
                 SpoofedFallback::Allow => "allow",
             });
         let node_selector_json = serialize_field("node_selector", &route.node_selector)?;
+        let managed_by_json = serialize_optional_field("managed_by", route.managed_by.as_ref())?;
 
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
@@ -148,13 +149,13 @@ impl ConfigStore {
              bot_protection,
              group_name,
              ai_bot_policy, ai_bot_spoofed_fallback, serve_robots_txt,
-             node_selector)
+             node_selector, managed_by)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
                      ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45,
                      ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65, ?66,
-                     ?67, ?68, ?69, ?70)",
+                     ?67, ?68, ?69, ?70, ?71)",
             params![
                 route.id,
                 route.hostname,
@@ -226,6 +227,7 @@ impl ConfigStore {
                 ai_bot_spoofed_fallback_str,
                 route.serve_robots_txt,
                 node_selector_json,
+                managed_by_json,
             ],
         )?;
         Ok(())
@@ -270,7 +272,7 @@ impl ConfigStore {
                  bot_protection,
                  group_name,
                  ai_bot_policy, ai_bot_spoofed_fallback, serve_robots_txt,
-                 node_selector
+                 node_selector, managed_by
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
@@ -317,7 +319,7 @@ impl ConfigStore {
              bot_protection,
              group_name,
              ai_bot_policy, ai_bot_spoofed_fallback, serve_robots_txt,
-             node_selector
+             node_selector, managed_by
              FROM routes ORDER BY hostname, path_prefix",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_route(row)))?;
@@ -380,6 +382,7 @@ impl ConfigStore {
                 SpoofedFallback::Allow => "allow",
             });
         let node_selector_json = serialize_field("node_selector", &route.node_selector)?;
+        let managed_by_json = serialize_optional_field("managed_by", route.managed_by.as_ref())?;
 
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,
@@ -416,7 +419,7 @@ impl ConfigStore {
              bot_protection=?64,
              group_name=?65,
              ai_bot_policy=?66, ai_bot_spoofed_fallback=?67, serve_robots_txt=?68,
-             node_selector=?69
+             node_selector=?69, managed_by=?70
              WHERE id=?1",
             params![
                 route.id,
@@ -488,10 +491,40 @@ impl ConfigStore {
                 ai_bot_spoofed_fallback_str,
                 route.serve_robots_txt,
                 node_selector_json,
+                managed_by_json,
             ],
         )?;
         if changed == 0 {
             return Err(ConfigError::NotFound(format!("route {}", route.id)));
+        }
+        Ok(())
+    }
+
+    /// Rebind one route to `certificate_id`, touching nothing else on
+    /// the row (Story 10.4 AC #4).
+    ///
+    /// The configuration snapshot build re-resolves every
+    /// `certificate_mode = auto` environment and lands the result here.
+    /// One column rather than [`ConfigStore::update_route`]: the caller
+    /// holds the route it just read, nothing else on it changed, and
+    /// the hostname-uniqueness check the full update runs has nothing
+    /// to say about a certificate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when `route_id` names no route.
+    pub fn set_route_certificate(
+        &self,
+        route_id: &str,
+        certificate_id: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE routes SET certificate_id=?2, updated_at=?3 WHERE id=?1",
+            params![route_id, certificate_id, updated_at.to_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Err(ConfigError::NotFound(format!("route {route_id}")));
         }
         Ok(())
     }

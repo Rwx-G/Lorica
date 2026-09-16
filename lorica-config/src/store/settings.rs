@@ -295,6 +295,9 @@ impl ConfigStore {
                 "syslog_audit_enabled" => {
                     settings.syslog_audit_enabled = value == "true" || value == "1";
                 }
+                "syslog_capture_enabled" => {
+                    settings.syslog_capture_enabled = value == "true" || value == "1";
+                }
                 "syslog_tls_ca_pem" => {
                     settings.syslog_tls_ca_pem = if value.is_empty() { None } else { Some(value) };
                 }
@@ -328,6 +331,18 @@ impl ConfigStore {
                     } else {
                         Some(self.decrypt_config(&value).unwrap_or(value))
                     };
+                }
+                "otlp_logs_access_enabled" => {
+                    settings.otlp_logs_access_enabled = value == "true" || value == "1";
+                }
+                "otlp_logs_waf_enabled" => {
+                    settings.otlp_logs_waf_enabled = value == "true" || value == "1";
+                }
+                "otlp_logs_audit_enabled" => {
+                    settings.otlp_logs_audit_enabled = value == "true" || value == "1";
+                }
+                "otlp_logs_capture_enabled" => {
+                    settings.otlp_logs_capture_enabled = value == "true" || value == "1";
                 }
                 _ => {}
             }
@@ -647,6 +662,10 @@ impl ConfigStore {
             params![settings.syslog_audit_enabled.to_string()],
         )?;
         self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_capture_enabled', ?1)",
+            params![settings.syslog_capture_enabled.to_string()],
+        )?;
+        self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_tls_ca_pem', ?1)",
             params![settings.syslog_tls_ca_pem.as_deref().unwrap_or("")],
         )?;
@@ -680,6 +699,22 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_auth_header', ?1)",
             params![otlp_auth_stored],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_access_enabled', ?1)",
+            params![settings.otlp_logs_access_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_waf_enabled', ?1)",
+            params![settings.otlp_logs_waf_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_audit_enabled', ?1)",
+            params![settings.otlp_logs_audit_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_capture_enabled', ?1)",
+            params![settings.otlp_logs_capture_enabled.to_string()],
         )?;
         Ok(())
     }

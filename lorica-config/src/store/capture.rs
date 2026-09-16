@@ -288,6 +288,7 @@ mod tests {
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            managed_by: None,
             created_at: now,
             updated_at: now,
         }

@@ -22,8 +22,9 @@
 //! backends, route_backends, certificates (metadata only, see D3),
 //! waf_custom_rules, waf_disabled_rules, cert_export_acls,
 //! ai_crawlers_custom (keyed on its UNIQUE `name`, not its
-//! autoincrement id), probe_configs, sla_configs and capture_rules.
-//! Rows absent from the blob are deleted in exactly those tables.
+//! autoincrement id), probe_configs, sla_configs, capture_rules and
+//! automation_environments. Rows absent from the blob are deleted in
+//! exactly those tables.
 //!
 //! A capture rule's two counters are the one thing the blob does not
 //! carry (Story 10.1): they count what THIS node recorded and dropped,
@@ -129,6 +130,11 @@ pub struct ReplicaOutcome {
     /// serve. They are dropped rather than inserted: the foreign key
     /// would refuse them and abort the whole apply.
     pub capture_rules_dropped: usize,
+    /// Automation environments written (Story 10.4).
+    pub automation_environments: usize,
+    /// Environments in the blob naming a route this node does not
+    /// serve, dropped for the same reason as `capture_rules_dropped`.
+    pub automation_environments_dropped: usize,
     /// Whether any fleet-policy global setting differed from the
     /// local value and was overwritten.
     pub global_fields_changed: bool,
@@ -148,8 +154,9 @@ impl ConfigStore {
     ///
     /// [`ReplicaError::Refused`] on a hash mismatch, on any
     /// [`decode_canonical`] failure (unknown field, wrong format
-    /// version, malformed shape), and on a route whose
-    /// `node_selector` breaks [`Route::validate_node_selector`].
+    /// version, malformed shape), on a global setting carrying a
+    /// malformed CIDR entry, and on a route whose `node_selector`
+    /// breaks [`Route::validate_node_selector`].
     pub fn prepare_replica(
         blob: &[u8],
         expected_hash: &str,
@@ -158,6 +165,17 @@ impl ConfigStore {
             return Err(ReplicaError::Refused("hash mismatch".to_string()));
         }
         let config = decode_canonical(blob).map_err(|e| ReplicaError::Refused(e.to_string()))?;
+        // A malformed address entry is refused here rather than dropped
+        // at parse time on the data plane: an allow list whose only
+        // entry is a typo parses to an EMPTY allow list, which the
+        // connection filter reads as default-allow, so applying the
+        // blob would silently take the node's TCP allowlist off
+        // (backlog #88). The round aborts fleet-wide, which is what a
+        // blob this node will not accept is supposed to do.
+        config
+            .global
+            .validate_cidr_lists()
+            .map_err(|reason| ReplicaError::Refused(format!("global settings: {reason}")))?;
         for route in &config.routes {
             route
                 .validate_node_selector()
@@ -311,6 +329,12 @@ impl ConfigStore {
         let (written, dropped) = self.apply_replica_capture_rules(config, &kept_ids)?;
         outcome.capture_rules = written;
         outcome.capture_rules_dropped = dropped;
+
+        // 11. Automation environments, after the routes they cascade
+        //     from (Story 10.4).
+        let (written, dropped) = self.apply_replica_automation_environments(config, &kept_ids)?;
+        outcome.automation_environments = written;
+        outcome.automation_environments_dropped = dropped;
 
         Ok(outcome)
     }
@@ -615,6 +639,46 @@ impl ConfigStore {
         }
         Ok((written, dropped))
     }
+
+    /// Automation environments for the kept routes. Returns
+    /// `(written, dropped)`.
+    ///
+    /// Same shape as [`ConfigStore::apply_replica_capture_rules`], for
+    /// the same reason: `automation_environments.route_id` is
+    /// `REFERENCES routes(id)`, so a row naming a route this node does
+    /// not serve would fail the insert and roll the whole generation
+    /// back. It is dropped and counted instead. The upsert writes every
+    /// column from the blob, `created_at` included, so a re-encode on
+    /// this node reproduces the control plane's bytes.
+    fn apply_replica_automation_environments(
+        &self,
+        config: &CanonicalConfig,
+        kept_ids: &HashSet<&str>,
+    ) -> Result<(usize, usize)> {
+        let blob_names: HashSet<&str> = config
+            .automation_environments
+            .iter()
+            .filter(|environment| kept_ids.contains(environment.route_id.as_str()))
+            .map(|environment| environment.name.as_str())
+            .collect();
+        for local in self.list_automation_environments()? {
+            if !blob_names.contains(local.name.as_str()) {
+                self.delete_automation_environment(&local.name)?;
+            }
+        }
+
+        let mut written = 0usize;
+        let mut dropped = 0usize;
+        for environment in &config.automation_environments {
+            if !kept_ids.contains(environment.route_id.as_str()) {
+                dropped += 1;
+                continue;
+            }
+            self.upsert_automation_environment(environment)?;
+            written += 1;
+        }
+        Ok((written, dropped))
+    }
 }
 
 #[cfg(test)]
@@ -624,10 +688,10 @@ mod tests {
     use super::*;
     use crate::canonical::{canonical_bytes, canonical_hash, CanonicalCaptureRule};
     use crate::models::{
-        Backend, CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput, CaptureRedaction,
-        CaptureRule, CaptureScope, CertExportAcl, CustomCrawler, CustomVerification,
-        GlobalSettings, HealthStatus, LifecycleState, LoadBalancing, ProbeConfig, SlaConfig,
-        StatusMatch, WafMode,
+        AutomationEnvironment, Backend, CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput,
+        CaptureRedaction, CaptureRule, CaptureScope, CertExportAcl, CertificateMode, CustomCrawler,
+        CustomVerification, EnvironmentOwner, GlobalSettings, HealthStatus, LifecycleState,
+        LoadBalancing, ManagedBy, OwnerKind, ProbeConfig, SlaConfig, StatusMatch, WafMode,
     };
     use crate::store::new_id;
 
@@ -712,6 +776,7 @@ mod tests {
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            managed_by: None,
             created_at: now,
             updated_at: now,
         }
@@ -735,6 +800,7 @@ mod tests {
             tls_skip_verify: false,
             tls_sni: None,
             h2_upstream: false,
+            managed_by: None,
             created_at: now,
             updated_at: now,
         }
@@ -792,28 +858,61 @@ mod tests {
         }
     }
 
+    fn automation_mark(environment: &str) -> Option<ManagedBy> {
+        Some(ManagedBy::Automation {
+            environment: environment.to_string(),
+        })
+    }
+
+    fn make_environment(name: &str, route_id: &str) -> AutomationEnvironment {
+        let now = fixed_now();
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("team".to_string(), "acme".to_string());
+        AutomationEnvironment {
+            name: name.to_string(),
+            route_id: route_id.to_string(),
+            owner: EnvironmentOwner {
+                kind: OwnerKind::StaticToken,
+                principal: "acme-ci".to_string(),
+            },
+            certificate_mode: CertificateMode::Auto,
+            labels,
+            expires_at: now,
+            created_at: now,
+            updated_at: now,
+            last_pipeline: Some("pipeline-7".to_string()),
+            pipeline: None,
+        }
+    }
+
     /// The control plane's configuration: two routes (one of them
     /// pinned to `edge-1`), two backends and every table the replica
-    /// apply owns. Deliberately no notification channel and no DNS
-    /// provider: those ride the blob for drift detection but are never
-    /// applied (D2), so a fixture carrying them could not converge.
+    /// apply owns. The fleet route and its first backend are
+    /// automation-managed by `env-1`. Deliberately no notification
+    /// channel and no DNS provider: those ride the blob for drift
+    /// detection but are never applied (D2), so a fixture carrying them
+    /// could not converge.
     fn seed_source(store: &ConfigStore) {
         let now = fixed_now();
         store
             .create_certificate(&make_certificate("cert-1", CERT_KEY))
             .expect("test setup: certificate");
-        for backend in [
-            make_backend("backend-1", "10.0.0.10:8080"),
-            make_backend("backend-2", "10.0.0.11:8080"),
-        ] {
+        let mut managed_backend = make_backend("backend-1", "10.0.0.10:8080");
+        managed_backend.managed_by = automation_mark("env-1");
+        for backend in [managed_backend, make_backend("backend-2", "10.0.0.11:8080")] {
             store.create_backend(&backend).expect("test setup: backend");
         }
+        let mut managed_route = make_route("route-fleet", "fleet.example.com", &[]);
+        managed_route.managed_by = automation_mark("env-1");
         for route in [
-            make_route("route-fleet", "fleet.example.com", &[]),
+            managed_route,
             make_route("route-edge", "edge.example.com", &["edge-1"]),
         ] {
             store.create_route(&route).expect("test setup: route");
         }
+        store
+            .upsert_automation_environment(&make_environment("env-1", "route-fleet"))
+            .expect("test setup: environment");
         for (route_id, backend_id) in [
             ("route-fleet", "backend-1"),
             ("route-fleet", "backend-2"),
@@ -951,6 +1050,8 @@ mod tests {
         assert_eq!(outcome.sla_configs, 1);
         assert_eq!(outcome.capture_rules, 1);
         assert_eq!(outcome.capture_rules_dropped, 0);
+        assert_eq!(outcome.automation_environments, 1);
+        assert_eq!(outcome.automation_environments_dropped, 0);
         assert!(outcome.global_fields_changed);
 
         // Every replicated table matches, which the canonical hash
@@ -1096,6 +1197,54 @@ mod tests {
         let err = ConfigStore::prepare_replica(&edited, &hash)
             .expect_err("an invalid selector must be refused");
         assert!(matches!(err, ReplicaError::Refused(_)));
+    }
+
+    #[test]
+    fn a_malformed_cidr_in_any_replicated_setting_is_refused_and_the_store_is_untouched() {
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        seed_source(&source);
+        seed_target_node_local(&target);
+        let baseline = canonical_hash(&target).expect("baseline hash");
+        let blob = canonical_bytes(&source).expect("encode");
+
+        // Every address list the blob carries, edited in turn: a new
+        // one that `CanonicalGlobalSettings::cidr_lists` does not name
+        // fails `every_replicated_cidr_setting_is_validated` over in
+        // `canonical.rs`, so this loop cannot go stale silently.
+        let fields: Vec<&str> = crate::canonical::CanonicalGlobalSettings::from(
+            &crate::models::GlobalSettings::default(),
+        )
+        .cidr_lists()
+        .iter()
+        .map(|(field, _)| *field)
+        .collect();
+        assert!(!fields.is_empty(), "the blob carries at least one list");
+
+        for field in fields {
+            let mut root: serde_json::Value = serde_json::from_slice(&blob).expect("json");
+            root["global"][field] = serde_json::json!(["10.0.0.0/33"]);
+            let edited = serde_json::to_vec(&root).expect("re-encode");
+            let hash = sha256_hex(&edited);
+
+            let err = ConfigStore::prepare_replica(&edited, &hash)
+                .expect_err("a /33 is not a v4 network");
+            match err {
+                ReplicaError::Refused(ref message) => {
+                    assert!(
+                        message.contains(field),
+                        "the refusal does not name {field}: {message}"
+                    );
+                    assert!(message.contains("10.0.0.0/33"), "{message}");
+                }
+                ReplicaError::Store(e) => panic!("a bad CIDR is a semantic refusal, not {e}"),
+            }
+            assert_eq!(
+                canonical_hash(&target).expect("post-refusal hash"),
+                baseline,
+                "prepare must not touch the store"
+            );
+        }
     }
 
     #[test]
@@ -1315,6 +1464,125 @@ mod tests {
         assert!(target
             .get_capture_rule("cap-1")
             .expect("capture rule read")
+            .is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // Story 10.4: the environment row and the managed_by mark
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn an_automation_environment_in_the_blob_lands_on_the_follower() {
+        // Applied AFTER routes: the row cascades from its route, so it
+        // cannot exist before the route does.
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        seed_source(&source);
+
+        let config = prepared(&source).expect("prepare");
+        let outcome = target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("apply");
+
+        assert_eq!(outcome.automation_environments, 1);
+        assert_eq!(outcome.automation_environments_dropped, 0);
+        let stored = target
+            .get_automation_environment("env-1")
+            .expect("environment read")
+            .expect("the environment landed");
+        assert_eq!(stored, make_environment("env-1", "route-fleet"));
+    }
+
+    #[test]
+    fn a_managed_by_mark_lands_on_the_follower_byte_for_byte() {
+        // The follower's own dashboard must show the badge and refuse
+        // the in-place edit, so the mark has to arrive intact on both
+        // the route and the backend.
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        seed_source(&source);
+        target
+            .create_certificate(&make_certificate("cert-1", CERT_KEY))
+            .expect("target holds the key");
+
+        target
+            .apply_replica(&prepared(&source).expect("prepare"), "edge-1", 1, "h1")
+            .expect("apply");
+
+        let route = target
+            .get_route("route-fleet")
+            .expect("route read")
+            .expect("the route landed");
+        assert_eq!(route.managed_by, automation_mark("env-1"));
+        let backend = target
+            .get_backend("backend-1")
+            .expect("backend read")
+            .expect("the backend landed");
+        assert_eq!(backend.managed_by, automation_mark("env-1"));
+        let unmarked = target
+            .get_route("route-edge")
+            .expect("route read")
+            .expect("the route landed");
+        assert_eq!(
+            unmarked.managed_by, None,
+            "an operator route stays unmarked"
+        );
+        assert_eq!(
+            canonical_hash(&source).expect("source hash"),
+            canonical_hash(&target).expect("target hash"),
+            "the marks re-encode to the control plane's bytes"
+        );
+    }
+
+    #[test]
+    fn an_environment_that_disappears_from_the_blob_is_deleted() {
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        seed_source(&source);
+        target
+            .apply_replica(&prepared(&source).expect("prepare"), "edge-1", 1, "h1")
+            .expect("first apply");
+
+        source
+            .delete_automation_environment("env-1")
+            .expect("test setup: environment removed on the control plane");
+        let outcome = target
+            .apply_replica(&prepared(&source).expect("prepare"), "edge-1", 2, "h2")
+            .expect("second apply");
+
+        assert_eq!(outcome.automation_environments, 0);
+        assert!(target
+            .list_automation_environments()
+            .expect("environments")
+            .is_empty());
+    }
+
+    #[test]
+    fn an_environment_naming_a_route_absent_from_the_payload_is_dropped_not_fatal() {
+        // Same defence as the capture rule: the foreign key would refuse
+        // the insert and roll back the whole generation over one row
+        // this node was never meant to hold.
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        seed_source(&source);
+
+        let mut config = prepared(&source).expect("prepare");
+        config
+            .automation_environments
+            .push(make_environment("env-ghost", "route-nobody-here-serves"));
+        let outcome = target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("the apply survives the stray environment");
+
+        assert_eq!(outcome.automation_environments, 1);
+        assert_eq!(outcome.automation_environments_dropped, 1);
+        assert!(target
+            .get_automation_environment("env-ghost")
+            .expect("environment read")
+            .is_none());
+        assert!(target
+            .get_automation_environment("env-1")
+            .expect("environment read")
             .is_some());
     }
 

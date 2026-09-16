@@ -39,8 +39,8 @@ use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
-use super::capture::validate_cidr;
 use super::hostname_pattern::matches_one_label;
+use crate::connection_filter::validate_cidr;
 
 /// Bytes in the public (lookup) half of an automation token.
 pub const AUTOMATION_TOKEN_PUBLIC_ID_LEN: usize = 12;
@@ -269,7 +269,11 @@ impl AutomationToken {
 /// rule vacuous, and an operator who wants a token over everything a
 /// node serves is describing an operator credential, not an automation
 /// one.
-fn validate_hostname_pattern(pattern: &str) -> Result<(), String> {
+///
+/// Shared with the OIDC issuer entry (Story 10.5), which grants the
+/// same kind of authority over a name and must read a pattern the same
+/// way.
+pub(super) fn validate_hostname_pattern(pattern: &str) -> Result<(), String> {
     let invalid = |why: &str| format!("`{pattern}` is not a valid hostname pattern: {why}");
     if pattern == "*" {
         return Err(invalid(

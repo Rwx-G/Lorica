@@ -66,10 +66,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ConfigError, Result};
 use crate::models::{
-    Backend, CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput, CaptureRedaction,
-    CaptureRule, CaptureScope, CertExportAcl, Certificate, CustomCrawler, DnsProvider,
-    GlobalSettings, NotificationConfig, ProbeConfig, Route, RouteBackend, SecurityHeaderPreset,
-    SlaConfig, SpoofedFallback,
+    AutomationEnvironment, Backend, CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput,
+    CaptureRedaction, CaptureRule, CaptureScope, CertExportAcl, Certificate, CustomCrawler,
+    DnsProvider, GlobalSettings, NotificationConfig, ProbeConfig, Route, RouteBackend,
+    SecurityHeaderPreset, SlaConfig, SpoofedFallback,
 };
 use crate::store::ConfigStore;
 
@@ -82,6 +82,15 @@ use crate::store::ConfigStore;
 /// whichever unknown field its decoder happens to reach first; the
 /// tolerant peek in [`decode_canonical`] is what makes that the
 /// reported reason.
+///
+/// Story 10.4 adds `managed_by` on routes and backends and the
+/// `automation_environments` table WITHOUT moving this number: 2 is
+/// the shape of the 1.8.0 blob, and everything that release adds rides
+/// it. A second bump inside one release would tell a mixed-version
+/// fleet that two incompatible things happened when only one did. If
+/// 10.1 and 10.4 ever ship in different releases, that changes, and
+/// `story_10_4_rides_format_version_two_without_a_second_bump` is the
+/// test to revisit.
 pub const CANONICAL_FORMAT_VERSION: u32 = 2;
 
 /// One WAF custom rule in canonical form. The store keeps these as
@@ -373,6 +382,36 @@ impl CanonicalGlobalSettings {
         settings.mirror_max_concurrent_global = self.mirror_max_concurrent_global;
         before != *self
     }
+
+    /// Every address list this projection carries, each paired with its
+    /// field name: the replicated subset of
+    /// [`GlobalSettings::cidr_lists`].
+    ///
+    /// `ConfigStore::prepare_replica` refuses a blob whose lists do not
+    /// validate, so this is the list of settings a control plane cannot
+    /// widen by shipping something the parser will silently drop
+    /// (backlog #88). The `every_replicated_cidr_setting_is_validated`
+    /// test ties it to `GlobalSettings::cidr_lists`, so a new address
+    /// setting that reaches the blob cannot skip the refusal.
+    pub fn cidr_lists(&self) -> [(&'static str, &[String]); 3] {
+        [
+            ("waf_whitelist_ips", &self.waf_whitelist_ips),
+            ("connection_deny_cidrs", &self.connection_deny_cidrs),
+            ("connection_allow_cidrs", &self.connection_allow_cidrs),
+        ]
+    }
+
+    /// Refuse the first malformed entry in any replicated address list.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing reason, naming the setting.
+    pub fn validate_cidr_lists(&self) -> std::result::Result<(), String> {
+        for (field, entries) in self.cidr_lists() {
+            crate::connection_filter::validate_cidr_list(entries, field)?;
+        }
+        Ok(())
+    }
 }
 
 /// The canonical, byte-stable snapshot of everything the cluster
@@ -417,6 +456,12 @@ pub struct CanonicalConfig {
     pub sla_configs: Vec<SlaConfig>,
     /// Traffic-capture rules, without their per-node counters.
     pub capture_rules: Vec<CanonicalCaptureRule>,
+    /// Automation environments (Story 10.4), cut per recipient with
+    /// the route each one owns. A follower serving that route needs
+    /// the row so its dashboard shows the badge with the environment
+    /// name and the expiry, and refuses the in-place edit the next
+    /// pipeline `PUT` would overwrite.
+    pub automation_environments: Vec<AutomationEnvironment>,
 }
 
 /// Recursively rewrite every JSON object with its keys in sorted
@@ -589,6 +634,7 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
             .iter()
             .map(CanonicalCaptureRule::from)
             .collect(),
+        automation_environments: store.list_automation_environments()?,
     };
 
     // Replace secret material with digests BEFORE sorting so the
@@ -619,6 +665,7 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
     sort_by_canonical_repr(&mut cfg.probe_configs);
     sort_by_canonical_repr(&mut cfg.sla_configs);
     sort_by_canonical_repr(&mut cfg.capture_rules);
+    sort_by_canonical_repr(&mut cfg.automation_environments);
 
     Ok(cfg)
 }
@@ -716,6 +763,10 @@ impl SelectorResolution {
 /// header names and values. Sending every node the fleet's rules would
 /// reopen exactly the disclosure Story 10.0 closed, one story after
 /// closing it.
+///
+/// Automation environments are cut the same way (Story 10.4): the row
+/// names its route and carries the owner principal and the labels,
+/// which a node not serving the route has no reason to hold.
 pub fn restrict_for_recipient(
     cfg: &CanonicalConfig,
     node_id: &str,
@@ -762,6 +813,12 @@ pub fn restrict_for_recipient(
         .filter(|rule| kept.contains(rule.route_id.as_str()))
         .cloned()
         .collect();
+    let automation_environments: Vec<AutomationEnvironment> = cfg
+        .automation_environments
+        .iter()
+        .filter(|environment| kept.contains(environment.route_id.as_str()))
+        .cloned()
+        .collect();
 
     CanonicalConfig {
         routes,
@@ -769,6 +826,7 @@ pub fn restrict_for_recipient(
         route_backends,
         certificates,
         capture_rules,
+        automation_environments,
         ..cfg.clone()
     }
 }
@@ -833,8 +891,8 @@ mod tests {
     use super::*;
     use crate::models::{
         CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput, CaptureRedaction, CaptureScope,
-        HealthStatus, LifecycleState, LoadBalancing, NotificationChannel, PathRule, StatusMatch,
-        WafMode,
+        CertificateMode, EnvironmentOwner, HealthStatus, LifecycleState, LoadBalancing, ManagedBy,
+        NotificationChannel, OwnerKind, PathRule, StatusMatch, WafMode,
     };
 
     /// Fixed timestamp so the same logical entity inserted into two
@@ -930,6 +988,7 @@ mod tests {
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            managed_by: None,
             created_at: now,
             updated_at: now,
         }
@@ -1016,8 +1075,31 @@ mod tests {
         }
     }
 
+    /// An environment owning `route_id`, with the owner principal and
+    /// the labels the per-recipient cut has to keep off other nodes.
+    fn make_environment(name: &str, route_id: &str) -> AutomationEnvironment {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("team".to_string(), "acme".to_string());
+        AutomationEnvironment {
+            name: name.to_string(),
+            route_id: route_id.to_string(),
+            owner: EnvironmentOwner {
+                kind: OwnerKind::StaticToken,
+                principal: "acme-ci".to_string(),
+            },
+            certificate_mode: CertificateMode::Auto,
+            labels,
+            expires_at: fixed_now(),
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+            last_pipeline: Some("pipeline-7".to_string()),
+            pipeline: None,
+        }
+    }
+
     /// Three routes: one fleet-wide, one for each edge, each with its
-    /// own backend and certificate.
+    /// own backend and certificate. The two edge routes and their
+    /// backends are automation-managed, each by its own environment.
     fn fleet_config() -> CanonicalConfig {
         let mut fleet = make_route("r-fleet", "fleet.example");
         fleet.node_selector = Vec::new();
@@ -1025,18 +1107,29 @@ mod tests {
         let mut a = make_route("r-a", "a.example");
         a.node_selector = vec!["edge-a".to_string()];
         a.certificate_id = Some("cert-a".to_string());
+        a.managed_by = Some(ManagedBy::Automation {
+            environment: "env-a".to_string(),
+        });
         let mut b = make_route("r-b", "b.example");
         b.node_selector = vec!["edge-b".to_string()];
         b.certificate_id = Some("cert-b".to_string());
+        b.managed_by = Some(ManagedBy::Automation {
+            environment: "env-b".to_string(),
+        });
+        let mut backend_a = make_backend("b-a", "10.0.0.10:8080");
+        backend_a.managed_by = Some(ManagedBy::Automation {
+            environment: "env-a".to_string(),
+        });
+        let mut backend_b = make_backend("b-b", "10.0.0.11:8080");
+        backend_b.managed_by = Some(ManagedBy::Automation {
+            environment: "env-b".to_string(),
+        });
 
         CanonicalConfig {
             version: CANONICAL_FORMAT_VERSION,
             global: CanonicalGlobalSettings::from(&GlobalSettings::default()),
             routes: vec![fleet, a, b],
-            backends: vec![
-                make_backend("b-a", "10.0.0.10:8080"),
-                make_backend("b-b", "10.0.0.11:8080"),
-            ],
+            backends: vec![backend_a, backend_b],
             route_backends: vec![
                 RouteBackend {
                     route_id: "r-a".to_string(),
@@ -1062,6 +1155,10 @@ mod tests {
             capture_rules: vec![
                 make_capture_rule("cap-a", "r-a"),
                 make_capture_rule("cap-b", "r-b"),
+            ],
+            automation_environments: vec![
+                make_environment("env-a", "r-a"),
+                make_environment("env-b", "r-b"),
             ],
         }
     }
@@ -1133,6 +1230,121 @@ mod tests {
             serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
         assert_eq!(peek["version"], 2);
         assert_eq!(CANONICAL_FORMAT_VERSION, 2);
+    }
+
+    // -----------------------------------------------------------------
+    // Story 10.4: ownership marks and the environment row
+    // -----------------------------------------------------------------
+
+    /// A GUARD, not an accident: Story 10.4 adds `managed_by` and
+    /// `automation_environments` to the blob under the SAME version
+    /// Story 10.1 set, because both ship in 1.8.0 and a second bump
+    /// inside one release would lie to a mixed-version fleet. A future
+    /// change that moves this number must be deliberate about it; this
+    /// test is where that deliberation gets recorded.
+    #[test]
+    fn story_10_4_rides_format_version_two_without_a_second_bump() {
+        assert_eq!(CANONICAL_FORMAT_VERSION, 2);
+        let cfg = fleet_config();
+        assert!(
+            cfg.routes.iter().any(|r| r.managed_by.is_some()),
+            "the fixture carries a managed_by mark"
+        );
+        assert!(
+            !cfg.automation_environments.is_empty(),
+            "the fixture carries an environment row"
+        );
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let peek: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        assert_eq!(peek["version"], 2, "a 10.4 blob is still a version-2 blob");
+        decode_canonical(&bytes).expect("a version-2 decoder accepts a 10.4 blob");
+    }
+
+    #[test]
+    fn an_environment_on_another_nodes_route_is_not_on_the_wire() {
+        // The row names its route and carries the owner principal and
+        // the labels, so it is cut with the route.
+        let cut = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let names: Vec<&str> = cut
+            .automation_environments
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["env-a"]);
+
+        let other = restrict_for_recipient(&fleet_config(), "id-b", &resolution());
+        assert!(
+            !other
+                .automation_environments
+                .iter()
+                .any(|e| e.name == "env-a"),
+            "edge-b must not see the environment on edge-a's route"
+        );
+    }
+
+    #[test]
+    fn an_environment_survives_an_encode_decode_round_trip_byte_identically() {
+        let cfg = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("test setup: decode");
+        assert_eq!(decoded.automation_environments, cfg.automation_environments);
+        let again = encode_canonical(&decoded).expect("test setup: re-encode");
+        assert_eq!(bytes, again);
+    }
+
+    #[test]
+    fn managed_by_survives_the_canonical_round_trip_byte_identically() {
+        // A follower must know a route is automation-managed so its own
+        // dashboard shows the badge and refuses in-place edits.
+        let cfg = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("test setup: decode");
+
+        let route = decoded
+            .routes
+            .iter()
+            .find(|r| r.id == "r-a")
+            .expect("edge-a's route is on the wire");
+        assert_eq!(
+            route.managed_by,
+            Some(ManagedBy::Automation {
+                environment: "env-a".to_string()
+            })
+        );
+        let backend = decoded
+            .backends
+            .iter()
+            .find(|b| b.id == "b-a")
+            .expect("edge-a's backend is on the wire");
+        assert_eq!(
+            backend.managed_by,
+            Some(ManagedBy::Automation {
+                environment: "env-a".to_string()
+            })
+        );
+        let fleet = decoded
+            .routes
+            .iter()
+            .find(|r| r.id == "r-fleet")
+            .expect("the fleet route is on the wire");
+        assert_eq!(fleet.managed_by, None, "an operator route stays unmarked");
+
+        let again = encode_canonical(&decoded).expect("test setup: re-encode");
+        assert_eq!(bytes, again);
+    }
+
+    #[test]
+    fn an_operator_managed_row_encodes_without_a_managed_by_key() {
+        // `None` is the operator's mark and is elided, so a fleet with
+        // no automation encodes exactly as it did before Story 10.4.
+        let mut cfg = fleet_config();
+        cfg.routes.retain(|r| r.id == "r-fleet");
+        cfg.backends.clear();
+        cfg.automation_environments.clear();
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let text = String::from_utf8(bytes).expect("test setup: the blob is UTF-8 JSON");
+        assert!(!text.contains("managed_by"), "{text}");
     }
 
     #[test]
@@ -1258,6 +1470,7 @@ mod tests {
                 probe_configs: Vec::new(),
                 sla_configs: Vec::new(),
                 capture_rules: Vec::new(),
+                automation_environments: Vec::new(),
             };
             let resolution = SelectorResolution::from_rows(rows.clone());
 
@@ -1319,6 +1532,7 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             tls_skip_verify: false,
             tls_sni: None,
             h2_upstream: false,
+            managed_by: None,
             created_at: now,
             updated_at: now,
         }
@@ -1583,18 +1797,53 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             syslog_access_enabled: _,
             syslog_waf_enabled: _,
             syslog_audit_enabled: _,
+            syslog_capture_enabled: _,
             syslog_tls_ca_pem: _,
             syslog_tls_client_cert_pem: _,
             syslog_tls_client_key_pem: _,
             syslog_extra_sd: _,
             otlp_logs_enabled: _,
             otlp_logs_auth_header: _,
+            otlp_logs_access_enabled: _,
+            otlp_logs_waf_enabled: _,
+            otlp_logs_audit_enabled: _,
+            otlp_logs_capture_enabled: _,
             // The automation listener only ever runs on a control
             // plane (a follower refuses to start it), and the set of
             // machines allowed to reach THIS node's socket is a
             // property of where the node sits, not of fleet policy.
             automation_allowed_cidrs: _,
         } = GlobalSettings::default();
+    }
+
+    #[test]
+    fn every_replicated_cidr_setting_is_validated() {
+        let settings = GlobalSettings::default();
+        let canonical = CanonicalGlobalSettings::from(&settings);
+        let covered: Vec<&str> = canonical.cidr_lists().iter().map(|(f, _)| *f).collect();
+        let value = serde_json::to_value(&canonical).expect("canonical settings serialise");
+        let object = value.as_object().expect("canonical settings are an object");
+
+        // Whatever `GlobalSettings` calls an address list and the blob
+        // carries, `prepare_replica` must be able to refuse. The two
+        // enumerations are tied here rather than by memory.
+        for (field, _) in settings.cidr_lists() {
+            if object.contains_key(field) {
+                assert!(
+                    covered.contains(&field),
+                    "`{field}` rides the canonical blob but \
+                     `CanonicalGlobalSettings::cidr_lists` does not name it, so a malformed \
+                     entry replicates unchecked"
+                );
+            }
+        }
+
+        for field in covered {
+            assert!(
+                object.contains_key(field),
+                "`{field}` is enumerated but the blob does not carry it any more"
+            );
+        }
     }
 
     #[test]

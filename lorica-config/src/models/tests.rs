@@ -471,6 +471,7 @@ fn test_route_with_path_rule_overrides_applies_some_fields() {
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        managed_by: None,
         created_at: now,
         updated_at: now,
     };
@@ -732,6 +733,7 @@ fn example_route_for_serde() -> Route {
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        managed_by: None,
         created_at: now,
         updated_at: now,
     }

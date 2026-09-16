@@ -12,12 +12,11 @@
 //!
 //! [`CanonicalCaptureRule`]: crate::canonical::CanonicalCaptureRule
 
-use std::net::IpAddr;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::enums::HeaderMatchType;
+use crate::connection_filter::validate_cidr;
 
 /// Hard cap on [`CaptureScope::request_body_max_bytes`] and
 /// [`CaptureScope::response_body_max_bytes`]. A capture holds the
@@ -306,7 +305,11 @@ pub struct CaptureRedaction {
     /// Extra header names to redact, case-insensitive.
     #[serde(default)]
     pub headers: Vec<String>,
-    /// Extra query-parameter names to redact, case-insensitive.
+    /// Extra query-parameter names to redact. Compared exactly, unlike
+    /// header names: HTTP makes header names case-insensitive and
+    /// makes no such promise about query parameters, and a masker that
+    /// folded case would mask a parameter the application treats as a
+    /// different one.
     #[serde(default)]
     pub query: Vec<String>,
 }
@@ -611,41 +614,6 @@ fn check_header_name(name: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Accept a CIDR (`10.0.0.0/8`, `2001:db8::/32`) or a bare address,
-/// which is what the connection filter accepts for the same kind of
-/// list. `field` names the list in the error message.
-///
-/// `lorica-config` has no `ipnet` dependency and gains none for this,
-/// so the check is built on `std::net::IpAddr` plus an explicit prefix
-/// bound: it accepts exactly the same shapes `ipnet` does for these two
-/// families, and rejects strictly more (an `ipnet` parse tolerates host
-/// bits set, which is fine to keep, but nothing looser).
-///
-/// Visible to the whole `models` module: every operator-supplied
-/// address list in the crate answers to this one definition, so an
-/// operator who learns what Lorica accepts learns it once.
-pub(super) fn validate_cidr(entry: &str, field: &str) -> Result<(), String> {
-    let trimmed = entry.trim();
-    let invalid = || format!("`{entry}` is not a valid IP or CIDR in {field}");
-    let (addr, prefix) = match trimmed.split_once('/') {
-        Some((addr, prefix)) => (addr, Some(prefix)),
-        None => (trimmed, None),
-    };
-    let ip: IpAddr = addr.parse().map_err(|_| invalid())?;
-    let Some(prefix) = prefix else {
-        return Ok(());
-    };
-    let bits: u8 = prefix.parse().map_err(|_| invalid())?;
-    let max_bits = match ip {
-        IpAddr::V4(_) => 32,
-        IpAddr::V6(_) => 128,
-    };
-    if bits > max_bits {
-        return Err(invalid());
-    }
-    Ok(())
-}
-
 /// A non-empty RFC 9110 section 5.6.2 `token`: ASCII letters, digits,
 /// and the fifteen `tchar` punctuation marks. Method names and header
 /// names are both this grammar, so they answer to one definition here.
@@ -878,6 +846,19 @@ mod tests {
             "::1".to_string(),
         ];
         assert!(rule.validate().is_ok());
+    }
+
+    #[test]
+    fn a_source_cidr_answers_to_the_shared_parser() {
+        for (entry, valid) in crate::connection_filter::CIDR_CORPUS {
+            let mut rule = valid_rule();
+            rule.match_.source_cidrs = vec![(*entry).to_string()];
+            assert_eq!(
+                rule.validate().is_ok(),
+                *valid,
+                "capture validation disagrees with the shared parser on {entry:?}"
+            );
+        }
     }
 
     #[test]

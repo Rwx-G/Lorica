@@ -83,6 +83,7 @@ mod tests {
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            managed_by: None,
             created_at: now,
             updated_at: now,
         }
@@ -104,6 +105,7 @@ mod tests {
             active_connections: 0,
             tls_upstream: false,
             tls_skip_verify: false,
+            managed_by: None,
             tls_sni: None,
             h2_upstream: false,
             created_at: now,
@@ -958,11 +960,12 @@ mod tests {
         let db_path = dir.path().join("legacy.db");
         {
             let conn = rusqlite::Connection::open(&db_path).expect("test setup: raw open");
-            // A real pre-v22 database also has the `routes` and
-            // `sessions` tables (created at v1 / v21); the v22+ tail
-            // adds columns to them. The old runner swallowed the ALTER
-            // errors when they were missing, the tracked runner does
-            // not, so the synthetic fixture must include them.
+            // A real pre-v22 database also has the `routes`, `backends`
+            // and `sessions` tables (created at v1 / v1 / v21); the
+            // v22+ tail adds columns to them. The old runner swallowed
+            // the ALTER errors when they were missing, the tracked
+            // runner does not, so the synthetic fixture must include
+            // them.
             conn.execute_batch(
                 "CREATE TABLE schema_migrations (
                     version INTEGER PRIMARY KEY,
@@ -972,6 +975,10 @@ mod tests {
                  CREATE TABLE routes (
                     id TEXT PRIMARY KEY,
                     hostname TEXT NOT NULL DEFAULT ''
+                 );
+                 CREATE TABLE backends (
+                    id TEXT PRIMARY KEY,
+                    address TEXT NOT NULL DEFAULT ''
                  );
                  CREATE TABLE sessions (
                     id TEXT PRIMARY KEY,
@@ -1208,10 +1215,17 @@ created_at = "2026-01-01T00:00:00Z"
         assert!(settings.syslog_access_enabled);
         assert!(settings.syslog_waf_enabled);
         assert!(settings.syslog_audit_enabled);
+        assert!(settings.syslog_capture_enabled);
         assert!(settings.syslog_tls_ca_pem.is_none());
         assert!(settings.syslog_extra_sd.is_none());
         assert!(!settings.otlp_logs_enabled);
         assert!(settings.otlp_logs_auth_header.is_none());
+        // Per-kind OTLP toggles default on (backlog #50): a toggle that
+        // appeared as "off" would silently stop an export in flight.
+        assert!(settings.otlp_logs_access_enabled);
+        assert!(settings.otlp_logs_waf_enabled);
+        assert!(settings.otlp_logs_audit_enabled);
+        assert!(settings.otlp_logs_capture_enabled);
 
         // Round-trip non-default values.
         let mut updated = settings;
@@ -1224,12 +1238,17 @@ created_at = "2026-01-01T00:00:00Z"
         updated.syslog_access_enabled = false;
         updated.syslog_waf_enabled = true;
         updated.syslog_audit_enabled = false;
+        updated.syslog_capture_enabled = false;
         updated.syslog_tls_ca_pem = Some("-----BEGIN CERTIFICATE-----".to_string());
         updated.syslog_tls_client_cert_pem = Some("-----BEGIN CERTIFICATE-----".to_string());
         updated.syslog_tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----".to_string());
         updated.syslog_extra_sd = Some("env=prod,dc=eu-west".to_string());
         updated.otlp_logs_enabled = true;
         updated.otlp_logs_auth_header = Some("Bearer token123".to_string());
+        updated.otlp_logs_access_enabled = false;
+        updated.otlp_logs_waf_enabled = true;
+        updated.otlp_logs_audit_enabled = false;
+        updated.otlp_logs_capture_enabled = false;
         store
             .update_global_settings(&updated)
             .expect("test setup: global settings update");
@@ -1249,6 +1268,7 @@ created_at = "2026-01-01T00:00:00Z"
         assert!(!fetched.syslog_access_enabled);
         assert!(fetched.syslog_waf_enabled);
         assert!(!fetched.syslog_audit_enabled);
+        assert!(!fetched.syslog_capture_enabled);
         assert_eq!(
             fetched.syslog_tls_client_key_pem.as_deref(),
             Some("-----BEGIN PRIVATE KEY-----")
@@ -1262,6 +1282,10 @@ created_at = "2026-01-01T00:00:00Z"
             fetched.otlp_logs_auth_header.as_deref(),
             Some("Bearer token123")
         );
+        assert!(!fetched.otlp_logs_access_enabled);
+        assert!(fetched.otlp_logs_waf_enabled);
+        assert!(!fetched.otlp_logs_audit_enabled);
+        assert!(!fetched.otlp_logs_capture_enabled);
 
         // Clearing an optional field (empty string in the KV table)
         // deserialises back to None.
@@ -1283,14 +1307,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 57 is the current head of the tracked MIGRATIONS table (every
+        // 59 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            57
+            59
         );
     }
 
@@ -1308,7 +1332,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                57
+                59
             );
         }
     }
@@ -1853,6 +1877,55 @@ backend_id = "also-nonexistent"
 "#;
         let result = parse_toml(toml_str);
         assert!(result.is_err());
+    }
+
+    /// A minimal import TOML whose `connection_allow_cidrs` holds
+    /// exactly `entry`.
+    fn toml_with_allow_cidr(entry: &str) -> String {
+        format!(
+            "version = 1\n\n\
+             [global_settings]\n\
+             management_port = 9443\n\
+             log_level = \"info\"\n\
+             default_health_check_interval_s = 10\n\
+             connection_allow_cidrs = [\"{entry}\"]\n"
+        )
+    }
+
+    #[test]
+    fn test_import_refuses_a_malformed_cidr_naming_the_field() {
+        let err = parse_toml(&toml_with_allow_cidr("10.0.0.0/33"))
+            .expect_err("a /33 is not a v4 network")
+            .to_string();
+        assert!(err.contains("connection_allow_cidrs"), "{err}");
+        assert!(err.contains("10.0.0.0/33"), "{err}");
+    }
+
+    #[test]
+    fn test_import_accepts_a_well_formed_cidr() {
+        let data = parse_toml(&toml_with_allow_cidr("10.0.0.0/8")).expect("a /8 is a v4 network");
+        assert_eq!(data.global_settings.connection_allow_cidrs, ["10.0.0.0/8"]);
+    }
+
+    #[test]
+    fn test_import_refuses_a_malformed_entry_in_every_cidr_setting() {
+        for (field, _) in GlobalSettings::default().cidr_lists() {
+            let toml_str = format!(
+                "version = 1\n\n\
+                 [global_settings]\n\
+                 management_port = 9443\n\
+                 log_level = \"info\"\n\
+                 default_health_check_interval_s = 10\n\
+                 {field} = [\"10.0.0.0/33\"]\n"
+            );
+            let err = parse_toml(&toml_str)
+                .expect_err("a /33 is not a v4 network")
+                .to_string();
+            assert!(
+                err.contains(field),
+                "the refusal does not name {field}: {err}"
+            );
+        }
     }
 
     // ---- File-based export/import ----

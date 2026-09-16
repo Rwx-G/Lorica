@@ -282,6 +282,15 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
                 .unwrap_or_else(|_| "[]".to_string());
             serde_json::from_str(&json).unwrap_or_default()
         },
+        // Column index 70 (Story 10.4 migration V58). NULL is
+        // operator-managed. A present-but-corrupt mark is a hard error
+        // like the security blobs above: silently reading it as `None`
+        // would let the dashboard edit a row the next pipeline `PUT`
+        // will overwrite.
+        managed_by: parse_optional_json_field(
+            row.get::<_, Option<String>>(70).unwrap_or(None),
+            "managed_by",
+        )?,
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })
@@ -315,6 +324,12 @@ pub(super) fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
             }
         },
         tls_skip_verify: row.get::<_, bool>(16).unwrap_or(false),
+        // Column index 17 (Story 10.4 migration V58); same contract as
+        // the route column.
+        managed_by: parse_optional_json_field(
+            row.get::<_, Option<String>>(17).unwrap_or(None),
+            "managed_by",
+        )?,
     })
 }
 

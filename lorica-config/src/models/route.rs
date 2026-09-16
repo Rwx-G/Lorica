@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::automation_environment::ManagedBy;
 use super::enums::{HeaderMatchType, LoadBalancing, PathMatchType, WafMode};
 
 /// Per-path override that layers on top of a [`Route`]. A matching rule
@@ -830,6 +831,15 @@ pub struct Route {
     /// [`NODE_SELECTOR_MAX_ENTRIES`] entries.
     #[serde(default)]
     pub node_selector: Vec<String>,
+    /// Who manages this route when it is not the operator (Story 10.4
+    /// AC #8). `None` is operator-managed: every row written before
+    /// the mark existed, and every row the dashboard creates. A
+    /// `Some` is shown as a badge and refused in-place edits, so a
+    /// manual fix is not silently overwritten by the next pipeline
+    /// `PUT`. Replicates with the row so a follower's dashboard
+    /// applies the same refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<ManagedBy>,
     /// First-insert timestamp (DB-assigned).
     pub created_at: DateTime<Utc>,
     /// Last-write timestamp (refreshed on every UPDATE).
