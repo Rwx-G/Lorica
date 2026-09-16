@@ -2510,10 +2510,26 @@ impl ProxyHttp for LoricaProxy {
                 .as_deref()
                 .map(|route_id| config.capture_rules.rules_for_route(route_id))
                 .unwrap_or_default();
-            let would_emit = rules
+            // The budgets are spent HERE and nowhere else, one call per
+            // rule that would emit. `admit` is the single critical
+            // section that reads the total, reads the rate window and
+            // advances both, so two requests racing for the last
+            // capture cannot both take it.
+            // A loop, not `any`: that one short-circuits, so the first
+            // rule to emit would leave every other matching rule's
+            // budget unspent and its counters wrong. Each rule that
+            // would emit consults its own.
+            let now = std::time::Instant::now();
+            let mut would_emit = false;
+            for rule in rules
                 .iter()
                 .filter(|rule| state.rule_ids.iter().any(|id| id == &rule.rule.id))
-                .any(|rule| rule.should_emit(status, latency_ms, upstream_error));
+                .filter(|rule| rule.should_emit(status, latency_ms, upstream_error))
+            {
+                if crate::capture::node_budgets().admit(rule, now).emitted() {
+                    would_emit = true;
+                }
+            }
             state.would_emit = would_emit;
             tracing::debug!(
                 request_id = %ctx.request_id,

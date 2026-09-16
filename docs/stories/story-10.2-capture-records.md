@@ -92,6 +92,8 @@ it.
 - [ ] AC #4: the drop path and its counter.
 - [ ] AC #5: the dashboard page, the ring, and the three frontend gates.
 - [ ] AC #6: the audit rows.
+- [ ] Flush `captures_emitted` and `captures_dropped` to the store. Story 10.1 built `ConfigStore::bump_capture_counters` and left it with no producer: the per-rule counts live in the process budget and never reach the row the dashboard reads. Whoever emits the record is the one who knows an emission happened, so it belongs here.
+- [ ] Two gauges do not aggregate in worker mode. `lorica_capture_rules_active` and `lorica_capture_inflight_bytes` are published per process, and the per-worker aggregation machinery is counters-only, so a scrape on the supervisor under `--workers` reports the supervisor's own values rather than the fleet of workers'. `lorica_captures_total` does aggregate. Either close the gap the way `set_active_connections` does, or say so in `docs/capture.md` next to the per-worker budget semantics; do not leave it for an operator to discover from a graph that reads zero.
 - [ ] AC #7: `docs/capture.md`, including two things an operator will otherwise discover the hard way: the response body is the upstream's and predates any rewrite, and a capture rule cannot be disabled on a follower without break-glass because it arrives by replication and a local change would be overwritten on the next round.
 - [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, and the frontend three (`npm run check`, `npm run lint`, `npx vitest run`).
 

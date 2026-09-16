@@ -663,6 +663,12 @@ impl ProxyConfig {
         let capture_rules = Arc::new(crate::capture::CompiledCaptureRules::compile(
             &capture_rules,
         ));
+        // A budget entry outlives the snapshot that created it, on
+        // purpose, so a reload cannot hand a rule its spent total back.
+        // The other side of that is this: entries for rules that left
+        // the configuration have to be dropped here, or the map grows
+        // with every rule an operator ever created.
+        crate::capture::node_budgets().retain_rules(capture_rules.rule_ids());
 
         ProxyConfig {
             routes_by_host,

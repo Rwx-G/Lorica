@@ -278,12 +278,36 @@ impl CompiledCaptureRules {
                 ),
             }
         }
-        Self { by_route }
+        let set = Self { by_route };
+        // `lorica_capture_rules_active` is published here rather than by
+        // the caller because this is the one place that knows what the
+        // node ended up armed with: a rule can be dropped for a pattern
+        // that does not compile, so the stored count and the running
+        // count are not the same number.
+        lorica_api::metrics::set_capture_rules_active(set.rule_count() as i64);
+        set
     }
 
     /// Whether the set holds no rule at all.
     pub fn is_empty(&self) -> bool {
         self.by_route.is_empty()
+    }
+
+    /// How many rules the set holds, across every route.
+    pub fn rule_count(&self) -> usize {
+        self.by_route.values().map(Vec::len).sum()
+    }
+
+    /// Every rule id in the set, for the budget map to keep.
+    ///
+    /// The budgets are keyed by rule id and a rule that left the
+    /// configuration must not keep its entry; this is the live set to
+    /// measure that against.
+    pub fn rule_ids(&self) -> impl Iterator<Item = &str> {
+        self.by_route
+            .values()
+            .flatten()
+            .map(|compiled| compiled.rule.id.as_str())
     }
 
     /// Whether any rule targets `route_id`, without evaluating a single

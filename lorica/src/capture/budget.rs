@@ -46,11 +46,22 @@ pub const CAPTURE_MAX_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 pub struct CaptureBudget {
     ceiling: usize,
     in_flight: AtomicUsize,
+    /// Whether this budget publishes `lorica_capture_inflight_bytes`.
+    ///
+    /// Only the process-wide one does. A budget a test built to exercise
+    /// the ceiling would otherwise write the same gauge, reporting a
+    /// reservation against a ceiling nothing on the node runs under.
+    publishes: bool,
 }
 
 /// The process-wide budget every request reserves from.
-static NODE_BUDGET: Lazy<Arc<CaptureBudget>> =
-    Lazy::new(|| CaptureBudget::new(CAPTURE_MAX_INFLIGHT_BYTES));
+static NODE_BUDGET: Lazy<Arc<CaptureBudget>> = Lazy::new(|| {
+    Arc::new(CaptureBudget {
+        ceiling: CAPTURE_MAX_INFLIGHT_BYTES,
+        in_flight: AtomicUsize::new(0),
+        publishes: true,
+    })
+});
 
 /// The budget the proxy pipeline uses.
 ///
@@ -67,7 +78,21 @@ impl CaptureBudget {
         Arc::new(Self {
             ceiling,
             in_flight: AtomicUsize::new(0),
+            publishes: false,
         })
+    }
+
+    /// Mirror the current reservation into
+    /// `lorica_capture_inflight_bytes` (Story 10.1 AC #9).
+    ///
+    /// Called after every change rather than sampled at scrape time
+    /// because the counter is a process-wide static the metrics crate
+    /// has no handle on, and in worker mode the scrape happens in a
+    /// different process entirely.
+    fn publish(&self) {
+        if self.publishes {
+            lorica_api::metrics::set_capture_inflight_bytes(self.in_flight() as i64);
+        }
     }
 
     /// Bytes currently reserved.
@@ -127,6 +152,7 @@ impl CaptureReservation {
                 });
         if outcome.is_ok() {
             self.held += extra;
+            self.budget.publish();
             true
         } else {
             false
@@ -141,6 +167,7 @@ impl CaptureReservation {
         let released = bytes.min(self.held);
         self.held -= released;
         self.budget.in_flight.fetch_sub(released, Ordering::Relaxed);
+        self.budget.publish();
     }
 }
 
@@ -149,6 +176,7 @@ impl Drop for CaptureReservation {
         self.budget
             .in_flight
             .fetch_sub(self.held, Ordering::Relaxed);
+        self.budget.publish();
     }
 }
 

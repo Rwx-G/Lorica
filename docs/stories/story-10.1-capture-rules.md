@@ -88,9 +88,9 @@ offered. See AC #10.
 - [x] AC #7: compilation into a `CompiledCaptureRules` set keyed by route. Wiring it into the `ProxyConfig` snapshot rides the proxy slice.
 - [x] AC #4: the two buffering seams and the overflow stance. The response body captured is the upstream's, before any rewrite; see Story 10.2 for why that has to be documented.
 - [x] AC #6: the node-wide ceiling, as a process-wide counter released by `Drop`.
-- [ ] AC #5: the per-rule budgets, the sliding window, the self-disable and its audit.
+- [x] AC #5: the per-rule budgets, the sliding window, the self-disable and its audit. One slice remains: `spawn_capture_disable_task` is written and not yet registered in the startup paths, which the Story 10.3 startup slice is touching.
 - [x] AC #8: the API surface with the 422 cases.
-- [ ] AC #9: the metrics.
+- [x] AC #9: the metrics. `lorica_captures_total` aggregates per worker; the two gauges do not, and Story 10.2 owes the choice between closing that or documenting it.
 - [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, and the frontend three once Story 10.2 adds the page.
 
 ## Dev Notes

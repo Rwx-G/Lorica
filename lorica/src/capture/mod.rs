@@ -14,10 +14,12 @@
 
 //! Traffic capture (Story 10.1).
 //!
-//! Three pieces: the compiled predicates a request is measured against
+//! Five pieces: the compiled predicates a request is measured against
 //! ([`rules`]), the per-request buffers a matched request fills
-//! ([`buffers`]), and the node-wide ceiling those buffers reserve from
-//! ([`budget`]).
+//! ([`buffers`]), the node-wide ceiling those buffers reserve from
+//! ([`budget`]), the per-rule total and rate an emission is counted
+//! against ([`budgets`]), and the task that disarms a rule which spent
+//! its total ([`self_disable`]).
 //!
 //! `lorica-config` owns the stored shape of a capture rule; this module
 //! owns the matcher built from it. The split follows where the `regex`
@@ -26,9 +28,17 @@
 //! compile-time budget and holds the compiled automaton.
 
 mod budget;
+mod budgets;
 mod buffers;
 mod rules;
+mod self_disable;
 
 pub use budget::{node_budget, CaptureBudget, CaptureReservation, CAPTURE_MAX_INFLIGHT_BYTES};
+pub use budgets::{
+    node_budgets, CaptureAdmission, CaptureBudgets, PendingDisable, CAPTURE_MAX_TRACKED_RULES,
+};
 pub use buffers::{CaptureBody, CaptureSkip, CaptureState};
 pub use rules::{CompiledCaptureRule, CompiledCaptureRules, CAPTURE_REGEX_SIZE_LIMIT};
+pub use self_disable::{
+    spawn_capture_disable_task, CAPTURE_AUTO_DISABLED_ACTION, CAPTURE_DISABLE_INTERVAL,
+};
