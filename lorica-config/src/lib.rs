@@ -34,8 +34,8 @@ pub mod store;
 mod tests;
 
 pub use canonical::{
-    canonical_bytes, canonical_config, canonical_hash, decode_canonical, CanonicalConfig,
-    CanonicalGlobalSettings, CanonicalWafRule, CANONICAL_FORMAT_VERSION,
+    canonical_bytes, canonical_config, canonical_hash, decode_canonical, CanonicalCaptureRule,
+    CanonicalConfig, CanonicalGlobalSettings, CanonicalWafRule, CANONICAL_FORMAT_VERSION,
 };
 pub use crypto::EncryptionKey;
 pub use error::{ConfigError, Result};

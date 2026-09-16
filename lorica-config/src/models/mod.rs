@@ -4,6 +4,7 @@
 
 mod ai_crawler;
 mod backend;
+mod capture;
 mod cert_export_acl;
 mod certificate;
 mod cluster;
@@ -23,6 +24,13 @@ pub use ai_crawler::{
     CustomCrawler, CustomVerification, CUSTOM_CRAWLER_MAX_CIDRS, CUSTOM_CRAWLER_MAX_COUNT,
 };
 pub use backend::{Backend, RouteBackend};
+pub use capture::{
+    CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput, CaptureRedaction, CaptureRule,
+    CaptureScope, HeaderMatch, StatusMatch, CAPTURE_BODY_MAX_BYTES_CAP,
+    CAPTURE_DEFAULT_BODY_MAX_BYTES, CAPTURE_DEFAULT_MAX_CAPTURES, CAPTURE_DEFAULT_RATE_PER_MINUTE,
+    CAPTURE_DEFAULT_TTL_SECONDS, CAPTURE_MAX_CAPTURES_CAP, CAPTURE_PATTERN_MAX_LEN,
+    CAPTURE_TTL_SECONDS_CAP,
+};
 pub use cert_export_acl::{
     pattern_matches, resolve as resolve_cert_export_acl, specificity, CertExportAcl,
 };

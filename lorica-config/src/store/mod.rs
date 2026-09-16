@@ -29,6 +29,7 @@ mod acme_challenges;
 mod ai_crawlers;
 mod backends;
 pub mod bot_stash;
+mod capture;
 mod cert_export_acls;
 mod certs;
 mod cluster_ca;
@@ -175,6 +176,7 @@ const MIGRATIONS: &[Migration] = &[
     (53, migrate_cluster_node_name_unique),
     (54, migrate_acme_challenge_expiry),
     (55, migrate_sla_buckets_drop_route_cascade),
+    (56, migrate_capture_rules),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -943,6 +945,44 @@ fn migrate_sla_buckets_drop_route_cascade(conn: &Connection) -> rusqlite::Result
             ON sla_buckets(route_id, bucket_start);
         CREATE INDEX IF NOT EXISTS idx_sla_buckets_time
             ON sla_buckets(bucket_start);",
+    )
+}
+
+/// Story 10.1: traffic-capture rules.
+///
+/// `route_id` is `ON DELETE CASCADE` because a capture rule describes
+/// what to record on one route: a rule outliving its route is a
+/// recorder pointed at nothing, and the operator who deleted the route
+/// has already said what should happen to it. This is the `sla_configs`
+/// stance, not the `sla_buckets` one (migration 55): configuration for
+/// a route cascades, a record of what that route served does not.
+///
+/// The nested blocks are JSON columns, matching how `routes` stores
+/// `path_rules` and `header_rules`. The two counters are plain integer
+/// columns because they are the one part of the row a hot path writes.
+fn migrate_capture_rules(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS capture_rules (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            route_id TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            match_json TEXT NOT NULL,
+            emit_json TEXT NOT NULL,
+            capture_json TEXT NOT NULL,
+            limits_json TEXT NOT NULL,
+            output_json TEXT NOT NULL,
+            redact_json TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            captures_emitted INTEGER NOT NULL DEFAULT 0,
+            captures_dropped INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_capture_rules_route
+            ON capture_rules(route_id);
+        CREATE INDEX IF NOT EXISTS idx_capture_rules_expires_at
+            ON capture_rules(expires_at);",
     )
 }
 

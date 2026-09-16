@@ -1,7 +1,7 @@
 # Story 10.1: Capture Rules, Two-Phase Matching and Budgets
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0, the epic's headline
 **Author:** Romain G.
 **Depends on:** Story 10.0 (a capture rule replicates through the same path, and the payload it travels in is now cut per recipient).
@@ -82,8 +82,8 @@ offered. See AC #10.
 
 ## Tasks
 
-- [ ] AC #1: the model, the migration, the store CRUD, the replication allowlist entry, and the `CanonicalConfig` field.
-- [ ] AC #10: `CANONICAL_FORMAT_VERSION` to 2 with the refusal test, plus the `docs/cluster.md` paragraph.
+- [x] AC #1: the model, the migration (56), the store CRUD, the replication allowlist entry, and the `CanonicalConfig` field. A capture rule is cut with its route, and its two counters stay out of the blob.
+- [x] AC #10: `CANONICAL_FORMAT_VERSION` to 2 with the refusal test. The `docs/cluster.md` paragraph rides the documentation slice.
 - [ ] AC #2/#3: the predicate types and their evaluation, unit-tested away from the proxy.
 - [ ] AC #7: compilation into the `ProxyConfig` snapshot.
 - [ ] AC #4: the two buffering seams and the overflow stance.
@@ -120,7 +120,27 @@ query parameters are where credentials hide, and Story 10.2 redacts those.
 
 ### Debug Log
 
-(empty)
+**Two budgets could not be reused, and both are named rather than
+hidden.** `lorica-config` depends on neither `regex` nor `ipnet`. The
+pattern-length cap is therefore a constant restated from the WAF's
+`MAX_CUSTOM_PATTERN_LEN` with a comment saying so, and the compiled-size
+budget (`RegexBuilder::size_limit`) has to be applied in whichever crate
+actually builds the matcher, which is the proxy slice. CIDR validation is
+hand-rolled on `std::net` with an explicit prefix bound; it converges onto
+the connection filter's parser when Story 10.3 moves that policy into this
+crate. Note the two differ deliberately in what they DO with a bad entry:
+the filter warns and skips, a write-time validator refuses.
+
+**`prepare_replica` does not validate capture rules**, and that is
+deliberate. A follower stricter than its control plane aborts the round
+for the whole fleet, which is the failure mode Story 9.4 AC #5 exists to
+avoid. The defence is on the apply instead: a rule naming a route this
+node does not serve is dropped and counted.
+
+**`StatusMatch::ClientError` excludes 499.** 499 is the client-abort
+marker, not a status a backend returned; folding it into the 4xx class
+would make every "show me client errors" rule silently collect aborted
+requests too. `ClientAborted` is the only way to ask for it.
 
 ### Completion Notes
 

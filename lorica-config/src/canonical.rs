@@ -66,15 +66,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ConfigError, Result};
 use crate::models::{
-    Backend, CertExportAcl, Certificate, CustomCrawler, DnsProvider, GlobalSettings,
-    NotificationConfig, ProbeConfig, Route, RouteBackend, SecurityHeaderPreset, SlaConfig,
-    SpoofedFallback,
+    Backend, CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput, CaptureRedaction,
+    CaptureRule, CaptureScope, CertExportAcl, Certificate, CustomCrawler, DnsProvider,
+    GlobalSettings, NotificationConfig, ProbeConfig, Route, RouteBackend, SecurityHeaderPreset,
+    SlaConfig, SpoofedFallback,
 };
 use crate::store::ConfigStore;
 
 /// Version stamped into every canonical blob so a future shape change
 /// is detectable instead of silently mis-decoded.
-pub const CANONICAL_FORMAT_VERSION: u32 = 1;
+///
+/// Raised to 2 by Story 10.1, which adds `capture_rules` to
+/// [`CanonicalConfig`]. The struct is `deny_unknown_fields`, so a node
+/// still on 1 must refuse a version-2 blob BY VERSION rather than by
+/// whichever unknown field its decoder happens to reach first; the
+/// tolerant peek in [`decode_canonical`] is what makes that the
+/// reported reason.
+pub const CANONICAL_FORMAT_VERSION: u32 = 2;
 
 /// One WAF custom rule in canonical form. The store keeps these as
 /// bare tuples; the blob needs a named, strict shape.
@@ -93,6 +101,99 @@ pub struct CanonicalWafRule {
     pub severity: u8,
     /// Whether the rule is active.
     pub enabled: bool,
+}
+
+/// One traffic-capture rule in canonical form: every field of
+/// [`CaptureRule`] EXCEPT `captures_emitted` and `captures_dropped`.
+///
+/// Those two counters are per process and per node. They say how many
+/// captures THIS node has written and dropped, which is exactly the
+/// kind of local observation that must not travel: replicating them
+/// would have the control plane's own traffic overwrite each
+/// follower's counts on every round, and every node in the fleet would
+/// report the control plane's numbers back as its own. Leaving them out
+/// of the projection means they cannot be reached from the blob at all,
+/// the same by-construction argument [`CanonicalGlobalSettings`] makes
+/// for node-local settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalCaptureRule {
+    /// Stable UUID; primary key of the `capture_rules` table.
+    pub id: String,
+    /// Operator-facing label.
+    pub name: String,
+    /// `Route.id` this rule records.
+    pub route_id: String,
+    /// Whether the rule is currently recording.
+    pub enabled: bool,
+    /// Which requests the rule considers.
+    #[serde(rename = "match")]
+    pub match_: CaptureMatch,
+    /// Which of those are written out.
+    pub emit: CaptureEmit,
+    /// How much of each exchange is kept.
+    pub capture: CaptureScope,
+    /// What stops the rule.
+    pub limits: CaptureLimits,
+    /// Where captures land.
+    pub output: CaptureOutput,
+    /// Names redacted on top of the always-redacted set.
+    pub redact: CaptureRedaction,
+    /// Username of the operator who created the rule.
+    pub created_by: String,
+    /// Insert timestamp.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Absolute UTC instant after which the rule records nothing.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<&CaptureRule> for CanonicalCaptureRule {
+    fn from(rule: &CaptureRule) -> Self {
+        Self {
+            id: rule.id.clone(),
+            name: rule.name.clone(),
+            route_id: rule.route_id.clone(),
+            enabled: rule.enabled,
+            match_: rule.match_.clone(),
+            emit: rule.emit.clone(),
+            capture: rule.capture.clone(),
+            limits: rule.limits.clone(),
+            output: rule.output.clone(),
+            redact: rule.redact.clone(),
+            created_by: rule.created_by.clone(),
+            created_at: rule.created_at,
+            expires_at: rule.expires_at,
+        }
+    }
+}
+
+impl CanonicalCaptureRule {
+    /// The storable rule this projection describes, with both counters
+    /// at zero.
+    ///
+    /// Zero is the value for a rule this node has never seen. For one it
+    /// already holds, the recipient must keep its own counts, which is
+    /// why `ConfigStore::update_capture_rule` does not write them at
+    /// all.
+    pub fn to_rule(&self) -> CaptureRule {
+        CaptureRule {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            route_id: self.route_id.clone(),
+            enabled: self.enabled,
+            match_: self.match_.clone(),
+            emit: self.emit.clone(),
+            capture: self.capture.clone(),
+            limits: self.limits.clone(),
+            output: self.output.clone(),
+            redact: self.redact.clone(),
+            created_by: self.created_by.clone(),
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            captures_emitted: 0,
+            captures_dropped: 0,
+        }
+    }
 }
 
 /// The fleet-policy subset of [`GlobalSettings`]. Node-local fields
@@ -314,6 +415,8 @@ pub struct CanonicalConfig {
     pub probe_configs: Vec<ProbeConfig>,
     /// SLA target definitions.
     pub sla_configs: Vec<SlaConfig>,
+    /// Traffic-capture rules, without their per-node counters.
+    pub capture_rules: Vec<CanonicalCaptureRule>,
 }
 
 /// Recursively rewrite every JSON object with its keys in sorted
@@ -481,6 +584,11 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
         ai_crawlers_custom: store.list_custom_crawlers()?,
         probe_configs: store.list_probe_configs()?,
         sla_configs: store.list_sla_configs()?,
+        capture_rules: store
+            .list_capture_rules()?
+            .iter()
+            .map(CanonicalCaptureRule::from)
+            .collect(),
     };
 
     // Replace secret material with digests BEFORE sorting so the
@@ -510,6 +618,7 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
     sort_by_canonical_repr(&mut cfg.ai_crawlers_custom);
     sort_by_canonical_repr(&mut cfg.probe_configs);
     sort_by_canonical_repr(&mut cfg.sla_configs);
+    sort_by_canonical_repr(&mut cfg.capture_rules);
 
     Ok(cfg)
 }
@@ -595,12 +704,18 @@ impl SelectorResolution {
 /// filtering on the control plane instead (Story 10.0, backlog #56).
 ///
 /// Restricted: routes the node serves, the links of those routes, the
-/// backends those links reference, and the certificates those routes
-/// bind. Left fleet-wide: global policy, WAF rules and disabled ids,
-/// export ACL patterns, AI crawler entries, probe and SLA definitions,
-/// notification channels and DNS providers. Those are fleet policy or
-/// carry digests only, and a node that cannot see them cannot tell
-/// whether it is behind.
+/// backends those links reference, the certificates those routes bind,
+/// and the capture rules attached to those routes. Left fleet-wide:
+/// global policy, WAF rules and disabled ids, export ACL patterns, AI
+/// crawler entries, probe and SLA definitions, notification channels
+/// and DNS providers. Those are fleet policy or carry digests only, and
+/// a node that cannot see them cannot tell whether it is behind.
+///
+/// Capture rules are cut WITH their route (Story 10.1). A rule names a
+/// route id and carries its match predicates: source CIDRs, paths,
+/// header names and values. Sending every node the fleet's rules would
+/// reopen exactly the disclosure Story 10.0 closed, one story after
+/// closing it.
 pub fn restrict_for_recipient(
     cfg: &CanonicalConfig,
     node_id: &str,
@@ -641,11 +756,19 @@ pub fn restrict_for_recipient(
         .cloned()
         .collect();
 
+    let capture_rules: Vec<CanonicalCaptureRule> = cfg
+        .capture_rules
+        .iter()
+        .filter(|rule| kept.contains(rule.route_id.as_str()))
+        .cloned()
+        .collect();
+
     CanonicalConfig {
         routes,
         backends,
         route_backends,
         certificates,
+        capture_rules,
         ..cfg.clone()
     }
 }
@@ -709,7 +832,9 @@ mod tests {
 
     use super::*;
     use crate::models::{
-        HealthStatus, LifecycleState, LoadBalancing, NotificationChannel, PathRule, WafMode,
+        CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput, CaptureRedaction, CaptureScope,
+        HealthStatus, LifecycleState, LoadBalancing, NotificationChannel, PathRule, StatusMatch,
+        WafMode,
     };
 
     /// Fixed timestamp so the same logical entity inserted into two
@@ -860,6 +985,37 @@ mod tests {
         assert_eq!(r.unresolvable(&sel), vec!["typo"]);
     }
 
+    /// A capture rule whose predicates name a real source range and a
+    /// real path: the disclosure the per-recipient cut has to prevent.
+    fn make_capture_rule(id: &str, route_id: &str) -> CanonicalCaptureRule {
+        CanonicalCaptureRule {
+            id: id.to_string(),
+            name: format!("rule {id}"),
+            route_id: route_id.to_string(),
+            enabled: true,
+            match_: CaptureMatch {
+                source_cidrs: vec!["10.0.0.0/8".to_string()],
+                methods: vec!["POST".to_string()],
+                path_prefix: Some("/internal/admin".to_string()),
+                path_regex: None,
+                headers: Vec::new(),
+            },
+            emit: CaptureEmit {
+                always: false,
+                status: vec![StatusMatch::ServerError],
+                min_latency_ms: None,
+                upstream_error: false,
+            },
+            capture: CaptureScope::default(),
+            limits: CaptureLimits::default(),
+            output: CaptureOutput::default(),
+            redact: CaptureRedaction::default(),
+            created_by: "admin".to_string(),
+            created_at: fixed_now(),
+            expires_at: fixed_now(),
+        }
+    }
+
     /// Three routes: one fleet-wide, one for each edge, each with its
     /// own backend and certificate.
     fn fleet_config() -> CanonicalConfig {
@@ -903,6 +1059,10 @@ mod tests {
             ai_crawlers_custom: Vec::new(),
             probe_configs: Vec::new(),
             sla_configs: Vec::new(),
+            capture_rules: vec![
+                make_capture_rule("cap-a", "r-a"),
+                make_capture_rule("cap-b", "r-b"),
+            ],
         }
     }
 
@@ -928,6 +1088,65 @@ mod tests {
             !cut.certificates.iter().any(|c| c.id == "cert-b"),
             "another node's certificate metadata, SANs included"
         );
+    }
+
+    #[test]
+    fn a_capture_rule_on_another_nodes_route_is_not_on_the_wire() {
+        // Story 10.1: a rule names a route id and carries its match
+        // predicates, so it is cut with its route or it reopens the
+        // disclosure Story 10.0 just closed.
+        let cut = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let ids: Vec<&str> = cut.capture_rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["cap-a"]);
+
+        let other = restrict_for_recipient(&fleet_config(), "id-b", &resolution());
+        assert!(
+            !other.capture_rules.iter().any(|r| r.id == "cap-a"),
+            "edge-b must not see the rule on edge-a's route"
+        );
+    }
+
+    #[test]
+    fn a_capture_rule_survives_an_encode_decode_round_trip_byte_identically() {
+        let cfg = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("test setup: decode");
+        assert_eq!(decoded.capture_rules, cfg.capture_rules);
+        let again = encode_canonical(&decoded).expect("test setup: re-encode");
+        assert_eq!(bytes, again);
+    }
+
+    #[test]
+    fn the_per_node_capture_counters_are_absent_from_the_encoded_blob() {
+        // Replicating them would have the control plane's own traffic
+        // overwrite every follower's counts on each round.
+        let bytes = encode_canonical(&fleet_config()).expect("test setup: encode");
+        let text = String::from_utf8(bytes).expect("test setup: the blob is UTF-8 JSON");
+        assert!(!text.contains("captures_emitted"), "{text}");
+        assert!(!text.contains("captures_dropped"), "{text}");
+    }
+
+    #[test]
+    fn the_canonical_format_version_is_two() {
+        let bytes = encode_canonical(&fleet_config()).expect("test setup: encode");
+        let peek: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        assert_eq!(peek["version"], 2);
+        assert_eq!(CANONICAL_FORMAT_VERSION, 2);
+    }
+
+    #[test]
+    fn a_blob_stamped_version_one_is_refused_by_version() {
+        // A 1.7.x node encodes version 1. The refusal must name the
+        // version, not whichever unknown field the strict decoder would
+        // otherwise reach first.
+        let mut cfg = fleet_config();
+        cfg.version = 1;
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let err = decode_canonical(&bytes).expect_err("a version 1 blob is refused");
+        let message = err.to_string();
+        assert!(message.contains("format version 1"), "{message}");
+        assert!(message.contains("supports 2"), "{message}");
     }
 
     #[test]
@@ -1038,6 +1257,7 @@ mod tests {
                 ai_crawlers_custom: Vec::new(),
                 probe_configs: Vec::new(),
                 sla_configs: Vec::new(),
+                capture_rules: Vec::new(),
             };
             let resolution = SelectorResolution::from_rows(rows.clone());
 
