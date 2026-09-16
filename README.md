@@ -15,7 +15,7 @@
 
 ---
 
-Lorica is a production-ready reverse proxy with a built-in web dashboard, WAF, SLA monitoring, and HTTP caching. One binary, zero external dependencies. Install it, open your browser, and manage everything from the UI - routes, backends, certificates, security rules, and performance metrics. Since 1.7.0 the same binary runs as a fleet: one control plane pushes configuration and certificates to any number of followers over mutual TLS, and their logs, WAF events and audit trails fan back in.
+Lorica is a production-ready reverse proxy with a built-in web dashboard, WAF, SLA monitoring, and HTTP caching. One binary, zero external dependencies. Install it, open your browser, and manage everything from the UI - routes, backends, certificates, security rules, and performance metrics. Since 1.7.0 the same binary runs as a fleet: one control plane pushes configuration and certificates to any number of followers over mutual TLS, and their logs, WAF events and audit trails fan back in. Since 1.8.0 a CI pipeline can bind a review app's hostname, backends and certificate in one call on a separate automation listener, and an operator can capture the full exchange for the one request in twenty that fails.
 
 Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine that powers a significant portion of Cloudflare's CDN traffic.
 
@@ -43,8 +43,9 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **WAF engine** - 49 OWASP CRS-inspired rules (SQLi, XSS, path traversal, command injection, SSRF, Log4Shell, XXE, CRLF)
 - **AI / LLM crawler deny-list** (v1.6.0) - curated registry of AI crawler User-Agents with per-vendor verification (forward-confirmed rDNS, published IP ranges, or UA-only), per-route policy (off / deny / log), auto-served `/robots.txt` advertising the active deny-list, spoofed-UA fallback policy, custom crawler rules, `lorica_ai_bot_total` counter. See `docs/ai-crawlers.md`
 - **Tamper-evident audit log** (v1.6.0) - every state-mutating management call records operator, role, action, target, source IP, user agent and before/after payload hashes in a SHA-256 hash chain; `GET /api/v1/audit/verify` walks the chain and localises tampering to the earliest broken row; day-based retention is chain-safe. In a fleet (v1.7.0) every follower's trail fans in to the control plane as its own chain, verified separately
+- **Per-recipient replication** (v1.8.0) - a follower receives only the routes it serves: the control plane resolves `node_selector` itself, against the node id the recipient's certificate proves, so a compromised edge no longer discloses the fleet's routing topology (every other node's upstream addresses, IP lists, mTLS configuration and Basic-auth hashes). Drift is judged against a per-node hash while the generation stays fleet-wide; the wire format did not move, so a mixed-version fleet upgrades in the documented order
 - **Management plane over TLS** (v1.6.0) - the loopback dashboard/API is served over HTTPS with a self-signed certificate generated on first boot (or an operator-supplied one), so the session cookie is `Secure`; `/metrics` requires a session or the bearer token in `prometheus_scrape_token` by default since v1.7.0
-- **Secrets never on argv** (v1.7.0) - every management CLI command (`unban`, `upgrade`, `cluster token|leave|status|break-glass`) reads its password from `--password-file`, `--password-stdin` or `LORICA_ADMIN_PASSWORD`, and a join token only from a file, stdin or `LORICA_JOIN_TOKEN`
+- **Secrets never on argv** (v1.7.0) - every management CLI command (`unban`, `upgrade`, `cluster token|leave|status|break-glass`, `automation token create`) reads its password from `--password-file`, `--password-stdin` or `LORICA_ADMIN_PASSWORD`, and a join token only from a file, stdin or `LORICA_JOIN_TOKEN`
 - **mTLS client verification** - per-route CA bundle + optional organization allowlist. Chain validated at the TLS handshake (rustls `WebPkiClientVerifier`), per-route enforcement returns 496 ("cert required") or 495 ("cert error"). `required` and org-allowlist hot-reload; CA edits take effect on restart
 - **Forward authentication** - per-route sub-request to Authelia / Authentik / Keycloak / oauth2-proxy before proxying; 2xx injects response headers into upstream, 401/403/3xx forwarded verbatim to the client, timeout = fail-closed 503. Optional opt-in verdict cache (TTL-capped at 60s, Cookie-keyed) to shortcut hot paths. Under `--workers N` the cache is owned by the supervisor and routed through the pipelined RPC channel, so an Allow verdict cached by one worker is served from every worker, and a session revocation invalidates the cache uniformly (WPAR-2, design § 7)
 - **Connection pre-filter** - global IP allow/deny CIDR policy enforced at TCP accept, before the TLS handshake. Deny always wins; non-empty allow switches to default-deny. Hot-reloaded via arc-swap in single-process and worker modes
@@ -69,8 +70,9 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Real-time access logs** - WebSocket streaming to the dashboard with filtering
 - **Load testing** - built-in load test engine with SSE streaming, cron scheduling, CPU circuit breaker, and result comparison
 - **SLA breach alerts** - automatic notifications when SLA drops below target
-- **Syslog export** (v1.7.0) - ship access logs, WAF events and audit entries to an existing SIEM as RFC 5424 messages over UDP, TCP (RFC 6587 octet-counting framing) or TCP+TLS (optional mutual TLS towards the collector). Configurable facility, per-event-kind severity mapping, per-kind toggles, and static structured-data parameters (`env=prod,dc=eu-west`). Fire-and-forget with a bounded queue: an unreachable collector sheds export rows (`lorica_log_sink_dropped_total`) and never affects request serving
-- **OTLP logs export** (v1.7.0, needs a build with `--features otel`) - the same three event kinds as OTLP log records to the OpenTelemetry collector already configured for tracing, with `trace_id` / `span_id` attached from the request's span context so a log record joins its trace in Grafana / Tempo / Loki-style backends. Optional `Authorization` header for authenticated collectors (HTTP transports)
+- **Request capture** (v1.8.0) - per-route rules that keep the full request and response for a subset of traffic, evaluated in two phases: request-side predicates (source CIDR, method, path prefix / regex, headers) decide which requests are buffered as they stream through, response-side predicates (status, latency, upstream error) decide which buffered exchange becomes a record, so the 502 one client in twenty gets is kept with the body that caused it. Every rule carries a hard expiry, a total and a per-minute budget, capped bodies and a node-wide in-flight ceiling; credential headers and named query parameters are redacted and no rule can turn that off. A record joins the access-log row on `request_id` and reaches the process log, the last-50 ring behind the Capture page, the syslog / OTLP sinks and optionally a per-rule directory; a sink that stalls loses records, never latency. Arming a rule is SuperAdmin, stopping one is Operator. `lorica_capture_rules_active`, `lorica_captures_total{rule_id,outcome}`, `lorica_capture_inflight_bytes`. See `docs/capture.md`
+- **Syslog export** (v1.7.0) - ship access logs, WAF events, audit entries and, since v1.8.0, capture records to an existing SIEM as RFC 5424 messages over UDP, TCP (RFC 6587 octet-counting framing) or TCP+TLS (optional mutual TLS towards the collector). Configurable facility, per-event-kind severity mapping, per-kind toggles, and static structured-data parameters (`env=prod,dc=eu-west`). Fire-and-forget with a bounded queue: an unreachable collector sheds export rows (`lorica_log_sink_dropped_total`) and never affects request serving
+- **OTLP logs export** (v1.7.0, needs a build with `--features otel`) - the same event kinds, each behind its own switch since v1.8.0, as OTLP log records to the OpenTelemetry collector already configured for tracing, with `trace_id` / `span_id` attached from the request's span context so a log record joins its trace in Grafana / Tempo / Loki-style backends. Optional `Authorization` header for authenticated collectors (HTTP transports)
 
   <details>
   <summary>Worked examples: SIEM (syslog) and OTLP collector</summary>
@@ -121,9 +123,10 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :globe_with_meridians: Management
 
 - **Multi-node cluster** (v1.7.0) - one control plane, any number of followers over mutual TLS with a fleet CA; short-lived join tokens bound to a node name, explicit activation, two-phase configuration replication with per-node route targeting, fleet-wide certificate issuance with need-to-know key distribution, and access logs / WAF events / bans / audit trail aggregated per node with one verifiable hash chain each. Followers are read-only with an audited break-glass window. See `docs/cluster.md`
+- **CI automation API** (v1.8.0) - a second listener, `--automation-listen`, off by default, so a pipeline can configure Lorica while the management API stays on loopback. A source-CIDR allowlist (`automation_allowed_cidrs`, mandatory) is enforced at TCP accept before the TLS handshake, followed by the cluster plane's pre-authentication budgets; requests authenticate with `Authorization: Bearer` only, there is no session, cookie or CSRF path, and every one is audited. Tokens are scoped (`environments:write`, `environments:read`, `routes:read`, `certificates:read`), bound to hostname patterns and backend CIDRs, minted once on the management plane (never through the listener) and stored as an HMAC. One idempotent `PUT /automation/v1/environments/{name}` creates or replaces a route, its backends and a covering certificate in a single transaction and answers with the public URL; a TTL capped by the token and a reaper remove what the pipeline forgot, and the routes and backends it owns are read-only in the dashboard. Runs on a standalone node or the control plane, never on a follower. Optional GitLab OIDC mode (Story 10.5): the job's own ID token, RS256 with a pinned issuer and audience, bound claims on project, ref and environment, and replay protection, replaces the shared secret in CI variables. See `docs/automation.md`
 - **Multi-user RBAC** (v1.6.0) - team accounts with three roles: `super_admin` (users, settings, config import, upgrades, fleet mutations), `operator` (full CRUD on routes, backends, certificates, WAF, SLA, probes, load tests, cache, bans; fleet reads) and `viewer` (read-only, secrets masked, fleet views hidden). Any role change, disable or password reset ends the target's sessions at once
-- **Web dashboard** - Svelte 5 UI (~59 KB) embedded in the binary: routes, backends, certs, WAF, SLA, load tests, cluster, team, settings
-- **REST API** - full CRUD for all entities, session-based auth, rate-limited login, a single fail-closed authorization middleware, OpenAPI description in `lorica-api/openapi.yaml`
+- **Web dashboard** - Svelte 5 UI (~59 KB) embedded in the binary: routes, backends, certs, WAF, SLA, load tests, capture, cluster, team, settings
+- **REST API** - full CRUD for all entities, session-based auth, rate-limited login, a single fail-closed authorization middleware, OpenAPI description in `lorica-api/openapi.yaml`; the automation plane has its own, `lorica-api/openapi-automation.yaml`, because it is a different socket with a different credential
 - **TOML config export/import** - with diff preview before applying changes
 - **Nginx config import** - paste an `nginx.conf` to auto-create routes, backends, certificates, and path rules with cert import support
 - **ACME / Let's Encrypt** - automatic TLS provisioning via HTTP-01 and DNS-01 challenges (Cloudflare, Route53, OVH providers), multi-domain SAN and wildcard support, smart auto-renewal, OCSP stapling
@@ -267,6 +270,8 @@ Options:
   --cluster-advertise <HOST>        Name followers dial, the SAN of the control-plane certificate
   --cluster-listen-any              Allow a wildcard host on the two listeners (never by accident)
   --cluster-auto-activate           Enrolled nodes become Active without operator approval (off)
+  --automation-listen <HOST:PORT>   Serve the automation API (opt-in; needs a non-empty allowlist, refused on a follower)
+  --automation-listen-any           Allow a wildcard host on the automation listener (never by accident)
   --version                         Print version
 
 Commands:
@@ -280,13 +285,18 @@ Commands:
   cluster status                    This node's fleet role and, with credentials, the live roster
   cluster break-glass [--close]     Re-enable local edits on a follower for a bounded window
   cluster leave                     Wipe this node's fleet identity (SuperAdmin, or proof of revocation)
+  automation token create --name <NAME> --scope <SCOPE>... --hostname <PATTERN>...
+                                    Mint a scoped automation token (SuperAdmin), printed once
 ```
 
 Every command that needs the admin password reads it from `--password-file`
 (mode 0600), `--password-stdin` or `LORICA_ADMIN_PASSWORD`; `--password` on
 argv only prints a warning. `cluster join` accepts a token only from a file,
-stdin or `LORICA_JOIN_TOKEN`. The global `--data-dir` goes before the
-subcommand.
+stdin or `LORICA_JOIN_TOKEN`. `automation token create` writes the token
+alone on standard output (the `public_id` and expiry go to stderr), so
+`> /run/secret` or a pipe into a secret store captures exactly the
+credential; it has no `--token` flag, the secret is only ever an output.
+The global `--data-dir` goes before the subcommand.
 
 ## Dashboard
 
@@ -325,17 +335,18 @@ The dashboard ships inside the binary and is served on the management port (defa
 ### Pages
 
 - **Overview** - cockpit dashboard with section helpers, setup checklist, system/route/security/performance cards
-- **Routes** - create/edit routes with host matching, path prefixes, load balancing, WAF mode, rate limits, caching, timeouts, security headers, CORS, and 25 other per-route settings
-- **Backends** - manage backend addresses, weights, health check type (TCP/HTTP), TLS upstream, active connections
+- **Routes** - create/edit routes with host matching, path prefixes, load balancing, WAF mode, rate limits, caching, timeouts, security headers, CORS, and 25 other per-route settings; a route the automation API owns carries an `automation` badge naming its environment and opens read-only, with a hint to update it through the pipeline
+- **Backends** - manage backend addresses, weights, health check type (TCP/HTTP), TLS upstream, active connections; automation-owned backends carry the same badge
 - **Certificates** - upload PEM certificates, view expiry dates, provision via ACME/Let's Encrypt (HTTP-01, DNS-01)
 - **Security** - WAF event table with category filtering, 49 rule toggles, IP ban list with unban button, admin audit log with chain verification; on a control plane every tab carries a node filter over the fleet's events, bans and audit chains
 - **SLA** - per-route passive/active SLA side-by-side, latency percentile tables, config editor, CSV/JSON export; on a control plane a node picker shows one follower's own figures (never a fleet aggregate: a fleet percentile is not a function of per-node percentiles)
 - **Load Tests** - test config management with clone, one-click execution, real-time SSE progress panel, historical results
 - **Active Probes** - CRUD for synthetic health probes with route selection, HTTP method/path/status/interval/timeout
 - **Access Logs** - scrollable real-time log stream via WebSocket with green pulsing indicator; on a control plane, the fleet's access logs with a node column and filter
+- **Capture** (v1.8.0) - the rule list with live counters, remaining budget and time to expiry, Disable for Operators, Create / Edit / Delete for SuperAdmins (the form refuses a rule that would record every request on a route unless the operator says so, and shows the expiry the TTL produces as they type), and a "Recent captures" panel over the last 50 records this process emitted, with a whole-record download
 - **Cluster** (v1.7.0) - the fleet roster with live sessions, applied configuration generation, resource gauges, per-node certificate entitlement and recent WAF events, join-token dialog with the ready-to-paste `cluster join` command, activation and revocation (which names the keys to re-issue); on a follower, the read-only banner with break-glass and leave
 - **System** - worker table with PID, health, heartbeat latency; CPU/memory/disk gauges
-- **Settings** - notification channels, security header presets, DNS providers (Cloudflare / Route53 / OVH), ban rules, OpenTelemetry exporter, log export (syslog and OTLP logs, per-sink test), GeoIP / ASN databases, AI crawler policy, team (users and roles), binary upgrade, certificate filesystem export zone + ACL editor, config export / import with diff preview
+- **Settings** - notification channels, security header presets, DNS providers (Cloudflare / Route53 / OVH), ban rules, network allow / deny lists and the automation listener's allowed CIDRs, OpenTelemetry exporter, log export (syslog and OTLP logs, one switch per event kind on each sink, per-sink test), GeoIP / ASN databases, AI crawler policy, team (users and roles), automation tokens (scopes, hostname patterns, backend CIDRs, lifetimes; the token is shown once, revocation keeps the row), binary upgrade, certificate filesystem export zone + ACL editor, config export / import with diff preview
 - **Theme** - light/dark mode toggle
 
 ## Architecture
@@ -349,7 +360,7 @@ Lorica is a Rust workspace with 31 crates: 16 forked from Cloudflare Pingora and
 | `lorica-tls` | SNI certificate resolver, hot-swap, encrypted key storage |
 | `lorica-acme` | Pure ACME core: HTTP-01 / DNS-01 issuance driver, DNS challengers (Cloudflare / Route53 / OVH) |
 | `lorica-config` | SQLite store, versioned migrations, TOML export/import |
-| `lorica-api` | axum REST API, auth, session management, RBAC |
+| `lorica-api` | axum REST API, auth, session management, RBAC, the automation listener and its scope gate |
 | `lorica-dashboard` | Svelte 5 frontend embedded via rust-embed |
 | `lorica-waf` | WAF engine, OWASP rules, IP blocklist |
 | `lorica-notify` | Alert dispatch (stdout, SMTP, webhook, Slack) |
@@ -609,6 +620,42 @@ Fleet reads are Operator+, fleet mutations SuperAdmin; every one of them answers
 | `GET` / `POST` / `DELETE` | `/api/v1/cluster/break-glass` | On a follower: the window's state / open it for a bounded time / close it (SuperAdmin) |
 | `POST` | `/api/v1/cluster/leave` | On a follower: tell the control plane, wipe the fleet identity (SuperAdmin) |
 
+### Capture (v1.8.0)
+
+Arming, editing, reading back and deleting a rule is SuperAdmin (the stored rule spells out what a node records); listing rules, stopping one and reading recent records is Operator+. See `docs/capture.md`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/capture/rules` | List capture rules with their counters, remaining budget and expiry (Operator+) |
+| `POST` | `/api/v1/capture/rules` | Create a capture rule |
+| `GET` | `/api/v1/capture/rules/{id}` | Get a capture rule |
+| `PUT` | `/api/v1/capture/rules/{id}` | Update a capture rule |
+| `DELETE` | `/api/v1/capture/rules/{id}` | Delete a capture rule |
+| `POST` | `/api/v1/capture/rules/{id}/disable` | Stop a rule (Operator+: the safe direction, for whoever is paged at 3am) |
+| `GET` | `/api/v1/capture/recent` | The last 50 records this process emitted, bodies cut at 4 KiB (Operator+; `503` on a `--workers` node, naming the sinks that carry them) |
+| `GET` | `/api/v1/capture/recent/{request_id}` | Download one whole record while it is still in the ring (Operator+) |
+
+### Automation (v1.8.0)
+
+Token administration lives on the management plane, SuperAdmin and audited; the automation listener serves none of it, so a token can never mint a token. See `docs/automation.md`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` / `POST` | `/api/v1/automation/tokens` | List tokens / mint one (scopes, hostname patterns, backend CIDRs, environment TTL ceiling, lifetime); the full token is returned by the create only, the node keeps its HMAC |
+| `DELETE` | `/api/v1/automation/tokens/{public_id}` | Revoke a token (stamps `revoked_at`, keeps the row) |
+| `GET` / `POST` | `/api/v1/automation/oidc-issuers` | List OIDC issuer entries / register one (GitLab instance URL, audience, `jwks_url`, bound claims, hostname patterns, backend CIDRs, environment TTL ceiling, scopes); SuperAdmin, audited |
+| `DELETE` | `/api/v1/automation/oidc-issuers/{id}` | Remove an issuer entry (a real delete; the next ID token it would have accepted is refused) |
+
+The automation routes answer on `--automation-listen`, authenticate with `Authorization: Bearer <token>` only (no cookie, no session), and are gated by scope rather than role. A path with no declared scope is reachable by no token.
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| `GET` | `/automation/v1/whoami` | `environments:read` | The token behind this request: name, `public_id`, scopes |
+| `GET` | `/automation/v1/environments` | `environments:read` | List environments (`?label=`, `?hostname=`, `?expiring_before=`) |
+| `GET` | `/automation/v1/environments/{name}` | `environments:read` | One environment, with its `ETag` |
+| `PUT` | `/automation/v1/environments/{name}` | `environments:write` | Create (201) or replace (200) the route, backends and certificate binding in one transaction; `If-Match` for a 412 instead of last-writer-wins |
+| `DELETE` | `/automation/v1/environments/{name}` | `environments:write` | Remove the route, its owned backends and the joins (204, idempotent) |
+
 ### System & Configuration
 
 | Method | Path | Description |
@@ -801,7 +848,9 @@ unreachable.
 
 What every node keeps as its own: listening addresses, data directory, log
 sinks' endpoints, export zone and master key. Everything else replicates.
-Upgrade followers before the control plane (a follower whose schema is behind
+`--automation-listen` (v1.8.0) belongs on the control plane: a follower
+refuses to start with it, since its configuration is replaced at the next
+replication round. Upgrade followers before the control plane (a follower whose schema is behind
 is refused at the handshake). `docs/cluster.md` covers the trust model (the
 control plane's `encryption.key` is the fleet's identity root), replication,
 key distribution, telemetry fan-in and its measured envelope, the audit
@@ -811,6 +860,8 @@ trail, failure modes and how to replace a control plane.
 
 - [docs/installation.md](docs/installation.md) - packages, first boot, the management plane's TLS certificate
 - [docs/cluster.md](docs/cluster.md) - multi-node operation, end to end
+- [docs/capture.md](docs/capture.md) - traffic capture: rules, budgets, the record, redaction, sinks
+- [docs/automation.md](docs/automation.md) - the CI automation API: the listener, tokens and scopes, the environment resource, GitLab pipelines and OIDC
 - [docs/security.md](docs/security.md), [docs/security/hardening-guide.md](docs/security/hardening-guide.md), [docs/security/threat-model.md](docs/security/threat-model.md) - what is protected, how, and what is not
 - [docs/worker-mode.md](docs/worker-mode.md), [docs/tuning.md](docs/tuning.md) - `--workers`, kernel and file-descriptor tuning
 - [docs/hot-upgrade.md](docs/hot-upgrade.md), [docs/ai-crawlers.md](docs/ai-crawlers.md), [docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md)
@@ -842,7 +893,7 @@ git verify-tag v1.7.4
 | **v1.5.1 + v1.5.2 (audit-closure cycles)** | Worker-mode cert hot-reload (cert install / renew now serves new cert across all workers without restart) ; SMTP encryption modes (`starttls` / `tls` / `none`) for the Email notification channel ; security defense-in-depth pass : webhook URL + Slack URL + auth_header scrubbed on JSON GET (matched the v1.5.1 TOML scrub asymmetry), CSV formula injection guard on access-log export, CSP3 directives (`frame-ancestors`, `form-action`, `base-uri`, `object-src`), per-endpoint rate limits broadened to ~16 mutating endpoints, redirect-policy=none on webhook / OCSP / blocklist clients ; reactor-stall pass : `LogStore` + `enforce_notification_retention` off-loaded to `spawn_blocking` ; reload pass : two-phase + legacy converged through one `apply_per_process_resolver_hooks` helper, cert-resolver reload serialised, OTel / GeoIP / ASN apply-error counter ; perf : Cow URL decode + `itoa` status formatting + chrono deferred until WAF match + `dashmap` fast-path on bot stash + `parking_lot::Mutex` on hot path + `RuleSet::matches` prefilter shortcut ; deps : `rustls-webpki 0.103.13` (RUSTSEC-2026-0104 + 0099), `postcss 8.5.10` (CVE-2026-41305), `aws-lc-rs` dropped from the `lorica-tls` crypto stack in favor of `ring` (the broader binary still pulls `aws-lc-rs` transitively via the rustls 0.23 default stack in `lorica-api`), `x509-parser 0.18` aligned across `lorica-tls` / `lorica-api` ; chore : `~50` magic-number `bl()` / `rl()` calls in `server.rs` lifted to `pub const`, 3 `formatBytes` dashboard implementations consolidated into `lib/format.ts`, 3 `docs/security.md` drift items fixed (49 WAF rules + ~80k IP blocklist) | Shipped |
 | v1.6.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC), TLS management plane, cert-resolver reliability + background OCSP, rate-limit unification, vendored captcha | Shipped |
 | v1.7.0 | Multi-node cluster (control plane + followers over mutual TLS, token enrollment with explicit activation, two-phase configuration replication with per-node route targeting, fleet-wide certificate issuance with need-to-know key distribution, telemetry and audit-trail fan-in with one chain per node, fleet dashboard), syslog (RFC 5424) and OTLP logs export, `/metrics` authenticated by default | Shipped |
-| v1.8.0 | Conditional request capture (per-route rules with request-side predicates on source CIDR, path, method and headers, response-side predicates on status and latency, capped request and response bodies, per-rule budgets and TTL, header and query-string redaction, export to the log sinks and a dashboard page) and a CI automation API (a separate listener on its own port, off by default, behind a source-CIDR allowlist and scoped bearer tokens while the management API stays on loopback; an idempotent `environment` resource that binds a hostname, a backend and a certificate in one atomic apply for review apps, optional GitLab OIDC ID-token authentication). PRD: [Epic 10](docs/prd/epic-10-v1.8.0.md), stories 10.1 to 10.5. | Planned |
+| v1.8.0 | Conditional request capture (per-route rules with request-side predicates on source CIDR, path, method and headers, response-side predicates on status and latency, capped request and response bodies, per-rule budgets and TTL, header and query-string redaction, export to the log sinks and a dashboard page) and a CI automation API (a separate listener on its own port, off by default, behind a source-CIDR allowlist and scoped bearer tokens while the management API stays on loopback; an idempotent `environment` resource that binds a hostname, a backend and a certificate in one atomic apply for review apps, optional GitLab OIDC ID-token authentication). PRD: [Epic 10](docs/prd/epic-10-v1.8.0.md), stories 10.1 to 10.5. | In progress |
 | v1.9.0 | Management MCP server with tiered access: an operator drives Lorica from an MCP client with the authority the task needs and no more. Three tiers (read, config, admin) that are scope sets on the Epic 10 automation tokens rather than a second authorization model, one process per tier with no tool that elevates, and every call in the tamper-evident audit chain marked as an MCP call. Streamable HTTP served as a path on the automation listener rather than a new port, so it inherits that listener's TLS, source-CIDR allowlist and token revocation; stdio for the workstation case. PRD: [Epic 11](docs/prd/epic-11-v1.9.0.md), stories 11.1 to 11.4. | Planned |
 | v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
 

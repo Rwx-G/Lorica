@@ -332,7 +332,8 @@ Every mutation increments a persisted generation, encodes the blob and
 its hash, and fans out a Prepare to every connected active node under a
 per-node ten-second deadline. A node that stages it answers prepared; a
 node that refuses the blob **semantically** (an unknown field, a
-version or hash mismatch) aborts the round fleet-wide and raises an
+version or hash mismatch, a malformed CIDR in a replicated setting, an
+invalid `node_selector`) aborts the round fleet-wide and raises an
 alert on the follower that refused it. A node that fails Prepare on
 **transport** is evicted from the commit set and the commit proceeds
 without it: a wedged or hostile follower cannot veto every

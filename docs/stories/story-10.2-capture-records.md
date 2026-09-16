@@ -90,11 +90,11 @@ it.
 - [ ] AC #2: the redaction pass, with the always-redacted set as a constant no configuration path can reach.
 - [ ] AC #3: `SinkKind::Capture`, the lane registration, the `tracing` target, and the directory writer with its pruning.
 - [ ] AC #4: the drop path and its counter.
-- [ ] AC #5: the dashboard page, the ring, and the three frontend gates.
+- [x] AC #5: the dashboard page, the ring, and the three frontend gates. The ring is a 503 on a `--workers` supervisor rather than shipped from the workers; see the Debug Log for what shipping would take.
 - [ ] AC #6: the audit rows.
 - [ ] Flush `captures_emitted` and `captures_dropped` to the store. Story 10.1 built `ConfigStore::bump_capture_counters` and left it with no producer: the per-rule counts live in the process budget and never reach the row the dashboard reads. Whoever emits the record is the one who knows an emission happened, so it belongs here.
-- [ ] Two gauges do not aggregate in worker mode. `lorica_capture_rules_active` and `lorica_capture_inflight_bytes` are published per process, and the per-worker aggregation machinery is counters-only, so a scrape on the supervisor under `--workers` reports the supervisor's own values rather than the fleet of workers'. `lorica_captures_total` does aggregate. Either close the gap the way `set_active_connections` does, or say so in `docs/capture.md` next to the per-worker budget semantics; do not leave it for an operator to discover from a graph that reads zero.
-- [ ] AC #7: `docs/capture.md`, including two things an operator will otherwise discover the hard way: the response body is the upstream's and predates any rewrite, and a capture rule cannot be disabled on a follower without break-glass because it arrives by replication and a local change would be overwritten on the next round.
+- [x] Two gauges do not aggregate in worker mode. Closed the way `set_active_connections` does: both now travel as typed fields on the worker's `MetricsReport` and the supervisor mirrors them into its registry at scrape time. `lorica_capture_rules_active` is the MAXIMUM across workers, never the sum (every worker compiles the same snapshot, so a sum multiplies the rule count by the worker count); `lorica_capture_inflight_bytes` IS summed, and the ceiling is per worker. The aggregation rule for each is documented on its setter in `lorica-api/src/metrics.rs`. Extending the generic per-worker machinery to gauges was rejected: it would need a second wire message, a second supervisor-side snapshot map and a per-gauge sum/max mode, which is more new machinery than the defect warrants.
+- [x] AC #7: `docs/capture.md`, including two things an operator will otherwise discover the hard way: the response body is the upstream's and predates any rewrite, and a capture rule cannot be disabled on a follower without break-glass because it arrives by replication and a local change would be overwritten on the next round.
 - [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, and the frontend three (`npm run check`, `npm run lint`, `npx vitest run`).
 
 ## Dev Notes
@@ -130,7 +130,51 @@ released. That is the only point where both halves and the access-log
 
 ### Debug Log
 
-(empty)
+**The ring lives in `lorica-api`, not beside the record.** The story
+anticipated `lorica/src/capture/ring.rs`, but the two handlers that read
+the ring are in `lorica-api` and `lorica` depends on `lorica-api`, not
+the other way round (the record itself imports `lorica_api::logs::LogEntry`).
+So the ring is `lorica_api::capture_ring`, a process-global fed by the
+sink exactly the way the export lanes and the metrics registry are fed,
+storing the record as the JSON document the lanes already receive plus
+the serialised text for the download. The sink computes the file name
+(`capture_file_name`) and hands it over, so the download and the
+directory sink agree on the name without the API crate learning the
+timestamp format.
+
+**Worker mode: 503, not shipping.** Under `--workers` each worker fills
+its own ring and the supervisor, which serves the API, holds an empty
+one. `GET /recent` and the download answer `ServiceUnavailable` (a new
+`ApiError` variant, 503, code `service_unavailable`) on a `Mode::Supervisor`
+state, with a message naming the `lorica::capture` log target, the lanes
+and `output.dir`. Shipping the workers' rings instead would take: a new
+field on `MetricsReport` in `lorica-command/src/messages.rs` carrying the
+elided listing views (the full documents are up to ~11 MiB each and have
+no business on the report cadence), a supervisor-side per-worker map
+merged newest-first at read time in `AggregatedMetrics`, the download
+either refused or served from the listing view only, and the startup
+wiring under `lorica/src/startup/`, which the Story 10.3 slice holds.
+Roughly the same shape as the per-worker counter aggregation, for a
+panel whose value on a `--workers` node is what the sinks already
+provide.
+
+**Expiry does not clear `enabled`.** AC #5 of Story 10.1 says reaching
+`expires_at` flips `enabled = false` and audits it; the shipped code
+stops an expired rule (it is never a candidate) and the self-disable
+task only reacts to a spent `max_captures`. `docs/capture.md` states
+what the code does: the clock stops the rule and the dashboard shows it
+as expired, the total clears the flag. Closing the gap is a ticker that
+walks the store for `enabled AND expires_at <= now` rows and disables
+them with an audit row; it is not in this slice.
+
+**`/api/v1/capture/recent` needed an explicit authorize clause.** The
+GET default in `required_role` is Viewer; without the clause a Viewer
+would have read production bodies. Pinned by
+`the_recent_captures_ring_is_operator_and_never_viewer`.
+
+**Nav placement.** The nav has no "Observability" section; the page sits
+under "Monitoring" beside Logs, hidden from a Viewer (every read on it
+is Operator+), through a new `operator` flag on `NavItem`.
 
 ### Completion Notes
 
@@ -138,13 +182,13 @@ released. That is the only point where both halves and the access-log
 
 ## File List
 
-Anticipated, to be corrected during implementation.
-
-- `lorica/src/capture/` (new: record building, redaction, the ring)
+- `lorica/src/capture/` (record building, redaction, sinks; `sink.rs` feeds the ring)
+- `lorica-api/src/capture_ring.rs` (new: the ring), `lorica-api/src/capture.rs` (the two `recent` handlers), `lorica-api/src/error.rs` (`ServiceUnavailable`), `lorica-api/src/server.rs`, `lorica-api/src/middleware/authorize.rs`, `lorica-api/src/lib.rs`, `lorica-api/src/tests.rs`, `lorica-api/openapi.yaml`
 - `lorica-api/src/log_sinks/mod.rs`, `lorica-api/src/metrics.rs`
-- `lorica-dashboard/frontend/src/routes/Capture.svelte` (new) and its test
-- `docs/capture.md` (new), `CHANGELOG.md`
+- `lorica-dashboard/frontend/src/routes/Capture.svelte` (new) and `Capture.test.ts`, `components/capture/CaptureRuleForm.svelte` and its test, `components/capture/RecentCaptures.svelte` and its test, `lib/capture.ts` and its test, `lib/api.ts`, `components/Nav.svelte`, `routes/Dashboard.svelte`
+- `docs/capture.md` (new), `README.md`, `CHANGELOG.md`
 
 ## Change Log
 
 - 2026-09-16: Story drafted from the Epic 10 PRD. Added IV4: the PRD states that redaction cannot be disabled but does not ask anyone to prove it, and "a configuration path that can reach the always-redacted set" is the one defect in this story that would be silent.
+- 2026-09-16: AC #5 and AC #7 landed: the ring (`lorica-api`, 503 under `--workers`), the two `recent` endpoints, the Capture page with its form refusals, and `docs/capture.md`. Recorded the expiry-does-not-clear-`enabled` gap in the Debug Log.

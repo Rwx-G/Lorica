@@ -1,7 +1,7 @@
 # Story 10.4: The Environment Resource
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Story 10.3 (the listener and the token that scopes what an environment may claim) and Story 10.0 (an environment's route replicates through a payload that is now cut per recipient).
@@ -85,15 +85,15 @@ token with the same name prefix, or one explicitly labelled `shared`.
 
 ## Tasks
 
-- [ ] AC #1/#2: the request type, the validation, and the one-transaction write with its rollback test.
-- [ ] AC #3: the hostname collision rules, including the listener-host refusal.
-- [ ] AC #4: the certificate resolver and its persisted mode, with the re-resolution at snapshot build.
-- [ ] AC #5/#6: the responses, the read filters, the idempotent delete.
-- [ ] AC #6 (ownership): the prefix and `shared` rule, refused on all three verbs.
-- [ ] AC #7: the reaper, gated on role.
-- [ ] AC #8: `managed_by` on routes and backends, and the dashboard badge plus edit refusal.
-- [ ] AC #9: the row-level serialisation and `If-Match`.
-- [ ] AC #10/#11: the metrics, and the assertion that the blob version stays 2.
+- [x] AC #1/#2: the request type, the validation, and the one-transaction write with its rollback test. `ConfigStore::in_transaction` was added for it: commit on `Ok`, rollback on drop.
+- [x] AC #3: the hostname collision rules. The listener-host refusal covers `localhost`, `*.localhost` and any IP literal, because neither bind is in `AppState`.
+- [x] AC #4: the certificate resolver and its persisted mode, with the re-resolution at snapshot build. It settles in one extra round. When no certificate covers the hostname any more, the route keeps its last id and a WARN names the environment: an environment that served yesterday must not stop serving silently because a certificate was deleted.
+- [x] AC #5/#6: the responses, the read filters, the idempotent delete. Delete answers 204 for both never-existed and already-deleted: telling them apart would mean consulting the audit trail, which retention truncates, and an API answer must not depend on log retention.
+- [x] AC #6 (ownership): the prefix and `shared` rule, refused on all three verbs. An empty prefix (a principal starting with `-`) matches nothing.
+- [x] AC #7: the reaper, gated twice: not spawned on a follower runtime, and each tick re-checks the stored identity.
+- [x] AC #8: `managed_by` on routes and backends. `group_name = automation:<name>` is refused by the management API's own group-name validator, and that is a guard, not a defect: nobody can hand-create a route that claims to be automation-managed. The dashboard badge and edit refusal ride the frontend slice.
+- [x] AC #9: the row-level serialisation (the store lock) and `If-Match`, strong and weak tags and `*`.
+- [x] AC #10/#11: the metrics, and `story_10_4_rides_format_version_two_without_a_second_bump`.
 - [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, the frontend three.
 
 ## Dev Notes
@@ -115,7 +115,28 @@ delete separately for that reason.
 
 ### Debug Log
 
-(empty)
+**`applied_generation` is a floor, not a target.** The response carries
+the generation the control plane had published at response time. The
+write itself starts the round that publishes the next one, so a pipeline
+that waits for the fleet must poll until every node's applied generation
+EXCEEDS the value it received, not equals it. The PRD said "until every
+node reports it", which was off by one. Two concurrent writers can move
+the generation by two, in which case a node reporting one past the floor
+has the first environment and not necessarily the second; a strict
+pipeline re-reads its own environment and compares against the latest.
+
+**The management API refuses `automation:<name>` as a group name.** The
+colon is outside its validator's alphabet. That looked like an
+inconsistency and is a guard: an operator cannot hand-create a route or
+backend that claims automation ownership, so `managed_by` and the group
+name agree by construction.
+
+**No covering certificate keeps the last id.** The story did not say
+what happens when the wildcard an `auto` environment resolved to is
+deleted and not replaced. Blanking `certificate_id` would make a
+serving environment stop serving, silently, over a certificate change it
+had no part in. The route keeps the last id that worked and the snapshot
+build logs one WARN per environment naming the hostname.
 
 ### Completion Notes
 

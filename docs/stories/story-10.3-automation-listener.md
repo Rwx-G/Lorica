@@ -112,14 +112,15 @@ touch the other.
 ## Tasks
 
 - [x] The bind validator: lift the primitives, parameterise by flag name, widen `ReservedPorts`, rewrite `validate_cluster_listen` on top of it (AC #1, #9). The opt-in flag is NOT derived from the flag name: `--cluster-enrollment-listen` shares `--cluster-listen-any`, so a derivation would have named a flag that does not exist. The caller passes the flag, the opt-in and the subject.
-- [ ] Move the pure `ConnectionFilterPolicy` to `lorica-config`, leaving the runtime in the binary. That move brings `ipnet` into `lorica-config`, and when it does, Story 10.1's `validate_cidr` (written without it, because the crate had no CIDR parser) must be folded onto the same parser. Two answers to "is this a CIDR" in one crate is the drift this story exists to avoid. They differ deliberately in what they do with a bad entry, the filter warns and skips while a write-time validator refuses, but they must agree on what a bad entry IS.
+- [x] Move the pure `ConnectionFilterPolicy` to `lorica-config`, leaving the runtime in the binary. Done together with backlog #88: four hand-rolled CIDR parsers now delegate to one, and `GlobalSettings::cidr_lists()` is the single enumeration a test guards. That move brings `ipnet` into `lorica-config`, and when it does, Story 10.1's `validate_cidr` (written without it, because the crate had no CIDR parser) must be folded onto the same parser. Two answers to "is this a CIDR" in one crate is the drift this story exists to avoid. They differ deliberately in what they do with a bad entry, the filter warns and skips while a write-time validator refuses, but they must agree on what a bad entry IS.
 - [x] AC #4: the token model, its migration, its own HMAC key row, mint, parse and constant-time verify.
 - [x] AC #1/#3: the listener, its TLS, its accept loop with the source check and the pre-auth budgets. Nothing starts it yet; the startup wiring is its own slice.
 - [x] AC #5/#7: the scope enum, the bearer middleware (not an extractor: an extractor runs after the scope gate and cannot feed it), the per-request audit. The counter is owed, named in the Debug Log.
-- [ ] AC #2: the follower refusal at startup.
-- [ ] AC #6: the management-API token endpoints and the dashboard sub-page.
-- [ ] AC #8: the CLI helper and the OpenAPI security scheme.
-- [ ] Hot upgrade: the seven plumbing points (key prefix, `InheritedListeners`, `partition_inherited_fds` before its catch-all, `HandoffArgs`, the producer's `try_clone` dup, the consumer's adopt loop, and the flag re-emission in `hot_upgrade_argv`).
+- [x] AC #2: the follower refusal at startup.
+- [x] AC #6: the management-API token endpoints and the dashboard sub-page. The plane-separation test asserts 403, not 404: the scope gate wraps the whole automation router, so an undeclared path is refused before routing resolves.
+- [x] AC #8: the CLI helper and the OpenAPI security scheme, in a separate `openapi-automation.yaml` with its own contract gate that cross-checks `x-required-scope` against `required_scope`.
+- [x] Hot upgrade: the seven plumbing points. Point four was blocked one slice and closed the next: `start_automation_server` had no inherited-listener parameter, so the producer side deliberately handed over nothing rather than a socket the new side could only close, and the consequence (EADDRINUSE during the overlap) was stated rather than hidden.
+- [ ] `docs/automation.md`, written once Stories 10.4 and 10.5 have settled the shapes it describes.
 - [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, the frontend three.
 
 ## Dev Notes

@@ -1,7 +1,7 @@
 # Story 10.5: GitLab OIDC ID Tokens (Optional Authentication Mode)
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** Draft
+**Status:** Review
 **Priority:** P1, the last story of the cycle
 **Author:** Romain G.
 **Depends on:** Story 10.3 (the listener and the scope model) and Story 10.4 (the resource whose ownership rule this story re-bases).
@@ -90,15 +90,15 @@ network.
 
 ## Tasks
 
-- [ ] Add `jsonwebtoken` to the workspace, pinned, with a comment in `Cargo.toml` naming the approval and the story. Run `cargo audit` and `cargo deny` before anything else.
-- [ ] AC #1: the issuer model, its migration, its management API and its audit rows.
-- [ ] AC #2: the verifier, the pinned algorithm, the JWKS cache and its two refresh triggers.
-- [ ] AC #3: the claim-derived identity on the environment row, and the ownership rule re-based on `project_path`.
-- [ ] AC #4: the bounded replay set with its eviction counter.
-- [ ] AC #5: the fail-closed paths.
-- [ ] AC #6: `docs/automation.md`.
-- [ ] The e2e OIDC fixture and IV1 to IV5.
-- [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, the frontend three if the dashboard gains an issuer page.
+- [x] Add `jsonwebtoken` to the workspace, pinned, with a comment in `Cargo.toml` naming the approval and the story. Run `cargo audit` and `cargo deny` before anything else.
+- [x] AC #1: the issuer model, its migration, its management API and its audit rows.
+- [x] AC #2: the verifier, the pinned algorithm, the JWKS cache and its two refresh triggers.
+- [x] AC #3: the claim-derived identity on the environment row, and the ownership rule re-based on `project_path`.
+- [x] AC #4: the bounded replay set with its eviction counter.
+- [x] AC #5: the fail-closed paths.
+- [x] AC #6: `docs/automation.md`.
+- [ ] The e2e OIDC fixture and IV1 to IV5. IV1 to IV5 are covered in-process by the `lorica-api` suite against a mock issuer (see Completion Notes); the Docker e2e fixture and its profile wiring are not done.
+- [x] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`. No dashboard page was added, so the frontend gates were not touched.
 
 ## Dev Notes
 
@@ -119,22 +119,36 @@ deployment with no GitLab keeps the mode it has.
 
 ### Debug Log
 
-(empty)
+- 2026-09-17: `jsonwebtoken` 11.1 needs exactly one crypto backend feature. `rust_crypto` pulls the `rsa` crate, which carries the open RUSTSEC-2023-0071 (Marvin) advisory with no patched release and would fail the `cargo audit` gate; `aws_lc_rs` was chosen, and `aws-lc-rs` 1.18.1 was already in the lockfile through the `route53` feature path. `cargo audit` after the add: 650 crates scanned, only the two pre-existing allowed `unmaintained` warnings (`derivative` via lorica-core, `rustls-pemfile` via lorica-tls), neither in the new tree. `cargo deny check advisories` fails on those same two pre-existing unmaintained crates, unrelated to this story.
+- 2026-09-17: the two IV4 tests were written first and run against a stub verifier that refused everything as `no_issuer`; both failed (`left: Some(NoIssuer)`, expected `WrongAlg`) before the verifier existed, then passed with it.
+- 2026-09-17: `jsonwebtoken` validates `exp`/`nbf` against the system clock, not a caller-supplied instant, so the tests mint tokens against the real clock and pass a synthetic `now` only to the JWKS cache and the replay set. `iat` is checked by the verifier itself, against the caller's `now`.
+- 2026-09-17: generating one RSA-2048 key per unknown `kid` made the thousand-kid test take 137 s; it now signs a thousand tokens with one unpublished key and varies only the header's `kid`, which is what the cache actually sees.
+- 2026-09-17: the environment-binding test first minted three tokens from one claims object, so the second request was refused as `replayed`; a test token is a job, and a job mints once.
 
 ### Completion Notes
 
-(empty)
+- Verifier: `lorica-api/src/automation/oidc/` (`mod.rs` verification and the GitLab slug rule, `jwks.rs` the cache and the HTTPS fetcher, `replay.rs` the bounded set, `test_support.rs` the mock issuer shared by every suite). RS256 is pinned twice: by string comparison on the header's `alg` before any key lookup, and in the `Validation.algorithms` list handed to the library.
+- The bearer gate picks the mode by shape (`parse_automation_token` first, then the three-segment JWT test), peeks `aud` without verification only to select the issuer entries, reads those entries from the store on every request, and answers one 401 body for every refusal on either path. The precise reason travels to the audit layer through the write-once `PrincipalSlot` and lands in the `reason` field of the `automation.request.unauthenticated` row.
+- `AutomationPrincipal` became credential-agnostic (kind, principal, grant id, grant fields, optional `pipeline`, optional required environment slug); the environment handlers no longer touch a token row. `whoami` reports `kind` and `pipeline`.
+- Issuer entries do not replicate, asserted by `oidc_issuers_stay_out_of_the_canonical_blob`. Migration 59 creates `oidc_issuers` and adds `automation_environments.pipeline_json`.
+- The GitLab environment slug rule (`Gitlab::Slug::Environment`) is reimplemented in `gitlab_environment_slug`: lowercase, non-alphanumerics to `-`, `env-` prefix when not starting with a letter, squeezed dashes, and for any name that is not already a slug or exceeds 24 characters, the first 17 characters plus `-` plus six base-36 digits of the SHA-256 of the name. The suffix arithmetic is derived from the Ruby source and tested for shape, determinism and distinctness, not against a value captured from a live GitLab; a mismatch would surface as a 403 naming both the sent name and the expected slug on the first protected deployment.
+- IV1 to IV5 hold in-process: `a_well_formed_token_is_accepted_and_its_claims_become_the_identity`, `each_claim_failure_is_refused_with_its_own_reason`, `a_replayed_jti_is_refused_and_a_mismatch_does_not_consume_it` (IV1); `a_rotated_key_is_picked_up_on_the_next_unknown_kid_refresh`, `a_jwks_outage_keeps_cached_keys_until_the_interval_elapses_then_refuses` (IV2); `removing_an_issuer_refuses_the_next_id_token_immediately` (IV3); `an_hs256_token_signed_with_the_public_key_as_the_secret_is_refused_as_wrong_alg`, `a_token_with_alg_none_is_refused_as_wrong_alg` (IV4); `a_thousand_unknown_kids_produce_at_most_one_fetch_in_a_minute` (IV5). The Docker e2e fixture is not written.
+- Not done: the e2e OIDC fixture in `tests-e2e-docker/`, a `lorica automation oidc-issuer` CLI subcommand, and a dashboard page. The management API is the registration surface.
 
 ## File List
 
-Anticipated, to be corrected during implementation.
-
-- `Cargo.toml` (workspace), `lorica-api/Cargo.toml`
-- `lorica-config/src/models/oidc_issuer.rs`, `store/oidc_issuer.rs`
-- `lorica-api/src/automation/oidc.rs` (new: verifier, JWKS cache, replay set)
-- `tests-e2e-docker/` (the OIDC fixture and its profile wiring)
-- `docs/automation.md`, `CHANGELOG.md`
+- `lorica-api/Cargo.toml` (`jsonwebtoken` 11.1 on `aws_lc_rs`; `aws-lc-rs` as a dev-dependency for test key generation), `Cargo.lock`
+- `lorica-config/src/models/oidc_issuer.rs` (new), `models/mod.rs`, `models/automation_token.rs` (`validate_hostname_pattern` shared), `models/automation_environment.rs` (`PipelineIdentity`, `pipeline`)
+- `lorica-config/src/store/oidc_issuer.rs` (new), `store/mod.rs` (migration 59), `store/automation_environment.rs` (`pipeline_json`), `store/replica.rs`, `canonical.rs`, `tests.rs` (migration head 59)
+- `lorica-api/src/automation/oidc/{mod,jwks,replay,test_support,tests}.rs` (new)
+- `lorica-api/src/automation/{mod,auth,audit,router,environments}.rs`, `automation/environments/tests.rs`
+- `lorica-api/src/oidc_issuers.rs`, `oidc_issuers/tests.rs` (new), `lib.rs`, `server.rs` (`AppState.oidc`, routes), `middleware/authorize.rs`, `metrics.rs`
+- `lorica-api/src/{tests,acme/tests,automation_tokens/tests}.rs` (`AppState.oidc` in the harnesses)
+- `lorica-api/openapi.yaml`, `lorica-api/openapi-automation.yaml`
+- `lorica/src/startup/{single,supervisor}.rs`, `lorica/src/reload.rs`
+- `docs/automation.md` (new, OIDC sections), `CHANGELOG.md`
 
 ## Change Log
 
+- 2026-09-17: Implemented AC #1 to #6 with the in-process IV1 to IV5; the Docker e2e fixture is left open. Status to Review.
 - 2026-09-16: Story drafted from the Epic 10 PRD. `jsonwebtoken` approved by the maintainer the same day, so the story is in scope. Added IV4 and IV5 and the bounded-set eviction counter in AC #4: the PRD describes the correct behaviour but asks nobody to prove the two failures that would be silent, algorithm confusion and an unbounded outbound fetch driven by unknown key ids.
