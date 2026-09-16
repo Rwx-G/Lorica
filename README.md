@@ -663,7 +663,7 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (2034 tests, Lorica-native)
+# Product crates only (2073 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-limits -p lorica-shmem \
@@ -671,12 +671,12 @@ cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-metrics -p lorica-cluster -p lorica-dashboard \
            --features otel
 
-# Pingora-forked crates (658 tests)
+# Pingora-forked crates (748 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-error -p lorica-tls -p lorica-cache \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
            -p lorica-lb -p lorica-ketama -p lorica-lru \
-           -p lorica-memory-cache -p lorica-header-serde -p tinyufo
+           -p lorica-memory-cache -p lorica-header-serde -p TinyUFO
 
 # The cluster crate's integration binaries, including the frozen v1.7.0
 # wire corpus (every message's encoding, pinned)
@@ -686,7 +686,7 @@ cargo test -p lorica-cluster --tests
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 
-The `lorica` binary crate carries 17 end-to-end binaries under
+The `lorica` binary crate carries 18 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends
 (mTLS, response rewriting, mirroring, forward auth, stale-while-revalidate,
 the connection pre-filter, canary and header routing, config reload, rate
@@ -825,12 +825,12 @@ curl -fsSL https://github.com/Rwx-G/Lorica/raw/main/docs/lorica-signing-key.asc 
 gpg --verify lorica.deb.asc lorica.deb
 ```
 
-From v1.7.3 on, the release tag is signed with the same key, so the chain runs
+From v1.7.4 on, the release tag is signed with the same key, so the chain runs
 from the package back to the commit it was built from. Earlier tags are
 unsigned; verify those releases by their package signature.
 
 ```bash
-git verify-tag v1.7.3
+git verify-tag v1.7.4
 ```
 
 ## Roadmap

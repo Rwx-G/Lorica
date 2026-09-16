@@ -72,14 +72,27 @@ unless the tag is an annotated object carrying a good signature from that key.
 
 Tags up to and including `v1.7.2` predate this and are unsigned; `v1.6.0` is
 lightweight, and the signature visible on it belongs to GitHub's web-flow key
-on the squash-merge commit it points at, not to the project key. Signed tags
-start at `v1.7.3`.
+on the squash-merge commit it points at, not to the project key. v1.7.3 was
+never tagged (its content ships in v1.7.4), so signed tags start at `v1.7.4`.
 
 ## Drift checks (v1.5.2 audit M-15)
 
 A handful of user-visible numbers live in code AND in marketing-style docs, and the docs have drifted twice in the past. Re-run these greps when editing `lorica-waf/` or bumping the version, and update the docs if the numbers moved :
 
 ```bash
+# Test counts quoted in README.md ("Product crates only (N tests)",
+# "Pingora-forked crates (N tests)", the Vitest figure) and in
+# CONTRIBUTING.md. They drift every cycle that adds a test and nothing
+# recomputes them. Sum the per-binary results rather than trusting the
+# last edit:
+cargo test <the README product-crate list> 2>&1 \
+  | grep -oE 'test result: ok\. [0-9]+ passed' | grep -oE '[0-9]+' \
+  | python3 -c 'import sys; print(sum(int(x) for x in sys.stdin))'
+# Same for the forked list, and `ls lorica/tests/*.rs | wc -l` for the
+# count of end-to-end binaries. Note the forked list needs `-p TinyUFO`,
+# not `-p tinyufo`: the package name is case-sensitive and the lowercase
+# form fails resolution.
+
 # WAF rule count (code = 49 today : 46 general in `RuleSet::rules` +
 # 3 header-scoped in `RuleSet::header_scoped` since v1.5.2 H-3).
 # Authoritative source is `lorica-waf/src/rules.rs` ; one
