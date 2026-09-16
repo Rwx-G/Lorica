@@ -15,7 +15,7 @@
   "devDependencies": {
     "@eslint/js": "^9.39.4",
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
-    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/jest-dom": "~6.9.1",
     "@testing-library/svelte": "^5.3.1",
     "@tsconfig/svelte": "^5.0.8",
     "@types/node": "^24.12.4",
@@ -32,9 +32,7 @@
     "vite": "^8.2.2",
     "vitest": "^4.1.6"
   },
-  "pnpm": {
-    "overrides": {
-      "postcss": ">=8.5.10"
-    }
+  "overrides": {
+    "postcss": ">=8.5.10"
   }
 }

@@ -1,2 +1,6 @@
+# pnpm 10+ reads its settings here, not from the `pnpm` field of
+# package.json. The floor below is the postcss CVE-2026-41305 fix taken
+# in v1.5.2: resolution already sits well above it, this only stops a
+# future resolution from sliding back under.
 overrides:
   postcss: '>=8.5.10'
