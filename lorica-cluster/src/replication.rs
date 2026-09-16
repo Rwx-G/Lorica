@@ -286,10 +286,41 @@ pub struct Replicator {
     round: tokio::sync::Mutex<()>,
     /// Bound on one Prepare, Commit or Abort exchange with one node.
     /// Default [`DEFAULT_PER_NODE_DEADLINE`].
-    pub per_node_deadline: Duration,
+    ///
+    /// Not operator configuration: there is no flag, no setting and no
+    /// construction site that sets it other than [`Default`]. It is
+    /// `pub(crate)` so this crate's tests can shrink it, and no wider,
+    /// because a `pub` field on a production struct reads as a knob
+    /// somebody can turn (backlog #57). Threading real tuning from the
+    /// CLI is a separate decision, wanted the day a high-latency WAN
+    /// link makes a slow node look like a quarantined one.
+    pub(crate) per_node_deadline: Duration,
     /// Consecutive evictions that quarantine a node. Default
-    /// [`DEFAULT_QUARANTINE_THRESHOLD`].
-    pub quarantine_threshold: u32,
+    /// [`DEFAULT_QUARANTINE_THRESHOLD`]. Same visibility, same reason.
+    pub(crate) quarantine_threshold: u32,
+}
+
+impl Replicator {
+    /// Shorten the per-node deadline.
+    ///
+    /// Consuming, so it can only be set while the object is being
+    /// built, never on one that is running a round. It exists for
+    /// tests that must not wait out a real deadline, and it is the
+    /// shape operator tuning would take if it is ever threaded from
+    /// the CLI (backlog #57). It is not that tuning today: no flag and
+    /// no setting reaches it.
+    pub fn with_per_node_deadline(mut self, deadline: Duration) -> Self {
+        self.per_node_deadline = deadline;
+        self
+    }
+
+    /// Lower the number of consecutive evictions that quarantine a
+    /// node. Same contract and same reason as
+    /// [`Self::with_per_node_deadline`].
+    pub fn with_quarantine_threshold(mut self, threshold: u32) -> Self {
+        self.quarantine_threshold = threshold;
+        self
+    }
 }
 
 impl Default for Replicator {

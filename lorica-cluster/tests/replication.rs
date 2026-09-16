@@ -349,12 +349,10 @@ async fn spawn_control_plane_with_state(
     let stats = Arc::clone(&config.stats);
     let handle = OperationalListener::spawn(config);
 
-    let mut replicator = Replicator::new();
     // A wedged follower must not stall the whole suite; the eviction
     // path is unit-tested at length in `src/replication.rs`.
-    replicator.per_node_deadline = Duration::from_secs(5);
-    let mut distributor = CertDistributor::new();
-    distributor.per_node_deadline = Duration::from_secs(5);
+    let replicator = Replicator::new().with_per_node_deadline(Duration::from_secs(5));
+    let distributor = CertDistributor::new().with_per_node_deadline(Duration::from_secs(5));
     Fleet {
         addr,
         stats,
@@ -363,9 +361,7 @@ async fn spawn_control_plane_with_state(
         accepted,
         replicator,
         distributor,
-        challenges: ChallengeFanout {
-            per_node_deadline: Duration::from_secs(5),
-        },
+        challenges: ChallengeFanout::default().with_per_node_deadline(Duration::from_secs(5)),
         handle,
     }
 }
