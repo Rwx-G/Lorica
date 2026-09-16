@@ -281,6 +281,16 @@ export interface PathRuleRequest {
   return_status?: number;
 }
 
+/// Who manages a route or a backend when it is not the operator (Story
+/// 10.4 AC #8). Mirrors `lorica_config::models::ManagedBy`, a
+/// `#[serde(tag = "kind")]` enum with one variant today. Absent on the
+/// wire means operator-managed.
+export interface ManagedBy {
+  kind: 'automation';
+  /// The `automation_environments.name` the row belongs to.
+  environment: string;
+}
+
 export interface RouteResponse {
   id: string;
   hostname: string;
@@ -356,6 +366,10 @@ export interface RouteResponse {
   /// Free-form classification label (prod / staging / homelab / ...).
   /// Empty string = ungrouped. Mirrors `Backend.group_name`.
   group_name?: string;
+  /// Set when the automation API owns the row. The dashboard badges it
+  /// and refuses in-place edits, so a manual fix is not silently
+  /// overwritten by the next pipeline `PUT`.
+  managed_by?: ManagedBy;
   created_at: string;
   updated_at: string;
 }
@@ -659,6 +673,8 @@ export interface BackendResponse {
   tls_sni: string | null;
   h2_upstream: boolean;
   ewma_score_us: number;
+  /// Same contract as `RouteResponse.managed_by`.
+  managed_by?: ManagedBy;
   created_at: string;
   updated_at: string;
 }
@@ -906,6 +922,10 @@ export interface GlobalSettingsResponse {
   waf_whitelist_ips: string[];
   connection_deny_cidrs: string[];
   connection_allow_cidrs: string[];
+  // Automation listener source allowlist (Story 10.3). Empty = the
+  // listener refuses to open, so this is not an optional hardening
+  // knob but the switch that makes the plane reachable at all.
+  automation_allowed_cidrs: string[];
   // Observability (v1.4.0 OTel). Empty endpoint = exporter off.
   otlp_endpoint?: string | null;
   otlp_protocol?: string;
@@ -940,6 +960,7 @@ export interface GlobalSettingsResponse {
   syslog_access_enabled?: boolean;
   syslog_waf_enabled?: boolean;
   syslog_audit_enabled?: boolean;
+  syslog_capture_enabled?: boolean;
   syslog_tls_ca_pem?: string | null;
   syslog_tls_client_cert_pem?: string | null;
   // SECRET: GET returns "**REDACTED**" when a key is stored.
@@ -948,6 +969,11 @@ export interface GlobalSettingsResponse {
   otlp_logs_enabled?: boolean;
   // SECRET: GET returns "**REDACTED**" when a header is stored.
   otlp_logs_auth_header?: string | null;
+  // Per-kind OTLP lane toggles (backlog #50); default true server-side.
+  otlp_logs_access_enabled?: boolean;
+  otlp_logs_waf_enabled?: boolean;
+  otlp_logs_audit_enabled?: boolean;
+  otlp_logs_capture_enabled?: boolean;
 }
 
 export interface UpdateSettingsRequest {
@@ -971,6 +997,7 @@ export interface UpdateSettingsRequest {
   waf_whitelist_ips?: string[];
   connection_deny_cidrs?: string[];
   connection_allow_cidrs?: string[];
+  automation_allowed_cidrs?: string[];
   otlp_endpoint?: string | null;
   otlp_protocol?: string;
   otlp_service_name?: string;
@@ -1003,12 +1030,17 @@ export interface UpdateSettingsRequest {
   syslog_access_enabled?: boolean;
   syslog_waf_enabled?: boolean;
   syslog_audit_enabled?: boolean;
+  syslog_capture_enabled?: boolean;
   syslog_tls_ca_pem?: string | null;
   syslog_tls_client_cert_pem?: string | null;
   syslog_tls_client_key_pem?: string | null;
   syslog_extra_sd?: string | null;
   otlp_logs_enabled?: boolean;
   otlp_logs_auth_header?: string | null;
+  otlp_logs_access_enabled?: boolean;
+  otlp_logs_waf_enabled?: boolean;
+  otlp_logs_audit_enabled?: boolean;
+  otlp_logs_capture_enabled?: boolean;
 }
 
 /**
@@ -1780,6 +1812,70 @@ export const api = {
   probeHistory: (id: string, limit = 100) =>
     request<{ results: ProbeResultResponse[]; total: number }>('GET', `/probes/${id}/history?limit=${limit}`),
 
+  // ---- Traffic capture (Stories 10.1 and 10.2) ----
+
+  listCaptureRules: () =>
+    request<{ rules: CaptureRuleResponse[] }>('GET', '/capture/rules'),
+
+  createCaptureRule: (body: CaptureRuleRequest) =>
+    request<CaptureRuleResponse>('POST', '/capture/rules', body),
+
+  updateCaptureRule: (id: string, body: CaptureRuleRequest) =>
+    request<CaptureRuleResponse>('PUT', `/capture/rules/${encodeURIComponent(id)}`, body),
+
+  deleteCaptureRule: (id: string) =>
+    request<{ message: string }>('DELETE', `/capture/rules/${encodeURIComponent(id)}`),
+
+  disableCaptureRule: (id: string) =>
+    request<CaptureRuleResponse>('POST', `/capture/rules/${encodeURIComponent(id)}/disable`),
+
+  /**
+   * The recent-captures ring. On a `--workers` node the error carries
+   * `code: 'service_unavailable'`: the ring is per worker and the
+   * supervisor serving the API holds an empty one, so the page shows
+   * where the records went instead of an empty list.
+   */
+  listRecentCaptures: () =>
+    request<RecentCapturesResponse>('GET', '/capture/recent'),
+
+  /**
+   * Trigger a browser download of one full capture record while it is
+   * still in the ring. Same fetch + Blob flow as `downloadCertificate`
+   * so the server's `Content-Disposition` name is honoured and a 404
+   * (evicted) or 503 (`--workers`) surfaces as a message, not as a
+   * downloaded error document.
+   */
+  downloadRecentCapture: async (
+    requestId: string,
+    ruleId: string,
+  ): Promise<{ ok: true } | { ok: false; message: string }> => {
+    const qs = new URLSearchParams({ rule_id: ruleId }).toString();
+    const res = await fetch(`${BASE}/capture/recent/${encodeURIComponent(requestId)}?${qs}`, {
+      method: 'GET',
+      credentials: 'same-origin',
+    });
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`;
+      try {
+        const j = await res.json();
+        if (j?.error?.message) message = j.error.message;
+      } catch { /* ignore */ }
+      return { ok: false, message };
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get('Content-Disposition') ?? '';
+    const filename = sanitizeFilenameFromHeader(cd, `${requestId}.json`);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    return { ok: true };
+  },
+
   // Load Testing
   listLoadTestConfigs: () =>
     request<LoadTestConfigResponse[]>('GET', '/loadtest/configs'),
@@ -1856,7 +1952,72 @@ export const api = {
     const qs = new URLSearchParams({ route_id: routeId, window: '5m' });
     return request<AiCrawlerStatsResponse>('GET', `/ai-crawlers/stats?${qs.toString()}`);
   },
+
+  // Automation tokens (Story 10.3 AC #6). SuperAdmin on every verb;
+  // the server's `required_role` is the enforcement, the dashboard
+  // only mirrors it.
+  listAutomationTokens: () =>
+    request<{ tokens: AutomationTokenResponse[] }>('GET', '/automation/tokens'),
+
+  /**
+   * Mint a token. The `token` field of the answer is the only time
+   * the secret exists outside the automation that will hold it: the
+   * node stores an HMAC of it and nothing else, so it can never be
+   * fetched again. Show it once, then drop it.
+   */
+  createAutomationToken: (body: CreateAutomationTokenRequest) =>
+    request<MintedAutomationTokenResponse>('POST', '/automation/tokens', body),
+
+  /**
+   * Revoke a token. Revocation, not deletion: the row stays with
+   * `revoked_at` stamped so the audit trail survives, which is why
+   * this returns the token rather than a bare confirmation.
+   */
+  revokeAutomationToken: (publicId: string) =>
+    request<AutomationTokenResponse>('DELETE', `/automation/tokens/${encodeURIComponent(publicId)}`),
 };
+
+/** The closed scope enum an automation token carries (Story 10.3). */
+export type AutomationScope =
+  | 'environments:write'
+  | 'environments:read'
+  | 'routes:read'
+  | 'certificates:read';
+
+/**
+ * One automation token as the API renders it. There is no field for
+ * the secret and none for its HMAC, by design on the server side.
+ */
+export interface AutomationTokenResponse {
+  public_id: string;
+  name: string;
+  scopes: AutomationScope[];
+  allowed_hostnames: string[];
+  allowed_backend_cidrs: string[];
+  max_ttl_seconds: number;
+  created_by: string;
+  created_at: string;
+  expires_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+/** Body of `POST /api/v1/automation/tokens`. */
+export interface CreateAutomationTokenRequest {
+  name: string;
+  scopes: AutomationScope[];
+  allowed_hostnames: string[];
+  allowed_backend_cidrs?: string[];
+  max_ttl_seconds?: number;
+  /** Mutually exclusive with `expires_at`, which the UI does not send. */
+  lifetime_days?: number;
+}
+
+/** The mint answer: the stored row plus the one-time secret. */
+export interface MintedAutomationTokenResponse extends AutomationTokenResponse {
+  /** The full `<public_id>.<secret>` string. Never returned again. */
+  token: string;
+}
 
 export interface WafEvent {
   rule_id: number;
@@ -2226,4 +2387,144 @@ export interface BanEntry {
 export interface BanListResponse {
   bans: BanEntry[];
   total: number;
+}
+
+// ---- Traffic capture (Stories 10.1 and 10.2) ----
+
+/**
+ * One `emit.status` entry. The three classes are bare strings, an
+ * exact code is `{ exact: 503 }`, mirroring the server's enum.
+ */
+export type CaptureStatusMatch =
+  | 'client_error'
+  | 'server_error'
+  | 'client_aborted'
+  | { exact: number };
+
+export interface CaptureHeaderMatch {
+  name: string;
+  match_type: 'exact' | 'prefix' | 'regex';
+  value: string;
+}
+
+/** Request-side predicates: which requests the rule considers. */
+export interface CaptureMatch {
+  source_cidrs: string[];
+  methods: string[];
+  path_prefix: string | null;
+  path_regex: string | null;
+  headers: CaptureHeaderMatch[];
+}
+
+/** Response-side predicates: which considered requests are written out. */
+export interface CaptureEmit {
+  always: boolean;
+  status: CaptureStatusMatch[];
+  min_latency_ms: number | null;
+  upstream_error: boolean;
+}
+
+export interface CaptureScope {
+  request_body: boolean;
+  response_body: boolean;
+  request_body_max_bytes: number;
+  response_body_max_bytes: number;
+}
+
+export interface CaptureLimits {
+  max_captures: number;
+  rate_per_minute: number;
+  ttl_seconds: number;
+}
+
+export interface CaptureOutput {
+  dir: string | null;
+  max_dir_bytes: number | null;
+}
+
+export interface CaptureRedaction {
+  headers: string[];
+  query: string[];
+}
+
+export interface CaptureRuleResponse {
+  id: string;
+  name: string;
+  route_id: string;
+  enabled: boolean;
+  match: CaptureMatch;
+  emit: CaptureEmit;
+  capture: CaptureScope;
+  limits: CaptureLimits;
+  output: CaptureOutput;
+  redact: CaptureRedaction;
+  created_by: string;
+  created_at: string;
+  /** Absolute UTC instant; the one bound every node in a fleet agrees on. */
+  expires_at: string;
+  captures_emitted: number;
+  captures_dropped: number;
+}
+
+/**
+ * Body of `POST /capture/rules` and `PUT /capture/rules/{id}`. The
+ * server refuses unknown fields, which is what keeps `expires_at` and
+ * the two counters server-owned.
+ */
+export interface CaptureRuleRequest {
+  name: string;
+  route_id: string;
+  enabled?: boolean;
+  match?: Partial<CaptureMatch>;
+  emit?: Partial<CaptureEmit>;
+  capture?: Partial<CaptureScope>;
+  limits?: Partial<CaptureLimits>;
+  output?: Partial<CaptureOutput>;
+  redact?: Partial<CaptureRedaction>;
+}
+
+/** One direction of a listed capture record. */
+export interface RecentCaptureHalf {
+  headers: [string, string][];
+  body: string | null;
+  body_encoding: 'utf8' | 'base64' | null;
+  body_bytes_total: number;
+  truncated: boolean;
+  body_skipped: 'streaming' | 'budget' | 'disabled' | null;
+  /** Whether the listing cut `body` at 4 KiB. Absent when `body` is null. */
+  body_elided?: boolean;
+  /** Stored length of `body` before the cut; present only when elided. */
+  body_elided_total?: number;
+}
+
+export interface RecentCaptureRequest extends RecentCaptureHalf {
+  method: string;
+  uri: string;
+  version: string;
+}
+
+export interface RecentCaptureResponse extends RecentCaptureHalf {
+  status: number;
+}
+
+/** One record as `GET /capture/recent` lists it. */
+export interface RecentCapture {
+  kind: 'capture';
+  rule_id: string;
+  rule_name: string;
+  route_id: string;
+  request_id: string;
+  timestamp: string;
+  client_ip: string;
+  is_xff: boolean;
+  backend: string;
+  latency_ms: number;
+  error: string | null;
+  request: RecentCaptureRequest;
+  response: RecentCaptureResponse;
+}
+
+export interface RecentCapturesResponse {
+  captures: RecentCapture[];
+  capacity: number;
 }

@@ -14,6 +14,7 @@
     inferTabFromBackendError,
   } from '../lib/route-form';
   import { showToast } from '../lib/toast';
+  import { managedEditHint } from '../lib/managed-by';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import GeneralTab from './route-tabs/GeneralTab.svelte';
   import RoutingTab from './route-tabs/RoutingTab.svelte';
@@ -64,6 +65,11 @@
   // needs to jump to. Used for both the Save-button disabled state
   // and the inline banner above the footer actions.
   let liveValidation = $derived(validateRouteFormWithTab(form));
+
+  // A route the automation API owns opens read-only: every control
+  // inside the body is disabled through the fieldset and Save is
+  // refused, whatever path opened the drawer (Story 10.4 AC #8).
+  let managedHint: string = $derived(editing?.managed_by ? managedEditHint(editing.managed_by) : '');
   function tabLabel(id: string | null): string {
     if (!id) return '';
     const t = TABS.find((x) => x.id === id);
@@ -299,6 +305,10 @@
   }
 
   async function handleSubmit() {
+    if (managedHint) {
+      formError = managedHint;
+      return;
+    }
     const { message, tab } = validateRouteFormWithTab(form);
     if (message) {
       formError = message;
@@ -382,6 +392,10 @@
         </div>
       </div>
 
+      {#if managedHint}
+        <div class="managed-banner" role="note">{managedHint}</div>
+      {/if}
+
       {#if formError}
         <div class="form-error">{formError}</div>
       {/if}
@@ -409,7 +423,7 @@
       </div>
 
       <!-- Tab content -->
-      <div class="drawer-body">
+      <fieldset class="drawer-body" disabled={managedHint !== ''}>
         {#if activeTab === 'general'}
           <GeneralTab bind:form={form} editing={!!editing} {importedFields} />
         {:else if activeTab === 'routing'}
@@ -425,7 +439,7 @@
         {:else if activeTab === 'upstream'}
           <UpstreamTab bind:form={form} {importedFields} />
         {/if}
-      </div>
+      </fieldset>
 
       <!-- Footer -->
       <div class="drawer-footer">
@@ -456,8 +470,8 @@
           <button class="btn btn-cancel" onclick={handleClose}>Cancel</button>
           <button
             class="btn btn-primary"
-            disabled={formSubmitting || liveValidation.message !== ''}
-            title={liveValidation.message ? liveValidation.message : ''}
+            disabled={formSubmitting || liveValidation.message !== '' || managedHint !== ''}
+            title={managedHint ? managedHint : liveValidation.message ? liveValidation.message : ''}
             onclick={handleSubmit}
           >
             {formSubmitting ? 'Saving...' : editing ? 'Update' : 'Create'}
@@ -699,6 +713,23 @@
     flex: 1;
     overflow-y: auto;
     padding: 1.5rem;
+    /* It is a fieldset so a managed route can disable every control in
+       one attribute; undo the UA fieldset chrome. */
+    border: none;
+    margin: 0;
+    min-width: 0;
+  }
+
+  .managed-banner {
+    background: var(--color-primary-subtle);
+    border: 1px solid var(--color-primary);
+    border-radius: 0.375rem;
+    color: var(--color-primary);
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8125rem;
+    line-height: 1.4;
+    margin: 0.75rem 1.5rem 0;
+    flex-shrink: 0;
   }
 
   .drawer-footer {

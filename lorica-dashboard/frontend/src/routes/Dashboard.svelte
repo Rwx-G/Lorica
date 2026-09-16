@@ -31,6 +31,7 @@
     '/probes':      () => import('./Probes.svelte'),
     '/loadtest':    () => import('./LoadTest.svelte'),
     '/logs':        () => import('./Logs.svelte'),
+    '/capture':     () => import('./Capture.svelte'),
     '/cluster':     () => import('./Cluster.svelte'),
     '/system':      () => import('./System.svelte'),
     '/settings':    () => import('./Settings.svelte'),

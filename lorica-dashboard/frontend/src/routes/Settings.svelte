@@ -26,6 +26,7 @@
   import CertExportTab from '../components/settings-tabs/CertExportTab.svelte';
   import BinaryUpgradeTab from '../components/settings-tabs/BinaryUpgradeTab.svelte';
   import UsersAccessTab from '../components/settings-tabs/UsersAccessTab.svelte';
+  import AutomationTokensTab from '../components/settings-tabs/AutomationTokensTab.svelte';
   import { isSuperAdmin, isSuperAdminRole } from '../lib/auth';
   import { parseOctalMode } from '../lib/validators';
 
@@ -54,6 +55,7 @@
     waf_whitelist_ips: '',
     connection_deny_cidrs: '',
     connection_allow_cidrs: '',
+    automation_allowed_cidrs: '',
     // Observability (v1.4.0)
     otlp_endpoint: '',
     otlp_protocol: 'http-proto',
@@ -74,12 +76,17 @@
     syslog_access_enabled: true,
     syslog_waf_enabled: true,
     syslog_audit_enabled: true,
+    syslog_capture_enabled: true,
     syslog_tls_ca_pem: '',
     syslog_tls_client_cert_pem: '',
     syslog_tls_client_key_pem: '',
     syslog_extra_sd: '',
     otlp_logs_enabled: false,
     otlp_logs_auth_header: '',
+    otlp_logs_access_enabled: true,
+    otlp_logs_waf_enabled: true,
+    otlp_logs_audit_enabled: true,
+    otlp_logs_capture_enabled: true,
     // Defense-in-depth data-plane bounds (Story 8.9).
     // connection_limits_per_ip is held as a string so an empty
     // input maps to "no cap" (null), same pattern as the cert
@@ -148,6 +155,7 @@
     cert_export: true,
     binary_upgrade: true,
     users_access: true,
+    automation_tokens: true,
   };
   let expandedSections = $state<Record<string, boolean>>((() => {
     try {
@@ -190,6 +198,7 @@
         waf_whitelist_ips: (settingsRes.data.waf_whitelist_ips ?? []).join('\n'),
         connection_deny_cidrs: (settingsRes.data.connection_deny_cidrs ?? []).join('\n'),
         connection_allow_cidrs: (settingsRes.data.connection_allow_cidrs ?? []).join('\n'),
+        automation_allowed_cidrs: (settingsRes.data.automation_allowed_cidrs ?? []).join('\n'),
         otlp_endpoint: settingsRes.data.otlp_endpoint ?? '',
         otlp_protocol: settingsRes.data.otlp_protocol ?? 'http-proto',
         otlp_service_name: settingsRes.data.otlp_service_name ?? 'lorica',
@@ -209,6 +218,7 @@
         syslog_access_enabled: settingsRes.data.syslog_access_enabled ?? true,
         syslog_waf_enabled: settingsRes.data.syslog_waf_enabled ?? true,
         syslog_audit_enabled: settingsRes.data.syslog_audit_enabled ?? true,
+        syslog_capture_enabled: settingsRes.data.syslog_capture_enabled ?? true,
         syslog_tls_ca_pem: settingsRes.data.syslog_tls_ca_pem ?? '',
         syslog_tls_client_cert_pem:
           settingsRes.data.syslog_tls_client_cert_pem ?? '',
@@ -217,6 +227,10 @@
         syslog_extra_sd: settingsRes.data.syslog_extra_sd ?? '',
         otlp_logs_enabled: settingsRes.data.otlp_logs_enabled ?? false,
         otlp_logs_auth_header: settingsRes.data.otlp_logs_auth_header ?? '',
+        otlp_logs_access_enabled: settingsRes.data.otlp_logs_access_enabled ?? true,
+        otlp_logs_waf_enabled: settingsRes.data.otlp_logs_waf_enabled ?? true,
+        otlp_logs_audit_enabled: settingsRes.data.otlp_logs_audit_enabled ?? true,
+        otlp_logs_capture_enabled: settingsRes.data.otlp_logs_capture_enabled ?? true,
         connection_limits_per_ip:
           settingsRes.data.connection_limits_per_ip != null
             ? String(settingsRes.data.connection_limits_per_ip)
@@ -317,6 +331,10 @@
         .split('\n')
         .map((s: string) => s.trim())
         .filter((s: string) => s.length > 0),
+      automation_allowed_cidrs: settingsForm.automation_allowed_cidrs
+        .split('\n')
+        .map((s: string) => s.trim())
+        .filter((s: string) => s.length > 0),
       // Observability string fields: always send the trimmed value
       // (including empty string) so the backend can distinguish
       // "clear" (Some("")) from "do not touch" (field absent). A
@@ -370,6 +388,7 @@
         waf_whitelist_ips: (res.data.waf_whitelist_ips ?? []).join('\n'),
         connection_deny_cidrs: (res.data.connection_deny_cidrs ?? []).join('\n'),
         connection_allow_cidrs: (res.data.connection_allow_cidrs ?? []).join('\n'),
+        automation_allowed_cidrs: (res.data.automation_allowed_cidrs ?? []).join('\n'),
         otlp_endpoint: res.data.otlp_endpoint ?? '',
         otlp_protocol: res.data.otlp_protocol ?? 'http-proto',
         otlp_service_name: res.data.otlp_service_name ?? 'lorica',
@@ -387,12 +406,17 @@
         syslog_access_enabled: res.data.syslog_access_enabled ?? true,
         syslog_waf_enabled: res.data.syslog_waf_enabled ?? true,
         syslog_audit_enabled: res.data.syslog_audit_enabled ?? true,
+        syslog_capture_enabled: res.data.syslog_capture_enabled ?? true,
         syslog_tls_ca_pem: res.data.syslog_tls_ca_pem ?? '',
         syslog_tls_client_cert_pem: res.data.syslog_tls_client_cert_pem ?? '',
         syslog_tls_client_key_pem: res.data.syslog_tls_client_key_pem ?? '',
         syslog_extra_sd: res.data.syslog_extra_sd ?? '',
         otlp_logs_enabled: res.data.otlp_logs_enabled ?? false,
         otlp_logs_auth_header: res.data.otlp_logs_auth_header ?? '',
+        otlp_logs_access_enabled: res.data.otlp_logs_access_enabled ?? true,
+        otlp_logs_waf_enabled: res.data.otlp_logs_waf_enabled ?? true,
+        otlp_logs_audit_enabled: res.data.otlp_logs_audit_enabled ?? true,
+        otlp_logs_capture_enabled: res.data.otlp_logs_capture_enabled ?? true,
         connection_limits_per_ip:
           res.data.connection_limits_per_ip != null
             ? String(res.data.connection_limits_per_ip)
@@ -535,6 +559,24 @@
       expanded={expandedSections.binary_upgrade}
       toggleSection={() => toggleSection('binary_upgrade')}
     />
+
+    <!--
+      Automation tokens are credentials, so every verb on
+      `/api/v1/automation/tokens` is SuperAdmin server-side and the
+      whole section is hidden below that role rather than rendered
+      empty.
+
+      `isSuperAdmin` rather than `isSuperAdminRole`: the rows do not
+      replicate and `follower_local_request` does not name this path,
+      so a follower refuses these mutations. Offering a form the node
+      will reject is worse than not offering it.
+    -->
+    {#if $isSuperAdmin}
+      <AutomationTokensTab
+        expanded={expandedSections.automation_tokens}
+        toggleSection={() => toggleSection('automation_tokens')}
+      />
+    {/if}
 
     <!--
       Accounts are node-local: `replica.rs` never writes `users`, and

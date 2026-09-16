@@ -17,6 +17,7 @@
     trusted_proxies: string;
     connection_deny_cidrs: string;
     connection_allow_cidrs: string;
+    automation_allowed_cidrs: string;
     geoip_db_path: string;
     geoip_auto_update_enabled: boolean;
     asn_db_path: string;
@@ -58,6 +59,8 @@
   function checkTrustedProxies() { trustedProxiesErr = cidrListErr(settingsForm.trusted_proxies); }
   function checkDenyCidrs() { denyCidrsErr = cidrListErr(settingsForm.connection_deny_cidrs); }
   function checkAllowCidrs() { allowCidrsErr = cidrListErr(settingsForm.connection_allow_cidrs); }
+  let automationCidrsErr = $state<string | null>(null);
+  function checkAutomationCidrs() { automationCidrsErr = cidrListErr(settingsForm.automation_allowed_cidrs); }
 
   // Defense-in-depth numeric bounds (Story 8.9). Empty is treated
   // as "unset"; the connection limit additionally accepts 0 as
@@ -149,6 +152,25 @@
           One IP or CIDR per line. Leave empty for default-allow. When
           non-empty, switches the pre-filter to default-deny: only listed IPs
           are accepted.
+        </span>
+      </div>
+
+      <div class="settings-form-row">
+        <label for="automation-allowed">Automation Listener Allowed CIDRs</label>
+        <textarea
+          id="automation-allowed"
+          rows="3"
+          bind:value={settingsForm.automation_allowed_cidrs}
+          placeholder="10.0.0.0/8&#10;192.0.2.10"
+          onblur={checkAutomationCidrs} oninput={checkAutomationCidrs}
+        ></textarea>
+        {#if automationCidrsErr}<span class="field-error" role="alert">{automationCidrsErr}</span>{/if}
+        <span class="hint">
+          One IP or CIDR per line. Source networks allowed to reach the
+          automation API listener. Always default-deny: the listener does not
+          open at all while this is empty. Matching happens on the connection,
+          at TCP accept, before the TLS handshake, so a source outside the list
+          never reaches the bearer check.
         </span>
       </div>
 

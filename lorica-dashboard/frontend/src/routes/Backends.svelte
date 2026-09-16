@@ -8,6 +8,8 @@
   } from '../lib/api';
   import StatusBadge from '../components/StatusBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import AutomationBadge from '../components/AutomationBadge.svelte';
+  import { managedDeleteHint, managedEditHint } from '../lib/managed-by';
   import { showToast } from '../lib/toast';
   import { canWrite } from '../lib/auth';
 
@@ -164,6 +166,9 @@
   }
 
   function openEditForm(b: BackendResponse) {
+    // The button is disabled for a managed backend; this guard covers a
+    // keyboard or scripted click that bypasses the attribute.
+    if (b.managed_by) return;
     editingBackend = b;
     formAddress = b.address;
     formName = b.name ?? '';
@@ -239,6 +244,17 @@
     await loadData();
   }
 
+  function openDeleteDialog(b: BackendResponse) {
+    // The button is disabled for a managed backend, and the API answers
+    // 409 anyway; this guard covers a keyboard or scripted click.
+    if (b.managed_by) return;
+    deletingBackend = b;
+  }
+
+  function deleteBackendMessage(b: BackendResponse): string {
+    return `Delete backend ${b.address}? Routes using this backend will lose it from their pool.`;
+  }
+
   async function handleDelete() {
     if (!deletingBackend) return;
     const res = await api.deleteBackend(deletingBackend.id);
@@ -311,7 +327,12 @@
         <tbody>
           {#each filteredBackends as b (b.id)}
             <tr>
-              <td>{b.name || '-'}</td>
+              <td>
+                {b.name || '-'}
+                {#if b.managed_by}
+                  <AutomationBadge managedBy={b.managed_by} />
+                {/if}
+              </td>
               <td>{b.group_name || '-'}</td>
               <td class="mono">{b.address}</td>
               <td><StatusBadge status={b.health_status as 'healthy' | 'degraded' | 'down' | 'unknown'} /></td>
@@ -338,11 +359,23 @@
               <td class="mono">{b.ewma_score_us > 0 ? `${(b.ewma_score_us / 1000).toFixed(1)}ms` : '-'}</td>
               <td class="actions">
                 {#if $canWrite}
-                  <button class="btn-icon" onclick={() => openEditForm(b)} title="Edit" aria-label="Edit">
+                  <button
+                    class="btn-icon"
+                    onclick={() => openEditForm(b)}
+                    title={b.managed_by ? managedEditHint(b.managed_by) : 'Edit'}
+                    aria-label="Edit {b.name || b.address}"
+                    disabled={!!b.managed_by}
+                  >
                     <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                     {@html editIcon}
                   </button>
-                  <button class="btn-icon btn-icon-danger" onclick={() => (deletingBackend = b)} title="Delete" aria-label="Delete">
+                  <button
+                    class="btn-icon btn-icon-danger"
+                    onclick={() => openDeleteDialog(b)}
+                    title={b.managed_by ? managedDeleteHint(b.managed_by) : 'Delete'}
+                    aria-label="Delete {b.name || b.address}"
+                    disabled={!!b.managed_by}
+                  >
                     <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                     {@html trashIcon}
                   </button>
@@ -358,7 +391,7 @@
   {#if deletingBackend}
     <ConfirmDialog
       title="Delete Backend"
-      message="Delete backend {deletingBackend.address}? Routes using this backend will lose it from their pool."
+      message={deleteBackendMessage(deletingBackend)}
       confirmLabel="Delete"
       onconfirm={handleDelete}
       oncancel={() => (deletingBackend = null)}
@@ -468,4 +501,8 @@
   .sortable:hover { color: var(--color-text-heading); }
   .checkbox-row { display: flex; flex-wrap: wrap; gap: var(--space-4) var(--space-6); margin-top: var(--space-2); margin-bottom: var(--space-4); }
   .checkbox-row .checkbox-item { white-space: nowrap; }
+  /* A managed row keeps its action buttons visible but inert, so the
+     operator reads the tooltip instead of wondering where Edit went. */
+  .btn-icon:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-icon:disabled:hover { background: none; color: var(--color-text-muted); }
 </style>
