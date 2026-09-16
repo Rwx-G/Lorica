@@ -46,7 +46,20 @@ When bumping the version, update ALL of these files:
 ## Release tag (signed)
 
 Once the release commit is on `main`, the tag is **annotated and GPG-signed**.
-Never lightweight, never unsigned:
+Never lightweight, never unsigned.
+
+**Cut it from the `Tag Release` workflow**, not from a workstation. Run it
+from the Actions tab with the version (no leading `v`); it checks that
+`lorica/Cargo.toml` already says that version, signs the tag with the project
+key, verifies the signature against the published public key before pushing
+anything, and pushes. The push is what starts the release pipeline.
+
+The reason it lives there: the key's passphrase exists only as a repository
+secret, and nobody holds a readable copy, so a job with access to that secret
+is the only place the tag can be signed. See the note at the end of this
+section.
+
+The local form stays documented for whoever holds the passphrase:
 
 ```bash
 git tag -s -a vX.Y.Z -m "vX.Y.Z: <merge commit subject, without the PR number>"
@@ -74,6 +87,32 @@ Tags up to and including `v1.7.2` predate this and are unsigned; `v1.6.0` is
 lightweight, and the signature visible on it belongs to GitHub's web-flow key
 on the squash-merge commit it points at, not to the project key. v1.7.3 was
 never tagged (its content ships in v1.7.4), so signed tags start at `v1.7.4`.
+
+**Why the workflow exists.** The passphrase for `B6E37EA916841674` is in the
+repository secrets as `GPG_PASSPHRASE` and in no other place anyone can read:
+the local copy was lost, and GitHub secrets cannot be read back. CI has used
+it on every release to sign the `.deb` and `.rpm`, so the key still works;
+what no longer exists is a person able to sign at a terminal. Two consequences
+worth stating rather than discovering:
+
+- the project's ability to sign now depends on a secret nobody can read. If
+  GitHub loses it, or something needs signing outside CI, that ability is
+  gone. Rotating to a key whose passphrase is held somewhere readable is the
+  only state where this cannot recur, and it is worth scheduling.
+- the old public key must stay published whatever happens next, because every
+  release from v1.2.0 to v1.7.2 is signed with it and those signatures are
+  what operators verify.
+
+`Tag Release` needs two things configured, once:
+
+- a `release` environment with required reviewers. Without them the gate is a
+  label, and anyone who can run a workflow can mint a tag signed by the
+  project key, which is a larger power than merging.
+- a `RELEASE_TAG_TOKEN` secret: a fine-grained PAT with `Contents: write` on
+  this repository. A tag pushed with the default `GITHUB_TOKEN` starts no
+  workflow run, so the release pipeline would never fire and the tag would sit
+  there alone. The workflow refuses to start without it rather than producing
+  that silence.
 
 ## Drift checks (v1.5.2 audit M-15)
 
