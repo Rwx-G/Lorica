@@ -288,9 +288,11 @@
     }
   }
 
+  // The server forms this verdict; the page shows it. Recomputing it
+  // here is what made the pill disagree with `/cluster/drift`
+  // (backlog #71).
   function driftedFrom(node: ClusterNodeResponse): boolean {
-    if (!status || node.status !== 'active') return false;
-    return node.applied_config_generation !== status.applied_config_generation;
+    return node.status === 'active' && node.drifted;
   }
 
   function relative(iso: string | null): string {

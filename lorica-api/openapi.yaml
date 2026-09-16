@@ -4272,6 +4272,27 @@ components:
         session_last_seen_unix:
           type: integer
           nullable: true
+        drifted:
+          type: boolean
+          description: >-
+            The control plane's own drift verdict for this node, formed
+            the same way `/cluster/drift` forms it: generation and hash,
+            from the live session when there is one and from the
+            registry row otherwise. Read it rather than recomputing it
+            from the registry fields, which answers a different question
+            (backlog #71).
+        applied_generation:
+          type: integer
+          description: The generation the verdict above was formed against.
+        applied_hash:
+          type: string
+          description: The hash the verdict above was formed against.
+        from_live_session:
+          type: boolean
+          description: >-
+            Whether that generation and hash came from the node's live
+            session or from the registry row, which a timer writes and
+            which can therefore lag a node that has already converged.
         selected_for_hostnames:
           type: array
           description: >-

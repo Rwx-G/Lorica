@@ -418,6 +418,63 @@ pub async fn distribute_certificate(
 /// the current version, the live session's report when the node is
 /// connected, the registry row's persisted `applied_config_*` columns
 /// otherwise. Records first-seen times in the tracker.
+/// What the fleet knows about one node's applied configuration, and
+/// the verdict that follows.
+///
+/// The single definition of drift. Two things used to answer this
+/// question: this module, comparing generation AND hash against the
+/// live session when the node is connected, and the dashboard,
+/// comparing generation alone against the registry column that a 30 s
+/// timer persists. Two divergences followed. A node that converged by
+/// pull kept a drift pill for up to half a minute after the endpoint
+/// called it in sync, and a same-generation hash divergence never
+/// showed a pill at all (backlog #71).
+#[derive(Debug, Clone, Serialize)]
+pub struct DriftVerdict {
+    /// Whether this node diverges from the control plane's current
+    /// configuration.
+    pub drifted: bool,
+    /// The generation this verdict was formed against.
+    pub applied_generation: u64,
+    /// The hash this verdict was formed against.
+    pub applied_hash: String,
+    /// Whether those two came from the node's live session or from the
+    /// registry row. The registry row is written on a timer, so it can
+    /// lag a converged node; saying which clock produced the answer is
+    /// what lets a reader tell a stale verdict from a real one.
+    pub from_live_session: bool,
+}
+
+/// Form the verdict for one node.
+///
+/// `live` is the node's own report from its open session, when it has
+/// one; otherwise the registry row is all there is. Both call sites,
+/// the drift endpoint and the fleet node list, go through here.
+pub fn evaluate_drift(
+    current: &ConfigVersion,
+    registry_generation: i64,
+    registry_hash: &str,
+    live: Option<&AppliedConfig>,
+) -> DriftVerdict {
+    let (generation, hash, from_live_session) = match live {
+        Some(applied) => (applied.generation, applied.hash.clone(), true),
+        None => (
+            u64::try_from(registry_generation).unwrap_or(0),
+            registry_hash.to_string(),
+            false,
+        ),
+    };
+    DriftVerdict {
+        drifted: !(generation == current.generation && hash == current.hash),
+        applied_generation: generation,
+        applied_hash: hash,
+        from_live_session,
+    }
+}
+
+/// Which Active nodes diverge from the control plane's current
+/// configuration, with how long each has been diverging. Records
+/// first-seen times; spends no alert budget (see [`DriftAlerter`]).
 pub async fn drift_report(
     runtime: &ControlPlaneRuntime,
     store: &Arc<Mutex<ConfigStore>>,
@@ -435,17 +492,22 @@ pub async fn drift_report(
     let mut drifted = Vec::new();
     let mut in_sync = 0usize;
     for node in nodes.into_iter().filter(|n| n.status == NodeStatus::Active) {
-        let (applied, connected) = live.get(&node.node_id).cloned().unwrap_or_else(|| {
-            (
-                AppliedConfig {
-                    generation: u64::try_from(node.applied_config_generation).unwrap_or(0),
-                    hash: node.applied_config_hash.clone(),
-                    break_glass: false,
-                },
-                false,
-            )
-        });
-        if applied.generation == current.generation && applied.hash == current.hash {
+        let session = live.get(&node.node_id);
+        let verdict = evaluate_drift(
+            &current,
+            node.applied_config_generation,
+            &node.applied_config_hash,
+            session.map(|(applied, _)| applied),
+        );
+        let connected = session.is_some_and(|(_, connected)| *connected);
+        let applied = session
+            .map(|(applied, _)| applied.clone())
+            .unwrap_or_else(|| AppliedConfig {
+                generation: verdict.applied_generation,
+                hash: verdict.applied_hash.clone(),
+                break_glass: false,
+            });
+        if !verdict.drifted {
             in_sync += 1;
             continue;
         }
