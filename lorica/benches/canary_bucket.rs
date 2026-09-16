@@ -13,8 +13,10 @@
 //! called once per request when a route has any traffic_splits
 //! configured, so any regression is multiplied by RPS.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+// criterion 0.8 deprecates its own re-export in favour of the std one.
 use lorica::proxy_wiring::canary_bucket;
+use std::hint::black_box;
 
 fn bench_canary_short(c: &mut Criterion) {
     let mut group = c.benchmark_group("canary_bucket");

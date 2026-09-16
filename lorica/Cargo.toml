@@ -1,6 +1,6 @@
 [package]
 name = "lorica"
-version = "1.7.2"
+version = "1.7.3"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -39,22 +39,22 @@ lorica-lb = { version = "0.1.0", path = "../lorica-lb", optional = true, default
 # call site explicit.
 lorica-ketama = { version = "0.1.0", path = "../lorica-ketama" }
 lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, default-features = false }
-lorica-config = { version = "1.7.2", path = "../lorica-config" }
-lorica-api = { version = "1.7.2", path = "../lorica-api" }
+lorica-config = { version = "1.7.3", path = "../lorica-config" }
+lorica-api = { version = "1.7.3", path = "../lorica-api" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
-lorica-worker = { version = "1.7.2", path = "../lorica-worker" }
-lorica-command = { version = "1.7.2", path = "../lorica-command" }
-lorica-cluster = { version = "1.7.2", path = "../lorica-cluster" }
-lorica-shmem = { version = "1.7.2", path = "../lorica-shmem" }
-lorica-waf = { version = "1.7.2", path = "../lorica-waf" }
-lorica-notify = { version = "1.7.2", path = "../lorica-notify" }
+lorica-worker = { version = "1.7.3", path = "../lorica-worker" }
+lorica-command = { version = "1.7.3", path = "../lorica-command" }
+lorica-cluster = { version = "1.7.3", path = "../lorica-cluster" }
+lorica-shmem = { version = "1.7.3", path = "../lorica-shmem" }
+lorica-waf = { version = "1.7.3", path = "../lorica-waf" }
+lorica-notify = { version = "1.7.3", path = "../lorica-notify" }
 lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-geoip = { version = "1.7.2", path = "../lorica-geoip" }
-lorica-challenge = { version = "1.7.2", path = "../lorica-challenge" }
+lorica-geoip = { version = "1.7.3", path = "../lorica-geoip" }
+lorica-challenge = { version = "1.7.3", path = "../lorica-challenge" }
 once_cell = { workspace = true }
-lorica-bench = { version = "1.7.2", path = "../lorica-bench" }
+lorica-bench = { version = "1.7.3", path = "../lorica-bench" }
 regex = "1"
 # HTML sanitization for operator-supplied error_page_html (v1.5.0
 # audit finding HIGH-1). Whitelist-based parser replaces the
@@ -87,7 +87,7 @@ arc-swap = "1"
 dashmap = "6"
 rand = "0.9"
 parking_lot = "0.12"
-argon2 = "0.5"
+argon2 = "0.6"
 base64 = "0.23"
 async-trait = { workspace = true }
 chrono = "0.4"
@@ -114,7 +114,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 # the process-wide `DashMap` + `Mutex<VecDeque>` carry
 # `#[serial(verdict_cache)]` so cargo test's parallel scheduler
 # does not interleave them and produce a FIFO-ordering flake.
-serial_test = "3"
+serial_test = "4"
 async-trait = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
@@ -124,7 +124,7 @@ chrono = { version = "0.4", features = ["serde"] }
 rcgen = "0.14"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pki-types = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "circuit_breaker"

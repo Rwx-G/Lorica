@@ -79,7 +79,7 @@ h2 = { workspace = true, features = ["unstable"] }
 tokio-stream = { version = "0.1", features = ["full"] }
 env_logger = "0.11"
 reqwest = { version = "0.12", features = ["rustls-tls-webpki-roots"], default-features = false }
-rstest = "0.23.0"
+rstest = "0.27.0"
 # Types only (ServerCertVerifier, CertificateDer, DigitallySignedStruct in
 # the connector tests). No provider feature: the runtime provider arrives
 # through lorica-tls, which pins ring. Left on default features this entry

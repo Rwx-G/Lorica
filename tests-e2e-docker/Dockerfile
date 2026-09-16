@@ -6,7 +6,7 @@
 FROM node:22-slim AS frontend
 RUN npm install -g pnpm@10
 WORKDIR /app/lorica-dashboard/frontend
-COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/pnpm-lock.yaml ./
+COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/pnpm-lock.yaml lorica-dashboard/frontend/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY lorica-dashboard/frontend/ ./
 RUN pnpm run build

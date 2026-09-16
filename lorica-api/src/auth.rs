@@ -370,18 +370,14 @@ pub fn verify_password(password: &str, stored_hash: &str) -> Result<(), ApiError
 
 /// Hash a password using argon2.
 pub fn hash_password(password: &str) -> Result<String, ApiError> {
-    use argon2::password_hash::{rand_core::OsRng, SaltString};
     use argon2::PasswordHasher;
 
-    // `argon2` 0.5 re-exports rand_core 0.6. Its `SaltString::generate`
-    // accepts the rand_core 0.6 `CryptoRngCore` trait, which `rand`
-    // 0.9's top-level `OsRng` does not implement (rand moved to
-    // rand_core 0.9 in 0.9.0). Using the re-exported type keeps
-    // argon2 on its own rand_core without forcing rand_core 0.6 as a
-    // separate direct dep here.
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = argon2_hasher()
-        .hash_password(password.as_bytes(), &salt)
+    // argon2 0.6 generates the salt itself, from the OS RNG, at the
+    // recommended length. The dance this used to do with a re-exported
+    // `SaltString` and `rand_core` existed only to keep two rand_core
+    // majors apart, and there is no longer a salt argument to pass.
+    let hash: argon2::PasswordHash = argon2_hasher()
+        .hash_password(password.as_bytes())
         .map_err(|e| ApiError::Internal(format!("password hashing failed: {e}")))?;
     Ok(hash.to_string())
 }
