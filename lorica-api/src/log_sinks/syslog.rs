@@ -453,7 +453,7 @@ fn push_sd_param(sd: &mut String, name: &str, value: &str) {
 /// it parses, otherwise now. RFC 5424 TIMESTAMP is RFC 3339 with an
 /// upper-case `T` / offset, which `to_rfc3339` produces.
 fn event_timestamp(event: &SinkEvent) -> String {
-    let raw = match &event.payload {
+    let raw = match &*event.payload {
         super::SinkPayload::Access(entry) => entry.timestamp.as_str(),
         super::SinkPayload::Waf(waf) => waf.timestamp.as_str(),
         super::SinkPayload::Audit(audit) => audit.timestamp.as_str(),
@@ -506,7 +506,7 @@ pub async fn send_test_message(
     let tls = build_tls_connector(config)?;
     let mut conn = connect(config, tls.as_ref()).await?;
     let event = SinkEvent {
-        payload: super::SinkPayload::Audit(super::AuditSinkRecord {
+        payload: std::sync::Arc::new(super::SinkPayload::Audit(super::AuditSinkRecord {
             timestamp: chrono::Utc::now().to_rfc3339(),
             operator_username: "test".to_string(),
             operator_role: "-".to_string(),
@@ -515,7 +515,7 @@ pub async fn send_test_message(
             target_id: String::new(),
             ip: String::new(),
             chain_hash: String::new(),
-        }),
+        })),
         trace_id: None,
         span_id: None,
     };
@@ -567,7 +567,7 @@ mod tests {
 
     fn audit_event() -> SinkEvent {
         SinkEvent {
-            payload: SinkPayload::Audit(AuditSinkRecord {
+            payload: std::sync::Arc::new(SinkPayload::Audit(AuditSinkRecord {
                 timestamp: "2026-06-10T00:00:00+00:00".to_string(),
                 operator_username: "admin".to_string(),
                 operator_role: "SuperAdmin".to_string(),
@@ -576,7 +576,7 @@ mod tests {
                 target_id: "r-1".to_string(),
                 ip: "192.0.2.10".to_string(),
                 chain_hash: "abc".to_string(),
-            }),
+            })),
             trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
             span_id: Some("00f067aa0ba902b7".to_string()),
         }
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn encode_truncates_oversized_bodies_per_transport() {
         let mut event = audit_event();
-        if let SinkPayload::Audit(record) = &mut event.payload {
+        if let SinkPayload::Audit(record) = std::sync::Arc::make_mut(&mut event.payload) {
             record.target_id = "x".repeat(4 * BODY_MAX_UDP);
         }
         let config = test_config("host01:514", SyslogTransport::Udp);
@@ -651,7 +651,7 @@ mod tests {
         // The stream ceiling is larger: the same event fits untruncated
         // under TCP only if below BODY_MAX_STREAM; make it larger to
         // assert the stream cap too.
-        if let SinkPayload::Audit(record) = &mut event.payload {
+        if let SinkPayload::Audit(record) = std::sync::Arc::make_mut(&mut event.payload) {
             record.target_id = "x".repeat(4 * BODY_MAX_STREAM);
         }
         let config = test_config("host01:514", SyslogTransport::Tcp);

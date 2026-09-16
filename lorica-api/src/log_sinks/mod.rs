@@ -109,7 +109,17 @@ pub enum SinkPayload {
 #[derive(Debug, Clone)]
 pub struct SinkEvent {
     /// Event payload.
-    pub payload: SinkPayload,
+    ///
+    /// Behind an `Arc` because the hub hands the same event to every
+    /// enabled lane and each hand-off is a clone: with syslog and OTLP
+    /// both on, an access row used to pay three deep copies of a
+    /// struct that is almost entirely owned strings (method, path,
+    /// user agent, referer, host). The payload is read-only from the
+    /// moment it is published, so sharing it costs a refcount bump and
+    /// nothing else. The trace and span ids stay owned: they are
+    /// bounded at 32 and 16 hex characters and an `Arc` each would buy
+    /// less than it costs (backlog #49).
+    pub payload: Arc<SinkPayload>,
     /// 32-hex-char W3C trace id of the request, when one was active.
     pub trace_id: Option<String>,
     /// 16-hex-char span id of the request, when one was active.
@@ -119,7 +129,7 @@ pub struct SinkEvent {
 impl SinkEvent {
     /// Kind of the wrapped payload.
     pub fn kind(&self) -> SinkKind {
-        match self.payload {
+        match *self.payload {
             SinkPayload::Access(_) => SinkKind::Access,
             SinkPayload::Waf(_) => SinkKind::Waf,
             SinkPayload::Audit(_) => SinkKind::Audit,
@@ -139,7 +149,7 @@ pub const SINK_BODY_VERSION: u32 = 1;
 /// envelope (syslog MSGID / OTLP attribute). Shared by both sink
 /// consumers so the two wire formats cannot drift.
 pub fn body_json(event: &SinkEvent) -> String {
-    let mut value = serde_json::to_value(&event.payload).unwrap_or_default();
+    let mut value = serde_json::to_value(&*event.payload).unwrap_or_default();
     if let Some(map) = value.as_object_mut() {
         map.insert("v".to_string(), serde_json::json!(SINK_BODY_VERSION));
         map.insert("kind".to_string(), serde_json::json!(event.kind().as_str()));
@@ -526,7 +536,7 @@ pub fn publish_access(entry: &LogEntry, trace_id: Option<&str>, span_id: Option<
         return;
     };
     state.offer_all(&SinkEvent {
-        payload: SinkPayload::Access(entry.clone()),
+        payload: Arc::new(SinkPayload::Access(entry.clone())),
         trace_id: trace_id.map(str::to_string),
         span_id: span_id.map(str::to_string),
     });
@@ -539,7 +549,7 @@ pub fn publish_waf(event: &lorica_waf::WafEvent, trace_id: Option<&str>, span_id
         return;
     };
     state.offer_all(&SinkEvent {
-        payload: SinkPayload::Waf(event.clone()),
+        payload: Arc::new(SinkPayload::Waf(event.clone())),
         trace_id: trace_id.map(str::to_string),
         span_id: span_id.map(str::to_string),
     });
@@ -553,7 +563,7 @@ pub fn publish_audit(record: AuditSinkRecord) {
         return;
     };
     state.offer_all(&SinkEvent {
-        payload: SinkPayload::Audit(record),
+        payload: Arc::new(SinkPayload::Audit(record)),
         trace_id: None,
         span_id: None,
     });
@@ -648,7 +658,7 @@ mod tests {
     #[test]
     fn body_json_carries_version_and_kind() {
         let event = SinkEvent {
-            payload: SinkPayload::Audit(AuditSinkRecord {
+            payload: Arc::new(SinkPayload::Audit(AuditSinkRecord {
                 timestamp: "2026-06-10T00:00:00Z".into(),
                 operator_username: "admin".into(),
                 operator_role: "SuperAdmin".into(),
@@ -657,7 +667,7 @@ mod tests {
                 target_id: "r1".into(),
                 ip: "192.0.2.10".into(),
                 chain_hash: "abc".into(),
-            }),
+            })),
             trace_id: None,
             span_id: None,
         };

@@ -549,7 +549,7 @@ mod imp {
     /// record's trace correlation (Story 9.8 AC #2).
     fn emit_sink_event(logger: &opentelemetry_sdk::logs::SdkLogger, event: &SinkEvent) {
         let kind = event.kind();
-        let (severity, severity_text, raw_ts) = match &event.payload {
+        let (severity, severity_text, raw_ts) = match &*event.payload {
             SinkPayload::Access(entry) => (Severity::Info, "INFO", entry.timestamp.as_str()),
             SinkPayload::Waf(waf) => (Severity::Warn, "WARN", waf.timestamp.as_str()),
             SinkPayload::Audit(audit) => (Severity::Info, "INFO", audit.timestamp.as_str()),
