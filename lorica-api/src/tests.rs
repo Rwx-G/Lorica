@@ -6008,7 +6008,7 @@ async fn test_settings_schema_bounds_match_validator() {
 /// the fleet handles wired the way the binary wires them. Returns the
 /// handle and the token-liveness receiver the enrollment listener
 /// would watch.
-fn test_control_plane() -> (
+pub(crate) fn test_control_plane() -> (
     std::sync::Arc<crate::cluster::ControlPlaneRuntime>,
     tokio::sync::watch::Receiver<u32>,
 ) {

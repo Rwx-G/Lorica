@@ -1352,6 +1352,14 @@ fn spawn_drift_watch(
     alert_sender: AlertSender,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // The one task entitled to advance the alert backoff. Claimed
+        // before the loop: if something else already holds it, this
+        // process would be alerting twice on one budget, which is a
+        // wiring bug and not a condition to paper over at runtime.
+        let Some(alerter) = runtime.claim_drift_alerter() else {
+            error!("drift alerter already claimed; this watch task will not run");
+            return;
+        };
         loop {
             tokio::time::sleep(DRIFT_CHECK_INTERVAL).await;
             let report = match lorica_api::cluster::runtime::drift_report(&runtime, &store).await {
@@ -1363,7 +1371,7 @@ fn spawn_drift_watch(
             };
             lorica_api::metrics::set_cluster_drift_nodes(report.drifted.len());
             let ids: Vec<String> = report.drifted.iter().map(|d| d.node_id.clone()).collect();
-            for node_id in runtime.drift.observe(&ids, Utc::now()) {
+            for node_id in alerter.due(&ids, Utc::now()) {
                 let Some(entry) = report.drifted.iter().find(|d| d.node_id == node_id) else {
                     continue;
                 };

@@ -82,8 +82,11 @@ pub enum ClusterRuntime {
 pub struct ControlPlaneRuntime {
     /// The fleet runtime shared with the listeners.
     pub control: Arc<ControlPlane>,
-    /// Drift bookkeeping.
+    /// Drift bookkeeping. The alert budget inside it is spendable
+    /// only through [`DriftAlerter`], claimed once by the watch task.
     pub drift: DriftTracker,
+    /// Whether the single [`DriftAlerter`] has been handed out.
+    alerter_claimed: std::sync::atomic::AtomicBool,
     /// The fan-in database (Story 9.6 AC #2), shared with the
     /// listener's ingest handler so the rows an operator reads are
     /// the rows the fleet delivered. `None` when it could not be
@@ -92,6 +95,22 @@ pub struct ControlPlaneRuntime {
 }
 
 impl ControlPlaneRuntime {
+    /// Claim the one [`DriftAlerter`] for this runtime.
+    ///
+    /// `Some` the first time, `None` afterwards: there is exactly one
+    /// task entitled to advance the alert backoff, and a second caller
+    /// asking for it is a bug worth failing on rather than a second
+    /// consumer of the same budget (backlog #59).
+    pub fn claim_drift_alerter(self: &Arc<Self>) -> Option<DriftAlerter> {
+        use std::sync::atomic::Ordering;
+        if self.alerter_claimed.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        Some(DriftAlerter {
+            runtime: Arc::clone(self),
+        })
+    }
+
     /// Bundle a control plane with fresh drift bookkeeping and no
     /// telemetry store (the transport tests, and any caller that does
     /// not fan telemetry in).
@@ -99,6 +118,7 @@ impl ControlPlaneRuntime {
         Self {
             control,
             drift: DriftTracker::default(),
+            alerter_claimed: std::sync::atomic::AtomicBool::new(false),
             telemetry: None,
         }
     }
@@ -111,6 +131,7 @@ impl ControlPlaneRuntime {
         Self {
             control,
             drift: DriftTracker::default(),
+            alerter_claimed: std::sync::atomic::AtomicBool::new(false),
             telemetry,
         }
     }
@@ -182,7 +203,15 @@ impl DriftTracker {
     /// ids whose alert is due (first observation, or the backoff
     /// expired); nodes back in sync are forgotten so their next drift
     /// starts from the shortest interval again.
-    pub fn observe(&self, drifted: &[String], now: DateTime<Utc>) -> Vec<String> {
+    ///
+    /// Crate-private on purpose: this call SPENDS the alert budget,
+    /// and the only thing entitled to spend it is the periodic watch
+    /// task, which reaches it through [`DriftAlerter`]. A read path
+    /// that called this would consume a node's suppression window on
+    /// behalf of whoever refreshed a dashboard, so the read path takes
+    /// [`Self::record_first_seen`] and the compiler now says which is
+    /// which (backlog #59).
+    pub(crate) fn observe(&self, drifted: &[String], now: DateTime<Utc>) -> Vec<String> {
         let mut first_seen = self.first_seen.lock().unwrap_or_else(|p| p.into_inner());
         let mut backoff = self.backoff.lock().unwrap_or_else(|p| p.into_inner());
         first_seen.retain(|id, _| drifted.contains(id));
@@ -230,6 +259,25 @@ impl DriftTracker {
             .unwrap_or_else(|p| p.into_inner())
             .get(node_id)
             .copied()
+    }
+}
+
+/// The right to spend the drift alert budget.
+///
+/// Claimed once per runtime by the task that owns the alerting loop.
+/// A second claim returns `None`, so "who advances the backoff" has an
+/// answer the type system can state rather than a comment asking
+/// nicely. Everything else that wants drift reads
+/// [`drift_report`], which records first-seen times and spends
+/// nothing.
+pub struct DriftAlerter {
+    runtime: Arc<ControlPlaneRuntime>,
+}
+
+impl DriftAlerter {
+    /// The ids whose alert is due now, advancing each one's backoff.
+    pub fn due(&self, drifted: &[String], now: DateTime<Utc>) -> Vec<String> {
+        self.runtime.drift.observe(drifted, now)
     }
 }
 
@@ -640,6 +688,20 @@ mod tests {
         assert!(roster["fp-b-old"].via_previous_certificate);
         assert_eq!(roster["fp-b-old"].node_id, "b");
         assert_eq!(roster["fp-c"].state, NodeState::Revoked);
+    }
+
+    #[test]
+    fn the_alert_budget_has_exactly_one_claimant() {
+        // The contract #59 asked for: the backoff is spendable only
+        // through a handle, and the handle exists once. A read path
+        // that wants drift calls `drift_report`, which records
+        // first-seen times and spends nothing.
+        let (runtime, _liveness) = crate::tests::test_control_plane();
+        assert!(runtime.claim_drift_alerter().is_some(), "first claim");
+        assert!(
+            runtime.claim_drift_alerter().is_none(),
+            "a second claimant would alert on a budget it does not own"
+        );
     }
 
     #[test]
