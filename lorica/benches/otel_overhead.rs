@@ -35,8 +35,10 @@
 //! request: < 500 ns for the wire-format steps. Numbers reported in
 //! the v1.4.0 release notes (CHANGELOG) come from this bench.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+// criterion 0.8 deprecates its own re-export in favour of the std one.
 use lorica::otel::{traceparent_from_request_id, TraceParent};
+use std::hint::black_box;
 
 fn bench_traceparent_parse(c: &mut Criterion) {
     let mut group = c.benchmark_group("otel_traceparent");

@@ -22,8 +22,10 @@
 //! A regression that pushes the noisy case past 200 us at modest QPS
 //! starts impacting tail latency.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+// criterion 0.8 deprecates its own re-export in favour of the std one.
 use lorica_waf::{WafEngine, WafMode};
+use std::hint::black_box;
 
 fn build_engine() -> WafEngine {
     WafEngine::new()
