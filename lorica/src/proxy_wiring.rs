@@ -2497,12 +2497,50 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Story 10.1 phase two, stopping short of the record itself:
-        // decide whether the buffers WOULD have produced one. Story 10.2
-        // builds it from the same state. The `emit` predicates are read
-        // by the rule ids the request recorded at `request_filter`, so
-        // the `match` block is not evaluated a second time.
-        if let Some(state) = capture.as_mut() {
+        // The access-log row. Built ahead of the consumers that want it
+        // because the capture record (below) is made FROM it: a capture
+        // joins the row on `request_id` and must agree with it on the
+        // client address, the backend, the latency and the error, and
+        // one struct read by both is how that agreement is kept rather
+        // than checked. The sink export is deliberately NOT gated on
+        // `ctx.access_log_enabled` (QA finding: a compliance-relevant
+        // SIEM export must not be switched off by the unrelated
+        // local-log toggle); the row is only built when at least one
+        // consumer wants it.
+        let sinks_want_access =
+            lorica_api::log_sinks::wants(lorica_api::log_sinks::SinkKind::Access);
+        let access_entry =
+            (ctx.access_log_enabled || sinks_want_access || capture.is_some()).then(|| LogEntry {
+                id: 0, // assigned by LogBuffer
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                method: method.to_string(),
+                path: path.to_string(),
+                host: host.to_string(),
+                status,
+                latency_ms,
+                backend: backend_addr.to_string(),
+                error: error_str,
+                client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
+                is_xff: ctx.is_xff,
+                xff_proxy_ip: ctx.xff_proxy_ip.as_deref().unwrap_or("").to_string(),
+                source: ctx.source.clone(),
+                request_id: ctx.request_id.clone(),
+            });
+
+        // Traffic capture, the record (Story 10.2). One record per rule
+        // the budgets admit, built from the buffers, the rule and the
+        // access-log row. The `emit` predicates are read by the rule ids
+        // the request recorded at `request_filter`, so the `match` block
+        // is not evaluated a second time.
+        //
+        // Each record owns its copy of the bytes it keeps, which is a
+        // second copy while `capture` is alive; the buffer dies at the
+        // end of this function and the record has to outlive it, so the
+        // copy is the price of the hand-off and not a leak. The rule's
+        // `output` rides along: it is the one thing the sinks need that
+        // the record does not carry.
+        let mut capture_records: Vec<crate::capture::CaptureEmission> = Vec::new();
+        if let (Some(state), Some(entry)) = (capture.as_mut(), access_entry.as_ref()) {
             let upstream_error = e.is_some_and(|err| err.esource() == &ErrorSource::Upstream);
             let config = self.config.load();
             let rules = ctx
@@ -2510,6 +2548,7 @@ impl ProxyHttp for LoricaProxy {
                 .as_deref()
                 .map(|route_id| config.capture_rules.rules_for_route(route_id))
                 .unwrap_or_default();
+            let response = session.as_downstream().response_written();
             // The budgets are spent HERE and nowhere else, one call per
             // rule that would emit. `admit` is the single critical
             // section that reads the total, reads the rate window and
@@ -2520,17 +2559,20 @@ impl ProxyHttp for LoricaProxy {
             // budget unspent and its counters wrong. Each rule that
             // would emit consults its own.
             let now = std::time::Instant::now();
-            let mut would_emit = false;
             for rule in rules
                 .iter()
                 .filter(|rule| state.rule_ids.iter().any(|id| id == &rule.rule.id))
                 .filter(|rule| rule.should_emit(status, latency_ms, upstream_error))
             {
                 if crate::capture::node_budgets().admit(rule, now).emitted() {
-                    would_emit = true;
+                    capture_records.push(crate::capture::CaptureEmission {
+                        record: crate::capture::CaptureRecord::build(
+                            &rule.rule, state, entry, req, response,
+                        ),
+                        output: rule.rule.output.clone(),
+                    });
                 }
             }
-            state.would_emit = would_emit;
             tracing::debug!(
                 request_id = %ctx.request_id,
                 capture_rules = state.rule_ids.len(),
@@ -2539,8 +2581,25 @@ impl ProxyHttp for LoricaProxy {
                 response_body_bytes = state.response.len(),
                 response_body_truncated = state.response.truncated(),
                 held_bytes = state.held_bytes(),
-                would_emit,
+                records = capture_records.len(),
                 "traffic capture buffered this exchange"
+            );
+        }
+
+        // Traffic capture, the outputs (Story 10.2 AC #3 and #4). The
+        // log line and the lane offers happen here, synchronously and
+        // without blocking; the directory write is queued to its own
+        // thread. Every failure on that path is a counted drop, so
+        // nothing below waits on a sink.
+        if !capture_records.is_empty() {
+            crate::capture::emit_captures(
+                capture_records,
+                ctx.outgoing_traceparent
+                    .as_ref()
+                    .map(|t| t.trace_id.as_str()),
+                ctx.outgoing_traceparent
+                    .as_ref()
+                    .map(|t| t.parent_id.as_str()),
             );
         }
 
@@ -2587,30 +2646,9 @@ impl ProxyHttp for LoricaProxy {
         }
 
         // Push to the in-memory log buffer for dashboard viewing (if
-        // enabled) and offer to the log-export sinks. The sink export
-        // is deliberately NOT gated on `ctx.access_log_enabled` (QA
-        // finding: a compliance-relevant SIEM export must not be
-        // switched off by the unrelated local-log toggle); the entry
-        // is only built when at least one consumer wants it.
-        let sinks_want_access =
-            lorica_api::log_sinks::wants(lorica_api::log_sinks::SinkKind::Access);
-        if ctx.access_log_enabled || sinks_want_access {
-            let entry = LogEntry {
-                id: 0, // assigned by LogBuffer
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                method: method.to_string(),
-                path: path.to_string(),
-                host: host.to_string(),
-                status,
-                latency_ms,
-                backend: backend_addr.to_string(),
-                error: error_str,
-                client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
-                is_xff: ctx.is_xff,
-                xff_proxy_ip: ctx.xff_proxy_ip.as_deref().unwrap_or("").to_string(),
-                source: ctx.source.clone(),
-                request_id: ctx.request_id.clone(),
-            };
+        // enabled) and offer to the log-export sinks. A row built only
+        // for a capture goes to neither.
+        if let Some(entry) = access_entry {
             if sinks_want_access {
                 // Story 9.8: trace context is captured here - the sink
                 // consumer thread has no ambient span to read it from.

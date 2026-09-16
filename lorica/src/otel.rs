@@ -237,6 +237,11 @@ pub struct OtelLogsConfig {
     pub service_name: String,
     /// Optional `Authorization` header value.
     pub auth_header: Option<String>,
+    /// Which event kinds the lane ships, from the
+    /// `otlp_logs_{access,waf,audit,capture}_enabled` settings
+    /// (backlog #50). Applied at `register_lane` time, so a change
+    /// takes effect on the reload that re-installs the sinks.
+    pub kinds: lorica_api::log_sinks::SinkKindToggles,
 }
 
 /// Hook installed by `init_logging` when the `otel` feature is built
@@ -488,7 +493,14 @@ mod imp {
         // Everything that can fail has succeeded: only now does a lane
         // exist to publish into. Registering earlier is what left a
         // queue with no reader behind it (backlog #51).
-        let mut rx = lorica_api::log_sinks::register_lane("otlp", true, true, true);
+        let kinds = cfg.kinds;
+        let mut rx = lorica_api::log_sinks::register_lane(
+            "otlp",
+            kinds.access,
+            kinds.waf,
+            kinds.audit,
+            kinds.capture,
+        );
         let spawned = std::thread::Builder::new()
             .name("lorica-otlp-logs-sink".into())
             .spawn(move || {
@@ -554,6 +566,7 @@ mod imp {
             SinkPayload::Access(entry) => (Severity::Info, "INFO", entry.timestamp.as_str()),
             SinkPayload::Waf(waf) => (Severity::Warn, "WARN", waf.timestamp.as_str()),
             SinkPayload::Audit(audit) => (Severity::Info, "INFO", audit.timestamp.as_str()),
+            SinkPayload::Capture(capture) => (Severity::Info, "INFO", capture.timestamp.as_str()),
         };
         let mut record = logger.create_log_record();
         record.set_severity_number(severity);

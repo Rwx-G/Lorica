@@ -223,12 +223,39 @@ pub struct PendingDisable {
 /// The `budget` value on every [`PendingDisable`] this module queues.
 const BUDGET_MAX_CAPTURES: &str = "max_captures";
 
+/// One rule's admissions since the counters were last flushed to the
+/// store, as the deltas `ConfigStore::bump_capture_counters` takes.
+///
+/// Accumulated here, under the admission lock, rather than written per
+/// capture: the store is a SQLite file every worker shares, and one
+/// `UPDATE` per admitted exchange would put a disk write on the path
+/// that decides whether to record. The flush task drains the map on
+/// its tick, so a rule costs one write per tick however many exchanges
+/// it admitted or refused in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCounters {
+    /// The rule the deltas belong to.
+    pub rule_id: String,
+    /// Exchanges admitted since the last flush.
+    pub emitted: i64,
+    /// Exchanges refused since the last flush, by rate or by total.
+    pub dropped: i64,
+}
+
 #[derive(Debug, Default)]
 struct BudgetState {
     per_rule: HashMap<String, RuleBudget>,
     /// Rules waiting for the store write that disarms them. Bounded by
     /// the map above, since `disable_signalled` queues each rule once.
     pending_disable: Vec<PendingDisable>,
+    /// Deltas waiting for the store write that publishes them, keyed
+    /// by rule id. Only a tracked rule gets an entry, so the map is
+    /// bounded by [`CAPTURE_MAX_TRACKED_RULES`] plus the rules retired
+    /// since the last flush; `retain_rules` deliberately leaves those
+    /// in place, because the exchanges a rule admitted before it was
+    /// disabled or evicted are still its exchanges and the flush is
+    /// what publishes them.
+    pending_counters: HashMap<String, PendingCounters>,
     /// Whether the tracking cap has already been reported. One line per
     /// process, not one per refused request.
     cap_reported: bool,
@@ -347,6 +374,20 @@ impl CaptureBudgets {
                 limit: limits.max_captures,
             });
         }
+        let counters = state
+            .pending_counters
+            .entry(rule_id.to_string())
+            .or_insert_with(|| PendingCounters {
+                rule_id: rule_id.to_string(),
+                emitted: 0,
+                dropped: 0,
+            });
+        match admission {
+            CaptureAdmission::Emit => counters.emitted += 1,
+            CaptureAdmission::DroppedRate | CaptureAdmission::DroppedBudget => {
+                counters.dropped += 1
+            }
+        }
         drop(guard);
 
         lorica_api::metrics::inc_capture_outcome(rule_id, admission.metric_outcome());
@@ -374,6 +415,15 @@ impl CaptureBudgets {
     /// empty. Called by the task that performs the store write.
     pub fn take_pending_disables(&self) -> Vec<PendingDisable> {
         std::mem::take(&mut self.state.lock().pending_disable)
+    }
+
+    /// Take every rule's unflushed counter deltas, leaving none behind.
+    /// Called by the task that performs the store writes; the order is
+    /// unspecified because each entry is an independent `UPDATE`.
+    pub fn take_pending_counters(&self) -> Vec<PendingCounters> {
+        std::mem::take(&mut self.state.lock().pending_counters)
+            .into_values()
+            .collect()
     }
 
     /// How many rules this process currently tracks a budget for.
@@ -523,6 +573,63 @@ mod tests {
             budgets.admit_rule("cap-1", "route-1", &limits, now),
             CaptureAdmission::DroppedBudget
         );
+    }
+
+    #[test]
+    fn every_admission_lands_in_the_pending_counters_and_taking_them_empties_the_map() {
+        let budgets = CaptureBudgets::new();
+        let limits = limits(2, 10_000);
+        let now = Instant::now();
+        for _ in 0..5 {
+            budgets.admit_rule("cap-1", "route-1", &limits, now);
+        }
+        budgets.admit_rule("cap-2", "route-1", &limits, now);
+
+        let mut pending = budgets.take_pending_counters();
+        pending.sort_by(|a, b| a.rule_id.cmp(&b.rule_id));
+        assert_eq!(
+            pending,
+            vec![
+                PendingCounters {
+                    rule_id: "cap-1".to_string(),
+                    emitted: 2,
+                    dropped: 3,
+                },
+                PendingCounters {
+                    rule_id: "cap-2".to_string(),
+                    emitted: 1,
+                    dropped: 0,
+                },
+            ]
+        );
+        assert!(budgets.take_pending_counters().is_empty());
+    }
+
+    #[test]
+    fn a_retired_rule_keeps_its_unflushed_counters_until_they_are_taken() {
+        let budgets = CaptureBudgets::new();
+        let limits = limits(10, 10_000);
+        let now = Instant::now();
+        budgets.admit_rule("cap-1", "route-1", &limits, now);
+        budgets.retain_rules(std::iter::empty());
+        assert_eq!(budgets.tracked_rules(), 0);
+        let pending = budgets.take_pending_counters();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].emitted, 1);
+    }
+
+    #[test]
+    fn a_rule_past_the_tracking_cap_records_no_counters() {
+        let budgets = CaptureBudgets::new();
+        let limits = limits(10_000, 10_000);
+        let now = Instant::now();
+        for i in 0..CAPTURE_MAX_TRACKED_RULES {
+            budgets.admit_rule(&format!("cap-{i}"), "route-1", &limits, now);
+        }
+        budgets.admit_rule("over", "route-1", &limits, now);
+        let pending = budgets.take_pending_counters();
+        assert_eq!(pending.len(), CAPTURE_MAX_TRACKED_RULES);
+        assert!(pending.iter().all(|p| p.rule_id != "over"));
     }
 
     #[test]

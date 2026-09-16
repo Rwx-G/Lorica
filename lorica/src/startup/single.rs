@@ -38,6 +38,21 @@ use crate::startup::{
 // Single-process mode (original behavior, no workers)
 // ---------------------------------------------------------------------------
 
+/// The GitLab ID-token verifier the automation listener shares with
+/// the management API's `AppState` (Story 10.5). Built once per
+/// process, outside the API task, so a broken TLS backend is a
+/// startup failure with a message and not a panic inside a spawned
+/// task.
+pub(crate) fn build_oidc_verifier() -> Arc<lorica_api::automation::OidcVerifier> {
+    match lorica_api::automation::OidcVerifier::with_http_fetcher() {
+        Ok(verifier) => Arc::new(verifier),
+        Err(e) => {
+            tracing::error!(error = %e, "OIDC JWKS client could not be built");
+            std::process::exit(1);
+        }
+    }
+}
+
 pub(crate) fn run_single_process(cli: Cli) {
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async move {
@@ -424,6 +439,18 @@ pub(crate) fn run_single_process(cli: Cli) {
             _ => None,
         };
 
+        // Story 10.4 AC #7: collect environments past their expiry.
+        // Gated on the fleet role here and on the stored identity at
+        // every tick; a follower never sweeps, replication does.
+        let _environment_reaper = startup::environment_reaper::spawn_environment_reaper(
+            &cluster_runtime,
+            Arc::clone(&store),
+            log_store.clone(),
+            config_reload_tx.clone(),
+            &single_task_tracker,
+            startup::environment_reaper::ENVIRONMENT_REAPER_INTERVAL,
+        );
+
         let automation_listen = cli.automation_listen.clone();
         let automation_listen_any = cli.automation_listen_any;
         let automation_store = Arc::clone(&store);
@@ -431,6 +458,7 @@ pub(crate) fn run_single_process(cli: Cli) {
         // bind must not land on the port the cluster plane just took.
         let cluster_operational_port: Option<u16> =
             cluster_plane.as_ref().map(|plane| plane.operational_port());
+        let oidc_verifier = build_oidc_verifier();
 
         let api_handle = tokio::spawn(async move {
             let state = AppState {
@@ -467,6 +495,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 log_writer: log_writer.clone(),
                 task_tracker: api_task_tracker,
                 cluster: cluster_runtime,
+                oidc: oidc_verifier,
             };
 
             // The automation API rides the same `AppState` as the

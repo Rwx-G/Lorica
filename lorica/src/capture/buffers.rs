@@ -183,10 +183,12 @@ pub struct CaptureState {
     pub request: CaptureBody,
     /// The response body, as far as the rules wanted it.
     pub response: CaptureBody,
-    /// Whether the finished exchange satisfied at least one candidate
-    /// rule's `emit` block. Filled at `logging`; Story 10.2 turns it
-    /// into a record.
-    pub would_emit: bool,
+    /// Bytes the request body carried, kept or not. Counted on every
+    /// chunk regardless of the direction's state, so a record can say
+    /// how large a body was even when it kept a prefix or nothing.
+    pub request_received: u64,
+    /// Bytes the response body carried, kept or not. Same reason.
+    pub response_received: u64,
     /// Bytes this request holds against the node-wide budget. Private
     /// because its release must stay tied to dropping the state.
     reservation: CaptureReservation,
@@ -222,18 +224,21 @@ impl CaptureState {
             rule_ids: candidates.iter().map(|c| c.rule.id.clone()).collect(),
             request: CaptureBody::new(request_cap),
             response: CaptureBody::new(response_cap),
-            would_emit: false,
+            request_received: 0,
+            response_received: 0,
             reservation: budget.reservation(),
         })
     }
 
     /// Keep what the rules allow of one request-body chunk.
     pub fn push_request(&mut self, chunk: &[u8]) {
+        self.request_received += chunk.len() as u64;
         self.request.push(chunk, &mut self.reservation);
     }
 
     /// Keep what the rules allow of one response-body chunk.
     pub fn push_response(&mut self, chunk: &[u8]) {
+        self.response_received += chunk.len() as u64;
         self.response.push(chunk, &mut self.reservation);
     }
 

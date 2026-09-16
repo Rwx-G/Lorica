@@ -218,6 +218,67 @@ fn fire_supervisor_reload() {
     }
 }
 
+/// Story 10.4 AC #4: re-resolve every `certificate_mode = auto`
+/// environment while the snapshot is being built, and land the result
+/// on the route row.
+///
+/// Only the process that owns the reload trigger does this: the
+/// supervisor, or the single-process node. A worker builds the same
+/// snapshot from the same store, but it is not the writer of record
+/// and eight workers rewriting one row at once is the kind of thing
+/// that works until it does not. The follower gate lives inside
+/// `reresolve_auto_certificates` itself, on the stored identity, the
+/// same check the reaper uses.
+///
+/// How the row reaches the fleet: the reload signal is a counter on a
+/// `watch` channel, and the control plane's replication watch encodes
+/// the canonical blob from the store each time it moves. The rows are
+/// rewritten HERE, before this build returns, and then the counter is
+/// bumped once more, so the round that wakes on that bump reads the
+/// new `certificate_id` from the store. Ordering between this build
+/// and the round already in flight does not matter: whichever encodes
+/// first, the bump guarantees one round after the write. The next
+/// build finds nothing to rewrite and does not bump, so this settles
+/// in one extra round rather than looping.
+///
+/// A store failure is logged and the snapshot goes on with the ids the
+/// rows already hold: yesterday's certificate is a better outcome than
+/// no configuration at all.
+fn reresolve_environment_certificates(
+    store: &ConfigStore,
+    routes: &mut [lorica_config::models::Route],
+    certificates: &[lorica_config::models::Certificate],
+) {
+    let Some(trigger) = SUPERVISOR_RELOAD_TRIGGER.get() else {
+        return;
+    };
+    match lorica_api::automation::reresolve_auto_certificates(
+        store,
+        routes,
+        certificates,
+        chrono::Utc::now(),
+    ) {
+        Ok(rewritten) if rewritten.is_empty() => {}
+        Ok(rewritten) => {
+            for change in &rewritten {
+                info!(
+                    environment = %change.environment,
+                    hostname = %change.hostname,
+                    route_id = %change.route_id,
+                    previous = ?change.previous,
+                    current = %change.current,
+                    "environment certificate re-resolved at snapshot build"
+                );
+            }
+            trigger.send_modify(|seq| *seq = seq.wrapping_add(1));
+        }
+        Err(e) => warn!(
+            error = %e,
+            "environment certificates could not be re-resolved; this snapshot keeps the stored ids"
+        ),
+    }
+}
+
 /// Hot-reload the ASN resolver from `GlobalSettings.asn_db_path`.
 /// Same pattern as `apply_geoip_settings_from_store` — parallels
 /// are intentional so both DBs follow one operator-visible model.
@@ -740,6 +801,9 @@ pub async fn apply_log_sinks_from_store(store: &Arc<Mutex<ConfigStore>>) {
             protocol: crate::otel::OtlpProtocol::from_settings(&next.otlp_protocol),
             service_name: next.otlp_service_name.clone(),
             auth_header: next.otlp_auth_header.clone(),
+            // Part of `next.sinks`, so a flipped toggle is a snapshot
+            // change and lands here on the same reload (backlog #50).
+            kinds: next.sinks.otlp_kinds,
         };
         match crate::otel::init_logs(&cfg) {
             Ok(()) => info!(
@@ -812,10 +876,14 @@ async fn build_proxy_config_inner(
 ) -> Result<PreparedReload, Box<dyn std::error::Error + Send + Sync>> {
     let store = store.lock().await;
 
-    let routes = store.list_routes()?;
+    let mut routes = store.list_routes()?;
     log_legacy_rate_limit_migration_notice(&routes);
     let backends = store.list_backends()?;
     let certificates = store.list_certificates()?;
+    // Story 10.4 AC #4. Between the reads above and the snapshot below,
+    // under the same lock, so the certificate an `auto` environment is
+    // rebound to is one of the `certificates` this snapshot carries.
+    reresolve_environment_certificates(&store, &mut routes, &certificates);
     let route_backends = store.list_route_backends()?;
     let settings = store.get_global_settings().ok();
     let custom_presets = settings
@@ -1200,5 +1268,334 @@ mod bot_secret_hex_tests {
         let mut bad = "0".repeat(63);
         bad.push('z');
         assert!(parse_bot_secret_hex(&bad).is_none());
+    }
+}
+
+#[cfg(test)]
+mod environment_certificate_tests {
+    //! Story 10.4 AC #4, through the real snapshot build.
+
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use chrono::{DateTime, Utc};
+    use lorica_config::models::{
+        AutomationEnvironment, Certificate, CertificateMode, EnvironmentOwner, LoadBalancing,
+        OwnerKind, Route, WafMode,
+    };
+    use lorica_config::ConfigStore;
+    use tokio::sync::Mutex;
+
+    use super::{
+        build_proxy_config, register_supervisor_reload_trigger, SUPERVISOR_RELOAD_TRIGGER,
+    };
+    use crate::proxy_wiring::{ProxyConfig, ProxyConfigGlobals};
+
+    /// The reload trigger is a process-wide singleton and both tests
+    /// below read its counter, so they take turns.
+    static TRIGGER_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    const HOSTNAME: &str = "pr-42.review.example.com";
+
+    fn at(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .expect("test setup: valid timestamp")
+            .with_timezone(&Utc)
+    }
+
+    fn certificate(id: &str, domain: &str, not_after: &str) -> Certificate {
+        Certificate {
+            id: id.to_string(),
+            domain: domain.to_string(),
+            san_domains: Vec::new(),
+            fingerprint: format!("fp-{id}"),
+            cert_pem: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_string(),
+            key_pem: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----".to_string(),
+            issuer: "test".to_string(),
+            not_before: at("2026-01-01T00:00:00Z"),
+            not_after: at(not_after),
+            is_acme: false,
+            acme_auto_renew: false,
+            created_at: at("2026-01-01T00:00:00Z"),
+            acme_method: None,
+            acme_dns_provider_id: None,
+        }
+    }
+
+    fn route(id: &str, certificate_id: &str) -> Route {
+        let now = at("2026-01-01T00:00:00Z");
+        Route {
+            id: id.to_string(),
+            hostname: HOSTNAME.to_string(),
+            path_prefix: "/".to_string(),
+            certificate_id: Some(certificate_id.to_string()),
+            load_balancing: LoadBalancing::RoundRobin,
+            waf_enabled: false,
+            waf_mode: WafMode::Detection,
+            enabled: true,
+            force_https: false,
+            redirect_hostname: None,
+            redirect_to: None,
+            hostname_aliases: Vec::new(),
+            proxy_headers: std::collections::HashMap::new(),
+            response_headers: std::collections::HashMap::new(),
+            security_headers: "moderate".to_string(),
+            connect_timeout_s: 5,
+            read_timeout_s: 60,
+            send_timeout_s: 60,
+            strip_path_prefix: None,
+            add_path_prefix: None,
+            path_rewrite_pattern: None,
+            path_rewrite_replacement: None,
+            access_log_enabled: true,
+            proxy_headers_remove: Vec::new(),
+            response_headers_remove: Vec::new(),
+            max_request_body_bytes: None,
+            websocket_enabled: true,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            ip_allowlist: Vec::new(),
+            ip_denylist: Vec::new(),
+            cors_allowed_origins: Vec::new(),
+            cors_allowed_methods: Vec::new(),
+            cors_max_age_s: None,
+            compression_enabled: false,
+            retry_attempts: None,
+            cache_enabled: false,
+            cache_ttl_s: 300,
+            cache_max_bytes: 52_428_800,
+            max_connections: None,
+            slowloris_threshold_ms: 5_000,
+            auto_ban_threshold: None,
+            auto_ban_duration_s: 3_600,
+            path_rules: Vec::new(),
+            return_status: None,
+            sticky_session: false,
+            basic_auth_username: None,
+            basic_auth_password_hash: None,
+            stale_while_revalidate_s: 10,
+            stale_if_error_s: 60,
+            retry_on_methods: Vec::new(),
+            maintenance_mode: false,
+            error_page_html: None,
+            cache_vary_headers: Vec::new(),
+            header_rules: Vec::new(),
+            traffic_splits: Vec::new(),
+            forward_auth: None,
+            mirror: None,
+            response_rewrite: None,
+            mtls: None,
+            rate_limit: None,
+            geoip: None,
+            bot_protection: None,
+            group_name: "automation:pr-42".to_string(),
+            node_selector: Vec::new(),
+            ai_bot_policy: None,
+            ai_bot_spoofed_fallback: None,
+            serve_robots_txt: false,
+            managed_by: Some(lorica_config::models::ManagedBy::Automation {
+                environment: "pr-42".to_string(),
+            }),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn environment(route_id: &str) -> AutomationEnvironment {
+        let now = at("2026-01-01T00:00:00Z");
+        AutomationEnvironment {
+            name: "pr-42".to_string(),
+            route_id: route_id.to_string(),
+            owner: EnvironmentOwner {
+                kind: OwnerKind::StaticToken,
+                principal: "acme-ci".to_string(),
+            },
+            certificate_mode: CertificateMode::Auto,
+            labels: std::collections::BTreeMap::new(),
+            expires_at: now + chrono::Duration::hours(1),
+            created_at: now,
+            updated_at: now,
+            last_pipeline: None,
+            pipeline: None,
+        }
+    }
+
+    /// A store holding one `auto` environment bound to certificate
+    /// `wild-a`.
+    fn seeded_store() -> Arc<Mutex<ConfigStore>> {
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        store
+            .create_certificate(&certificate(
+                "wild-a",
+                "*.review.example.com",
+                "2027-01-01T00:00:00Z",
+            ))
+            .expect("test setup: certificate");
+        store
+            .create_route(&route("route-1", "wild-a"))
+            .expect("test setup: route");
+        store
+            .upsert_automation_environment(&environment("route-1"))
+            .expect("test setup: environment");
+        Arc::new(Mutex::new(store))
+    }
+
+    fn empty_proxy_config() -> Arc<ArcSwap<ProxyConfig>> {
+        Arc::new(ArcSwap::from_pointee(ProxyConfig::from_store(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ProxyConfigGlobals::default(),
+        )))
+    }
+
+    /// The trigger's current counter. Registering is a no-op once set,
+    /// so every test reads the same channel.
+    fn trigger_value() -> u64 {
+        let (tx, _rx) = tokio::sync::watch::channel(0u64);
+        register_supervisor_reload_trigger(tx);
+        *SUPERVISOR_RELOAD_TRIGGER
+            .get()
+            .expect("the trigger was just registered")
+            .borrow()
+    }
+
+    fn stored_certificate_id(store: &ConfigStore, route_id: &str) -> Option<String> {
+        store
+            .get_route(route_id)
+            .expect("route read")
+            .expect("the route exists")
+            .certificate_id
+    }
+
+    #[tokio::test]
+    async fn an_auto_environment_is_rebound_when_a_newer_certificate_appears_at_snapshot_build() {
+        let _serial = TRIGGER_TEST_GUARD.lock().await;
+        let store = seeded_store();
+        let proxy_config = empty_proxy_config();
+
+        // Replacing the wildcard with a NEW id, not renewing in place.
+        store
+            .lock()
+            .await
+            .create_certificate(&certificate(
+                "wild-b",
+                "*.review.example.com",
+                "2028-01-01T00:00:00Z",
+            ))
+            .expect("test setup: second certificate");
+
+        let before = trigger_value();
+        let prepared = build_proxy_config(&store, &proxy_config, None)
+            .await
+            .expect("the snapshot builds");
+
+        // The snapshot carries the new certificate...
+        let entry = &prepared.config.routes_by_host[HOSTNAME][0];
+        assert_eq!(
+            entry.certificate.as_ref().map(|c| c.id.as_str()),
+            Some("wild-b")
+        );
+        // ...and so does the row a follower would receive.
+        assert_eq!(
+            stored_certificate_id(&*store.lock().await, "route-1").as_deref(),
+            Some("wild-b")
+        );
+        assert_eq!(
+            trigger_value(),
+            before + 1,
+            "a rewrite owes the fleet one more round"
+        );
+
+        // The next build has nothing to change and does not bump again.
+        build_proxy_config(&store, &proxy_config, None)
+            .await
+            .expect("the second snapshot builds");
+        assert_eq!(trigger_value(), before + 1);
+    }
+
+    /// Collects the `environment` field of every WARN event.
+    #[derive(Default)]
+    struct WarnedEnvironments(std::sync::Mutex<Vec<String>>);
+
+    struct EnvironmentFieldVisitor(Option<String>);
+
+    impl tracing::field::Visit for EnvironmentFieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "environment" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "environment" {
+                self.0 = Some(value.to_string());
+            }
+        }
+    }
+
+    struct WarnTapLayer(Arc<WarnedEnvironments>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnTapLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = EnvironmentFieldVisitor(None);
+            event.record(&mut visitor);
+            if let Some(environment) = visitor.0 {
+                self.0 .0.lock().expect("tap lock").push(environment);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_covering_certificate_keeps_the_last_id_and_warns() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let _serial = TRIGGER_TEST_GUARD.lock().await;
+        let store = seeded_store();
+        let proxy_config = empty_proxy_config();
+
+        // The only certificate no longer covers the hostname; the row
+        // still exists, so the route's binding is intact.
+        store
+            .lock()
+            .await
+            .update_certificate(&certificate(
+                "wild-a",
+                "*.prod.example.com",
+                "2027-01-01T00:00:00Z",
+            ))
+            .expect("test setup: certificate moved off the hostname");
+
+        let warned = Arc::new(WarnedEnvironments::default());
+        let subscriber =
+            tracing_subscriber::Registry::default().with(WarnTapLayer(Arc::clone(&warned)));
+        let _tracing = tracing::subscriber::set_default(subscriber);
+
+        let before = trigger_value();
+        build_proxy_config(&store, &proxy_config, None)
+            .await
+            .expect("the snapshot builds");
+
+        assert_eq!(
+            stored_certificate_id(&*store.lock().await, "route-1").as_deref(),
+            Some("wild-a"),
+            "the last certificate that served stays on the row"
+        );
+        assert_eq!(trigger_value(), before, "nothing was rewritten");
+        let warned = warned.0.lock().expect("tap lock");
+        assert!(
+            warned
+                .iter()
+                .any(|environment| environment.contains("pr-42")),
+            "a WARN must name the environment; warned: {warned:?}"
+        );
     }
 }

@@ -164,7 +164,7 @@ pub(crate) async fn prepare_automation_listener(
     // operator must be able to spot in the journal.
     warn!(
         addr = %addr,
-        allowed_cidrs = config.allowed_cidrs.len(),
+        allowed_cidrs = config.allowed_cidrs.allow.len(),
         "automation API enabled: listener bound (bearer tokens only, source-filtered)"
     );
 

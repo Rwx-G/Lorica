@@ -73,6 +73,7 @@ fn make_route(id: &str, hostname: &str, path: &str, enabled: bool) -> Route {
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        managed_by: None,
         created_at: now,
         updated_at: now,
     }
@@ -94,6 +95,7 @@ fn make_backend(id: &str, addr: &str) -> Backend {
         active_connections: 0,
         tls_upstream: false,
         tls_skip_verify: false,
+        managed_by: None,
         tls_sni: None,
         h2_upstream: false,
         created_at: now,

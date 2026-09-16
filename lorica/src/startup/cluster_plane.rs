@@ -1236,6 +1236,19 @@ pub(crate) async fn replicate_after_reload(
         if hash == accepted_hash {
             return Ok::<_, ApiError>(None);
         }
+        // A follower refuses a blob whose address lists do not parse
+        // (backlog #88), which aborts the round for the whole fleet.
+        // The API, the importer and the replica apply all validate, so
+        // reaching this means a store written before they did; say so
+        // HERE, where the setting and the node are known, instead of
+        // leaving the operator with N identical refusals and no cause.
+        if let Err(reason) = cfg.global.validate_cidr_lists() {
+            warn!(
+                %reason,
+                "a replicated setting carries a malformed CIDR; every follower will refuse this \
+                 configuration until it is corrected through the settings API"
+            );
+        }
         let nodes = node_rows(store)?;
         let generation = store
             .increment_cluster_config_generation()

@@ -277,6 +277,87 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: ClusterAction,
     },
+    /// Automation-plane management commands (Story 10.3).
+    Automation {
+        #[command(subcommand)]
+        action: AutomationAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum AutomationAction {
+    /// Automation token management.
+    Token {
+        #[command(subcommand)]
+        action: AutomationTokenAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum AutomationTokenAction {
+    /// Mint a scoped automation token through the local management
+    /// API (SuperAdmin). The token is printed once on standard
+    /// output, alone, so the command can be piped straight into a
+    /// file or a secret store.
+    ///
+    /// There is deliberately NO `--token` flag on this command, and
+    /// none should be added. The secret is only ever an OUTPUT here:
+    /// nothing about minting requires the operator to supply one, so
+    /// there is nothing to keep off argv on the way in. The command
+    /// that CONSUMES a token is the automation's own client, and that
+    /// one reads it from a file, standard input or the environment.
+    Create {
+        /// Operator-facing label for the token.
+        #[arg(long)]
+        name: String,
+
+        /// A scope the token carries. Repeat the flag for each one;
+        /// at least one is required. Accepted values:
+        /// `environments:write`, `environments:read`, `routes:read`,
+        /// `certificates:read`.
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<String>,
+
+        /// A hostname pattern the token may claim. Repeat the flag
+        /// for each one; at least one is required. An exact name or a
+        /// single leading `*.` wildcard.
+        #[arg(long = "hostname", required = true)]
+        hostnames: Vec<String>,
+
+        /// A CIDR (or bare address) the token may point a hostname
+        /// at. Repeat the flag for each one. Omit for the node's
+        /// default backend policy.
+        #[arg(long = "backend-cidr")]
+        backend_cidrs: Vec<String>,
+
+        /// Ceiling, in seconds, on the lifetime any environment this
+        /// token creates may request. Defaults to seven days.
+        #[arg(long)]
+        max_ttl_seconds: Option<u32>,
+
+        /// The token's own lifetime in days. Defaults to 365.
+        #[arg(long)]
+        lifetime_days: Option<i64>,
+
+        /// SuperAdmin username on the local management API.
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// Read the SuperAdmin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the SuperAdmin password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// SuperAdmin password on the command line (discouraged: it
+        /// mints a credential, and argv is readable through /proc and
+        /// lands in shell history; `LORICA_ADMIN_PASSWORD` is also
+        /// read).
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]

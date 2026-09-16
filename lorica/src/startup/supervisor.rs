@@ -60,6 +60,23 @@ fn decode_ban_report_entry(
     )
 }
 
+/// Lift a worker's traffic-capture gauges out of its
+/// [`lorica_command::MetricsReport`].
+///
+/// Both metrics-report ingestion sites need the same two fields, and
+/// the supervisor's own gauges are always zero (the capture feature
+/// runs in the workers), so this is where the fleet figure comes from.
+/// The aggregation each one gets is decided in
+/// [`lorica_api::workers::AggregatedMetrics`], not here.
+fn capture_gauges_from(
+    report: &lorica_command::MetricsReport,
+) -> lorica_api::workers::CaptureGauges {
+    lorica_api::workers::CaptureGauges {
+        rules_active: report.capture_rules_active,
+        inflight_bytes: report.capture_inflight_bytes,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Supervisor mode (Unix only): forks workers, runs API server, monitors workers
 // ---------------------------------------------------------------------------
@@ -1050,6 +1067,18 @@ pub(crate) fn run_supervisor(cli: Cli) {
             _ => None,
         };
 
+        // Story 10.4 AC #7: collect environments past their expiry.
+        // Gated on the fleet role here and on the stored identity at
+        // every tick; a follower never sweeps, replication does.
+        let _environment_reaper = startup::environment_reaper::spawn_environment_reaper(
+            &cluster_runtime,
+            Arc::clone(&store),
+            log_store.clone(),
+            config_reload_tx.clone(),
+            &task_tracker,
+            startup::environment_reaper::ENVIRONMENT_REAPER_INTERVAL,
+        );
+
         // The automation listener's inherited sockets, partitioned out
         // of the pulled FD table beside the cluster ones above. Every
         // entry is handed to `prepare_automation_listener`, which
@@ -1076,6 +1105,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // just took.
         let cluster_operational_port: Option<u16> =
             cluster_plane.as_ref().map(|plane| plane.operational_port());
+        let oidc_verifier = super::single::build_oidc_verifier();
 
         let api_handle = tokio::spawn(async move {
             let state = AppState {
@@ -1111,6 +1141,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 log_writer: None,
                 task_tracker: api_task_tracker,
                 cluster: cluster_runtime,
+                oidc: oidc_verifier,
             };
             // The automation API rides the same `AppState` as the
             // management API and starts before it, so a refused
@@ -1909,6 +1940,7 @@ fn spawn_worker_channel_task(
                                         backend_conns,
                                         req_counts,
                                         waf_counts,
+                                        capture_gauges_from(&report),
                                     )
                                     .await;
                                 // Cross-worker generic-counter
@@ -2819,6 +2851,7 @@ async fn pull_all_metrics_via_rpc(
                             backend_conns,
                             req_counts,
                             waf_counts,
+                            capture_gauges_from(&report),
                         )
                         .await;
                     // Cross-worker counter aggregation (v1.4.0

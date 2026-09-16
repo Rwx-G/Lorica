@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Traffic capture (Story 10.1).
+//! Traffic capture (Stories 10.1 and 10.2).
 //!
-//! Five pieces: the compiled predicates a request is measured against
+//! Eight pieces: the compiled predicates a request is measured against
 //! ([`rules`]), the per-request buffers a matched request fills
 //! ([`buffers`]), the node-wide ceiling those buffers reserve from
 //! ([`budget`]), the per-rule total and rate an emission is counted
-//! against ([`budgets`]), and the task that disarms a rule which spent
-//! its total ([`self_disable`]).
+//! against ([`budgets`]), the task that publishes the counters and
+//! disarms a rule which spent its total ([`self_disable`]), the record
+//! an admitted exchange becomes ([`record`]), the redaction applied to
+//! it before it leaves the proxy ([`redact`]), and the outputs it
+//! leaves through ([`sink`]).
 //!
 //! `lorica-config` owns the stored shape of a capture rule; this module
 //! owns the matcher built from it. The split follows where the `regex`
@@ -30,15 +33,31 @@
 mod budget;
 mod budgets;
 mod buffers;
+mod record;
+mod redact;
 mod rules;
 mod self_disable;
+mod sink;
 
 pub use budget::{node_budget, CaptureBudget, CaptureReservation, CAPTURE_MAX_INFLIGHT_BYTES};
 pub use budgets::{
-    node_budgets, CaptureAdmission, CaptureBudgets, PendingDisable, CAPTURE_MAX_TRACKED_RULES,
+    node_budgets, CaptureAdmission, CaptureBudgets, PendingCounters, PendingDisable,
+    CAPTURE_MAX_TRACKED_RULES,
 };
 pub use buffers::{CaptureBody, CaptureSkip, CaptureState};
+pub use record::{
+    is_textual_content_type, BodyEncoding, BodySkip, CaptureRecord, CapturedRequest,
+    CapturedResponse, CAPTURE_RECORD_KIND,
+};
+pub use redact::{is_redacted_header, mask_query, redacted_marker, ALWAYS_REDACTED_HEADERS};
 pub use rules::{CompiledCaptureRule, CompiledCaptureRules, CAPTURE_REGEX_SIZE_LIMIT};
 pub use self_disable::{
-    spawn_capture_disable_task, CAPTURE_AUTO_DISABLED_ACTION, CAPTURE_DISABLE_INTERVAL,
+    disable_expired, spawn_capture_disable_task, CAPTURE_AUTO_DISABLED_ACTION,
+    CAPTURE_DISABLE_INTERVAL, CAPTURE_EXPIRED_BUDGET,
+};
+pub use sink::{
+    capture_file_name, emit_captures, is_capture_file_name, prune_capture_dir, write_capture_file,
+    CaptureDirWriter, CaptureEmission, CAPTURE_DIR_QUEUE_CAP, CAPTURE_DIR_QUEUE_MAX_BYTES,
+    CAPTURE_DROPPED_SINK_OUTCOME, CAPTURE_FILE_MODE, CAPTURE_PRUNE_MAX_REMOVALS,
+    CAPTURE_TRACING_TARGET,
 };

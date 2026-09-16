@@ -24,6 +24,7 @@
 pub(crate) mod automation;
 pub(crate) mod cluster_follower;
 pub(crate) mod cluster_plane;
+pub(crate) mod environment_reaper;
 pub(crate) mod hot_upgrade;
 pub(crate) mod single;
 pub(crate) mod supervisor;

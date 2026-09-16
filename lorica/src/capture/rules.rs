@@ -155,7 +155,7 @@ impl CompiledCaptureRule {
             .match_
             .source_cidrs
             .iter()
-            .map(|entry| parse_net(entry))
+            .map(|entry| lorica_config::connection_filter::parse_cidr(entry))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
@@ -359,19 +359,6 @@ fn compile_pattern(pattern: &str) -> Result<Regex, String> {
         .size_limit(CAPTURE_REGEX_SIZE_LIMIT)
         .build()
         .map_err(|e| format!("invalid regex: {e}"))
-}
-
-/// Parse one `source_cidrs` entry, promoting a bare address to its
-/// single-host network the way `connection_filter::parse_cidrs` does.
-fn parse_net(entry: &str) -> Result<IpNet, String> {
-    let trimmed = entry.trim();
-    if let Ok(net) = trimmed.parse::<IpNet>() {
-        return Ok(net);
-    }
-    trimmed
-        .parse::<IpAddr>()
-        .map(IpNet::from)
-        .map_err(|_| format!("`{entry}` is not a valid IP or CIDR"))
 }
 
 #[cfg(test)]
