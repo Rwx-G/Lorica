@@ -13,6 +13,18 @@ Author: Rwx-G
 
 ### Changed
 
+### Fixed
+
+### Removed
+
+### Security
+
+## [1.7.2] - 2026-09-16
+
+Patch release: the WAF stops rejecting large uploads it was never going to inspect, a dependency pass over the whole lockfile, and a second upstream Pingora sync. **Three behaviours change under a patch number, so read this before rolling it out:** a request carrying two answers to "which host is this for" is now answered `400` instead of being resolved, an upstream connection whose response body did not finish cleanly is no longer reused, and a non-idempotent request (POST, PATCH) is no longer replayed upstream after a mid-proxy error. No configuration changes, no schema migration.
+
+### Changed
+
 - **The WAF decides whether it can read a request body before it buffers it (Story 10.6 AC #1 to #4).** `WafEngine::evaluate_body` has always returned `Pass` on any body that does not decode as UTF-8, but the decision to buffer and the decision to reject were taken earlier, on byte count alone. A 500 MB `PUT` with `Content-Type: application/octet-stream` on a WAF-Blocking route was therefore buffered up to the 1 MiB scan window and answered `413 Payload Too Large`, for a scan that would have passed on the first byte. The only remedies were to turn the WAF off on the route or to move the upload endpoint to a route with the WAF off, which is a worse security posture than the one the rejection was protecting. The new `lorica_waf::body_is_inspectable` takes that decision on the declared `Content-Type`, once per request, where the request header is already in hand: `application/json`, `application/x-www-form-urlencoded`, `application/xml`, `text/xml`, every `text/` subtype and the RFC 6839 `+json` / `+xml` structured suffixes are inspected; everything else, an absent or malformed header included, is not. A body outside the set is never buffered, never counted against the scan window, and never handed to the engine, so `max_request_body_bytes` is the only ceiling that applies to it. **Set that cap on routes that accept large uploads: with the WAF no longer bounding them, it is the only thing left that does.** Inspectable bodies are unchanged in both modes, the v1.5.1 audit H-2 padding bypass included: a megabyte of inert text ahead of a payload is still text, so the window still applies and a Blocking route still answers `413`. Nine end-to-end tests over a real proxy cover the Content-Length and chunked paths for both verdicts, plus the audit H-2 regression case verbatim.
 - `multipart/form-data` is deliberately outside the inspected set. Lorica has no multipart parser, so scanning it means running SQL and XSS signatures over base64 and binary part payloads: high false-positive, low value. A parser with a separate limit for the non-file parts (the ModSecurity `SecRequestBodyNoFilesLimit` model) is tracked as backlog #86.
 
@@ -20,8 +32,6 @@ Author: Rwx-G
 
 - **A completed hot binary upgrade no longer leaks a socket (upstream `b2b35fda`, the half the fork lacked).** The connection `get_fds_from` accepts to receive the listening sockets was kept as a bare descriptor and never closed, so every upgrade left one connected unix socket open for the life of the process. The `MSG_CMSG_CLOEXEC` half of that upstream commit was already in.
 - **Graceful shutdown stops waiting twice for the same timeout (upstream `6f15714d`).** Each runtime thread called `shutdown_timeout`, which already returns as soon as the runtime is done, and then slept for the full timeout again. Every stop and every upgrade burned the whole grace period even when the runtimes had exited immediately.
-
-### Removed
 
 ### Security
 

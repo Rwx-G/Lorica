@@ -2943,7 +2943,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lorica"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "ammonia",
  "arc-swap",
@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-acme"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-api"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3087,7 +3087,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-bench"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "chrono",
  "lorica-config",
@@ -3140,7 +3140,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-challenge"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -3160,7 +3160,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-cluster"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -3178,7 +3178,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-command"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "nix 0.29.0",
  "prost 0.13.5",
@@ -3189,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-config"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -3265,7 +3265,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-dashboard"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "axum",
  "getrandom 0.4.3",
@@ -3283,7 +3283,7 @@ version = "0.1.0"
 
 [[package]]
 name = "lorica-geoip"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -3394,7 +3394,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-metrics"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "once_cell",
  "parking_lot",
@@ -3403,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-notify"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "chrono",
  "lettre",
@@ -3477,7 +3477,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-shmem"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "nix 0.31.3",
  "rand 0.9.5",
@@ -3516,7 +3516,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-waf"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "aho-corasick",
  "chrono",
@@ -3530,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-worker"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "nix 0.29.0",
  "socket2 0.5.10",
