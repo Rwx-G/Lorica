@@ -11,8 +11,8 @@
 # Stage 1: Build frontend
 FROM node:22-slim AS frontend
 WORKDIR /app/lorica-dashboard/frontend
-COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/pnpm-lock.yaml* lorica-dashboard/frontend/package-lock.json* ./
-RUN npm i -g pnpm && (pnpm install --frozen-lockfile 2>/dev/null || npm ci)
+COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/pnpm-lock.yaml* lorica-dashboard/frontend/pnpm-workspace.yaml* lorica-dashboard/frontend/package-lock.json* ./
+RUN npm i -g pnpm@10 && (pnpm install --frozen-lockfile 2>/dev/null || npm ci)
 COPY lorica-dashboard/frontend/ ./
 RUN npm run build
 
