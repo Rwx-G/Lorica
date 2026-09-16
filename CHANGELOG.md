@@ -15,11 +15,15 @@ Author: Rwx-G
 
 ### Changed
 
+- **A follower's configuration is cut for it, and the fleet no longer has one hash.** `node_selector` used to be evaluated by the recipient: every follower received every route and deleted locally what it was not selected for. The control plane now resolves the selector itself, against the `node_id` the recipient's certificate proves, and sends each node only what it serves. The generation stays fleet-wide, which is what keeps "this node is behind" meaningful, but the hash is per node: two nodes correctly converged on the same generation legitimately hold different bytes. So every answer addressed to a node, the handshake ack, the heartbeat ack and the up-to-date pull ack, now carries that node's expected version, and drift is judged against it. The expectation is derived from the accepted payload source rather than stored in a new column: canonical encoding is deterministic, so a control-plane restart rebuilds it identically and raises no drift alerts, and there is no second copy to fall out of step. The wire format did not move, and the frozen wire corpus proves it, so a mixed-version fleet upgrades in the documented order with no extra step: a 1.7.x follower applies the smaller payload and its own filter finds nothing left to remove.
+
 ### Fixed
 
 ### Removed
 
 ### Security
+
+- **A compromised edge no longer discloses the fleet's routing topology (backlog #56).** Because the payload was fleet-wide, any enrolled node held, in memory and on the wire, every other node's routes: upstream addresses, IP allow and deny lists, mTLS configuration and Basic-auth password hashes. `docs/cluster.md` stated it plainly ("it scopes serving, not disclosure") and it was an accepted trade while the payload carried no secret material. It stops being one now that a CI pipeline creates routes through the same path at pipeline rate. Those bytes are no longer sent. A selector entry that resolves to no single node, an unknown name or a collision in a database restored from before the name index, targets nobody rather than whoever answers to the name; the management API refuses such an entry at write time on a control plane and the replicator logs it if it meets one anyway.
 
 ## [1.7.4] - 2026-09-16
 

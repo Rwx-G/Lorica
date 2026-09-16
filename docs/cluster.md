@@ -423,27 +423,57 @@ the "bounded in size" clause, and it is why the rule has it.
 ### Targeting a subset
 
 A route carries a `node_selector`: a list of node names, empty meaning
-fleet-wide. A follower whose name is absent does not serve that route
-and deletes it locally.
+fleet-wide. A follower whose name is absent does not serve that route.
 
-**It scopes serving, not disclosure.** The blob is fleet-wide: every
-follower receives every route and filters on arrival. So a node that
-serves nothing still holds, in memory and on the wire, the definition of
-every other node's routes, including upstream addresses, IP allow and
-deny lists, mTLS configuration and Basic-auth password hashes. Compromise
-of the least-trusted edge therefore discloses the fleet's routing
-topology. Treat `node_selector` as a deployment filter and the blob as
-readable by any enrolled node.
+**It scopes disclosure, not just serving.** The control plane cuts one
+payload per recipient: the selector is resolved server-side, against the
+`node_id` the recipient's certificate proves, using the roster read under
+the same store lock as the configuration itself. A route selected for one
+node is absent from every other node's payload on the wire, not filtered
+on arrival. So a compromised edge does not hand over the fleet's routing
+topology: other nodes' upstream addresses, IP allow and deny lists, mTLS
+configuration and Basic-auth password hashes were never sent to it.
 
-That is acceptable while the payload carries no secret material, which
-is the case here: private keys and channel credentials travel as digests
-only. It stops being acceptable the moment real keys are distributed,
-because a predicate the recipient evaluates on a payload it already holds
-is not need-to-know. Certificate distribution therefore has to filter on
-the CONTROL PLANE, per recipient, and match on the node id rather than
-the display name (a name is chosen by the joining node and is not
-unique). Each node then converges on its own payload, which is a real
-change to the single fleet-wide hash this chapter describes.
+A selector entry is a name, and a name has to designate exactly one node
+for that to mean anything. `cluster_nodes.name` is UNIQUE and bound to
+the join token at mint time, so an entry normally resolves to one id. An
+entry that resolves to no single node, because the name is unknown or
+because a database predating that index still carries a collision,
+targets NOBODY: the safe direction, since the alternative is handing a
+route to whoever happens to answer to the name. The management API
+refuses such an entry at write time on a control plane, and the
+replicator logs it at WARN when it encounters one anyway.
+
+What is cut per recipient: routes, route-to-backend links, backends, and
+certificates. What every payload still carries in full: global settings,
+WAF custom rules and disabled rule ids, certificate export ACL patterns,
+AI crawler entries, probe definitions, SLA targets, notification channels
+and DNS providers. Fleet policy stays fleet-wide on purpose. A node that
+cannot see the policy it is judged against cannot tell whether it is
+behind, and none of it names another node.
+
+**The hash is per node; the generation is not.** Two nodes correctly
+converged on the same generation legitimately hold different bytes, so
+there is no longer one hash the whole fleet reports. The generation stays
+fleet-wide because it is a counter over configuration changes rather than
+a digest, and that is what keeps "this node is behind" a meaningful
+sentence. Every answer addressed to a node, the handshake ack, the
+heartbeat ack and the up-to-date pull ack, advertises THAT node's
+expected version: the fleet generation with the hash of its own payload.
+Drift is judged the same way. `GET /api/v1/cluster/drift` still reports
+the control plane's own generation and hash in its header, which is where
+the fleet is, and judges each node against what that node was offered.
+
+The expectation is derived, not stored. The control plane keeps the
+accepted generation's source and recomputes a recipient's cut on demand;
+canonical encoding is deterministic, so a restart rebuilds the same
+source from the store and every node's expected hash comes out identical.
+There is no second copy to fall out of step with the first, and a
+control-plane restart raises no drift alerts.
+
+What a follower still learns: the routes it serves, the fleet-wide policy
+above, the current generation, and that other generations exist. That is
+the floor for a node that has to know when it is behind.
 
 ### Follower read-only, and break-glass
 
@@ -1074,6 +1104,16 @@ follower at once, and from outside that is indistinguishable from a
 control-plane outage. Already-configured traffic keeps flowing on the
 refused followers; they simply stop receiving changes until they are
 upgraded.
+
+Per-recipient payloads do not change that order, because they change no
+message. A 1.7.x follower under a 1.8.0 control plane receives its own
+cut, applies it, and reports the hash of what it applied, which is
+exactly what the control plane expects from it; its local
+`node_selector` filter then finds nothing left to remove. A 1.8.0
+follower under a 1.7.x control plane receives the fleet-wide blob and
+filters it on arrival, as every build did before. The recipient-side
+filter is kept for both reasons: it is what makes the old control plane
+work, and it is the assertion that the new one cut correctly.
 
 **Wire encoding** is pinned by a frozen corpus: one instance of every
 message the v1.7.0 build puts on the wire, checked into
