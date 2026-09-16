@@ -58,6 +58,15 @@ argon2 = "0.6"
 # `generate`, so the optional `rand_core` feature stays off and no
 # extra RNG dep is pulled.
 ed25519-dalek = "3"
+# GitLab OIDC ID tokens on the automation listener (Story 10.5).
+# Approved by the maintainer on 2026-09-16. Pinned to the current
+# stable major. `aws_lc_rs` is the backend rather than `rust_crypto`
+# because the latter pulls the `rsa` crate, which carries the open
+# RUSTSEC-2023-0071 (Marvin) advisory with no patched release, and
+# `cargo audit` is a CI gate. `aws-lc-rs` is already in the lockfile
+# through the `route53` feature path. No `use_pem`: the verifier
+# builds its keys from JWK components, never from PEM.
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
 rand = "0.9"
 rand_chacha = "0.9"
 rcgen = "0.14"
@@ -113,6 +122,13 @@ default = []
 route53 = ["lorica-acme/route53"]
 
 [dev-dependencies]
+# Test-only RSA key generation for the OIDC verifier tests (Story
+# 10.5): the mock issuer needs a signing key and neither `ring` nor
+# `jsonwebtoken` can generate one. Not a new crate in the tree: it is
+# the backend `jsonwebtoken` already builds above, named here so the
+# tests can reach it directly instead of checking a private key into
+# the repository.
+aws-lc-rs = "1"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 hyper = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }

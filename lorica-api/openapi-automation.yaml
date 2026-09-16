@@ -1,0 +1,712 @@
+openapi: 3.0.3
+info:
+  title: Lorica Automation API
+  description: >-
+    The automation plane: a second HTTPS listener whose only credential
+    is a scoped bearer token.
+
+
+    This is NOT the management API. The two planes share no credential
+    and no socket. A request arriving here with a valid `lorica_session`
+    cookie and no `Authorization` header is a 401, and the cookie is
+    never read. The management API is described in `openapi.yaml`.
+
+
+    Reaching this listener at all requires two things beyond a token.
+    The listener refuses to open while `automation_allowed_cidrs` is
+    empty, and a source outside that allowlist is dropped at TCP accept,
+    before the TLS handshake, so it never sees a 401 or a 403 at all.
+
+
+    Authorization is by scope, never by role. Every path below declares
+    the scope it requires. A path that declares no scope is reachable by
+    no token, including a token carrying every scope in the enum:
+    refusing outright is what keeps a path added without a declaration
+    from silently inheriting the widest grant.
+  version: "1.7.4"
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://{host}:{port}
+    description: >-
+      The automation listener (`--automation-listen`). It has its own
+      socket and its own bind address; unlike the management listener it
+      is not loopback by construction, because an automation usually
+      runs on another host.
+    variables:
+      host:
+        default: lorica.internal.example.org
+        description: The host the automation listener was told to bind.
+      port:
+        default: "9444"
+        description: The port the automation listener was told to bind.
+
+tags:
+  - name: Identity
+    description: >-
+      What the presented token is. Reaches nothing else, so it is the
+      call an automation makes to check that its credential is still
+      live and still carries the scopes it expects.
+  - name: Environments
+    description: >-
+      The environment resource (Story 10.4): a route, its backends, a
+      certificate binding and a lifetime, created or replaced by ONE
+      idempotent `PUT`, readable, and removed by `DELETE` or by the
+      reaper once `expires_at` has passed.
+
+
+      Ownership is an authorization rule, not a convenience. A token
+      reaches an environment created by a token with the same name
+      prefix (the part before the first `-`), or one labelled
+      `shared: "true"` exactly. Anything else is a 403 with an audit
+      row, on read, update and delete alike.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /automation/v1/whoami:
+    get:
+      tags: [Identity]
+      summary: Report the token behind this request
+      description: >-
+        Returns the presented token's label, its lookup half and its
+        scopes. The secret half is never returned, and the node could
+        not return it anyway: the store keeps only its HMAC.
+
+
+        Required scope: `environments:read`, the narrowest scope any
+        token that talks to this plane at all will carry.
+      operationId: automationWhoAmI
+      x-required-scope: environments:read
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The token behind this request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/WhoAmI"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/environments:
+    get:
+      tags: [Environments]
+      summary: List the environments this token may access
+      description: >-
+        Every environment the caller may read under the ownership rule,
+        newest name first. Environments owned by another prefix and not
+        labelled shared are absent, not refused: a listing is not the
+        place to reveal that a name exists.
+
+
+        Required scope: `environments:read`.
+      operationId: automationListEnvironments
+      x-required-scope: environments:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: label
+          in: query
+          required: false
+          description: "`key:value`; only environments carrying exactly that label."
+          schema:
+            type: string
+            example: "team:acme"
+        - name: hostname
+          in: query
+          required: false
+          description: Only the environment answering on this hostname.
+          schema:
+            type: string
+            example: pr-42.review.example.com
+        - name: expiring_before
+          in: query
+          required: false
+          description: RFC 3339; only environments expiring strictly before it.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: The accessible environments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      environments:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/EnvironmentView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /automation/v1/environments/{name}:
+    get:
+      tags: [Environments]
+      summary: Read one environment
+      description: >-
+        The environment and the route facts behind it. The response
+        carries an `ETag` derived from `updated_at`; send it back as
+        `If-Match` on a `PUT` to get a 412 instead of silently winning
+        a race.
+
+
+        Required scope: `environments:read`.
+      operationId: automationGetEnvironment
+      x-required-scope: environments:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EnvironmentName"
+      responses:
+        "200":
+          description: The environment
+          headers:
+            ETag:
+              description: The current version, from `updated_at`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/EnvironmentView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Environments]
+      summary: Create or replace an environment
+      description: >-
+        One transaction writes the route, the backends, the joins and
+        the environment row, or none of them. 201 on create, 200 on
+        update; an update keeps the same `route_id`, replaces the
+        backend set and recomputes `expires_at` from now.
+
+
+        The refusals, each naming the field: the name must be an RFC
+        1123 label (422); the hostname must be an exact DNS name that
+        is neither a wildcard, an address literal nor `localhost`
+        (422), must be inside the token's `allowed_hostnames` (403),
+        and must not be held by another route (409, naming the
+        hostname and nothing about the route holding it); every backend
+        address must be an `ip:port` (422) inside
+        `allowed_backend_cidrs` (403); `ttl_seconds` must be at or
+        under the token's `max_ttl_seconds` (422); an explicit
+        `certificate` id needs `certificates:read` (403) and must
+        exist (422); `certificate: "auto"` with no covering certificate
+        is a 422 whose message starts with
+        `no_certificate_covers_hostname` and names the wildcard an
+        operator could provision through the DNS-01 endpoint. Any
+        unknown field is 422.
+
+
+        Two pipelines racing on one name serialise on the store; the
+        later `PUT` wins in full. `If-Match` with the `ETag` from `GET`
+        turns a lost race into a 412.
+
+
+        Required scope: `environments:write`.
+      operationId: automationPutEnvironment
+      x-required-scope: environments:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EnvironmentName"
+        - name: If-Match
+          in: header
+          required: false
+          description: The `ETag` a previous `GET` returned; 412 when it no longer matches.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnvironmentRequest"
+      responses:
+        "200":
+          description: Updated in place
+          headers:
+            ETag:
+              description: The new version, from `updated_at`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/EnvironmentWriteResponse"
+        "201":
+          description: Created
+          headers:
+            ETag:
+              description: The new version, from `updated_at`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/EnvironmentWriteResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+    delete:
+      tags: [Environments]
+      summary: Remove an environment
+      description: >-
+        Removes the route, the backends it owned and the joins in one
+        transaction. 204 whether or not the environment exists: a
+        cleanup job wants "gone" to be success, and telling "never
+        existed" from "already deleted" would mean consulting the audit
+        trail, which an API answer must not depend on. A typo in the
+        name is a diagnostic the audit row of this call gives the
+        operator.
+
+
+        Required scope: `environments:write`.
+      operationId: automationDeleteEnvironment
+      x-required-scope: environments:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EnvironmentName"
+      responses:
+        "204":
+          description: Gone, whether or not it was there.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+components:
+  parameters:
+    EnvironmentName:
+      name: name
+      in: path
+      required: true
+      description: >-
+        The environment name: an RFC 1123 label, 1 to 63 characters of
+        lowercase ASCII letters, digits and hyphens, neither starting
+        nor ending with a hyphen. It becomes the `group_name`
+        (`automation:<name>`) of the route and the backends.
+      schema:
+        type: string
+        example: pr-42
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        `Authorization: Bearer <credential>`, where the credential is
+        either a static token, `<public_id>.<secret>` (Story 10.3), or
+        a GitLab ID token, the JWT a job receives through `id_tokens:`
+        (Story 10.5). The listener picks the mode by the shape of the
+        value and nothing else; every refusal on either path answers the
+        same 401 body, so a caller cannot learn which mode was tried.
+        The precise reason is in the audit row, which an operator can
+        read.
+
+
+        An ID token is accepted when a SuperAdmin has registered an
+        issuer entry on the management API
+        (`POST /api/v1/automation/oidc-issuers`) whose `audience` the job
+        named in `id_tokens.<NAME>.aud` and whose `bound_claims` all hold.
+        It is verified RS256-only against the issuer's published keys,
+        with `iss`, `aud`, `exp`, `nbf` and `iat` checked, and its `jti`
+        is remembered until `exp` so it cannot be presented twice.
+
+
+        A static token is created on the MANAGEMENT api, with
+        `POST /api/v1/automation/tokens`, never through this listener.
+        The secret half is shown once, at creation, and is not
+        recoverable afterwards: the store keeps only its HMAC, so a lost
+        token is re-minted, not read back.
+
+
+        Store it in a GitLab CI/CD variable marked both masked and
+        protected, and read it from the environment in the job. Never
+        pass it in argv: a command line is visible to every process on
+        the host, is echoed into job logs by any shell tracing, and ends
+        up in the runner's shell history. `curl -H "Authorization:
+        Bearer $LORICA_AUTOMATION_TOKEN"` is argv too; prefer
+        `curl -H @<file>` or a client that reads the variable itself.
+
+
+        Revocation is immediate and needs no invalidation step: nothing
+        about a token is cached, so a revoked or expired token fails on
+        its very next request.
+
+  schemas:
+    WhoAmI:
+      type: object
+      description: The verified credential behind the request, as the node holds it.
+      required: [name, public_id, kind, scopes]
+      properties:
+        name:
+          type: string
+          description: >-
+            The token's operator-facing label, or the ID token's
+            `project_path`.
+          example: gitlab-staging-deploy
+        public_id:
+          type: string
+          description: >-
+            The id an operator withdraws: the token's lookup half, or the
+            issuer entry's id for an ID token. The only identifier that
+            appears in server-side logs.
+          example: 4f9a1c7e2b6d8051
+        kind:
+          type: string
+          enum: [static_token, oidc_project]
+          description: Which credential authenticated the request.
+        scopes:
+          type: array
+          description: Everything this credential may do.
+          items:
+            $ref: "#/components/schemas/AutomationScope"
+        pipeline:
+          $ref: "#/components/schemas/PipelineIdentity"
+
+    PipelineIdentity:
+      type: object
+      description: >-
+        The CI job behind a GitLab ID token, as the issuer signed it
+        (Story 10.5). Absent on a static token.
+      required: [project_path]
+      properties:
+        project_path:
+          type: string
+          example: acme/web
+        ref:
+          type: string
+          nullable: true
+        pipeline_id:
+          type: string
+          nullable: true
+        job_id:
+          type: string
+          nullable: true
+        user_login:
+          type: string
+          nullable: true
+          example: ["environments:read", "routes:read"]
+
+    AutomationScope:
+      type: string
+      description: One grant on the automation plane.
+      enum:
+        - environments:write
+        - environments:read
+        - routes:read
+        - certificates:read
+
+    EnvironmentRequest:
+      type: object
+      description: >-
+        What a pipeline declares. Unknown fields are refused (422), so
+        a field from a later version is noticed on the first call.
+      required: [hostname, backends, certificate, ttl_seconds]
+      additionalProperties: false
+      properties:
+        hostname:
+          type: string
+          description: The exact hostname; no wildcard, no address literal, not `localhost`.
+          example: pr-42.review.example.com
+        backends:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/EnvironmentBackendRequest"
+        certificate:
+          type: string
+          description: >-
+            `auto` binds the certificate covering the hostname (exact
+            name over wildcard, then latest `not_after`), re-resolved at
+            every snapshot build. Anything else is an explicit
+            certificate id and needs `certificates:read`.
+          example: auto
+        waf_enabled:
+          type: boolean
+          default: false
+        force_https:
+          type: boolean
+          default: false
+        path_prefix:
+          type: string
+          default: "/"
+        ttl_seconds:
+          type: integer
+          minimum: 1
+          description: The lifetime, at or under the token's `max_ttl_seconds`; recomputed from now on every `PUT`.
+          example: 7200
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+          description: At most 16 entries of at most 128 bytes each side. `shared: "true"` opens the environment to every principal.
+          example: { team: acme, shared: "true" }
+
+    EnvironmentBackendRequest:
+      type: object
+      required: [address]
+      additionalProperties: false
+      properties:
+        address:
+          type: string
+          description: "`ip:port`. A name is refused: it cannot be checked against `allowed_backend_cidrs`."
+          example: "10.0.12.34:8080"
+        tls_upstream:
+          type: boolean
+          default: false
+        tls_sni:
+          type: string
+          nullable: true
+        weight:
+          type: integer
+          minimum: 1
+          default: 1
+
+    EnvironmentWriteResponse:
+      type: object
+      required: [name, url, route_id, backend_ids, certificate_id, certificate_not_after, expires_at, applied_generation]
+      properties:
+        name:
+          type: string
+        url:
+          type: string
+          description: "`https://<hostname><path_prefix>`."
+          example: https://pr-42.review.example.com/
+        route_id:
+          type: string
+          description: The route the environment owns; stable across updates.
+        backend_ids:
+          type: array
+          items:
+            type: string
+        certificate_id:
+          type: string
+        certificate_not_after:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        applied_generation:
+          type: integer
+          format: int64
+          description: >-
+            The fleet configuration generation the control plane had
+            published when the response was built; 0 on a standalone
+            node. The write starts a replication round that publishes
+            the next generation, so a strict pipeline polls
+            `GET /api/v1/cluster/status` until `applied_config_generation`
+            exceeds this value. Never the hash: two converged nodes
+            legitimately report different hashes.
+
+    EnvironmentView:
+      type: object
+      required: [name, hostname, path_prefix, url, route_id, backend_ids, certificate_mode, labels, owner, expires_at, created_at, updated_at]
+      properties:
+        name:
+          type: string
+        hostname:
+          type: string
+        path_prefix:
+          type: string
+        url:
+          type: string
+        route_id:
+          type: string
+        backend_ids:
+          type: array
+          items:
+            type: string
+        certificate_id:
+          type: string
+          nullable: true
+          description: The certificate currently bound to the route.
+        certificate_mode:
+          type: object
+          description: "`{mode: auto}` or `{mode: explicit, certificate_id: ...}`."
+          properties:
+            mode:
+              type: string
+              enum: [auto, explicit]
+            certificate_id:
+              type: string
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        owner:
+          type: object
+          required: [kind, principal]
+          properties:
+            kind:
+              type: string
+              enum: [static_token, oidc_project]
+            principal:
+              type: string
+              description: The token name for a static token.
+        expires_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+          description: The source of the `ETag`.
+        last_pipeline:
+          type: string
+          nullable: true
+        pipeline:
+          $ref: "#/components/schemas/PipelineIdentity"
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+
+  responses:
+    NotFound:
+      description: No environment has this name.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: >-
+        The hostname is held by another route. The message names the
+        hostname and nothing about the route holding it.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: conflict
+              message: "conflict: hostname `pr-42.review.example.com` is already used by another route"
+    PreconditionFailed:
+      description: "`If-Match` named a version the environment is no longer at, or the environment does not exist."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: precondition_failed
+              message: "If-Match does not match the current ETag \"2026-09-16T10:00:00+00:00\""
+    Unprocessable:
+      description: >-
+        The body parsed and a rule refuses it: an unknown field, a
+        malformed value, a cap over its limit, or no certificate
+        covering the hostname (message prefixed
+        `no_certificate_covers_hostname`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: unprocessable_entity
+              message: "unprocessable: no_certificate_covers_hostname: no certificate covers `pr-42.review.example.com`; provision *.review.example.com through POST /api/v1/acme/provision-dns (DNS-01), or name an explicit certificate id"
+    Unauthorized:
+      description: >-
+        The credential was not accepted. Missing, malformed, unknown,
+        wrong secret, revoked and expired all answer alike, with the
+        same body and the same
+        `WWW-Authenticate: Bearer realm="lorica-automation"` challenge:
+        telling a caller that their token is known but revoked would
+        confirm the id for them. An operator distinguishes the cases in
+        the audit log, which they can read and a caller cannot.
+
+
+        Retrying with the same token will not help. Present a different
+        one.
+      headers:
+        WWW-Authenticate:
+          description: The bearer challenge naming the automation realm.
+          schema:
+            type: string
+            example: Bearer realm="lorica-automation"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: unauthorized
+              message: a valid automation bearer token is required
+    Forbidden:
+      description: >-
+        The credential WAS accepted and the token does not carry the
+        scope this path requires. The distinction from a 401 is the
+        whole point of answering two codes: a 401 says re-present a
+        credential, a 403 says the credential is real and the grant is
+        missing, which is the one sentence that leads to the right fix.
+        An automation that retries a 403, or an operator who re-mints a
+        token that was never the problem, has read the wrong code.
+
+
+        The message names the missing scope. That is not a disclosure:
+        the caller holds the token and can read its own scopes from
+        `whoami`; what they cannot do is guess which scope this path
+        wanted.
+
+
+        The same code answers a path that declares no scope at all, for
+        every token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: forbidden
+              message: this token does not carry the environments:read scope

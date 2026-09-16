@@ -29,10 +29,20 @@
 //! bearer gate refuses. But it therefore also loses the request
 //! extensions by the time the response comes back, and the principal
 //! is only known inside the gate. On the way down it installs a
-//! [`PrincipalSlot`]; the gate fills it on a successful
-//! authentication, and this layer reads its own handle afterwards.
-//! The slot is write-once, so a later layer cannot rewrite who the
-//! row names.
+//! [`PrincipalSlot`]; the gate fills it with the principal on a
+//! successful authentication and with the precise reason on a
+//! refusal, and this layer reads its own handle afterwards. The slot
+//! is write-once, so a later layer cannot rewrite who the row names.
+//!
+//! # The reason lives here and nowhere else
+//!
+//! A refused request answers one generic 401 on the wire (Story 10.5
+//! AC #2). The `reason` field of the `automation.request.unauthenticated`
+//! row is the only place the precise cause is written: `wrong_alg`,
+//! `unknown_kid`, `expired`, `bound_claim_mismatch:<claim>`,
+//! `replayed`, `token_revoked` and the rest, so an operator can tell a
+//! pipeline what to fix without the wire telling an attacker what to
+//! try next.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -41,8 +51,8 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use lorica_config::models::AutomationToken;
 
+use super::auth::AutomationPrincipal;
 use crate::audit::AuditContext;
 use crate::server::AppState;
 
@@ -52,7 +62,7 @@ use crate::server::AppState;
 /// principal has no role, it has scopes, so the column names the plane
 /// instead: an operator filtering the audit log on `automation` gets
 /// every machine-driven request and nothing else.
-const AUTOMATION_ROLE: &str = "automation";
+pub(super) const AUTOMATION_ROLE: &str = "automation";
 
 /// `target_type` stamped on every automation row.
 const AUTOMATION_TARGET_TYPE: &str = "automation_request";
@@ -60,23 +70,38 @@ const AUTOMATION_TARGET_TYPE: &str = "automation_request";
 /// What `operator_username` says when the request never authenticated.
 const ANONYMOUS_PRINCIPAL: &str = "-";
 
+/// What the bearer gate decided about a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// Authenticated; carries [`AutomationPrincipal::audit_identity`].
+    Accepted(String),
+    /// Refused; carries the precise reason for the audit row.
+    Refused(String),
+}
+
 /// Write-once handle the bearer gate uses to tell the audit layer who
-/// the caller turned out to be.
+/// the caller turned out to be, or why they were turned away.
 ///
 /// Cloning shares the cell, which is the point: the audit layer keeps
 /// one handle while the other travels down inside the request.
 #[derive(Debug, Clone, Default)]
-pub struct PrincipalSlot(Arc<OnceLock<(String, String)>>);
+pub struct PrincipalSlot(Arc<OnceLock<AuthOutcome>>);
 
 impl PrincipalSlot {
-    /// Record the authenticated token. The first write wins.
-    pub fn fill(&self, token: &AutomationToken) {
-        let _ = self.0.set((token.public_id.clone(), token.name.clone()));
+    /// Record the authenticated principal. The first write wins.
+    pub fn accept(&self, principal: &AutomationPrincipal) {
+        let _ = self
+            .0
+            .set(AuthOutcome::Accepted(principal.audit_identity()));
     }
 
-    /// The `(public_id, name)` of the authenticated token, or `None`
-    /// when the request never got past the bearer gate.
-    pub fn get(&self) -> Option<(String, String)> {
+    /// Record why the request was refused. The first write wins.
+    pub fn refuse(&self, reason: &str) {
+        let _ = self.0.set(AuthOutcome::Refused(reason.to_string()));
+    }
+
+    /// The gate's decision, or `None` when the gate never ran.
+    pub fn get(&self) -> Option<AuthOutcome> {
         self.0.get().cloned()
     }
 }
@@ -120,14 +145,24 @@ pub async fn audit_automation_request(
 
     let response = next.run(req).await;
 
-    // The token's two halves share one column because the audit row
-    // has one principal field and an automation principal has two
+    // Counted from the same word the audit row gets, so the scrape and
+    // the log never disagree on what a request was.
+    let outcome_word: &'static str = outcome(response.status());
+    crate::metrics::inc_automation_request(outcome_word);
+
+    // The principal's two halves share one column because the audit
+    // row has one principal field and an automation principal has two
     // identities: the label an operator reads, and the id they revoke.
     // Splitting them would put one of them in a column that already
-    // means something else.
-    let username: String = match slot.get() {
-        Some((public_id, name)) => format!("{name} ({public_id})"),
-        None => ANONYMOUS_PRINCIPAL.to_string(),
+    // means something else. A refusal names nobody and carries its
+    // reason in the payload instead.
+    let (username, reason): (String, Option<serde_json::Value>) = match slot.get() {
+        Some(AuthOutcome::Accepted(identity)) => (identity, None),
+        Some(AuthOutcome::Refused(reason)) => (
+            ANONYMOUS_PRINCIPAL.to_string(),
+            Some(serde_json::json!({ "reason": reason })),
+        ),
+        None => (ANONYMOUS_PRINCIPAL.to_string(), None),
     };
     let ctx = AuditContext {
         username,
@@ -138,10 +173,10 @@ pub async fn audit_automation_request(
     crate::audit::record(
         &state,
         &ctx,
-        &format!("automation.request.{}", outcome(response.status())),
+        &format!("automation.request.{outcome_word}"),
         (AUTOMATION_TARGET_TYPE, &format!("{method} {path}")),
         None,
-        None,
+        reason.as_ref(),
     )
     .await;
 
@@ -166,5 +201,11 @@ mod tests {
     fn the_principal_slot_is_write_once() {
         let slot = PrincipalSlot::default();
         assert_eq!(slot.get(), None);
+        slot.refuse("wrong_alg");
+        slot.refuse("expired");
+        assert_eq!(
+            slot.get(),
+            Some(AuthOutcome::Refused("wrong_alg".to_string()))
+        );
     }
 }

@@ -213,8 +213,7 @@ fn validate_bot_protection(
                 "bot_protection.bypass.ip_cidrs: empty entry".into(),
             ));
         }
-        if trimmed.parse::<ipnet::IpNet>().is_err() && trimmed.parse::<std::net::IpAddr>().is_err()
-        {
+        if lorica_config::connection_filter::parse_cidr(trimmed).is_err() {
             return Err(ApiError::BadRequest(format!(
                 "bot_protection.bypass.ip_cidrs: '{trimmed}' is not a valid IP or CIDR"
             )));
@@ -388,7 +387,7 @@ fn validate_rate_limit(
 /// since v1.2 without validation; this helper applies the new rule
 /// to both routes and backends going forward. Returns the trimmed
 /// value.
-fn validate_group_name(raw: &str) -> Result<String, ApiError> {
+pub(crate) fn validate_group_name(raw: &str) -> Result<String, ApiError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(String::new());
@@ -2909,10 +2908,54 @@ pub struct RouteResponse {
     /// (Story 8.2 AC #10). Default `false` = passthrough to backend.
     #[serde(default)]
     pub serve_robots_txt: bool,
+    /// Who manages this route when it is not the operator (Story 10.4
+    /// AC #8). Absent on an operator-managed row. A `Some` is badged by
+    /// the dashboard and refused in-place edits by this API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<lorica_config::models::ManagedBy>,
     /// RFC 3339 insert timestamp.
     pub created_at: String,
     /// RFC 3339 last-write timestamp.
     pub updated_at: String,
+}
+
+/// The 422 a client gets for sending `managed_by` on a route or a
+/// backend body.
+///
+/// The mark is server-owned: only the automation API sets it, on the
+/// rows it creates. A client that could set it would either forge an
+/// environment's ownership over a plain row or clear the mark to slip
+/// past the refusal below, so the field is refused rather than ignored.
+pub(crate) fn refuse_client_managed_by(
+    managed_by: Option<&serde_json::Value>,
+) -> Result<(), ApiError> {
+    if managed_by.is_some() {
+        return Err(ApiError::Unprocessable(
+            "managed_by is set by the automation API and cannot be sent through the \
+             management API"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The 409 an in-place edit of an automation-managed row gets.
+///
+/// `verb` names what was refused (`update`, `delete`); `kind` is
+/// `route` or `backend`; `remedy` says what the caller should do
+/// instead. The environment is named so the operator knows which
+/// pipeline owns the row.
+pub(crate) fn managed_row_conflict(
+    verb: &str,
+    kind: &str,
+    managed_by: &lorica_config::models::ManagedBy,
+    remedy: &str,
+) -> ApiError {
+    let lorica_config::models::ManagedBy::Automation { environment } = managed_by;
+    ApiError::Conflict(format!(
+        "cannot {verb} this {kind}: it is managed by the automation API for environment \
+         `{environment}`. {remedy}"
+    ))
 }
 
 /// JSON body for `POST /api/v1/routes`. Most fields are optional and
@@ -3063,6 +3106,11 @@ pub struct CreateRouteRequest {
     /// Auto-serve a Lorica-generated `/robots.txt` for this route
     /// (Story 8.2 AC #10). Default `false` = passthrough to backend.
     pub serve_robots_txt: Option<bool>,
+    /// Refused with 422 when present: the mark is server-owned (see
+    /// [`refuse_client_managed_by`]). Declared so the refusal is a
+    /// deliberate check and not a silently dropped unknown field.
+    #[serde(default)]
+    pub managed_by: Option<serde_json::Value>,
 }
 
 /// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are
@@ -3247,6 +3295,10 @@ pub struct UpdateRouteRequest {
     /// Auto-serve a Lorica-generated `/robots.txt` for this route
     /// (Story 8.2 AC #10). `None` leaves alone.
     pub serve_robots_txt: Option<bool>,
+    /// Refused with 422 when present: the mark is server-owned (see
+    /// [`refuse_client_managed_by`]).
+    #[serde(default)]
+    pub managed_by: Option<serde_json::Value>,
 }
 
 fn route_to_response(
@@ -3402,6 +3454,7 @@ fn route_to_response(
         ai_bot_policy: route.ai_bot_policy,
         ai_bot_spoofed_fallback: route.ai_bot_spoofed_fallback,
         serve_robots_txt: route.serve_robots_txt,
+        managed_by: route.managed_by.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -3465,6 +3518,7 @@ pub async fn create_route(
     Extension(session): Extension<Session>,
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    refuse_client_managed_by(body.managed_by.as_ref())?;
     if body.hostname.is_empty() {
         return Err(ApiError::BadRequest("hostname is required".into()));
     }
@@ -3777,6 +3831,9 @@ pub async fn create_route(
         ai_bot_policy: body.ai_bot_policy,
         ai_bot_spoofed_fallback: body.ai_bot_spoofed_fallback,
         serve_robots_txt: body.serve_robots_txt.unwrap_or(false),
+        // The dashboard and the operator API only ever create
+        // operator-managed rows; the automation API sets the mark.
+        managed_by: None,
         created_at: now,
         updated_at: now,
     };
@@ -3839,6 +3896,7 @@ pub async fn update_route(
     Path(id): Path<String>,
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    refuse_client_managed_by(body.managed_by.as_ref())?;
     // Read before the update closure takes the store lock, and only
     // when the patch actually touches the pinning.
     let node_roster = if body.node_selector.is_some() {
@@ -3851,6 +3909,18 @@ pub async fn update_route(
         let mut route = store
             .get_route(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
+        // Story 10.4 AC #8. Every in-place mutation of a route, the
+        // maintenance toggle included, goes through this handler, so
+        // this one check is the whole guard: the next automation PUT
+        // would overwrite whatever an operator changed here.
+        if let Some(managed_by) = &route.managed_by {
+            return Err(managed_row_conflict(
+                "update",
+                "route",
+                managed_by,
+                "Update the environment through the pipeline instead.",
+            ));
+        }
         let before_route = route.clone();
 
         validate_route_numeric_bounds(
@@ -4283,6 +4353,13 @@ pub async fn update_route(
 }
 
 /// DELETE /api/v1/routes/:id - delete a route and notify the proxy.
+///
+/// A managed route is deletable (Story 10.4 AC #8): the
+/// `automation_environments` row cascades away with it, so the delete
+/// is the same transaction the environment's own `DELETE` runs, and
+/// the pipeline's next `PUT` recreates the environment from scratch.
+/// The audit row names the environment so the operator can see which
+/// review app went with the route.
 pub async fn delete_route(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
@@ -4290,17 +4367,33 @@ pub async fn delete_route(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let route_id = id.clone();
-    db_blocking(&state.store, move |store| store.delete_route(&id)).await?;
+    let route = db_blocking(&state.store, move |store| {
+        let route = store
+            .get_route(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
+        store.delete_route(&id)?;
+        Ok::<_, ApiError>(route)
+    })
+    .await?;
     state.notify_config_changed();
 
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let mut before = serde_json::to_value(route_to_response(&route, Vec::new())).ok();
+    if let (Some(serde_json::Value::Object(payload)), Some(managed_by)) =
+        (before.as_mut(), &route.managed_by)
+    {
+        let lorica_config::models::ManagedBy::Automation { environment } = managed_by;
+        payload.insert(
+            "environment".to_string(),
+            serde_json::Value::String(environment.clone()),
+        );
+    }
     crate::audit::record(
         &state,
         &audit_ctx,
         "route.delete",
-        ("route", &route_id),
-        None,
+        ("route", &route.id),
+        before.as_ref(),
         None,
     )
     .await;

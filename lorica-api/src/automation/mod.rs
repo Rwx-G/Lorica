@@ -40,24 +40,50 @@
 //! - [`scope`] - the per-path scope floor and the gate enforcing it.
 //! - [`audit`] - the outermost layer, which records every request.
 //! - [`router`] - the router and the `whoami` endpoint.
+//! - [`environments`] - the environment resource (Story 10.4): the
+//!   handlers, the one-transaction write, and the reaper's sweep.
+//! - [`oidc`] - the GitLab ID-token verifier (Story 10.5): the pinned
+//!   algorithm, the JWKS cache and the bounded replay set.
 //!
-//! # Not in the OpenAPI document
+//! # Two credentials, one gate
+//!
+//! Since Story 10.5 the bearer value is either a static token
+//! (`<public_id>.<secret>`) or a GitLab ID token (a JWT). [`auth`]
+//! picks the mode by the shape of the value and never by anything the
+//! caller can choose separately, and every refusal on either path
+//! answers the same 401 body, so a caller cannot learn which mode was
+//! tried. The precise reason goes to the audit row alone.
+//!
+//! # Its own OpenAPI document
 //!
 //! `openapi.yaml` describes the management plane: one server, one
 //! security scheme (the session cookie). The automation plane is a
 //! different socket with a different scheme, so its paths are not
 //! management-API operations and documenting them there would say
-//! something false about both. The `openapi_contract` drift gate scans
-//! `src/server.rs` only, so this router is outside its scope by
-//! construction rather than by an allowlist entry.
+//! something false about both. They live in `openapi-automation.yaml`
+//! instead, which declares `bearerAuth` and, per operation, the scope
+//! [`required_scope`] enforces.
+//!
+//! Each document has its own drift gate in `tests/openapi_contract.rs`:
+//! the management one scans `src/server.rs`, the automation one scans
+//! [`router`] and additionally checks that every documented scope is
+//! the scope the gate actually applies.
 
 pub mod audit;
 pub mod auth;
+pub mod environments;
 pub mod listener;
+pub mod oidc;
 pub mod router;
 pub mod scope;
 
 pub use auth::AutomationPrincipal;
+pub use environments::{
+    delete_environment_rows, publish_environment_gauges, reap_expired_environments,
+    reresolve_auto_certificates, DeletedEnvironment, EnvironmentCounts, ReresolvedCertificate,
+    ENVIRONMENT_EXPIRED_ACTION,
+};
 pub use listener::{start_automation_server, AutomationListenerConfig, AutomationListenerError};
+pub use oidc::{OidcVerifier, RefusalReason, OIDC_REPLAY_SET_CAP};
 pub use router::build_automation_router;
 pub use scope::required_scope;

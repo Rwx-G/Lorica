@@ -13,8 +13,9 @@
 //! submitted `ttl_seconds`, and the two capture counters, which are
 //! per-process runtime state rather than configuration.
 
-use axum::extract::{Extension, Path};
+use axum::extract::{Extension, Path, Query};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
@@ -24,10 +25,11 @@ use lorica_config::models::{
     CaptureScope,
 };
 
+use crate::capture_ring::{node_capture_ring, CAPTURE_RING_CAPACITY};
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
-use crate::server::AppState;
+use crate::server::{AppState, Mode};
 
 fn default_enabled() -> bool {
     true
@@ -437,4 +439,84 @@ pub async fn disable_capture_rule(
     .await;
 
     Ok(json_data(rule_to_response(&rule)))
+}
+
+/// Refuse to serve the ring from a process that never fills it.
+///
+/// Under `--workers` every capture is emitted in a worker, into that
+/// worker's ring, and this API runs in the supervisor, whose ring stays
+/// empty for the life of the process. Answering the empty ring would
+/// show an operator nothing on a node that is capturing normally, which
+/// is the one outcome worse than an error. The 503 names the outputs
+/// that do carry the records on such a node.
+fn require_local_ring(state: &AppState) -> Result<(), ApiError> {
+    if matches!(state.mode, Mode::Supervisor { .. }) {
+        return Err(ApiError::ServiceUnavailable(
+            "the recent-captures ring is per worker and this node runs --workers; the \
+             management API runs in the supervisor, whose ring is empty. Read the records \
+             from the capture sink instead: the `lorica::capture` log target, the syslog or \
+             OTLP lane, or the rule's output.dir"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// GET /api/v1/capture/recent - the last records this process emitted,
+/// newest first, bodies cut at `CAPTURE_RING_LIST_BODY_MAX`.
+///
+/// Operator floor, one below arming a rule: the records are what an
+/// operator debugging an incident came for, and the redaction pass has
+/// already run on them.
+pub async fn list_recent_captures(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_local_ring(&state)?;
+    Ok(json_data(serde_json::json!({
+        "captures": node_capture_ring().list(),
+        "capacity": CAPTURE_RING_CAPACITY,
+    })))
+}
+
+/// Query of `GET /api/v1/capture/recent/{request_id}`.
+#[derive(Deserialize)]
+pub struct RecentCaptureQuery {
+    /// Narrow to the record one rule produced, when two rules admitted
+    /// the same exchange. Absent: the newest record for the request.
+    pub rule_id: Option<String>,
+}
+
+/// GET /api/v1/capture/recent/{request_id} - one full record, as a
+/// download.
+///
+/// The body is the record exactly as the sinks received it, and the
+/// file name is the one the directory sink would have written, so a
+/// download and a file on disk are interchangeable. 404 once the ring
+/// has evicted the record.
+pub async fn download_recent_capture(
+    Extension(state): Extension<AppState>,
+    Path(request_id): Path<String>,
+    Query(query): Query<RecentCaptureQuery>,
+) -> Result<Response, ApiError> {
+    require_local_ring(&state)?;
+    let entry = node_capture_ring()
+        .get(&request_id, query.rule_id.as_deref())
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "capture {request_id} is no longer in the recent-captures ring"
+            ))
+        })?;
+    // The file name is `[A-Za-z0-9._-]` by construction (the sink
+    // sanitises the request id before naming), so it needs no quoting
+    // beyond the RFC 6266 quotes.
+    let disposition = format!("attachment; filename=\"{}\"", entry.file_name);
+    Ok((
+        StatusCode::OK,
+        [
+            (http::header::CONTENT_TYPE, "application/json".to_string()),
+            (http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        entry.document.clone(),
+    )
+        .into_response())
 }

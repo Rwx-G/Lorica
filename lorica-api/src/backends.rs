@@ -1,4 +1,11 @@
 //! CRUD endpoints for upstream backends, including graceful drain on delete.
+//!
+//! A backend the automation API owns (Story 10.4 AC #8) is refused
+//! both `PUT` and `DELETE` here: an environment's backend set belongs
+//! to the pipeline, and removing one member by hand is an edit of that
+//! set as much as changing its address is. The route side differs (a
+//! managed route may be deleted, taking the environment with it);
+//! see `routes::crud::delete_route`.
 
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
@@ -9,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
+use crate::routes::crud::{managed_row_conflict, refuse_client_managed_by};
 use crate::server::AppState;
 
 /// JSON view of a backend enriched with live EWMA score and active connection count.
@@ -47,6 +55,11 @@ pub struct BackendResponse {
     pub h2_upstream: bool,
     /// Live EWMA latency score for the Peak-EWMA LB policy (μs).
     pub ewma_score_us: f64,
+    /// Who manages this backend when it is not the operator (Story 10.4
+    /// AC #8). Absent on an operator-managed row. A `Some` is badged by
+    /// the dashboard and refused in-place edits and deletes by this API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<lorica_config::models::ManagedBy>,
     /// RFC 3339 insert timestamp.
     pub created_at: String,
     /// RFC 3339 last-write timestamp.
@@ -78,6 +91,10 @@ pub struct CreateBackendRequest {
     pub tls_sni: Option<String>,
     /// Force HTTP/2 on the upstream leg.
     pub h2_upstream: Option<bool>,
+    /// Refused with 422 when present: the mark is server-owned (see
+    /// [`refuse_client_managed_by`]).
+    #[serde(default)]
+    pub managed_by: Option<serde_json::Value>,
 }
 
 /// JSON body for `PUT /api/v1/backends/:id`. Only the supplied fields are mutated.
@@ -105,6 +122,10 @@ pub struct UpdateBackendRequest {
     pub tls_sni: Option<String>,
     /// Force HTTP/2 on the upstream leg.
     pub h2_upstream: Option<bool>,
+    /// Refused with 422 when present: the mark is server-owned (see
+    /// [`refuse_client_managed_by`]).
+    #[serde(default)]
+    pub managed_by: Option<serde_json::Value>,
 }
 
 fn backend_to_response(
@@ -129,6 +150,7 @@ fn backend_to_response(
         tls_sni: b.tls_sni.clone(),
         h2_upstream: b.h2_upstream,
         ewma_score_us: ewma_score,
+        managed_by: b.managed_by.clone(),
         created_at: b.created_at.to_rfc3339(),
         updated_at: b.updated_at.to_rfc3339(),
     }
@@ -191,6 +213,7 @@ pub async fn create_backend(
     Extension(session): Extension<Session>,
     Json(body): Json<CreateBackendRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    refuse_client_managed_by(body.managed_by.as_ref())?;
     if body.address.is_empty() {
         return Err(ApiError::BadRequest("address is required".into()));
     }
@@ -200,7 +223,14 @@ pub async fn create_backend(
         id: uuid::Uuid::new_v4().to_string(),
         address: body.address,
         name: body.name.unwrap_or_default(),
-        group_name: body.group_name.unwrap_or_default(),
+        // The same rule the route path applies. Its doc has said "both
+        // routes and backends" since v1.2 while this path never called
+        // it, which is how a backend could carry a group name no route
+        // may have, `automation:<name>` included.
+        group_name: match body.group_name.as_deref() {
+            Some(raw) => crate::routes::crud::validate_group_name(raw)?,
+            None => String::new(),
+        },
         weight: body.weight.unwrap_or(100),
         health_status: lorica_config::models::HealthStatus::Unknown,
         health_check_enabled: body.health_check_enabled.unwrap_or(true),
@@ -212,6 +242,9 @@ pub async fn create_backend(
         tls_skip_verify: body.tls_skip_verify.unwrap_or(false),
         tls_sni: body.tls_sni.clone().filter(|s| !s.is_empty()),
         h2_upstream: body.h2_upstream.unwrap_or(false),
+        // The dashboard and the operator API only ever create
+        // operator-managed rows; the automation API sets the mark.
+        managed_by: None,
         created_at: now,
         updated_at: now,
     };
@@ -264,10 +297,19 @@ pub async fn update_backend(
     Path(id): Path<String>,
     Json(body): Json<UpdateBackendRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    refuse_client_managed_by(body.managed_by.as_ref())?;
     let (before_backend, backend) = db_blocking(&state.store, move |store| {
         let mut backend = store
             .get_backend(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        if let Some(managed_by) = &backend.managed_by {
+            return Err(managed_row_conflict(
+                "update",
+                "backend",
+                managed_by,
+                "Update the environment through the pipeline instead.",
+            ));
+        }
         let before_backend = backend.clone();
 
         if let Some(address) = body.address {
@@ -276,8 +318,8 @@ pub async fn update_backend(
         if let Some(name) = body.name {
             backend.name = name;
         }
-        if let Some(group_name) = body.group_name {
-            backend.group_name = group_name;
+        if let Some(group_name) = body.group_name.as_deref() {
+            backend.group_name = crate::routes::crud::validate_group_name(group_name)?;
         }
         if let Some(weight) = body.weight {
             backend.weight = weight;
@@ -354,6 +396,18 @@ pub async fn delete_backend(
         let mut backend = store
             .get_backend(&id_db)?
             .ok_or_else(|| ApiError::NotFound(format!("backend {id_db}")))?;
+        // Removing one backend from an environment's set is an edit of
+        // that set, which only the pipeline owns. Whole-environment
+        // removal goes through the route (its delete cascades) or the
+        // automation API.
+        if let Some(managed_by) = &backend.managed_by {
+            return Err(managed_row_conflict(
+                "delete",
+                "backend",
+                managed_by,
+                "Delete the environment, or update it through the pipeline, instead.",
+            ));
+        }
 
         // If already closing/closed, force delete immediately
         if backend.lifecycle_state != lorica_config::models::LifecycleState::Normal {

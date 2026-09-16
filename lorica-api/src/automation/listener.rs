@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use ipnet::IpNet;
 use lorica_cluster::preauth::{AttemptWindow, PreAuthBudgets, SourceGate};
+use lorica_config::connection_filter::{parse_cidr, ConnectionFilterPolicy};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
@@ -82,9 +83,16 @@ pub struct AutomationListenerConfig {
     /// sit: an automation usually runs on another host, and the CLI
     /// refuses a wildcard host without an explicit flag.
     pub addr: SocketAddr,
-    /// The source networks allowed to reach the socket. Mandatory and
-    /// non-empty; see [`AutomationListenerError::EmptyAllowlist`].
-    pub allowed_cidrs: Vec<IpNet>,
+    /// The source networks allowed to reach the socket, as the shared
+    /// policy type. Mandatory and non-empty; see
+    /// [`AutomationListenerError::EmptyAllowlist`].
+    ///
+    /// Held as a [`ConnectionFilterPolicy`] with an empty deny list.
+    /// The type reads an EMPTY allow list as default-allow, which this
+    /// listener must never do; [`AutomationListenerConfig::new`]
+    /// refuses to build one, so the default-allow branch is
+    /// unreachable here and the policy is default-deny in practice.
+    pub allowed_cidrs: ConnectionFilterPolicy,
     /// Pre-authentication budgets, shared with the cluster listeners.
     pub budgets: PreAuthBudgets,
 }
@@ -107,19 +115,14 @@ impl AutomationListenerConfig {
     ) -> Result<Self, AutomationListenerError> {
         let mut nets: Vec<IpNet> = Vec::with_capacity(allowed_cidrs.len());
         for entry in allowed_cidrs {
-            let trimmed: &str = entry.trim();
-            if trimmed.is_empty() {
+            if entry.trim().is_empty() {
                 continue;
             }
-            if let Ok(net) = trimmed.parse::<IpNet>() {
-                nets.push(net);
-            } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
-                nets.push(IpNet::from(ip));
-            } else {
-                return Err(AutomationListenerError::InvalidCidr {
+            let net: IpNet =
+                parse_cidr(entry).map_err(|_| AutomationListenerError::InvalidCidr {
                     entry: entry.clone(),
-                });
-            }
+                })?;
+            nets.push(net);
         }
         if nets.is_empty() {
             return Err(AutomationListenerError::EmptyAllowlist(
@@ -128,14 +131,14 @@ impl AutomationListenerConfig {
         }
         Ok(Self {
             addr,
-            allowed_cidrs: nets,
+            allowed_cidrs: ConnectionFilterPolicy::from_nets(nets, Vec::new()),
             budgets: PreAuthBudgets::default(),
         })
     }
 
     /// Whether `ip` is inside the allowlist.
     pub fn allows(&self, ip: IpAddr) -> bool {
-        self.allowed_cidrs.iter().any(|net| net.contains(&ip))
+        self.allowed_cidrs.accepts(ip)
     }
 }
 
@@ -217,7 +220,7 @@ pub async fn start_automation_server(
     })?;
     info!(
         addr = %config.addr,
-        allowed_cidrs = config.allowed_cidrs.len(),
+        allowed_cidrs = config.allowed_cidrs.allow.len(),
         "automation API listening (bearer tokens only, source-filtered)"
     );
 
@@ -242,34 +245,43 @@ pub async fn start_automation_server(
         // socket: a caller outside the allowlist gets no handshake, no
         // certificate, and no byte read from them.
         //
-        // This is the first axum listener in the project to filter by
-        // source, and the check is open-coded rather than reused.
-        // `lorica::connection_filter::GlobalConnectionFilter` is the
-        // pingora L4 filter: it implements
-        // `lorica_core::listeners::ConnectionFilter`, which only that
-        // accept path calls, it lives in the `lorica` binary crate
-        // (which depends on THIS crate, so referencing it back would
-        // be a dependency cycle), and it enforces a different policy -
-        // the proxy's hot-reloaded allow/deny lists, default-allow when
-        // empty. This allowlist is default-deny and is not reloadable.
+        // The RULE is shared: `ConnectionFilterPolicy` in
+        // `lorica-config` decides both this allowlist and the proxy's
+        // TCP pre-filter, so one definition of an address entry serves
+        // both. The RUNTIME is not:
+        // `lorica::connection_filter::GlobalConnectionFilter` carries
+        // the `ArcSwap`, the per-IP counters and the pingora
+        // `lorica_core::listeners::ConnectionFilter` implementation,
+        // it lives in the `lorica` binary crate (which depends on THIS
+        // crate, so referencing it back would be a dependency cycle),
+        // and it is hot-reloaded and default-allow when empty. This
+        // allowlist is fixed at start and default-deny.
         if !config.allows(peer.ip()) {
             drop(tcp);
+            crate::metrics::inc_automation_source_refused();
             tracing::debug!(peer = %peer, "automation connection refused: source not allowed");
             continue;
         }
 
         // Then the pre-auth budgets, in the enrollment listener's
         // order, all taken before the handshake and held across it.
+        // Each refusal has its own counter: they answer different
+        // questions (is the node saturated, is one source hammering,
+        // is one source retrying too fast) and one shared counter
+        // would hide which budget is the one biting.
         let Ok(handshake_permit) = Arc::clone(&handshakes).try_acquire_owned() else {
             drop(tcp);
+            crate::metrics::inc_automation_rejected_concurrent_handshakes();
             continue;
         };
         let Some(source_slot) = sources.try_enter(peer.ip()) else {
             drop(tcp);
+            crate::metrics::inc_automation_rejected_per_source();
             continue;
         };
         if !attempts.allow(peer.ip()) {
             drop(tcp);
+            crate::metrics::inc_automation_rejected_attempt_window();
             continue;
         }
 
@@ -294,10 +306,12 @@ pub async fn start_automation_server(
             let tls_stream = match handshake {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(e)) => {
+                    crate::metrics::inc_automation_tls_handshake_failed();
                     tracing::debug!(peer = %peer, error = %e, "automation TLS handshake failed");
                     return;
                 }
                 Err(_) => {
+                    crate::metrics::inc_automation_tls_handshake_failed();
                     tracing::debug!(peer = %peer, "automation TLS handshake timed out");
                     return;
                 }

@@ -54,6 +54,7 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
+        oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -1224,6 +1225,494 @@ async fn test_backends_crud() {
 
     let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ---- Automation-managed rows (Story 10.4 AC #8, server side) ----
+//
+// The dashboard disables Edit on a managed row; the API is the guard.
+// Each refused verb is tried on a managed row and on a plain one in
+// the same test, so a guard that refuses everything cannot pass.
+
+fn automation_mark(environment: &str) -> lorica_config::models::ManagedBy {
+    lorica_config::models::ManagedBy::Automation {
+        environment: environment.to_string(),
+    }
+}
+
+async fn create_plain_route(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    hostname: &str,
+) -> String {
+    let response = send(
+        state,
+        session_store,
+        rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        cookie,
+        Some(serde_json::json!({ "hostname": hostname })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    parse_data(response).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string()
+}
+
+async fn create_plain_backend(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    address: &str,
+) -> String {
+    let response = send(
+        state,
+        session_store,
+        rate_limiter,
+        "POST",
+        "/api/v1/backends",
+        cookie,
+        Some(serde_json::json!({ "address": address })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    parse_data(response).await["id"]
+        .as_str()
+        .expect("backend id")
+        .to_string()
+}
+
+/// A route the automation API owns, as its `PUT` leaves it: the mark
+/// on the row and the `automation_environments` row the route delete
+/// must cascade away.
+async fn seed_managed_route(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    environment: &str,
+) -> String {
+    let route_id = create_plain_route(
+        state,
+        session_store,
+        rate_limiter,
+        cookie,
+        &format!("{environment}.review.example.com"),
+    )
+    .await;
+    let now = chrono::Utc::now();
+    let store = state.store.lock().await;
+    let mut route = store
+        .get_route(&route_id)
+        .expect("route read")
+        .expect("the route exists");
+    route.managed_by = Some(automation_mark(environment));
+    store.update_route(&route).expect("mark written");
+    store
+        .upsert_automation_environment(&lorica_config::models::AutomationEnvironment {
+            name: environment.to_string(),
+            route_id: route_id.clone(),
+            owner: lorica_config::models::EnvironmentOwner {
+                kind: lorica_config::models::OwnerKind::StaticToken,
+                principal: "acme-ci".to_string(),
+            },
+            certificate_mode: lorica_config::models::CertificateMode::Auto,
+            labels: std::collections::BTreeMap::new(),
+            expires_at: now + chrono::Duration::hours(1),
+            created_at: now,
+            updated_at: now,
+            last_pipeline: None,
+            pipeline: None,
+        })
+        .expect("environment row written");
+    route_id
+}
+
+/// A backend the automation API owns.
+async fn seed_managed_backend(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    environment: &str,
+) -> String {
+    let backend_id = create_plain_backend(
+        state,
+        session_store,
+        rate_limiter,
+        cookie,
+        "10.0.12.34:8080",
+    )
+    .await;
+    let store = state.store.lock().await;
+    let mut backend = store
+        .get_backend(&backend_id)
+        .expect("backend read")
+        .expect("the backend exists");
+    backend.managed_by = Some(automation_mark(environment));
+    store.update_backend(&backend).expect("mark written");
+    backend_id
+}
+
+async fn error_envelope(response: axum::response::Response) -> (String, String) {
+    let json = body_json(response).await;
+    (
+        json["error"]["code"]
+            .as_str()
+            .expect("an error code")
+            .to_string(),
+        json["error"]["message"]
+            .as_str()
+            .expect("an error message")
+            .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn test_put_on_a_managed_route_is_409_naming_the_environment() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let managed = seed_managed_route(&state, &session_store, &rate_limiter, &cookie, "pr-42").await;
+    let plain = create_plain_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "shop.example.com",
+    )
+    .await;
+
+    // The maintenance toggle is a PUT like any other field.
+    let patch = serde_json::json!({ "maintenance_mode": true });
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{managed}"),
+        &cookie,
+        Some(patch.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let (code, message) = error_envelope(response).await;
+    assert_eq!(code, "conflict");
+    assert!(
+        message.contains("`pr-42`"),
+        "names the environment: {message}"
+    );
+    assert!(
+        message.contains("pipeline"),
+        "points at the pipeline: {message}"
+    );
+    {
+        let store = state.store.lock().await;
+        let route = store
+            .get_route(&managed)
+            .expect("route read")
+            .expect("the route is still there");
+        assert!(!route.maintenance_mode, "the refused patch wrote nothing");
+    }
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{plain}"),
+        &cookie,
+        Some(patch),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(parse_data(response).await["maintenance_mode"], true);
+
+    // The listing carries the mark the dashboard reads, and only there.
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/routes/{managed}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(
+        parse_data(response).await["managed_by"],
+        serde_json::json!({ "kind": "automation", "environment": "pr-42" })
+    );
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/routes/{plain}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert!(parse_data(response).await.get("managed_by").is_none());
+}
+
+#[tokio::test]
+async fn test_put_on_a_managed_backend_is_409_naming_the_environment() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let managed =
+        seed_managed_backend(&state, &session_store, &rate_limiter, &cookie, "pr-42").await;
+    let plain = create_plain_backend(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "10.0.0.7:8080",
+    )
+    .await;
+
+    let patch = serde_json::json!({ "weight": 7 });
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/backends/{managed}"),
+        &cookie,
+        Some(patch.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let (code, message) = error_envelope(response).await;
+    assert_eq!(code, "conflict");
+    assert!(
+        message.contains("`pr-42`"),
+        "names the environment: {message}"
+    );
+    assert!(
+        message.contains("pipeline"),
+        "points at the pipeline: {message}"
+    );
+    {
+        let store = state.store.lock().await;
+        let backend = store
+            .get_backend(&managed)
+            .expect("backend read")
+            .expect("the backend is still there");
+        assert_eq!(backend.weight, 100, "the refused patch wrote nothing");
+    }
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/backends/{plain}"),
+        &cookie,
+        Some(patch),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(parse_data(response).await["weight"], 7);
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/backends/{managed}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(
+        parse_data(response).await["managed_by"],
+        serde_json::json!({ "kind": "automation", "environment": "pr-42" })
+    );
+}
+
+#[tokio::test]
+async fn test_delete_on_a_managed_backend_is_409_naming_the_environment() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let managed =
+        seed_managed_backend(&state, &session_store, &rate_limiter, &cookie, "pr-42").await;
+    let plain = create_plain_backend(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "10.0.0.7:8080",
+    )
+    .await;
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/backends/{managed}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let (code, message) = error_envelope(response).await;
+    assert_eq!(code, "conflict");
+    assert!(
+        message.contains("`pr-42`"),
+        "names the environment: {message}"
+    );
+    assert!(
+        message.contains("Delete the environment"),
+        "points at the environment: {message}"
+    );
+    {
+        let store = state.store.lock().await;
+        let backend = store
+            .get_backend(&managed)
+            .expect("backend read")
+            .expect("the backend is still there");
+        assert_eq!(
+            backend.lifecycle_state,
+            lorica_config::models::LifecycleState::Normal,
+            "no drain was started"
+        );
+    }
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/backends/{plain}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_delete_on_a_managed_route_removes_the_environment_row() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let managed = seed_managed_route(&state, &session_store, &rate_limiter, &cookie, "pr-42").await;
+    {
+        let store = state.store.lock().await;
+        assert!(store
+            .get_automation_environment("pr-42")
+            .expect("environment read")
+            .is_some());
+    }
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/routes/{managed}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let store = state.store.lock().await;
+    assert!(store.get_route(&managed).expect("route read").is_none());
+    assert!(
+        store
+            .get_automation_environment("pr-42")
+            .expect("environment read")
+            .is_none(),
+        "the environment row cascades away with its route"
+    );
+}
+
+#[tokio::test]
+async fn test_managed_by_on_input_is_refused() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route = create_plain_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "shop.example.com",
+    )
+    .await;
+    let backend = create_plain_backend(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "10.0.0.7:8080",
+    )
+    .await;
+    let mark = serde_json::json!({ "kind": "automation", "environment": "pr-42" });
+
+    let attempts = [
+        (
+            "POST",
+            "/api/v1/routes".to_string(),
+            serde_json::json!({ "hostname": "forged.example.com", "managed_by": mark }),
+        ),
+        (
+            "PUT",
+            format!("/api/v1/routes/{route}"),
+            serde_json::json!({ "managed_by": mark }),
+        ),
+        (
+            "POST",
+            "/api/v1/backends".to_string(),
+            serde_json::json!({ "address": "10.0.0.8:8080", "managed_by": mark }),
+        ),
+        (
+            "PUT",
+            format!("/api/v1/backends/{backend}"),
+            serde_json::json!({ "managed_by": mark }),
+        ),
+    ];
+    for (method, uri, body) in attempts {
+        let response = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            &uri,
+            &cookie,
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{method} {uri}"
+        );
+        let (code, message) = error_envelope(response).await;
+        assert_eq!(code, "unprocessable_entity", "{method} {uri}");
+        assert!(message.contains("managed_by"), "{method} {uri}: {message}");
+    }
+
+    let store = state.store.lock().await;
+    assert_eq!(store.list_routes().expect("routes read").len(), 1);
+    assert_eq!(store.list_backends().expect("backends read").len(), 1);
+    assert!(store
+        .get_route(&route)
+        .expect("route read")
+        .expect("the route exists")
+        .managed_by
+        .is_none());
+    assert!(store
+        .get_backend(&backend)
+        .expect("backend read")
+        .expect("the backend exists")
+        .managed_by
+        .is_none());
 }
 
 // ---- Certificates Tests ----
@@ -3812,6 +4301,35 @@ async fn test_create_backend_empty_address_returns_400() {
 }
 
 #[tokio::test]
+async fn test_a_backend_cannot_claim_an_automation_group_name_by_hand() {
+    // The route path has refused a colon in a group name since v1.2;
+    // the backend path never called the same validator, so a backend
+    // could carry `automation:<name>` without ever being managed. The
+    // guard on `managed_by` is the stronger one; this closes the name.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "address": "10.0.0.10:8080",
+        "group_name": "automation:review-42"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/backends")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_get_backend_nonexistent_returns_404() {
     let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
@@ -4863,6 +5381,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
+        oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -4903,6 +5422,7 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
+        oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -8089,6 +8609,174 @@ async fn a_created_rule_expires_at_now_plus_its_ttl() {
         (0..5).contains(&drift),
         "expires_at must be creation plus ttl_seconds, drifted {drift}s"
     );
+}
+
+#[tokio::test]
+async fn the_recent_captures_ring_is_operator_and_refused_below() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-op-recent",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-viewer-recent",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/capture/recent",
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "viewer");
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/capture/recent",
+        &operator,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "operator");
+    let body = body_json(resp).await;
+    assert!(body["data"]["captures"].is_array());
+    assert_eq!(
+        body["data"]["capacity"],
+        crate::capture_ring::CAPTURE_RING_CAPACITY as u64
+    );
+}
+
+#[tokio::test]
+async fn the_ring_is_refused_on_a_workers_supervisor_and_the_refusal_names_the_sink() {
+    // The one outcome not allowed is an empty ring on a node that is
+    // capturing normally: the supervisor never emits, so it answers
+    // 503 and says where the records are.
+    let (state, session_store, rate_limiter) = test_state_with_workers().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    for uri in ["/api/v1/capture/recent", "/api/v1/capture/recent/abc"] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            uri,
+            &admin,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "service_unavailable");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(message.contains("--workers"), "{message}");
+        assert!(message.contains("output.dir"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn a_record_in_the_ring_downloads_whole_and_an_evicted_one_is_a_404() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // The ring is process-global, so the id is unique to this test.
+    let request_id = format!("ring-test-{}", uuid::Uuid::new_v4().simple());
+    let document = serde_json::json!({
+        "kind": "capture",
+        "rule_id": "cap-ring",
+        "request_id": request_id,
+        "request": { "method": "POST", "body": "x".repeat(8192), "body_encoding": "utf8" },
+        "response": { "status": 503, "body": "", "body_encoding": "base64" },
+    });
+    let text = serde_json::to_string(&document).expect("test setup: serialises");
+    let file_name = format!("20260101T000000.000000000Z-{request_id}.json");
+    crate::capture_ring::node_capture_ring().remember(
+        "cap-ring",
+        &request_id,
+        &file_name,
+        document,
+        text.clone(),
+    );
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/capture/recent/{request_id}?rule_id=cap-ring"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(http::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("attachment; filename=\"{file_name}\"").as_str())
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(
+        bytes.as_ref(),
+        text.as_bytes(),
+        "the download is the record, whole"
+    );
+
+    // The listing carries the same record with its body cut.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/capture/recent",
+        &admin,
+        None,
+    )
+    .await;
+    let listed = body_json(resp).await;
+    let row = listed["data"]["captures"]
+        .as_array()
+        .expect("captures")
+        .iter()
+        .find(|row| row["request_id"] == request_id)
+        .expect("this test's record is listed");
+    assert_eq!(row["request"]["body_elided"], true);
+    assert_eq!(row["request"]["body_elided_total"], 8192);
+    assert_eq!(
+        row["request"]["body"].as_str().expect("body").len(),
+        crate::capture_ring::CAPTURE_RING_LIST_BODY_MAX
+    );
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/capture/recent/never-in-the-ring",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

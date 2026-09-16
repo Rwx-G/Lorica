@@ -364,6 +364,10 @@ fn encode_rfc5424(
         SinkKind::Access => config.severity_access,
         SinkKind::Waf => config.severity_waf,
         SinkKind::Audit => config.severity_audit,
+        // A capture is the access-log row with bodies attached, so it
+        // carries that row's severity; there is no
+        // `syslog_severity_capture` setting, only the toggle.
+        SinkKind::Capture => config.severity_access,
     };
     let pri = u32::from(config.facility) * 8 + u32::from(severity);
     let timestamp = event_timestamp(event);
@@ -457,6 +461,7 @@ fn event_timestamp(event: &SinkEvent) -> String {
         super::SinkPayload::Access(entry) => entry.timestamp.as_str(),
         super::SinkPayload::Waf(waf) => waf.timestamp.as_str(),
         super::SinkPayload::Audit(audit) => audit.timestamp.as_str(),
+        super::SinkPayload::Capture(capture) => capture.timestamp.as_str(),
     };
     match chrono::DateTime::parse_from_rfc3339(raw) {
         Ok(ts) => ts.to_rfc3339(),
@@ -558,6 +563,7 @@ mod tests {
             access_enabled: true,
             waf_enabled: true,
             audit_enabled: true,
+            capture_enabled: true,
             tls_ca_pem: None,
             tls_client_cert_pem: None,
             tls_client_key_pem: None,
@@ -708,9 +714,9 @@ mod tests {
         let addr = listener.local_addr().expect("listener addr");
         let sinks = LogSinksConfig {
             syslog: Some(test_config(&addr.to_string(), SyslogTransport::Udp)),
-            otlp: false,
             node_id: "node-1".to_string(),
             node_name: "edge01".to_string(),
+            ..LogSinksConfig::default()
         };
         super::super::install(&sinks);
         super::super::publish_audit(AuditSinkRecord {

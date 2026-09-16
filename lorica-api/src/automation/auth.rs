@@ -14,12 +14,24 @@
 
 //! Bearer authentication for the automation plane.
 //!
-//! `Authorization: Bearer <public_id>.<secret>` is the ONLY credential
-//! this layer looks at. The cookie header is never read, so a browser
-//! that happens to hold a dashboard session gains nothing by pointing
-//! at this listener.
+//! `Authorization: Bearer <value>` is the ONLY credential this layer
+//! looks at. The cookie header is never read, so a browser that happens
+//! to hold a dashboard session gains nothing by pointing at this
+//! listener.
 //!
-//! # Order of work, and why
+//! # Two credentials, picked by shape
+//!
+//! The value is either a static token, `<public_id>.<secret>`
+//! (Story 10.3), or a GitLab ID token, a three-segment JWT
+//! (Story 10.5). The mode is chosen by the SHAPE of the value and by
+//! nothing the caller can state separately: a value with a minted
+//! token's shape takes the static path, a value with a JWT's shape
+//! takes the OIDC path, and anything else is refused without touching
+//! the store. The two shapes cannot collide, because a static token's
+//! secret half is base64url with no dot in it and a JWT has exactly
+//! two.
+//!
+//! # The static path, in order
 //!
 //! 1. [`lorica_config::models::parse_automation_token`] rejects
 //!    anything without a minted token's shape. A mistyped token
@@ -39,8 +51,28 @@
 //!    expiry takes effect on the very next request with no
 //!    invalidation step to get wrong.
 //!
-//! Every refusal answers `401` with the same body. Telling a caller
-//! that their token is known but revoked confirms the id for them.
+//! # The OIDC path, in order
+//!
+//! 1. The token's `aud` is read WITHOUT verification, only to select
+//!    the issuer entries to try; a forged `aud` selects entries whose
+//!    keys then refuse the forgery.
+//! 2. One store read: the entries registered for that audience. Read
+//!    per request and never cached, for the same reason the static
+//!    path caches nothing: removing an entry refuses the very next
+//!    token.
+//! 3. [`super::oidc::OidcVerifier::verify`], which pins the algorithm,
+//!    checks the signature and the standard claims, judges the bound
+//!    claims per entry and consumes the `jti`.
+//!
+//! # Every refusal answers the same 401
+//!
+//! Missing, malformed, unknown, wrong, revoked, expired, unsigned,
+//! mis-signed and replayed all read alike on the wire, and the body
+//! does not say which mode was tried. Telling a caller that their
+//! token is known but revoked confirms the id; telling them that their
+//! JWT reached the verifier confirms that an audience is registered.
+//! The precise reason is written to the audit row, which an operator
+//! can read and an attacker cannot.
 
 use axum::extract::FromRequestParts;
 use axum::extract::{Request, State};
@@ -51,9 +83,11 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use lorica_config::models::{
     dummy_automation_secret_hmac_hex, parse_automation_token, verify_automation_secret,
-    AutomationScope, AutomationToken, AUTOMATION_TOKEN_HMAC_KEY_LEN,
+    AutomationScope, AutomationToken, EnvironmentOwner, OidcIssuer, OwnerKind, PipelineIdentity,
+    AUTOMATION_TOKEN_HMAC_KEY_LEN,
 };
 
+use super::oidc::{gitlab_environment_slug, looks_like_jwt, peek_audiences, VerifiedIdToken};
 use crate::db::db_blocking;
 use crate::error::ApiError;
 use crate::server::AppState;
@@ -64,38 +98,131 @@ pub const AUTOMATION_REALM: &str = "lorica-automation";
 /// The single message every authentication refusal carries.
 ///
 /// Missing, malformed, unknown, wrong, revoked and expired all read
-/// alike on the wire. An automation that cannot reach the plane has to
-/// look at the audit log, which an operator can read and an attacker
-/// cannot.
-const UNAUTHORIZED_MESSAGE: &str = "a valid automation bearer token is required";
+/// alike on the wire, on both credential paths. An automation that
+/// cannot reach the plane has to look at the audit log, which an
+/// operator can read and an attacker cannot.
+const UNAUTHORIZED_MESSAGE: &str = "a valid automation bearer credential is required";
 
 /// The authenticated automation behind a request, installed in the
 /// request extensions by [`require_automation_auth`].
 ///
-/// It carries the whole token row rather than a reduced view: the
-/// scope gate needs the scopes, and the handlers Story 10.4 adds need
-/// `allowed_hostnames`, `allowed_backend_cidrs` and `max_ttl_seconds`
-/// on the same request.
+/// One shape for both credentials, so the scope gate and the
+/// environment handlers never ask which kind of caller they are looking
+/// at: the grant fields carry what the static token row or the issuer
+/// entry said, and the ownership fields carry the token name or the
+/// project path. What differs is what the audit row names and what an
+/// environment row records about the job.
 #[derive(Debug, Clone)]
 pub struct AutomationPrincipal {
-    /// The verified token row, read at the start of this request.
-    pub token: AutomationToken,
+    /// Which authority stands behind the request, and therefore which
+    /// ownership namespace the principal lives in.
+    pub kind: OwnerKind,
+    /// The ownership principal: the token's name, or the project path.
+    pub principal: String,
+    /// The id an operator withdraws: the token's `public_id`, or the
+    /// issuer entry's id.
+    pub grant_id: String,
+    /// What the credential may do.
+    pub scopes: Vec<AutomationScope>,
+    /// Hostname patterns the credential may claim.
+    pub allowed_hostnames: Vec<String>,
+    /// CIDRs the credential may point a hostname at.
+    pub allowed_backend_cidrs: Vec<String>,
+    /// Ceiling on the lifetime any environment this credential creates
+    /// may request, in seconds.
+    pub max_ttl_seconds: u32,
+    /// The CI job behind an ID token; `None` for a static token.
+    pub pipeline: Option<PipelineIdentity>,
+    /// When the issuer entry binds `environment_protected = true`: the
+    /// GitLab slug of the job's `environment` claim, which every
+    /// environment this principal writes must be named after (AC #3).
+    /// An empty string means the entry binds it but the token carries
+    /// no `environment` claim, which no name can satisfy.
+    pub required_environment_slug: Option<String>,
 }
 
 impl AutomationPrincipal {
-    /// The token's lookup half, which is what an operator revokes.
-    pub fn public_id(&self) -> &str {
-        &self.token.public_id
+    /// The principal a verified static token row yields.
+    pub fn from_static_token(token: AutomationToken) -> Self {
+        Self {
+            kind: OwnerKind::StaticToken,
+            principal: token.name,
+            grant_id: token.public_id,
+            scopes: token.scopes,
+            allowed_hostnames: token.allowed_hostnames,
+            allowed_backend_cidrs: token.allowed_backend_cidrs,
+            max_ttl_seconds: token.max_ttl_seconds,
+            pipeline: None,
+            required_environment_slug: None,
+        }
     }
 
-    /// The operator-facing label of the token.
+    /// The principal a verified ID token yields: the accepting entry's
+    /// grant, and the token's claims as the identity.
+    pub fn from_id_token(verified: VerifiedIdToken) -> Self {
+        let VerifiedIdToken { issuer, claims } = verified;
+        let required_environment_slug = issuer.binds_protected_environment().then(|| {
+            claims
+                .environment
+                .as_deref()
+                .map(gitlab_environment_slug)
+                .unwrap_or_default()
+        });
+        Self {
+            kind: OwnerKind::OidcProject,
+            principal: claims.project_path,
+            grant_id: issuer.id,
+            scopes: issuer.scopes,
+            allowed_hostnames: issuer.allowed_hostnames,
+            allowed_backend_cidrs: issuer.allowed_backend_cidrs,
+            max_ttl_seconds: issuer.max_ttl_seconds,
+            pipeline: Some(claims.pipeline),
+            required_environment_slug,
+        }
+    }
+
+    /// The operator-facing label: the token name, or the project path.
     pub fn name(&self) -> &str {
-        &self.token.name
+        &self.principal
+    }
+
+    /// The id an operator withdraws: the token's `public_id`, or the
+    /// issuer entry's id.
+    pub fn grant_id(&self) -> &str {
+        &self.grant_id
+    }
+
+    /// The principal as the owner an environment row records.
+    pub fn as_owner(&self) -> EnvironmentOwner {
+        EnvironmentOwner {
+            kind: self.kind,
+            principal: self.principal.clone(),
+        }
+    }
+
+    /// The one string the audit rows name this principal by: the label
+    /// and the id an operator revokes, in one column, because the audit
+    /// row has one principal field and an automation principal has two
+    /// identities. An ID token is marked `oidc:` so the id reads as an
+    /// issuer entry and not as a token.
+    pub fn audit_identity(&self) -> String {
+        match self.kind {
+            OwnerKind::StaticToken => format!("{} ({})", self.principal, self.grant_id),
+            OwnerKind::OidcProject => format!("{} (oidc:{})", self.principal, self.grant_id),
+        }
     }
 
     /// Whether this principal carries `scope`.
     pub fn has_scope(&self, scope: AutomationScope) -> bool {
-        self.token.has_scope(scope)
+        self.scopes.contains(&scope)
+    }
+
+    /// Whether any of the principal's patterns covers `hostname`, under
+    /// the one-label wildcard rule both credentials share.
+    pub fn allows_hostname(&self, hostname: &str) -> bool {
+        self.allowed_hostnames
+            .iter()
+            .any(|pattern| lorica_config::models::matches_one_label(pattern, hostname))
     }
 }
 
@@ -122,36 +249,46 @@ where
     }
 }
 
-/// Axum middleware authenticating the bearer token and installing the
-/// [`AutomationPrincipal`] extension.
+/// Axum middleware authenticating the bearer credential and installing
+/// the [`AutomationPrincipal`] extension.
 ///
 /// Answers `401` with `WWW-Authenticate: Bearer realm="lorica-automation"`
-/// on every refusal.
+/// on every refusal, and tells the audit layer the precise reason
+/// through the slot it installed on the way down.
 pub async fn require_automation_auth(
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Response {
+    let slot = req
+        .extensions()
+        .get::<super::audit::PrincipalSlot>()
+        .cloned();
+
     let Some(presented) = bearer_value(&req) else {
+        if let Some(slot) = &slot {
+            slot.refuse("no_bearer");
+        }
         return unauthorized();
     };
 
-    let token = match authenticate(&state, &presented, Utc::now()).await {
-        Ok(token) => token,
-        Err(()) => return unauthorized(),
+    let principal = match authenticate(&state, &presented, Utc::now()).await {
+        Ok(principal) => principal,
+        Err(reason) => {
+            if let Some(slot) = &slot {
+                slot.refuse(&reason);
+            }
+            return unauthorized();
+        }
     };
 
     // The audit layer wraps this one, so it cannot see the request
     // extensions any more once the response comes back. The slot it
     // installed on the way down is how the principal reaches it.
-    if let Some(slot) = req
-        .extensions()
-        .get::<super::audit::PrincipalSlot>()
-        .cloned()
-    {
-        slot.fill(&token);
+    if let Some(slot) = &slot {
+        slot.accept(&principal);
     }
-    req.extensions_mut().insert(AutomationPrincipal { token });
+    req.extensions_mut().insert(principal);
     next.run(req).await
 }
 
@@ -179,56 +316,74 @@ fn bearer_value(req: &Request) -> Option<String> {
     }
 }
 
-/// Verify `presented` against the store at `now`.
+/// Verify `presented` against the store at `now`, on whichever path
+/// its shape selects.
 ///
-/// `Err(())` is the whole error surface on purpose: the caller has one
-/// answer to give and must not be able to accidentally spell which of
-/// the refusals happened into the response.
+/// `Err` carries the audit reason and nothing else: the caller has one
+/// answer to give on the wire and must not be able to accidentally
+/// spell the reason into it.
 async fn authenticate(
     state: &AppState,
     presented: &str,
     now: DateTime<Utc>,
-) -> Result<AutomationToken, ()> {
-    // Step 1: the shape guard, before anything touches the store.
-    let parsed = parse_automation_token(presented).map_err(|_| ())?;
+) -> Result<AutomationPrincipal, String> {
+    if let Ok(parsed) = parse_automation_token(presented) {
+        return authenticate_static_token(state, parsed.public_id, parsed.secret, now).await;
+    }
+    if looks_like_jwt(presented) {
+        return authenticate_id_token(state, presented, now).await;
+    }
+    Err("not_a_credential".to_string())
+}
 
-    // Steps 2 and 3 share one store visit so the lookup and the key
-    // read do not queue for the mutex twice.
-    let public_id = parsed.public_id.clone();
+/// The static-token path: lookup, constant-time verification,
+/// liveness, `last_used_at`.
+async fn authenticate_static_token(
+    state: &AppState,
+    public_id: String,
+    secret: [u8; lorica_config::models::AUTOMATION_TOKEN_SECRET_LEN],
+    now: DateTime<Utc>,
+) -> Result<AutomationPrincipal, String> {
+    // The lookup and the key read share one store visit so they do not
+    // queue for the mutex twice.
+    let lookup_id = public_id.clone();
     let looked_up: Result<
         ([u8; AUTOMATION_TOKEN_HMAC_KEY_LEN], Option<AutomationToken>),
         ApiError,
     > = db_blocking(&state.store, move |store| {
         let key = store.automation_token_hmac_key()?;
-        let token = store.get_automation_token(&public_id)?;
+        let token = store.get_automation_token(&lookup_id)?;
         Ok::<_, lorica_config::ConfigError>((key, token))
     })
     .await;
     let (hmac_key, found) = looked_up.map_err(|e| {
         tracing::error!(error = %e, "automation token lookup failed");
+        "store_error".to_string()
     })?;
 
     let stored_hmac: String = found
         .as_ref()
         .map(|token| token.secret_hmac.clone())
         .unwrap_or_else(dummy_automation_secret_hmac_hex);
-    let secret_ok: bool = verify_automation_secret(&hmac_key, &parsed.secret, &stored_hmac);
+    let secret_ok: bool = verify_automation_secret(&hmac_key, &secret, &stored_hmac);
 
     // `secret_ok` is computed before this branch and for both paths, so
-    // an unknown id runs exactly the work a known one does.
+    // an unknown id runs exactly the work a known one does. The reason
+    // below is written after that work, to the audit row only.
     let (Some(token), true) = (found, secret_ok) else {
-        return Err(());
+        return Err("token_unknown_or_wrong_secret".to_string());
     };
 
-    // Step 4: liveness at the caller's single notion of now.
+    if token.revoked_at.is_some() {
+        return Err("token_revoked".to_string());
+    }
     if !token.is_live(now) {
-        return Err(());
+        return Err("token_expired".to_string());
     }
 
     // Best effort: a token that was just accepted is a token in use,
     // and failing the request because the stamp did not land would
     // trade a working automation for a reporting field.
-    let public_id = token.public_id.clone();
     if let Err(e) = db_blocking(&state.store, move |store| {
         store.touch_automation_token_last_used(&public_id, now)
     })
@@ -237,7 +392,43 @@ async fn authenticate(
         tracing::warn!(error = %e, "automation token last_used stamp failed");
     }
 
-    Ok(token)
+    Ok(AutomationPrincipal::from_static_token(token))
+}
+
+/// The OIDC path: the audience peek, the per-request store read of the
+/// matching issuer entries, and the verifier.
+async fn authenticate_id_token(
+    state: &AppState,
+    token: &str,
+    now: DateTime<Utc>,
+) -> Result<AutomationPrincipal, String> {
+    let audiences = peek_audiences(token);
+    if audiences.is_empty() {
+        return Err("malformed".to_string());
+    }
+
+    // Read from the store on every request, never cached: an entry an
+    // operator removes must refuse the very next token, and a cache
+    // would be one more thing to invalidate on that path.
+    let candidates: Vec<OidcIssuer> = db_blocking(&state.store, move |store| {
+        let mut entries = Vec::new();
+        for audience in &audiences {
+            entries.extend(store.list_oidc_issuers_for_audience(audience)?);
+        }
+        Ok::<_, lorica_config::ConfigError>(entries)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "oidc issuer lookup failed");
+        "store_error".to_string()
+    })?;
+
+    state
+        .oidc
+        .verify(token, &candidates, now)
+        .await
+        .map(AutomationPrincipal::from_id_token)
+        .map_err(|reason| reason.audit_reason())
 }
 
 /// The `401` every refusal answers, challenge header included.
@@ -294,5 +485,35 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("Bearer realm=\"lorica-automation\"")
         );
+    }
+
+    #[test]
+    fn a_static_token_and_an_id_token_yield_one_principal_shape() {
+        let now = Utc::now();
+        let token = AutomationToken {
+            public_id: "0123456789abcdef01234567".to_string(),
+            name: "acme-ci".to_string(),
+            secret_hmac: dummy_automation_secret_hmac_hex(),
+            scopes: vec![AutomationScope::EnvironmentsRead],
+            allowed_hostnames: vec!["*.review.example.com".to_string()],
+            allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
+            max_ttl_seconds: 600,
+            created_by: "admin".to_string(),
+            created_at: now,
+            expires_at: now + chrono::Duration::days(1),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        let principal = AutomationPrincipal::from_static_token(token);
+        assert_eq!(principal.kind, OwnerKind::StaticToken);
+        assert_eq!(principal.name(), "acme-ci");
+        assert_eq!(principal.grant_id(), "0123456789abcdef01234567");
+        assert_eq!(
+            principal.audit_identity(),
+            "acme-ci (0123456789abcdef01234567)"
+        );
+        assert!(principal.allows_hostname("mr-1.review.example.com"));
+        assert!(principal.pipeline.is_none());
+        assert!(principal.required_environment_slug.is_none());
     }
 }

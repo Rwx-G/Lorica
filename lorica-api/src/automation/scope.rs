@@ -64,7 +64,7 @@ use crate::error::ApiError;
 ///     None
 /// );
 /// ```
-pub fn required_scope(_method: &http::Method, path: &str) -> Option<AutomationScope> {
+pub fn required_scope(method: &http::Method, path: &str) -> Option<AutomationScope> {
     // `whoami` reports the token back to its own holder and reaches
     // nothing else, so it sits on the narrowest scope any automation
     // token that talks to this plane at all will carry.
@@ -72,8 +72,30 @@ pub fn required_scope(_method: &http::Method, path: &str) -> Option<AutomationSc
         return Some(AutomationScope::EnvironmentsRead);
     }
 
+    // The environment resource (Story 10.4): the collection, and one
+    // environment by name. Exactly one path segment after the
+    // collection, so a deeper path stays undeclared and refused.
+    if let Some(rest) = path.strip_prefix(ENVIRONMENTS_PATH) {
+        let is_collection = rest.is_empty();
+        let is_one = rest
+            .strip_prefix('/')
+            .is_some_and(|name| !name.is_empty() && !name.contains('/'));
+        if is_collection || is_one {
+            return match *method {
+                http::Method::GET => Some(AutomationScope::EnvironmentsRead),
+                http::Method::PUT | http::Method::DELETE if is_one => {
+                    Some(AutomationScope::EnvironmentsWrite)
+                }
+                _ => None,
+            };
+        }
+    }
+
     None
 }
+
+/// The environment collection path; single environments hang under it.
+const ENVIRONMENTS_PATH: &str = "/automation/v1/environments";
 
 /// Axum middleware enforcing [`required_scope`] against the
 /// authenticated principal.
@@ -151,12 +173,53 @@ mod tests {
         // and says nothing. `None` refuses every token, so the missing
         // declaration surfaces as a 403 on the first call.
         for path in [
-            "/automation/v1/environments",
+            "/automation/v1/tokens",
+            "/automation/v1/environments/pr-42/backends",
+            "/automation/v1/environments/",
             "/automation/v1/whoami/extra",
             "/",
         ] {
             assert_eq!(required_scope(&Method::GET, path), None, "{path}");
         }
+    }
+
+    #[test]
+    fn the_environment_paths_read_with_read_and_write_with_write() {
+        assert_eq!(
+            required_scope(&Method::GET, "/automation/v1/environments"),
+            Some(AutomationScope::EnvironmentsRead)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/automation/v1/environments/pr-42"),
+            Some(AutomationScope::EnvironmentsRead)
+        );
+        assert_eq!(
+            required_scope(&Method::PUT, "/automation/v1/environments/pr-42"),
+            Some(AutomationScope::EnvironmentsWrite)
+        );
+        assert_eq!(
+            required_scope(&Method::DELETE, "/automation/v1/environments/pr-42"),
+            Some(AutomationScope::EnvironmentsWrite)
+        );
+        // The OpenAPI gate asks with the parameter normalised away.
+        assert_eq!(
+            required_scope(&Method::PUT, "/automation/v1/environments/{}"),
+            Some(AutomationScope::EnvironmentsWrite)
+        );
+        // No verb the router does not mount inherits a scope: a POST on
+        // the collection or a PUT on it is refused for every token.
+        assert_eq!(
+            required_scope(&Method::POST, "/automation/v1/environments"),
+            None
+        );
+        assert_eq!(
+            required_scope(&Method::PUT, "/automation/v1/environments"),
+            None
+        );
+        assert_eq!(
+            required_scope(&Method::POST, "/automation/v1/environments/pr-42"),
+            None
+        );
     }
 
     #[test]

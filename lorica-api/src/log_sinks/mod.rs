@@ -25,6 +25,17 @@
 //! installed per process by the reload path
 //! (`lorica::reload::apply_per_process_reload_state`), so each
 //! process ships exactly the kinds it produces.
+//!
+//! # Per-kind toggles (backlog #50)
+//!
+//! Every lane carries one flag per [`SinkKind`], and every flag is a
+//! `GlobalSettings` field of its own: `syslog_{access,waf,audit,
+//! capture}_enabled` for the syslog lane, `otlp_logs_{access,waf,
+//! audit,capture}_enabled` for the OTLP lane. The four kinds are
+//! symmetric on both sinks; [`SinkKind::Capture`] (Story 10.2 AC #3)
+//! rides the same filter as the three original kinds. The toggles are
+//! node-local (a sink is where THIS node ships its logs), which is the
+//! decision `lorica_config::canonical` forces per field.
 
 pub mod syslog;
 
@@ -51,17 +62,66 @@ pub enum SinkKind {
     Waf,
     /// Audit-trail entry.
     Audit,
+    /// Traffic capture record (Story 10.2).
+    Capture,
 }
 
 impl SinkKind {
-    /// Stable label value (`access` / `waf` / `audit`) used in
-    /// metrics and as the syslog MSGID.
+    /// Stable label value (`access` / `waf` / `audit` / `capture`)
+    /// used in metrics and as the syslog MSGID.
     pub fn as_str(self) -> &'static str {
         match self {
             SinkKind::Access => "access",
             SinkKind::Waf => "waf",
             SinkKind::Audit => "audit",
+            SinkKind::Capture => "capture",
         }
+    }
+}
+
+/// One flag per [`SinkKind`]: which kinds a lane wants. The OTLP
+/// lane's filter is carried by this type from settings to
+/// [`register_lane`]; the syslog lane keeps its flags inline on
+/// [`SyslogSinkConfig`] beside the per-kind severities they pair with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SinkKindToggles {
+    /// Ship access-log rows.
+    pub access: bool,
+    /// Ship WAF events.
+    pub waf: bool,
+    /// Ship audit entries.
+    pub audit: bool,
+    /// Ship traffic capture records.
+    pub capture: bool,
+}
+
+/// A capture record as exported to sinks: the record's JSON document
+/// plus the three values the consumers read without parsing it (the
+/// syslog HEADER timestamp, the drop counter's `rule_id` label, the
+/// join key).
+///
+/// The document is carried as a [`serde_json::Value`] rather than as
+/// the proxy's typed record because the record type lives in the
+/// `lorica` binary crate, which depends on this one and not the other
+/// way round. `Serialize` writes the document alone, so
+/// [`body_json`] flattens the record's own fields at the top level
+/// like every other kind.
+#[derive(Debug, Clone)]
+pub struct CaptureSinkRecord {
+    /// The rule that admitted the exchange; the `rule_id` label of
+    /// `lorica_captures_total{outcome="dropped_sink"}`.
+    pub rule_id: String,
+    /// The access-log row's `request_id`.
+    pub request_id: String,
+    /// RFC 3339 event timestamp, copied from the access-log row.
+    pub timestamp: String,
+    /// The capture record as one JSON object.
+    pub document: serde_json::Value,
+}
+
+impl Serialize for CaptureSinkRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.document.serialize(serializer)
     }
 }
 
@@ -100,6 +160,8 @@ pub enum SinkPayload {
     Waf(lorica_waf::WafEvent),
     /// Audit entry.
     Audit(AuditSinkRecord),
+    /// Traffic capture record.
+    Capture(CaptureSinkRecord),
 }
 
 /// Envelope delivered to sink consumers: the payload plus the trace
@@ -133,6 +195,7 @@ impl SinkEvent {
             SinkPayload::Access(_) => SinkKind::Access,
             SinkPayload::Waf(_) => SinkKind::Waf,
             SinkPayload::Audit(_) => SinkKind::Audit,
+            SinkPayload::Capture(_) => SinkKind::Capture,
         }
     }
 }
@@ -207,6 +270,8 @@ pub struct SyslogSinkConfig {
     pub waf_enabled: bool,
     /// Ship audit entries.
     pub audit_enabled: bool,
+    /// Ship capture records.
+    pub capture_enabled: bool,
     /// PEM CA bundle for `tcp-tls`; `None` = platform trust store.
     pub tls_ca_pem: Option<String>,
     /// PEM client certificate chain for collector mTLS.
@@ -229,6 +294,7 @@ impl std::fmt::Debug for SyslogSinkConfig {
             .field("access_enabled", &self.access_enabled)
             .field("waf_enabled", &self.waf_enabled)
             .field("audit_enabled", &self.audit_enabled)
+            .field("capture_enabled", &self.capture_enabled)
             .field("tls_ca_pem", &self.tls_ca_pem.as_ref().map(|_| "<pem>"))
             .field(
                 "tls_client_cert_pem",
@@ -254,6 +320,11 @@ pub struct LogSinksConfig {
     /// compiled in and an OTLP endpoint is configured, and for
     /// draining the receiver returned by [`install`].
     pub otlp: bool,
+    /// Which kinds the OTLP lane ships (backlog #50). Meaningless
+    /// while `otlp` is false; carried here so a flip of one toggle
+    /// changes the snapshot the reload path compares and re-registers
+    /// the lane with the new filter.
+    pub otlp_kinds: SinkKindToggles,
     /// Stable node id (empty on standalone installs; Story 9.6).
     pub node_id: String,
     /// Display node name (empty on standalone installs; Story 9.6).
@@ -288,6 +359,7 @@ impl LogSinksConfig {
                     access_enabled: settings.syslog_access_enabled,
                     waf_enabled: settings.syslog_waf_enabled,
                     audit_enabled: settings.syslog_audit_enabled,
+                    capture_enabled: settings.syslog_capture_enabled,
                     tls_ca_pem: settings.syslog_tls_ca_pem.clone(),
                     tls_client_cert_pem: settings.syslog_tls_client_cert_pem.clone(),
                     tls_client_key_pem: settings.syslog_tls_client_key_pem.clone(),
@@ -303,6 +375,12 @@ impl LogSinksConfig {
         LogSinksConfig {
             syslog,
             otlp,
+            otlp_kinds: SinkKindToggles {
+                access: settings.otlp_logs_access_enabled,
+                waf: settings.otlp_logs_waf_enabled,
+                audit: settings.otlp_logs_audit_enabled,
+                capture: settings.otlp_logs_capture_enabled,
+            },
             node_id: String::new(),
             node_name: String::new(),
         }
@@ -343,12 +421,14 @@ fn parse_extra_sd(raw: Option<&str>) -> Vec<(String, String)> {
 }
 
 /// What happened to an event offered to a lane, from the hub's point
-/// of view: `Gone` means the receiver is closed and the lane should be
-/// torn out, which is different from a full queue (a drop, but the
-/// consumer is alive and will catch up).
+/// of view. `Dropped` is a full queue: a drop, but the consumer is
+/// alive and will catch up. `Gone` means the receiver is closed and
+/// the lane should be torn out. A lane that does not want the kind
+/// reports `Delivered`: nothing was lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaneOutcome {
     Delivered,
+    Dropped,
     Gone,
 }
 
@@ -364,6 +444,7 @@ struct SinkLane {
     access: bool,
     waf: bool,
     audit: bool,
+    capture: bool,
     label: &'static str,
 }
 
@@ -373,6 +454,7 @@ impl SinkLane {
             SinkKind::Access => self.access,
             SinkKind::Waf => self.waf,
             SinkKind::Audit => self.audit,
+            SinkKind::Capture => self.capture,
         }
     }
 
@@ -385,7 +467,7 @@ impl SinkLane {
             Ok(()) => LaneOutcome::Delivered,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 crate::metrics::inc_log_sink_dropped(self.label, kind.as_str());
-                LaneOutcome::Delivered
+                LaneOutcome::Dropped
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 crate::metrics::inc_log_sink_dropped(self.label, kind.as_str());
@@ -412,15 +494,26 @@ impl HubState {
         self.lanes.iter().any(|l| l.wants(kind))
     }
 
-    fn offer_all(&self, event: &SinkEvent) {
+    /// Offer `event` to every lane. Returns how many lanes wanted it
+    /// and lost it (full or gone), so a publisher whose kind has its
+    /// own drop counter can bump it once per lost copy.
+    fn offer_all(&self, event: &SinkEvent) -> usize {
+        let mut lost = 0;
         for lane in &self.lanes {
-            if lane.offer(event) == LaneOutcome::Gone {
-                // The consumer dropped its receiver without saying so.
-                // Tear the lane out rather than counting every future
-                // event as a drop for the life of the process.
-                remove_lane(lane.id);
+            match lane.offer(event) {
+                LaneOutcome::Delivered => {}
+                LaneOutcome::Dropped => lost += 1,
+                LaneOutcome::Gone => {
+                    lost += 1;
+                    // The consumer dropped its receiver without saying
+                    // so. Tear the lane out rather than counting every
+                    // future event as a drop for the life of the
+                    // process.
+                    remove_lane(lane.id);
+                }
             }
         }
+        lost
     }
 }
 
@@ -475,6 +568,7 @@ pub fn install(config: &LogSinksConfig) {
                 access: syslog_cfg.access_enabled,
                 waf: syslog_cfg.waf_enabled,
                 audit: syslog_cfg.audit_enabled,
+                capture: syslog_cfg.capture_enabled,
                 label: "syslog",
             });
             *syslog_thread_slot().lock() = Some(handle);
@@ -502,6 +596,7 @@ pub fn register_lane(
     access: bool,
     waf: bool,
     audit: bool,
+    capture: bool,
 ) -> tokio::sync::mpsc::Receiver<SinkEvent> {
     use std::sync::atomic::Ordering;
 
@@ -517,6 +612,7 @@ pub fn register_lane(
         access,
         waf,
         audit,
+        capture,
         label,
     });
     *guard = Arc::new(next);
@@ -625,6 +721,29 @@ pub fn publish_audit(record: AuditSinkRecord) {
     });
 }
 
+/// Publish a capture record with its request trace context (Story
+/// 10.2 AC #3). Same non-blocking contract as [`publish_access`].
+///
+/// Returns how many lanes wanted the record and lost it, so the
+/// caller can count each lost copy as
+/// `lorica_captures_total{outcome="dropped_sink"}` (AC #4): the
+/// per-sink drop counter is bumped here, but the per-rule one carries
+/// a label only the capture path knows.
+pub fn publish_capture(
+    record: CaptureSinkRecord,
+    trace_id: Option<&str>,
+    span_id: Option<&str>,
+) -> usize {
+    let Some(state) = state_if_wants(SinkKind::Capture) else {
+        return 0;
+    };
+    state.offer_all(&SinkEvent {
+        payload: Arc::new(SinkPayload::Capture(record)),
+        trace_id: trace_id.map(str::to_string),
+        span_id: span_id.map(str::to_string),
+    })
+}
+
 /// Serialises tests that install the process-global hub (this module
 /// and `syslog::tests`), so parallel test threads cannot replace each
 /// other's hub between install and publish.
@@ -668,6 +787,7 @@ mod tests {
         assert_eq!(syslog.severity_waf, 2);
         assert!(syslog.access_enabled);
         assert!(!syslog.audit_enabled);
+        assert!(syslog.capture_enabled);
         assert_eq!(
             syslog.extra_sd,
             vec![
@@ -747,6 +867,7 @@ mod tests {
             access_enabled: true,
             waf_enabled: true,
             audit_enabled: true,
+            capture_enabled: true,
             tls_ca_pem: None,
             tls_client_cert_pem: None,
             tls_client_key_pem: Some("-----BEGIN PRIVATE KEY-----\ntopsecret".into()),
@@ -788,7 +909,7 @@ mod tests {
     async fn a_registered_lane_receives_published_events() {
         let _guard = test_hub_lock().lock().await;
         install(&LogSinksConfig::default());
-        let mut rx = register_lane("otlp", true, true, true);
+        let mut rx = register_lane("otlp", true, true, true, true);
         publish_audit(AuditSinkRecord {
             timestamp: "2026-06-10T00:00:00Z".into(),
             operator_username: "admin".into(),
@@ -816,8 +937,7 @@ mod tests {
         let cfg = LogSinksConfig {
             syslog: None,
             otlp: true,
-            node_id: String::new(),
-            node_name: String::new(),
+            ..LogSinksConfig::default()
         };
         install(&cfg);
         assert!(!wants(SinkKind::Audit), "no consumer, no lane");
@@ -830,7 +950,7 @@ mod tests {
         // leave the hub counting every event as a drop forever.
         let _guard = test_hub_lock().lock().await;
         install(&LogSinksConfig::default());
-        let rx = register_lane("otlp", true, true, true);
+        let rx = register_lane("otlp", true, true, true, true);
         assert!(wants(SinkKind::Audit));
         drop(rx);
         publish_audit(AuditSinkRecord {
@@ -844,6 +964,200 @@ mod tests {
             chain_hash: "abc".into(),
         });
         assert!(!wants(SinkKind::Audit), "the dead lane is gone");
+        install(&LogSinksConfig::default());
+    }
+
+    fn capture_record(rule_id: &str) -> CaptureSinkRecord {
+        CaptureSinkRecord {
+            rule_id: rule_id.to_string(),
+            request_id: "0123456789abcdef0123456789abcdef".into(),
+            timestamp: "2026-06-10T00:00:00+00:00".into(),
+            document: serde_json::json!({
+                "kind": "capture",
+                "rule_id": rule_id,
+                "request_id": "0123456789abcdef0123456789abcdef",
+                "timestamp": "2026-06-10T00:00:00+00:00",
+                "request": { "method": "POST" },
+            }),
+        }
+    }
+
+    #[test]
+    fn syslog_capture_toggle_is_its_own_setting() {
+        // Until backlog #50 closed, the capture lane followed
+        // `syslog_access_enabled`. It now answers to
+        // `syslog_capture_enabled` alone, in both directions.
+        let mut s = base_settings();
+        s.syslog_endpoint = Some("host01:514".into());
+        s.syslog_access_enabled = false;
+        s.syslog_capture_enabled = true;
+        let syslog = LogSinksConfig::from_settings(&s, false)
+            .syslog
+            .expect("syslog sink configured");
+        assert!(!syslog.access_enabled);
+        assert!(syslog.capture_enabled);
+
+        s.syslog_access_enabled = true;
+        s.syslog_capture_enabled = false;
+        let syslog = LogSinksConfig::from_settings(&s, false)
+            .syslog
+            .expect("syslog sink configured");
+        assert!(syslog.access_enabled);
+        assert!(!syslog.capture_enabled);
+    }
+
+    #[test]
+    fn otlp_kinds_follow_their_settings() {
+        let mut s = base_settings();
+        s.otlp_logs_enabled = true;
+        s.otlp_endpoint = Some("http://collector:4318".into());
+        assert_eq!(
+            LogSinksConfig::from_settings(&s, true).otlp_kinds,
+            SinkKindToggles {
+                access: true,
+                waf: true,
+                audit: true,
+                capture: true,
+            },
+            "every kind ships by default"
+        );
+        s.otlp_logs_audit_enabled = false;
+        s.otlp_logs_capture_enabled = false;
+        assert_eq!(
+            LogSinksConfig::from_settings(&s, true).otlp_kinds,
+            SinkKindToggles {
+                access: true,
+                waf: true,
+                audit: false,
+                capture: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_otlp_lane_registered_from_settings_skips_a_kind_toggled_off() {
+        // The path `otel::init_logs` takes: settings -> `otlp_kinds` ->
+        // `register_lane`. With `otlp_logs_audit_enabled` off, an
+        // audit entry never reaches the lane while an access row does.
+        let _guard = test_hub_lock().lock().await;
+        install(&LogSinksConfig::default());
+
+        let mut s = base_settings();
+        s.otlp_logs_enabled = true;
+        s.otlp_endpoint = Some("http://collector:4318".into());
+        s.otlp_logs_audit_enabled = false;
+        let kinds = LogSinksConfig::from_settings(&s, true).otlp_kinds;
+        let mut rx = register_lane("otlp", kinds.access, kinds.waf, kinds.audit, kinds.capture);
+
+        assert!(!wants(SinkKind::Audit));
+        publish_audit(AuditSinkRecord {
+            timestamp: "2026-06-10T00:00:00Z".into(),
+            operator_username: "admin".into(),
+            operator_role: "SuperAdmin".into(),
+            action: "settings.update".into(),
+            target_type: "settings".into(),
+            target_id: String::new(),
+            ip: "192.0.2.10".into(),
+            chain_hash: String::new(),
+        });
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "audit is toggled off for the otlp lane"
+        );
+
+        assert!(wants(SinkKind::Access));
+        publish_access(
+            &LogEntry {
+                id: 1,
+                timestamp: "2026-06-10T00:00:00Z".into(),
+                method: "GET".into(),
+                path: "/".into(),
+                host: "example.com".into(),
+                status: 200,
+                latency_ms: 3,
+                backend: "10.0.0.10:8080".into(),
+                error: None,
+                client_ip: "192.0.2.10".into(),
+                is_xff: false,
+                xff_proxy_ip: String::new(),
+                source: String::new(),
+                request_id: "0123456789abcdef0123456789abcdef".into(),
+            },
+            None,
+            None,
+        );
+        let event = rx.recv().await.expect("access row delivered");
+        assert_eq!(event.kind(), SinkKind::Access);
+        install(&LogSinksConfig::default());
+    }
+
+    #[test]
+    fn body_json_flattens_a_capture_document_and_stamps_its_kind() {
+        let event = SinkEvent {
+            payload: Arc::new(SinkPayload::Capture(capture_record("cap-1"))),
+            trace_id: None,
+            span_id: None,
+        };
+        assert_eq!(event.kind(), SinkKind::Capture);
+        let value: serde_json::Value =
+            serde_json::from_str(&body_json(&event)).expect("body is valid JSON");
+        assert_eq!(value["v"], SINK_BODY_VERSION);
+        assert_eq!(value["kind"], "capture");
+        assert_eq!(value["rule_id"], "cap-1");
+        assert_eq!(value["request"]["method"], "POST");
+        // The transport wrapper never nests the document.
+        assert!(value.get("document").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_capture_reaches_a_lane_with_the_flag_on_and_not_one_with_it_off() {
+        let _guard = test_hub_lock().lock().await;
+        install(&LogSinksConfig::default());
+
+        let mut off = register_lane("otlp", true, true, true, false);
+        assert!(!wants(SinkKind::Capture));
+        assert_eq!(publish_capture(capture_record("cap-1"), None, None), 0);
+        assert!(
+            matches!(
+                off.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "a lane with the capture flag off receives nothing"
+        );
+
+        let mut on = register_lane("otlp", true, true, true, true);
+        assert!(wants(SinkKind::Capture));
+        assert_eq!(
+            publish_capture(capture_record("cap-1"), Some("4bf9"), Some("00f0")),
+            0
+        );
+        let event = on.recv().await.expect("event delivered");
+        assert_eq!(event.kind(), SinkKind::Capture);
+        assert_eq!(event.trace_id.as_deref(), Some("4bf9"));
+        match &*event.payload {
+            SinkPayload::Capture(record) => assert_eq!(record.rule_id, "cap-1"),
+            other => panic!("expected a capture payload, got {other:?}"),
+        }
+        install(&LogSinksConfig::default());
+    }
+
+    #[tokio::test]
+    async fn a_full_capture_lane_reports_each_lost_copy() {
+        let _guard = test_hub_lock().lock().await;
+        install(&LogSinksConfig::default());
+        // The receiver is held and never drained, so the lane fills.
+        let _rx = register_lane("otlp", false, false, false, true);
+        for _ in 0..SINK_QUEUE_CAP {
+            assert_eq!(publish_capture(capture_record("cap-full"), None, None), 0);
+        }
+        assert_eq!(
+            publish_capture(capture_record("cap-full"), None, None),
+            1,
+            "the lane is full: the publisher learns that one copy was lost"
+        );
         install(&LogSinksConfig::default());
     }
 }

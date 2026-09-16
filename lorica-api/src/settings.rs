@@ -443,6 +443,8 @@ pub struct UpdateSettingsRequest {
     pub syslog_waf_enabled: Option<bool>,
     /// Story 9.8 AC #1. Ship audit entries to syslog.
     pub syslog_audit_enabled: Option<bool>,
+    /// Backlog #50. Ship traffic capture records to syslog.
+    pub syslog_capture_enabled: Option<bool>,
     /// Story 9.8 AC #1. PEM CA bundle trusted for `tcp-tls`. Empty
     /// clears it (platform trust store).
     pub syslog_tls_ca_pem: Option<String>,
@@ -464,6 +466,15 @@ pub struct UpdateSettingsRequest {
     /// exporter. Secret: empty clears, `**REDACTED**` leaves
     /// unchanged.
     pub otlp_logs_auth_header: Option<String>,
+    /// Backlog #50. Ship access-log rows on the OTLP logs lane.
+    pub otlp_logs_access_enabled: Option<bool>,
+    /// Backlog #50. Ship WAF events on the OTLP logs lane.
+    pub otlp_logs_waf_enabled: Option<bool>,
+    /// Backlog #50. Ship audit entries on the OTLP logs lane.
+    pub otlp_logs_audit_enabled: Option<bool>,
+    /// Backlog #50. Ship traffic capture records on the OTLP logs
+    /// lane.
+    pub otlp_logs_capture_enabled: Option<bool>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -599,12 +610,12 @@ pub async fn update_settings(
         apply_cidr_list(
             body.trusted_proxies,
             &mut settings.trusted_proxies,
-            "trusted proxy",
+            "trusted_proxies",
         )?;
         apply_cidr_list(
             body.waf_whitelist_ips,
             &mut settings.waf_whitelist_ips,
-            "WAF whitelist",
+            "waf_whitelist_ips",
         )?;
         apply_cidr_list(
             body.connection_deny_cidrs,
@@ -732,6 +743,10 @@ pub async fn update_settings(
         apply_plain(body.syslog_access_enabled, &mut settings.syslog_access_enabled);
         apply_plain(body.syslog_waf_enabled, &mut settings.syslog_waf_enabled);
         apply_plain(body.syslog_audit_enabled, &mut settings.syslog_audit_enabled);
+        apply_plain(
+            body.syslog_capture_enabled,
+            &mut settings.syslog_capture_enabled,
+        );
         apply_optional_pem(
             body.syslog_tls_ca_pem,
             &mut settings.syslog_tls_ca_pem,
@@ -754,6 +769,22 @@ pub async fn update_settings(
         apply_syslog_extra_sd(body.syslog_extra_sd, &mut settings.syslog_extra_sd)?;
         apply_plain(body.otlp_logs_enabled, &mut settings.otlp_logs_enabled);
         apply_secret_token(body.otlp_logs_auth_header, &mut settings.otlp_logs_auth_header);
+        apply_plain(
+            body.otlp_logs_access_enabled,
+            &mut settings.otlp_logs_access_enabled,
+        );
+        apply_plain(
+            body.otlp_logs_waf_enabled,
+            &mut settings.otlp_logs_waf_enabled,
+        );
+        apply_plain(
+            body.otlp_logs_audit_enabled,
+            &mut settings.otlp_logs_audit_enabled,
+        );
+        apply_plain(
+            body.otlp_logs_capture_enabled,
+            &mut settings.otlp_logs_capture_enabled,
+        );
 
         // Cross-field invariants (backlog #48). Per-field bounds are applied
         // above; these reject a partial update that inverts a related pair
@@ -913,8 +944,9 @@ fn apply_string_choice(
 }
 
 /// Assign a CIDR/IP list field when present. Every non-empty entry
-/// must parse as a bare IP (1.2.3.4) or CIDR (1.2.3.0/24); the first
-/// invalid entry yields `400 "invalid <label> CIDR or IP: <entry>"`.
+/// must parse as a bare IP (1.2.3.4) or CIDR (1.2.3.0/24) per
+/// `lorica_config::connection_filter`; the first invalid entry yields
+/// `400` naming the field and the entry.
 fn apply_cidr_list(
     value: Option<Vec<String>>,
     target: &mut Vec<String>,
@@ -1456,19 +1488,12 @@ pub async fn test_otlp_logs_connection(
 }
 
 fn validate_cidr_list(entries: &[String], field: &str) -> Result<(), ApiError> {
-    for entry in entries {
-        let trimmed = entry.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.parse::<std::net::IpAddr>().is_err() && trimmed.parse::<ipnet::IpNet>().is_err()
-        {
-            return Err(ApiError::BadRequest(format!(
-                "invalid {field} CIDR or IP: {trimmed}"
-            )));
-        }
-    }
-    Ok(())
+    // The store-side definition, so the API and every other writer
+    // (import, replica apply) cannot drift on what an address is. The
+    // API refuses a bad entry; the data plane skips it. They disagree
+    // on the disposition on purpose, never on the verdict.
+    lorica_config::connection_filter::validate_cidr_list(entries, field)
+        .map_err(ApiError::BadRequest)
 }
 
 // ---- Notification Configs ----
