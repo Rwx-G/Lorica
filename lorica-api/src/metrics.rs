@@ -1287,6 +1287,12 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     "lorica_log_sink_dropped_total",
     "lorica_log_sink_sent_total",
     "lorica_log_sink_truncated_total",
+    // Capture decisions (Story 10.1 AC #9). The budget is consulted in
+    // `logging`, which runs in the workers, so without aggregation the
+    // supervisor's /metrics would read 0 for every rule in the default
+    // packaged deployment - a feature that works and looks like it does
+    // not.
+    "lorica_captures_total",
 ];
 
 /// Re-export of the worker -> supervisor wire tuple. The lorica
@@ -1363,6 +1369,9 @@ fn resolve_per_worker_counter(
         }
         "lorica_log_sink_truncated_total" => {
             Some((&["sink"], CounterTarget::Vec(&LOG_SINK_TRUNCATED_TOTAL)))
+        }
+        "lorica_captures_total" => {
+            Some((&["rule_id", "outcome"], CounterTarget::Vec(&CAPTURES_TOTAL)))
         }
         _ => None,
     }
@@ -1940,6 +1949,78 @@ static HOT_UPGRADE_DRAIN_SECONDS: Lazy<Histogram> = Lazy::new(|| {
 /// the supervisor's handoff success path after `shutdown_all` returns.
 pub fn observe_hot_upgrade_drain(seconds: f64) {
     HOT_UPGRADE_DRAIN_SECONDS.observe(seconds);
+}
+
+// ---- Traffic capture (Story 10.1 AC #9) ----
+//
+// Cardinality discipline: `rule_id` is operator-controlled but bounded,
+// because it is the primary key of a `capture_rules` row and the proxy
+// only ever reports ids for rules it is tracking a budget for, which is
+// itself capped (`lorica::capture::CAPTURE_MAX_TRACKED_RULES`). Do NOT
+// add a label derived from a request - route, path, status, client -
+// to this family: those are unbounded in a way the rule id is not, and
+// this is the one metric family fed from the per-request path.
+
+/// Capture rules loaded and enabled on this node.
+static CAPTURE_RULES_ACTIVE: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "capture_rules_active",
+        "Capture rules loaded and enabled on this node",
+    )
+});
+
+/// Publish how many capture rules this node currently has loaded.
+///
+/// Set when a configuration snapshot is built, which is the only moment
+/// the set changes. A gauge rather than a counter: it answers "is
+/// anything recording right now", which is the question an operator
+/// asks before looking at the capture directory.
+pub fn set_capture_rules_active(count: i64) {
+    CAPTURE_RULES_ACTIVE.set(count);
+}
+
+/// Capture decisions per rule. Labels: rule_id, outcome.
+static CAPTURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "captures_total",
+        "Capture decisions per rule (outcome=emitted|dropped_rate|dropped_budget|dropped_sink)",
+        &["rule_id", "outcome"],
+    )
+});
+
+/// Record one capture decision.
+///
+/// `outcome` MUST be one of `emitted | dropped_rate | dropped_budget |
+/// dropped_sink`; the counter API does not constrain it, so the call
+/// site enforces (`CaptureAdmission::metric_outcome` is the one that
+/// does for the first three).
+///
+/// `dropped_sink` has no producer yet: it belongs to the writer Story
+/// 10.2 adds, and is declared here so the outcome vocabulary is
+/// complete from the day the family ships. A dashboard built against it
+/// keeps working when the writer lands.
+pub fn inc_capture_outcome(rule_id: &str, outcome: &str) {
+    CAPTURES_TOTAL.with_label_values(&[rule_id, outcome]).inc();
+}
+
+/// Bytes held by in-flight capture buffers on this process.
+static CAPTURE_INFLIGHT_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "capture_inflight_bytes",
+        "Bytes held by in-flight capture buffers on this process",
+    )
+});
+
+/// Publish the node-wide capture budget's current reservation.
+///
+/// Written by the proxy's capture reservation on every grow and
+/// release. In worker mode this is the WORKER's figure: the gauge
+/// aggregation the supervisor does covers counters
+/// ([`PER_WORKER_COUNTERS`]) and a handful of hand-wired gauges, and
+/// this one is not among them, so the supervisor's own `/metrics`
+/// reports its own process rather than the fleet of workers.
+pub fn set_capture_inflight_bytes(bytes: i64) {
+    CAPTURE_INFLIGHT_BYTES.set(bytes);
 }
 
 /// GET /metrics - Prometheus scrape endpoint.

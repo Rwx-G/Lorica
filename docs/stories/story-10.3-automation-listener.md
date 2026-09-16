@@ -113,9 +113,9 @@ touch the other.
 
 - [x] The bind validator: lift the primitives, parameterise by flag name, widen `ReservedPorts`, rewrite `validate_cluster_listen` on top of it (AC #1, #9). The opt-in flag is NOT derived from the flag name: `--cluster-enrollment-listen` shares `--cluster-listen-any`, so a derivation would have named a flag that does not exist. The caller passes the flag, the opt-in and the subject.
 - [ ] Move the pure `ConnectionFilterPolicy` to `lorica-config`, leaving the runtime in the binary. That move brings `ipnet` into `lorica-config`, and when it does, Story 10.1's `validate_cidr` (written without it, because the crate had no CIDR parser) must be folded onto the same parser. Two answers to "is this a CIDR" in one crate is the drift this story exists to avoid. They differ deliberately in what they do with a bad entry, the filter warns and skips while a write-time validator refuses, but they must agree on what a bad entry IS.
-- [ ] AC #4: the token model, its migration, its own HMAC key row, mint, parse and constant-time verify.
-- [ ] AC #1/#3: the listener, its TLS, its accept loop with the source check and the pre-auth budgets.
-- [ ] AC #5/#7: the scope enum, the bearer extractor, the per-request audit and the counter.
+- [x] AC #4: the token model, its migration, its own HMAC key row, mint, parse and constant-time verify.
+- [x] AC #1/#3: the listener, its TLS, its accept loop with the source check and the pre-auth budgets. Nothing starts it yet; the startup wiring is its own slice.
+- [x] AC #5/#7: the scope enum, the bearer middleware (not an extractor: an extractor runs after the scope gate and cannot feed it), the per-request audit. The counter is owed, named in the Debug Log.
 - [ ] AC #2: the follower refusal at startup.
 - [ ] AC #6: the management-API token endpoints and the dashboard sub-page.
 - [ ] AC #8: the CLI helper and the OpenAPI security scheme.
@@ -123,6 +123,29 @@ touch the other.
 - [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, the frontend three.
 
 ## Dev Notes
+
+### An undeclared path must be reachable by nobody
+
+The first implementation defaulted an unlisted path to the widest scope
+and called it fail-closed. It is not. A route added without a scope
+declaration would stay reachable by exactly the tokens that can do the
+most damage, and nothing would say so. `required_scope` returns an
+`Option` now: `None` refuses every token and logs at ERROR, so a missing
+declaration surfaces as a 403 on the first call instead of as a grant
+nobody chose.
+
+### Owed by this story, not yet done
+
+The startup wiring that builds the listener config from
+`--automation-listen` and `automation_allowed_cidrs` and starts the
+server. The hot-upgrade plumbing, all seven points. The metrics, which
+the listener wants and does not have:
+`lorica_automation_requests_total{outcome}`,
+`lorica_automation_source_refused_total`, and one counter each for the
+three pre-auth refusals. A separate OpenAPI document for this plane,
+which Story 10.4 needs anyway. And the `ConnectionFilterPolicy` move
+into `lorica-config`, which would let the listener share the CIDR parser
+rather than using `ipnet` directly.
 
 ### The thing most likely to go wrong
 

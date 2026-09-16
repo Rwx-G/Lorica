@@ -16,6 +16,7 @@ pub mod acme;
 pub mod ai_crawlers;
 pub mod audit;
 pub mod auth;
+pub mod automation;
 pub mod backends;
 pub mod ban;
 pub mod cache;
