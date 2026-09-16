@@ -100,7 +100,7 @@ pub(super) fn spawn_syslog_sink(
                 Ok(rt) => rt.block_on(consumer_loop(id, rx, config, node_id, node_name)),
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to build syslog sink runtime; sink disabled");
-                    super::remove_syslog_lane(id);
+                    super::remove_lane(id);
                 }
             }
         });
@@ -140,7 +140,7 @@ async fn consumer_loop(
             // Terminal: the lane must not survive its consumer, or
             // every event becomes a counted drop forever.
             tracing::warn!(error = %e, "invalid syslog TLS configuration; sink disabled");
-            super::remove_syslog_lane(id);
+            super::remove_lane(id);
             return;
         }
     };

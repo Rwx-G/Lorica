@@ -342,6 +342,16 @@ fn parse_extra_sd(raw: Option<&str>) -> Vec<(String, String)> {
         .collect()
 }
 
+/// What happened to an event offered to a lane, from the hub's point
+/// of view: `Gone` means the receiver is closed and the lane should be
+/// torn out, which is different from a full queue (a drop, but the
+/// consumer is alive and will catch up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneOutcome {
+    Delivered,
+    Gone,
+}
+
 /// One sink lane: the producer side of a bounded queue plus the kind
 /// filter for that sink. `id` is a process-monotonic lane id so a
 /// consumer that dies can tear out exactly its own lane and never a
@@ -366,36 +376,50 @@ impl SinkLane {
         }
     }
 
-    fn offer(&self, event: &SinkEvent) {
+    fn offer(&self, event: &SinkEvent) -> LaneOutcome {
         let kind = event.kind();
         if !self.wants(kind) {
-            return;
+            return LaneOutcome::Delivered;
         }
-        if self.tx.try_send(event.clone()).is_err() {
-            crate::metrics::inc_log_sink_dropped(self.label, kind.as_str());
+        match self.tx.try_send(event.clone()) {
+            Ok(()) => LaneOutcome::Delivered,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                crate::metrics::inc_log_sink_dropped(self.label, kind.as_str());
+                LaneOutcome::Delivered
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                crate::metrics::inc_log_sink_dropped(self.label, kind.as_str());
+                LaneOutcome::Gone
+            }
         }
     }
 }
 
 /// Installed hub state for this process.
+///
+/// A list rather than one field per sink: a lane's identity is its
+/// `id`, removal already worked by id, and the two named fields meant
+/// every new consumer had to be threaded through `wants`, `offer_all`,
+/// `install` and a removal function of its own. Story 10.2 adds a
+/// capture lane; it costs one `register_lane` call.
 #[derive(Default, Clone)]
 struct HubState {
-    syslog: Option<SinkLane>,
-    otlp: Option<SinkLane>,
+    lanes: Vec<SinkLane>,
 }
 
 impl HubState {
     fn wants(&self, kind: SinkKind) -> bool {
-        self.syslog.as_ref().is_some_and(|l| l.wants(kind))
-            || self.otlp.as_ref().is_some_and(|l| l.wants(kind))
+        self.lanes.iter().any(|l| l.wants(kind))
     }
 
     fn offer_all(&self, event: &SinkEvent) {
-        if let Some(lane) = &self.syslog {
-            lane.offer(event);
-        }
-        if let Some(lane) = &self.otlp {
-            lane.offer(event);
+        for lane in &self.lanes {
+            if lane.offer(event) == LaneOutcome::Gone {
+                // The consumer dropped its receiver without saying so.
+                // Tear the lane out rather than counting every future
+                // event as a drop for the life of the process.
+                remove_lane(lane.id);
+            }
         }
     }
 }
@@ -419,14 +443,19 @@ fn syslog_thread_slot() -> &'static parking_lot::Mutex<Option<std::thread::JoinH
 }
 
 /// Install (or replace) this process's sink hub from a configuration
-/// snapshot. The syslog consumer thread is spawned FIRST and its lane
-/// only installed on a successful spawn, so the hub can never claim a
-/// sink with no consumer behind it. When `config.otlp` is set, the
-/// OTLP lane is created and its receiver returned; the caller must
-/// hand it to the OTLP logs consumer (`lorica::otel`). Replacing the
-/// hub drops the previous lanes' senders; each old consumer drains
-/// its remaining queue and exits.
-pub fn install(config: &LogSinksConfig) -> Option<tokio::sync::mpsc::Receiver<SinkEvent>> {
+/// snapshot.
+///
+/// Installs only the lanes whose consumer this function starts itself:
+/// the syslog thread is spawned FIRST and its lane installed only on a
+/// successful spawn. A consumer that lives elsewhere registers its own
+/// lane with [`register_lane`] once it is running, which is the point
+/// of that split.
+///
+/// Replacing the hub drops the previous lanes' senders; each old
+/// consumer drains its remaining queue and exits. A consumer owned
+/// elsewhere must therefore re-register after a reinstall, which is
+/// what the settings-reload path does.
+pub fn install(config: &LogSinksConfig) {
     use std::sync::atomic::Ordering;
 
     let mut state = HubState::default();
@@ -440,7 +469,7 @@ pub fn install(config: &LogSinksConfig) -> Option<tokio::sync::mpsc::Receiver<Si
             config.node_id.clone(),
             config.node_name.clone(),
         ) {
-            state.syslog = Some(SinkLane {
+            state.lanes.push(SinkLane {
                 id,
                 tx,
                 access: syslog_cfg.access_enabled,
@@ -451,34 +480,61 @@ pub fn install(config: &LogSinksConfig) -> Option<tokio::sync::mpsc::Receiver<Si
             *syslog_thread_slot().lock() = Some(handle);
         }
     }
-    let mut otlp_rx = None;
-    if config.otlp {
-        let (tx, rx) = tokio::sync::mpsc::channel::<SinkEvent>(SINK_QUEUE_CAP);
-        let id = LANE_ID.fetch_add(1, Ordering::Relaxed) + 1;
-        state.otlp = Some(SinkLane {
-            id,
-            tx,
-            access: true,
-            waf: true,
-            audit: true,
-            label: "otlp",
-        });
-        otlp_rx = Some(rx);
-    }
     *hub_slot().write() = Arc::new(state);
-    otlp_rx
 }
 
-/// Tear the syslog lane with `id` out of the hub. Called by the
-/// consumer on a terminal failure (invalid TLS material, runtime
-/// build failure) so the hub never keeps offering events to a lane
-/// whose consumer is gone. The id check makes a racing reinstall win.
-pub(super) fn remove_syslog_lane(id: u64) {
+/// Add a lane for a consumer this module does not own, and hand back
+/// the receiving end.
+///
+/// The caller is the consumer: it calls this **after** it is able to
+/// consume, and the returned `Receiver` is the proof. The previous
+/// arrangement had `install` create the OTLP lane and return its
+/// receiver for someone else to wire up, so a failed `init_logs` left
+/// a lane with no consumer behind it, publishing into a queue nobody
+/// read. The settings-reload path logged exactly that and carried on
+/// (backlog #51).
+///
+/// A lane whose receiver is later dropped is torn out on the next
+/// event rather than accumulating drops forever, so the invariant
+/// survives a consumer that dies as well as one that never started.
+pub fn register_lane(
+    label: &'static str,
+    access: bool,
+    waf: bool,
+    audit: bool,
+) -> tokio::sync::mpsc::Receiver<SinkEvent> {
+    use std::sync::atomic::Ordering;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<SinkEvent>(SINK_QUEUE_CAP);
+    let id = LANE_ID.fetch_add(1, Ordering::Relaxed) + 1;
     let slot = hub_slot();
     let mut guard = slot.write();
-    if guard.syslog.as_ref().is_some_and(|l| l.id == id) {
+    let mut next = (**guard).clone();
+    next.lanes.retain(|l| l.label != label);
+    next.lanes.push(SinkLane {
+        id,
+        tx,
+        access,
+        waf,
+        audit,
+        label,
+    });
+    *guard = Arc::new(next);
+    rx
+}
+
+/// Tear the lane with `id` out of the hub. Called by a consumer on a
+/// terminal failure (invalid TLS material, runtime build failure) and
+/// by the hub itself when a lane's receiver turns out to be closed, so
+/// the hub never keeps offering events to a lane whose consumer is
+/// gone. Matching on the id makes a racing reinstall win: a lane
+/// replaced in the meantime has a different id and survives.
+pub(super) fn remove_lane(id: u64) {
+    let slot = hub_slot();
+    let mut guard = slot.write();
+    if guard.lanes.iter().any(|l| l.id == id) {
         let mut next = (**guard).clone();
-        next.syslog = None;
+        next.lanes.retain(|l| l.id != id);
         *guard = Arc::new(next);
     }
 }
@@ -729,15 +785,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn otlp_lane_receives_published_events() {
+    async fn a_registered_lane_receives_published_events() {
         let _guard = test_hub_lock().lock().await;
-        let cfg = LogSinksConfig {
-            syslog: None,
-            otlp: true,
-            node_id: String::new(),
-            node_name: String::new(),
-        };
-        let mut rx = install(&cfg).expect("otlp lane requested");
+        install(&LogSinksConfig::default());
+        let mut rx = register_lane("otlp", true, true, true);
         publish_audit(AuditSinkRecord {
             timestamp: "2026-06-10T00:00:00Z".into(),
             operator_username: "admin".into(),
@@ -751,6 +802,48 @@ mod tests {
         let event = rx.recv().await.expect("event delivered");
         assert_eq!(event.kind(), SinkKind::Audit);
         // Tear the hub down so other tests see a clean slate.
+        install(&LogSinksConfig::default());
+    }
+
+    #[tokio::test]
+    async fn install_alone_registers_no_consumerless_lane() {
+        // The defect this inversion removes: `install` used to create
+        // the otlp lane and hand its receiver to someone else to wire
+        // up, so a failed `init_logs` left the hub publishing into a
+        // queue nobody read (backlog #51). With registration owned by
+        // the consumer, asking for otlp in the config creates nothing.
+        let _guard = test_hub_lock().lock().await;
+        let cfg = LogSinksConfig {
+            syslog: None,
+            otlp: true,
+            node_id: String::new(),
+            node_name: String::new(),
+        };
+        install(&cfg);
+        assert!(!wants(SinkKind::Audit), "no consumer, no lane");
+        install(&LogSinksConfig::default());
+    }
+
+    #[tokio::test]
+    async fn a_lane_whose_receiver_is_dropped_is_torn_out() {
+        // And the other half: a consumer that dies later does not
+        // leave the hub counting every event as a drop forever.
+        let _guard = test_hub_lock().lock().await;
+        install(&LogSinksConfig::default());
+        let rx = register_lane("otlp", true, true, true);
+        assert!(wants(SinkKind::Audit));
+        drop(rx);
+        publish_audit(AuditSinkRecord {
+            timestamp: "2026-06-10T00:00:00Z".into(),
+            operator_username: "admin".into(),
+            operator_role: "SuperAdmin".into(),
+            action: "route.create".into(),
+            target_type: "route".into(),
+            target_id: "r1".into(),
+            ip: "192.0.2.10".into(),
+            chain_hash: "abc".into(),
+        });
+        assert!(!wants(SinkKind::Audit), "the dead lane is gone");
         install(&LogSinksConfig::default());
     }
 }

@@ -421,10 +421,7 @@ mod imp {
     /// Safe to call repeatedly: a previous provider is flushed and
     /// replaced, and the previous consumer thread exits with its
     /// closed lane.
-    pub fn init_logs(
-        cfg: &OtelLogsConfig,
-        mut rx: tokio::sync::mpsc::Receiver<SinkEvent>,
-    ) -> Result<(), String> {
+    pub fn init_logs(cfg: &OtelLogsConfig) -> Result<(), String> {
         if cfg.endpoint.trim().is_empty() {
             return Ok(());
         }
@@ -488,6 +485,10 @@ mod imp {
             .build();
 
         let logger = provider.logger("lorica");
+        // Everything that can fail has succeeded: only now does a lane
+        // exist to publish into. Registering earlier is what left a
+        // queue with no reader behind it (backlog #51).
+        let mut rx = lorica_api::log_sinks::register_lane("otlp", true, true, true);
         let spawned = std::thread::Builder::new()
             .name("lorica-otlp-logs-sink".into())
             .spawn(move || {
@@ -592,12 +593,10 @@ mod imp {
 
     /// No-op stub. The reload path never requests an OTLP logs lane
     /// when the `otel` feature is off (`LogSinksConfig::from_settings`
-    /// is called with `otlp_available = false`), so this only exists
-    /// so call sites compile; the receiver is dropped unread.
-    pub fn init_logs(
-        _cfg: &OtelLogsConfig,
-        _rx: tokio::sync::mpsc::Receiver<lorica_api::log_sinks::SinkEvent>,
-    ) -> Result<(), String> {
+    /// is called with `otlp_available = false`), so this only exists so
+    /// call sites compile. It registers no lane, which is now the same
+    /// statement as "it consumes nothing".
+    pub fn init_logs(_cfg: &OtelLogsConfig) -> Result<(), String> {
         Ok(())
     }
 

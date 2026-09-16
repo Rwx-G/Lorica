@@ -729,27 +729,30 @@ pub async fn apply_log_sinks_from_store(store: &Arc<Mutex<ConfigStore>>) {
         return;
     }
 
-    let otlp_rx = lorica_api::log_sinks::install(&next.sinks);
-    match otlp_rx {
-        Some(rx) => {
-            let cfg = crate::otel::OtelLogsConfig {
-                endpoint: next.otlp_endpoint.clone().unwrap_or_default(),
-                protocol: crate::otel::OtlpProtocol::from_settings(&next.otlp_protocol),
-                service_name: next.otlp_service_name.clone(),
-                auth_header: next.otlp_auth_header.clone(),
-            };
-            match crate::otel::init_logs(&cfg, rx) {
-                Ok(()) => info!(
-                    endpoint = %cfg.endpoint,
-                    protocol = cfg.protocol.as_str(),
-                    "OTLP logs sink (re)installed from settings"
-                ),
-                Err(e) => {
-                    warn!(error = %e, "OTLP logs sink init failed; events on the otlp lane will be dropped")
-                }
+    // Installs the lanes whose consumer `log_sinks` owns (syslog). The
+    // OTLP consumer lives here, so it registers its own lane below,
+    // and only once it is running: a lane that exists before its
+    // consumer does is a queue nobody reads (backlog #51).
+    lorica_api::log_sinks::install(&next.sinks);
+    if next.sinks.otlp {
+        let cfg = crate::otel::OtelLogsConfig {
+            endpoint: next.otlp_endpoint.clone().unwrap_or_default(),
+            protocol: crate::otel::OtlpProtocol::from_settings(&next.otlp_protocol),
+            service_name: next.otlp_service_name.clone(),
+            auth_header: next.otlp_auth_header.clone(),
+        };
+        match crate::otel::init_logs(&cfg) {
+            Ok(()) => info!(
+                endpoint = %cfg.endpoint,
+                protocol = cfg.protocol.as_str(),
+                "OTLP logs sink (re)installed from settings"
+            ),
+            Err(e) => {
+                warn!(error = %e, "OTLP logs sink init failed; no otlp lane is registered")
             }
         }
-        None => crate::otel::shutdown_logs(),
+    } else {
+        crate::otel::shutdown_logs();
     }
     if let Some(syslog) = &next.sinks.syslog {
         info!(
