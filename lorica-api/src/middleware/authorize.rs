@@ -103,6 +103,30 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
         return Role::Operator;
     }
 
+    // Traffic-capture rules (Story 10.1). A capture rule writes real
+    // request and response bodies to disk, so arming or editing one is
+    // SuperAdmin, and so is reading one back: the stored rule spells
+    // out the paths, headers and source ranges a node records.
+    //
+    // Two openings sit below that floor, both deliberate. The listing
+    // is Operator+ so an on-call operator can see WHICH rules are
+    // armed without being able to read what any of them records. And
+    // `disable` is Operator+ because stopping a recorder is the safe
+    // direction: someone paged at 3am about a capture filling a disk
+    // must be able to end it without waking the SuperAdmin who armed
+    // it. Arming still takes the higher role.
+    if path == "/api/v1/capture/rules"
+        && (method == http::Method::GET || method == http::Method::HEAD)
+    {
+        return Role::Operator;
+    }
+    if path.starts_with("/api/v1/capture/rules/") && path.ends_with("/disable") {
+        return Role::Operator;
+    }
+    if path == "/api/v1/capture/rules" || path.starts_with("/api/v1/capture/rules/") {
+        return Role::SuperAdmin;
+    }
+
     if method == http::Method::GET || method == http::Method::HEAD {
         // `format=key` / `format=full` return the private key; the
         // whole download endpoint is treated as secret material

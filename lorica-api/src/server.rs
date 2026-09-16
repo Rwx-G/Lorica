@@ -638,6 +638,33 @@ pub fn build_router(
             "/api/v1/routes/{id}",
             delete(crate::routes::delete_route).layer(rl("routes_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
         )
+        // Traffic-capture rules (Story 10.1). Role floors live in the
+        // authorize middleware: the listing and `disable` are
+        // Operator+, everything that arms or edits a recorder is
+        // SuperAdmin.
+        .route(
+            "/api/v1/capture/rules",
+            get(crate::capture::list_capture_rules)
+                .post(crate::capture::create_capture_rule)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("capture_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/capture/rules/{id}",
+            get(crate::capture::get_capture_rule)
+                .put(crate::capture::update_capture_rule)
+                .delete(crate::capture::delete_capture_rule)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("capture_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/capture/rules/{id}/disable",
+            post(crate::capture::disable_capture_rule).layer(rl(
+                "capture_cud",
+                RL_ROUTES_CUD,
+                RL_WINDOW_S,
+            )),
+        )
         .route(
             "/api/v1/validate/mtls-pem",
             post(crate::routes::validate_mtls_pem),

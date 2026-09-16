@@ -29,6 +29,18 @@ pub enum ApiError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// 422 Unprocessable Entity: the body parsed, and its content is
+    /// refused by a model rule.
+    ///
+    /// Distinct from [`ApiError::BadRequest`] because axum already
+    /// answers 422 when a `deny_unknown_fields` body carries a field
+    /// the server owns (a client-supplied `expires_at`, a runtime
+    /// counter). A handler that then answered 400 for a cap over its
+    /// limit would split one class of refusal across two statuses on
+    /// the same endpoint.
+    #[error("unprocessable: {0}")]
+    Unprocessable(String),
+
     /// 429 Too Many Requests: client exceeded a per-bucket rate
     /// limiter. The inner `u64` is the Retry-After value in
     /// seconds (0 if unknown; the response still emits the
@@ -82,6 +94,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -94,6 +107,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => "unauthorized",
             ApiError::Forbidden(_) => "forbidden",
             ApiError::Conflict(_) => "conflict",
+            ApiError::Unprocessable(_) => "unprocessable_entity",
             ApiError::RateLimited(_) => "rate_limited",
             ApiError::Internal(_) => "internal_error",
         }
@@ -197,6 +211,10 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(
+            ApiError::Unprocessable("x".into()).status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
             ApiError::RateLimited(30).status_code(),
             StatusCode::TOO_MANY_REQUESTS
         );
@@ -213,6 +231,10 @@ mod tests {
         assert_eq!(ApiError::Unauthorized("x".into()).code(), "unauthorized");
         assert_eq!(ApiError::Forbidden("x".into()).code(), "forbidden");
         assert_eq!(ApiError::Conflict("x".into()).code(), "conflict");
+        assert_eq!(
+            ApiError::Unprocessable("x".into()).code(),
+            "unprocessable_entity"
+        );
         assert_eq!(ApiError::RateLimited(30).code(), "rate_limited");
         assert_eq!(ApiError::Internal("x".into()).code(), "internal_error");
     }

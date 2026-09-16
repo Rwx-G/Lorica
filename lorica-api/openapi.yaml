@@ -54,6 +54,8 @@ tags:
     description: Admin audit log (tamper-evident hash chain)
   - name: Cluster
     description: Fleet registry, join tokens and node lifecycle (control plane), fleet status and leave (follower)
+  - name: Capture
+    description: Traffic-capture rules (Story 10.1); a rule records real request and response bodies, so every operation names its role floor
 
 paths:
   # ---------------------------------------------------------------------------
@@ -602,6 +604,179 @@ paths:
                 $ref: "#/components/schemas/MessageResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Capture rules (Story 10.1)
+  # ---------------------------------------------------------------------------
+  /api/v1/capture/rules:
+    get:
+      tags: [Capture]
+      summary: List the capture rules on this node (Operator+)
+      description: >-
+        The listing sits one role below reading a single rule: an on-call
+        operator has to see WHICH recorders are armed without being able to
+        read the paths, headers and source ranges any of them matches.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Every capture rule, oldest id first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      rules:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/CaptureRule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Capture]
+      summary: Arm a new capture rule (SuperAdmin)
+      description: >-
+        `expires_at` is materialised server-side from `limits.ttl_seconds`
+        and cannot be supplied; neither can the two capture counters. The
+        body is `deny_unknown_fields`, so sending any of them is a 422.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CaptureRuleRequest"
+      responses:
+        "201":
+          description: Capture rule created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CaptureRule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/capture/rules/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [Capture]
+      summary: Read one capture rule (SuperAdmin)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The capture rule
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CaptureRule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Capture]
+      summary: Replace one capture rule (SuperAdmin)
+      description: >-
+        A full replace, not a patch. `created_at`, `created_by` and both
+        capture counters are kept from the stored row, and `expires_at` is
+        recomputed as `created_at` plus the submitted `limits.ttl_seconds`,
+        so no sequence of edits carries a rule past the seven-day retention
+        ceiling from when it was created.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CaptureRuleRequest"
+      responses:
+        "200":
+          description: The replaced capture rule
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CaptureRule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+    delete:
+      tags: [Capture]
+      summary: Delete one capture rule (SuperAdmin)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Capture rule deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/capture/rules/{id}/disable:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    post:
+      tags: [Capture]
+      summary: Stop one capture rule (Operator+)
+      description: >-
+        Deliberately one role below creating a rule. Arming a recorder
+        decides that production bodies get written to disk; stopping one
+        only decides that they stop, and an operator paged about a capture
+        filling a disk must be able to end it without waking a SuperAdmin.
+        Idempotent: disabling an already-disabled rule is a 200.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The rule, now disabled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CaptureRule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -4928,6 +5103,192 @@ components:
         return_status:
           type: integer
 
+    CaptureMatch:
+      type: object
+      description: Which requests a rule considers. Every populated field narrows; an empty block considers every request on the route.
+      properties:
+        source_cidrs:
+          type: array
+          description: Client source addresses as CIDRs or bare IPs. Empty means any.
+          items:
+            type: string
+        methods:
+          type: array
+          description: Uppercase HTTP methods. Empty means any.
+          items:
+            type: string
+        path_prefix:
+          type: string
+          nullable: true
+        path_regex:
+          type: string
+          nullable: true
+          description: Regex over the request path, at most 4096 bytes of source.
+        headers:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              match_type:
+                type: string
+                enum: [exact, prefix, regex]
+              value:
+                type: string
+
+    CaptureEmit:
+      type: object
+      description: >-
+        Which of the considered requests are written out. Exactly one
+        shape is legal: `always: true` alone, or at least one of the other
+        three with `always` false.
+      properties:
+        always:
+          type: boolean
+        status:
+          type: array
+          items:
+            oneOf:
+              - type: string
+                enum: [client_error, server_error, client_aborted]
+              - type: object
+                properties:
+                  exact:
+                    type: integer
+        min_latency_ms:
+          type: integer
+          nullable: true
+        upstream_error:
+          type: boolean
+
+    CaptureScope:
+      type: object
+      description: How much of a captured exchange is kept. Headers and the request line are always kept.
+      properties:
+        request_body:
+          type: boolean
+        response_body:
+          type: boolean
+        request_body_max_bytes:
+          type: integer
+          description: Non-zero, at most 4194304.
+        response_body_max_bytes:
+          type: integer
+          description: Non-zero, at most 4194304.
+
+    CaptureLimits:
+      type: object
+      description: What stops a rule - a total, a rate, and a clock.
+      properties:
+        max_captures:
+          type: integer
+          description: Non-zero, at most 10000.
+        rate_per_minute:
+          type: integer
+          description: Non-zero, at most 10000. Zero is refused rather than read as unlimited.
+        ttl_seconds:
+          type: integer
+          description: Non-zero, at most 604800 (seven days). Becomes the absolute `expires_at`.
+
+    CaptureOutput:
+      type: object
+      description: Where captures land. Both fields absent means the node's own capture directory and size budget.
+      properties:
+        dir:
+          type: string
+          nullable: true
+        max_dir_bytes:
+          type: integer
+          nullable: true
+
+    CaptureRedaction:
+      type: object
+      description: >-
+        Names redacted IN ADDITION to the always-redacted set the capture
+        writer applies. An empty block still produces a redacted capture.
+      properties:
+        headers:
+          type: array
+          items:
+            type: string
+        query:
+          type: array
+          items:
+            type: string
+
+    CaptureRuleRequest:
+      type: object
+      description: >-
+        Body for creating or replacing a capture rule. Unknown fields are
+        refused, which is what makes `expires_at`, `captures_emitted` and
+        `captures_dropped` server-owned rather than merely ignored.
+      required: [name, route_id]
+      properties:
+        name:
+          type: string
+        route_id:
+          type: string
+          description: Must name an existing route; a route that does not exist is a 422 on this field.
+        enabled:
+          type: boolean
+          default: true
+        match:
+          $ref: "#/components/schemas/CaptureMatch"
+        emit:
+          $ref: "#/components/schemas/CaptureEmit"
+        capture:
+          $ref: "#/components/schemas/CaptureScope"
+        limits:
+          $ref: "#/components/schemas/CaptureLimits"
+        output:
+          $ref: "#/components/schemas/CaptureOutput"
+        redact:
+          $ref: "#/components/schemas/CaptureRedaction"
+
+    CaptureRule:
+      type: object
+      description: One traffic-capture rule, always bound to exactly one route.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        route_id:
+          type: string
+        enabled:
+          type: boolean
+        match:
+          $ref: "#/components/schemas/CaptureMatch"
+        emit:
+          $ref: "#/components/schemas/CaptureEmit"
+        capture:
+          $ref: "#/components/schemas/CaptureScope"
+        limits:
+          $ref: "#/components/schemas/CaptureLimits"
+        output:
+          $ref: "#/components/schemas/CaptureOutput"
+        redact:
+          $ref: "#/components/schemas/CaptureRedaction"
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: Absolute UTC instant, so every node in a fleet stops the rule at the same moment.
+        captures_emitted:
+          type: integer
+          readOnly: true
+          description: This node's process counter. Read-only; refused on input.
+        captures_dropped:
+          type: integer
+          readOnly: true
+          description: This node's process counter. Read-only; refused on input.
+
     Backend:
       type: object
       properties:
@@ -5241,6 +5602,12 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     NotFound:
       description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unprocessable:
+      description: The body parsed but a model rule refuses its content
       content:
         application/json:
           schema:

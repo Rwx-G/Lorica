@@ -7698,3 +7698,614 @@ fn hashing_the_same_password_twice_gives_different_salts() {
     let b = hash_password("same").expect("hashing");
     assert_ne!(a, b);
 }
+
+// ---- Traffic-capture rules (Story 10.1) ----
+
+/// Create a route through the API and return its id, so a capture rule
+/// has something real to hang on.
+async fn seed_capture_route(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    admin: &str,
+    hostname: &str,
+) -> String {
+    let resp = send(
+        state,
+        session_store,
+        rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        admin,
+        Some(serde_json::json!({
+            "hostname": hostname,
+            "path_prefix": "/",
+            "load_balancing": "round_robin"
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "test setup: route");
+    body_json(resp).await["data"]["id"]
+        .as_str()
+        .expect("test setup: route id")
+        .to_string()
+}
+
+/// A capture rule body that validates, so each test below changes
+/// exactly one thing and the failure it asserts is the thing it changed.
+fn capture_body(route_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "checkout 5xx",
+        "route_id": route_id,
+        "emit": { "status": ["server_error"] },
+        "limits": { "ttl_seconds": 900 },
+    })
+}
+
+#[tokio::test]
+async fn capture_listing_is_operator_and_refused_below() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-op-list",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-viewer-list",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    for (cookie, expected, who) in [
+        (&operator, StatusCode::OK, "operator"),
+        (&viewer, StatusCode::FORBIDDEN, "viewer"),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            "/api/v1/capture/rules",
+            cookie,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), expected, "{who}");
+    }
+}
+
+#[tokio::test]
+async fn capture_create_read_update_delete_are_super_admin_only() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-op-cud",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap1.example",
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &operator,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "an operator may not arm a recorder"
+    );
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let rule_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .expect("rule id")
+        .to_string();
+
+    for (method, body) in [
+        ("GET", None),
+        ("PUT", Some(capture_body(&route_id))),
+        ("DELETE", None),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            &format!("/api/v1/capture/rules/{rule_id}"),
+            &operator,
+            body,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} for operator"
+        );
+    }
+
+    for (method, body, expected) in [
+        ("GET", None, StatusCode::OK),
+        ("PUT", Some(capture_body(&route_id)), StatusCode::OK),
+        ("DELETE", None, StatusCode::OK),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            &format!("/api/v1/capture/rules/{rule_id}"),
+            &admin,
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), expected, "{method} for admin");
+    }
+}
+
+#[tokio::test]
+async fn an_operator_can_stop_a_capture_it_could_never_have_started() {
+    // The asymmetry is the point: arming a recorder writes production
+    // bodies to disk, stopping one only stops that.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-op-disable",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-viewer-disable",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap2.example",
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    let created = body_json(resp).await;
+    assert_eq!(created["data"]["enabled"], true);
+    let rule_id = created["data"]["id"].as_str().expect("rule id").to_string();
+    let disable = format!("/api/v1/capture/rules/{rule_id}/disable");
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        &disable,
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "viewer");
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        &disable,
+        &operator,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "operator");
+    assert_eq!(body_json(resp).await["data"]["enabled"], false);
+
+    // The same operator still cannot arm one.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &operator,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_created_rule_expires_at_now_plus_its_ttl() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap3.example",
+    )
+    .await;
+
+    let before = chrono::Utc::now();
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = body_json(resp).await;
+
+    let expires = chrono::DateTime::parse_from_rfc3339(
+        body["data"]["expires_at"].as_str().expect("expires_at"),
+    )
+    .expect("expires_at parses")
+    .with_timezone(&chrono::Utc);
+    let drift = (expires - before).num_seconds() - 900;
+    assert!(
+        (0..5).contains(&drift),
+        "expires_at must be creation plus ttl_seconds, drifted {drift}s"
+    );
+}
+
+#[tokio::test]
+async fn a_client_supplied_expires_at_is_refused() {
+    // The instant is server-owned: a client that picks it can outlive
+    // the seven-day retention ceiling by writing its own date.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap4.example",
+    )
+    .await;
+
+    let mut body = capture_body(&route_id);
+    body["expires_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn capture_counters_are_refused_on_input() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap5.example",
+    )
+    .await;
+
+    for counter in ["captures_emitted", "captures_dropped"] {
+        let mut body = capture_body(&route_id);
+        body[counter] = serde_json::json!(0);
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/capture/rules",
+            &admin,
+            Some(body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{counter}");
+    }
+}
+
+#[tokio::test]
+async fn a_route_id_naming_no_route_names_the_field_instead_of_faulting() {
+    // Without the pre-check the foreign key raises a driver error and
+    // the client gets a 500 that names nothing.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body("no-such-route")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let message = body_json(resp).await["error"]["message"]
+        .as_str()
+        .expect("message")
+        .to_string();
+    assert!(message.contains("route_id"), "{message}");
+}
+
+#[tokio::test]
+async fn each_refused_capture_rule_names_the_field_that_refused_it() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap6.example",
+    )
+    .await;
+
+    let no_route = {
+        let mut body = capture_body(&route_id);
+        body["route_id"] = serde_json::json!("");
+        (body, "route_id")
+    };
+    let unconstrained_emit = {
+        let mut body = capture_body(&route_id);
+        body["emit"] = serde_json::json!({});
+        (body, "emit.always")
+    };
+    let always_plus_predicate = {
+        let mut body = capture_body(&route_id);
+        body["emit"] = serde_json::json!({ "always": true, "upstream_error": true });
+        (body, "emit.always")
+    };
+    let over_the_cap = {
+        let mut body = capture_body(&route_id);
+        body["limits"] = serde_json::json!({
+            "ttl_seconds": lorica_config::models::CAPTURE_TTL_SECONDS_CAP + 1
+        });
+        (body, "limits.ttl_seconds")
+    };
+
+    for (body, field) in [
+        no_route,
+        unconstrained_emit,
+        always_plus_predicate,
+        over_the_cap,
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/capture/rules",
+            &admin,
+            Some(body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        let message = body_json(resp).await["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_string();
+        assert!(message.contains(field), "expected {field} in: {message}");
+    }
+}
+
+#[tokio::test]
+async fn a_put_preserves_created_at_created_by_and_both_counters() {
+    // Resetting the counters on an edit would make a rule that has
+    // already spent its budget look untouched.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap7.example",
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    let created = body_json(resp).await;
+    let rule_id = created["data"]["id"].as_str().expect("rule id").to_string();
+
+    {
+        let store = state.store.lock().await;
+        store
+            .bump_capture_counters(&rule_id, 7, 3)
+            .expect("test setup: counter bump");
+    }
+
+    let mut edited = capture_body(&route_id);
+    edited["name"] = serde_json::json!("renamed");
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/capture/rules/{rule_id}"),
+        &admin,
+        Some(edited),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let updated = body_json(resp).await;
+
+    assert_eq!(updated["data"]["name"], "renamed");
+    assert_eq!(updated["data"]["created_at"], created["data"]["created_at"]);
+    assert_eq!(updated["data"]["created_by"], created["data"]["created_by"]);
+    assert_eq!(updated["data"]["captures_emitted"], 7);
+    assert_eq!(updated["data"]["captures_dropped"], 3);
+}
+
+#[tokio::test]
+async fn deleting_an_unknown_capture_rule_is_404() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        "/api/v1/capture/rules/no-such-rule",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn every_capture_mutation_lands_in_the_audit_log() {
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(data_dir.path()).expect("test setup: log store"),
+    ));
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap8.example",
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    let rule_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .expect("rule id")
+        .to_string();
+
+    for (method, uri, body) in [
+        (
+            "PUT",
+            format!("/api/v1/capture/rules/{rule_id}"),
+            Some(capture_body(&route_id)),
+        ),
+        (
+            "POST",
+            format!("/api/v1/capture/rules/{rule_id}/disable"),
+            None,
+        ),
+        ("DELETE", format!("/api/v1/capture/rules/{rule_id}"), None),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            &uri,
+            &admin,
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{method} {uri}");
+    }
+
+    let log_store = state.log_store.clone().expect("log store");
+    let (rows, _total) = log_store
+        .query_audit(&crate::audit::AuditQuery {
+            operator: None,
+            action_prefix: Some("capture.".to_string()),
+            from: None,
+            to: None,
+            limit: 50,
+            before_id: None,
+            node_id: None,
+        })
+        .expect("audit query");
+
+    let mut actions: Vec<&str> = rows.iter().map(|r| r.action.as_str()).collect();
+    actions.sort_unstable();
+    assert_eq!(
+        actions,
+        vec![
+            "capture.create",
+            "capture.delete",
+            "capture.disable",
+            "capture.update"
+        ]
+    );
+    for row in &rows {
+        assert_eq!(row.operator_username, "admin");
+        assert_eq!(row.target_type, "capture_rule");
+        assert_eq!(row.target_id, rule_id);
+    }
+}

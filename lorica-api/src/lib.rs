@@ -19,6 +19,7 @@ pub mod auth;
 pub mod backends;
 pub mod ban;
 pub mod cache;
+pub mod capture;
 pub mod cert_export;
 pub mod certificates;
 pub mod cluster;
