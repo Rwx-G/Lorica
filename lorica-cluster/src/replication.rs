@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
 
 use lorica_command::RpcEndpoint;
 use tokio::task::JoinSet;
@@ -117,6 +117,39 @@ pub struct ConfigPayload {
     pub blob: Vec<u8>,
 }
 
+/// Where a round gets the payload for one recipient.
+///
+/// One blob for the whole fleet is over: `node_selector` is evaluated
+/// on the control plane now, so two nodes correctly converged on the
+/// same generation legitimately hold different bytes (Story 10.0). The
+/// generation is common to the round; the blob and its hash are not.
+pub trait PayloadSource: Send + Sync {
+    /// The generation every recipient in this round is offered.
+    fn generation(&self) -> u64;
+    /// The payload for one recipient.
+    fn payload_for(&self, node_id: &str) -> ConfigPayload;
+    /// The hash of the control plane's own full view, used as the
+    /// fleet's identity and for change detection. Not what any single
+    /// recipient reports back.
+    fn fleet_hash(&self) -> String;
+}
+
+/// A single blob for everyone: the pre-Story-10.0 behaviour, kept for
+/// tests and for any caller with nothing to filter on.
+impl PayloadSource for ConfigPayload {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn payload_for(&self, _node_id: &str) -> ConfigPayload {
+        self.clone()
+    }
+
+    fn fleet_hash(&self) -> String {
+        self.hash.clone()
+    }
+}
+
 impl ConfigPayload {
     /// The version half of this payload.
     pub fn version(&self) -> ConfigVersion {
@@ -150,7 +183,17 @@ impl ConfigPayload {
 #[derive(Clone)]
 pub struct AcceptedConfig {
     version: Arc<ArcSwap<ConfigVersion>>,
-    payload: Arc<ArcSwapOption<ConfigPayload>>,
+    /// The accepted generation's source, kept rather than the bytes it
+    /// produced.
+    ///
+    /// A pull must answer with the cut its caller is entitled to, not
+    /// with the control plane's full view, or the disclosure Story 10.0
+    /// closes would simply move from the push path to the pull path.
+    /// Holding the source rather than a map of what the round offered
+    /// also answers the node that joined after the round: it was in no
+    /// round, and its cut is computed on demand instead of sending it
+    /// the fleet's configuration for want of an entry.
+    source: Arc<Mutex<Option<Arc<dyn PayloadSource>>>>,
 }
 
 impl Default for AcceptedConfig {
@@ -166,7 +209,7 @@ impl AcceptedConfig {
     pub fn new() -> Self {
         Self {
             version: Arc::new(ArcSwap::from_pointee(ConfigVersion::default())),
-            payload: Arc::new(ArcSwapOption::empty()),
+            source: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -175,28 +218,48 @@ impl AcceptedConfig {
         (**self.version.load()).clone()
     }
 
-    /// The encoded payload a convergence pull is answered from, or
-    /// `None` before the first publication.
-    pub fn payload(&self) -> Option<Arc<ConfigPayload>> {
-        self.payload.load_full()
+    /// The payload `node_id` is entitled to at the accepted
+    /// generation, or `None` before the first publication.
+    ///
+    /// The lock is released before the cut is computed: encoding one
+    /// recipient's configuration must not hold up every other pull.
+    pub fn payload_for(&self, node_id: &str) -> Option<ConfigPayload> {
+        let source = self
+            .source
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()?;
+        Some(source.payload_for(node_id))
     }
 
-    /// The shared version slot, handed to
-    /// [`crate::listener::OperationalConfig::config_version`] so the
-    /// accept path reads it with no lock.
-    pub fn version_handle(&self) -> Arc<ArcSwap<ConfigVersion>> {
-        Arc::clone(&self.version)
+    /// The version `node_id` is expected to hold at the accepted
+    /// generation: the fleet's generation, with the hash of that
+    /// node's own payload.
+    ///
+    /// Every answer addressed to a node compares against this rather
+    /// than against [`Self::version`], because since Story 10.0 the
+    /// fleet hash is the hash of a blob no follower receives. A node
+    /// the accepted source has nothing for, and a listener with no
+    /// fleet layer, fall back to the fleet version.
+    pub fn expected_for(&self, node_id: &str) -> ConfigVersion {
+        match self.payload_for(node_id) {
+            Some(payload) => payload.version(),
+            None => self.version(),
+        }
     }
 
     /// Publish a generation the fleet has accepted.
     ///
-    /// The payload lands BEFORE the version, so a follower that learns
-    /// version N from a heartbeat can always be served payload N; the
-    /// reverse order would leave a window where a node is told it is
-    /// behind and then handed the previous generation.
-    pub fn publish(&self, payload: ConfigPayload) {
-        let version = payload.version();
-        self.payload.store(Some(Arc::new(payload)));
+    /// The source lands BEFORE the version, so a follower that learns
+    /// version N from a heartbeat can always be served generation N;
+    /// the reverse order would leave a window where a node is told it
+    /// is behind and then handed the previous generation.
+    pub fn publish(&self, source: Arc<dyn PayloadSource>) {
+        let version = ConfigVersion {
+            generation: source.generation(),
+            hash: source.fleet_hash(),
+        };
+        *self.source.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
         self.version.store(Arc::new(version));
     }
 }
@@ -211,8 +274,14 @@ impl AcceptedConfig {
 pub struct ReplicationReport {
     /// The generation this round pushed.
     pub generation: u64,
-    /// Canonical hash of that generation.
+    /// Canonical hash of the control plane's own full view at that
+    /// generation. Since Story 10.0 this is NOT what any single
+    /// recipient reports back: each is offered the cut it is entitled
+    /// to, and `offered` carries the hash each one actually received.
     pub hash: String,
+    /// The hash offered to each addressed node, in the order the round
+    /// addressed them.
+    pub offered: Vec<(String, String)>,
     /// Unix seconds when the round started.
     pub started_unix: u64,
     /// Unix seconds when the round finished.
@@ -412,11 +481,12 @@ impl Replicator {
         &self,
         sessions: &SessionRegistry,
         accepted: &AcceptedConfig,
-        payload: ConfigPayload,
+        payloads: Arc<dyn PayloadSource>,
     ) -> ReplicationReport {
         let _round = self.round.lock().await;
-        self.in_flight.store(payload.generation, Ordering::Relaxed);
-        let report = self.run_round(sessions, accepted, payload).await;
+        self.in_flight
+            .store(payloads.generation(), Ordering::Relaxed);
+        let report = self.run_round(sessions, accepted, payloads).await;
         self.in_flight.store(0, Ordering::Relaxed);
         *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(report.clone());
         report
@@ -426,11 +496,11 @@ impl Replicator {
         &self,
         sessions: &SessionRegistry,
         accepted: &AcceptedConfig,
-        payload: ConfigPayload,
+        payloads: Arc<dyn PayloadSource>,
     ) -> ReplicationReport {
         let mut report = ReplicationReport {
-            generation: payload.generation,
-            hash: payload.hash.clone(),
+            generation: payloads.generation(),
+            hash: payloads.fleet_hash(),
             started_unix: unix_now(),
             ..ReplicationReport::default()
         };
@@ -453,10 +523,14 @@ impl Replicator {
         for (node_id, endpoint) in &targets {
             let node_id = node_id.clone();
             let endpoint = endpoint.clone();
+            // One payload per recipient: what this node is entitled to,
+            // cut on the control plane (Story 10.0).
+            let mine = payloads.payload_for(&node_id);
+            report.offered.push((node_id.clone(), mine.hash.clone()));
             let request = ClusterRequest::config_prepare(ConfigPrepare {
-                generation: payload.generation,
-                hash: payload.hash.clone(),
-                blob: payload.blob.clone(),
+                generation: mine.generation,
+                hash: mine.hash,
+                blob: mine.blob,
             });
             let deadline = self.per_node_deadline;
             outcomes.spawn(async move {
@@ -514,7 +588,7 @@ impl Replicator {
             // The control plane is now ahead of its own fleet, which is
             // the honest state and what the caller logs.
             report.aborted = true;
-            abort_all(&prepared, payload.generation, self.per_node_deadline).await;
+            abort_all(&prepared, payloads.generation(), self.per_node_deadline).await;
             finish(&mut report);
             return report;
         }
@@ -523,13 +597,18 @@ impl Replicator {
         // and the generation becomes the one the fleet converges on.
         // Every commit below, and every pull from here on, refers to
         // it.
-        accepted.publish(payload.clone());
+        // The published version carries the control plane's own hash,
+        // which is the fleet's identity; what each node holds is its
+        // own cut, and a pull is answered from the same source the
+        // round pushed from.
+        accepted.publish(Arc::clone(&payloads));
 
         let mut commits: JoinSet<(String, Result<AppliedConfig, String>)> = JoinSet::new();
         for (node_id, endpoint) in prepared {
             let deadline = self.per_node_deadline;
-            let generation = payload.generation;
-            let hash = payload.hash.clone();
+            let mine = payloads.payload_for(&node_id);
+            let generation = mine.generation;
+            let hash = mine.hash;
             commits.spawn(async move {
                 let outcome = commit_one(&endpoint, generation, &hash, deadline).await;
                 (node_id, outcome)
@@ -989,7 +1068,9 @@ mod tests {
         fast(&mut replicator);
         let accepted = AcceptedConfig::new();
 
-        let report = replicator.replicate(&registry, &accepted, payload(7)).await;
+        let report = replicator
+            .replicate(&registry, &accepted, Arc::new(payload(7)))
+            .await;
         assert_eq!(report.targets, vec!["node-a", "node-b"]);
         assert_eq!(report.prepared, vec!["node-a", "node-b"]);
         assert_eq!(report.committed, vec!["node-a", "node-b"]);
@@ -1027,7 +1108,9 @@ mod tests {
         fast(&mut replicator);
         let accepted = AcceptedConfig::new();
 
-        let report = replicator.replicate(&registry, &accepted, payload(8)).await;
+        let report = replicator
+            .replicate(&registry, &accepted, Arc::new(payload(8)))
+            .await;
         assert!(report.aborted);
         assert_eq!(report.prepared, vec!["node-a"]);
         assert!(report.committed.is_empty());
@@ -1052,7 +1135,7 @@ mod tests {
             "an aborted generation must never become the version the fleet converges on"
         );
         assert!(
-            accepted.payload().is_none(),
+            accepted.payload_for("node-a").is_none(),
             "an aborted generation must not be servable by a convergence pull"
         );
         drop((good, bad));
@@ -1082,14 +1165,16 @@ mod tests {
         // own, one node would veto every generation forever at no cost.
         for generation in 1..DEFAULT_QUARANTINE_THRESHOLD as u64 + 1 {
             let report = replicator
-                .replicate(&registry, &accepted, payload(generation))
+                .replicate(&registry, &accepted, Arc::new(payload(generation)))
                 .await;
             assert!(report.aborted, "generation {generation}");
         }
         assert!(replicator.is_quarantined("node-b"));
 
         // Quarantined, it is skipped and the fleet moves again.
-        let report = replicator.replicate(&registry, &accepted, payload(9)).await;
+        let report = replicator
+            .replicate(&registry, &accepted, Arc::new(payload(9)))
+            .await;
         assert!(!report.aborted);
         assert_eq!(report.committed, vec!["node-a"]);
         assert_eq!(report.skipped_quarantined, vec!["node-b"]);
@@ -1110,7 +1195,9 @@ mod tests {
         fast(&mut replicator);
         let accepted = AcceptedConfig::new();
 
-        let report = replicator.replicate(&registry, &accepted, payload(6)).await;
+        let report = replicator
+            .replicate(&registry, &accepted, Arc::new(payload(6)))
+            .await;
         assert_eq!(report.prepared, vec!["node-a"]);
         assert!(
             report.committed.is_empty(),
@@ -1147,7 +1234,7 @@ mod tests {
 
         for generation in 1..=2 {
             let report = replicator
-                .replicate(&registry, &accepted, payload(generation))
+                .replicate(&registry, &accepted, Arc::new(payload(generation)))
                 .await;
             assert!(!report.aborted, "a transport failure must not veto a round");
             assert_eq!(report.committed, vec!["node-a"]);
@@ -1157,20 +1244,26 @@ mod tests {
         assert!(!replicator.is_quarantined("node-b"));
 
         // Third consecutive eviction: quarantined.
-        let report = replicator.replicate(&registry, &accepted, payload(3)).await;
+        let report = replicator
+            .replicate(&registry, &accepted, Arc::new(payload(3)))
+            .await;
         assert_eq!(report.evicted.len(), 1);
         assert!(replicator.is_quarantined("node-b"));
         assert_eq!(replicator.quarantined(), vec!["node-b"]);
 
         // From now on it is not even addressed.
-        let report = replicator.replicate(&registry, &accepted, payload(4)).await;
+        let report = replicator
+            .replicate(&registry, &accepted, Arc::new(payload(4)))
+            .await;
         assert_eq!(report.targets, vec!["node-a"]);
         assert_eq!(report.skipped_quarantined, vec!["node-b"]);
         assert!(report.evicted.is_empty());
 
         assert!(replicator.release("node-b"));
         assert!(!replicator.release("node-b"), "already released");
-        let report = replicator.replicate(&registry, &accepted, payload(5)).await;
+        let report = replicator
+            .replicate(&registry, &accepted, Arc::new(payload(5)))
+            .await;
         assert_eq!(report.targets, vec!["node-a", "node-b"]);
         assert_eq!(good.prepares.load(Ordering::SeqCst), 5);
         drop((good, silent));
@@ -1199,7 +1292,9 @@ mod tests {
         fast(&mut replicator);
         let accepted = AcceptedConfig::new();
 
-        let report = replicator.replicate(&registry, &accepted, payload(9)).await;
+        let report = replicator
+            .replicate(&registry, &accepted, Arc::new(payload(9)))
+            .await;
         assert_eq!(report.targets, vec!["node-a"]);
         assert_eq!(report.skipped_break_glass, vec!["node-b"]);
         assert_eq!(report.committed, vec!["node-a"]);
@@ -1259,7 +1354,9 @@ mod tests {
         let replicator = Replicator::new();
         let accepted = AcceptedConfig::new();
         assert_eq!(replicator.last_report(), None);
-        let report = replicator.replicate(&registry, &accepted, payload(1)).await;
+        let report = replicator
+            .replicate(&registry, &accepted, Arc::new(payload(1)))
+            .await;
         assert!(report.targets.is_empty() && !report.aborted);
         assert_eq!(report.generation, 1);
         assert!(report.finished_unix >= report.started_unix);

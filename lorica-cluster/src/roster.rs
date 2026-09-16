@@ -39,7 +39,7 @@ use crate::certs::{CertBundle, CertDistributor, CertPushReport};
 use crate::challenge::{ChallengeFanout, ChallengeReport};
 use crate::messages::{ClusterFrame, NodeResources};
 use crate::replication::{
-    AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
+    AcceptedConfig, AppliedConfig, ConfigVersion, PayloadSource, ReplicationReport, Replicator,
 };
 use crate::tls::{operational_server_config_with_crl, ClusterTlsError, SwappableAcceptor};
 
@@ -688,19 +688,23 @@ impl ControlPlane {
         self.accepted.version()
     }
 
-    /// The shared version slot, handed to
-    /// [`crate::listener::OperationalConfig::config_version`] so the
-    /// handshake and the heartbeat answer the current value with no
-    /// lock and no back-reference to this handle.
-    pub fn config_version_handle(&self) -> Arc<ArcSwap<ConfigVersion>> {
-        self.accepted.version_handle()
+    /// The version one node is expected to hold: the fleet's
+    /// generation with that node's own payload hash (Story 10.0).
+    /// Every per-node comparison goes through here.
+    pub fn expected_config_version(&self, node_id: &str) -> ConfigVersion {
+        self.accepted.expected_for(node_id)
     }
 
     /// Run one replication round and publish the generation only if
     /// the fleet accepts it (Story 9.4 AC #6).
-    pub async fn replicate(&self, payload: ConfigPayload) -> ReplicationReport {
+    ///
+    /// `payloads` answers per recipient: since Story 10.0 each node is
+    /// offered the cut it is entitled to, so the round has no single
+    /// blob to take. A `ConfigPayload` implements the trait by giving
+    /// everyone the same bytes, which is what the transport tests want.
+    pub async fn replicate(&self, payloads: Arc<dyn PayloadSource>) -> ReplicationReport {
         self.replication
-            .replicate(&self.sessions, &self.accepted, payload)
+            .replicate(&self.sessions, &self.accepted, payloads)
             .await
     }
 
@@ -1223,22 +1227,22 @@ mod tests {
             "1.7.0",
         );
         assert_eq!(control_plane.config_version(), ConfigVersion::default());
-        let shared = control_plane.config_version_handle();
-        let next = ConfigPayload {
+        let shared = control_plane.accepted.clone();
+        let next = crate::replication::ConfigPayload {
             generation: 12,
             hash: "abcd".to_string(),
             blob: b"{}".to_vec(),
         };
-        control_plane.accepted.publish(next.clone());
+        control_plane.accepted.publish(Arc::new(next.clone()));
         assert_eq!(control_plane.config_version(), next.version());
         assert_eq!(
-            control_plane.accepted.payload().map(|p| (*p).clone()),
+            control_plane.accepted.payload_for("any-node"),
             Some(next.clone()),
             "a convergence pull is answered from the same slot"
         );
         let next = next.version();
         assert_eq!(
-            **shared.load(),
+            shared.version(),
             next,
             "the listener's handle sees the same value"
         );

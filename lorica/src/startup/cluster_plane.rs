@@ -71,9 +71,10 @@ use lorica_cluster::IngestQuota;
 use lorica_cluster::{
     token, AppliedConfig, CertBundle, ClusterCa, ConfigPayload, ControlPlane, EnrollmentHandle,
     EnrollmentListener, EnrollmentStats, FleetHooks, HandshakeConfig, IssuedLeaf,
-    OperationalConfig, OperationalHandle, OperationalListener, OperationalStats, PreAuthBudgets,
-    SwappableAcceptor,
+    OperationalConfig, OperationalHandle, OperationalListener, OperationalStats, PayloadSource,
+    PreAuthBudgets, SwappableAcceptor,
 };
+use lorica_config::canonical::{restrict_for_recipient, CanonicalConfig, SelectorResolution};
 use lorica_config::models::{ClusterNode, NodeStatus};
 use lorica_config::store::{ConfigStore, LiveNodeFacts};
 use lorica_notify::events::{AlertEvent, AlertType};
@@ -1064,7 +1065,7 @@ impl SessionHandler for FleetHandlers {
         let node_id = node_id.to_string();
         Box::pin(async move {
             let accepted = &self.control.accepted;
-            if !accepted.version().is_behind(&applied) {
+            if !accepted.expected_for(&node_id).is_behind(&applied) {
                 // The node is where the fleet is. If it was quarantined
                 // for slow or refused Prepares, it has converged on its
                 // own and belongs back in the commit set, which is the
@@ -1077,12 +1078,13 @@ impl SessionHandler for FleetHandlers {
                 }
                 return Ok(None);
             }
-            // Served from the ACCEPTED payload, never re-encoded from
-            // the store. Two reasons: a pull must not be able to make
-            // the control plane walk every replicated table under the
-            // store lock, and it must never hand out a generation the
-            // fleet aborted.
-            let Some(payload) = accepted.payload() else {
+            // Served from the ACCEPTED source, never re-read from the
+            // store. Three reasons: a pull must not be able to make the
+            // control plane walk every replicated table under the store
+            // lock, it must never hand out a generation the fleet
+            // aborted, and what it hands out is the caller's own cut
+            // (Story 10.0), not the fleet's configuration.
+            let Some(payload) = accepted.payload_for(&node_id) else {
                 return Err("no configuration has been accepted by the fleet yet".to_string());
             };
             info!(
@@ -1092,7 +1094,7 @@ impl SessionHandler for FleetHandlers {
                 "serving a configuration pull"
             );
             lorica_api::metrics::inc_cluster_config_apply(&node_id, "pulled");
-            Ok(Some((*payload).clone()))
+            Ok(Some(payload))
         })
     }
 }
@@ -1220,25 +1222,23 @@ pub(crate) async fn replicate_after_reload(
     // generation does not move and no round runs.
     let accepted_hash = control.accepted.version().hash;
     let encoded = db_blocking(store, move |store| {
-        let blob = lorica_config::canonical::canonical_bytes(store).map_err(internal)?;
+        let cfg = lorica_config::canonical::canonical_config(store).map_err(internal)?;
+        let blob = lorica_config::canonical::encode_canonical(&cfg).map_err(internal)?;
         // From the bytes we already hold: `canonical_hash` would walk
         // every replicated table and serialise it a second time.
         let hash = lorica_config::canonical::sha256_hex(&blob);
         if hash == accepted_hash {
             return Ok::<_, ApiError>(None);
         }
+        let nodes = node_rows(store)?;
         let generation = store
             .increment_cluster_config_generation()
             .map_err(internal)?;
-        Ok(Some(ConfigPayload {
-            generation,
-            hash,
-            blob,
-        }))
+        Ok(Some(FleetPayloads::new(generation, hash, cfg, &nodes)))
     })
     .await;
-    let payload = match encoded {
-        Ok(Some(payload)) => payload,
+    let payloads: Arc<FleetPayloads> = match encoded {
+        Ok(Some(payloads)) => Arc::new(payloads),
         Ok(None) => {
             info!("configuration reload changed nothing the fleet replicates; no round");
             return;
@@ -1249,10 +1249,10 @@ pub(crate) async fn replicate_after_reload(
         }
     };
 
-    let generation = payload.generation;
+    let generation = payloads.generation;
     // The round publishes the version itself, and only once Prepare
     // has succeeded fleet-wide: see `AcceptedConfig`.
-    let report = control.replicate(payload).await;
+    let report = control.replicate(payloads).await;
     for node_id in &report.committed {
         lorica_api::metrics::inc_cluster_config_apply(node_id, "committed");
     }
@@ -1290,6 +1290,100 @@ pub(crate) async fn replicate_after_reload(
             skipped_quarantined = report.skipped_quarantined.len(),
             "cluster configuration replicated"
         );
+    }
+}
+
+/// The `(name, node_id)` rows a round resolves `node_selector`
+/// against. Read under the same store lock as the configuration, so
+/// the entitlement a payload is cut on matches the roster the
+/// generation was encoded from.
+fn node_rows(store: &ConfigStore) -> Result<Vec<(String, String)>, ApiError> {
+    Ok(store
+        .list_cluster_nodes()
+        .map_err(internal)?
+        .into_iter()
+        .map(|node| (node.name, node.node_id))
+        .collect())
+}
+
+/// One generation's payloads, cut per recipient (Story 10.0).
+///
+/// Holds the control plane's full canonical view plus the round's
+/// name-to-id resolution, and encodes a recipient's cut on demand. The
+/// memo matters because the same node is asked for more than once: the
+/// Prepare, then the Commit, then every convergence pull answered from
+/// this source until the next generation replaces it.
+pub(crate) struct FleetPayloads {
+    generation: u64,
+    fleet_hash: String,
+    config: CanonicalConfig,
+    resolution: SelectorResolution,
+    memo: StdMutex<HashMap<String, ConfigPayload>>,
+}
+
+impl FleetPayloads {
+    fn new(
+        generation: u64,
+        fleet_hash: String,
+        config: CanonicalConfig,
+        node_rows: &[(String, String)],
+    ) -> Self {
+        let resolution = SelectorResolution::from_rows(node_rows.iter().cloned());
+        // A selector entry naming no single node reaches nobody. That
+        // is the safe direction, but silence would leave an operator
+        // debugging a route that is simply never delivered, so the
+        // round says so once per encode of the fleet's view.
+        for route in &config.routes {
+            for name in resolution.unresolvable(&route.node_selector) {
+                warn!(
+                    route_id = %route.id,
+                    selector_entry = %name,
+                    "node_selector entry resolves to no single node; this route is delivered to nobody through it"
+                );
+            }
+        }
+        Self {
+            generation,
+            fleet_hash,
+            config,
+            resolution,
+            memo: StdMutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl PayloadSource for FleetPayloads {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn fleet_hash(&self) -> String {
+        self.fleet_hash.clone()
+    }
+
+    fn payload_for(&self, node_id: &str) -> ConfigPayload {
+        {
+            let memo = self.memo.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(found) = memo.get(node_id) {
+                return found.clone();
+            }
+        }
+        let cut = restrict_for_recipient(&self.config, node_id, &self.resolution);
+        // An encode failure here would mean a configuration this
+        // process just read cannot be serialised. The empty blob that
+        // results is refused by the recipient's strict decode, which
+        // fails the round, rather than applied as "nothing configured".
+        let blob = lorica_config::canonical::encode_canonical(&cut).unwrap_or_default();
+        let payload = ConfigPayload {
+            generation: self.generation,
+            hash: lorica_config::canonical::sha256_hex(&blob),
+            blob,
+        };
+        self.memo
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(node_id.to_string(), payload.clone());
+        payload
     }
 }
 
@@ -1695,14 +1789,15 @@ pub(crate) async fn spawn_cluster_plane(
         let generation = s
             .cluster_config_generation()
             .map_err(|e| format!("cluster plane: configuration generation: {e}"))?;
-        let blob = lorica_config::canonical::canonical_bytes(&s)
+        let cfg = lorica_config::canonical::canonical_config(&s)
+            .map_err(|e| format!("cluster plane: canonical read: {e}"))?;
+        let blob = lorica_config::canonical::encode_canonical(&cfg)
             .map_err(|e| format!("cluster plane: canonical encode: {e}"))?;
         let hash = lorica_config::canonical::sha256_hex(&blob);
-        control.accepted.publish(ConfigPayload {
-            generation,
-            hash,
-            blob,
-        });
+        let nodes = node_rows(&s).map_err(|e| format!("cluster plane: {e}"))?;
+        control
+            .accepted
+            .publish(Arc::new(FleetPayloads::new(generation, hash, cfg, &nodes)));
     }
     let telemetry = match ClusterTelemetryStore::open(&opts.data_dir) {
         Ok(store) => Some(Arc::new(store)),
@@ -1745,7 +1840,7 @@ pub(crate) async fn spawn_cluster_plane(
     // the version below, so a follower that is behind pulls instead of
     // drifting. One slot shared with the control-plane handle, swapped
     // by the coordinator after each round.
-    operational_config.config_version = control.config_version_handle();
+    operational_config.accepted = Arc::new(control.accepted.clone());
     operational_config.fleet = Some(FleetHooks {
         roster: Arc::clone(&control.roster),
         sessions: Arc::clone(&control.sessions),

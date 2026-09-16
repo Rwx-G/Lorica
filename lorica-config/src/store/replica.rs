@@ -226,6 +226,15 @@ impl ConfigStore {
         outcome.backends = config.backends.len();
 
         // 4. Routes, scoped by `node_selector`.
+        //
+        // Since Story 10.0 this is no longer where targeting happens:
+        // the control plane cuts the payload per recipient, so a route
+        // this node is not selected for never arrives. The filter stays
+        // for two reasons. It is what makes a 1.8.0 follower work under
+        // a 1.7.x control plane, which still sends the fleet-wide blob.
+        // And on a current fleet it is the assertion that the cut was
+        // correct: if it ever removes a row, the control plane sent
+        // this node something it was not entitled to.
         let kept: Vec<&Route> = config
             .routes
             .iter()

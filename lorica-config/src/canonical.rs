@@ -960,6 +960,127 @@ mod tests {
         assert_eq!(sha256_hex(&once), sha256_hex(&twice));
     }
 
+    /// Story 10.0 turned one fleet-wide encode per replication round
+    /// into one encode per recipient. This prints what that costs at
+    /// three fleet sizes.
+    ///
+    /// Ignored because it is a measurement and not a gate: a shared
+    /// CI runner under load would make any time-based assertion flap,
+    /// so it asserts none. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test --release -p lorica-config \
+    ///     per_recipient_encoding_cost_at_fleet_scale -- --ignored --nocapture
+    /// ```
+    ///
+    /// A debug build measures the unoptimised serde path, so only the
+    /// `--release` numbers describe production cost.
+    #[test]
+    #[ignore = "measurement, not a gate: timing-sensitive, prints a cost table"]
+    fn per_recipient_encoding_cost_at_fleet_scale() {
+        use std::time::Instant;
+
+        /// Routes pinned to one node by `node_selector`.
+        const PINNED_PER_NODE: usize = 20;
+        /// Routes with an empty selector, which every recipient keeps.
+        const FLEET_WIDE_ROUTES: usize = 10;
+
+        for fleet_size in [2usize, 10, 50] {
+            let mut rows: Vec<(String, String)> = Vec::with_capacity(fleet_size);
+            let mut routes: Vec<Route> = Vec::new();
+            let mut backends: Vec<Backend> = Vec::new();
+            let mut route_backends: Vec<RouteBackend> = Vec::new();
+            let mut certificates: Vec<Certificate> = Vec::new();
+
+            for node in 0..fleet_size {
+                let name = format!("edge-{node}");
+                let node_id = format!("id-{node}");
+                for slot in 0..PINNED_PER_NODE {
+                    let route_id = format!("r-{node}-{slot}");
+                    let backend_id = format!("b-{node}-{slot}");
+                    let cert_id = format!("cert-{node}-{slot}");
+                    let mut route = make_route(&route_id, &format!("h{slot}.node{node}.example"));
+                    route.node_selector = vec![name.clone()];
+                    route.certificate_id = Some(cert_id.clone());
+                    routes.push(route);
+                    backends.push(make_backend(
+                        &backend_id,
+                        &format!("10.0.{node}.{slot}:8080"),
+                    ));
+                    route_backends.push(RouteBackend {
+                        route_id,
+                        backend_id,
+                    });
+                    certificates.push(make_certificate(&cert_id, &format!("sha256:{node}-{slot}")));
+                }
+                rows.push((name, node_id));
+            }
+            for slot in 0..FLEET_WIDE_ROUTES {
+                let mut route =
+                    make_route(&format!("r-fleet-{slot}"), &format!("fleet{slot}.example"));
+                route.node_selector = Vec::new();
+                route.certificate_id = None;
+                routes.push(route);
+            }
+
+            let cfg = CanonicalConfig {
+                version: CANONICAL_FORMAT_VERSION,
+                global: CanonicalGlobalSettings::from(&GlobalSettings::default()),
+                routes,
+                backends,
+                route_backends,
+                certificates,
+                notification_configs: Vec::new(),
+                dns_providers: Vec::new(),
+                waf_custom_rules: Vec::new(),
+                waf_disabled_rules: vec![1, 2, 3, 4, 5],
+                cert_export_acls: Vec::new(),
+                ai_crawlers_custom: Vec::new(),
+                probe_configs: Vec::new(),
+                sla_configs: Vec::new(),
+            };
+            let resolution = SelectorResolution::from_rows(rows.clone());
+
+            // What the old design paid per round: one encode, one hash.
+            let started = Instant::now();
+            let fleet_blob = encode_canonical(&cfg).expect("fleet-wide encode");
+            let fleet_hash = sha256_hex(&fleet_blob);
+            let fleet_encode = started.elapsed();
+
+            // What the new design pays per round: one cut, encode and
+            // hash per recipient.
+            let started = Instant::now();
+            let mut total_bytes = 0usize;
+            let mut hashes: Vec<String> = Vec::with_capacity(fleet_size);
+            for (_, node_id) in &rows {
+                let cut = restrict_for_recipient(&cfg, node_id, &resolution);
+                let blob = encode_canonical(&cut).expect("per-recipient encode");
+                total_bytes += blob.len();
+                hashes.push(sha256_hex(&blob));
+            }
+            let per_recipient_total = started.elapsed();
+
+            let divisor = u32::try_from(fleet_size).expect("fleet size fits a u32");
+            let per_recipient_mean = per_recipient_total / divisor;
+            let mean_bytes = total_bytes / fleet_size;
+
+            println!(
+                "N={fleet_size} routes={routes} fleet_encode={fleet_encode:?} \
+per_recipient_total={per_recipient_total:?} per_recipient_mean={per_recipient_mean:?} \
+fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
+                routes = cfg.routes.len(),
+                fleet_bytes = fleet_blob.len(),
+            );
+
+            assert_eq!(fleet_hash.len(), 64);
+            assert_eq!(hashes.len(), fleet_size);
+            assert!(
+                mean_bytes < fleet_blob.len(),
+                "a recipient holds a strict subset of the fleet blob"
+            );
+        }
+    }
+
     fn make_backend(id: &str, address: &str) -> Backend {
         let now = fixed_now();
         Backend {
