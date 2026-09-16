@@ -23,7 +23,7 @@ The Svelte frontend is compiled automatically during `cargo build` via `build.rs
 ### Running Tests
 
 ```bash
-# All Rust unit tests (~2100 tests across 30 crates; see the
+# All Rust tests (~2800 across 31 crates; see the
 # test-coverage table in README.md for the per-layer breakdown)
 cargo test
 
