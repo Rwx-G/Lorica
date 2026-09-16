@@ -6,7 +6,7 @@ use axum::http::{Request, StatusCode};
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 
-use crate::auth::{ensure_admin_user, hash_password};
+use crate::auth::{ensure_admin_user, hash_password, verify_password};
 use crate::logs::LogBuffer;
 use crate::middleware::auth::SessionStore;
 use crate::middleware::rate_limit::RateLimiter;
@@ -7474,4 +7474,51 @@ async fn probe_crud_history_and_validation() {
     )
     .await;
     assert_eq!(json["data"].as_array().expect("probes").len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Argon2 upgrade compatibility (v1.7.3 dependency pass)
+// ---------------------------------------------------------------------------
+
+/// An Argon2id hash of "correct horse battery staple", produced by
+/// argon2 0.5.3 with this project's production parameters (19456 KiB,
+/// t=2, p=1, v0x13) before the 0.6 bump.
+///
+/// Every operator who upgrades carries hashes made by the old version
+/// in their `users` table. If 0.6 stopped verifying them, the upgrade
+/// would lock every account out of the dashboard with no way back in,
+/// so this asserts the PHC string keeps verifying rather than trusting
+/// that the format is stable.
+const ARGON2_0_5_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$ZejrHZb5AuCSJUxQEdjwCg$AVRumvhNKCLBm3Id+0AZ32F6Bn4bXs3/vJ+UUnddKKc";
+
+#[test]
+fn argon2_0_5_hashes_still_verify() {
+    verify_password("correct horse battery staple", ARGON2_0_5_HASH)
+        .expect("a hash written by argon2 0.5 must still verify after the 0.6 bump");
+}
+
+#[test]
+fn argon2_0_5_hashes_still_reject_a_wrong_password() {
+    assert!(verify_password("wrong horse battery staple", ARGON2_0_5_HASH).is_err());
+}
+
+#[test]
+fn hashing_round_trips_on_the_current_version() {
+    let hash = hash_password("s3cret-passphrase").expect("hashing");
+    assert!(
+        hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+        "{hash}"
+    );
+    verify_password("s3cret-passphrase", &hash).expect("round trip");
+    assert!(verify_password("s3cret-passphras3", &hash).is_err());
+}
+
+#[test]
+fn hashing_the_same_password_twice_gives_different_salts() {
+    // The salt now comes from argon2's own OS RNG rather than a
+    // `SaltString` this crate built; assert it is still per-call.
+    let a = hash_password("same").expect("hashing");
+    let b = hash_password("same").expect("hashing");
+    assert_ne!(a, b);
 }

@@ -87,7 +87,7 @@ arc-swap = "1"
 dashmap = "6"
 rand = "0.9"
 parking_lot = "0.12"
-argon2 = "0.5"
+argon2 = "0.6"
 base64 = "0.23"
 async-trait = { workspace = true }
 chrono = "0.4"

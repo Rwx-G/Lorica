@@ -30,7 +30,7 @@ lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 axum = { version = "0.8", features = ["multipart", "ws"] }
 futures-util = "0.3"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 # `net` was added for the Story 9.8 log-export sinks (UDP / TCP /
 # TCP+TLS syslog client sockets); no new crate, tokio already ships it.
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time", "net"] }
@@ -50,7 +50,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
-argon2 = "0.5"
+argon2 = "0.6"
 # Native Ed25519 verification for the Story 8.4 hot binary-upgrade
 # endpoint (`POST /api/v1/system/upgrade`). Default features only:
 # the `verify_strict` path needs no RNG, and tests build a

@@ -11,7 +11,7 @@ description = "Cluster plane for Lorica: mTLS transport, handshake, and CA for m
 arc-swap = "1"
 chrono = { version = "0.4", features = ["serde"] }
 lorica-command = { path = "../lorica-command" }
-prost = "0.13"
+prost = "0.14"
 # `x509-parser` feature: `Issuer::from_ca_cert_pem`, so a persisted CA
 # reloads with its real subject DN (issued leaves must chain to it).
 # The x509-parser crate is already in the workspace tree via lorica-api.
