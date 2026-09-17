@@ -7,9 +7,10 @@
 //! and nothing queries inside these blocks: every read is by rule id or
 //! by route id, both of which are real columns.
 
+use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
 
-use super::row_helpers::parse_datetime;
+use super::row_helpers::{json_column, parse_datetime};
 use super::{serialize_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::CaptureRule;
@@ -19,19 +20,6 @@ use crate::models::CaptureRule;
 const CAPTURE_COLUMNS: &str = "id, name, route_id, enabled, match_json, emit_json, \
      capture_json, limits_json, output_json, redact_json, created_by, created_at, \
      expires_at, captures_emitted, captures_dropped";
-
-/// Decode one JSON block column of a `capture_rules` row.
-fn json_block<T: serde::de::DeserializeOwned>(
-    row: &rusqlite::Row<'_>,
-    index: usize,
-    field: &str,
-) -> Result<T> {
-    let raw: String = row
-        .get(index)
-        .map_err(|e| ConfigError::Validation(format!("capture {field} unreadable: {e}")))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| ConfigError::Validation(format!("invalid capture {field} JSON: {e}")))
-}
 
 /// Decode one `capture_rules` row.
 ///
@@ -47,12 +35,12 @@ fn row_to_capture_rule(row: &rusqlite::Row<'_>) -> Result<CaptureRule> {
         name: row.get(1)?,
         route_id: row.get(2)?,
         enabled: row.get(3)?,
-        match_: json_block(row, 4, "match")?,
-        emit: json_block(row, 5, "emit")?,
-        capture: json_block(row, 6, "capture")?,
-        limits: json_block(row, 7, "limits")?,
-        output: json_block(row, 8, "output")?,
-        redact: json_block(row, 9, "redact")?,
+        match_: json_column(row, 4, "capture", "match")?,
+        emit: json_column(row, 5, "capture", "emit")?,
+        capture: json_column(row, 6, "capture", "capture")?,
+        limits: json_column(row, 7, "capture", "limits")?,
+        output: json_column(row, 8, "capture", "output")?,
+        redact: json_column(row, 9, "capture", "redact")?,
         created_by: row.get(10)?,
         created_at: parse_datetime(&created_at)?,
         expires_at: parse_datetime(&expires_at)?,
@@ -67,6 +55,33 @@ impl ConfigStore {
         let sql = format!("SELECT {CAPTURE_COLUMNS} FROM capture_rules ORDER BY id ASC");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| Ok(row_to_capture_rule(row)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
+    /// Every ARMED capture rule whose `expires_at` is at or before
+    /// `instant`: exactly the set the self-disable sweep disarms.
+    ///
+    /// The sweep runs every five seconds on every standalone node and
+    /// control plane, and on almost every tick the answer is "none".
+    /// Reading the whole table and filtering in Rust made that tick cost
+    /// one full scan plus a JSON decode per rule; `idx_capture_rules_expires_at`
+    /// exists for this query and was going unused.
+    pub fn list_capture_rules_expiring_before(
+        &self,
+        instant: DateTime<Utc>,
+    ) -> Result<Vec<CaptureRule>> {
+        let sql = format!(
+            "SELECT {CAPTURE_COLUMNS} FROM capture_rules \
+             WHERE enabled = 1 AND expires_at <= ?1 ORDER BY id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![instant.to_rfc3339()], |row| {
+            Ok(row_to_capture_rule(row))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row??);
@@ -357,6 +372,41 @@ mod tests {
                 .expect("test setup: listing")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn the_expiry_query_returns_only_the_armed_rules_already_past_their_expiry() {
+        use chrono::Duration;
+
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        seed_route(&store, "route-1");
+
+        let mut due = rule("cap-due", "route-1");
+        due.expires_at = fixed_now() - Duration::minutes(1);
+        let mut exactly_now = rule("cap-now", "route-1");
+        exactly_now.expires_at = fixed_now();
+        let mut later = rule("cap-later", "route-1");
+        later.expires_at = fixed_now() + Duration::hours(1);
+        let mut already_off = rule("cap-off", "route-1");
+        already_off.expires_at = fixed_now() - Duration::hours(1);
+        already_off.enabled = false;
+        for rule in [&due, &exactly_now, &later, &already_off] {
+            store
+                .create_capture_rule(rule)
+                .expect("test setup: rule insert");
+        }
+
+        let swept: Vec<String> = store
+            .list_capture_rules_expiring_before(fixed_now())
+            .expect("the expiry query runs")
+            .into_iter()
+            .map(|rule| rule.id)
+            .collect();
+        assert_eq!(
+            swept,
+            vec!["cap-due".to_string(), "cap-now".to_string()],
+            "the boundary is inclusive, a rule already disarmed is not swept again"
         );
     }
 

@@ -12,12 +12,30 @@
 //! # Why globs are allowed on one claim and refused on the others
 //!
 //! `project_path` takes a glob because a group of projects is a real
-//! authorisation unit (`acme/*` is "everything the acme group owns").
-//! `ref_protected` and `environment_protected` are booleans and
-//! `deployment_tier` is an enum; their whole value is being exact, and
-//! a glob there would silently widen a decision an operator believed
-//! they had narrowed. [`OidcIssuer::validate`] refuses a `*` anywhere
-//! but in `project_path`, so the widening cannot be expressed at all.
+//! authorisation unit (`acme/*` is "every project directly under the
+//! acme group"). `ref_protected` and `environment_protected` are
+//! booleans and `deployment_tier` is an enum; their whole value is
+//! being exact, and a glob there would silently widen a decision an
+//! operator believed they had narrowed. [`OidcIssuer::validate`]
+//! refuses a `*` anywhere but in `project_path`, so the widening
+//! cannot be expressed at all.
+//!
+//! # Why a `project_path` glob must be anchored on a namespace
+//!
+//! A `*` that may start anywhere is not a group grant, it is a string
+//! prefix: `acme*` would cover `acme-evil/pwn`, a namespace an
+//! attacker can create on a shared GitLab. So a glob has to carry a
+//! `/` BEFORE its first `*`, which pins at least one whole namespace
+//! segment, and a `*` never matches a `/`, so `acme/*` grants the
+//! acme group's own projects and not a subgroup an operator never
+//! named. `acme/sub/*` is how the subgroup is granted, in writing.
+//!
+//! # Why an entry must bind a project or a namespace
+//!
+//! `aud` is a value a job puts in its own `id_tokens` block, not a
+//! secret. An entry binding neither `project_path` nor
+//! `namespace_path` therefore accepts a token minted by any project
+//! on the instance that guessed the audience string.
 //!
 //! # Why the URLs must be `https`
 //!
@@ -25,6 +43,14 @@
 //! plane. Over plain HTTP the JWKS it serves could be replaced on the
 //! path, which is a signing key for every automation this entry
 //! grants; `https` with the node's trust roots is the floor.
+//!
+//! # The two trust modes of a JWKS fetch
+//!
+//! By default the fetch trusts what the node trusts: webpki's public
+//! root bundle plus the platform store, so a public GitLab and a
+//! self-hosted one whose CA the distribution already carries both work
+//! with nothing extra. An entry may instead carry [`OidcIssuer::ca_pem`],
+//! and then that CA is the only anchor for its fetch.
 
 use std::collections::BTreeMap;
 
@@ -50,6 +76,11 @@ pub const OIDC_BOUND_CLAIM_NAMES: &[&str] = &[
 
 /// The ONE bound claim whose value may carry a `*` glob.
 pub const OIDC_BOUND_CLAIM_WITH_GLOB: &str = "project_path";
+
+/// The bound claims that name WHO the token speaks for. An entry must
+/// bind at least one of them: `aud` is not a secret, so an entry that
+/// binds neither accepts every project on the instance.
+pub const OIDC_OWNERSHIP_BOUND_CLAIMS: &[&str] = &["project_path", "namespace_path"];
 
 /// The two bound claims whose value must be exactly `true` or `false`.
 pub const OIDC_BOOLEAN_BOUND_CLAIMS: &[&str] = &["ref_protected", "environment_protected"];
@@ -90,6 +121,26 @@ pub struct OidcIssuer {
     /// Where the issuer's signing keys are fetched from. Defaults to
     /// `<issuer>/oauth/discovery/keys`. Must be `https`.
     pub jwks_url: String,
+    /// One or more PEM certificates that become the ONLY trust anchors
+    /// for this entry's JWKS fetch. `None` means the fetch uses the
+    /// node's own trust: webpki's public roots plus the platform store,
+    /// which is where a distribution's CA bundle and `SSL_CERT_FILE`
+    /// land.
+    ///
+    /// An explicit CA REPLACES that trust for this entry rather than
+    /// adding to it. An operator who pins a CA is naming the authority
+    /// they expect to have signed the JWKS endpoint; keeping the public
+    /// roots alongside it would mean any of a few hundred commercial
+    /// CAs could still vouch for the issuer, which is the outcome
+    /// pinning exists to refuse.
+    ///
+    /// Never serialised: the management API answers with a
+    /// `ca_fingerprint` instead, so an operator can confirm which CA is
+    /// pinned without the material leaving the node. The X.509 parse
+    /// runs at the write boundary in `lorica-api`, where the rustls PEM
+    /// reader lives; `lorica-config` carries no certificate parser.
+    #[serde(default, skip_serializing)]
+    pub ca_pem: Option<String>,
     /// Claims that must match exactly, keyed by name from
     /// [`OIDC_BOUND_CLAIM_NAMES`]. A `*` glob is accepted in
     /// [`OIDC_BOUND_CLAIM_WITH_GLOB`] only. A `BTreeMap` so the row
@@ -98,8 +149,11 @@ pub struct OidcIssuer {
     /// Hostname patterns a token from this entry may claim. At least
     /// one, the same rule as a static token.
     pub allowed_hostnames: Vec<String>,
-    /// CIDRs a token from this entry may point a hostname at. Empty
-    /// means the node's default backend policy applies.
+    /// CIDRs a token from this entry may point a hostname at. At
+    /// least one: there is no node-wide default backend policy to fall
+    /// back on, and the filter reads an empty allow list as
+    /// allow-every-address, which would let a job aim a public
+    /// hostname at loopback or at a cloud metadata service.
     #[serde(default)]
     pub allowed_backend_cidrs: Vec<String>,
     /// Ceiling on the lifetime any environment a token from this entry
@@ -186,10 +240,12 @@ impl OidcIssuer {
     /// Returns `Err` when a URL is not `https` or is malformed, when
     /// the audience is blank, when a bound claim is outside
     /// [`OIDC_BOUND_CLAIM_NAMES`], carries a glob outside
-    /// [`OIDC_BOUND_CLAIM_WITH_GLOB`], or is not `true`/`false` for a
-    /// boolean claim, when the entry grants no scope or matches no
-    /// hostname, when a hostname pattern or a CIDR is malformed, or
-    /// when `max_ttl_seconds` is zero or over the static-token cap.
+    /// [`OIDC_BOUND_CLAIM_WITH_GLOB`], is not anchored on a namespace
+    /// segment, or is not `true`/`false` for a boolean claim, when the
+    /// entry binds none of [`OIDC_OWNERSHIP_BOUND_CLAIMS`], when the
+    /// entry grants no scope, matches no hostname or names no backend
+    /// CIDR, when a hostname pattern or a CIDR is malformed, or when
+    /// `max_ttl_seconds` is zero or over the static-token cap.
     ///
     /// ```
     /// use lorica_config::models::OidcIssuer;
@@ -218,6 +274,16 @@ impl OidcIssuer {
         for (name, value) in &self.bound_claims {
             validate_bound_claim(name, value)?;
         }
+        if !self
+            .bound_claims
+            .keys()
+            .any(|name| OIDC_OWNERSHIP_BOUND_CLAIMS.contains(&name.as_str()))
+        {
+            return Err(format!(
+                "oidc issuer entry must bind one of {}; the audience is not a secret, so an                  entry that binds neither accepts a token from every project on the instance",
+                OIDC_OWNERSHIP_BOUND_CLAIMS.join(" or ")
+            ));
+        }
         if self.scopes.is_empty() {
             return Err("oidc issuer entry must grant at least one scope".to_string());
         }
@@ -230,6 +296,12 @@ impl OidcIssuer {
         }
         for pattern in &self.allowed_hostnames {
             validate_hostname_pattern(pattern)?;
+        }
+        if self.allowed_backend_cidrs.is_empty() {
+            return Err(
+                "oidc issuer entry must allow at least one backend CIDR; an empty                  allowed_backend_cidrs is read as every address, which would let a job point a                  public hostname at loopback or at a metadata service"
+                    .to_string(),
+            );
         }
         for cidr in &self.allowed_backend_cidrs {
             validate_cidr(cidr, "allowed_backend_cidrs")?;
@@ -257,6 +329,8 @@ impl OidcIssuer {
 /// ```
 /// use lorica_config::models::bound_claim_matches;
 /// assert!(bound_claim_matches("project_path", "acme/*", "acme/web"));
+/// // A `*` stops at a `/`, so a group grant is not a subgroup grant.
+/// assert!(!bound_claim_matches("project_path", "acme/*", "acme/sub/web"));
 /// assert!(!bound_claim_matches("namespace_path", "acme/*", "acme/web"));
 /// assert!(bound_claim_matches("ref_protected", "true", "true"));
 /// ```
@@ -292,6 +366,21 @@ fn validate_bound_claim(name: &str, value: &str) -> Result<(), String> {
              `{OIDC_BOUND_CLAIM_WITH_GLOB}`"
         ));
     }
+    if name == OIDC_BOUND_CLAIM_WITH_GLOB {
+        // The star has to sit behind a whole namespace segment.
+        // `acme*` reads as a group grant and is a string prefix: it
+        // also covers `acme-evil/pwn`, a namespace anybody can create
+        // on a shared instance.
+        if let Some(first_star) = value.find('*') {
+            if !value[..first_star].contains('/') {
+                return Err(format!(
+                    "bound claim `{name}` glob `{value}` must pin a whole namespace before its \
+                     first `*`: write `acme/*`, not `acme*`, which would also cover \
+                     `acme-evil/pwn`"
+                ));
+            }
+        }
+    }
     if OIDC_BOOLEAN_BOUND_CLAIMS.contains(&name) && value != "true" && value != "false" {
         return Err(format!(
             "bound claim `{name}` must be exactly `true` or `false`"
@@ -326,8 +415,15 @@ fn validate_https_url(field: &str, raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Wildcard match where `*` stands for any run of characters, `/`
-/// included, so `acme/*` covers `acme/web` and `acme/team/web`.
+/// Wildcard match where `*` stands for any run of characters OTHER
+/// than `/`, so `acme/*` covers `acme/web` and refuses
+/// `acme/team/web`.
+///
+/// The `/` exclusion is what keeps a glob a grant over the namespace
+/// an operator wrote down: with `/` included, `acme/*` would also hand
+/// over every subgroup created after the entry was registered. It
+/// pairs with the anchor rule in [`validate_bound_claim`], which
+/// refuses a glob whose `*` is not preceded by a `/`.
 ///
 /// Iterative two-pointer matching with backtracking to the last `*`,
 /// so a pattern with several stars still runs in linear time on the
@@ -344,7 +440,11 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
         } else if p < pattern.len() && pattern[p] == value[v] {
             p += 1;
             v += 1;
-        } else if let Some((star_p, star_v)) = star {
+        } else if let Some((star_p, star_v)) = star.filter(|(_, sv)| value[*sv] != '/') {
+            // Backtracking widens the run the star stands for by one
+            // character. A `/` may not join that run, so the star
+            // stops at a namespace separator and the match fails
+            // rather than spanning it.
             p = star_p + 1;
             v = star_v + 1;
             star = Some((star_p, star_v + 1));
@@ -384,6 +484,7 @@ mod tests {
             issuer: "https://gitlab.example.com".to_string(),
             audience: "lorica-prod".to_string(),
             jwks_url: OidcIssuer::default_jwks_url("https://gitlab.example.com"),
+            ca_pem: None,
             bound_claims: claims(&[("project_path", "acme/*"), ("ref_protected", "true")]),
             allowed_hostnames: vec!["*.preview.example.com".to_string()],
             allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
@@ -494,18 +595,67 @@ mod tests {
         for name in ["ref_protected", "environment_protected"] {
             for value in ["true", "false"] {
                 let mut issuer = valid_issuer();
-                issuer.bound_claims = claims(&[(name, value)]);
+                // An ownership claim rides along: without one the
+                // entry is refused for a different reason entirely.
+                issuer.bound_claims = claims(&[("project_path", "acme/*"), (name, value)]);
                 assert_eq!(issuer.validate(), Ok(()), "{name}={value}");
             }
             for value in ["True", "yes", "1", ""] {
                 let mut issuer = valid_issuer();
-                issuer.bound_claims = claims(&[(name, value)]);
+                issuer.bound_claims = claims(&[("project_path", "acme/*"), (name, value)]);
                 assert!(
                     issuer.validate().is_err(),
                     "{name}={value:?} must be refused"
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_entry_binding_neither_a_project_nor_a_namespace_is_refused() {
+        // `aud` is a string the job writes into its own `id_tokens`
+        // block, not a secret: an entry bound to nothing else accepts
+        // a token from every project on the instance.
+        let mut issuer = valid_issuer();
+        issuer.bound_claims = claims(&[("ref_protected", "true")]);
+        let err = issuer.validate().expect_err("refused");
+        assert!(err.contains("project_path"), "{err}");
+        assert!(err.contains("namespace_path"), "{err}");
+
+        issuer.bound_claims = BTreeMap::new();
+        assert!(issuer.validate().is_err(), "no bound claim at all");
+
+        // Either one on its own is enough.
+        for name in ["project_path", "namespace_path"] {
+            let mut issuer = valid_issuer();
+            issuer.bound_claims = claims(&[(name, "acme/web")]);
+            assert_eq!(issuer.validate(), Ok(()), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_project_path_glob_must_pin_a_namespace_before_its_star() {
+        for anchored in ["acme/*", "acme/sub/*", "acme/web-*"] {
+            let mut issuer = valid_issuer();
+            issuer.bound_claims = claims(&[("project_path", anchored)]);
+            assert_eq!(issuer.validate(), Ok(()), "{anchored}");
+        }
+        for unanchored in ["acme*", "*", "*/web", "*acme/web"] {
+            let mut issuer = valid_issuer();
+            issuer.bound_claims = claims(&[("project_path", unanchored)]);
+            let err = issuer.validate().expect_err("refused");
+            assert!(err.contains("namespace"), "{unanchored}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_entry_with_no_backend_cidr_is_refused() {
+        // An empty allow list is default-allow in the connection
+        // filter, so "no CIDR named" would be the widest grant.
+        let mut issuer = valid_issuer();
+        issuer.allowed_backend_cidrs.clear();
+        let err = issuer.validate().expect_err("refused");
+        assert!(err.contains("allowed_backend_cidrs"), "{err}");
     }
 
     #[test]
@@ -524,6 +674,10 @@ mod tests {
 
         let mut issuer = valid_issuer();
         issuer.allowed_backend_cidrs = vec!["10.0.0.0/33".to_string()];
+        assert!(issuer.validate().is_err());
+
+        let mut issuer = valid_issuer();
+        issuer.allowed_backend_cidrs.clear();
         assert!(issuer.validate().is_err());
 
         let mut issuer = valid_issuer();
@@ -570,18 +724,37 @@ mod tests {
     }
 
     #[test]
-    fn the_project_path_glob_spans_slashes_and_the_others_compare_bytes() {
+    fn the_project_path_glob_stops_at_a_slash_and_the_others_compare_bytes() {
         assert!(bound_claim_matches("project_path", "acme/*", "acme/web"));
-        assert!(bound_claim_matches(
+        // The star never crosses a `/`: a grant over the acme group is
+        // not a grant over every subgroup created after it was written.
+        assert!(!bound_claim_matches(
             "project_path",
             "acme/*",
             "acme/team/web"
         ));
-        assert!(bound_claim_matches("project_path", "*/web", "acme/web"));
+        assert!(bound_claim_matches(
+            "project_path",
+            "acme/sub/*",
+            "acme/sub/web"
+        ));
         assert!(bound_claim_matches(
             "project_path",
             "acme/*/web",
             "acme/team/web"
+        ));
+        // The one an unanchored glob used to hand over. Validation
+        // refuses `acme*` outright; the matcher refuses it too, so a
+        // row written before the rule cannot reach across namespaces.
+        assert!(!bound_claim_matches(
+            "project_path",
+            "acme/*",
+            "acme-evil/pwn"
+        ));
+        assert!(!bound_claim_matches(
+            "project_path",
+            "acme*",
+            "acme-evil/pwn"
         ));
         assert!(!bound_claim_matches(
             "project_path",

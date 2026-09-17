@@ -29,6 +29,25 @@ pub const AUTOMATION_ENVIRONMENT_MAX_LABELS: usize = 16;
 /// Byte ceiling on a label key and on a label value.
 pub const AUTOMATION_ENVIRONMENT_LABEL_MAX_LEN: usize = 128;
 
+/// Most environments one automation principal may own at once.
+///
+/// A quota, not a capacity estimate: every `PUT` writes a route, its
+/// backends and the join rows, and each one starts a fleet
+/// replication round. Without a ceiling one looping pipeline turns
+/// the control plane into a write amplifier for every node. A hundred
+/// review apps is more than any project this product was designed for
+/// keeps alive at once, and an operator who needs more says so by
+/// splitting the work across credentials.
+pub const AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL: usize = 100;
+
+/// Most backends one environment may carry.
+///
+/// The body cap alone would let a single `PUT` write about 2 700
+/// backend rows inside one transaction, on the one store mutex the
+/// whole node shares. Thirty-two upstreams is a load-balanced review
+/// app; more than that is a fleet, and a fleet is an operator's route.
+pub const AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT: usize = 32;
+
 /// The label that opens an environment to every automation principal,
 /// when its value is exactly [`AUTOMATION_ENVIRONMENT_SHARED_VALUE`].
 pub const AUTOMATION_ENVIRONMENT_SHARED_LABEL: &str = "shared";
@@ -269,16 +288,6 @@ pub fn validate_environment_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The part of a principal before its first `-`, or the whole principal
-/// when it has none.
-///
-/// `acme-ci`, `acme-deploy` and `acme` all share the prefix `acme`;
-/// `acmecorp` does not. A principal that starts with a hyphen has an
-/// empty prefix, which [`may_access`] never matches.
-pub fn principal_prefix(principal: &str) -> &str {
-    principal.split('-').next().unwrap_or(principal)
-}
-
 /// Whether a label set carries `shared = "true"`.
 fn labels_mark_shared(labels: &BTreeMap<String, String>) -> bool {
     labels
@@ -290,16 +299,26 @@ fn labels_mark_shared(labels: &BTreeMap<String, String>) -> bool {
 /// (Story 10.4 AC #6).
 ///
 /// The caller may when it is a principal of the SAME kind as the owner
-/// and shares its prefix (see [`principal_prefix`]), or when the
+/// and its principal string is EXACTLY the owner's, or when the
 /// environment carries the label
 /// [`AUTOMATION_ENVIRONMENT_SHARED_LABEL`] with the exact value
 /// [`AUTOMATION_ENVIRONMENT_SHARED_VALUE`].
 ///
 /// A different kind never matches, even on an identical principal
 /// string: a static token named `acme` and an OIDC project `acme` were
-/// issued by different authorities and are not the same owner. An empty
-/// prefix matches nothing, so a principal beginning with a hyphen cannot
-/// reach another such principal's environments by accident.
+/// issued by different authorities and are not the same owner.
+///
+/// # Why identity and not a name prefix
+///
+/// The rule used to compare the text before the first `-`, so
+/// `ci-acme` and `ci-globex` owned each other's environments and the
+/// OIDC projects `acme/web` and `acme/web-docs` did too. A naming
+/// convention is not an authorisation boundary: whoever picks the
+/// token name or the project name picks who else they can reach, and
+/// on a shared GitLab anybody can pick. Identity is the only
+/// comparison where an operator granting a token cannot be surprised
+/// by what else that grant covers; the `shared` label is the one
+/// opt-in, and it is written on the environment by its owner.
 ///
 /// The rule is narrow on purpose. Two projects sharing a Lorica must not
 /// be able to delete each other's review apps, and the same check gates
@@ -315,7 +334,8 @@ fn labels_mark_shared(labels: &BTreeMap<String, String>) -> bool {
 ///     principal: "acme-ci".to_string(),
 /// };
 /// let labels = BTreeMap::new();
-/// assert!(may_access(&owner, "acme-deploy", OwnerKind::StaticToken, &labels));
+/// assert!(may_access(&owner, "acme-ci", OwnerKind::StaticToken, &labels));
+/// assert!(!may_access(&owner, "acme-deploy", OwnerKind::StaticToken, &labels));
 /// assert!(!may_access(&owner, "globex-ci", OwnerKind::StaticToken, &labels));
 /// assert!(!may_access(&owner, "acme-ci", OwnerKind::OidcProject, &labels));
 /// ```
@@ -328,11 +348,7 @@ pub fn may_access(
     if labels_mark_shared(labels) {
         return true;
     }
-    if owner.kind != caller_kind {
-        return false;
-    }
-    let prefix = principal_prefix(&owner.principal);
-    !prefix.is_empty() && prefix == principal_prefix(caller_principal)
+    owner.kind == caller_kind && owner.principal == caller_principal
 }
 
 #[cfg(test)]
@@ -452,33 +468,46 @@ mod tests {
     // ---- The ownership matrix (AC #6) ----
 
     #[test]
-    fn same_kind_and_same_prefix_may_access() {
+    fn same_kind_and_the_same_principal_may_access() {
         let owner = owner(OwnerKind::StaticToken, "acme-ci");
         let none = BTreeMap::new();
         assert!(may_access(&owner, "acme-ci", OwnerKind::StaticToken, &none));
-        assert!(may_access(
-            &owner,
-            "acme-deploy",
-            OwnerKind::StaticToken,
-            &none
-        ));
-        assert!(may_access(&owner, "acme", OwnerKind::StaticToken, &none));
     }
 
     #[test]
-    fn same_kind_but_a_different_prefix_may_not() {
-        let owner = owner(OwnerKind::StaticToken, "acme-ci");
+    fn sharing_a_name_prefix_is_not_sharing_an_owner() {
+        // The prefix rule crossed tenants in both directions:
+        // `ci-acme`/`ci-globex` on the token side, `acme/web` and
+        // `acme/web-docs` on the OIDC side. A naming convention is not
+        // an authorisation boundary.
         let none = BTreeMap::new();
+        let token = owner(OwnerKind::StaticToken, "acme-ci");
+        for other in ["acme-deploy", "acme", "acmecorp-ci", "globex-ci"] {
+            assert!(
+                !may_access(&token, other, OwnerKind::StaticToken, &none),
+                "{other} must not reach acme-ci's environments"
+            );
+        }
+        let shared_first_segment = owner(OwnerKind::StaticToken, "ci-acme");
         assert!(!may_access(
-            &owner,
-            "globex-ci",
+            &shared_first_segment,
+            "ci-globex",
             OwnerKind::StaticToken,
             &none
         ));
-        assert!(
-            !may_access(&owner, "acmecorp-ci", OwnerKind::StaticToken, &none),
-            "the prefix is the whole first segment, not a string prefix"
-        );
+        let project = owner(OwnerKind::OidcProject, "acme/web");
+        assert!(!may_access(
+            &project,
+            "acme/web-docs",
+            OwnerKind::OidcProject,
+            &none
+        ));
+        assert!(may_access(
+            &project,
+            "acme/web",
+            OwnerKind::OidcProject,
+            &none
+        ));
     }
 
     #[test]
@@ -525,27 +554,6 @@ mod tests {
             OwnerKind::StaticToken,
             &other_key
         ));
-    }
-
-    #[test]
-    fn an_empty_prefix_matches_nothing() {
-        let owner = owner(OwnerKind::StaticToken, "-ci");
-        let none = BTreeMap::new();
-        assert!(!may_access(
-            &owner,
-            "-deploy",
-            OwnerKind::StaticToken,
-            &none
-        ));
-        assert!(!may_access(&owner, "-ci", OwnerKind::StaticToken, &none));
-    }
-
-    #[test]
-    fn the_prefix_is_the_text_before_the_first_hyphen() {
-        assert_eq!(principal_prefix("acme-ci-eu"), "acme");
-        assert_eq!(principal_prefix("acme"), "acme");
-        assert_eq!(principal_prefix("-acme"), "");
-        assert_eq!(principal_prefix(""), "");
     }
 
     // ---- Serialised shape ----

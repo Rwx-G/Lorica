@@ -23,7 +23,7 @@
 
 use rusqlite::{params, OptionalExtension};
 
-use super::row_helpers::parse_datetime;
+use super::row_helpers::{json_column, parse_datetime};
 use super::{serialize_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::OidcIssuer;
@@ -32,25 +32,7 @@ use crate::models::OidcIssuer;
 /// [`row_to_oidc_issuer`] expects.
 const OIDC_ISSUER_COLUMNS: &str = "id, issuer, audience, jwks_url, bound_claims_json, \
      scopes_json, allowed_hostnames_json, allowed_backend_cidrs_json, max_ttl_seconds, \
-     created_by, created_at";
-
-/// Decode one JSON column of an `oidc_issuers` row.
-///
-/// A malformed column is an error rather than a default, the same
-/// stance as `api_tokens`: the bound claims and the grant lists ARE the
-/// entry's authority, and degrading one to "empty" would either make a
-/// policy that matches nothing or one that binds nothing.
-fn json_column<T: serde::de::DeserializeOwned>(
-    row: &rusqlite::Row<'_>,
-    index: usize,
-    field: &str,
-) -> Result<T> {
-    let raw: String = row
-        .get(index)
-        .map_err(|e| ConfigError::Validation(format!("oidc issuer {field} unreadable: {e}")))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| ConfigError::Validation(format!("invalid oidc issuer {field} JSON: {e}")))
-}
+     created_by, created_at, ca_pem";
 
 /// Decode one `oidc_issuers` row.
 fn row_to_oidc_issuer(row: &rusqlite::Row<'_>) -> Result<OidcIssuer> {
@@ -60,13 +42,14 @@ fn row_to_oidc_issuer(row: &rusqlite::Row<'_>) -> Result<OidcIssuer> {
         issuer: row.get(1)?,
         audience: row.get(2)?,
         jwks_url: row.get(3)?,
-        bound_claims: json_column(row, 4, "bound_claims")?,
-        scopes: json_column(row, 5, "scopes")?,
-        allowed_hostnames: json_column(row, 6, "allowed_hostnames")?,
-        allowed_backend_cidrs: json_column(row, 7, "allowed_backend_cidrs")?,
+        bound_claims: json_column(row, 4, "oidc issuer", "bound_claims")?,
+        scopes: json_column(row, 5, "oidc issuer", "scopes")?,
+        allowed_hostnames: json_column(row, 6, "oidc issuer", "allowed_hostnames")?,
+        allowed_backend_cidrs: json_column(row, 7, "oidc issuer", "allowed_backend_cidrs")?,
         max_ttl_seconds: row.get(8)?,
         created_by: row.get(9)?,
         created_at: parse_datetime(&created_at)?,
+        ca_pem: row.get(11)?,
     })
 }
 
@@ -119,8 +102,8 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT INTO oidc_issuers (id, issuer, audience, jwks_url, bound_claims_json,
              scopes_json, allowed_hostnames_json, allowed_backend_cidrs_json, max_ttl_seconds,
-             created_by, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             created_by, created_at, ca_pem)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 issuer.id,
                 issuer.issuer,
@@ -136,6 +119,7 @@ impl ConfigStore {
                 issuer.max_ttl_seconds,
                 issuer.created_by,
                 issuer.created_at.to_rfc3339(),
+                issuer.ca_pem,
             ],
         )?;
         Ok(())
@@ -183,6 +167,7 @@ mod tests {
             issuer: "https://gitlab.example.com".to_string(),
             audience: audience.to_string(),
             jwks_url: "https://gitlab.example.com/oauth/discovery/keys".to_string(),
+            ca_pem: None,
             bound_claims,
             allowed_hostnames: vec!["*.preview.example.com".to_string()],
             allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],

@@ -258,7 +258,7 @@ pub struct GlobalSettings {
     pub geoip_db_path: Option<String>,
     /// Whether Lorica should periodically download a fresh DB-IP
     /// Lite Country snapshot and hot-swap the in-memory reader.
-    /// Default `false` — operators opt in via the dashboard after
+    /// Default `false` - operators opt in via the dashboard after
     /// they have read the CC-BY 4.0 attribution requirement. When
     /// `true`, the supervisor runs a weekly refresh task inside its
     /// tokio runtime; failures fall back to serving the previously
@@ -323,7 +323,7 @@ pub struct GlobalSettings {
     /// every certificate renewal so cookie lifetime is capped at
     /// the cert TTL. Never serialised over the API (the field is
     /// scrubbed from `GET /api/v1/settings` responses at the API
-    /// layer — a leaked hex secret is equivalent to a forgeable
+    /// layer - a leaked hex secret is equivalent to a forgeable
     /// cookie for the full cookie TTL across every route). Empty
     /// string = "not yet initialised"; the first reload after
     /// startup populates it via `secret::generate` + persist.

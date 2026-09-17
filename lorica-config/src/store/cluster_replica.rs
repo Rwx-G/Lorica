@@ -1,13 +1,19 @@
-//! Follower-side replication state on `ConfigStore` (Story 9.4).
+//! Replication state on `ConfigStore` that is text rather than a
+//! number (Story 9.4).
 //!
-//! Three keys in the `cluster_replica` table created by migration 52:
-//! the generation and canonical hash of the last replica this node
-//! applied (AC #7 / AC #12 convergence and drift input), and the
-//! break-glass deadline (AC #11).
+//! Four keys in the `cluster_replica` table created by migration 52.
+//! Three are follower-side: the generation and canonical hash of the
+//! last replica this node applied (AC #7 / AC #12 convergence and
+//! drift input), and the break-glass deadline (AC #11). The fourth is
+//! control-plane side: the fleet identity hash of the last generation
+//! this node published (Story 10.0 restart path).
 //!
 //! They live here rather than in `cluster_state` because migration 48
-//! typed that table's `value` column as INTEGER, and both the hash and
-//! the deadline are text.
+//! typed that table's `value` column as INTEGER, and a hash, a
+//! deadline and a digest are all text. The table is key-value and
+//! `read_key` answers an absent row with the empty string, so a new
+//! key needs no migration: a database created before this one simply
+//! reads it as "never published".
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
@@ -53,8 +59,8 @@ impl ConfigStore {
         // it has applied nothing and re-apply from scratch, which hides
         // the corruption behind a full reconciliation.
         let generation: u64 = raw.parse().map_err(|_| {
-            ConfigError::Validation(
-                "cluster_replica.applied_config_generation is not a number".to_string(),
+            ConfigError::Corrupt(
+                "stored cluster_replica.applied_config_generation is not a number".to_string(),
             )
         })?;
         let hash: String = read_key(self, "applied_config_hash")?;
@@ -108,5 +114,39 @@ impl ConfigStore {
     pub fn set_cluster_break_glass_until(&self, until: Option<DateTime<Utc>>) -> Result<()> {
         let value = until.map(|t| t.to_rfc3339()).unwrap_or_default();
         write_key(self, "break_glass_until", &value)
+    }
+
+    /// The fleet identity hash of the last generation this CONTROL
+    /// PLANE published: the canonical blob folded together with the
+    /// roster rows the per-recipient cuts resolve against (Story 10.0,
+    /// `lorica_config::canonical::fleet_identity_hash`).
+    ///
+    /// Empty on a node that has never published one, which is what a
+    /// database created before this key existed reads as.
+    ///
+    /// # Why it is persisted at all
+    ///
+    /// The generation is a counter over changes to the fleet's
+    /// identity, and the boot seed rebuilds a generation's payloads
+    /// from the store. Those two agree only if nothing changed the
+    /// identity without advancing the counter. A crash between a
+    /// roster write and the round it owes is exactly that window, and
+    /// the recomputed hash differing from this one is how the next
+    /// boot notices instead of seeding a generation no node holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a read failure.
+    pub fn cluster_published_fleet_hash(&self) -> Result<String> {
+        read_key(self, "published_fleet_hash")
+    }
+
+    /// Record the fleet identity hash just published.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Database`] on a write failure.
+    pub fn set_cluster_published_fleet_hash(&self, hash: &str) -> Result<()> {
+        write_key(self, "published_fleet_hash", hash)
     }
 }

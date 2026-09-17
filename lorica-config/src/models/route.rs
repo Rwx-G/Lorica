@@ -397,7 +397,7 @@ fn default_forward_auth_timeout_ms() -> u32 {
 ///
 /// When `scope = PerIp`, each client IP gets its own bucket. When
 /// `scope = PerRoute`, a single shared bucket caps aggregate route
-/// traffic regardless of client — useful to protect an origin that
+/// traffic regardless of client - useful to protect an origin that
 /// cannot handle more than X rps total.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -445,7 +445,7 @@ impl RateLimit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RateLimitScope {
-    /// One bucket per `(route_id, client_ip)`. Default — protects
+    /// One bucket per `(route_id, client_ip)`. Default: protects
     /// against a single abusive client without penalising the rest.
     #[default]
     PerIp,
@@ -964,7 +964,7 @@ pub enum BotProtectionMode {
 }
 
 /// Five-category bypass rule set. Each non-empty field is a
-/// separate early-exit to the backend — the order of evaluation is
+/// separate early-exit to the backend - the order of evaluation is
 /// documented in the architecture doc § 6.3. A request matching ANY
 /// rule skips the challenge entirely. Rules are additive: setting
 /// `ip_cidrs` does not disable the other categories.
@@ -1044,7 +1044,7 @@ pub struct BotProtectionConfig {
     /// Captcha modes but persisted.
     #[serde(default = "default_captcha_alphabet")]
     pub captcha_alphabet: String,
-    /// Bypass matrix. All categories default to empty lists — the
+    /// Bypass matrix. All categories default to empty lists - the
     /// feature starts in "challenge every request" mode and the
     /// operator whitelists over time.
     #[serde(default)]

@@ -28,11 +28,11 @@ pub use ai_crawler::{
     CustomCrawler, CustomVerification, CUSTOM_CRAWLER_MAX_CIDRS, CUSTOM_CRAWLER_MAX_COUNT,
 };
 pub use automation_environment::{
-    may_access, principal_prefix, validate_environment_name, AutomationEnvironment,
-    CertificateMode, EnvironmentOwner, ManagedBy, OwnerKind, PipelineIdentity,
-    AUTOMATION_ENVIRONMENT_LABEL_MAX_LEN, AUTOMATION_ENVIRONMENT_MAX_LABELS,
-    AUTOMATION_ENVIRONMENT_NAME_MAX_LEN, AUTOMATION_ENVIRONMENT_SHARED_LABEL,
-    AUTOMATION_ENVIRONMENT_SHARED_VALUE,
+    may_access, validate_environment_name, AutomationEnvironment, CertificateMode,
+    EnvironmentOwner, ManagedBy, OwnerKind, PipelineIdentity, AUTOMATION_ENVIRONMENT_LABEL_MAX_LEN,
+    AUTOMATION_ENVIRONMENT_MAX_LABELS, AUTOMATION_ENVIRONMENT_NAME_MAX_LEN,
+    AUTOMATION_ENVIRONMENT_SHARED_LABEL, AUTOMATION_ENVIRONMENT_SHARED_VALUE,
+    AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT, AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL,
 };
 pub use automation_token::{
     automation_public_id_is_valid, automation_secret_hmac_hex, dummy_automation_secret_hmac_hex,
@@ -70,7 +70,7 @@ pub use notification::NotificationConfig;
 pub use oidc_issuer::{
     bound_claim_matches, OidcIssuer, OIDC_AUDIENCE_MAX_LEN, OIDC_BOOLEAN_BOUND_CLAIMS,
     OIDC_BOUND_CLAIM_NAMES, OIDC_BOUND_CLAIM_VALUE_MAX_LEN, OIDC_BOUND_CLAIM_WITH_GLOB,
-    OIDC_ISSUER_DEFAULT_JWKS_PATH, OIDC_ISSUER_URL_MAX_LEN,
+    OIDC_ISSUER_DEFAULT_JWKS_PATH, OIDC_ISSUER_URL_MAX_LEN, OIDC_OWNERSHIP_BOUND_CLAIMS,
 };
 pub use preferences::{User, UserPreference};
 pub use probes::{ProbeConfig, ProbeResultRow};

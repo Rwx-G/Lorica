@@ -742,7 +742,7 @@ fn example_route_for_serde() -> Route {
 #[test]
 fn route_rate_limit_is_skipped_when_none() {
     // The `skip_serializing_if = "Option::is_none"` keeps older tooling
-    // and dashboards happy — a route without rate_limit does not leak
+    // and dashboards happy - a route without rate_limit does not leak
     // a `"rate_limit": null` field.
     let route = example_route_for_serde();
     assert!(route.rate_limit.is_none());

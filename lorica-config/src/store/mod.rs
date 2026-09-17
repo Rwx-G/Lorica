@@ -183,6 +183,7 @@ const MIGRATIONS: &[Migration] = &[
     (57, migrate_api_tokens),
     (58, migrate_automation_environments),
     (59, migrate_oidc_issuers),
+    (60, migrate_oidc_issuer_ca_pem),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1108,6 +1109,22 @@ fn migrate_oidc_issuers(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// Story 10.5 follow-up: the CA an issuer entry pins for its own JWKS
+/// fetch.
+///
+/// Nullable with no backfill, and that is the meaning of the column
+/// rather than an accident of ordering: `NULL` says "fetch on the
+/// node's trust roots", which is what every row written before this
+/// migration did and what a public GitLab wants. A value says "this CA
+/// and nothing else signs that endpoint".
+///
+/// Its own migration rather than an edit of 59: a database created
+/// earlier in the v1.8.0 cycle already carries the table at version 59,
+/// and `CREATE TABLE IF NOT EXISTS` would leave it without the column.
+fn migrate_oidc_issuer_ca_pem(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "oidc_issuers", "ca_pem", "TEXT DEFAULT NULL")
+}
+
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {
     // Story 9.5 AC #6 / D11: `acme_challenges` carried no timestamp, no
     // index and no purge, so an order that died between the write and
@@ -1315,11 +1332,11 @@ impl ConfigStore {
             Some(key) => {
                 let plaintext = key.decrypt(data)?;
                 String::from_utf8(plaintext).map_err(|e| {
-                    ConfigError::Validation(format!("decrypted key_pem is not valid UTF-8: {e}"))
+                    ConfigError::Corrupt(format!("decrypted key_pem is not UTF-8: {e}"))
                 })
             }
             None => String::from_utf8(data.to_vec())
-                .map_err(|e| ConfigError::Validation(format!("key_pem is not valid UTF-8: {e}"))),
+                .map_err(|e| ConfigError::Corrupt(format!("stored key_pem is not UTF-8: {e}"))),
         }
     }
 
@@ -1354,10 +1371,12 @@ impl ConfigStore {
             Some(key) => {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(stored)
-                    .map_err(|e| ConfigError::Validation(format!("invalid base64 config: {e}")))?;
+                    .map_err(|e| {
+                        ConfigError::Corrupt(format!("stored config is not valid base64: {e}"))
+                    })?;
                 let plaintext = key.decrypt(&decoded)?;
                 String::from_utf8(plaintext).map_err(|e| {
-                    ConfigError::Validation(format!("decrypted config not UTF-8: {e}"))
+                    ConfigError::Corrupt(format!("decrypted config is not UTF-8: {e}"))
                 })
             }
             None => Ok(stored.to_string()),

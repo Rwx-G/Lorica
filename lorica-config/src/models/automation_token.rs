@@ -99,6 +99,13 @@ fn default_max_ttl_seconds() -> u32 {
 /// assert_eq!(scope, AutomationScope::EnvironmentsWrite);
 /// assert!(serde_json::from_str::<AutomationScope>("\"settings:write\"").is_err());
 /// ```
+// The wire spelling below lives in three places and a rename has to
+// touch all three: these renames, `scope_str` in
+// `lorica-api/src/automation/scope.rs` (the string an operator reads in
+// a 403), and
+// `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.fixture.ts`
+// (what the mint form offers). Two of the three agreeing is a token
+// minted with a scope the gate never matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AutomationScope {
     /// Create, update and tear down environments.
@@ -143,7 +150,10 @@ pub struct AutomationToken {
     /// At least one.
     pub allowed_hostnames: Vec<String>,
     /// CIDRs (or bare addresses) this token may point a hostname at.
-    /// Empty means the node's own default backend policy applies.
+    /// At least one: there is no node-wide default backend policy to
+    /// fall back on, and the filter reads an empty allow list as
+    /// allow-every-address, which would let a token aim a public
+    /// hostname at loopback or at a cloud metadata service.
     #[serde(default)]
     pub allowed_backend_cidrs: Vec<String>,
     /// Ceiling on the lifetime any environment this token creates may
@@ -213,10 +223,11 @@ impl AutomationToken {
     /// # Errors
     ///
     /// Returns `Err` when the name is blank, when the token grants no
-    /// scope, when it matches no hostname, when a hostname pattern or a
-    /// backend CIDR is malformed, when `max_ttl_seconds` is zero or
-    /// over [`AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP`], or when
-    /// `expires_at` is not after `created_at`.
+    /// scope, when it matches no hostname, when it names no backend
+    /// CIDR, when a hostname pattern or a backend CIDR is malformed,
+    /// when `max_ttl_seconds` is zero or over
+    /// [`AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP`], or when `expires_at`
+    /// is not after `created_at`.
     ///
     /// ```
     /// use lorica_config::models::AutomationToken;
@@ -243,6 +254,12 @@ impl AutomationToken {
         }
         for pattern in &self.allowed_hostnames {
             validate_hostname_pattern(pattern)?;
+        }
+        if self.allowed_backend_cidrs.is_empty() {
+            return Err(
+                "automation token must allow at least one backend CIDR; an empty                  allowed_backend_cidrs is read as every address, which would let this token                  point a public hostname at loopback or at a metadata service"
+                    .to_string(),
+            );
         }
         for cidr in &self.allowed_backend_cidrs {
             validate_cidr(cidr, "allowed_backend_cidrs")?;
@@ -530,6 +547,19 @@ mod tests {
                 "{unknown} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_token_with_no_backend_cidr_is_refused() {
+        // An empty allow list is default-allow in the connection
+        // filter, so "no CIDR named" would be the widest grant the
+        // token can carry rather than the narrowest.
+        let mut token = valid_token();
+        token.allowed_backend_cidrs.clear();
+        let err = token
+            .validate()
+            .expect_err("an empty backend grant is refused");
+        assert!(err.contains("allowed_backend_cidrs"), "{err}");
     }
 
     // ---- Liveness ----

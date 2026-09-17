@@ -30,7 +30,7 @@ use chrono::{DateTime, Utc};
 use ring::rand::SecureRandom;
 use rusqlite::{params, OptionalExtension};
 
-use super::row_helpers::{parse_datetime, parse_optional_datetime};
+use super::row_helpers::{json_column, parse_datetime, parse_optional_datetime};
 use super::{serialize_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::{AutomationToken, AUTOMATION_TOKEN_HMAC_KEY_LEN};
@@ -49,24 +49,6 @@ const AUTOMATION_TOKEN_COLUMNS: &str = "public_id, name, secret_hmac, scopes_jso
      allowed_hostnames_json, allowed_backend_cidrs_json, max_ttl_seconds, created_by, \
      created_at, expires_at, last_used_at, revoked_at";
 
-/// Decode one JSON list column of an `api_tokens` row.
-///
-/// A malformed list is an error rather than an empty default: the lists
-/// ARE the token's blast radius, so degrading an unreadable one to
-/// "empty" would turn a corrupted row into a token that matches
-/// nothing, and degrading it any other way would widen what it reaches.
-fn json_list<T: serde::de::DeserializeOwned>(
-    row: &rusqlite::Row<'_>,
-    index: usize,
-    field: &str,
-) -> Result<T> {
-    let raw: String = row.get(index).map_err(|e| {
-        ConfigError::Validation(format!("automation token {field} unreadable: {e}"))
-    })?;
-    serde_json::from_str(&raw)
-        .map_err(|e| ConfigError::Validation(format!("invalid automation token {field} JSON: {e}")))
-}
-
 /// Decode one `api_tokens` row.
 fn row_to_automation_token(row: &rusqlite::Row<'_>) -> Result<AutomationToken> {
     let created_at: String = row.get(8)?;
@@ -75,9 +57,9 @@ fn row_to_automation_token(row: &rusqlite::Row<'_>) -> Result<AutomationToken> {
         public_id: row.get(0)?,
         name: row.get(1)?,
         secret_hmac: row.get(2)?,
-        scopes: json_list(row, 3, "scopes")?,
-        allowed_hostnames: json_list(row, 4, "allowed_hostnames")?,
-        allowed_backend_cidrs: json_list(row, 5, "allowed_backend_cidrs")?,
+        scopes: json_column(row, 3, "automation token", "scopes")?,
+        allowed_hostnames: json_column(row, 4, "automation token", "allowed_hostnames")?,
+        allowed_backend_cidrs: json_column(row, 5, "automation token", "allowed_backend_cidrs")?,
         max_ttl_seconds: row.get(6)?,
         created_by: row.get(7)?,
         created_at: parse_datetime(&created_at)?,
@@ -121,7 +103,7 @@ impl ConfigStore {
             }
         };
         raw.try_into().map_err(|_| {
-            ConfigError::Validation("stored automation token key has the wrong length".into())
+            ConfigError::Corrupt("stored automation token key has the wrong length".into())
         })
     }
 

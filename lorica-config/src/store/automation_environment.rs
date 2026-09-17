@@ -15,7 +15,7 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
 
-use super::row_helpers::parse_datetime;
+use super::row_helpers::{json_column, parse_datetime};
 use super::{serialize_field, serialize_optional_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::AutomationEnvironment;
@@ -24,19 +24,6 @@ use crate::models::AutomationEnvironment;
 /// [`row_to_environment`] expects.
 const ENVIRONMENT_COLUMNS: &str = "name, route_id, owner_json, certificate_mode_json, \
      labels_json, expires_at, created_at, updated_at, last_pipeline, pipeline_json";
-
-/// Decode one JSON column of an `automation_environments` row.
-fn json_column<T: serde::de::DeserializeOwned>(
-    row: &rusqlite::Row<'_>,
-    index: usize,
-    field: &str,
-) -> Result<T> {
-    let raw: String = row
-        .get(index)
-        .map_err(|e| ConfigError::Validation(format!("environment {field} unreadable: {e}")))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| ConfigError::Validation(format!("invalid environment {field} JSON: {e}")))
-}
 
 /// Decode one `automation_environments` row.
 ///
@@ -52,16 +39,16 @@ fn row_to_environment(row: &rusqlite::Row<'_>) -> Result<AutomationEnvironment> 
     let pipeline = pipeline_json
         .map(|raw| {
             serde_json::from_str(&raw).map_err(|e| {
-                ConfigError::Validation(format!("invalid environment pipeline JSON: {e}"))
+                ConfigError::Corrupt(format!("invalid environment pipeline JSON: {e}"))
             })
         })
         .transpose()?;
     Ok(AutomationEnvironment {
         name: row.get(0)?,
         route_id: row.get(1)?,
-        owner: json_column(row, 2, "owner")?,
-        certificate_mode: json_column(row, 3, "certificate_mode")?,
-        labels: json_column(row, 4, "labels")?,
+        owner: json_column(row, 2, "environment", "owner")?,
+        certificate_mode: json_column(row, 3, "environment", "certificate_mode")?,
+        labels: json_column(row, 4, "environment", "labels")?,
         expires_at: parse_datetime(&expires_at)?,
         created_at: parse_datetime(&created_at)?,
         updated_at: parse_datetime(&updated_at)?,

@@ -91,6 +91,15 @@ use crate::store::ConfigStore;
 /// 10.1 and 10.4 ever ship in different releases, that changes, and
 /// `story_10_4_rides_format_version_two_without_a_second_bump` is the
 /// test to revisit.
+///
+/// This integer names a SHAPE, and nothing about the integer enforces
+/// that. Four migrations (56 to 59) changed [`CanonicalConfig`] under
+/// this one number, and a test that pins the number would have passed
+/// on every one of them. What ties the two together is
+/// `the_canonical_shape_digest_matches_the_blob_s_field_set` below:
+/// it digests the field-name set of the blob's whole type inventory,
+/// so a shape change that leaves this number alone fails there and the
+/// decision has to be taken deliberately.
 pub const CANONICAL_FORMAT_VERSION: u32 = 2;
 
 /// One WAF custom rule in canonical form. The store keeps these as
@@ -820,15 +829,72 @@ pub fn restrict_for_recipient(
         .cloned()
         .collect();
 
+    // Every fleet-wide field is listed rather than filled from
+    // `..cfg.clone()`: the struct update syntax clones the WHOLE
+    // source first, six large tables included, and then drops the six
+    // the literal above already replaced. At 50 nodes that is 50
+    // pointless deep clones of the fleet's routes, backends, links,
+    // certificates, capture rules and environments per round. The cost
+    // of spelling the fleet-wide half out is that a new field must be
+    // added here; that is the right place to be asked "is this one
+    // fleet-wide or is it cut with the route?".
     CanonicalConfig {
+        version: cfg.version,
+        global: cfg.global.clone(),
         routes,
         backends,
         route_backends,
         certificates,
+        notification_configs: cfg.notification_configs.clone(),
+        dns_providers: cfg.dns_providers.clone(),
+        waf_custom_rules: cfg.waf_custom_rules.clone(),
+        waf_disabled_rules: cfg.waf_disabled_rules.clone(),
+        cert_export_acls: cfg.cert_export_acls.clone(),
+        ai_crawlers_custom: cfg.ai_crawlers_custom.clone(),
+        probe_configs: cfg.probe_configs.clone(),
+        sla_configs: cfg.sla_configs.clone(),
         capture_rules,
         automation_environments,
-        ..cfg.clone()
     }
+}
+
+/// The identity of what the fleet replicates: the canonical blob's
+/// hash folded together with the `(name, node_id)` roster rows the
+/// per-recipient cuts are resolved against.
+///
+/// # Why the roster is part of the fleet's identity
+///
+/// Since Story 10.0 a recipient's payload is a function of two
+/// sources, not one: the canonical configuration AND the roster that
+/// turns a `node_selector` name into a node id. The generation is a
+/// counter over changes to the first. Left at that, a roster change
+/// (a node enrolling under a name a route already selects) would move
+/// every cut without moving the generation, and two processes reading
+/// the store at different moments would compute two different payloads
+/// for one generation: the node holds the cut it was sent, a restarted
+/// control plane expects the cut it recomputes. That is a drift alert
+/// for a fleet that never drifted.
+///
+/// Folding the roster into the hash the reload path compares makes a
+/// roster change a configuration change, so the generation advances
+/// with it and the source can no longer move underneath one.
+///
+/// The rows are sorted before hashing, so the value does not depend on
+/// the order the store happened to return them in.
+pub fn fleet_identity_hash(blob_hash: &str, node_rows: &[(String, String)]) -> String {
+    let mut rows: Vec<&(String, String)> = node_rows.iter().collect();
+    rows.sort();
+    let mut material = String::with_capacity(blob_hash.len() + rows.len() * 64);
+    material.push_str(blob_hash);
+    for (name, node_id) in rows {
+        // A separator that cannot occur in either half, so
+        // ("ab", "c") and ("a", "bc") cannot hash alike.
+        material.push('\u{1f}');
+        material.push_str(name);
+        material.push('\u{1e}');
+        material.push_str(node_id);
+    }
+    sha256_hex(material.as_bytes())
 }
 
 /// SHA-256 of [`canonical_bytes`], lowercase hex. The value compared
@@ -1230,6 +1296,158 @@ mod tests {
             serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
         assert_eq!(peek["version"], 2);
         assert_eq!(CANONICAL_FORMAT_VERSION, 2);
+    }
+
+    /// The field-name set of every type the canonical blob carries,
+    /// digested. Update it ONLY together with a deliberate answer to
+    /// the question the failure message asks.
+    const CANONICAL_SHAPE_DIGEST: &str =
+        "3825ea544c4250cf5f7b0bb84417f17ccc70d461edeb574218e8bd5f87e39387";
+
+    /// Every field name `T` accepts, read from the type itself rather
+    /// than from the JSON of some fixture.
+    ///
+    /// A struct carrying `deny_unknown_fields` answers an unknown key
+    /// with the list of the ones it expects, so what comes back is the
+    /// DESERIALIZE shape: a field with `skip_serializing_if`, and an
+    /// `Option` a fixture happens to leave `None`, are both in it,
+    /// where the JSON of one particular value would carry neither.
+    fn field_names<T: serde::de::DeserializeOwned>(type_name: &str) -> Vec<String> {
+        const PROBE: &str = "__lorica_shape_probe__";
+        let Err(error) = serde_json::from_str::<T>(&format!("{{\"{PROBE}\": null}}")) else {
+            panic!(
+                "{type_name} accepted an unknown field, so it carries no \
+                 #[serde(deny_unknown_fields)] and the shape guard cannot read it. Add the \
+                 attribute (the blob's strict decode wants it anyway) or drop the type from \
+                 the inventory and say why"
+            );
+        };
+        let message = error.to_string();
+        // "unknown field `X`, expected one of `a`, `b` at line .."
+        // Every odd-indexed split on a backtick is a quoted name; the
+        // first of them is the probe.
+        let mut names: Vec<String> = message
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(PROBE),
+            "{type_name}: serde did not answer the probe with an unknown-field error: {message}"
+        );
+        names.remove(0);
+        assert!(
+            !names.is_empty(),
+            "{type_name}: no field names came back from {message}"
+        );
+        names.sort();
+        names
+    }
+
+    /// One line per type, `Type(field,field,...)`, sorted twice so the
+    /// digest depends on the shape and on nothing else.
+    fn shape_lines() -> Vec<String> {
+        macro_rules! shapes {
+            ($($t:ty),+ $(,)?) => {{
+                let mut lines: Vec<String> = Vec::new();
+                $(
+                    let name = stringify!($t);
+                    lines.push(format!("{name}({})", field_names::<$t>(name).join(",")));
+                )+
+                lines.sort();
+                lines
+            }};
+        }
+        // The blob's type inventory: `CanonicalConfig` and everything
+        // reachable from its fields. A canonical type absent from this
+        // list is a type the guard does not watch, so adding one is
+        // part of adding a replicated table.
+        shapes![
+            CanonicalConfig,
+            CanonicalGlobalSettings,
+            CanonicalWafRule,
+            CanonicalCaptureRule,
+            crate::models::Route,
+            crate::models::PathRule,
+            crate::models::Backend,
+            crate::models::RouteBackend,
+            crate::models::Certificate,
+            crate::models::NotificationConfig,
+            crate::models::DnsProvider,
+            crate::models::CertExportAcl,
+            crate::models::CustomCrawler,
+            crate::models::ProbeConfig,
+            crate::models::SlaConfig,
+            crate::models::AutomationEnvironment,
+            crate::models::EnvironmentOwner,
+            crate::models::SecurityHeaderPreset,
+            crate::models::CaptureMatch,
+            crate::models::CaptureEmit,
+            crate::models::CaptureScope,
+            crate::models::CaptureLimits,
+            crate::models::CaptureOutput,
+            crate::models::CaptureRedaction,
+        ]
+    }
+
+    /// The guard `CANONICAL_FORMAT_VERSION` cannot be on its own.
+    ///
+    /// Migrations 56 to 59 each changed the blob's shape under version
+    /// 2, and a test that pins the integer passes on every one of
+    /// them. The window that opens is narrow and nasty: a dev build
+    /// stamps 2 on a blob missing a field, a later build is
+    /// schema-ahead of it and still admitted by the version gate, and
+    /// the failure surfaces as the confusing per-field decode error
+    /// AC #10 exists to prevent.
+    #[test]
+    fn the_canonical_shape_digest_matches_the_blob_s_field_set() {
+        let digest = sha256_hex(shape_lines().join("\n").as_bytes());
+        assert_eq!(
+            digest,
+            CANONICAL_SHAPE_DIGEST,
+            "the canonical blob's shape moved. Either bump CANONICAL_FORMAT_VERSION because a \
+             peer on the old shape must refuse this blob, or update CANONICAL_SHAPE_DIGEST to \
+             {digest} and say in the commit message why the old shape is still compatible.\n\
+             Current inventory:\n{}",
+            shape_lines().join("\n")
+        );
+    }
+
+    #[test]
+    fn the_fleet_identity_hash_moves_with_the_roster_and_not_with_its_order() {
+        let blob = "abcd";
+        let rows = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(n, i)| ((*n).to_string(), (*i).to_string()))
+                .collect()
+        };
+        let two = rows(&[("edge-a", "id-a"), ("edge-b", "id-b")]);
+        let reversed = rows(&[("edge-b", "id-b"), ("edge-a", "id-a")]);
+        assert_eq!(
+            fleet_identity_hash(blob, &two),
+            fleet_identity_hash(blob, &reversed),
+            "the store's row order must not change the fleet's identity"
+        );
+        let three = rows(&[("edge-a", "id-a"), ("edge-b", "id-b"), ("edge-c", "id-c")]);
+        assert_ne!(
+            fleet_identity_hash(blob, &two),
+            fleet_identity_hash(blob, &three),
+            "a node enrolling changes what every cut can resolve to"
+        );
+        assert_ne!(
+            fleet_identity_hash(blob, &two),
+            fleet_identity_hash("dcba", &two),
+            "and so does the configuration itself"
+        );
+        // A name and an id that are two rows must not hash like the
+        // one row whose halves concatenate to the same text.
+        assert_ne!(
+            fleet_identity_hash(blob, &rows(&[("ab", "c")])),
+            fleet_identity_hash(blob, &rows(&[("a", "bc")])),
+        );
     }
 
     // -----------------------------------------------------------------
