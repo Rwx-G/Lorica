@@ -1,7 +1,7 @@
 # Story 10.2: Capture Records, Redaction, Sinks and Dashboard
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** Draft
+**Status:** Done
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Story 10.1, which decides what is captured. This story decides what the capture looks like and where it goes.
@@ -86,16 +86,16 @@ it.
 
 ## Tasks
 
-- [ ] AC #1: the record type and its serialisation, with the `body_encoding` decision unit-tested on both branches.
-- [ ] AC #2: the redaction pass, with the always-redacted set as a constant no configuration path can reach.
-- [ ] AC #3: `SinkKind::Capture`, the lane registration, the `tracing` target, and the directory writer with its pruning.
-- [ ] AC #4: the drop path and its counter.
+- [x] AC #1: the record type and its serialisation, with the `body_encoding` decision unit-tested on both branches.
+- [x] AC #2: the redaction pass, with the always-redacted set as a constant no configuration path can reach.
+- [x] AC #3: `SinkKind::Capture`, the lane registration, the `tracing` target, and the directory writer with its pruning.
+- [x] AC #4: the drop path and its counter.
 - [x] AC #5: the dashboard page, the ring, and the three frontend gates. The ring is a 503 on a `--workers` supervisor rather than shipped from the workers; see the Debug Log for what shipping would take.
-- [ ] AC #6: the audit rows.
-- [ ] Flush `captures_emitted` and `captures_dropped` to the store. Story 10.1 built `ConfigStore::bump_capture_counters` and left it with no producer: the per-rule counts live in the process budget and never reach the row the dashboard reads. Whoever emits the record is the one who knows an emission happened, so it belongs here.
+- [x] AC #6: the audit rows.
+- [x] Flush `captures_emitted` and `captures_dropped` to the store. Story 10.1 built `ConfigStore::bump_capture_counters` and left it with no producer: the per-rule counts live in the process budget and never reach the row the dashboard reads. Whoever emits the record is the one who knows an emission happened, so it belongs here.
 - [x] Two gauges do not aggregate in worker mode. Closed the way `set_active_connections` does: both now travel as typed fields on the worker's `MetricsReport` and the supervisor mirrors them into its registry at scrape time. `lorica_capture_rules_active` is the MAXIMUM across workers, never the sum (every worker compiles the same snapshot, so a sum multiplies the rule count by the worker count); `lorica_capture_inflight_bytes` IS summed, and the ceiling is per worker. The aggregation rule for each is documented on its setter in `lorica-api/src/metrics.rs`. Extending the generic per-worker machinery to gauges was rejected: it would need a second wire message, a second supervisor-side snapshot map and a per-gauge sum/max mode, which is more new machinery than the defect warrants.
 - [x] AC #7: `docs/capture.md`, including two things an operator will otherwise discover the hard way: the response body is the upstream's and predates any rewrite, and a capture rule cannot be disabled on a follower without break-glass because it arrives by replication and a local change would be overwritten on the next round.
-- [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, and the frontend three (`npm run check`, `npm run lint`, `npx vitest run`).
+- [x] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, and the frontend three (`npm run check`, `npm run lint`, `npx vitest run`).
 
 ## Dev Notes
 
@@ -176,9 +176,52 @@ would have read production bodies. Pinned by
 under "Monitoring" beside Logs, hidden from a Viewer (every read on it
 is Operator+), through a new `operator` flag on `NavItem`.
 
+**The emit side was looking the rules up by the wrong route id, so no
+refusal was ever recorded.** `logging` built its candidate list from
+`ctx.route_id`, which `upstream_peer` sets. Every request the proxy
+refuses inside `request_filter` returns before that hook runs, so a WAF
+block, a 403 from an IP list, a 429, a redirect, a maintenance page or a
+`return_status` reached this file with no route and produced no record,
+however exactly the rule's `emit.status` matched the answer sent. A rule
+asking for `4xx` on a route the WAF guards recorded nothing at all. What
+worked was the PRD's motivating case, the upstream 500, and only because
+a 500 comes back from a backend the request had already routed to; the
+half of the traffic an operator opens a capture rule FOR is the half the
+proxy handled itself. The route id and the compiled rule set now travel
+on `CaptureState` from the admission in phase 1, so this file reads the
+route that admitted the request and the generation that judged it, and
+the `self.config.load()` that used to happen here is gone with them.
+Story 10.1's Debug Log carries the same note; the defect spanned both
+slices because the admission is in one and the emission in the other.
+
 ### Completion Notes
 
-(empty)
+**Done.** All seven acceptance criteria met, IV1 to IV4 proven in the
+Docker `capture` profile (24, 22, 8 and 4 assertions) with the records
+read back from stdout, the syslog collector, the OTLP collector and the
+directory writer, and joined to their access-log rows on `request_id`.
+
+**Audit pass.** Five read-only reviewers (security, offensive, architecture,
+quality, performance) ran against the whole epic before merge. Every
+Critical, High and Medium finding, and every Low with operational
+impact, was fixed on the branch rather than recorded; the findings that
+touched this story are listed in its Debug Log.
+
+What the audit changed in this story: the writer thread started on every
+node that captured, not on the first rule with a directory; every record
+was serialised twice and copied twice, and the ring took a parsed value
+it now derives lazily from the shared text; the symlink check covered the
+file and not the directory; the always-redacted set and the additive rule
+held under every attempt. Backlog #50 closed for all four sink kinds, not
+only capture, since it was the same code.
+
+Gates, all green on the final tree in the dev container: the three CI
+clippy commands with `RUSTFLAGS=-D warnings`; `cargo test --workspace`
+with no failure; `cargo audit` with its two pre-existing allowed
+warnings; the frontend three (`svelte-check` 0 errors, eslint clean,
+vitest 480 tests). Two suites that flaked under fourteen concurrent
+`cargo test` runs (`waf_body_inspection_e2e_test`, `lorica-memory-cache`)
+passed ten consecutive solo runs each on the quiet tree.
 
 ## File List
 

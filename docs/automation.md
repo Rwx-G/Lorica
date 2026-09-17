@@ -86,13 +86,31 @@ during an incident.
 Behind the allowlist, and still before the handshake, the accept loop
 takes the same pre-authentication budgets the cluster plane's
 enrollment listener takes, in the same order, held across the handshake
-and released when the connection ends: a global cap of 256 concurrent
-handshakes, 8 concurrent connections per source, and a sliding window
-of 20 connection attempts per source per minute over a map bounded at
-4096 sources. The handshake itself has 3 seconds to complete. Each
-refusal has its own counter (see Metrics), because the three answer
-different questions: is the node saturated, is one source holding every
-slot, is one source retrying too fast.
+and released when the connection ends. The numbers are this plane's
+own, sized for a pipeline rather than for an enrollment:
+
+| Budget | Automation listener | Enrollment listener |
+| --- | --- | --- |
+| Concurrent handshakes, whole listener | 256 | 256 |
+| Concurrent connections per source | 32 | 8 |
+| Connection attempts per source per minute | 300 | 20 |
+| Handshake timeout | 3 s | 3 s |
+| Sources tracked by the attempt window | 4096 | 4096 |
+
+Size a pipeline against the middle two rows. A source is one IPv4
+address or one IPv6 /64, so every job on a shared runner counts against
+the same budget, and one HTTP call over a fresh connection is one
+attempt: a job that runs `curl` thirty times makes thirty attempts. A
+source that goes past either bound has its connection dropped before
+TLS, with no HTTP response and therefore no 429 to read, which is the
+denial-of-service floor and not a rate limit to tune against. A runner
+that needs more than 300 calls a minute should reuse its connection
+(`curl --next`, or a client with keep-alive) rather than ask for the
+bound to be raised.
+
+Each refusal has its own counter (see Metrics), because the three
+answer different questions: is the node saturated, is one source
+holding every slot, is one source retrying too fast.
 
 Past the handshake the router caps request bodies at 64 KiB, far below
 the management plane's 1 MiB. An environment declaration is a hostname,
@@ -203,10 +221,10 @@ A token carries:
 | `name` | Operator-facing label, and the ownership principal (see Ownership). | Not blank. |
 | `scopes` | What it may do. | At least one, from the closed list below. |
 | `allowed_hostnames` | Hostname patterns it may claim. | At least one. An exact name or a single leading `*.`; a bare `*` is refused. |
-| `allowed_backend_cidrs` | CIDRs or bare addresses it may point a hostname at. | Empty accepts any address: the policy reads an empty allow list as default-allow, so name the ranges. |
+| `allowed_backend_cidrs` | CIDRs or bare addresses it may point a hostname at. | At least one. There is no node-wide default backend policy to fall back on, and the filter reads an empty allow list as allow-every-address, so an empty list is refused at mint time and the grant covers nothing at use time. |
 | `max_ttl_seconds` | Ceiling on the lifetime any environment it creates may request. | Default seven days, hard cap thirty. |
 | `expires_at` | Absolute UTC instant after which the token is refused. | Mandatory. Given as `expires_at` or as `lifetime_days` from now, never both; default 365 days. |
-| `last_used_at` | When the token was last accepted. | Stamped on every accepted request, best effort. The signal to retire a token nobody presents. |
+| `last_used_at` | When the token was last accepted. | Stamped at most once a minute per token, best effort: the field answers "is anybody still using this", and one SQLite write per request on the single store lock is not what that question costs. The signal to retire a token nobody presents. |
 | `revoked_at` | When an operator withdrew it. | `DELETE /api/v1/automation/tokens/{public_id}` stamps it and keeps the row. |
 
 Revocation is immediate: nothing about a token is cached, so a revoked
@@ -339,13 +357,21 @@ first call rather than a value silently ignored:
 | Field | Meaning | Rule |
 |---|---|---|
 | `hostname` | The exact host the environment answers on. | Lowercase-folded, trailing dot stripped. No wildcard, no scheme or path, no address literal, not `localhost` or under it, DNS label rules. Must match one of the credential's `allowed_hostnames` (403). |
-| `backends[]` | The upstreams: `address`, optional `tls_upstream`, `tls_sni`, `weight`. | At least one. `address` is `ip:port` with a non-zero port; a name is refused because it cannot be checked against a CIDR grant without a resolution the caller controls. Every address inside `allowed_backend_cidrs` (403). `weight` at least 1, default 1. |
-| `certificate` | `"auto"`, or an explicit certificate id. | An explicit id needs the `certificates:read` scope (403) and must exist (422). |
+| `backends[]` | The upstreams: `address`, optional `tls_upstream`, `tls_sni`, `weight`. | At least one, at most 32. `address` is `ip:port` with a non-zero port; a name is refused because it cannot be checked against a CIDR grant without a resolution the caller controls. Every address inside `allowed_backend_cidrs` (403); a credential naming no CIDR reaches no address at all. `tls_sni` is an RFC 1123 DNS name, no wildcard and no address literal. `weight` between 1 and 1000, default 1. |
+| `certificate` | `"auto"`, or an explicit certificate id. | An explicit id needs the `certificates:read` scope (403), must exist (422) and must cover the hostname under the same one-label wildcard rule `auto` uses (422): naming an id does not widen what the certificate carries. |
 | `waf_enabled` | Whether the WAF inspects the route, in detection mode. | Default off. |
 | `force_https` | Whether plain HTTP redirects to HTTPS. | Default off. |
 | `path_prefix` | The route's path prefix. | Default `/`; must start with `/`, no whitespace, `?`, `#` or `..`. |
 | `ttl_seconds` | How long the environment lives. | Greater than zero, at or under the credential's `max_ttl_seconds` (422). Recomputed from now on every `PUT`. |
-| `labels` | Free-form `key: value` pairs. | At most 16, keys and values at most 128 bytes, no empty key. `shared: "true"` opens the environment to every principal. |
+| `labels` | Free-form `key: value` pairs. | At most 16, keys and values at most 128 bytes, no empty key. `shared: "true"` opens the environment to every principal; only the owner may rewrite the labels, so a caller who reached a shared environment cannot close the door behind them. |
+
+One principal owns at most 100 environments. The cap is counted on
+create alone, inside the transaction, and a 422 names it: every `PUT`
+writes a route, its backends and the joins and starts a fleet
+replication round, so a looping pipeline without a ceiling is a write
+amplifier for every node. A pipeline that legitimately needs more
+splits the work across credentials, which is also how an operator sees
+which project is growing.
 
 Every rule above is checked before the store lock is taken, so a
 refusal a caller can provoke writes nothing and rolls back nothing.
@@ -502,26 +528,42 @@ delete an environment when all of the following hold:
   kind never matches, even on an identical string: a static token named
   `acme` and an OIDC project `acme` were issued by different
   authorities and are not the same owner.
-- The two principals share a prefix, where the prefix is the text
-  before the first `-`, or the whole principal when it has none. So
-  `acme-ci`, `acme-deploy` and `acme` are one owner; `acmecorp-ci` is
-  not, because the prefix is the whole first segment and not a string
-  prefix. An empty prefix, a principal that starts with `-`, matches
-  nothing, not even itself.
+- The two principals are the SAME string, byte for byte. `acme-ci`
+  reaches only `acme-ci`; `acme-deploy`, `acme` and `globex-ci` are
+  strangers to it.
+
+The rule used to compare the text before the first `-`, so `ci-acme`
+and `ci-globex` were one owner and so were the projects `acme/web` and
+`acme/web-docs`. A naming convention is not an authorization boundary:
+whoever picks the token name or the project name would be picking who
+else they can reach, and on a shared GitLab anybody can pick. This is a
+deliberate departure from the PRD's "same name prefix" wording, and it
+is recorded in the story Debug Logs of 10.4 and 10.5.
 
 The only opt-in is the label `shared` with the exact value `"true"`,
 which opens the environment to every principal of either kind. `"yes"`,
 `"True"`, `"1"` and `" true"` do not: an authorization rule must not be
 reachable by a near miss.
 
-For an ID token the same rule runs on `project_path`. A GitLab project
-path is `group/project`, and unless the project name itself carries a
-hyphen it has no `-` in it, so the prefix is the whole path: `acme/web`
-and `acme/api` are different owners, and so are `acme/web` and
-`acme/web-docs` only when the second is spelled with the hyphen
-(`acme/web-docs` shares the prefix `acme/web`, exactly as `acme-ci` and
-`acme-deploy` share `acme`). Ownership is therefore per PROJECT by
-default, which is GitLab's own model: an environment belongs to the
+A shared environment stays its owner's. A `PUT` by anybody else
+rewrites the route, the backends, the certificate binding and the
+lifetime; the stored `owner` is never replaced and the stored `labels`
+are kept as they are. Without that, reaching a shared environment and
+`PUT`ting it with `"labels": {}` would take it over and lock its owner
+out of it.
+
+A caller that may not access an environment is told the environment
+does not exist: `GET`, `DELETE` and a `PUT` carrying `If-Match` all
+answer the 404 an unknown name answers, with the same body. A 403 would
+confirm that the name is taken and by somebody else, which is the one
+fact a neighbour on a shared node must not be able to enumerate. The
+refusal reason is in the `automation.environment.forbidden` audit row,
+which an operator can read and a caller cannot.
+
+For an ID token the same rule runs on `project_path`: `acme/web`
+reaches only `acme/web`, and `acme/api` and `acme/web-docs` are both
+strangers to it. Ownership is therefore per PROJECT, which is GitLab's
+own model: an environment belongs to the
 project whose pipeline deployed it, and a job of another project in the
 same group has no say over it in GitLab either. A group that wants one
 grant across its projects expresses that on the issuer entry, with
@@ -685,11 +727,33 @@ Field by field:
 | `issuer` | The GitLab instance URL, which is the token's `iss`. | `https` only, no credentials in the URL, no query string or fragment. |
 | `audience` | The value the job puts in `id_tokens.<NAME>.aud`. | Identifies THIS Lorica instance. Several entries may share one. |
 | `jwks_url` | Where the signing keys are fetched from. | `https` only. Defaults to `<issuer>/oauth/discovery/keys`, which is where GitLab publishes them. |
-| `bound_claims` | Claims that must match exactly. | Keys from the closed set `project_path`, `namespace_path`, `ref_protected`, `environment_protected`, `deployment_tier`. A `*` glob is accepted in `project_path` ONLY. The two `_protected` claims take exactly `true` or `false`. |
+| `ca_pem` | A CA this entry pins for its own JWKS fetch. | Optional. One or more PEM certificates, 64 KiB at most; at least one must parse or the registration is refused. Never returned: a listing answers with `ca_fingerprint`. |
+| `bound_claims` | Claims that must match exactly. | Keys from the closed set `project_path`, `namespace_path`, `ref_protected`, `environment_protected`, `deployment_tier`. At least one of `project_path` and `namespace_path`: `aud` is not a secret, so an entry binding neither accepts a token from every project on the instance. A `*` glob is accepted in `project_path` ONLY, must carry a `/` before its first `*` (`acme/*`, never `acme*`, which would also cover `acme-evil/pwn`), and never spans a `/`, so `acme/*` is the acme group's own projects and `acme/sub/*` is how a subgroup is granted. The two `_protected` claims take exactly `true` or `false`. |
 | `allowed_hostnames` | Hostname patterns a token may claim. | At least one. Same one-label wildcard rule as a static token; a bare `*` is refused. |
-| `allowed_backend_cidrs` | CIDRs a token may point a hostname at. | Same rule as a static token; empty accepts any address. |
+| `allowed_backend_cidrs` | CIDRs a token may point a hostname at. | Same rule as a static token: at least one, and an empty list is refused rather than read as every address. |
 | `max_ttl_seconds` | Ceiling on the lifetime an environment may request. | Defaults to seven days, capped at thirty. |
 | `scopes` | What a token may do. | At least one; the same closed list as a static token. |
+
+**Which CA signs the JWKS endpoint.** The fetch runs on the node's own
+trust: webpki's public root bundle plus the platform store, which is
+where a distribution's `ca-certificates` bundle and anything
+`SSL_CERT_FILE` points at end up. A public `gitlab.com` needs nothing.
+A self-hosted GitLab behind a corporate PKI has two ways to work:
+install that CA on the host, where the platform store picks it up for
+every entry, or pin it on the entry itself with `ca_pem`.
+
+Pinning REPLACES the node's trust for that entry rather than adding to
+it. That is deliberate: an operator who names a CA is naming the
+authority they expect to have signed that endpoint, and keeping the
+public bundle alongside it would leave a few hundred commercial CAs
+able to vouch for the issuer too, which is the outcome pinning exists
+to refuse. Pin on the entry when the CA should be trusted for this one
+issuer and nothing else; install it on the host when the whole node
+should trust it. A listing never echoes the certificate back; it
+reports `ca_fingerprint`, the lowercase-hex SHA-256 of the first
+certificate's DER, which is what `openssl x509 -fingerprint -sha256`
+prints, so the pinned CA can be confirmed without the material leaving
+the node.
 
 **One entry is one authorisation policy.** Several entries may share
 an issuer and an audience with different bound claims: the verifier
@@ -750,7 +814,11 @@ For every presented ID token, in this order:
    header's `kid` must be present and non-empty.
 2. The token's `aud` is read WITHOUT verification, only to select the
    issuer entries to try; a forged `aud` selects entries whose keys then
-   refuse the forgery. No entry for that audience is a refusal.
+   refuse the forgery. No entry for that audience is a refusal. The
+   list is capped at 8 entries and the bearer value itself at 8 KiB,
+   both before any store access: the audience list is attacker-chosen
+   and each entry is one indexed read inside the single closure that
+   holds the store mutex, plus one audit row per attempt.
 3. The `kid` is looked up in the key set fetched from the entry's
    `jwks_url` over HTTPS on the node's trust roots, with a 5 second
    connect timeout, a 10 second total timeout, a 256 KiB body cap, and
@@ -762,9 +830,14 @@ For every presented ID token, in this order:
    regardless of how many unknown kids arrive; the cap is on ATTEMPTS,
    so a failing issuer is also asked once a minute and not once per
    request. Without it a caller sending tokens with random `kid` values
-   would drive one outbound fetch each, at request rate. The cache lock
-   is held across the fetch, so a burst on one issuer produces one
-   fetch and not a herd. A fetch failure keeps the cached keys until
+   would drive one outbound fetch each, at request rate. The cache
+   lock is NEVER held across the fetch: one unreachable issuer would
+   otherwise stall every OIDC authentication on the node for the full
+   ten-second timeout, cached issuers included. A burst on one issuer
+   still produces one fetch and not a herd, because the attempt stamp
+   is claimed under the lock before it is dropped, so the second
+   request through finds itself inside the minute and answers from what
+   the cache holds. A fetch failure keeps the cached keys until
    their refresh interval elapses; once it has elapsed with no
    successful fetch there is no key the node can vouch for, and
    verification fails closed until the issuer answers again.
@@ -798,13 +871,52 @@ where `GET` and `whoami` report them and the audit trail keeps them.
 
 ### Reading a refusal
 
-Every refusal is the same 401 on the wire. The
-`automation.request.unauthenticated` audit row carries the precise
-cause in its `reason` field:
+Every refusal is the same 401 on the wire, and every missing grant the
+same 403. The audit row is where the precise cause is written, and it
+is written in the two places an operator looks:
+
+- **`GET /api/v1/audit`**, and the Audit page that reads it. The reason
+  rides inside the row's `action`, after a colon:
+  `automation.request.unauthenticated:wrong_alg`,
+  `automation.request.forbidden:environments:write`. Filtering the
+  endpoint on `action=automation.request.unauthenticated` still returns
+  every refusal, because the filter is a prefix match.
+- **syslog, OTLP and the file log**, which carry the `lorica::audit`
+  tracing event. The same text is a `reason` field of its own there, so
+  a SIEM rule matches on a field instead of parsing a dotted verb.
+
+The row is durable within the audit writer's next drain, not before
+the 401 comes back. Both planes hand their rows to one bounded queue
+that a single writer drains in arrival order, which is what keeps the
+hash chain in the order the requests were served; the write no longer
+sits between the request and its response. In practice the row is
+there before an operator can look, but a script that refuses a request
+and reads `GET /api/v1/audit` in the same breath can race it. If the
+queue stays full, rows are dropped rather than made to wait, and
+`lorica_audit_rows_dropped_total` counts exactly how many: a non-zero
+value is the only evidence that the trail has a gap, so alert on it.
+
+What it is never written into is a payload. Payloads are hashed and
+never stored (Story 9.9) because they may carry secrets; the reason
+vocabulary below is a closed list of words the node chooses, with no
+caller-supplied material in it, which is exactly why it may travel in
+clear where a payload may not. The one list the code and this table
+both answer to is `AUTOMATION_AUDIT_REASONS` in
+`lorica-api/src/automation/audit.rs`, and a test refuses any reason the
+gates can emit that is not in it.
+
+#### 401, the credential
 
 | `reason` | Meaning |
 |---|---|
+| `no_bearer` | No `Authorization: Bearer` header, or another scheme, or an empty value. |
+| `bearer_too_long` | The bearer value is over 8 KiB; refused before its shape is looked at. |
+| `not_a_credential` | Neither a `<public_id>.<secret>` static token nor anything JWT-shaped. |
+| `token_unknown_or_wrong_secret` | No such static token, or the secret half does not verify. The two are one reason on purpose: telling them apart would confirm a public id. |
+| `token_revoked` | The static token was withdrawn. |
+| `token_expired` | The static token is past its `expires_at`. |
 | `malformed` | Not a decodable JWT, or a payload with no usable `aud`. |
+| `too_many_audiences` | The token names more than 8 audiences; refused before any store read. |
 | `wrong_alg` | The header's `alg` is not `RS256` (`HS256`, `none`, `RS512`, ...). |
 | `no_issuer` | No registered entry names the token's `aud`. |
 | `unknown_kid` | The header's `kid` is absent, or the current key set does not carry it. |
@@ -825,6 +937,35 @@ one. A pipeline that cannot authenticate therefore asks an operator,
 who reads the row; the wire tells an attacker nothing about which mode
 was tried or how close they got.
 
+#### 403, the grant
+
+The credential authenticated and the scope gate turned it away. The
+reason is the grant the path wanted, spelled exactly as the token
+spells it, so an operator can compare it against `whoami` without
+translating:
+
+| `reason` | Meaning |
+|---|---|
+| `environments:read` | The path reads environments and the credential does not carry the scope. |
+| `environments:write` | The path writes environments and the credential does not carry the scope. |
+| `routes:read` | Same, for the routes an environment resolves to. |
+| `certificates:read` | Same, for certificate metadata. |
+| `no_declared_scope` | The path has no entry in the scope matrix, so no token can reach it. A bug in Lorica, not in the caller: the scope gate also logs it at ERROR. |
+
+A 403 a handler raised rather than the scope gate (an ownership rule, a
+hostname outside the credential's grant) carries no reason at all: the
+verb is a bare `automation.request.forbidden`. Naming the path's scope
+there would send an operator off to re-mint a token that was never the
+problem; the handler's own message on the wire is what explains those.
+
+#### The node's own faults
+
+`automation.request.error` is a 5xx: the node broke rather than
+deciding. It is its own outcome word so that a trail scanned for
+Lorica's faults does not have to pick them out of the requests Lorica
+turned away on purpose. A handler that panics lands here too, with a
+500 on the wire and a row like any other request.
+
 ### Static token vs ID token
 
 | | Static token | GitLab ID token |
@@ -832,7 +973,7 @@ was tried or how close they got.
 | What the job holds | A long-lived secret in a masked, protected CI variable. | Nothing before the job starts; GitLab mints the token per job. |
 | Lifetime | Until its `expires_at` (default one year) or revocation. | The job timeout or five minutes, whichever is shorter. |
 | What Lorica stores | HMAC of the secret half, per token. | The issuer entry only; no per-job state beyond the `jti` until `exp`. |
-| Who is the principal | The token's name; ownership by name prefix. | The job's `project_path`; ownership by its prefix, per project by default. |
+| Who is the principal | The token's name; ownership by that exact name. | The job's `project_path`; ownership by that exact path, per project. |
 | What the authorisation is bound to | Whoever holds the string. | The project, ref and environment GitLab signed into the claims. |
 | Rotation | An operator mints a new token and updates the CI variable. | Automatic; the key set rotates at the issuer and Lorica follows on the next unknown `kid`. |
 | Revocation | `DELETE /api/v1/automation/tokens/{public_id}`, immediate. | `DELETE /api/v1/automation/oidc-issuers/{id}` for the whole policy, immediate; a single job cannot be revoked short of its five minutes. |
@@ -988,7 +1129,8 @@ reaper all run in the supervisor.
   plane is the reaper task having died, which nothing else reports.
 - **`lorica_automation_requests_total{outcome}`** (counter): one per
   request on the listener, `outcome` being the word the audit row
-  gets, `ok`, `unauthenticated`, `forbidden` or `refused`, so the
+  gets, `ok`, `unauthenticated`, `forbidden`, `error` (a 5xx, the
+  node's own fault, a panicking handler included) or `refused`, so the
   scrape and the log never disagree on what a request was.
 - **`lorica_automation_source_refused_total`** (counter): connections
   dropped before the handshake because the source was outside
@@ -1016,10 +1158,17 @@ any check. Retrying with the same credential will not help; read the
 means the credential WAS accepted and the grant is not there: the path
 wants a scope the credential does not carry (the message names it), the
 hostname is outside `allowed_hostnames`, a backend address is outside
-`allowed_backend_cidrs`, an explicit certificate id was named without
-`certificates:read`, the environment belongs to another owner, or the
+`allowed_backend_cidrs` (or the credential names no CIDR at all), an
+explicit certificate id was named without `certificates:read`, or the
 entry binds `environment_protected` and the name is not the job's
 slug. Do not re-mint a token for a 403; fix the grant or the request.
+
+**A 404 on an environment a colleague says exists.** It exists and it
+is not yours: it belongs to another principal and carries no
+`shared: "true"` label. Foreign and unknown answer alike on purpose,
+so the status cannot be used to enumerate the neighbours' names. The
+`automation.environment.forbidden` audit row of that very call says
+which it was.
 
 **`no_certificate_covers_hostname`.** No certificate's `domain` or
 `san_domains` covers the hostname under the one-label wildcard rule.

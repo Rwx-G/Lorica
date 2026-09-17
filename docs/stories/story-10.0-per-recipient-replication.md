@@ -62,7 +62,7 @@ The generation stays fleet-wide. It is a monotonic counter over configuration ch
 ## Tasks
 
 - [x] AC #1/#2: control-plane-side selection, name-to-id resolution with the ambiguity rule, API validator message.
-- [x] AC #3: per-node expected hash, DERIVED rather than persisted (see the Debug Log), with the restart path.
+- [x] AC #3: per-node expected hash, DERIVED rather than persisted (see the Debug Log), with the restart path. The fleet identity hash that makes the derivation safe, and that IS persisted, landed on the architecture review.
 - [x] AC #4: `evaluate_drift` takes the expected hash; four tests plus the regression guard.
 - [x] AC #5: replication round report carries the per-node hash (`ReplicationReport::offered`).
 - [x] AC #6: the wire corpus passes unmodified.
@@ -106,19 +106,49 @@ The load-bearing property was never name uniqueness anyway: it is that
 the resolution happens on the control plane and answers with the
 `node_id` the recipient's certificate proves.
 
-**AC #3: derived, not persisted, and that is the better answer.** The
-criterion asks for the per-node expected hash to be persisted so a
-control-plane restart does not turn every node into a drift alert. It is
-not persisted, and the restart still raises nothing. `AcceptedConfig`
-holds the accepted generation's `PayloadSource` rather than the bytes it
-produced, and recomputes a recipient's cut on demand (memoised per
-round). Canonical encoding is deterministic, so the boot seed rebuilds an
-identical source from the store and every node's expected hash comes out
-the same. Persisting it would have created a second copy of a derivable
-fact, which is the exact shape of the drift this cycle has been closing
-(the drift pill against `/cluster/drift`, two package managers, two
+**AC #3: derived, not persisted, and what had to change to make that
+true.** The criterion asks for the per-node expected hash to be
+persisted so a control-plane restart does not turn every node into a
+drift alert. It is not persisted. `AcceptedConfig` holds the accepted
+generation's `PayloadSource` rather than the bytes it produced, and
+recomputes a recipient's cut on demand (memoised per round). Canonical
+encoding is deterministic, so the boot seed rebuilds an identical source
+from the store and every node's expected hash comes out the same.
+Persisting it would have created a second copy of a derivable fact,
+which is the exact shape of the drift this cycle has been closing (the
+drift pill against `/cluster/drift`, two package managers, two
 definitions of ambiguous authority). One source, recomputed, cannot
 disagree with itself.
+
+The derivation stands. The premise this paragraph originally rested on
+did not, and the architecture review was right to say so. A cut is a
+function of TWO sources: the canonical configuration, and the roster
+that turns a `node_selector` name into a node id. Recomputation is only
+sound while neither can move under a generation, and the roster could:
+the generation advanced on configuration changes alone, so a node
+enrolling under a name a route already selects changed every cut without
+advancing anything. Two nodes could then hold two payloads for one
+generation, and a restarted control plane, rebuilding from the roster as
+it is THEN, would expect a third.
+
+What makes the derivation safe is not that the expectation is
+recomputable but that its sources cannot change under a generation. So
+the identity the reload path compares now covers the canonical blob AND
+the sorted `(name, node_id)` rows
+(`lorica_config::canonical::fleet_identity_hash`), which makes a roster
+change a configuration change: the generation advances with it and a
+round runs. Enrolment is the only runtime write that can change a
+resolution and it fires the same reload signal a configuration mutation
+fires; activation and revocation flip a status column and leave the name
+and the id alone, so they change no cut and are deliberately silent. The
+identity hash is persisted beside `cluster_config_generation` (a fourth
+`cluster_replica` key, no migration: the table is key-value and an absent
+row reads as never published), and the boot seed compares the recomputed
+one against it. Equal means the seed is faithful and publishes the stored
+generation unchanged; different means a change landed without a round
+behind it, a crash between the registry write and the round, so the seed
+advances the generation, publishes, and logs at WARN that a round was
+owed. `docs/cluster.md` says all of this under the per-recipient section.
 
 **The consequence that was not in the story: what the control plane
 ADVERTISES had to move too.** With a per-node hash, a follower comparing
@@ -230,6 +260,17 @@ Anticipated, to be corrected during implementation.
 
 ## Change Log
 
+- 2026-09-17: Architecture and performance review follow-up. The roster
+  joins the fleet's identity hash, so a roster change advances the
+  generation and cannot move a cut under one; the identity is persisted
+  and the boot seed repairs a generation a crash left behind (the AC #3
+  paragraph above is rewritten). `PayloadSource::expected_version_for`
+  answers the Commit, the drift verdict and every ack without copying a
+  recipient's blob. `restrict_for_recipient` stops deep-cloning the six
+  tables it replaces. `CANONICAL_SHAPE_DIGEST` guards the blob's field
+  set so `CANONICAL_FORMAT_VERSION` cannot name two shapes. The real
+  `FleetPayloads` is now driven through the real `Replicator` in a
+  binary test, against `restrict_for_recipient` itself.
 - 2026-09-16: Implemented and closed. Six commits: the round's per-recipient
   payloads and the advertised-version change that had to come with them, the
   drift verdict, the write-time selector check, the documentation, and the

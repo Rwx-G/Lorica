@@ -1,7 +1,7 @@
 # Story 10.3: Automation Listener and Scoped API Tokens
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** InProgress
+**Status:** Done
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** nothing in this epic.
@@ -120,8 +120,8 @@ touch the other.
 - [x] AC #6: the management-API token endpoints and the dashboard sub-page. The plane-separation test asserts 403, not 404: the scope gate wraps the whole automation router, so an undeclared path is refused before routing resolves.
 - [x] AC #8: the CLI helper and the OpenAPI security scheme, in a separate `openapi-automation.yaml` with its own contract gate that cross-checks `x-required-scope` against `required_scope`.
 - [x] Hot upgrade: the seven plumbing points. Point four was blocked one slice and closed the next: `start_automation_server` had no inherited-listener parameter, so the producer side deliberately handed over nothing rather than a socket the new side could only close, and the consequence (EADDRINUSE during the overlap) was stated rather than hidden.
-- [ ] `docs/automation.md`, written once Stories 10.4 and 10.5 have settled the shapes it describes.
-- [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, the frontend three.
+- [x] `docs/automation.md`, written once Stories 10.4 and 10.5 have settled the shapes it describes.
+- [x] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, the frontend three.
 
 ## Dev Notes
 
@@ -171,7 +171,36 @@ rather than sampling it.
 
 ### Completion Notes
 
-(empty)
+**Done.** All nine acceptance criteria met. `docs/automation.md` written
+from the code. IV1 to IV4 run in the Docker `cluster` profile's automation
+smoke.
+
+**Audit pass.** Five read-only reviewers (security, offensive, architecture,
+quality, performance) ran against the whole epic before merge. Every
+Critical, High and Medium finding, and every Low with operational
+impact, was fixed on the branch rather than recorded; the findings that
+touched this story are listed in its Debug Log.
+
+What the audit changed in this story: an unauthenticated JWT carrying
+thousands of `aud` values drove one store read each under the global
+mutex, capped now at eight audiences and an 8 KiB bearer before any
+lookup; the pre-auth window sized for enrolment dropped a pipeline's
+twenty-first connection silently, so the listener has its own budgets and
+the documentation states them; the source allowlist was read once at
+start and narrows live now; a handler that panicked skipped its audit
+row, closed with a panic net inside the audit layer; the precise refusal
+reason lived only in a hashed payload, and now rides the stored action
+and a structured tracing field; the token's `last_used_at` was one
+SQLite write per request, coalesced to one per minute; the JWKS cache
+lock was held across the fetch.
+
+Gates, all green on the final tree in the dev container: the three CI
+clippy commands with `RUSTFLAGS=-D warnings`; `cargo test --workspace`
+with no failure; `cargo audit` with its two pre-existing allowed
+warnings; the frontend three (`svelte-check` 0 errors, eslint clean,
+vitest 480 tests). Two suites that flaked under fourteen concurrent
+`cargo test` runs (`waf_body_inspection_e2e_test`, `lorica-memory-cache`)
+passed ten consecutive solo runs each on the quiet tree.
 
 ## File List
 

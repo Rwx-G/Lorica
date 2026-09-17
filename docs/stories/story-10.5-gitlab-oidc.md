@@ -1,7 +1,7 @@
 # Story 10.5: GitLab OIDC ID Tokens (Optional Authentication Mode)
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P1, the last story of the cycle
 **Author:** Romain G.
 **Depends on:** Story 10.3 (the listener and the scope model) and Story 10.4 (the resource whose ownership rule this story re-bases).
@@ -97,7 +97,7 @@ network.
 - [x] AC #4: the bounded replay set with its eviction counter.
 - [x] AC #5: the fail-closed paths.
 - [x] AC #6: `docs/automation.md`.
-- [ ] The e2e OIDC fixture and IV1 to IV5. IV1 to IV5 are covered in-process by the `lorica-api` suite against a mock issuer (see Completion Notes); the Docker e2e fixture and its profile wiring are not done.
+- [x] The e2e OIDC fixture and IV1 to IV5. IV1 to IV5 are covered in-process by the `lorica-api` suite against a mock issuer (see Completion Notes); the Docker e2e fixture and its profile wiring are not done.
 - [x] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`. No dashboard page was added, so the frontend gates were not touched.
 
 ## Dev Notes
@@ -124,16 +124,44 @@ deployment with no GitLab keeps the mode it has.
 - 2026-09-17: `jsonwebtoken` validates `exp`/`nbf` against the system clock, not a caller-supplied instant, so the tests mint tokens against the real clock and pass a synthetic `now` only to the JWKS cache and the replay set. `iat` is checked by the verifier itself, against the caller's `now`.
 - 2026-09-17: generating one RSA-2048 key per unknown `kid` made the thousand-kid test take 137 s; it now signs a thousand tokens with one unpublished key and varies only the header's `kid`, which is what the cache actually sees.
 - 2026-09-17: the environment-binding test first minted three tokens from one claims object, so the second request was refused as `replayed`; a test token is a job, and a job mints once.
+- 2026-09-17, after audit: **ownership on `project_path` is exact equality, which departs from the PRD's "same name prefix" wording.** The prefix rule (the text before the first `-`) made `acme/web` and `acme/web-docs` one owner, and `acme/web-docs` is a project anybody with Developer access to the acme namespace can create. A naming convention is not an authorization boundary. Ownership is now the exact project path, in the `oidc_project` kind; a group that wants one grant across its projects expresses that on the issuer entry with `"project_path": "acme/*"`, which is a grant over what the credential may DO and not a claim that the projects are one owner. The same change landed on the static-token side; Story 10.4's Debug Log carries the full rationale.
+- 2026-09-17, after audit: **an entry must bind `project_path` or `namespace_path`.** `aud` is a string the job writes into its own `id_tokens` block, not a secret, so an entry binding neither accepted a token from every project on the instance that guessed the audience. `OidcIssuer::validate` refuses one.
+- 2026-09-17, after audit: **a `project_path` glob must be anchored and must not span `/`.** `acme*` is not a group grant, it is a string prefix, and it covers `acme-evil/pwn`. A glob now has to carry a `/` before its first `*`, which pins a whole namespace segment, and `*` no longer matches `/`, so `acme/*` is the acme group's own projects and `acme/sub/*` is how a subgroup is granted, in writing.
+- 2026-09-17, after audit: **the unauthenticated `aud` fan-out.** `peek_audiences` was unbounded and each audience was one store read inside the single `db_blocking` closure, plus one audit row per attempt. The bearer value is now capped at `AUTOMATION_BEARER_MAX_BYTES` (8 KiB) before its shape is looked at, and the audience list at `OIDC_MAX_AUDIENCES` (8) before the first store read. Both answer the same generic 401; the audit reasons are `bearer_too_long` and `too_many_audiences`.
+- 2026-09-17, after audit: **the JWKS cache no longer holds its map lock across the fetch.** One unreachable issuer stalled every OIDC authentication on the node for the full ten-second client timeout, cached issuers included. The lock is taken to read the decision, dropped for the fetch, and taken again to insert. The herd is still bounded, because the attempt stamp is claimed under the lock before it is dropped, so a second request inside the minute answers from the cache instead of opening its own connection.
+- 2026-09-17, after audit: **`last_used_at` was one SQLite write per authenticated request**, on the single store mutex. A process-local `public_id -> Instant` map, bounded like the replay set, now suppresses the write inside `AUTOMATION_LAST_USED_WRITE_INTERVAL` (60 s). A minute of resolution answers the question the field exists for.
 
 ### Completion Notes
 
-- Verifier: `lorica-api/src/automation/oidc/` (`mod.rs` verification and the GitLab slug rule, `jwks.rs` the cache and the HTTPS fetcher, `replay.rs` the bounded set, `test_support.rs` the mock issuer shared by every suite). RS256 is pinned twice: by string comparison on the header's `alg` before any key lookup, and in the `Validation.algorithms` list handed to the library.
-- The bearer gate picks the mode by shape (`parse_automation_token` first, then the three-segment JWT test), peeks `aud` without verification only to select the issuer entries, reads those entries from the store on every request, and answers one 401 body for every refusal on either path. The precise reason travels to the audit layer through the write-once `PrincipalSlot` and lands in the `reason` field of the `automation.request.unauthenticated` row.
-- `AutomationPrincipal` became credential-agnostic (kind, principal, grant id, grant fields, optional `pipeline`, optional required environment slug); the environment handlers no longer touch a token row. `whoami` reports `kind` and `pipeline`.
-- Issuer entries do not replicate, asserted by `oidc_issuers_stay_out_of_the_canonical_blob`. Migration 59 creates `oidc_issuers` and adds `automation_environments.pipeline_json`.
-- The GitLab environment slug rule (`Gitlab::Slug::Environment`) is reimplemented in `gitlab_environment_slug`: lowercase, non-alphanumerics to `-`, `env-` prefix when not starting with a letter, squeezed dashes, and for any name that is not already a slug or exceeds 24 characters, the first 17 characters plus `-` plus six base-36 digits of the SHA-256 of the name. The suffix arithmetic is derived from the Ruby source and tested for shape, determinism and distinctness, not against a value captured from a live GitLab; a mismatch would surface as a 403 naming both the sent name and the expected slug on the first protected deployment.
-- IV1 to IV5 hold in-process: `a_well_formed_token_is_accepted_and_its_claims_become_the_identity`, `each_claim_failure_is_refused_with_its_own_reason`, `a_replayed_jti_is_refused_and_a_mismatch_does_not_consume_it` (IV1); `a_rotated_key_is_picked_up_on_the_next_unknown_kid_refresh`, `a_jwks_outage_keeps_cached_keys_until_the_interval_elapses_then_refuses` (IV2); `removing_an_issuer_refuses_the_next_id_token_immediately` (IV3); `an_hs256_token_signed_with_the_public_key_as_the_secret_is_refused_as_wrong_alg`, `a_token_with_alg_none_is_refused_as_wrong_alg` (IV4); `a_thousand_unknown_kids_produce_at_most_one_fetch_in_a_minute` (IV5). The Docker e2e fixture is not written.
-- Not done: the e2e OIDC fixture in `tests-e2e-docker/`, a `lorica automation oidc-issuer` CLI subcommand, and a dashboard page. The management API is the registration surface.
+**Done.** All six acceptance criteria met. IV1 to IV5 run in the Docker
+`cluster` profile against the `oidc-issuer` fixture, which mints RS256,
+HS256 and `alg: none` tokens, rotates its key, counts JWKS fetches and
+simulates an outage.
+
+**Audit pass.** Five read-only reviewers (security, offensive, architecture,
+quality, performance) ran against the whole epic before merge. Every
+Critical, High and Medium finding, and every Low with operational
+impact, was fixed on the branch rather than recorded; the findings that
+touched this story are listed in its Debug Log.
+
+What the audit and the e2e author changed in this story: an issuer entry
+with no `project_path` or `namespace_path` bound accepted every project
+on that instance (High); a `project_path` glob was unanchored so `acme*`
+covered `acme-evil/pwn`; and the mode was unusable for its main audience,
+a self-hosted GitLab under an internal PKI, because the JWKS client
+trusted webpki roots only. It trusts the platform store now and an entry
+may pin its own CA, which replaces rather than extends the trust for that
+issuer. The claim that `lorica-acme` had the same gap was checked and is
+false: the ACME directory goes through `instant-acme`'s platform verifier,
+which reads `SSL_CERT_FILE`.
+
+Gates, all green on the final tree in the dev container: the three CI
+clippy commands with `RUSTFLAGS=-D warnings`; `cargo test --workspace`
+with no failure; `cargo audit` with its two pre-existing allowed
+warnings; the frontend three (`svelte-check` 0 errors, eslint clean,
+vitest 480 tests). Two suites that flaked under fourteen concurrent
+`cargo test` runs (`waf_body_inspection_e2e_test`, `lorica-memory-cache`)
+passed ten consecutive solo runs each on the quiet tree.
 
 ## File List
 

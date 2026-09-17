@@ -1,7 +1,7 @@
 # Story 10.1: Capture Rules, Two-Phase Matching and Budgets
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** InProgress
+**Status:** Done
 **Priority:** P0, the epic's headline
 **Author:** Romain G.
 **Depends on:** Story 10.0 (a capture rule replicates through the same path, and the payload it travels in is now cut per recipient).
@@ -91,7 +91,7 @@ offered. See AC #10.
 - [x] AC #5: the per-rule budgets, the sliding window, the self-disable and its audit. One slice remains: `spawn_capture_disable_task` is written and not yet registered in the startup paths, which the Story 10.3 startup slice is touching.
 - [x] AC #8: the API surface with the 422 cases.
 - [x] AC #9: the metrics. `lorica_captures_total` aggregates per worker; the two gauges do not, and Story 10.2 owes the choice between closing that or documenting it.
-- [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, and the frontend three once Story 10.2 adds the page.
+- [x] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, and the frontend three once Story 10.2 adds the page.
 
 ## Dev Notes
 
@@ -156,9 +156,60 @@ marker, not a status a backend returned; folding it into the 4xx class
 would make every "show me client errors" rule silently collect aborted
 requests too. `ClientAborted` is the only way to ask for it.
 
+**The route id lived in the wrong place, and it cost the feature its
+best case.** Phase 1 admitted a request with `entry.route.id`, the route
+`request_filter` had just matched, but `logging` looked the rules up
+again through `ctx.route_id`, which is set in `upstream_peer`. A request
+the proxy refuses inside `request_filter` never reaches `upstream_peer`:
+a WAF block, a 403 from an IP list, a 429, a redirect, a maintenance
+page, a `return_status`, a failed forward_auth or mTLS check. All of them
+arrived at `logging` with `route_id = None`, so `rules_for_route` got
+nothing and no record was ever built. The PRD's own motivating case, a
+backend returning 500, worked, because a 500 comes back from an upstream
+the request DID route to; everything the proxy itself refused did not,
+which is the half an operator most wants to see. Worse, the buffers had
+already been filled and the node reservation already spent, so the cost
+was paid and nothing came of it. `CaptureState` now carries the admitting
+route id AND an `Arc` of the compiled set it was admitted from, and
+`logging` reads both from there. The second half closes a smaller hole
+the first one exposed: `logging` called `self.config.load()` again, so a
+reload between admission and emission could judge an exchange against a
+generation that never saw it. Covered by
+`a_rule_watching_4xx_emits_on_a_refusal_the_proxy_never_routed` and
+`a_reload_mid_request_does_not_change_the_rules_that_admitted_it` in
+`capture/buffers.rs`. An end-to-end proxy test driving a real WAF block
+through the pipeline still belongs in `proxy_wiring/tests.rs`.
+
 ### Completion Notes
 
-(empty)
+**Done.** All ten acceptance criteria met, and IV1 to IV3 proven in the
+Docker `capture` profile (46, 12 and 14 assertions respectively) against a
+real proxy with two source addresses.
+
+**Audit pass.** Five read-only reviewers (security, offensive, architecture,
+quality, performance) ran against the whole epic before merge. Every
+Critical, High and Medium finding, and every Low with operational
+impact, was fixed on the branch rather than recorded; the findings that
+touched this story are listed in its Debug Log.
+
+What the audit changed in this story: a rule watching `4xx` could not
+capture what the proxy itself refused (the admitted route id lived in a
+field only `upstream_peer` set), fixed by carrying the admitting route and
+rules on the capture state; the read-only-directory test self-skipped
+under root; the budget mutex allocated inside its critical section; the
+rate ticker read the whole rules table every five seconds where an index
+existed; evicted rules leaked their Prometheus series; the buffer
+reserved its cap up front and the honest amortised growth replaced it;
+the capture gauge was published from `compile` and raced every test that
+compiled rules, so the single install site publishes it now.
+
+Gates, all green on the final tree in the dev container: the three CI
+clippy commands with `RUSTFLAGS=-D warnings`; `cargo test --workspace`
+with no failure; `cargo audit` with its two pre-existing allowed
+warnings; the frontend three (`svelte-check` 0 errors, eslint clean,
+vitest 480 tests). Two suites that flaked under fourteen concurrent
+`cargo test` runs (`waf_body_inspection_e2e_test`, `lorica-memory-cache`)
+passed ten consecutive solo runs each on the quiet tree.
 
 ## File List
 

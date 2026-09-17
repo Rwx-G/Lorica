@@ -473,6 +473,29 @@ source from the store and every node's expected hash comes out identical.
 There is no second copy to fall out of step with the first, and a
 control-plane restart raises no drift alerts.
 
+**The roster is part of the fleet's identity, and that is what makes the
+derivation safe.** A cut is a function of two sources, not one: the
+configuration, and the roster that turns a `node_selector` name into a
+node id. Deriving an expectation is only sound while neither can move
+under a generation. So the hash the reload path compares, the one
+`/cluster/drift` and `/cluster/replication` report as the fleet's, covers
+the canonical blob AND the `(name, node_id)` rows the selectors resolve
+against. A node enrolling under a name a route already selects changes
+every cut without touching one byte of configuration; folding the roster
+in makes that a configuration change, so the generation advances with it
+and a round runs. Enrolment is the only runtime write that can do this:
+activation and revocation flip a status column and leave the name and the
+id alone, so they change no cut and run no round.
+
+The control plane persists that identity hash beside the generation. At
+boot it recomputes it and compares: equal means the generation still
+describes what the store holds, and the seed publishes it unchanged, so a
+restart raises no drift. Different means a change landed without a round
+behind it, which a crash between a registry write and its round can
+leave. The seed then advances the generation, publishes, and logs at WARN
+that a round was owed, rather than telling every node it is in sync with
+a cut this process no longer computes.
+
 What a follower still learns: the routes it serves, the fleet-wide policy
 above, the current generation, and that other generations exist. That is
 the floor for a node that has to know when it is behind.
@@ -1012,6 +1035,17 @@ allocate arbitrarily.
 A node that joins an existing fleet ships what it records from then on,
 not its whole pre-cluster history. Those rows are still on the node and
 still verifiable there.
+
+The claim is about the FAN-IN path: a row a node recorded is never
+dropped on its way to the control plane. Recording it is a separate
+step with its own limit. Both planes hand new rows to one bounded
+queue that a single writer drains in arrival order, so a row is
+durable within that drain rather than before the response, and a queue
+that stays full drops rows rather than making a caller wait for
+SQLite. `lorica_audit_rows_dropped_total` counts them, and it is the
+only trace such a row leaves: the chain closes over what was written,
+so a row that never reached it breaks nothing and shows as nothing.
+Alert on that counter.
 
 ### What is recorded
 

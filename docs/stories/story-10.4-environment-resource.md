@@ -1,7 +1,7 @@
 # Story 10.4: The Environment Resource
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** InProgress
+**Status:** Done
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Story 10.3 (the listener and the token that scopes what an environment may claim) and Story 10.0 (an environment's route replicates through a payload that is now cut per recipient).
@@ -94,7 +94,7 @@ token with the same name prefix, or one explicitly labelled `shared`.
 - [x] AC #8: `managed_by` on routes and backends. `group_name = automation:<name>` is refused by the management API's own group-name validator, and that is a guard, not a defect: nobody can hand-create a route that claims to be automation-managed. The dashboard badge and edit refusal ride the frontend slice.
 - [x] AC #9: the row-level serialisation (the store lock) and `If-Match`, strong and weak tags and `*`.
 - [x] AC #10/#11: the metrics, and `story_10_4_rides_format_version_two_without_a_second_bump`.
-- [ ] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, the frontend three.
+- [x] Gates: the three CI clippy commands with `RUSTFLAGS=-D warnings`, every Rust suite, `cargo audit`, the frontend three.
 
 ## Dev Notes
 
@@ -131,6 +131,61 @@ inconsistency and is a guard: an operator cannot hand-create a route or
 backend that claims automation ownership, so `managed_by` and the group
 name agree by construction.
 
+**Ownership is principal identity, not a name prefix. This departs
+from the PRD.** The PRD says a credential reaches an environment
+created by a credential with the "same name prefix", and the first
+implementation read that as the text before the first `-`. Two audits
+found the same hole: the prefix crosses tenants in both directions.
+`ci-acme` and `ci-globex` own each other's environments, and so do the
+OIDC projects `acme/web` and `acme/web-docs`. A naming convention is
+not an authorization boundary: whoever picks a token name or a project
+name picks who else they can reach, and on a shared GitLab anybody can
+pick. `may_access` therefore requires the caller's principal to equal
+the owner's, byte for byte, in the same kind, and `principal_prefix`
+is gone. The `shared = "true"` label stays the only opt-in, and it is
+written on the environment by its owner. An operator who wants one
+grant across several credentials expresses it with that label, or by
+handing the same credential to both pipelines.
+
+**The `shared` label was a takeover primitive.** A `PUT` rebuilt the
+row with the request's `owner` and `labels` after the access check had
+passed, so a caller who reached a shared environment could `PUT` it
+with `"labels": {}` and become its owner, locking the real owner out.
+The stored `owner` is now never replaced on an update, and the stored
+`labels` are rewritten by the exact owner alone; a non-owner `PUT`
+still rewrites the route, the backends and the lifetime, which is what
+sharing is for.
+
+**Foreign and unknown answer alike.** A 403 on an environment another
+principal owns confirms that the name is taken and by somebody else,
+which is the one fact a neighbour on a shared node must not be able to
+enumerate. `GET`, `DELETE` and a `PUT` carrying `If-Match` all answer
+the 404 an unknown name answers, with the same body; the refusal
+reason is in the `automation.environment.forbidden` audit row.
+
+**An empty `allowed_backend_cidrs` was allow-everything.**
+`ConnectionFilterPolicy::from_cidrs` reads an empty allow list as
+default-allow, which is right for a filter an operator opts into and
+wrong for a grant a credential carries: a token minted without the
+field could aim a public hostname at `127.0.0.1:9443` or at a cloud
+metadata address. Both models refuse an empty list at write time, and
+`validate_backends` refuses one again at use time for the rows written
+before that rule. The "node default backend policy" both model docs
+described never existed.
+
+**The caps.** `AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL = 100` and
+`AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT = 32`. Without them the body
+cap alone let one `PUT` write about 2 700 backend rows inside the one
+transaction that holds the store mutex, and nothing bounded how many
+environments one looping pipeline could create, each one a fleet
+replication round. `AUTOMATION_MAX_BACKEND_WEIGHT = 1000` because the
+route model stores a bare `i32` and caps nothing.
+
+**An explicit certificate id must still cover the hostname.** Naming
+an id used to skip the coverage rule `auto` applies, so a route could
+serve a name its leaf does not carry and every browser would refuse the
+site the pipeline had just reported as up.
+
 **No covering certificate keeps the last id.** The story did not say
 what happens when the wildcard an `auto` environment resolved to is
 deleted and not replaced. Blanking `certificate_id` would make a
@@ -140,7 +195,42 @@ build logs one WARN per environment naming the hostname.
 
 ### Completion Notes
 
-(empty)
+**Done.** All eleven acceptance criteria met. IV1 to IV5 run in the Docker
+`cluster` profile's automation smoke.
+
+**Audit pass.** Five read-only reviewers (security, offensive, architecture,
+quality, performance) ran against the whole epic before merge. Every
+Critical, High and Medium finding, and every Low with operational
+impact, was fixed on the branch rather than recorded; the findings that
+touched this story are listed in its Debug Log.
+
+What the audit changed in this story, and two of them were High: an
+empty `allowed_backend_cidrs` was read as "every address" by a policy
+whose empty allow list means default-allow, so a token minted without the
+field could point a public hostname at the loopback management API or
+the cloud metadata service; both models require it now and an empty
+grant is deny-all. The `shared` label was a takeover primitive because an
+update rewrote `owner` and `labels` from the request; the stored owner is
+never replaced and labels are owner-only. The "same name prefix"
+ownership rule from the PRD crossed tenants (`acme/web-docs` reached
+`acme/web`) and is replaced by exact principal equality of the same kind,
+with `shared: "true"` as the only opt-in; that is a deliberate deviation
+from the PRD's wording. Also: the `environment_protected` binding ran on
+PUT only; a foreign environment answered 403 where an unknown one
+answered 404, an existence oracle; an explicit certificate need not cover
+the hostname; `tls_sni` was unvalidated and `weight` uncapped; there was
+no quota on environments per principal or backends per environment; the
+management API did not refuse in-place edits of managed rows, which the
+dashboard alone was guarding, and route and backend responses never
+serialised `managed_by` at all.
+
+Gates, all green on the final tree in the dev container: the three CI
+clippy commands with `RUSTFLAGS=-D warnings`; `cargo test --workspace`
+with no failure; `cargo audit` with its two pre-existing allowed
+warnings; the frontend three (`svelte-check` 0 errors, eslint clean,
+vitest 480 tests). Two suites that flaked under fourteen concurrent
+`cargo test` runs (`waf_body_inspection_e2e_test`, `lorica-memory-cache`)
+passed ten consecutive solo runs each on the quiet tree.
 
 ## File List
 
