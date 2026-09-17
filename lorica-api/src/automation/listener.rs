@@ -25,20 +25,25 @@
 //! 3. the per-source concurrency slot,
 //! 4. the per-source attempt window.
 //!
-//! Steps 2 to 4 are [`lorica_cluster::preauth`], the same budgets the
-//! enrollment listener applies and in the same order, held across the
-//! handshake and released when the connection ends.
+//! Steps 2 to 4 are [`lorica_cluster::preauth`], the enrollment
+//! listener's machinery in the same order, held across the handshake
+//! and released when the connection ends. The NUMBERS are this plane's
+//! own, [`automation_preauth_budgets`]: a pipeline is not an
+//! enrollment, and the defaults sized for one node making one attempt
+//! dropped a CI runner's twenty-first `curl` before TLS.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use ipnet::IpNet;
 use lorica_cluster::preauth::{AttemptWindow, PreAuthBudgets, SourceGate};
 use lorica_config::connection_filter::{parse_cidr, ConnectionFilterPolicy};
+use parking_lot::RwLock;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::server::AppState;
 
@@ -75,6 +80,195 @@ pub enum AutomationListenerError {
     },
 }
 
+/// The source allowlist the accept loop consults, swappable while the
+/// listener runs.
+///
+/// Read once at process start, the allowlist was a fact an operator
+/// could not change without a restart: narrowing it during an incident
+/// had no effect until the service bounced, and nothing said so. It is
+/// held here behind a lock over an `Arc` instead, the shape
+/// `lorica::connection_filter::GlobalConnectionFilter` uses for the
+/// TCP pre-filter, so a settings write followed by a config reload
+/// takes effect on the NEXT accepted connection. Connections already
+/// established are not dropped: this is an allowlist on accept, not a
+/// session killer.
+///
+/// The read happens once per TCP accept, not once per request, so an
+/// uncontended read lock is not worth a new dependency to avoid; the
+/// swap itself is a single pointer store under the write lock.
+#[derive(Debug)]
+pub struct AutomationSourcePolicy {
+    policy: RwLock<Arc<ConnectionFilterPolicy>>,
+}
+
+impl AutomationSourcePolicy {
+    /// Wrap already-parsed networks. Private because the only way in
+    /// is [`AutomationListenerConfig::new`], which refuses an empty
+    /// set; a policy with no entry would read as default-allow.
+    fn from_nets(nets: Vec<IpNet>) -> Self {
+        Self {
+            policy: RwLock::new(Arc::new(ConnectionFilterPolicy::from_nets(
+                nets,
+                Vec::new(),
+            ))),
+        }
+    }
+
+    /// Whether `ip` is inside the allowlist as it stands right now.
+    pub fn allows(&self, ip: IpAddr) -> bool {
+        let snapshot: Arc<ConnectionFilterPolicy> = Arc::clone(&self.policy.read());
+        snapshot.accepts(ip)
+    }
+
+    /// How many networks the live allowlist holds, for the operator
+    /// log lines that report the shape of the listener.
+    pub fn entries(&self) -> usize {
+        self.policy.read().allow.len()
+    }
+
+    /// Replace the allowlist with `allowed_cidrs`.
+    ///
+    /// # Errors
+    ///
+    /// The same two refusals [`AutomationListenerConfig::new`] applies
+    /// at start, and for the same reasons. On either one the PREVIOUS
+    /// allowlist stands: an empty or unreadable list must never widen
+    /// the listener to every source, and a reload is not a place to
+    /// fail open. The caller logs the refusal.
+    pub fn reload(&self, allowed_cidrs: &[String]) -> Result<usize, AutomationListenerError> {
+        let nets: Vec<IpNet> = parse_allowlist(allowed_cidrs)?;
+        let count: usize = nets.len();
+        *self.policy.write() = Arc::new(ConnectionFilterPolicy::from_nets(nets, Vec::new()));
+        Ok(count)
+    }
+}
+
+/// The policy the listener running in THIS process consults, published
+/// by the startup path so the config-reload path can reach it.
+///
+/// A process-global rather than an argument threaded through the
+/// reload signature, because of where the two sides live: the listener
+/// is started from the `lorica` binary API task, and the commit half
+/// of a config reload runs in `lorica::reload`, which cannot borrow
+/// anything that task owns. A worker process never starts the
+/// listener, so the slot stays empty there and
+/// [`reload_automation_source_policy`] is a no-op.
+static LIVE_SOURCE_POLICY: OnceLock<Arc<AutomationSourcePolicy>> = OnceLock::new();
+
+/// Publish the policy of the listener this process is about to start.
+///
+/// Called once, before the accept loop is spawned. A second call is
+/// ignored: one process serves at most one automation listener.
+pub fn publish_automation_source_policy(policy: &Arc<AutomationSourcePolicy>) {
+    let _ = LIVE_SOURCE_POLICY.set(Arc::clone(policy));
+}
+
+/// Apply `automation_allowed_cidrs` to the running listener.
+///
+/// A no-op when this process runs no automation listener, which is
+/// every worker and every node that did not pass
+/// `--automation-listen`.
+///
+/// A refused list (empty, or carrying an entry that is not an address)
+/// leaves the previous allowlist in place and is logged at ERROR: an
+/// operator who emptied the setting expecting the socket to close
+/// needs to read that it did not, and the alternative, an empty
+/// allowlist read as default-allow, would turn a narrowing into the
+/// widest possible opening. The listener refuses to OPEN on an empty
+/// allowlist and refuses to ADOPT one live, which is the same rule
+/// said twice on purpose.
+pub fn reload_automation_source_policy(allowed_cidrs: &[String]) {
+    let Some(live) = LIVE_SOURCE_POLICY.get() else {
+        return;
+    };
+    match live.reload(allowed_cidrs) {
+        Ok(count) => info!(
+            allowed_cidrs = count,
+            "automation listener source allowlist reloaded"
+        ),
+        Err(e) => error!(
+            error = %e,
+            allowed_cidrs = live.entries(),
+            "automation listener source allowlist NOT reloaded; the previous allowlist still \
+             applies. The listener will not accept an empty or unreadable allowlist live, the \
+             same way it will not open on one. To stop serving automation, drop \
+             --automation-listen and restart"
+        ),
+    }
+}
+
+/// Parse an allowlist into networks, refusing an empty set and any
+/// entry that is not an address.
+///
+/// One function for both doors, the start-time build and the live
+/// reload, so the two can never drift into accepting different lists.
+fn parse_allowlist(allowed_cidrs: &[String]) -> Result<Vec<IpNet>, AutomationListenerError> {
+    let mut nets: Vec<IpNet> = Vec::with_capacity(allowed_cidrs.len());
+    for entry in allowed_cidrs {
+        if entry.trim().is_empty() {
+            continue;
+        }
+        let net: IpNet = parse_cidr(entry).map_err(|_| AutomationListenerError::InvalidCidr {
+            entry: entry.clone(),
+        })?;
+        nets.push(net);
+    }
+    if nets.is_empty() {
+        return Err(AutomationListenerError::EmptyAllowlist(
+            "no entry was supplied".to_string(),
+        ));
+    }
+    Ok(nets)
+}
+
+/// Accepted connections one source may open inside
+/// [`AUTOMATION_ATTEMPT_WINDOW`] before the listener drops it.
+pub const AUTOMATION_MAX_ATTEMPTS_PER_WINDOW: usize = 300;
+
+/// Pre-session connections one source may hold at once.
+pub const AUTOMATION_MAX_PER_SOURCE: usize = 32;
+
+/// Pre-session connections the whole listener may hold at once.
+pub const AUTOMATION_MAX_CONCURRENT_HANDSHAKES: usize = 256;
+
+/// The sliding window [`AUTOMATION_MAX_ATTEMPTS_PER_WINDOW`] counts in.
+pub const AUTOMATION_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+
+/// The pre-authentication budgets the automation listener applies.
+///
+/// Deliberately NOT [`PreAuthBudgets::default`]. Those defaults are the
+/// enrollment listener's, and they are sized for the traffic an
+/// enrollment sees: one node makes one attempt, so 20 attempts per
+/// source per minute and 8 concurrent connections per source are
+/// already generous there.
+///
+/// The automation plane sees the opposite shape. A CI runner opens one
+/// connection per `curl`, and a pipeline that declares an environment,
+/// uploads a certificate and polls for the result makes tens of calls
+/// from ONE address inside a minute. Under the enrollment numbers the
+/// twenty-first connection was dropped before TLS, so the runner saw a
+/// connection reset rather than a 429 and had nothing to retry against.
+/// 300 attempts per minute and 32 concurrent connections per source
+/// leave room for a busy pipeline while staying a hard floor against a
+/// source that opens connections in a loop: past it the connection is
+/// dropped exactly as before, and
+/// `lorica_automation_rejected_attempt_window_total` says so.
+///
+/// The remaining fields keep the shared defaults: the 3-second
+/// handshake timeout and the 4096-source map bound are not
+/// workload-specific, and the enrollment-only fields
+/// (`max_inflight_enrollments`, `per_conn_max_bytes`,
+/// `per_conn_max_duration`) are unread on this path.
+pub fn automation_preauth_budgets() -> PreAuthBudgets {
+    PreAuthBudgets {
+        max_concurrent_handshakes: AUTOMATION_MAX_CONCURRENT_HANDSHAKES,
+        max_per_source: AUTOMATION_MAX_PER_SOURCE,
+        max_attempts_per_window: AUTOMATION_MAX_ATTEMPTS_PER_WINDOW,
+        attempt_window: AUTOMATION_ATTEMPT_WINDOW,
+        ..PreAuthBudgets::default()
+    }
+}
+
 /// Everything the automation listener needs to run.
 #[derive(Debug, Clone)]
 pub struct AutomationListenerConfig {
@@ -83,17 +277,21 @@ pub struct AutomationListenerConfig {
     /// sit: an automation usually runs on another host, and the CLI
     /// refuses a wildcard host without an explicit flag.
     pub addr: SocketAddr,
-    /// The source networks allowed to reach the socket, as the shared
-    /// policy type. Mandatory and non-empty; see
-    /// [`AutomationListenerError::EmptyAllowlist`].
+    /// The source networks allowed to reach the socket. Mandatory and
+    /// non-empty; see [`AutomationListenerError::EmptyAllowlist`].
     ///
-    /// Held as a [`ConnectionFilterPolicy`] with an empty deny list.
-    /// The type reads an EMPTY allow list as default-allow, which this
-    /// listener must never do; [`AutomationListenerConfig::new`]
-    /// refuses to build one, so the default-allow branch is
-    /// unreachable here and the policy is default-deny in practice.
-    pub allowed_cidrs: ConnectionFilterPolicy,
-    /// Pre-authentication budgets, shared with the cluster listeners.
+    /// Held as an [`AutomationSourcePolicy`] over a
+    /// [`ConnectionFilterPolicy`] with an empty deny list, so an
+    /// operator can narrow it during an incident without a restart.
+    /// The underlying type reads an EMPTY allow list as default-allow,
+    /// which this listener must never do; neither
+    /// [`AutomationListenerConfig::new`] nor
+    /// [`AutomationSourcePolicy::reload`] will build one, so the
+    /// default-allow branch is unreachable here and the policy is
+    /// default-deny in practice.
+    pub allowed_cidrs: Arc<AutomationSourcePolicy>,
+    /// Pre-authentication budgets. The cluster listeners' type, sized
+    /// for this plane's traffic: see [`automation_preauth_budgets`].
     pub budgets: PreAuthBudgets,
 }
 
@@ -113,32 +311,17 @@ impl AutomationListenerConfig {
         addr: SocketAddr,
         allowed_cidrs: &[String],
     ) -> Result<Self, AutomationListenerError> {
-        let mut nets: Vec<IpNet> = Vec::with_capacity(allowed_cidrs.len());
-        for entry in allowed_cidrs {
-            if entry.trim().is_empty() {
-                continue;
-            }
-            let net: IpNet =
-                parse_cidr(entry).map_err(|_| AutomationListenerError::InvalidCidr {
-                    entry: entry.clone(),
-                })?;
-            nets.push(net);
-        }
-        if nets.is_empty() {
-            return Err(AutomationListenerError::EmptyAllowlist(
-                "no entry was supplied".to_string(),
-            ));
-        }
+        let nets: Vec<IpNet> = parse_allowlist(allowed_cidrs)?;
         Ok(Self {
             addr,
-            allowed_cidrs: ConnectionFilterPolicy::from_nets(nets, Vec::new()),
-            budgets: PreAuthBudgets::default(),
+            allowed_cidrs: Arc::new(AutomationSourcePolicy::from_nets(nets)),
+            budgets: automation_preauth_budgets(),
         })
     }
 
-    /// Whether `ip` is inside the allowlist.
+    /// Whether `ip` is inside the allowlist as it stands right now.
     pub fn allows(&self, ip: IpAddr) -> bool {
-        self.allowed_cidrs.accepts(ip)
+        self.allowed_cidrs.allows(ip)
     }
 }
 
@@ -220,7 +403,7 @@ pub async fn start_automation_server(
     })?;
     info!(
         addr = %config.addr,
-        allowed_cidrs = config.allowed_cidrs.allow.len(),
+        allowed_cidrs = config.allowed_cidrs.entries(),
         "automation API listening (bearer tokens only, source-filtered)"
     );
 
@@ -254,8 +437,11 @@ pub async fn start_automation_server(
         // `lorica_core::listeners::ConnectionFilter` implementation,
         // it lives in the `lorica` binary crate (which depends on THIS
         // crate, so referencing it back would be a dependency cycle),
-        // and it is hot-reloaded and default-allow when empty. This
-        // allowlist is fixed at start and default-deny.
+        // and it is default-allow when empty. This allowlist is
+        // default-deny, and it is hot-reloaded too: the read below
+        // goes through `AutomationSourcePolicy`, so narrowing
+        // `automation_allowed_cidrs` bites on the next accept instead
+        // of on the next restart.
         if !config.allows(peer.ip()) {
             drop(tcp);
             crate::metrics::inc_automation_source_refused();
@@ -370,6 +556,84 @@ mod tests {
             result,
             Err(AutomationListenerError::InvalidCidr { .. })
         ));
+    }
+
+    /// Story 10.3, audit M5: narrowing the allowlist during an
+    /// incident must bite on the next accept, not on the next restart,
+    /// and no reload may ever widen it by accident.
+    #[test]
+    fn a_swap_narrows_the_set_the_accept_check_consults() {
+        let config = AutomationListenerConfig::new(addr(), &["10.0.0.0/8".to_string()])
+            .expect("test config");
+        let inside: IpAddr = "10.4.5.6".parse().expect("test ip");
+        let outside: IpAddr = "10.9.9.9".parse().expect("test ip");
+        assert!(config.allows(inside));
+        assert!(config.allows(outside));
+
+        // The narrowing an operator does mid-incident.
+        assert_eq!(
+            config
+                .allowed_cidrs
+                .reload(&["10.4.0.0/16".to_string()])
+                .expect("a narrower allowlist applies"),
+            1
+        );
+        assert!(config.allows(inside));
+        assert!(
+            !config.allows(outside),
+            "the accept check must read the narrowed allowlist, not the one from process start"
+        );
+
+        // An emptied setting keeps the previous allowlist: an empty
+        // allow list reads as default-allow, so adopting it would turn
+        // the narrowing into the widest possible opening.
+        assert!(matches!(
+            config.allowed_cidrs.reload(&[]),
+            Err(AutomationListenerError::EmptyAllowlist(_))
+        ));
+        assert!(config.allows(inside));
+        assert!(!config.allows(outside));
+
+        // A typo is refused whole, for the same reason it is refused
+        // at start: a partially applied allowlist is the failure an
+        // operator discovers during an incident.
+        assert!(matches!(
+            config
+                .allowed_cidrs
+                .reload(&["10.0.0.0/8".to_string(), "10.0.0.0/33".to_string()]),
+            Err(AutomationListenerError::InvalidCidr { .. })
+        ));
+        assert!(!config.allows(outside));
+        assert_eq!(config.allowed_cidrs.entries(), 1);
+    }
+
+    #[test]
+    fn a_reload_without_a_listener_in_this_process_is_a_no_op() {
+        // Every worker process and every node without
+        // `--automation-listen` reaches the commit half of a config
+        // reload with nothing published. It must not panic there.
+        reload_automation_source_policy(&["10.0.0.0/8".to_string()]);
+        reload_automation_source_policy(&[]);
+    }
+
+    #[test]
+    fn the_pre_auth_budgets_are_sized_for_pipelines_not_for_enrolment() {
+        let budgets: PreAuthBudgets = automation_preauth_budgets();
+        assert_eq!(budgets.max_attempts_per_window, 300);
+        assert_eq!(budgets.max_per_source, 32);
+        assert_eq!(budgets.max_concurrent_handshakes, 256);
+        assert_eq!(budgets.attempt_window, Duration::from_secs(60));
+        // The enrolment defaults are what a thirty-call pipeline used
+        // to run into, so the two must not be the same number.
+        assert_ne!(
+            budgets.max_attempts_per_window,
+            PreAuthBudgets::default().max_attempts_per_window
+        );
+        // And the listener actually takes them.
+        let config = AutomationListenerConfig::new(addr(), &["10.0.0.0/8".to_string()])
+            .expect("test config");
+        assert_eq!(config.budgets.max_attempts_per_window, 300);
+        assert_eq!(config.budgets.max_per_source, 32);
     }
 
     #[test]

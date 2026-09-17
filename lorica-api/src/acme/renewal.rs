@@ -37,7 +37,7 @@ use crate::server::AppState;
 /// - `(cert.not_after - now).num_days() <= threshold_days` (inside
 ///   the renewal window)
 /// - `cert.acme_method != Some("dns01-manual")` (manual DNS-01
-///   flows require a human — the auto-renewal loop cannot fire
+///   flows require a human - the auto-renewal loop cannot fire
 ///   them, see the `spawn_renewal_task` body for the handling)
 ///
 /// Extracted so the filtering logic is unit-testable without
@@ -296,7 +296,7 @@ pub fn spawn_renewal_task(
                 }
 
                 // Skip dns01-manual certs from the ACME renewal call
-                // itself — the operator must confirm the new TXT.
+                // itself - the operator must confirm the new TXT.
                 if !should_auto_renew(cert, now, renewal_threshold_days) {
                     info!(
                         domain = %cert.domain,

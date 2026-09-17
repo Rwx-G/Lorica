@@ -1200,7 +1200,7 @@ pub fn inc_geoip_block(route_id: &str, country: &str, mode: &str) {
 /// - `outcome`: `"shown"` (challenge page served), `"passed"`
 ///   (verdict cookie verified OR solve succeeded), `"failed"`
 ///   (wrong PoW / captcha answer, or cookie scope mismatch), or
-///   `"bypassed"` (one of the five bypass categories matched —
+///   `"bypassed"` (one of the five bypass categories matched;
 ///   detail carried on the OTel span, not the metric).
 ///
 /// Cardinality bound: routes × 3 modes × 4 outcomes, well inside
@@ -1229,7 +1229,7 @@ pub fn inc_bot_challenge(route_id: &str, mode: &str, outcome: &str) {
 //
 // In worker mode, each of the `IntCounterVec` statics above lives
 // in the worker process that incremented it. The supervisor's
-// `/metrics` handler scrapes the supervisor's own registry — which
+// `/metrics` handler scrapes the supervisor's own registry - which
 // does NOT see worker-side increments for these counters because
 // the existing `MetricsReport` wire format only carries the typed
 // fields (cache_hits, active_connections, per-route request counts,
@@ -1239,10 +1239,10 @@ pub fn inc_bot_challenge(route_id: &str, mode: &str, outcome: &str) {
 // per-worker counters into `Vec<GenericCounterEntry>` (cheap: iter
 // the `IntCounterVec::get_metric_with_label_values`-style family
 // readback via `prometheus::core::Collector::collect()`), and let
-// the supervisor apply that snapshot to its OWN registry — keyed
+// the supervisor apply that snapshot to its OWN registry - keyed
 // per-worker so successive scrapes replace instead of double-count.
 //
-// The supervisor's apply path does not just `inc_by` — that would
+// The supervisor's apply path does not just `inc_by` - that would
 // double-count on the second scrape. Instead it tracks per-worker
 // snapshots (worker_id -> metric_name -> label_tuple -> value) and
 // on every apply it computes the delta to reach the new value; if
@@ -1252,7 +1252,7 @@ pub fn inc_bot_challenge(route_id: &str, mode: &str, outcome: &str) {
 
 /// Names of the per-worker counter vecs whose deltas ship on the
 /// wire. Kept as a const array so worker snapshot and supervisor
-/// apply look at the same list — a counter added here without
+/// apply look at the same list - a counter added here without
 /// being added to both snapshot + apply logic will simply not
 /// aggregate.
 pub const PER_WORKER_COUNTERS: &[&str] = &[
@@ -1774,6 +1774,32 @@ pub fn inc_audit_insert_failed() {
     AUDIT_INSERT_FAILED_TOTAL.inc();
 }
 
+/// Counter: audit rows dropped because the write queue was full.
+///
+/// The row never reached the chain, so unlike a broken hash this
+/// leaves NO evidence in the table: an operator who does not watch
+/// this counter cannot tell a quiet period from a shed one. Any
+/// non-zero value means the SQLite writer fell behind a burst on the
+/// management API or the automation plane, and the trail has a gap
+/// exactly there.
+static AUDIT_ROWS_DROPPED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "audit_rows_dropped_total",
+        "Audit rows dropped on write-queue overflow (the mutation still succeeded)",
+    )
+});
+
+/// Bump the dropped-audit-row counter.
+pub fn inc_audit_rows_dropped() {
+    AUDIT_ROWS_DROPPED_TOTAL.inc();
+}
+
+/// Read the dropped-audit-row counter, for the queue's drop-path test.
+#[cfg(test)]
+pub fn audit_rows_dropped_total() -> u64 {
+    AUDIT_ROWS_DROPPED_TOTAL.get()
+}
+
 /// Counter: management-plane TLS handshakes that failed (client aborted,
 /// spoke plaintext, or trusted the wrong cert). The management listener
 /// is loopback-only, so this mainly surfaces local handshake churn - a
@@ -2039,6 +2065,28 @@ pub fn capture_outcome_value(rule_id: &str, outcome: &str) -> u64 {
     CAPTURES_TOTAL.with_label_values(&[rule_id, outcome]).get()
 }
 
+/// Every `outcome` a `lorica_captures_total` series can carry, so the
+/// removal below covers the family and a new outcome cannot be added
+/// without landing here.
+const CAPTURE_OUTCOMES: [&str; 4] = ["emitted", "dropped_rate", "dropped_budget", "dropped_sink"];
+
+/// Forget every `lorica_captures_total` series for `rule_id`.
+///
+/// Called when the budgets evict a rule, which is when a configuration
+/// snapshot no longer carries it. A `CounterVec` never drops a label set
+/// on its own, so without this a node that creates and retires capture
+/// rules keeps exporting four series per retired rule for the life of
+/// the process. A rule that comes back starts from zero, which matches
+/// the budget entry it comes back with.
+pub fn remove_capture_outcome_series(rule_id: &str) {
+    for outcome in CAPTURE_OUTCOMES {
+        // `Err` means the series was never created (the rule was
+        // evicted without ever recording an outcome), which is the
+        // state this function wants anyway.
+        let _ = CAPTURES_TOTAL.remove_label_values(&[rule_id, outcome]);
+    }
+}
+
 /// Bytes held by in-flight capture buffers on this process.
 static CAPTURE_INFLIGHT_BYTES: Lazy<IntGauge> = Lazy::new(|| {
     lorica_metrics::register_int_gauge(
@@ -2148,7 +2196,7 @@ pub fn inc_automation_reaper_run() {
 static AUTOMATION_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
         "automation_requests_total",
-        "Automation API requests (outcome=ok|unauthenticated|forbidden|refused)",
+        "Automation API requests (outcome=ok|unauthenticated|forbidden|refused|error)",
         &["outcome"],
     )
 });
@@ -2859,7 +2907,7 @@ mod tests {
             "regressed snapshot must not decrement supervisor counter"
         );
 
-        // Forgetting worker 2 clears its snapshot — but the
+        // Forgetting worker 2 clears its snapshot - but the
         // supervisor counter stays where it is (Prometheus
         // counters can't decrement). A later worker 2 snapshot
         // will therefore push full value again as new delta.
@@ -2882,7 +2930,7 @@ mod tests {
         // Before forget: 4 (w1) + 5 (w2) = 9.
         // After forget + w2 resend 7: 4 + 5 + 7 = 16 (the
         // forget wiped w2's prev=5 so the full 7 reappears as
-        // delta). This is the correct semantics — a crashed
+        // delta). This is the correct semantics - a crashed
         // worker's counts are NOT lost at the supervisor.
         assert_eq!(v, 16);
     }
@@ -2944,7 +2992,7 @@ mod tests {
     #[test]
     fn test_snapshot_emits_only_non_zero() {
         // Snapshot should skip counter entries that have never
-        // been incremented — that keeps the RPC payload small
+        // been incremented - that keeps the RPC payload small
         // under steady state.
         inc_bot_challenge("snapshot-test", "javascript", "passed");
         let snap = snapshot_per_worker_counters();
@@ -2955,7 +3003,7 @@ mod tests {
             hit.is_some(),
             "incremented counter should appear in snapshot"
         );
-        // None of the entries should have value 0 — that's the
+        // None of the entries should have value 0 - that's the
         // skip-zero-entries guard.
         for (_, _, v) in &snap {
             assert!(*v > 0, "snapshot must not emit zero entries");

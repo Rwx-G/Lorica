@@ -386,7 +386,7 @@ impl AppState {
 
     /// Rotate the bot-protection HMAC secret (v1.4.0 Epic 3,
     /// follow-up to story 3.5a). Called from every certificate
-    /// install / renew success path — the design doc calls for
+    /// install / renew success path - the design doc calls for
     /// "rotate the secret on every cert renewal so cookie
     /// lifetime is capped at the cert TTL".
     ///
@@ -397,7 +397,7 @@ impl AppState {
     /// every subsequent `reload_proxy_config*`, triggered by the
     /// cert-save site's own `notify_config_changed` call). Two
     /// consecutive writes would double-rotate in a tight renewal
-    /// loop, which is fine — the user just solves the challenge
+    /// loop, which is fine - the user just solves the challenge
     /// once more.
     ///
     /// Tolerates failures: a DB write error is `warn!`-logged

@@ -57,11 +57,19 @@ tags:
       reaper once `expires_at` has passed.
 
 
-      Ownership is an authorization rule, not a convenience. A token
-      reaches an environment created by a token with the same name
-      prefix (the part before the first `-`), or one labelled
-      `shared: "true"` exactly. Anything else is a 403 with an audit
-      row, on read, update and delete alike.
+      Ownership is an authorization rule, not a convenience. A
+      credential reaches an environment created by the SAME principal,
+      of the same kind, or one labelled `shared: "true"` exactly. A
+      name prefix is not an owner: whoever picks a token name or a
+      project name would otherwise pick who else they can reach.
+      Anything else answers the 404 an unknown name answers, on read,
+      update and delete alike, with the reason in the audit row.
+
+
+      A `shared: "true"` environment is readable and writable by every
+      principal, and its owner and its labels are still its owner's: a
+      `PUT` by anybody else rewrites the route, the backends and the
+      lifetime and leaves both untouched.
 
 security:
   - bearerAuth: []
@@ -104,8 +112,8 @@ paths:
       summary: List the environments this token may access
       description: >-
         Every environment the caller may read under the ownership rule,
-        newest name first. Environments owned by another prefix and not
-        labelled shared are absent, not refused: a listing is not the
+        newest name first. Environments owned by another principal and
+        not labelled shared are absent, not refused: a listing is not the
         place to reveal that a name exists.
 
 
@@ -214,14 +222,22 @@ paths:
         and must not be held by another route (409, naming the
         hostname and nothing about the route holding it); every backend
         address must be an `ip:port` (422) inside
-        `allowed_backend_cidrs` (403); `ttl_seconds` must be at or
-        under the token's `max_ttl_seconds` (422); an explicit
-        `certificate` id needs `certificates:read` (403) and must
-        exist (422); `certificate: "auto"` with no covering certificate
-        is a 422 whose message starts with
-        `no_certificate_covers_hostname` and names the wildcard an
-        operator could provision through the DNS-01 endpoint. Any
-        unknown field is 422.
+        `allowed_backend_cidrs` (403, and a credential naming no CIDR
+        at all reaches no address); at most 32 backends (422), each
+        `weight` between 1 and 1000 (422) and each `tls_sni` a DNS
+        name (422); `ttl_seconds` must be at or under the token's
+        `max_ttl_seconds` (422); one principal owns at most 100
+        environments (422); an explicit `certificate` id needs
+        `certificates:read` (403), must exist (422) and must cover the
+        hostname under the same rule `auto` uses (422);
+        `certificate: "auto"` with no covering certificate is a 422
+        whose message starts with `no_certificate_covers_hostname` and
+        names the wildcard an operator could provision through the
+        DNS-01 endpoint. Any unknown field is 422.
+
+
+        An environment another principal owns answers 404, the answer
+        an unknown name gets, `If-Match` included.
 
 
         Two pipelines racing on one name serialise on the store; the
@@ -298,6 +314,10 @@ paths:
         trail, which an API answer must not depend on. A typo in the
         name is a diagnostic the audit row of this call gives the
         operator.
+
+
+        An environment another principal owns answers 404 and is not
+        removed.
 
 
         Required scope: `environments:write`.
@@ -453,6 +473,7 @@ components:
         backends:
           type: array
           minItems: 1
+          maxItems: 32
           items:
             $ref: "#/components/schemas/EnvironmentBackendRequest"
         certificate:
@@ -481,7 +502,10 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: At most 16 entries of at most 128 bytes each side. `shared: "true"` opens the environment to every principal.
+          description: >-
+            At most 16 entries of at most 128 bytes each side.
+            `shared: "true"` opens the environment to every principal,
+            and only its owner may rewrite it.
           example: { team: acme, shared: "true" }
 
     EnvironmentBackendRequest:
@@ -499,9 +523,11 @@ components:
         tls_sni:
           type: string
           nullable: true
+          description: The SNI presented to a TLS upstream; an RFC 1123 DNS name, no wildcard and no address literal.
         weight:
           type: integer
           minimum: 1
+          maximum: 1000
           default: 1
 
     EnvironmentWriteResponse:
@@ -615,7 +641,13 @@ components:
 
   responses:
     NotFound:
-      description: No environment has this name.
+      description: >-
+        No environment of this caller's has this name. An environment
+        another principal owns and did not label `shared: "true"`
+        answers exactly this, body included: a 403 would confirm the
+        name is taken, which is the one fact a neighbour on a shared
+        node must not be able to enumerate. The refusal reason is in
+        the audit row.
       content:
         application/json:
           schema:
@@ -645,8 +677,10 @@ components:
     Unprocessable:
       description: >-
         The body parsed and a rule refuses it: an unknown field, a
-        malformed value, a cap over its limit, or no certificate
-        covering the hostname (message prefixed
+        malformed value, a cap over its limit (backends per
+        environment, environments per principal, backend weight), or
+        no certificate covering the hostname, whether resolved or
+        named by id (message prefixed
         `no_certificate_covers_hostname`).
       content:
         application/json:
@@ -685,8 +719,11 @@ components:
               message: a valid automation bearer token is required
     Forbidden:
       description: >-
-        The credential WAS accepted and the token does not carry the
-        scope this path requires. The distinction from a 401 is the
+        The credential WAS accepted and the grant is not there: the
+        token does not carry the scope this path requires, its
+        `allowed_hostnames` or `allowed_backend_cidrs` do not cover
+        what the body asks for, or the issuer entry binds the caller to
+        one environment name. The distinction from a 401 is the
         whole point of answering two codes: a 401 says re-present a
         credential, a 403 says the credential is real and the grant is
         missing, which is the one sentence that leads to the right fix.

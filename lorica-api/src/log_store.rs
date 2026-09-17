@@ -3,12 +3,33 @@
 //! [`crate::logs::LogBuffer`] as a transient fallback in tests.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use rusqlite::{params, Connection};
 
 use crate::logs::{LogEntry, LogsQuery};
+
+/// Capacity of the audit write queue that fronts
+/// [`LogStore::insert_audit`].
+///
+/// At roughly 400 bytes per queued row the worst-case resident size is
+/// under 2 MiB. Sized so a burst from a pipeline hammering the
+/// automation plane is absorbed rather than dropped: SQLite commits
+/// the chain at a few thousand rows per second, so 4096 buys about a
+/// second of stall before the queue starts shedding.
+pub const AUDIT_QUEUE_CAPACITY: usize = 4096;
+
+/// One item on the audit write queue.
+enum AuditWrite {
+    /// A row to chain and persist.
+    Row(Box<crate::audit::NewAuditEntry>),
+    /// Flush barrier: when the consumer reaches it, every row enqueued
+    /// before it is on disk, and the ack fires. The seam tests and the
+    /// CLI use it; nothing on the request path does.
+    Barrier(tokio::sync::oneshot::Sender<()>),
+}
 
 /// Aggregated WAF-event statistics returned by
 /// [`LogStore::waf_event_stats`]: `(total, total_24h, by_category)`
@@ -100,7 +121,14 @@ pub struct WafRowForFanIn {
 
 /// Persistent log database wrapper. Cheaply cloneable through `Arc<LogStore>`.
 pub struct LogStore {
-    conn: Mutex<Connection>,
+    /// Shared with the audit consumer thread, which therefore cannot
+    /// hold an `Arc<LogStore>`: that would be a cycle keeping the
+    /// store alive forever and the thread with it.
+    conn: Arc<Mutex<Connection>>,
+    /// Producer end of the audit write queue. Dropping the last
+    /// `LogStore` closes it, which is how the consumer thread learns
+    /// to drain and exit.
+    audit_tx: tokio::sync::mpsc::Sender<AuditWrite>,
 }
 
 impl LogStore {
@@ -273,9 +301,123 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to set access log pragmas: {e}"))?;
 
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        let conn = Arc::new(Mutex::new(conn));
+        let (audit_tx, audit_rx) = tokio::sync::mpsc::channel(AUDIT_QUEUE_CAPACITY);
+        Self::spawn_audit_writer(Arc::clone(&conn), audit_rx);
+        Ok(Self { conn, audit_tx })
+    }
+
+    /// Spawn the single consumer that owns audit chain writes.
+    ///
+    /// ONE consumer, never a pool: `insert_audit` chains each row to
+    /// the previous row's hash, so the chain only means anything in
+    /// write order. A second consumer would fork it.
+    ///
+    /// A plain OS thread rather than a tokio task, matching
+    /// [`crate::log_writer`]: [`LogStore::open`] runs in the daemon,
+    /// in a worker, and in the CLI, sometimes with no runtime current,
+    /// and `insert_audit` is a blocking SQLite commit that has no
+    /// business on a runtime thread. The thread exits when the last
+    /// [`LogStore`] drops and the queue has drained.
+    ///
+    /// No batching, unlike the access-log writer: each row's
+    /// `prev_chain_hash` is the previous row's `chain_hash`, computed
+    /// inside the transaction, so one row is one transaction by
+    /// construction. Getting the commit off the caller's thread is the
+    /// whole win here; folding commits together is not available.
+    fn spawn_audit_writer(
+        conn: Arc<Mutex<Connection>>,
+        mut rx: tokio::sync::mpsc::Receiver<AuditWrite>,
+    ) {
+        let spawned = std::thread::Builder::new()
+            .name("lorica-audit-writer".into())
+            .spawn(move || {
+                while let Some(write) = rx.blocking_recv() {
+                    match write {
+                        AuditWrite::Row(entry) => match Self::insert_audit_into(&conn, &entry) {
+                            Ok((_id, chain_hash)) => {
+                                crate::audit::emit_stored_event(&entry, &chain_hash);
+                            }
+                            Err(e) => {
+                                // Same policy as before the queue:
+                                // counted, logged, swallowed. The
+                                // mutation itself already succeeded.
+                                crate::metrics::inc_audit_insert_failed();
+                                tracing::error!(error = %e, "audit log insert failed");
+                                crate::audit::emit_stored_event(&entry, "");
+                            }
+                        },
+                        AuditWrite::Barrier(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            // Thread creation only fails on resource exhaustion. The
+            // store stays usable; every audit row then counts as a
+            // drop once the queue fills, which the metric surfaces.
+            tracing::error!(error = %e, "failed to spawn the audit writer thread; audit rows will be dropped");
+        }
+    }
+
+    /// Hand one audit row to the write queue. Never blocks.
+    ///
+    /// On a full queue (or a dead consumer) the row comes back to the
+    /// caller, which counts and logs the drop. Blocking here is the
+    /// outage this queue exists to prevent: a caller waiting on a full
+    /// audit queue is a management API that stops answering because
+    /// SQLite is slow.
+    ///
+    /// # Errors
+    ///
+    /// Returns the entry unwritten when the queue is full or closed.
+    /// Boxed, because the row is a dozen `String`s and an error this
+    /// size inflates every `Result` on the path back.
+    pub fn enqueue_audit(
+        &self,
+        entry: Box<crate::audit::NewAuditEntry>,
+    ) -> Result<(), Box<crate::audit::NewAuditEntry>> {
+        match self.audit_tx.try_send(AuditWrite::Row(entry)) {
+            Ok(()) => Ok(()),
+            Err(rejected) => match rejected.into_inner() {
+                AuditWrite::Row(entry) => Err(entry),
+                // The channel hands back exactly what was offered, and
+                // what was offered on this line is a Row.
+                AuditWrite::Barrier(_) => Ok(()),
+            },
+        }
+    }
+
+    /// Wait until every audit row enqueued before this call is on disk.
+    ///
+    /// Unlike [`LogStore::enqueue_audit`] this applies backpressure
+    /// rather than dropping: it is called where durability is the
+    /// point and latency is not, which is the `lorica cluster leave`
+    /// CLI (the process exits right after) and the tests that read the
+    /// chain back. Never on the request path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(())` when the consumer thread is gone, which
+    /// callers read as "nothing left to flush".
+    pub async fn flush_audit(&self) -> Result<(), ()> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.audit_tx
+            .send(AuditWrite::Barrier(ack_tx))
+            .await
+            .map_err(|_| ())?;
+        ack_rx.await.map_err(|_| ())
+    }
+
+    /// Stall the audit writer by taking the connection it needs.
+    ///
+    /// The only way to fill a queue whose consumer drains it as fast
+    /// as it is fed. Test-only: nothing in production has a reason to
+    /// hold this lock across awaits.
+    #[cfg(test)]
+    pub(crate) fn block_audit_writer_for_test(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
     }
 
     /// Insert a log entry.
@@ -1147,7 +1289,7 @@ impl LogStore {
     /// Count the total number of persisted notification history
     /// rows. Cheap `SELECT COUNT(*)` so the API can surface an
     /// accurate total without paying for the full list payload
-    /// (symmetry with `waf_event_stats` — avoids the same
+    /// (symmetry with `waf_event_stats` - avoids the same
     /// load-and-count plateau the WAF stats endpoint hit).
     pub fn notification_history_count(&self) -> Result<u64, String> {
         let conn = self.conn.lock();
@@ -1294,12 +1436,26 @@ impl LogStore {
     /// computed HERE, inside the connection lock: two concurrent
     /// mutations cannot fork the chain. The previous hash comes from
     /// the newest stored row, else the retention seal, else genesis.
+    /// Callers on the request path go through
+    /// [`LogStore::enqueue_audit`] instead; this one commits inline
+    /// and is what the audit writer thread runs.
     pub fn insert_audit(
         &self,
         entry: &crate::audit::NewAuditEntry,
     ) -> Result<(i64, String), String> {
+        Self::insert_audit_into(&self.conn, entry)
+    }
+
+    /// The body of [`LogStore::insert_audit`], taking the connection
+    /// rather than the store so the audit writer thread can call it
+    /// without holding an `Arc<LogStore>` and keeping the store (and
+    /// therefore itself) alive forever.
+    fn insert_audit_into(
+        conn: &Mutex<Connection>,
+        entry: &crate::audit::NewAuditEntry,
+    ) -> Result<(i64, String), String> {
         use rusqlite::{OptionalExtension, TransactionBehavior};
-        let mut guard = self.conn.lock();
+        let mut guard = conn.lock();
         // IMMEDIATE, so the tail read and the insert hold SQLite's
         // write lock together across PROCESSES (backlog #74): the
         // in-process mutex above serialises this daemon's writers, but

@@ -516,7 +516,7 @@ pub async fn download_recent_capture(
             (http::header::CONTENT_TYPE, "application/json".to_string()),
             (http::header::CONTENT_DISPOSITION, disposition),
         ],
-        entry.document.clone(),
+        entry.document.to_string(),
     )
         .into_response())
 }

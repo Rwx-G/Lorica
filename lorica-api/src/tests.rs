@@ -28,7 +28,7 @@ const TEST_KEY_RSA_PEM: &str = include_str!("../../lorica-tls/tests/test-key-rsa
 const TEST_CERT_EC_PEM: &str = include_str!("../../lorica-tls/tests/test-cert.pem");
 const TEST_KEY_EC_PEM: &str = include_str!("../../lorica-tls/tests/test-key.pem");
 
-async fn test_state() -> (AppState, SessionStore, RateLimiter) {
+pub(crate) async fn test_state() -> (AppState, SessionStore, RateLimiter) {
     let store = lorica_config::ConfigStore::open_in_memory().expect("test setup");
     let store = Arc::new(Mutex::new(store));
     let state = AppState {
@@ -306,7 +306,7 @@ async fn test_change_password_rotates_session_cookie() {
     let cookie_a_value = extract_session_cookie(&response).expect("test setup");
     let cookie_a = format!("lorica_session={cookie_a_value}");
 
-    // Change password — the response carries a fresh Set-Cookie
+    // Change password - the response carries a fresh Set-Cookie
     // whose session id differs from cookie_A.
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({
@@ -3664,8 +3664,8 @@ async fn test_update_settings_cert_export_clears_dir_on_empty_string() {
 
 #[tokio::test]
 async fn test_rate_limit_settings_bucket_returns_429_after_limit() {
-    // PUT /api/v1/settings is capped at 30/60s per IP (v1.5.0 A.3
-    // — relaxed from the initial 10/60s after the e2e smoke flagged
+    // PUT /api/v1/settings is capped at 30/60s per IP (v1.5.0 A.3,
+    // relaxed from the initial 10/60s after the e2e smoke flagged
     // realistic operator activity on the /settings endpoint under
     // test-isolation). Drive 31 PUTs from the same (simulated)
     // client and assert the 31st returns 429 with a Retry-After
@@ -5963,7 +5963,7 @@ async fn test_otel_connection_reachable_when_mock_server_responds() {
 
     // Persist the mock server as the OTLP endpoint. The probe path
     // appends /v1/traces for http-proto, which our dummy server
-    // ignores — it answers any path.
+    // ignores - it answers any path.
     {
         let s = state.store.lock().await;
         let mut cur = s.get_global_settings().expect("test setup");
@@ -6049,7 +6049,7 @@ async fn test_otel_connection_unreachable_when_port_is_dead() {
 #[tokio::test]
 async fn test_rotate_bot_hmac_is_non_deterministic_across_calls() {
     // Two back-to-back rotations on the same state must produce two
-    // different secrets — the rotation path pulls fresh bytes from
+    // different secrets - the rotation path pulls fresh bytes from
     // `rand::rngs::OsRng`, so a collision here means the CSPRNG call
     // was accidentally swapped for a deterministic generator.
     let (state, _session_store, _rate_limiter) = test_state().await;
@@ -8711,8 +8711,7 @@ async fn a_record_in_the_ring_downloads_whole_and_an_evicted_one_is_a_404() {
         "cap-ring",
         &request_id,
         &file_name,
-        document,
-        text.clone(),
+        std::sync::Arc::from(text.clone()),
     );
 
     let resp = send(
@@ -9060,6 +9059,12 @@ async fn every_capture_mutation_lands_in_the_audit_log() {
     }
 
     let log_store = state.log_store.clone().expect("log store");
+    // `record` only enqueues: the chain is durable within the audit
+    // writer's next drain, not before the response returned above.
+    log_store
+        .flush_audit()
+        .await
+        .expect("the audit writer drains");
     let (rows, _total) = log_store
         .query_audit(&crate::audit::AuditQuery {
             operator: None,
@@ -9104,11 +9109,14 @@ async fn every_capture_mutation_lands_in_the_audit_log() {
 /// Mint one automation token into the store and return the string a
 /// caller would present. `expires_at` and `revoked_at` are parameters
 /// so a test can place a token on either side of its liveness without
-/// waiting for a clock.
-async fn mint_automation(
+/// waiting for a clock, and `allowed_hostnames` because the resource
+/// tests need names their seeded certificates cover and names they
+/// deliberately do not.
+pub(crate) async fn mint_automation(
     state: &AppState,
     name: &str,
     scopes: Vec<lorica_config::models::AutomationScope>,
+    allowed_hostnames: &[&str],
     expires_at: chrono::DateTime<chrono::Utc>,
     revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> String {
@@ -9122,8 +9130,10 @@ async fn mint_automation(
         name: name.to_string(),
         secret_hmac: minted.secret_hmac.clone(),
         scopes,
-        allowed_hostnames: vec!["*.preview.example.com".to_string()],
-        allowed_backend_cidrs: Vec::new(),
+        allowed_hostnames: allowed_hostnames.iter().map(|h| (*h).to_string()).collect(),
+        // `AutomationToken::validate` refuses an empty grant: the
+        // connection filter reads one as allow-every-address.
+        allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
         max_ttl_seconds: lorica_config::models::AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS,
         created_by: "admin".to_string(),
         created_at: chrono::Utc::now() - chrono::Duration::hours(1),
@@ -9144,6 +9154,7 @@ async fn mint_live_reader(state: &AppState, name: &str) -> String {
         state,
         name,
         vec![lorica_config::models::AutomationScope::EnvironmentsRead],
+        &["*.preview.example.com"],
         chrono::Utc::now() + chrono::Duration::days(30),
         None,
     )
@@ -9173,8 +9184,16 @@ async fn automation_send(
 }
 
 /// Every `automation.` audit action recorded so far, sorted.
-fn automation_audit_actions(state: &AppState) -> Vec<String> {
+///
+/// Async because `record` only enqueues: the rows are durable within
+/// the audit writer's next drain, so the flush is what makes "recorded
+/// so far" a true statement.
+async fn automation_audit_actions(state: &AppState) -> Vec<String> {
     let log_store = state.log_store.clone().expect("test setup: log store");
+    log_store
+        .flush_audit()
+        .await
+        .expect("the audit writer drains");
     let (rows, _total) = log_store
         .query_audit(&crate::audit::AuditQuery {
             operator: None,
@@ -9304,6 +9323,7 @@ async fn an_expired_automation_token_is_refused() {
         &state,
         "expired",
         vec![lorica_config::models::AutomationScope::EnvironmentsRead],
+        &["*.preview.example.com"],
         chrono::Utc::now() - chrono::Duration::minutes(1),
         None,
     )
@@ -9330,6 +9350,7 @@ async fn a_token_without_the_scope_is_forbidden_and_not_unauthorized() {
         &state,
         "write-only",
         vec![lorica_config::models::AutomationScope::EnvironmentsWrite],
+        &["*.preview.example.com"],
         chrono::Utc::now() + chrono::Duration::days(30),
         None,
     )
@@ -9399,6 +9420,7 @@ async fn every_automation_request_lands_in_the_audit_log() {
         &state,
         "write-only",
         vec![lorica_config::models::AutomationScope::EnvironmentsWrite],
+        &["*.preview.example.com"],
         chrono::Utc::now() + chrono::Duration::days(30),
         None,
     )
@@ -9430,13 +9452,16 @@ async fn every_automation_request_lands_in_the_audit_log() {
     }
 
     assert_eq!(
-        automation_audit_actions(&state),
+        automation_audit_actions(&state).await,
         vec![
-            "automation.request.forbidden",
+            // The verb carries the precise cause after a colon, which
+            // is how `GET /api/v1/audit` shows an operator why a
+            // request was turned away (the wire said only 401 or 403).
+            "automation.request.forbidden:environments:read",
             "automation.request.ok",
-            "automation.request.unauthenticated",
-            "automation.request.unauthenticated",
-            "automation.request.unauthenticated",
+            "automation.request.unauthenticated:no_bearer",
+            "automation.request.unauthenticated:no_bearer",
+            "automation.request.unauthenticated:not_a_credential",
         ]
     );
 

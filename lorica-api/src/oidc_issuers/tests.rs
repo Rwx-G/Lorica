@@ -315,6 +315,22 @@ async fn the_model_rules_are_refused_with_a_422_naming_the_field() {
         ("bound_claims", serde_json::json!({ "sub": "anything" })),
         ("scopes", serde_json::json!([])),
         ("allowed_hostnames", serde_json::json!(["*"])),
+        // An entry binding neither a project nor a namespace accepts a
+        // token from every project on the instance: `aud` is not a
+        // secret.
+        (
+            "bound_claims",
+            serde_json::json!({ "ref_protected": "true" }),
+        ),
+        ("bound_claims", serde_json::json!({})),
+        // An unanchored glob is a string prefix: `acme*` covers
+        // `acme-evil/pwn`.
+        (
+            "bound_claims",
+            serde_json::json!({ "project_path": "acme*" }),
+        ),
+        // An empty CIDR list is read as every address.
+        ("allowed_backend_cidrs", serde_json::json!([])),
     ] {
         let mut body = create_body();
         body[field] = value;
@@ -352,6 +368,130 @@ async fn the_model_rules_are_refused_with_a_422_naming_the_field() {
         StatusCode::UNPROCESSABLE_ENTITY,
         "a server-owned field on input is refused, not ignored"
     );
+}
+
+/// A throwaway CA, minted per test so no key material lives in the
+/// tree.
+fn test_ca_pem() -> String {
+    let mut params = rcgen::CertificateParams::new(Vec::new()).expect("test setup: CA params");
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Lorica Issuer Test CA");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let key = rcgen::KeyPair::generate().expect("test setup: CA key");
+    params
+        .self_signed(&key)
+        .expect("test setup: CA self-signs")
+        .pem()
+}
+
+#[tokio::test]
+async fn a_malformed_ca_pem_is_refused_at_write_time_naming_the_field() {
+    let key = TestKey::generate("k1");
+    let (state, sessions, limiter) = test_state(MockIssuer::serving(&[&key])).await;
+    let admin = super_admin(&state, &sessions, &limiter).await;
+
+    for bad in [
+        "not a certificate at all",
+        "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----",
+        // A private key is PEM, and is not a trust anchor.
+        "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----",
+    ] {
+        let mut body = create_body();
+        body["ca_pem"] = serde_json::json!(bad);
+        let response = management(
+            &state,
+            &sessions,
+            &limiter,
+            "POST",
+            ISSUERS_PATH,
+            &admin,
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ca_pem {bad:?} must be refused"
+        );
+        let message = body_json(response).await["error"].to_string();
+        assert!(message.contains("ca_pem"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn a_pinned_ca_is_listed_as_a_fingerprint_and_never_as_the_pem() {
+    let key = TestKey::generate("k1");
+    let (state, sessions, limiter) = test_state(MockIssuer::serving(&[&key])).await;
+    let admin = super_admin(&state, &sessions, &limiter).await;
+    let ca_pem = test_ca_pem();
+
+    let mut body = create_body();
+    body["ca_pem"] = serde_json::json!(ca_pem);
+    let id = register(&state, &sessions, &limiter, &admin, body).await;
+
+    let listing = body_json(
+        management(
+            &state,
+            &sessions,
+            &limiter,
+            "GET",
+            ISSUERS_PATH,
+            &admin,
+            None,
+        )
+        .await,
+    )
+    .await;
+    let rows = listing["data"]["issuers"]
+        .as_array()
+        .expect("the listing answers with an array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], id);
+    assert!(
+        rows[0]["ca_pem"].is_null(),
+        "the pinned certificate never leaves the node: {}",
+        rows[0]
+    );
+    let fingerprint = rows[0]["ca_fingerprint"]
+        .as_str()
+        .expect("a pinned entry lists a fingerprint");
+    assert_eq!(fingerprint.len(), 64, "SHA-256 in lowercase hex");
+    assert!(
+        fingerprint
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "{fingerprint}"
+    );
+    // The whole listing, not just the one field: no part of the PEM
+    // may appear anywhere in the answer.
+    let serialised = listing.to_string();
+    assert!(!serialised.contains("BEGIN CERTIFICATE"), "{serialised}");
+
+    // An entry that pins nothing says so rather than inventing a value.
+    let plain = register(&state, &sessions, &limiter, &admin, create_body()).await;
+    let listing = body_json(
+        management(
+            &state,
+            &sessions,
+            &limiter,
+            "GET",
+            ISSUERS_PATH,
+            &admin,
+            None,
+        )
+        .await,
+    )
+    .await;
+    let row = listing["data"]["issuers"]
+        .as_array()
+        .expect("the listing answers with an array")
+        .iter()
+        .find(|row| row["id"] == plain.as_str())
+        .expect("the second entry is listed")
+        .clone();
+    assert!(row["ca_fingerprint"].is_null(), "{row}");
 }
 
 #[tokio::test]

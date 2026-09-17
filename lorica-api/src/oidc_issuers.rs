@@ -36,10 +36,22 @@
 //!
 //! # Validation
 //!
-//! [`lorica_config::models::OidcIssuer::validate`] is the only
-//! validator: the `https` rule, the closed claim set, the one glob and
-//! the grant caps all belong to the model. This module only fills in
-//! the defaults an operator may omit.
+//! [`lorica_config::models::OidcIssuer::validate`] is the validator for
+//! every field the model can judge on its own: the `https` rule, the
+//! closed claim set, the one glob and the grant caps. `ca_pem` is the
+//! exception and is judged here, by [`validate_ca_pem`], because
+//! deciding whether a blob is a certificate needs an X.509 parser and
+//! `lorica-config` has none. It is still a write-time rule: this
+//! handler is the only path that writes a row.
+//!
+//! # `ca_pem` goes in and never comes back
+//!
+//! The certificate an entry pins is not a secret, but it is node-local
+//! material an operator supplied, and a listing is the wrong place for
+//! a few kilobytes of PEM. `GET` answers with a `ca_fingerprint`, the
+//! SHA-256 of the first certificate's DER in lowercase hex, which is
+//! what an operator compares against `openssl x509 -fingerprint
+//! -sha256` to confirm the right CA is pinned.
 
 use std::collections::BTreeMap;
 
@@ -47,7 +59,9 @@ use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::CertificateDer;
 
 use lorica_config::models::{
     AutomationScope, OidcIssuer, AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS,
@@ -61,14 +75,23 @@ use crate::server::AppState;
 /// `target_type` of every issuer-entry audit row.
 const OIDC_ISSUER_TARGET_TYPE: &str = "oidc_issuer";
 
+/// Most bytes accepted in a `ca_pem`. A root plus an intermediate is
+/// around four kilobytes; the cap is sixteen times that, and it exists
+/// so a SuperAdmin typo cannot park a megabyte in a row every JWKS
+/// fetch reads.
+const CA_PEM_MAX_LEN: usize = 64 * 1024;
+
 /// JSON body for `POST /api/v1/automation/oidc-issuers`.
 ///
 /// `deny_unknown_fields`, so the server-owned facts (`id`,
 /// `created_by`, `created_at`) are refused on input rather than
 /// quietly ignored. `jwks_url` defaults to
-/// `<issuer>/oauth/discovery/keys`, `bound_claims` and
-/// `allowed_backend_cidrs` to empty, and `max_ttl_seconds` to the
-/// static-token default.
+/// `<issuer>/oauth/discovery/keys` and `max_ttl_seconds` to the
+/// static-token default. `bound_claims` and `allowed_backend_cidrs`
+/// have no usable default: an entry binding neither `project_path`
+/// nor `namespace_path` accepts every project on the instance, and an
+/// empty CIDR list is read as every address, so the model refuses
+/// both.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateOidcIssuerRequest {
@@ -86,7 +109,8 @@ pub struct CreateOidcIssuerRequest {
     pub bound_claims: BTreeMap<String, String>,
     /// Hostname patterns a token from this entry may claim.
     pub allowed_hostnames: Vec<String>,
-    /// CIDRs a token from this entry may point a hostname at.
+    /// CIDRs a token from this entry may point a hostname at. At
+    /// least one.
     #[serde(default)]
     pub allowed_backend_cidrs: Vec<String>,
     /// Ceiling on the lifetime any environment a token from this entry
@@ -95,13 +119,88 @@ pub struct CreateOidcIssuerRequest {
     pub max_ttl_seconds: Option<u32>,
     /// What a token from this entry may do. At least one.
     pub scopes: Vec<AutomationScope>,
+    /// PEM certificates that become the only trust anchors for this
+    /// entry's JWKS fetch. Omit it on a public GitLab, or on a
+    /// self-hosted one whose CA the node already trusts.
+    #[serde(default)]
+    pub ca_pem: Option<String>,
+}
+
+/// One entry as the API answers it: the stored row, whose `ca_pem` is
+/// never serialised, plus the fingerprint of the CA it pins.
+#[derive(Serialize)]
+struct OidcIssuerView {
+    #[serde(flatten)]
+    entry: OidcIssuer,
+    /// Lowercase-hex SHA-256 of the first pinned certificate's DER, or
+    /// `null` when the entry fetches on the node's trust roots.
+    ca_fingerprint: Option<String>,
+}
+
+impl OidcIssuerView {
+    fn of(entry: &OidcIssuer) -> Self {
+        Self {
+            entry: entry.clone(),
+            ca_fingerprint: entry.ca_pem.as_deref().and_then(ca_fingerprint),
+        }
+    }
+}
+
+/// The certificates a `ca_pem` holds, in order.
+///
+/// The same rustls PEM reader the management-TLS loader and the
+/// syslog sink use, so a certificate this node accepts here is one its
+/// TLS stack can actually anchor on.
+fn certificates_of(ca_pem: &str) -> Vec<CertificateDer<'static>> {
+    CertificateDer::pem_slice_iter(ca_pem.as_bytes())
+        .filter_map(Result::ok)
+        .map(CertificateDer::into_owned)
+        .collect()
+}
+
+/// SHA-256 of the first certificate's DER, lowercase hex.
+///
+/// DER and not the PEM text, so the value matches what
+/// `openssl x509 -fingerprint -sha256` prints and does not move when
+/// the file is rewrapped or a trailing newline changes.
+fn ca_fingerprint(ca_pem: &str) -> Option<String> {
+    let first = certificates_of(ca_pem).into_iter().next()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, first.as_ref());
+    Some(
+        digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+/// A `ca_pem` an operator supplied: bounded, and at least one
+/// certificate the TLS stack can parse.
+///
+/// # Errors
+///
+/// A message naming `ca_pem`, suitable for a `422` body.
+fn validate_ca_pem(ca_pem: &str) -> Result<(), String> {
+    if ca_pem.len() > CA_PEM_MAX_LEN {
+        return Err(format!("ca_pem exceeds {CA_PEM_MAX_LEN} bytes"));
+    }
+    if certificates_of(ca_pem).is_empty() {
+        return Err(
+            "ca_pem must hold at least one PEM certificate; nothing in it parsed as one"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// The audit payload for one entry: everything it says, because an
 /// entry is policy and the audit trail is where policy changes are
-/// answered for. There is no secret in it.
+/// answered for. The pinned certificate itself stays out, and its
+/// fingerprint stands in, which is what identifies the trust decision
+/// anyway.
 fn audit_payload(issuer: &OidcIssuer) -> serde_json::Value {
-    serde_json::to_value(issuer).unwrap_or(serde_json::Value::Null)
+    serde_json::to_value(OidcIssuerView::of(issuer)).unwrap_or(serde_json::Value::Null)
 }
 
 /// Record one issuer-entry mutation.
@@ -138,7 +237,8 @@ pub async fn list_oidc_issuers(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let issuers = db_blocking(&state.store, move |store| store.list_oidc_issuers()).await?;
-    Ok(json_data(serde_json::json!({ "issuers": issuers })))
+    let views: Vec<OidcIssuerView> = issuers.iter().map(OidcIssuerView::of).collect();
+    Ok(json_data(serde_json::json!({ "issuers": views })))
 }
 
 /// POST /api/v1/automation/oidc-issuers - register an issuer entry
@@ -159,16 +259,24 @@ pub async fn create_oidc_issuer(
         allowed_backend_cidrs,
         max_ttl_seconds,
         scopes,
+        ca_pem,
     } = body;
     let jwks_url = jwks_url
         .map(|url| url.trim().to_string())
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| OidcIssuer::default_jwks_url(&issuer));
+    let ca_pem = ca_pem
+        .map(|pem| pem.trim().to_string())
+        .filter(|pem| !pem.is_empty());
+    if let Some(pem) = ca_pem.as_deref() {
+        validate_ca_pem(pem).map_err(ApiError::Unprocessable)?;
+    }
     let entry = OidcIssuer {
         id: uuid::Uuid::new_v4().to_string(),
         issuer,
         audience,
         jwks_url,
+        ca_pem,
         bound_claims,
         allowed_hostnames,
         allowed_backend_cidrs,
@@ -199,7 +307,10 @@ pub async fn create_oidc_issuer(
     )
     .await;
 
-    Ok(json_data_with_status(StatusCode::CREATED, entry))
+    Ok(json_data_with_status(
+        StatusCode::CREATED,
+        OidcIssuerView::of(&entry),
+    ))
 }
 
 /// DELETE /api/v1/automation/oidc-issuers/{id} - remove an issuer

@@ -143,6 +143,13 @@ pub async fn authorize_scope(req: Request, next: Next) -> Result<Response, ApiEr
 
 /// The wire spelling of a scope, matching its serde rename so an
 /// operator reads the same string in the error and in the token.
+///
+/// The third copy of this vocabulary is
+/// `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.fixture.ts`,
+/// which is what the mint form offers. A rename touches all three: the
+/// serde renames on `AutomationScope`, this match, and that fixture.
+/// The test below pins this half against serde; nothing pins the
+/// fixture, so it is the one to check by hand.
 fn scope_str(scope: AutomationScope) -> &'static str {
     match scope {
         AutomationScope::EnvironmentsWrite => "environments:write",
@@ -220,6 +227,52 @@ mod tests {
             required_scope(&Method::POST, "/automation/v1/environments/pr-42"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn the_layer_refuses_an_undeclared_path_for_a_token_holding_every_scope() {
+        use axum::body::Body;
+        use axum::routing::get;
+        use axum::{Extension, Router};
+        use http::Request;
+        use tower::ServiceExt;
+
+        // The matrix test above asserts the function. This one asserts
+        // the layer consults it, which is the half a caller meets: a
+        // handler mounted on a path with no declaration must be
+        // unreachable, and unreachable by the widest token there is.
+        let principal = AutomationPrincipal {
+            kind: lorica_config::models::OwnerKind::StaticToken,
+            principal: "acme-ci".to_string(),
+            grant_id: "0123456789abcdef01234567".to_string(),
+            scopes: vec![
+                AutomationScope::EnvironmentsWrite,
+                AutomationScope::EnvironmentsRead,
+                AutomationScope::RoutesRead,
+                AutomationScope::CertificatesRead,
+            ],
+            allowed_hostnames: vec!["*.review.example.com".to_string()],
+            allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
+            max_ttl_seconds: 3_600,
+            pipeline: None,
+            required_environment_slug: None,
+        };
+        let app = Router::new()
+            .route("/automation/v1/tokens", get(|| async { "reached" }))
+            .layer(axum::middleware::from_fn(authorize_scope))
+            .layer(Extension(principal));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/automation/v1/tokens")
+                    .body(Body::empty())
+                    .expect("test setup: request builds"),
+            )
+            .await
+            .expect("test setup: request runs");
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
     }
 
     #[test]

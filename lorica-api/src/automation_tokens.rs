@@ -79,11 +79,12 @@ use crate::server::AppState;
 /// `secret_hmac`, `created_at`, `created_by`, `last_used_at`,
 /// `revoked_at`) are refused on input rather than quietly ignored.
 ///
-/// The three omissible fields fall back to the model's own defaults:
-/// `allowed_backend_cidrs` to empty (the node's default backend policy
-/// applies), `max_ttl_seconds` to
-/// [`AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS`], and the expiry to
-/// [`AUTOMATION_TOKEN_DEFAULT_LIFETIME_DAYS`] from now.
+/// The two omissible fields fall back to the model's own defaults:
+/// `max_ttl_seconds` to [`AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS`]
+/// and the expiry to [`AUTOMATION_TOKEN_DEFAULT_LIFETIME_DAYS`] from
+/// now. `allowed_backend_cidrs` has no default: there is no node-wide
+/// backend policy to fall back on, and an empty list would be read as
+/// every address, so the model refuses one.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAutomationTokenRequest {
@@ -93,7 +94,7 @@ pub struct CreateAutomationTokenRequest {
     pub scopes: Vec<AutomationScope>,
     /// Hostname patterns this token may claim.
     pub allowed_hostnames: Vec<String>,
-    /// CIDRs this token may point a hostname at.
+    /// CIDRs this token may point a hostname at. At least one.
     #[serde(default)]
     pub allowed_backend_cidrs: Vec<String>,
     /// Ceiling on the lifetime any environment this token creates may

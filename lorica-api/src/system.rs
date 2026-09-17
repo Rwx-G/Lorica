@@ -261,7 +261,7 @@ fn public_version(full: &str) -> String {
 ///
 /// `label` is the role string surfaced in the JSON response
 /// (`"root"` / `"data"`) ; we intentionally do NOT serialise the
-/// absolute mount path — it is useful for reconnaissance on a
+/// absolute mount path - it is useful for reconnaissance on a
 /// compromised session and the two labels are enough for an
 /// operator to identify which filesystem is which.
 ///

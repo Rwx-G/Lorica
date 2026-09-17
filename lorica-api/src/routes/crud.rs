@@ -130,7 +130,7 @@ fn validate_bot_protection(
 
     // Hard caps matching `lorica_challenge::pow` constants (the
     // crate constants are not re-exported here to avoid forcing
-    // lorica-api to depend on lorica-challenge at compile time —
+    // lorica-api to depend on lorica-challenge at compile time;
     // the values are tiny and duplicated as named constants below).
     // Audit L-23 : the `BOT_*` and `BYPASS_*` constants are public
     // so OpenAPI / SDK generators can read the same upper bounds
@@ -225,8 +225,8 @@ fn validate_bot_protection(
     // `lorica_geoip::AsnResolver` loaded from
     // `GlobalSettings.asn_db_path`. When the DB is missing at
     // request time, `asn_handle().lookup_asn()` returns `None` and
-    // the request falls through to the remaining bypass categories
-    // — the config is accepted, it just does not fire until the
+    // the request falls through to the remaining bypass categories;
+    // the config is accepted, it just does not fire until the
     // operator points `asn_db_path` at an ASN `.mmdb`.
     check_cap("asns", cfg.bypass.asns.len())?;
     for n in &cfg.bypass.asns {
@@ -271,7 +271,7 @@ fn validate_bot_protection(
     // confirmation is enforced in-process by
     // `lorica::bot_rdns::RdnsResolver` (resolve PTR then confirm
     // one of the resulting names forward-resolves back to the
-    // client IP — without this a hostile resolver could trivially
+    // client IP - without this a hostile resolver could trivially
     // spoof any PTR and bypass).
     //
     // Shape rules: printable ASCII, no leading dot, contains at
@@ -2658,7 +2658,7 @@ mod bot_protection_validation_tests {
 
     #[test]
     fn rejects_bare_trailing_dot_tld_in_rdns() {
-        // `com.` is a TLD with canonical trailing dot — still a
+        // `com.` is a TLD with canonical trailing dot - still a
         // bare TLD that would match every .com host.
         let mut c = baseline();
         c.bypass.rdns = vec!["com.".to_string()];
@@ -4279,7 +4279,7 @@ pub async fn update_route(
             // operator toggles bot-protection OFF on a route that
             // previously had a config. Mutually exclusive with
             // sending a new `bot_protection` body (would be a
-            // contradiction — `disable` wins so the API contract
+            // contradiction - `disable` wins so the API contract
             // stays predictable).
             route.bot_protection = None;
         } else if let Some(ref b) = body.bot_protection {

@@ -612,6 +612,13 @@ async fn an_invalid_request_is_refused_by_the_models_validator_with_the_field_na
             serde_json::json!(["not-a-cidr"]),
             "allowed_backend_cidrs",
         ),
+        // An empty list is default-allow in the connection filter, so
+        // it would be the widest grant a token can carry.
+        (
+            "allowed_backend_cidrs",
+            serde_json::json!([]),
+            "allowed_backend_cidrs",
+        ),
         ("max_ttl_seconds", serde_json::json!(0), "max_ttl_seconds"),
     ];
 

@@ -77,7 +77,10 @@ pub mod oidc;
 pub mod router;
 pub mod scope;
 
-pub use auth::AutomationPrincipal;
+pub use auth::{
+    AutomationPrincipal, AUTOMATION_BEARER_MAX_BYTES, AUTOMATION_LAST_USED_WRITE_INTERVAL,
+    OIDC_MAX_AUDIENCES,
+};
 pub use environments::{
     delete_environment_rows, publish_environment_gauges, reap_expired_environments,
     reresolve_auto_certificates, DeletedEnvironment, EnvironmentCounts, ReresolvedCertificate,

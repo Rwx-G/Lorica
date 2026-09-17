@@ -51,6 +51,18 @@
 //!    expiry takes effect on the very next request with no
 //!    invalidation step to get wrong.
 //!
+//! # What an unauthenticated caller may cost before any store access
+//!
+//! Both paths refuse a bearer longer than
+//! [`AUTOMATION_BEARER_MAX_BYTES`] before looking at its shape, and
+//! the OIDC path refuses a token naming more than
+//! [`OIDC_MAX_AUDIENCES`] audiences before its first store read. The
+//! audience list is attacker-chosen and each entry used to be one
+//! indexed read inside the single `db_blocking` closure that holds
+//! the store mutex, plus one audit row per attempt, so an unsigned
+//! JWT carrying a thousand audiences was a thousand reads under the
+//! lock every node's control plane shares.
+//!
 //! # The OIDC path, in order
 //!
 //! 1. The token's `aud` is read WITHOUT verification, only to select
@@ -74,6 +86,10 @@
 //! The precise reason is written to the audit row, which an operator
 //! can read and an attacker cannot.
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+
 use axum::extract::FromRequestParts;
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
@@ -81,6 +97,8 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
+
 use lorica_config::models::{
     dummy_automation_secret_hmac_hex, parse_automation_token, verify_automation_secret,
     AutomationScope, AutomationToken, EnvironmentOwner, OidcIssuer, OwnerKind, PipelineIdentity,
@@ -102,6 +120,73 @@ pub const AUTOMATION_REALM: &str = "lorica-automation";
 /// cannot reach the plane has to look at the audit log, which an
 /// operator can read and an attacker cannot.
 const UNAUTHORIZED_MESSAGE: &str = "a valid automation bearer credential is required";
+
+/// Most bytes accepted in a bearer value, before its shape is even
+/// looked at.
+///
+/// A minted static token is under a hundred bytes and a GitLab ID
+/// token a couple of kilobytes; eight kibibytes is room for an issuer
+/// with an unusually long claim set and a hard stop well below what a
+/// caller could otherwise hand the base64 decoder and the JSON parser
+/// on an unauthenticated endpoint.
+pub const AUTOMATION_BEARER_MAX_BYTES: usize = 8 * 1024;
+
+/// Most `aud` entries an ID token may name.
+///
+/// The audience list decides how many issuer-entry lookups one
+/// unauthenticated request costs, and the caller writes it. A job
+/// names exactly one audience; eight is room for a migration between
+/// two Lorica instances and a ceiling on the fan-out.
+pub const OIDC_MAX_AUDIENCES: usize = 8;
+
+/// Least time between two `last_used_at` writes for one credential.
+///
+/// The stamp is a reporting field an operator reads to retire a token
+/// nobody presents, and it was costing one SQLite write on the single
+/// store mutex per authenticated request. A minute of resolution
+/// answers the question it exists for.
+pub const AUTOMATION_LAST_USED_WRITE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Most credentials the stamp throttle remembers at once.
+///
+/// Bounded for the same reason the replay set is: the entries are
+/// keyed by a value a caller supplies, so an attacker presenting many
+/// distinct public ids must not be able to grow a process-local map
+/// without limit. A key is a 24-character id beside an `Instant`, so
+/// the cap holds the map near a megabyte.
+const LAST_USED_THROTTLE_CAP: usize = 10_000;
+
+/// When each `public_id` last had its `last_used_at` written.
+///
+/// Process-local and deliberately not replicated: the stamp is a
+/// local reporting field, and a node that restarts simply writes one
+/// stamp per credential again.
+static LAST_USED_STAMPS: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether `public_id` is due a `last_used_at` write at `now`.
+///
+/// Entries older than the interval are dropped before the cap is
+/// measured, the way the replay set purges before it evicts: an entry
+/// past its interval suppresses nothing, so keeping it costs memory
+/// and buys nothing. A map full of live entries answers `true` without
+/// remembering the id, which is the un-throttled behaviour for that
+/// credential until the pressure passes and never unbounded memory.
+fn last_used_write_due(public_id: &str, now: Instant) -> bool {
+    let mut stamps = LAST_USED_STAMPS.lock();
+    if stamps
+        .get(public_id)
+        .is_some_and(|previous| now.duration_since(*previous) < AUTOMATION_LAST_USED_WRITE_INTERVAL)
+    {
+        return false;
+    }
+    stamps.retain(|_, stamp| now.duration_since(*stamp) < AUTOMATION_LAST_USED_WRITE_INTERVAL);
+    if stamps.len() >= LAST_USED_THROTTLE_CAP {
+        return true;
+    }
+    stamps.insert(public_id.to_string(), now);
+    true
+}
 
 /// The authenticated automation behind a request, installed in the
 /// request extensions by [`require_automation_auth`].
@@ -327,6 +412,11 @@ async fn authenticate(
     presented: &str,
     now: DateTime<Utc>,
 ) -> Result<AutomationPrincipal, String> {
+    // Before the shape test, so nothing downstream ever decodes or
+    // parses an attacker-sized value.
+    if presented.len() > AUTOMATION_BEARER_MAX_BYTES {
+        return Err("bearer_too_long".to_string());
+    }
     if let Ok(parsed) = parse_automation_token(presented) {
         return authenticate_static_token(state, parsed.public_id, parsed.secret, now).await;
     }
@@ -381,15 +471,19 @@ async fn authenticate_static_token(
         return Err("token_expired".to_string());
     }
 
-    // Best effort: a token that was just accepted is a token in use,
-    // and failing the request because the stamp did not land would
-    // trade a working automation for a reporting field.
-    if let Err(e) = db_blocking(&state.store, move |store| {
-        store.touch_automation_token_last_used(&public_id, now)
-    })
-    .await
-    {
-        tracing::warn!(error = %e, "automation token last_used stamp failed");
+    // Best effort, and at most once per
+    // [`AUTOMATION_LAST_USED_WRITE_INTERVAL`] per credential: a token
+    // that was just accepted is a token in use, and failing the
+    // request because the stamp did not land would trade a working
+    // automation for a reporting field.
+    if last_used_write_due(&public_id, Instant::now()) {
+        if let Err(e) = db_blocking(&state.store, move |store| {
+            store.touch_automation_token_last_used(&public_id, now)
+        })
+        .await
+        {
+            tracing::warn!(error = %e, "automation token last_used stamp failed");
+        }
     }
 
     Ok(AutomationPrincipal::from_static_token(token))
@@ -405,6 +499,13 @@ async fn authenticate_id_token(
     let audiences = peek_audiences(token);
     if audiences.is_empty() {
         return Err("malformed".to_string());
+    }
+    // Before the store read below, which is one indexed lookup per
+    // audience inside one closure holding the store mutex, and one
+    // audit row per attempt. The list is unverified and the caller
+    // writes it.
+    if audiences.len() > OIDC_MAX_AUDIENCES {
+        return Err("too_many_audiences".to_string());
     }
 
     // Read from the store on every request, never cached: an entry an

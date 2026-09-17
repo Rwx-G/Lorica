@@ -55,10 +55,11 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, TimeDelta, Utc};
 use lorica_config::models::{
-    may_access, resolve_certificate_for_hostname, validate_environment_name,
+    matches_one_label, may_access, resolve_certificate_for_hostname, validate_environment_name,
     wildcard_patterns_an_operator_could_provision, AutomationEnvironment, AutomationScope, Backend,
     Certificate, CertificateMode, EnvironmentOwner, HealthStatus, LifecycleState, LoadBalancing,
-    ManagedBy, PipelineIdentity, Route, WafMode,
+    ManagedBy, PipelineIdentity, Route, WafMode, AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT,
+    AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL,
 };
 use lorica_config::{ConfigError, ConfigStore, ConnectionFilterPolicy};
 use serde::{Deserialize, Serialize};
@@ -89,6 +90,15 @@ const DNS01_PROVISIONING_ENDPOINT: &str = "POST /api/v1/acme/provision-dns";
 
 /// Default backend weight when the request leaves it out.
 const DEFAULT_BACKEND_WEIGHT: i32 = 1;
+
+/// Highest backend weight an environment may ask for.
+///
+/// The route model stores a bare `i32` and caps nothing, so a caller
+/// could write `2_147_483_647` beside a weight of 1 and turn a
+/// round-robin pool into a single upstream while the response still
+/// reports two backends. A thousand to one is more spread than any
+/// real pool needs and keeps every weight sum inside an `i32`.
+const AUTOMATION_MAX_BACKEND_WEIGHT: i32 = 1_000;
 
 /// Health-check cadence for automation backends, the same default the
 /// backend API applies.
@@ -279,6 +289,28 @@ enum PutOutcome {
     StaleIfMatch {
         current: Option<String>,
     },
+    /// The name is taken by another principal's environment.
+    Foreign,
+}
+
+/// A lookup that produced nothing the caller may see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Missing {
+    /// No row carries that name.
+    Unknown,
+    /// A row carries it and another principal owns it.
+    ///
+    /// The wire answer is the one [`Missing::Unknown`] gets, so a
+    /// caller cannot walk the name space to learn which environments
+    /// its neighbours run; the distinction reaches the audit row and
+    /// nothing else.
+    Foreign,
+}
+
+/// The one 404 an environment lookup answers, whether the name is
+/// unknown or owned by another principal.
+fn not_found(name: &str) -> ApiError {
+    ApiError::NotFound(format!("environment {name}"))
 }
 
 /// The rows a delete removed, for the audit payload.
@@ -294,18 +326,22 @@ pub struct DeletedEnvironment {
 
 // ---- Validation, pure ----
 
-/// Check the hostname the way AC #3 reads it: an exact DNS name,
-/// lowercase, that names neither listener.
-fn validate_environment_hostname(raw: &str) -> Result<String, ApiError> {
+/// The RFC 1123 rule every name field on this resource reads, with
+/// the field named so the caller knows which one it is about.
+///
+/// Same shape as the route API's own hostname check: a bare name, no
+/// scheme, path, port, wildcard or address literal, 253 characters at
+/// most, every label 1 to 63 ASCII alphanumerics and inner hyphens.
+/// Returns the name lowercased with a trailing dot folded away, which
+/// is the form the rows store and compare.
+fn validate_dns_name(raw: &str, field: &str) -> Result<String, ApiError> {
     let name = raw.trim().trim_end_matches('.').to_ascii_lowercase();
-    let refuse = |why: &str| ApiError::Unprocessable(format!("hostname {why}"));
+    let refuse = |why: &str| ApiError::Unprocessable(format!("{field} {why}"));
     if name.is_empty() {
         return Err(refuse("must not be empty"));
     }
     if name.contains('*') {
-        return Err(refuse(
-            "cannot be a wildcard: an environment answers on one exact host",
-        ));
+        return Err(refuse("cannot be a wildcard: it names one exact host"));
     }
     if name.contains("://") || name.contains('/') {
         return Err(refuse(
@@ -319,15 +355,7 @@ fn validate_environment_hostname(raw: &str) -> Result<String, ApiError> {
         ));
     }
     if name.parse::<IpAddr>().is_ok() {
-        return Err(refuse(
-            "must be a DNS name, not an address: an address literal names a listener, not a \
-             site",
-        ));
-    }
-    if name == "localhost" || name.ends_with(".localhost") {
-        return Err(refuse(
-            "cannot be `localhost`: that is the management listener's host",
-        ));
+        return Err(refuse("must be a DNS name, not an address literal"));
     }
     if name.len() > 253 {
         return Err(refuse("is longer than 253 characters (DNS limit)"));
@@ -347,6 +375,21 @@ fn validate_environment_hostname(raw: &str) -> Result<String, ApiError> {
                 "may only contain ASCII letters, digits, `-` and `.`",
             ));
         }
+    }
+    Ok(name)
+}
+
+/// Check the hostname the way AC #3 reads it: an exact DNS name,
+/// lowercase, that names neither listener.
+fn validate_environment_hostname(raw: &str) -> Result<String, ApiError> {
+    let name = validate_dns_name(raw, "hostname")?;
+    // The listener rule, which applies to the name a route answers on
+    // and to nothing else: an address literal names a listener rather
+    // than a site, and `localhost` is the management listener's host.
+    if name == "localhost" || name.ends_with(".localhost") {
+        return Err(ApiError::Unprocessable(
+            "hostname cannot be `localhost`: that is the management listener's host".to_string(),
+        ));
     }
     Ok(name)
 }
@@ -378,6 +421,17 @@ fn validate_path_prefix(raw: Option<&str>) -> Result<String, ApiError> {
 /// name cannot be checked against one without a resolution the token
 /// holder would control. Outside the grant is 403, the same answer the
 /// scope gate gives: the token is real and the grant is not there.
+///
+/// # An empty grant is deny-all here
+///
+/// [`ConnectionFilterPolicy`] reads an empty allow list as
+/// default-allow, which is right for a filter an operator opts into
+/// and wrong for a grant a credential carries: it would make a
+/// credential minted without the field the widest one on the node,
+/// able to aim a public hostname at `127.0.0.1` or at a cloud
+/// metadata address. The models refuse an empty list at write time;
+/// this refuses it again at use time, for the rows written before
+/// that rule landed.
 fn validate_backends(
     principal: &AutomationPrincipal,
     backends: &[EnvironmentBackendRequest],
@@ -385,6 +439,21 @@ fn validate_backends(
     if backends.is_empty() {
         return Err(ApiError::Unprocessable(
             "backends must name at least one upstream".to_string(),
+        ));
+    }
+    if backends.len() > AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT {
+        return Err(ApiError::Unprocessable(format!(
+            "backends names {} upstreams; an environment carries at most \
+             {AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT}, because every one of them is a row \
+             written inside the single transaction this call holds the store for",
+            backends.len()
+        )));
+    }
+    if principal.allowed_backend_cidrs.is_empty() {
+        return Err(ApiError::Forbidden(
+            "this credential names no allowed_backend_cidrs, so its backend grant covers no \
+             address; ask an operator to name the ranges it may reach"
+                .to_string(),
         ));
     }
     let policy = ConnectionFilterPolicy::from_cidrs(&principal.allowed_backend_cidrs, &[]);
@@ -414,12 +483,28 @@ fn validate_backends(
                 "backends[{index}].weight must be at least 1"
             )));
         }
-        let tls_sni = backend
+        if weight > AUTOMATION_MAX_BACKEND_WEIGHT {
+            return Err(ApiError::Unprocessable(format!(
+                "backends[{index}].weight `{weight}` exceeds \
+                 {AUTOMATION_MAX_BACKEND_WEIGHT}"
+            )));
+        }
+        let tls_sni = match backend
             .tls_sni
             .as_deref()
             .map(str::trim)
             .filter(|sni| !sni.is_empty())
-            .map(str::to_string);
+        {
+            // The SNI lands on a backend row and is presented on the
+            // wire to the upstream, so it goes through the same DNS
+            // name rule the route path applies to every other name
+            // this API stores.
+            Some(sni) => Some(validate_dns_name(
+                sni,
+                &format!("backends[{index}].tls_sni"),
+            )?),
+            None => None,
+        };
         out.push(ValidatedBackend {
             address: addr.to_string(),
             tls_upstream: backend.tls_upstream,
@@ -478,28 +563,20 @@ fn parse_certificate_mode(
     Ok(CertificateMode::Explicit(value.to_string()))
 }
 
-/// The AC #6 ownership rule, as a refusal.
+/// The AC #6 ownership rule.
 ///
 /// `caller` is the principal as an owner: a static token's name, or
 /// an ID token's `project_path` (Story 10.5 AC #3), each in its own
-/// kind, so the two never match each other.
-fn ensure_may_access(
-    environment: &AutomationEnvironment,
-    caller: &EnvironmentOwner,
-) -> Result<(), ApiError> {
-    if may_access(
+/// kind, so the two never match each other. An environment is reached
+/// by its exact owner, or by anybody when its owner labelled it
+/// `shared = "true"`.
+fn caller_may_access(environment: &AutomationEnvironment, caller: &EnvironmentOwner) -> bool {
+    may_access(
         &environment.owner,
         &caller.principal,
         caller.kind,
         &environment.labels,
-    ) {
-        return Ok(());
-    }
-    Err(ApiError::Forbidden(format!(
-        "environment `{}` was created by a principal with another name prefix and is not \
-         labelled shared=true",
-        environment.name
-    )))
+    )
 }
 
 /// AC #3: a credential bound to `environment_protected = true` may only
@@ -702,12 +779,31 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
     let existing = store.get_automation_environment(&input.name)?;
     let current_etag = existing.as_ref().map(etag_for);
     if let Some(existing) = &existing {
-        ensure_may_access(existing, &input.owner)?;
+        if !caller_may_access(existing, &input.owner) {
+            return Ok(PutOutcome::Foreign);
+        }
     }
     if !if_match_holds(input.if_match.as_deref(), current_etag.as_deref()) {
         return Ok(PutOutcome::StaleIfMatch {
             current: current_etag,
         });
+    }
+    if existing.is_none() {
+        // The quota is counted on create alone: an update rewrites
+        // rows the principal already owns and adds nothing to the
+        // fleet's row set.
+        let owned = store
+            .list_automation_environments()?
+            .into_iter()
+            .filter(|environment| environment.owner == input.owner)
+            .count();
+        if owned >= AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL {
+            return Err(ApiError::Unprocessable(format!(
+                "this principal already owns {owned} environments and the cap is \
+                 {AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL}; delete one before creating \
+                 another"
+            )));
+        }
     }
 
     // The conflict names the hostname and nothing about the route
@@ -748,10 +844,29 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
                 input.hostname
             ))
         })?,
-        CertificateMode::Explicit(id) => certificates
-            .iter()
-            .find(|cert| &cert.id == id)
-            .ok_or_else(|| ApiError::Unprocessable(format!("certificate `{id}` does not exist")))?,
+        CertificateMode::Explicit(id) => {
+            let named = certificates
+                .iter()
+                .find(|cert| &cert.id == id)
+                .ok_or_else(|| {
+                    ApiError::Unprocessable(format!("certificate `{id}` does not exist"))
+                })?;
+            // Naming an id does not widen what the certificate covers.
+            // Without this the route would serve a name the leaf does
+            // not carry, and every browser would refuse the site the
+            // pipeline just reported as up.
+            let covers = std::iter::once(named.domain.as_str())
+                .chain(named.san_domains.iter().map(String::as_str))
+                .any(|name| matches_one_label(name, &input.hostname));
+            if !covers {
+                return Err(ApiError::Unprocessable(format!(
+                    "{NO_CERTIFICATE_COVERS_HOSTNAME}: certificate `{id}` covers `{}` and not \
+                     `{}`; name a certificate that carries the hostname, or use `auto`",
+                    named.domain, input.hostname
+                )));
+            }
+            named
+        }
     };
 
     let (route_id, route_created_at) = match &existing {
@@ -790,12 +905,25 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
         backend_ids.push(row.id);
     }
 
+    // The owner of an existing row is never replaced, and its labels
+    // are rewritten by the exact owner alone. `shared = "true"` is a
+    // door its owner opened: a caller who walks through it must not be
+    // able to close it behind them by PUTting an empty label set and
+    // stamping themselves as the owner.
+    let (owner, labels) = match &existing {
+        Some(existing) if existing.owner == input.owner => {
+            (existing.owner.clone(), input.labels.clone())
+        }
+        Some(existing) => (existing.owner.clone(), existing.labels.clone()),
+        None => (input.owner.clone(), input.labels.clone()),
+    };
+
     let environment = AutomationEnvironment {
         name: input.name.clone(),
         route_id,
-        owner: input.owner.clone(),
+        owner,
         certificate_mode: input.certificate_mode.clone(),
-        labels: input.labels.clone(),
+        labels,
         expires_at: input.expires_at,
         created_at: existing.as_ref().map(|e| e.created_at).unwrap_or(input.now),
         updated_at: input.now,
@@ -902,7 +1030,7 @@ pub fn reresolve_auto_certificates(
     certificates: &[Certificate],
     now: DateTime<Utc>,
 ) -> Result<Vec<ReresolvedCertificate>, ConfigError> {
-    if store.get_cluster_identity()?.is_some() {
+    if store.is_follower() {
         return Ok(Vec::new());
     }
     let mut rewritten = Vec::new();
@@ -1205,6 +1333,18 @@ async fn put_environment_inner(
         Ok(PutOutcome::StaleIfMatch { current }) => {
             return Ok(precondition_failed(current.as_deref()));
         }
+        Ok(PutOutcome::Foreign) => {
+            audit_environment(
+                state,
+                &ctx,
+                "automation.environment.forbidden",
+                name,
+                None,
+                None,
+            )
+            .await;
+            return Err(not_found(name));
+        }
         Err(err @ ApiError::Forbidden(_)) => {
             audit_environment(
                 state,
@@ -1336,34 +1476,39 @@ pub async fn get_environment(
     Extension(state): Extension<AppState>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError> {
+    ensure_environment_binding(&name, &principal)?;
     let caller = principal.as_owner();
     let lookup = name.clone();
     let outcome = db_blocking(&state.store, move |store| {
-        let environment = store
-            .get_automation_environment(&lookup)?
-            .ok_or_else(|| ApiError::NotFound(format!("environment {lookup}")))?;
-        ensure_may_access(&environment, &caller)?;
-        let view = view_for(store, &environment)?
-            .ok_or_else(|| ApiError::NotFound(format!("environment {lookup}")))?;
-        Ok::<_, ApiError>((etag_for(&environment), view))
+        let Some(environment) = store.get_automation_environment(&lookup)? else {
+            return Ok::<_, ConfigError>(Err(Missing::Unknown));
+        };
+        if !caller_may_access(&environment, &caller) {
+            return Ok(Err(Missing::Foreign));
+        }
+        let Some(view) = view_for(store, &environment)? else {
+            return Ok(Err(Missing::Unknown));
+        };
+        Ok(Ok((etag_for(&environment), view)))
     })
-    .await;
+    .await?;
     let (etag, view) = match outcome {
         Ok(found) => found,
-        Err(err @ ApiError::Forbidden(_)) => {
-            let ctx = audit_context(&principal, &connect_info, &headers);
-            audit_environment(
-                &state,
-                &ctx,
-                "automation.environment.forbidden",
-                &name,
-                None,
-                None,
-            )
-            .await;
-            return Err(err);
+        Err(missing) => {
+            if missing == Missing::Foreign {
+                let ctx = audit_context(&principal, &connect_info, &headers);
+                audit_environment(
+                    &state,
+                    &ctx,
+                    "automation.environment.forbidden",
+                    &name,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            return Err(not_found(&name));
         }
-        Err(err) => return Err(err),
     };
     Ok(with_etag(json_data(view).into_response(), &etag))
 }
@@ -1377,6 +1522,12 @@ pub async fn get_environment(
 /// answer must not depend on log retention. A pipeline's cleanup job
 /// wants "gone" to be success; a typo in the name is a diagnostic the
 /// audit row of this very call gives the operator.
+///
+/// An environment another principal owns answers the 404 a `GET` on
+/// it answers, not a 403: a 403 would confirm that the name is taken
+/// and by somebody else, which is the one fact a neighbour on a shared
+/// node must not be able to enumerate. The refusal reason is in the
+/// audit row.
 pub async fn delete_environment(
     principal: AutomationPrincipal,
     connect_info: ClientConnectInfo,
@@ -1402,22 +1553,25 @@ async fn delete_environment_inner(
     state: &AppState,
     name: &str,
 ) -> Result<StatusCode, ApiError> {
+    ensure_environment_binding(name, &principal)?;
     let caller = principal.as_owner();
     let lookup = name.to_string();
     let ctx = audit_context(&principal, &connect_info, &headers);
     let outcome = db_blocking(&state.store, move |store| {
         let Some(environment) = store.get_automation_environment(&lookup)? else {
-            return Ok::<_, ApiError>(None);
+            return Ok::<_, ApiError>(Ok(None));
         };
-        ensure_may_access(&environment, &caller)?;
+        if !caller_may_access(&environment, &caller) {
+            return Ok(Err(Missing::Foreign));
+        }
         let deleted = store.in_transaction(|store| delete_environment_rows(store, &environment))?;
         refresh_environment_gauges(store, Utc::now());
-        Ok(Some(deleted))
+        Ok(Ok(Some(deleted)))
     })
-    .await;
+    .await?;
     let deleted = match outcome {
         Ok(deleted) => deleted,
-        Err(err @ ApiError::Forbidden(_)) => {
+        Err(_) => {
             audit_environment(
                 state,
                 &ctx,
@@ -1427,9 +1581,8 @@ async fn delete_environment_inner(
                 None,
             )
             .await;
-            return Err(err);
+            return Err(not_found(name));
         }
-        Err(err) => return Err(err),
     };
     if let Some(deleted) = deleted {
         state.notify_config_changed();
@@ -1497,15 +1650,8 @@ pub async fn reap_expired_environments(
     };
 
     // The actor is the node, not a principal: no token is behind an
-    // expiry. The identity mirrors the capture self-disable task's so
-    // an operator reading the audit log sees one shape for node-side
-    // events.
-    let ctx = AuditContext {
-        username: "reaper".to_string(),
-        role: "node".to_string(),
-        ip: String::new(),
-        user_agent: String::new(),
-    };
+    // expiry, which is the shape `AuditContext::node` carries.
+    let ctx = AuditContext::node("reaper");
     let mut names = Vec::with_capacity(reaped.len());
     for deleted in reaped {
         tracing::info!(

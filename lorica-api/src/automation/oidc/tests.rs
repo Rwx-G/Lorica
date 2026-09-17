@@ -27,6 +27,7 @@
 //! private key is checked into the repository.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use lorica_config::models::{
@@ -54,6 +55,7 @@ fn issuer_entry(id: &str, bound_claims: BTreeMap<String, String>) -> OidcIssuer 
         issuer: ISSUER_URL.to_string(),
         audience: AUDIENCE.to_string(),
         jwks_url: JWKS_URL.to_string(),
+        ca_pem: None,
         bound_claims,
         allowed_hostnames: vec!["*.review.example.com".to_string()],
         allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
@@ -709,3 +711,75 @@ fn the_environment_slug_follows_the_gitlab_rule() {
         gitlab_environment_slug("review/mr-43")
     );
 }
+
+// ---- The key cache holds no lock across a fetch ----
+
+/// A fetcher that blocks on `gate` for one URL and answers at once for
+/// every other, so a test can hold one issuer's fetch open and ask the
+/// cache about another.
+struct GatedFetcher {
+    slow_url: String,
+    keys: Vec<serde_json::Value>,
+    entered: Arc<tokio::sync::Notify>,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl super::JwksFetcher for GatedFetcher {
+    async fn fetch(&self, url: &str) -> Result<jsonwebtoken::jwk::JwkSet, String> {
+        if url == self.slow_url {
+            self.entered.notify_waiters();
+            self.gate.notified().await;
+        }
+        serde_json::from_value(serde_json::json!({ "keys": self.keys.clone() }))
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[tokio::test]
+async fn a_fetch_in_flight_for_one_issuer_does_not_block_another() {
+    // The cache used to hold its map lock across the fetch, so one
+    // unreachable issuer stalled every OIDC authentication on the node
+    // for the client's full ten-second timeout.
+    let key = TestKey::generate("k1");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let cache = Arc::new(super::JwksCache::new(Arc::new(GatedFetcher {
+        slow_url: SLOW_JWKS_URL.to_string(),
+        keys: vec![key.jwk()],
+        entered: Arc::clone(&entered),
+        gate: Arc::clone(&gate),
+    })));
+    let now = Utc::now();
+
+    // Prime the fast issuer, so the assertion below is a cache hit.
+    cache
+        .decoding_key(JWKS_URL, &key.kid, now)
+        .await
+        .expect("the fast issuer answers");
+
+    let waiting = entered.notified();
+    let slow = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        let kid = key.kid.clone();
+        async move { cache.decoding_key(SLOW_JWKS_URL, &kid, now).await }
+    });
+    waiting.await;
+
+    // With the slow fetch in flight, the fast issuer still answers.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cache.decoding_key(JWKS_URL, &key.kid, now),
+    )
+    .await
+    .expect("a cached issuer is not held behind another issuer's fetch")
+    .expect("the fast issuer answers");
+
+    gate.notify_waiters();
+    slow.await
+        .expect("the slow lookup finishes")
+        .expect("the slow issuer answers once its fetch returns");
+}
+
+/// A second issuer's key URL, for the test above.
+const SLOW_JWKS_URL: &str = "https://gitlab.slow.example.com/oauth/discovery/keys";

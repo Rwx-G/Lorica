@@ -30,7 +30,11 @@ lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 axum = { version = "0.8", features = ["multipart", "ws"] }
 futures-util = "0.3"
 tower = "0.5"
-tower-http = { version = "0.7", features = ["cors"] }
+# `catch-panic` is the automation plane's panic net (Story 10.5 audit
+# A2): the audit layer promises every request lands a row, which an
+# unwinding handler would break in the one case an operator most wants
+# the row. Feature on a crate already here, not a new dependency.
+tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
 # `net` was added for the Story 9.8 log-export sinks (UDP / TCP /
 # TCP+TLS syslog client sockets); no new crate, tokio already ships it.
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time", "net"] }
@@ -88,7 +92,17 @@ sysinfo = "0.39"
 # `#![deny(unsafe_code)]` stays intact.
 nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
 thiserror = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+# `rustls-tls-native-roots` sits beside the webpki bundle rather than
+# replacing it: with both on, reqwest seeds its root store from
+# webpki-roots AND from the platform store, which is where a
+# distribution's CA bundle and anything `SSL_CERT_FILE` points at
+# land. Without it the OIDC JWKS fetch (Story 10.5) trusts webpki's
+# public roots only, so a self-hosted GitLab under a corporate PKI
+# answered every ID token with `jwks_unavailable` however the host was
+# configured. `rustls-native-certs` is already in the lockfile through
+# the cluster TLS stack, so this is a feature flag and not a new
+# dependency.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots", "json"] }
 async-trait = { workspace = true }
 base64 = "0.23"
 dashmap = "6"

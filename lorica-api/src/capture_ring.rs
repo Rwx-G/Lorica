@@ -34,14 +34,18 @@
 //! instead), because a ring that is silently empty on a busy node reads
 //! as a feature that does not work.
 //!
-//! # Two shapes of one record
+//! # One shape stored, a second derived on demand
 //!
-//! Every entry keeps the record twice: the full JSON text, byte for
-//! byte what the sinks received, for the download; and a listing view
-//! whose bodies are cut at [`CAPTURE_RING_LIST_BODY_MAX`], built once
-//! at push time. The listing view is what keeps `GET /recent` from
-//! shipping fifty records of up to two 4 MiB bodies each; the full text
-//! is what makes the download the same document the SIEM has.
+//! An entry holds the full JSON text, byte for byte what the sinks
+//! received, shared with the log line it was built for. The listing
+//! view, whose bodies are cut at [`CAPTURE_RING_LIST_BODY_MAX`], is
+//! parsed out of that text the first time someone lists the ring and
+//! memoised per entry. Built at push time instead, it made every
+//! capture pay a `serde_json::Value` for a dashboard nobody had open;
+//! derived on read, a ring nobody lists costs the text and nothing
+//! else. The listing view is what keeps `GET /recent` from shipping
+//! fifty records of up to two 4 MiB bodies each; the full text is what
+//! makes the download the same document the SIEM has.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
@@ -70,10 +74,37 @@ pub struct RecentCapture {
     /// `Content-Disposition` file name of the download. Computed by
     /// the sink so the two agree.
     pub file_name: String,
-    /// The record, bodies cut at [`CAPTURE_RING_LIST_BODY_MAX`].
-    pub listed: Value,
-    /// The record as one JSON document, exactly as emitted.
-    pub document: String,
+    /// The record as one JSON document, exactly as emitted. Shared
+    /// with the log line the emit path built it for, so keeping a
+    /// record costs a refcount rather than a copy.
+    pub document: Arc<str>,
+    /// The listing view, parsed and elided on the first read of this
+    /// entry. Private: [`RecentCapture::listed`] is the way in, and it
+    /// is what makes the derivation happen at most once.
+    listed: OnceLock<Value>,
+}
+
+impl RecentCapture {
+    /// The record with its bodies cut at
+    /// [`CAPTURE_RING_LIST_BODY_MAX`], derived from
+    /// [`document`](Self::document) on the first call and memoised.
+    pub fn listed(&self) -> &Value {
+        self.listed.get_or_init(|| {
+            // The text came out of `serde_json::to_string` on the
+            // record, so it parses. The fallback is here because the
+            // alternative on a read path is a panic in a handler, and
+            // an entry that names itself is more useful than none.
+            let mut document: Value = serde_json::from_str(&self.document).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "rule_id": self.rule_id,
+                    "request_id": self.request_id,
+                    "unparseable": true,
+                })
+            });
+            elide_bodies(&mut document, CAPTURE_RING_LIST_BODY_MAX);
+            document
+        })
+    }
 }
 
 /// A bounded, newest-first ring of [`RecentCapture`].
@@ -101,27 +132,17 @@ impl CaptureRing {
 
     /// Keep one record, evicting the oldest when the ring is full.
     ///
-    /// `document` is the record as one JSON object; `text` is the same
-    /// record serialised, which the caller already has for the log
-    /// line. The listing view is derived here, once, so the lock in
-    /// [`list`](Self::list) guards a handful of `Arc` clones and
-    /// nothing else. Never blocks on anything but this ring's own
+    /// `text` is the record serialised, which the caller already holds
+    /// for the log line; the ring shares it rather than copying it and
+    /// never parses it. Never blocks on anything but this ring's own
     /// mutex, whose critical sections are a push and a pop.
-    pub fn remember(
-        &self,
-        rule_id: &str,
-        request_id: &str,
-        file_name: &str,
-        mut document: Value,
-        text: String,
-    ) {
-        elide_bodies(&mut document, CAPTURE_RING_LIST_BODY_MAX);
+    pub fn remember(&self, rule_id: &str, request_id: &str, file_name: &str, text: Arc<str>) {
         let entry = Arc::new(RecentCapture {
             rule_id: rule_id.to_string(),
             request_id: request_id.to_string(),
             file_name: file_name.to_string(),
-            listed: document,
             document: text,
+            listed: OnceLock::new(),
         });
         let mut entries = self.entries.lock();
         if entries.len() >= self.capacity {
@@ -131,9 +152,16 @@ impl CaptureRing {
     }
 
     /// Every record, newest first, in its listing view.
+    ///
+    /// The lock guards a handful of `Arc` clones; the parsing and the
+    /// eliding happen outside it, once per entry across the ring's
+    /// life however many times it is listed.
     pub fn list(&self) -> Vec<Value> {
         let snapshot: Vec<Arc<RecentCapture>> = self.entries.lock().iter().rev().cloned().collect();
-        snapshot.iter().map(|entry| entry.listed.clone()).collect()
+        snapshot
+            .iter()
+            .map(|entry| entry.listed().clone())
+            .collect()
     }
 
     /// The newest record for `request_id`, narrowed to `rule_id` when
@@ -209,12 +237,12 @@ mod tests {
 
     fn remember(ring: &CaptureRing, request_id: &str, rule_id: &str, request_body: &str) {
         let document = record(request_id, rule_id, request_body);
-        let text = serde_json::to_string(&document).expect("a document serialises");
+        let text: Arc<str> =
+            Arc::from(serde_json::to_string(&document).expect("a document serialises"));
         ring.remember(
             rule_id,
             request_id,
             &format!("20260101T000000.000000000Z-{request_id}.json"),
-            document,
             text,
         );
     }
@@ -260,6 +288,29 @@ mod tests {
         );
         assert!(parsed["request"].get("body_elided").is_none());
         assert_eq!(full.file_name, "20260101T000000.000000000Z-req-long.json");
+    }
+
+    #[test]
+    fn the_listing_view_is_derived_from_the_shared_text_and_built_once() {
+        let ring = CaptureRing::new(2);
+        let document = record("req-lazy", "cap-1", "{}");
+        let text: Arc<str> =
+            Arc::from(serde_json::to_string(&document).expect("a document serialises"));
+        ring.remember("cap-1", "req-lazy", "f.json", Arc::clone(&text));
+
+        let entry = ring
+            .get("req-lazy", None)
+            .expect("the record is in the ring");
+        assert!(
+            Arc::ptr_eq(&text, &entry.document),
+            "the ring shares the log line's text rather than copying it"
+        );
+        let first: *const Value = entry.listed();
+        assert_eq!(entry.listed()["request_id"], "req-lazy");
+        assert!(
+            std::ptr::eq(first, entry.listed()),
+            "the listing view is memoised, so listing twice parses once"
+        );
     }
 
     #[test]

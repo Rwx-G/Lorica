@@ -86,7 +86,23 @@ impl From<lorica_config::ConfigError> for ApiError {
     fn from(err: lorica_config::ConfigError) -> Self {
         match &err {
             lorica_config::ConfigError::NotFound(_) => ApiError::NotFound(err.to_string()),
-            lorica_config::ConfigError::Validation(_) => ApiError::BadRequest(err.to_string()),
+            // The store's two input refusals land on the two halves of
+            // the rule documented on `Unprocessable` above. A rule the
+            // store enforces (uniqueness, a cap, a reference naming no
+            // row) is a request the server understood and refuses on
+            // its merits: 422. A payload the store could not read is a
+            // request the server did not understand: 400. Mapping both
+            // to 400, as this did, split one class of refusal across
+            // two statuses on the same endpoint depending on whether
+            // the handler or the store caught it.
+            lorica_config::ConfigError::Validation(_) => ApiError::Unprocessable(err.to_string()),
+            lorica_config::ConfigError::Malformed(_) => ApiError::BadRequest(err.to_string()),
+            // A stored column this process itself wrote back that no
+            // longer decodes is not the caller's doing: no payload they
+            // could send would make it succeed. 500, with the same
+            // wording the store used, so the operator reads "the
+            // database is damaged" rather than "your request is bad".
+            lorica_config::ConfigError::Corrupt(_) => ApiError::Internal(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }
     }
@@ -389,9 +405,29 @@ mod tests {
     }
 
     #[test]
-    fn test_config_error_validation_converts() {
+    fn test_config_error_validation_converts_to_unprocessable() {
+        // A store-level rule refusal is a request the server
+        // understood: the same 422 a handler-level refusal answers.
         let err: ApiError = lorica_config::ConfigError::Validation("bad ref".into()).into();
+        assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn test_config_error_malformed_converts_to_bad_request() {
+        let err: ApiError = lorica_config::ConfigError::Malformed("not JSON".into()).into();
         assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_config_error_corrupt_converts_to_internal() {
+        // A JSON column this process wrote back and can no longer read
+        // is a damaged or downgraded database, not a bad request: the
+        // caller has nothing to fix, so it is a 500 and never a 4xx.
+        let err: ApiError =
+            lorica_config::ConfigError::Corrupt("invalid path_rules JSON: eof".into()).into();
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_ne!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]

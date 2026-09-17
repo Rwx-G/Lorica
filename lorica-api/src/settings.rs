@@ -367,6 +367,13 @@ pub struct UpdateSettingsRequest {
     /// Source networks allowed to reach the automation API listener
     /// (`--automation-listen`). Always default-deny: the listener
     /// refuses to open while this is empty.
+    ///
+    /// Applied live. A narrower list bites on the next accepted
+    /// connection, with no restart, which is what an incident needs.
+    /// Emptying it does NOT close the socket: an empty allow list
+    /// reads as default-allow, so the listener keeps the previous list
+    /// and logs at ERROR rather than widening itself to every source.
+    /// Stopping the plane means dropping `--automation-listen`.
     pub automation_allowed_cidrs: Option<Vec<String>>,
     /// OTLP collector endpoint URL.
     pub otlp_endpoint: Option<String>,
@@ -1253,12 +1260,12 @@ fn apply_otlp_sampling_ratio(value: Option<f64>, target: &mut f64) -> Result<(),
 /// "Test connection" button. Does NOT mutate state; does NOT
 /// re-init the OTel provider. Just opens a plain HTTP(S)
 /// connection to the endpoint's `/v1/traces` path (for http-proto
-/// / http-json) or to the base URL (grpc — we cannot speak the
+/// / http-json) or to the base URL (grpc: we cannot speak the
 /// HTTP/2 gRPC preamble from reqwest so "TCP open" is all we
 /// assert) and reports status + round-trip latency.
 ///
 /// Any HTTP status code (including 4xx and 5xx) counts as
-/// "reachable" — the collector is answering, even if it does not
+/// "reachable" - the collector is answering, even if it does not
 /// like our empty request. Connection refused, DNS failure or
 /// timeout count as "unreachable".
 pub async fn test_otel_connection(

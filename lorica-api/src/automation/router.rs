@@ -77,21 +77,51 @@ pub async fn whoami(principal: AutomationPrincipal) -> axum::Json<serde_json::Va
     })
 }
 
+/// Wrap `router` in the audit layer and the panic net underneath it.
+///
+/// The two belong together and in this order. The audit layer promises
+/// that EVERY request lands a row; an inner service that unwinds would
+/// carry that promise away with it, and skip the row in precisely the
+/// case an operator most wants one. `CatchPanicLayer` turns the unwind
+/// into a 500 that returns normally, so the audit layer sees a status
+/// like any other and records it with outcome `error`.
+///
+/// The panic net sits INSIDE the audit layer and OUTSIDE everything
+/// else, so it covers the bearer gate and the scope gate as well as the
+/// handlers, and so the audit layer itself is never the thing being
+/// caught.
+///
+/// The test router in [`super::audit`] is built through this same
+/// function, which is the only way a test can assert the order the
+/// production listener actually runs.
+pub(super) fn with_audit_and_panic_net(router: Router, state: AppState) -> Router {
+    router
+        .layer(tower_http::catch_panic::CatchPanicLayer::new())
+        // `from_fn_with_state` rather than an `Extension`: the audit
+        // layer is outermost, so it runs BEFORE any extension a layer
+        // below inserts into the request on the way down.
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            super::audit::audit_automation_request,
+        ))
+}
+
 /// Build the automation-plane router.
 ///
 /// Layer order, outermost first:
 ///
 /// 1. [`super::audit::audit_automation_request`] - outermost, so a
 ///    request refused by the bearer gate still lands a row.
-/// 2. [`super::auth::require_automation_auth`] - the bearer check.
-/// 3. [`super::scope::authorize_scope`] - the scope floor.
+/// 2. `CatchPanicLayer` - see [`with_audit_and_panic_net`].
+/// 3. [`super::auth::require_automation_auth`] - the bearer check.
+/// 4. [`super::scope::authorize_scope`] - the scope floor.
 ///
 /// There is deliberately NO cookie layer, NO CSRF layer and NO session
 /// store here. The two management planes share no credential, and the
 /// cheapest way to keep that true is for this router to have no way to
 /// read one.
 pub fn build_automation_router(state: AppState) -> Router {
-    Router::new()
+    let routed = Router::new()
         .route("/automation/v1/whoami", get(whoami))
         .route("/automation/v1/environments", get(list_environments))
         .route(
@@ -106,12 +136,6 @@ pub fn build_automation_router(state: AppState) -> Router {
             super::auth::require_automation_auth,
         ))
         .layer(axum::extract::DefaultBodyLimit::max(AUTOMATION_BODY_CAP))
-        .layer(axum::Extension(state.clone()))
-        // `from_fn_with_state` rather than the `Extension` above: the
-        // audit layer is outermost, so it runs BEFORE that extension is
-        // inserted into the request on the way down.
-        .layer(axum::middleware::from_fn_with_state(
-            state,
-            super::audit::audit_automation_request,
-        ))
+        .layer(axum::Extension(state.clone()));
+    with_audit_and_panic_net(routed, state)
 }

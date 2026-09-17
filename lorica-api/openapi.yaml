@@ -5827,7 +5827,8 @@ components:
             type: string
         allowed_backend_cidrs:
           type: array
-          description: CIDRs (or bare addresses) this token may point a hostname at. Empty means the node's default backend policy applies.
+          description: "CIDRs (or bare addresses) this token may point a hostname at. At least one: there is no node-wide default backend policy, and an empty list would be read as every address."
+          minItems: 1
           items:
             type: string
         max_ttl_seconds:
@@ -5904,6 +5905,16 @@ components:
         jwks_url:
           type: string
           description: Where the signing keys are fetched from. Must be `https`. Defaults to `<issuer>/oauth/discovery/keys`.
+        ca_pem:
+          type: string
+          nullable: true
+          description: >-
+            One or more PEM certificates that become the ONLY trust anchors for
+            this entry's JWKS fetch, replacing the node's own roots for it.
+            Omit it on a public GitLab, or on a self-hosted one whose CA the
+            node already trusts. At least one certificate must parse, and the
+            whole field is capped at 64 KiB. It is never returned: `GET`
+            answers with `ca_fingerprint`.
         bound_claims:
           type: object
           additionalProperties:
@@ -5920,7 +5931,8 @@ components:
             type: string
         allowed_backend_cidrs:
           type: array
-          description: CIDRs a token from this entry may point a hostname at. Empty means the node's default backend policy applies.
+          description: "CIDRs a token from this entry may point a hostname at. At least one: there is no node-wide default backend policy, and an empty list would be read as every address."
+          minItems: 1
           items:
             type: string
         max_ttl_seconds:
@@ -5934,7 +5946,9 @@ components:
 
     OidcIssuer:
       type: object
-      description: One OIDC issuer entry, exactly as stored. There is no secret in it.
+      description: >-
+        One OIDC issuer entry as the API answers it. There is no secret in it,
+        and the pinned CA is reported as a fingerprint rather than as the PEM.
       properties:
         id:
           type: string
@@ -5946,6 +5960,15 @@ components:
           type: string
         jwks_url:
           type: string
+        ca_fingerprint:
+          type: string
+          nullable: true
+          description: >-
+            Lowercase-hex SHA-256 of the first pinned certificate's DER, which
+            is what `openssl x509 -fingerprint -sha256` prints, so an operator
+            can confirm which CA is pinned without the PEM leaving the node.
+            Null when the entry fetches on the node's own trust roots. The
+            `ca_pem` itself is never returned.
         bound_claims:
           type: object
           additionalProperties:

@@ -31,6 +31,32 @@
 //! (single-process or supervisor). Payloads (`before` / `after`) are
 //! hashed, never stored: no secret material can land in the audit
 //! table by construction.
+//!
+//! # One queue, one writer, both planes
+//!
+//! [`record`] used to await a chained-hash SQLite commit before its
+//! caller could answer, so every audited request paid one write and a
+//! burst serialised there. It now hands the row to the bounded queue
+//! that [`crate::log_store::LogStore`] owns
+//! (`AUDIT_QUEUE_CAPACITY` deep) and returns.
+//!
+//! ONE queue for the management API and the automation plane
+//! together, and one consumer behind it. Both write the same table and
+//! the chain hash only means anything in write order, so a second
+//! consumer would fork the chain and a second queue would give the two
+//! planes different durability promises for the same rows. Ordering is
+//! what the queue buys: rows chain in the order [`record`] was called,
+//! whichever plane called it.
+//!
+//! What it costs is a window. A row is durable within the consumer's
+//! next drain, not before the response, so a caller that must read the
+//! row back (the `lorica cluster leave` CLI, which then exits; tests
+//! that assert on the trail) flushes with
+//! [`crate::log_store::LogStore::flush_audit`] first. And a full queue
+//! DROPS the row, counted in `lorica_audit_rows_dropped_total` and
+//! logged at ERROR: blocking a caller on a full audit queue would turn
+//! a slow disk into a plane that stops answering, which is the outage
+//! the log-writer stance already refuses.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -347,6 +373,28 @@ impl AuditContext {
                 .to_string(),
         }
     }
+
+    /// The context of an event no management session is behind: a
+    /// budget running out, an environment expiring, a replication
+    /// apply. `actor` names the background worker (`capture`,
+    /// `reaper`, `cluster`).
+    ///
+    /// They share one shape on purpose. An operator scanning the audit
+    /// log has to be able to tell a node-side event from an operator's
+    /// at a glance, and that only works while every such event carries
+    /// the same `node` role and the same empty provenance; a caller
+    /// that spells the shape itself is one refactor away from drifting.
+    /// A site with a real source address (the cluster plane's peer)
+    /// overrides `ip` on top of this, which keeps the role and the
+    /// missing user agent shared.
+    pub fn node(actor: &str) -> Self {
+        Self {
+            username: actor.to_string(),
+            role: "node".to_string(),
+            ip: String::new(),
+            user_agent: String::new(),
+        }
+    }
 }
 
 /// Optional peer-address extractor for management-plane handlers.
@@ -385,15 +433,19 @@ where
 
 /// Record one audit entry for a mutation that SUCCEEDED, and emit the
 /// matching `lorica::audit` tracing event (picked up by stdout/JSON
-/// logging and, when enabled, the OTel bridge - inside the current
-/// `api_request` span).
+/// logging and, when enabled, the OTel bridge).
 ///
 /// `target` is `(target_type, target_id)`. `before` / `after` payloads
-/// are SHA-256-hashed; the payloads themselves are never persisted. The
-/// tracing event is emitted AFTER persistence so it carries the committed
-/// `chain_hash` (the external-anchor control in the module threat model);
-/// on the no-store / failure paths it is still emitted, with an empty
-/// `chain_hash`. Failure policy: an insert failure is counted
+/// are SHA-256-hashed; the payloads themselves are never persisted.
+///
+/// The row is HANDED TO THE QUEUE here, not written here: the caller
+/// pays a `try_send`, and [`crate::log_store::LogStore`]'s single
+/// audit writer commits it. See the module docs for what that costs
+/// and what it buys. The tracing event is emitted by that writer,
+/// AFTER persistence, so it carries the committed `chain_hash` (the
+/// external-anchor control in the module threat model); on the
+/// no-store, dropped and failure paths it is still emitted, with an
+/// empty `chain_hash`. Failure policy: an insert failure is counted
 /// (`lorica_audit_insert_failed_total`), logged, and swallowed -
 /// availability beats auditability, the chain covers integrity, not
 /// liveness. A `None` log store (worker mode, tests) skips persistence.
@@ -411,7 +463,12 @@ pub async fn record(
 /// [`record`] for callers that hold the log store but no `AppState`:
 /// the cluster plane's lifecycle hooks (enrollment, renewal, leave,
 /// identity refusals), which run in the binary before and beside the
-/// API. Same persistence, same sink copy, same failure policy.
+/// API. Same queue, same sink copy, same failure policy.
+///
+/// Still `async` though nothing here awaits: every one of its ninety
+/// call sites is in an async handler and reads as a call that records
+/// something. Making it sync would churn all of them to say nothing
+/// new.
 pub async fn record_with_store(
     log_store: Option<std::sync::Arc<crate::log_store::LogStore>>,
     ctx: &AuditContext,
@@ -431,8 +488,10 @@ pub async fn record_with_store(
         return;
     };
 
-    let entry = NewAuditEntry {
-        timestamp: timestamp.clone(),
+    // Boxed from the start: the queue carries it boxed, so building it
+    // on the stack would only move a dozen strings twice.
+    let entry = Box::new(NewAuditEntry {
+        timestamp,
         operator_username: ctx.username.clone(),
         operator_role: ctx.role.clone(),
         action: action.to_string(),
@@ -442,24 +501,62 @@ pub async fn record_with_store(
         after_payload_hash: hash_payload(after),
         ip: ctx.ip.clone(),
         user_agent: ctx.user_agent.clone(),
-    };
+    });
 
-    let result = tokio::task::spawn_blocking(move || log_store.insert_audit(&entry)).await;
-    match result {
-        Ok(Ok((_id, chain_hash))) => {
-            emit_audit_event(ctx, action, target_type, target_id, &chain_hash, &timestamp);
-        }
-        Ok(Err(e)) => {
-            crate::metrics::inc_audit_insert_failed();
-            tracing::error!(error = %e, "audit log insert failed");
-            emit_audit_event(ctx, action, target_type, target_id, "", &timestamp);
-        }
-        Err(e) => {
-            crate::metrics::inc_audit_insert_failed();
-            tracing::error!(error = %e, "audit log insert task failed");
-            emit_audit_event(ctx, action, target_type, target_id, "", &timestamp);
-        }
+    // The enqueue is what fixes the order: `try_send` returns in call
+    // order, and a single consumer writes in receive order, so rows
+    // chain in the order `record` was called across both planes.
+    // Nothing may await between building the entry and offering it.
+    if let Err(dropped) = log_store.enqueue_audit(entry) {
+        // A full queue sheds the row rather than the request. Waiting
+        // here would turn a slow disk into a management plane that
+        // stops answering, which is the outage the log-writer stance
+        // already refuses; the counter is how an operator learns the
+        // trail has a hole.
+        crate::metrics::inc_audit_rows_dropped();
+        tracing::error!(
+            action = %dropped.action,
+            operator = %dropped.operator_username,
+            "audit queue full; the row was dropped and the chain has a gap"
+        );
+        emit_stored_event(&dropped, "");
     }
+}
+
+/// The part of an action verb that follows the first `:`.
+///
+/// The automation plane spells the precise cause of a refusal there
+/// (`automation.request.unauthenticated:wrong_alg`); the management
+/// plane's verbs carry none and read as empty. Deriving the event
+/// field from the verb rather than passing it down separately keeps
+/// one source of truth: the stored row and the shipped event cannot
+/// disagree about why a request was turned away.
+fn action_reason(action: &str) -> &str {
+    action.split_once(':').map_or("", |(_, reason)| reason)
+}
+
+/// [`emit_audit_event`] for a row that has already been built.
+///
+/// The audit writer thread calls this once the row is committed, so
+/// the event carries the real `chain_hash`; `record_with_store` calls
+/// it with an empty one when the queue dropped the row. The entry
+/// already holds every field the event needs, which is why the writer
+/// does not have to carry an [`AuditContext`] alongside it.
+pub(crate) fn emit_stored_event(entry: &NewAuditEntry, chain_hash: &str) {
+    let ctx = AuditContext {
+        username: entry.operator_username.clone(),
+        role: entry.operator_role.clone(),
+        ip: entry.ip.clone(),
+        user_agent: entry.user_agent.clone(),
+    };
+    emit_audit_event(
+        &ctx,
+        &entry.action,
+        &entry.target_type,
+        &entry.target_id,
+        chain_hash,
+        &entry.timestamp,
+    );
 }
 
 /// Emit the `lorica::audit` tracing event for one mutation, and offer
@@ -467,6 +564,13 @@ pub async fn record_with_store(
 /// committed chain head (the out-of-band anchor), or `""` when
 /// nothing was persisted (worker mode or an insert failure) - the
 /// sink copy is best-effort either way.
+///
+/// `reason` rides as its OWN field as well as inside `action`, so a
+/// syslog or OTLP consumer filters refusals on a field instead of
+/// parsing a dotted verb. The payloads stay hashed (Story 9.9): the
+/// reason vocabulary is a closed list of words with no caller-supplied
+/// material in it, which is exactly why it can travel in clear when a
+/// payload cannot.
 fn emit_audit_event(
     ctx: &AuditContext,
     action: &str,
@@ -480,6 +584,7 @@ fn emit_audit_event(
         operator = %ctx.username,
         role = %ctx.role,
         action = %action,
+        reason = %action_reason(action),
         target_type = %target_type,
         target_id = %target_id,
         ip = %ctx.ip,
@@ -705,10 +810,198 @@ mod tests {
     }
 
     #[test]
+    fn the_event_reason_is_whatever_the_action_spells_after_the_first_colon() {
+        assert_eq!(action_reason("route.delete"), "");
+        assert_eq!(
+            action_reason("automation.request.unauthenticated:wrong_alg"),
+            "wrong_alg"
+        );
+        // A parametrised reason keeps its own colon: the split is on
+        // the FIRST one, so the claim name travels with the stem.
+        assert_eq!(
+            action_reason("automation.request.unauthenticated:bound_claim_mismatch:project_path"),
+            "bound_claim_mismatch:project_path"
+        );
+        assert_eq!(
+            action_reason("automation.request.forbidden:environments:write"),
+            "environments:write"
+        );
+    }
+
+    #[test]
     fn chain_hash_is_boundary_unambiguous() {
         // With raw concatenation these two would collide.
         let a = compute_chain_hash(GENESIS_HASH, &input("ab", "c", "1"));
         let b = compute_chain_hash(GENESIS_HASH, &input("a", "bc", "1"));
         assert_ne!(a, b);
+    }
+
+    // ---- the write queue ----
+
+    fn probe_ctx(username: &str, role: &str) -> AuditContext {
+        AuditContext {
+            username: username.to_string(),
+            role: role.to_string(),
+            ip: String::new(),
+            user_agent: String::new(),
+        }
+    }
+
+    /// The stored rows for one probe target type, oldest first.
+    fn probe_rows(
+        log_store: &crate::log_store::LogStore,
+        target_type: &str,
+    ) -> Vec<(String, String)> {
+        let (mut rows, _) = log_store
+            .query_audit(&AuditQuery {
+                limit: 1000,
+                ..AuditQuery::default()
+            })
+            .expect("the audit query runs");
+        rows.retain(|row| row.target_type == target_type);
+        // `query_audit` answers newest first; call order reads better
+        // the other way round.
+        rows.reverse();
+        rows.into_iter()
+            .map(|row| (row.operator_username, row.target_id))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rows_chain_in_call_order_when_both_planes_interleave() {
+        let dir = tempfile::tempdir().expect("test setup: temp dir");
+        let log_store = std::sync::Arc::new(
+            crate::log_store::LogStore::open(dir.path()).expect("test setup: log store"),
+        );
+
+        const ROUNDS: usize = 24;
+        const TARGET_TYPE: &str = "queue_order_probe";
+
+        // Two tasks stand in for the two planes, handing the turn back
+        // and forth: call order is then a fact this test states, not a
+        // race it hopes wins.
+        let (to_automation, mut automation_turn) = tokio::sync::mpsc::channel::<()>(1);
+        let (to_management, mut management_turn) = tokio::sync::mpsc::channel::<()>(1);
+
+        let management_store = std::sync::Arc::clone(&log_store);
+        let management = tokio::spawn(async move {
+            let ctx = probe_ctx("operator", "super_admin");
+            for round in 0..ROUNDS {
+                let target_id = format!("management-{round:02}");
+                record_with_store(
+                    Some(std::sync::Arc::clone(&management_store)),
+                    &ctx,
+                    "queue.order",
+                    (TARGET_TYPE, &target_id),
+                    None,
+                    None,
+                )
+                .await;
+                if to_automation.send(()).await.is_err() {
+                    break;
+                }
+                if management_turn.recv().await.is_none() {
+                    break;
+                }
+            }
+        });
+
+        let automation_store = std::sync::Arc::clone(&log_store);
+        let automation = tokio::spawn(async move {
+            let ctx = probe_ctx("pipeline", "automation");
+            for round in 0..ROUNDS {
+                if automation_turn.recv().await.is_none() {
+                    break;
+                }
+                let target_id = format!("automation-{round:02}");
+                record_with_store(
+                    Some(std::sync::Arc::clone(&automation_store)),
+                    &ctx,
+                    "queue.order",
+                    (TARGET_TYPE, &target_id),
+                    None,
+                    None,
+                )
+                .await;
+                if to_management.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        management.await.expect("the management task finishes");
+        automation.await.expect("the automation task finishes");
+        log_store
+            .flush_audit()
+            .await
+            .expect("the audit writer drains");
+
+        let expected: Vec<(String, String)> = (0..ROUNDS)
+            .flat_map(|round| {
+                [
+                    ("operator".to_string(), format!("management-{round:02}")),
+                    ("pipeline".to_string(), format!("automation-{round:02}")),
+                ]
+            })
+            .collect();
+        assert_eq!(
+            probe_rows(&log_store, TARGET_TYPE),
+            expected,
+            "one consumer writes in arrival order, so the chain follows call order across planes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_audit_queue_drops_the_row_counts_it_and_never_blocks() {
+        let dir = tempfile::tempdir().expect("test setup: temp dir");
+        let log_store = std::sync::Arc::new(
+            crate::log_store::LogStore::open(dir.path()).expect("test setup: log store"),
+        );
+
+        // A thread stalls the writer by holding the connection it
+        // commits through. A thread rather than a guard in this
+        // function because the lock must outlive an await and a future
+        // has no business holding one across a yield point.
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (stalled, is_stalled) = std::sync::mpsc::channel::<()>();
+        let stalling_store = std::sync::Arc::clone(&log_store);
+        let staller = std::thread::spawn(move || {
+            let _connection = stalling_store.block_audit_writer_for_test();
+            let _ = stalled.send(());
+            let _ = released.recv();
+        });
+        is_stalled
+            .recv()
+            .expect("the stalling thread takes the connection");
+
+        // The consumer may already hold one row, so capacity + 1 rows
+        // can still be absorbed; the surplus has nowhere to go.
+        const SURPLUS: usize = 64;
+        let overflow = crate::log_store::AUDIT_QUEUE_CAPACITY + SURPLUS;
+        let before = crate::metrics::audit_rows_dropped_total();
+        let ctx = probe_ctx("pipeline", "automation");
+        for row in 0..overflow {
+            let target_id = format!("drop-{row}");
+            // Reaching the end of this loop IS the no-block assertion:
+            // a `send().await` here would never return.
+            record_with_store(
+                Some(std::sync::Arc::clone(&log_store)),
+                &ctx,
+                "queue.drop",
+                ("queue_drop_probe", &target_id),
+                None,
+                None,
+            )
+            .await;
+        }
+        let dropped = crate::metrics::audit_rows_dropped_total() - before;
+
+        let _ = release.send(());
+        staller.join().expect("the stalling thread finishes");
+
+        assert!(
+            dropped >= (SURPLUS - 1) as u64,
+            "a full queue sheds every row it cannot hold: {dropped} dropped of {overflow} offered"
+        );
     }
 }

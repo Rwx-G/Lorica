@@ -255,8 +255,11 @@ impl OidcVerifier {
         }
 
         let mut last = RefusalReason::NoIssuer;
-        for (issuer_url, jwks_url, entries) in group_by_key_source(candidates) {
-            let key = match self.jwks.decoding_key(jwks_url, &kid, now).await {
+        for (issuer_url, entries) in group_by_key_source(candidates) {
+            let Some(source) = entries.first().copied() else {
+                continue;
+            };
+            let key = match self.jwks.decoding_key_for(source, &kid, now).await {
                 Ok(key) => key,
                 Err(JwksLookupError::UnknownKid) => {
                     last = RefusalReason::UnknownKid;
@@ -347,18 +350,26 @@ fn pinned_header_kid(token: &str) -> Result<String, RefusalReason> {
         .ok_or(RefusalReason::UnknownKid)
 }
 
-/// The candidate entries grouped by `(issuer, jwks_url)` in first-seen
-/// order, so one key lookup and one signature check serve every entry
-/// that shares a key source.
-fn group_by_key_source(candidates: &[OidcIssuer]) -> Vec<(&str, &str, Vec<&OidcIssuer>)> {
-    let mut groups: Vec<(&str, &str, Vec<&OidcIssuer>)> = Vec::new();
+/// The candidate entries grouped by `(issuer, jwks_url, ca_pem)` in
+/// first-seen order, so one key lookup and one signature check serve
+/// every entry that shares a key source.
+///
+/// The pinned CA is part of the identity of a key source, not a detail
+/// of how it is reached: two entries on one URL trusting different
+/// anchors are asking two different questions, and merging them would
+/// let the answer one entry's CA vouched for verify a token for the
+/// other.
+fn group_by_key_source(candidates: &[OidcIssuer]) -> Vec<(&str, Vec<&OidcIssuer>)> {
+    let mut groups: Vec<(&str, Vec<&OidcIssuer>)> = Vec::new();
     for entry in candidates {
-        match groups
-            .iter_mut()
-            .find(|(issuer, jwks, _)| *issuer == entry.issuer && *jwks == entry.jwks_url)
-        {
-            Some((_, _, members)) => members.push(entry),
-            None => groups.push((&entry.issuer, &entry.jwks_url, vec![entry])),
+        match groups.iter_mut().find(|(issuer, members)| {
+            *issuer == entry.issuer
+                && members.first().is_some_and(|first: &&OidcIssuer| {
+                    first.jwks_url == entry.jwks_url && first.ca_pem == entry.ca_pem
+                })
+        }) {
+            Some((_, members)) => members.push(entry),
+            None => groups.push((&entry.issuer, vec![entry])),
         }
     }
     groups

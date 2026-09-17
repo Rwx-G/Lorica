@@ -22,12 +22,10 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Duration, Utc};
-use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 use lorica_config::models::{
@@ -37,45 +35,26 @@ use lorica_config::models::{
 
 use super::reap_expired_environments;
 use crate::audit::AuditQuery;
-use crate::logs::LogBuffer;
 use crate::metrics::gathered_counter;
-use crate::server::{AppState, Mode};
-use crate::system::SystemCache;
+use crate::server::AppState;
 
 const COLLECTION: &str = "/automation/v1/environments";
 const HOSTNAME: &str = "pr-42.review.example.com";
 
-fn test_state() -> AppState {
-    let store = lorica_config::ConfigStore::open_in_memory().expect("test setup: store opens");
-    AppState {
-        store: Arc::new(Mutex::new(store)),
-        log_buffer: Arc::new(LogBuffer::new(100)),
-        system_cache: Arc::new(Mutex::new(SystemCache::new())),
-        active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        started_at: Instant::now(),
-        data_dir: std::path::PathBuf::from("/var/lib/lorica"),
-        http_port: 8080,
-        https_port: 8443,
-        config_reload_tx: None,
-        mode: Mode::Test,
-        waf_event_buffer: None,
-        waf_engine: None,
-        waf_rule_count: None,
-        acme_challenge_store: None,
-        pending_dns_challenges: Arc::new(dashmap::DashMap::new()),
-        sla_collector: None,
-        load_test_engine: None,
-        notification_history: None,
-        log_store: None,
-        log_writer: None,
-        task_tracker: tokio_util::task::TaskTracker::new(),
-        cluster: crate::cluster::ClusterRuntime::Standalone,
-        oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
-    }
-}
+/// What every token here may claim: the pattern the seeded
+/// certificates cover, plus a name none of them covers, which is what
+/// the failed-resolution tests aim at.
+const GRANTED_HOSTNAMES: &[&str] = &["*.review.example.com", "*.uncovered.example.com"];
 
-/// Mint a token straight into the store and return the full string.
-async fn mint(state: &AppState, name: &str, scopes: &[AutomationScope]) -> String {
+/// [`crate::tests::mint_automation`] with the backend grant spelled
+/// out, for the tests that care what it covers. The crate-wide helper
+/// fixes that grant, and these need it empty or narrow.
+async fn mint_with_cidrs(
+    state: &AppState,
+    name: &str,
+    scopes: &[AutomationScope],
+    cidrs: &[&str],
+) -> String {
     let store = state.store.lock().await;
     let key = store
         .automation_token_hmac_key()
@@ -88,13 +67,8 @@ async fn mint(state: &AppState, name: &str, scopes: &[AutomationScope]) -> Strin
             name: name.to_string(),
             secret_hmac: minted.secret_hmac,
             scopes: scopes.to_vec(),
-            // The second pattern is a name no certificate covers, for
-            // the failed-resolution tests.
-            allowed_hostnames: vec![
-                "*.review.example.com".to_string(),
-                "*.uncovered.example.com".to_string(),
-            ],
-            allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
+            allowed_hostnames: GRANTED_HOSTNAMES.iter().map(|h| (*h).to_string()).collect(),
+            allowed_backend_cidrs: cidrs.iter().map(|c| (*c).to_string()).collect(),
             max_ttl_seconds: 3_600,
             created_by: "admin".to_string(),
             created_at: now,
@@ -108,13 +82,16 @@ async fn mint(state: &AppState, name: &str, scopes: &[AutomationScope]) -> Strin
 
 /// A token that can read and write environments.
 async fn writer(state: &AppState, name: &str) -> String {
-    mint(
+    crate::tests::mint_automation(
         state,
         name,
-        &[
+        vec![
             AutomationScope::EnvironmentsRead,
             AutomationScope::EnvironmentsWrite,
         ],
+        GRANTED_HOSTNAMES,
+        Utc::now() + Duration::days(30),
+        None,
     )
     .await
 }
@@ -242,6 +219,43 @@ async fn seed_manual_route(state: &AppState, id: &str, hostname: &str, aliases: 
         .expect("test setup: manual route stored");
 }
 
+/// `count` environments owned by a static token named `principal`,
+/// written straight to the store: the quota test needs the rows, not
+/// the round trips.
+async fn seed_owned_environments(state: &AppState, principal: &str, count: usize) {
+    for index in 0..count {
+        let name = format!("owned-{index}");
+        seed_manual_route(
+            state,
+            &format!("route-{index}"),
+            &format!("{name}.review.example.com"),
+            &[],
+        )
+        .await;
+        let now = Utc::now();
+        state
+            .store
+            .lock()
+            .await
+            .upsert_automation_environment(&lorica_config::models::AutomationEnvironment {
+                name,
+                route_id: format!("route-{index}"),
+                owner: lorica_config::models::EnvironmentOwner {
+                    kind: lorica_config::models::OwnerKind::StaticToken,
+                    principal: principal.to_string(),
+                },
+                certificate_mode: lorica_config::models::CertificateMode::Auto,
+                labels: BTreeMap::new(),
+                expires_at: now + Duration::hours(1),
+                created_at: now,
+                updated_at: now,
+                last_pipeline: None,
+                pipeline: None,
+            })
+            .expect("test setup: environment stored");
+    }
+}
+
 /// One request on the automation plane, through the real router.
 async fn automation(
     state: &AppState,
@@ -348,7 +362,7 @@ fn assert_no_rows(counts: &RowCounts) {
 
 #[tokio::test]
 async fn create_returns_201_and_an_identical_put_returns_200_with_the_same_route_id() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
 
@@ -415,7 +429,7 @@ async fn create_returns_201_and_an_identical_put_returns_200_with_the_same_route
 
 #[tokio::test]
 async fn a_name_that_is_not_an_rfc_1123_label_is_refused() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let response = put(&state, &token, "PR-42", env_body()).await;
@@ -426,7 +440,7 @@ async fn a_name_that_is_not_an_rfc_1123_label_is_refused() {
 
 #[tokio::test]
 async fn a_hostname_outside_the_token_allowlist_is_refused() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let mut body = env_body();
@@ -445,7 +459,7 @@ async fn a_hostname_outside_the_token_allowlist_is_refused() {
 
 #[tokio::test]
 async fn a_wildcard_hostname_is_refused() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let mut body = env_body();
@@ -463,7 +477,7 @@ async fn a_listener_host_is_refused() {
     // The management listener is loopback and the automation listener
     // binds an address, so the names that could reach either are
     // `localhost` and an address literal.
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     for hostname in ["localhost", "api.localhost", "127.0.0.1", "10.0.0.1", "::1"] {
@@ -483,7 +497,7 @@ async fn a_listener_host_is_refused() {
 
 #[tokio::test]
 async fn a_hostname_held_by_another_route_is_a_409_that_names_only_the_hostname() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     seed_manual_route(&state, "manual-route-id", HOSTNAME, &[]).await;
     seed_manual_route(
@@ -522,7 +536,7 @@ async fn a_hostname_held_by_another_route_is_a_409_that_names_only_the_hostname(
 async fn an_environment_may_keep_its_own_hostname_on_update() {
     // The collision rule skips the route the environment already owns,
     // or every second PUT would be a 409 against itself.
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     assert_eq!(
@@ -540,7 +554,7 @@ async fn an_environment_may_keep_its_own_hostname_on_update() {
 
 #[tokio::test]
 async fn a_backend_outside_the_token_cidrs_is_refused_with_the_address_named() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let mut body = env_body();
@@ -559,7 +573,7 @@ async fn a_backend_outside_the_token_cidrs_is_refused_with_the_address_named() {
 
 #[tokio::test]
 async fn a_backend_address_that_is_a_name_or_has_no_port_is_refused() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     for address in ["app.internal:8080", "10.0.0.5", "10.0.0.5:0", ""] {
@@ -584,10 +598,13 @@ async fn a_backend_address_that_is_a_name_or_has_no_port_is_refused() {
 
 #[tokio::test]
 async fn a_ttl_over_the_token_ceiling_is_refused() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
-    for ttl in [3_601, 0] {
+    // One second over whatever ceiling the token carries, so the
+    // assertion is about the rule and not about the helper's default.
+    let over = lorica_config::models::AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS + 1;
+    for ttl in [over, 0] {
         let mut body = env_body();
         body["ttl_seconds"] = serde_json::json!(ttl);
         let response = put(&state, &token, "pr-42", body).await;
@@ -600,7 +617,7 @@ async fn a_ttl_over_the_token_ceiling_is_refused() {
 
 #[tokio::test]
 async fn an_unknown_field_is_refused() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let mut body = env_body();
@@ -617,7 +634,7 @@ async fn an_unknown_field_is_refused() {
 
 #[tokio::test]
 async fn too_many_labels_are_refused_by_the_model() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let labels: BTreeMap<String, String> = (0..17)
@@ -635,7 +652,7 @@ async fn too_many_labels_are_refused_by_the_model() {
 
 #[tokio::test]
 async fn no_covering_certificate_is_a_422_that_leaves_zero_rows() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_certificate(&state, "prod", "*.prod.example.com", "2027-01-01T00:00:00Z").await;
     let token = writer(&state, "acme-ci").await;
 
@@ -659,7 +676,7 @@ async fn no_covering_certificate_is_a_422_that_leaves_zero_rows() {
 
 #[tokio::test]
 async fn a_failed_resolution_on_update_leaves_the_previous_environment_intact() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let created = body_json(put(&state, &token, "pr-42", env_body()).await).await["data"].clone();
@@ -709,14 +726,10 @@ async fn a_failed_resolution_on_update_leaves_the_previous_environment_intact() 
 
 #[tokio::test]
 async fn an_explicit_certificate_needs_certificates_read_and_must_exist() {
-    let state = test_state();
-    seed_certificate(
-        &state,
-        "explicit",
-        "elsewhere.example.com",
-        "2027-01-01T00:00:00Z",
-    )
-    .await;
+    let state = crate::tests::test_state().await.0;
+    // The named certificate covers the hostname exactly; that it must
+    // is asserted on its own beside this one.
+    seed_certificate(&state, "explicit", HOSTNAME, "2027-01-01T00:00:00Z").await;
 
     let without = writer(&state, "acme-ci").await;
     let mut body = env_body();
@@ -725,14 +738,17 @@ async fn an_explicit_certificate_needs_certificates_read_and_must_exist() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(error_message(response).await.contains("certificates:read"));
 
-    let with = mint(
+    let with = crate::tests::mint_automation(
         &state,
         "acme-deploy",
-        &[
+        vec![
             AutomationScope::EnvironmentsRead,
             AutomationScope::EnvironmentsWrite,
             AutomationScope::CertificatesRead,
         ],
+        GRANTED_HOSTNAMES,
+        Utc::now() + Duration::days(30),
+        None,
     )
     .await;
     let mut missing = env_body();
@@ -750,14 +766,250 @@ async fn an_explicit_certificate_needs_certificates_read_and_must_exist() {
     );
 }
 
+#[tokio::test]
+async fn a_credential_with_no_backend_cidr_may_point_a_hostname_at_nothing() {
+    // The connection filter reads an empty allow list as
+    // allow-every-address, so a token minted before the model refused
+    // one could aim a public hostname at loopback or at a metadata
+    // service. The grant is deny-all here.
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    let token = mint_with_cidrs(
+        &state,
+        "acme-ci",
+        &[
+            AutomationScope::EnvironmentsRead,
+            AutomationScope::EnvironmentsWrite,
+        ],
+        &[],
+    )
+    .await;
+    let mut body = env_body();
+    body["backends"] = serde_json::json!([{ "address": "127.0.0.1:9443" }]);
+    let response = put(&state, &token, "pr-42", body).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let message = error_message(response).await;
+    assert!(message.contains("covers no address"), "{message}");
+    assert_no_rows(&row_counts(&state).await);
+}
+
+#[tokio::test]
+async fn an_environment_carries_at_most_the_capped_number_of_backends() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    let token = writer(&state, "acme-ci").await;
+    let cap = lorica_config::models::AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT;
+
+    let backends = |count: usize| -> serde_json::Value {
+        (0..count)
+            .map(|i| serde_json::json!({ "address": format!("10.0.1.{i}:8080") }))
+            .collect()
+    };
+    let mut at_cap = env_body();
+    at_cap["backends"] = backends(cap);
+    assert_eq!(
+        put(&state, &token, "pr-42", at_cap).await.status(),
+        StatusCode::CREATED
+    );
+
+    let mut over = env_body();
+    over["backends"] = backends(cap + 1);
+    let response = put(&state, &token, "pr-43", over).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let message = error_message(response).await;
+    assert!(message.contains(&cap.to_string()), "{message}");
+}
+
+#[tokio::test]
+async fn a_principal_owns_at_most_the_capped_number_of_environments() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    let token = writer(&state, "acme-ci").await;
+    let cap = lorica_config::models::AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL;
+    seed_owned_environments(&state, "acme-ci", cap).await;
+
+    let response = put(&state, &token, "one-too-many", env_body()).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let message = error_message(response).await;
+    assert!(message.contains(&cap.to_string()), "{message}");
+    assert_eq!(
+        state
+            .store
+            .lock()
+            .await
+            .list_automation_environments()
+            .expect("environments read")
+            .len(),
+        cap,
+        "the refusal wrote nothing"
+    );
+
+    // Another principal is not held back by this one's quota, and an
+    // update of an environment the principal already owns is not a
+    // create.
+    let globex = writer(&state, "globex-ci").await;
+    let mut theirs = env_body();
+    theirs["hostname"] = serde_json::json!("pr-globex.review.example.com");
+    assert_eq!(
+        put(&state, &globex, "pr-globex", theirs).await.status(),
+        StatusCode::CREATED
+    );
+    let mut update = env_body();
+    update["hostname"] = serde_json::json!("owned-0.review.example.com");
+    assert_eq!(
+        put(&state, &token, "owned-0", update).await.status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_certificate_must_cover_the_hostname() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    seed_certificate(
+        &state,
+        "elsewhere",
+        "*.other.example.com",
+        "2027-01-01T00:00:00Z",
+    )
+    .await;
+    let token = crate::tests::mint_automation(
+        &state,
+        "acme-ci",
+        vec![
+            AutomationScope::EnvironmentsRead,
+            AutomationScope::EnvironmentsWrite,
+            AutomationScope::CertificatesRead,
+        ],
+        GRANTED_HOSTNAMES,
+        Utc::now() + Duration::days(30),
+        None,
+    )
+    .await;
+
+    // Naming an id does not widen what the certificate covers: the
+    // route would serve a name the leaf does not carry, and every
+    // browser would refuse the site the pipeline reported as up.
+    let mut body = env_body();
+    body["certificate"] = serde_json::json!("elsewhere");
+    let response = put(&state, &token, "pr-42", body).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let message = error_message(response).await;
+    assert!(message.contains("*.other.example.com"), "{message}");
+    assert!(message.contains(HOSTNAME), "{message}");
+    assert_no_rows(&row_counts(&state).await);
+
+    // The certificate that does cover it is accepted by id.
+    let mut body = env_body();
+    body["certificate"] = serde_json::json!("wild");
+    assert_eq!(
+        put(&state, &token, "pr-42", body).await.status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn a_backend_sni_is_a_dns_name_and_a_weight_is_capped() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    let token = writer(&state, "acme-ci").await;
+
+    for bad_sni in [
+        "not a host",
+        "https://upstream.example.com",
+        "10.0.0.5",
+        "*.x.example.com",
+    ] {
+        let mut body = env_body();
+        body["backends"] =
+            serde_json::json!([{ "address": "10.0.12.34:8080", "tls_sni": bad_sni }]);
+        let response = put(&state, &token, "pr-42", body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tls_sni {bad_sni:?}"
+        );
+        let message = error_message(response).await;
+        assert!(message.contains("backends[0].tls_sni"), "{message}");
+    }
+
+    let mut body = env_body();
+    body["backends"] = serde_json::json!([{ "address": "10.0.12.34:8080", "weight": 1_000_001 }]);
+    let response = put(&state, &token, "pr-42", body).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(error_message(response).await.contains("weight"));
+    assert_no_rows(&row_counts(&state).await);
+
+    // A well-formed SNI is stored as the row carries it, lowercased.
+    let mut body = env_body();
+    body["backends"] =
+        serde_json::json!([{ "address": "10.0.12.34:8080", "tls_sni": "Upstream.Example.com." }]);
+    assert_eq!(
+        put(&state, &token, "pr-42", body).await.status(),
+        StatusCode::CREATED
+    );
+    let store = state.store.lock().await;
+    let backends = store.list_backends().expect("backends read");
+    assert_eq!(backends[0].tls_sni.as_deref(), Some("upstream.example.com"));
+}
+
+#[tokio::test]
+async fn last_used_at_is_stamped_once_per_interval_and_not_once_per_request() {
+    // One SQLite write per authenticated request, on the single store
+    // mutex the whole node shares, for a reporting field a minute of
+    // resolution answers.
+    let state = crate::tests::test_state().await.0;
+    let token = writer(&state, "acme-ci").await;
+    let public_id = token
+        .split('.')
+        .next()
+        .expect("a minted token carries its public id")
+        .to_string();
+
+    async fn stamp(state: &AppState, public_id: &str) -> Option<DateTime<Utc>> {
+        state
+            .store
+            .lock()
+            .await
+            .get_automation_token(public_id)
+            .expect("token read")
+            .expect("the token exists")
+            .last_used_at
+    }
+
+    assert_eq!(
+        automation(&state, "GET", COLLECTION, &token, None, &[])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let first = stamp(&state, &public_id).await;
+    assert!(first.is_some(), "the first acceptance stamps the token");
+
+    assert_eq!(
+        automation(&state, "GET", COLLECTION, &token, None, &[])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        stamp(&state, &public_id).await,
+        first,
+        "a second request inside the interval writes nothing"
+    );
+}
+
 // ---- Ownership (AC #6) ----
 
 #[tokio::test]
-async fn ownership_is_refused_on_get_put_and_delete_for_another_prefix() {
-    let state = test_state();
+async fn ownership_is_refused_on_get_put_and_delete_for_every_other_principal() {
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let acme = writer(&state, "acme-ci").await;
     let globex = writer(&state, "globex-ci").await;
+    // Sharing the text before the first `-` used to be sharing an
+    // owner, which made `ci-acme` and `ci-globex` one tenant. The rule
+    // is identity now, so a sibling token is a stranger.
     let acme_deploy = writer(&state, "acme-deploy").await;
     assert_eq!(
         put(&state, &acme, "pr-42", env_body()).await.status(),
@@ -765,21 +1017,23 @@ async fn ownership_is_refused_on_get_put_and_delete_for_another_prefix() {
     );
     let uri = format!("{COLLECTION}/pr-42");
 
-    for (method, body) in [("GET", None), ("PUT", Some(env_body())), ("DELETE", None)] {
-        let response = automation(&state, method, &uri, &globex, body, &[]).await;
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "{method} by another prefix must be refused"
-        );
+    for stranger in [&globex, &acme_deploy] {
+        for (method, body) in [("GET", None), ("PUT", Some(env_body())), ("DELETE", None)] {
+            let response = automation(&state, method, &uri, stranger, body, &[]).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{method} by another principal answers the 404 an unknown name answers"
+            );
+        }
     }
     let counts = row_counts(&state).await;
     assert_eq!(counts.environments, 1, "the refusals wrote nothing");
     assert_eq!(counts.routes, 1);
 
-    // The same prefix is the same project.
+    // The owner itself still reaches it.
     assert_eq!(
-        automation(&state, "GET", &uri, &acme_deploy, None, &[])
+        automation(&state, "GET", &uri, &acme, None, &[])
             .await
             .status(),
         StatusCode::OK
@@ -787,8 +1041,116 @@ async fn ownership_is_refused_on_get_put_and_delete_for_another_prefix() {
 }
 
 #[tokio::test]
-async fn a_shared_environment_is_open_to_every_prefix() {
-    let state = test_state();
+async fn a_foreign_environment_is_indistinguishable_from_one_that_never_existed() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    let acme = writer(&state, "acme-ci").await;
+    let globex = writer(&state, "globex-ci").await;
+    assert_eq!(
+        put(&state, &acme, "pr-42", env_body()).await.status(),
+        StatusCode::CREATED
+    );
+
+    let foreign = automation(
+        &state,
+        "GET",
+        &format!("{COLLECTION}/pr-42"),
+        &globex,
+        None,
+        &[],
+    )
+    .await;
+    let unknown = automation(
+        &state,
+        "GET",
+        &format!("{COLLECTION}/never-existed"),
+        &globex,
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    // Same status and same body: a neighbour cannot walk the name
+    // space to learn which environments the other projects run.
+    assert_eq!(
+        body_json(foreign).await["error"]["code"],
+        body_json(unknown).await["error"]["code"]
+    );
+
+    // `If-Match` on a foreign name answers the same 404, not the 412
+    // that would confirm the row exists at some other version.
+    let response = automation(
+        &state,
+        "PUT",
+        &format!("{COLLECTION}/pr-42"),
+        &globex,
+        Some(env_body()),
+        &[("If-Match", "\"2026-01-01T00:00:00+00:00\"")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(row_counts(&state).await.environments, 1);
+}
+
+#[tokio::test]
+async fn a_non_owner_put_on_a_shared_environment_takes_neither_the_owner_nor_the_labels() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    let acme = writer(&state, "acme-ci").await;
+    let globex = writer(&state, "globex-ci").await;
+    let mut body = env_body();
+    body["labels"] = serde_json::json!({ "shared": "true", "team": "acme" });
+    assert_eq!(
+        put(&state, &acme, "pr-42", body).await.status(),
+        StatusCode::CREATED
+    );
+
+    // The takeover: reach a shared environment, then PUT it with an
+    // empty label set and become its owner. Both halves are refused.
+    let mut takeover = env_body();
+    takeover["labels"] = serde_json::json!({});
+    assert_eq!(
+        put(&state, &globex, "pr-42", takeover).await.status(),
+        StatusCode::OK
+    );
+    {
+        let store = state.store.lock().await;
+        let row = store
+            .get_automation_environment("pr-42")
+            .expect("environment read")
+            .expect("the environment exists");
+        assert_eq!(
+            row.owner.principal, "acme-ci",
+            "the owner is never restamped"
+        );
+        assert_eq!(
+            row.labels.get("shared").map(String::as_str),
+            Some("true"),
+            "a non-owner PUT keeps the stored labels"
+        );
+        assert_eq!(row.labels.get("team").map(String::as_str), Some("acme"));
+    }
+
+    // The owner still owns it, and still writes its labels.
+    let mut relabel = env_body();
+    relabel["labels"] = serde_json::json!({ "shared": "true", "team": "acme-eu" });
+    assert_eq!(
+        put(&state, &acme, "pr-42", relabel).await.status(),
+        StatusCode::OK
+    );
+    let store = state.store.lock().await;
+    let row = store
+        .get_automation_environment("pr-42")
+        .expect("environment read")
+        .expect("the environment exists");
+    assert_eq!(row.owner.principal, "acme-ci");
+    assert_eq!(row.labels.get("team").map(String::as_str), Some("acme-eu"));
+}
+
+#[tokio::test]
+async fn a_shared_environment_is_open_to_every_principal() {
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let acme = writer(&state, "acme-ci").await;
     let globex = writer(&state, "globex-ci").await;
@@ -823,7 +1185,7 @@ async fn a_shared_environment_is_open_to_every_prefix() {
 
 #[tokio::test]
 async fn the_list_returns_only_accessible_environments_and_honours_the_filters() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let acme = writer(&state, "acme-ci").await;
     let globex = writer(&state, "globex-ci").await;
@@ -911,7 +1273,7 @@ async fn the_list_returns_only_accessible_environments_and_honours_the_filters()
 
 #[tokio::test]
 async fn an_if_match_that_does_not_match_is_a_412() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let uri = format!("{COLLECTION}/pr-42");
@@ -970,7 +1332,7 @@ async fn an_if_match_that_does_not_match_is_a_412() {
 
 #[tokio::test]
 async fn delete_is_idempotent_and_removes_every_row() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let uri = format!("{COLLECTION}/pr-42");
@@ -1018,7 +1380,7 @@ async fn delete_is_idempotent_and_removes_every_row() {
 
 #[tokio::test]
 async fn the_reaper_deletes_an_expired_environment_and_audits_and_skips_an_unexpired_one() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let mut expired = env_body();
@@ -1072,6 +1434,12 @@ async fn the_reaper_deletes_an_expired_environment_and_audits_and_skips_an_unexp
     );
     assert_eq!(store.list_route_backends().expect("joins read").len(), 1);
 
+    // The reaper only enqueues its row; the flush is what makes the
+    // read below deterministic.
+    log_store
+        .flush_audit()
+        .await
+        .expect("the audit writer drains");
     let (rows, _) = log_store
         .query_audit(&AuditQuery {
             action_prefix: Some(super::ENVIRONMENT_EXPIRED_ACTION.to_string()),
@@ -1094,9 +1462,17 @@ async fn the_reaper_deletes_an_expired_environment_and_audits_and_skips_an_unexp
 
 #[tokio::test]
 async fn a_read_only_token_cannot_write_and_a_missing_scope_is_403() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
-    let reader = mint(&state, "acme-ci", &[AutomationScope::EnvironmentsRead]).await;
+    let reader = crate::tests::mint_automation(
+        &state,
+        "acme-ci",
+        vec![AutomationScope::EnvironmentsRead],
+        GRANTED_HOSTNAMES,
+        Utc::now() + Duration::days(30),
+        None,
+    )
+    .await;
     let response = put(&state, &reader, "pr-42", env_body()).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(error_message(response).await.contains("environments:write"));
@@ -1148,16 +1524,19 @@ async fn stored_certificate_id(state: &AppState, environment: &str) -> Option<St
 
 #[tokio::test]
 async fn an_auto_environment_follows_a_new_certificate_and_an_explicit_one_does_not() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
-    let token = mint(
+    let token = crate::tests::mint_automation(
         &state,
         "acme-ci",
-        &[
+        vec![
             AutomationScope::EnvironmentsRead,
             AutomationScope::EnvironmentsWrite,
             AutomationScope::CertificatesRead,
         ],
+        GRANTED_HOSTNAMES,
+        Utc::now() + Duration::days(30),
+        None,
     )
     .await;
     assert_eq!(
@@ -1204,7 +1583,7 @@ async fn an_auto_environment_follows_a_new_certificate_and_an_explicit_one_does_
 
 #[tokio::test]
 async fn no_covering_certificate_keeps_the_last_id_on_the_route() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     assert_eq!(
@@ -1232,7 +1611,7 @@ async fn no_covering_certificate_keeps_the_last_id_on_the_route() {
 
 #[tokio::test]
 async fn a_follower_identity_makes_the_re_resolution_a_no_op() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     assert_eq!(
@@ -1286,7 +1665,7 @@ const OPS: &str = "lorica_automation_environment_ops_total";
 
 #[tokio::test]
 async fn environment_operations_are_counted_by_op_and_outcome() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let create_ok = gathered_counter(OPS, &[("op", "create"), ("outcome", "ok")]);
@@ -1328,7 +1707,7 @@ async fn environment_operations_are_counted_by_op_and_outcome() {
 
 #[tokio::test]
 async fn the_reaper_counts_its_runs_and_expiries_and_publishes_the_gauge() {
-    let state = test_state();
+    let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
     let mut expired = env_body();
@@ -1389,8 +1768,16 @@ async fn the_reaper_counts_its_runs_and_expiries_and_publishes_the_gauge() {
 
 #[tokio::test]
 async fn every_automation_request_is_counted_by_its_outcome() {
-    let state = test_state();
-    let reader = mint(&state, "acme-ci", &[AutomationScope::EnvironmentsRead]).await;
+    let state = crate::tests::test_state().await.0;
+    let reader = crate::tests::mint_automation(
+        &state,
+        "acme-ci",
+        vec![AutomationScope::EnvironmentsRead],
+        GRANTED_HOSTNAMES,
+        Utc::now() + Duration::days(30),
+        None,
+    )
+    .await;
     const REQUESTS: &str = "lorica_automation_requests_total";
     let ok = gathered_counter(REQUESTS, &[("outcome", "ok")]);
     let unauthenticated = gathered_counter(REQUESTS, &[("outcome", "unauthenticated")]);
@@ -1451,14 +1838,20 @@ mod oidc {
 
     /// A state whose verifier trusts `issuer`, with one registered entry
     /// bound to `bound_claims`.
+    ///
+    /// The row is written straight to the store, so a test may seed an
+    /// entry binding no ownership claim; `OidcIssuer::validate`
+    /// refuses one on the administration path, and the ownership tests
+    /// below need several project paths to reach the same entry.
     async fn state_with_entry(issuer: &Arc<MockIssuer>, bound_claims: &[(&str, &str)]) -> AppState {
-        let mut state = test_state();
+        let mut state = crate::tests::test_state().await.0;
         state.oidc = Arc::new(OidcVerifier::new(issuer.clone()));
         let entry = OidcIssuer {
             id: "issuer-1".to_string(),
             issuer: ISSUER_URL.to_string(),
             audience: AUDIENCE.to_string(),
             jwks_url: JWKS_URL.to_string(),
+            ca_pem: None,
             bound_claims: bound_claims
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -1544,10 +1937,10 @@ mod oidc {
         );
         let uri = format!("{COLLECTION}/pr-42");
 
-        // Another job of the same project reaches it. The Story 10.4
-        // prefix rule applies to the project path as it does to a token
-        // name: the part before the first `-`, so `acme/web-docs` is
-        // the same owner and `acme/api` is not, whatever the namespace.
+        // Another job of the SAME project reaches it. Ownership is the
+        // project path itself, not the text before its first `-`:
+        // `acme/web-docs` is a different project anybody in the acme
+        // namespace can create, so it is a stranger.
         let mut later_job = gitlab_claims();
         later_job["pipeline_id"] = serde_json::json!("1235");
         assert_eq!(
@@ -1556,22 +1949,14 @@ mod oidc {
                 .status(),
             StatusCode::OK
         );
-        let mut same_prefix = gitlab_claims();
-        same_prefix["project_path"] = serde_json::json!("acme/web-docs");
-        assert_eq!(
-            automation(&state, "GET", &uri, &key.sign(&same_prefix), None, &[])
-                .await
-                .status(),
-            StatusCode::OK
-        );
-        for other in ["acme/api", "globex/web"] {
+        for other in ["acme/web-docs", "acme/api", "globex/web"] {
             let mut stranger = gitlab_claims();
             stranger["project_path"] = serde_json::json!(other);
             assert_eq!(
                 automation(&state, "GET", &uri, &key.sign(&stranger), None, &[])
                     .await
                     .status(),
-                StatusCode::FORBIDDEN,
+                StatusCode::NOT_FOUND,
                 "{other}"
             );
         }
@@ -1584,7 +1969,7 @@ mod oidc {
             automation(&state, "GET", &uri, &impostor, None, &[])
                 .await
                 .status(),
-            StatusCode::FORBIDDEN
+            StatusCode::NOT_FOUND
         );
         let counts = row_counts(&state).await;
         assert_eq!(counts.environments, 1);
@@ -1637,6 +2022,108 @@ mod oidc {
         assert!(error_message(response)
             .await
             .contains("no environment claim"));
+    }
+
+    #[tokio::test]
+    async fn a_credential_bound_to_one_environment_cannot_read_or_delete_another() {
+        // The binding used to be checked on `PUT` alone, so a job
+        // bound to `staging` could still delete `production`.
+        let key = TestKey::generate("k1");
+        let issuer = MockIssuer::serving(&[&key]);
+        let state = state_with_entry(&issuer, &[("environment_protected", "true")]).await;
+        seed_wildcard(&state).await;
+
+        let staging_job = || {
+            let mut claims = gitlab_claims();
+            claims["environment"] = serde_json::json!("staging");
+            claims["environment_protected"] = serde_json::json!("true");
+            claims
+        };
+        let mut body = env_body();
+        body["hostname"] = serde_json::json!("production.review.example.com");
+        assert_eq!(
+            put(&state, &writer(&state, "ops").await, "production", body)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+
+        for method in ["GET", "DELETE"] {
+            let response = automation(
+                &state,
+                method,
+                &format!("{COLLECTION}/production"),
+                &key.sign(&staging_job()),
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+            let message = error_message(response).await;
+            assert!(message.contains("`staging`"), "{method}: {message}");
+        }
+        assert_eq!(
+            row_counts(&state).await.environments,
+            1,
+            "the refused DELETE removed nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_bearer_and_a_wide_audience_list_are_refused_before_the_store() {
+        let key = TestKey::generate("k1");
+        let issuer = MockIssuer::serving(&[&key]);
+        let state = state_with_entry(&issuer, &[("project_path", "acme/*")]).await;
+        seed_wildcard(&state).await;
+        let uri = COLLECTION.to_string();
+
+        // A token that authenticates, padded past the byte cap, is
+        // refused on its size and not on its shape: the same claims
+        // under the cap are accepted.
+        let mut small = gitlab_claims();
+        small["padding"] = serde_json::json!("x".repeat(16));
+        assert_eq!(
+            automation(&state, "GET", &uri, &key.sign(&small), None, &[])
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let mut oversized = gitlab_claims();
+        oversized["padding"] =
+            serde_json::json!("x".repeat(crate::automation::AUTOMATION_BEARER_MAX_BYTES));
+        let bearer = key.sign(&oversized);
+        assert!(bearer.len() > crate::automation::AUTOMATION_BEARER_MAX_BYTES);
+        assert_eq!(
+            automation(&state, "GET", &uri, &bearer, None, &[])
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // The audience list is what decides how many issuer lookups an
+        // unauthenticated request costs, and the caller writes it.
+        let cap = crate::automation::OIDC_MAX_AUDIENCES;
+        let audiences = |count: usize| -> serde_json::Value {
+            let mut names: Vec<String> = (1..count).map(|i| format!("other-{i}")).collect();
+            names.push(AUDIENCE.to_string());
+            serde_json::json!(names)
+        };
+        let mut at_cap = gitlab_claims();
+        at_cap["aud"] = audiences(cap);
+        assert_eq!(
+            automation(&state, "GET", &uri, &key.sign(&at_cap), None, &[])
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let mut over = gitlab_claims();
+        over["aud"] = audiences(cap + 1);
+        assert_eq!(
+            automation(&state, "GET", &uri, &key.sign(&over), None, &[])
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]
