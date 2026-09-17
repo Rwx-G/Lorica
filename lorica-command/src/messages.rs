@@ -485,7 +485,7 @@ pub struct MetricsReport {
 /// One generic counter delta in a [`MetricsReport`]. `labels` is
 /// an ordered list of label values matching the registration order
 /// the supervisor uses when it declared the counter. `value` is
-/// the cumulative count on the worker (not a delta) — the
+/// the cumulative count on the worker (not a delta) - the
 /// supervisor reconciles by replacing the per-worker snapshot and
 /// re-summing on every scrape.
 #[derive(Clone, PartialEq, prost::Message)]

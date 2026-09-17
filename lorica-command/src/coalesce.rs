@@ -41,7 +41,7 @@ use tokio::sync::{watch, Mutex};
 ///   it for `ttl`.
 ///
 /// The cached value is invalidated after `ttl`; subsequent callers
-/// re-issue `compute`. Errors are not cached — a failing `compute` is
+/// re-issue `compute`. Errors are not cached - a failing `compute` is
 /// propagated to all current waiters, and the next caller re-issues.
 ///
 /// `V` must be `Clone` because multiple waiters receive copies.
@@ -117,7 +117,7 @@ where
             Plan::Cached(v) => Ok(v),
             Plan::Subscribe(mut rx) => {
                 // Wait for publication. If the initiator failed, the slot
-                // is removed and the watch sender dropped — recursively
+                // is removed and the watch sender dropped - recursively
                 // retry once so callers still get an answer.
                 loop {
                     if let Some(v) = rx.borrow().clone() {

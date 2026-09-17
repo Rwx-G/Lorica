@@ -22,8 +22,8 @@
 //! `lorica-shmem`. On the wire, the tags are serialised as a space-
 //! separated list alongside the SCM_RIGHTS payload:
 //!
-//! - `listener:0.0.0.0:8080` — a TCP listener
-//! - `shmem` — the anonymous memfd holding the `SharedRegion`
+//! - `listener:0.0.0.0:8080`: a TCP listener
+//! - `shmem`: the anonymous memfd holding the `SharedRegion`
 
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};

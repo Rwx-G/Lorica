@@ -42,7 +42,7 @@ use crate::{ChallengeError, Result};
 /// Default alphabet: digits + mixed-case ASCII letters, minus the
 /// visually-confusable glyphs (`0`, `O`, `1`, `l`, `I`) AND the
 /// glyphs the vendored 1.0 font does not render (`L` uppercase, `o`
-/// lowercase — the renderer silently drops any unknown glyph, which
+/// lowercase - the renderer silently drops any unknown glyph, which
 /// would produce short codes if left in).
 /// Keeping the list hard-coded and visible makes it auditable:
 /// future font changes that alter the character set must be paired
@@ -191,7 +191,7 @@ pub fn verify(submitted: &str, expected: &str) -> Result<()> {
     // length inputs but only after comparing the min prefix.
     // Bailing early keeps the branch-free guarantee since the
     // length check is not secret-dependent (the expected length
-    // is known to the attacker already — it is the captcha code
+    // is known to the attacker already - it is the captcha code
     // length they saw on the image).
     if sub.len() != exp.len() {
         return Err(ChallengeError::CaptchaMismatch);

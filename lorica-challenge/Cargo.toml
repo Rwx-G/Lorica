@@ -53,7 +53,7 @@ thiserror = "2"
 # Tracing for rare anomalies (HMAC rotation, cookie decode errors).
 # Hot path stays event-free.
 tracing = "0.1"
-# Arc-swap for the hot-reloadable HMAC secret — same pattern as
+# Arc-swap for the hot-reloadable HMAC secret - same pattern as
 # `lorica-geoip::GeoIpResolver`'s inner state.
 arc-swap = "1"
 # Module-static lazy init for the `ArcSwap` slot. Matches the rest

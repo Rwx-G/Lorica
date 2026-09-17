@@ -30,7 +30,7 @@
 //!
 //! Load failures are typed via [`GeoIpError`] so the caller (the
 //! supervisor's auto-update job in story 2.3) can distinguish a
-//! temporary download failure from a corrupt file — the auto-update
+//! temporary download failure from a corrupt file - the auto-update
 //! job keeps serving the old DB on transient errors and only swaps
 //! once a fresh copy has passed a sanity check.
 
@@ -117,7 +117,7 @@ pub struct GeoIpDbStatus {
     /// show it for diagnostics).
     pub path: String,
     /// When this DB was last loaded into Lorica (UTC). Distinct from
-    /// the DB's own build_epoch — a loaded DB may be months old on
+    /// the DB's own build_epoch - a loaded DB may be months old on
     /// disk but freshly opened by Lorica on restart.
     pub loaded_at: DateTime<Utc>,
     /// Number of IPv4 + IPv6 prefixes the DB indexes. Rough proxy for
@@ -156,7 +156,7 @@ impl GeoIpResolver {
     /// ~3 MiB allocation for DB-IP Lite Country) so the resolver does
     /// not depend on the file staying present after `load_from_path`
     /// returns. Sanity-checked by looking up `8.8.8.8` and asserting
-    /// the lookup returns a non-empty country code — rejects files
+    /// the lookup returns a non-empty country code - rejects files
     /// that parse as `.mmdb` but index nothing useful (empty / broken
     /// / wrong database type).
     pub fn load_from_path<P: AsRef<Path>>(&self, path: P) -> Result<(), GeoIpError> {
@@ -175,13 +175,13 @@ impl GeoIpResolver {
         // GeoLite2, which all index 8.8.8.8 / 1.1.1.1) AND on the
         // open-licensed test fixture we ship in `tests-e2e-docker/`
         // (which only indexes 214.78.120.0/22). Accept the DB as
-        // valid if ANY of the probes resolves — a DB that parses as
+        // valid if ANY of the probes resolves - a DB that parses as
         // `.mmdb` but returns None for every one of these is either
         // empty, the wrong database type, or corrupt in a way the
         // format parser missed.
         let sanity_probes: &[&str] = &[
-            "8.8.8.8",      // Google DNS (US) — every real country DB
-            "1.1.1.1",      // Cloudflare (AU) — fallback if GOOG is missing
+            "8.8.8.8",      // Google DNS (US) - every real country DB
+            "1.1.1.1",      // Cloudflare (AU) - fallback if GOOG is missing
             "214.78.120.5", // MaxMind GeoIP2-Country-Test fixture hit (US)
         ];
         let any_hit = sanity_probes
@@ -268,7 +268,7 @@ fn maxminddb_lookup_country(
     // Both GeoLite2-Country and DB-IP Lite Country expose
     // `country.iso_code` at the same JSON path. maxminddb 0.27 offers
     // a `decode_path` primitive that decodes only the target field
-    // instead of deserialising the whole record — ~2x cheaper at
+    // instead of deserialising the whole record - ~2x cheaper at
     // lookup time and no struct boilerplate to keep in sync with
     // upstream schema tweaks.
     use maxminddb::PathElement;

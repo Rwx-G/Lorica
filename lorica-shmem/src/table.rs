@@ -90,7 +90,7 @@ pub struct AtomicHashTable<const N: usize> {
 }
 
 impl<const N: usize> AtomicHashTable<N> {
-    /// Construct an empty table. Not typically used directly — in a
+    /// Construct an empty table. Not typically used directly - in a
     /// shared-memory region the bytes are zero-initialised by
     /// `ftruncate` and cast to this layout, which is equivalent.
     pub fn new_zeroed() -> Box<Self> {
@@ -202,7 +202,7 @@ impl<const N: usize> AtomicHashTable<N> {
     /// key will reclaim a fresh slot with `value = by`.
     ///
     /// Used by the WAF auto-ban path to clear a counter after a ban
-    /// has been issued — a repeat offender after ban expiry starts
+    /// has been issued - a repeat offender after ban expiry starts
     /// counting from zero rather than inheriting the previous run.
     pub fn reset(&self, tagged_hash: u64) -> bool {
         debug_assert!(tagged_hash != 0);
@@ -259,7 +259,7 @@ pub fn tagged_hash(raw: u64) -> u64 {
 ///
 /// `CLOCK_MONOTONIC`'s reference is the kernel's boot time, so values
 /// written by the supervisor and by forked workers are directly
-/// comparable — both processes read the same clock.
+/// comparable - both processes read the same clock.
 pub fn now_ns() -> u64 {
     use nix::sys::time::TimeValLike;
     use nix::time::{clock_gettime, ClockId};
@@ -271,7 +271,7 @@ pub fn now_ns() -> u64 {
     match clock_gettime(ClockId::CLOCK_MONOTONIC) {
         Ok(ts) => {
             // tv_nsec is i64 but POSIX constrains CLOCK_MONOTONIC to
-            // 0..=999_999_999 — never negative in practice — so the
+            // 0..=999_999_999 (never negative in practice), so the
             // `as u64` cast is well-defined.
             (ts.num_seconds() as u64)
                 .saturating_mul(1_000_000_000)

@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use crate::{ChallengeError, Result};
 
 /// Hard lower bound. Anything below 14 bits solves in < 10 ms on
-/// 2024 hardware — effectively no bot cost. Keeping the floor
+/// 2024 hardware - effectively no bot cost. Keeping the floor
 /// external-to-the-config means the API validator can reject
 /// misconfiguration cleanly.
 pub const MIN_DIFFICULTY: u8 = 14;
@@ -48,7 +48,7 @@ pub const MAX_DIFFICULTY: u8 = 22;
 pub const DEFAULT_DIFFICULTY: u8 = 18;
 
 /// Default challenge TTL. Once a challenge's `expires_at` is past,
-/// even a correctly-mined counter is rejected — so a bot cannot
+/// even a correctly-mined counter is rejected - so a bot cannot
 /// pre-compute a pool of solutions and pay the cost once.
 pub const DEFAULT_CHALLENGE_TTL_S: u64 = 300;
 
@@ -166,7 +166,7 @@ pub fn verify_solution(
 }
 
 /// Return true iff the first `n` bits of `bytes` are zero.
-/// `n` may span across byte boundaries — the last partial byte is
+/// `n` may span across byte boundaries - the last partial byte is
 /// masked to the remaining bit count.
 ///
 /// Kept `pub(crate)` so tests in other modules (and a future
@@ -222,7 +222,7 @@ fn hex_digit(c: u8) -> Result<u8> {
 /// upwards and returns the first value that clears the
 /// difficulty target. NOT exposed outside `cfg(test)` because
 /// production has no legitimate reason to mine on the server
-/// side — the whole point is that the client pays the cost.
+/// side - the whole point is that the client pays the cost.
 #[cfg(test)]
 pub(crate) fn mine(nonce_hex: &str, difficulty: u8) -> u64 {
     for counter in 0u64..u64::MAX {
@@ -323,7 +323,7 @@ mod tests {
         let err = verify_solution(nonce_hex, counter + 1, 100, 14, 500);
         // 1 in 16384 chance of counter+1 also clearing 14 bits;
         // if so the test would be flaky. Retry the mine by bumping
-        // the nonce instead — but at 14 bits that risk is
+        // the nonce instead - but at 14 bits that risk is
         // acceptable given this is deterministic on a given
         // fixture. If this flakes, pick a different nonce_hex
         // literal.

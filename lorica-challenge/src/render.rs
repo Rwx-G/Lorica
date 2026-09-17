@@ -15,7 +15,7 @@
 //!   embedded as `<style>` / `<script>` blocks so a single response
 //!   is enough to run the challenge.
 //! - **`<noscript>`** block explains how to contact the operator and
-//!   never loads anything remotely — the fallback is static text.
+//!   never loads anything remotely - the fallback is static text.
 //!
 //! A plain-text fallback is rendered when the request's `Accept`
 //! header does not advertise `text/html`: a short 403 body with a
@@ -23,7 +23,7 @@
 //! a bag of HTML.
 //!
 //! The rendered pages are intentionally conservative on visual
-//! polish — this is a friction gate, not a product surface. A future
+//! polish - this is a friction gate, not a product surface. A future
 //! UX story may style them per-route; story 3.4 scope is functional
 //! correctness + unit-test coverage of the string composition.
 
@@ -97,7 +97,7 @@ pub fn render_pow_page(
 
     // The embedded JS uses crypto.subtle.digest, available in every
     // evergreen browser (and in Node when packaged through wrap
-    // layers). The worker runs in the main JS context — a Web
+    // layers). The worker runs in the main JS context - a Web
     // Worker would keep the UI thread responsive for high N but
     // adds ~4 KiB of bundle. v1.4.0 keeps it simple; a future UX
     // polish story can switch to a Worker if sub-second input
