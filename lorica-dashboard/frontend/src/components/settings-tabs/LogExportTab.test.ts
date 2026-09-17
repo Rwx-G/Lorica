@@ -3,12 +3,16 @@ import { describe, it, expect, vi } from 'vitest';
 import type { ComponentProps } from 'svelte';
 
 import LogExportTab from './LogExportTab.svelte';
+import { reactive } from '../../test-reactive.svelte';
 
 type TabProps = ComponentProps<typeof LogExportTab>;
 type FormShape = TabProps['settingsForm'];
 
+/// `settingsForm` is `$bindable`, so it has to arrive as a `$state`
+/// proxy: a plain object makes the component's writes through the
+/// binding unobservable and Svelte warns `binding_property_non_reactive`.
 function form(overrides: Partial<FormShape> = {}): FormShape {
-  return {
+  return reactive({
     syslog_endpoint: '',
     syslog_transport: 'udp',
     syslog_facility: 16,
@@ -30,7 +34,7 @@ function form(overrides: Partial<FormShape> = {}): FormShape {
     otlp_logs_audit_enabled: true,
     otlp_logs_capture_enabled: true,
     ...overrides,
-  };
+  });
 }
 
 function props(overrides: Partial<TabProps> = {}): TabProps {

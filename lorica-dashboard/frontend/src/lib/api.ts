@@ -152,6 +152,7 @@ async function request<T>(
   method: string,
   path: string,
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<ApiResponse<T>> {
   const opts: RequestInit = {
     method,
@@ -160,6 +161,9 @@ async function request<T>(
   };
   if (body !== undefined) {
     opts.body = JSON.stringify(body);
+  }
+  if (signal) {
+    opts.signal = signal;
   }
 
   let res: Response;
@@ -1834,9 +1838,13 @@ export const api = {
    * `code: 'service_unavailable'`: the ring is per worker and the
    * supervisor serving the API holds an empty one, so the page shows
    * where the records went instead of an empty list.
+   *
+   * `signal` lets a polling caller drop the in-flight read when its
+   * component goes away, so a slow answer never lands on a torn-down
+   * page.
    */
-  listRecentCaptures: () =>
-    request<RecentCapturesResponse>('GET', '/capture/recent'),
+  listRecentCaptures: (signal?: AbortSignal) =>
+    request<RecentCapturesResponse>('GET', '/capture/recent', undefined, signal),
 
   /**
    * Trigger a browser download of one full capture record while it is
@@ -2491,7 +2499,11 @@ export interface RecentCaptureHalf {
   body_bytes_total: number;
   truncated: boolean;
   body_skipped: 'streaming' | 'budget' | 'disabled' | null;
-  /** Whether the listing cut `body` at 4 KiB. Absent when `body` is null. */
+  /**
+   * Whether the listing cut `body`. The cap is the node's, not this
+   * client's, and is not on the wire; only the fact and the stored
+   * length are. Absent when `body` is null.
+   */
   body_elided?: boolean;
   /** Stored length of `body` before the cut; present only when elided. */
   body_elided_total?: number;

@@ -4,7 +4,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { auth } from '../../lib/auth';
 import { clusterStatus } from '../../lib/cluster';
 import { api, type AutomationTokenResponse } from '../../lib/api';
-import AutomationTokensTab from './AutomationTokensTab.svelte';
+import AutomationTokensTab, { ALL_SCOPES } from './AutomationTokensTab.svelte';
+import { AUTOMATION_SCOPE_WIRE_STRINGS } from './automation-scopes.fixture';
 
 const FULL_TOKEN = '0123456789abcdef01234567.SGVsbG9Xb3JsZFNlY3JldFZhbHVlSGVyZTEyMzQ1Ng';
 
@@ -38,6 +39,24 @@ beforeEach(() => {
 afterEach(() => {
   auth.set({ status: 'unauthenticated' });
   clusterStatus.set(null);
+});
+
+describe('AutomationTokensTab scope spelling', () => {
+  // The four strings are Rust's: the serde renames on
+  // `AutomationScope` and `scope_str`. Nothing generates this client,
+  // so this is the only thing standing between a rename on the server
+  // and a create form that mints tokens the node refuses. The fixture
+  // carries the wire spelling; the component restates it.
+  it('offers exactly the scopes the wire fixture names', () => {
+    const offered = ALL_SCOPES.map((scope) => scope.value).sort();
+    expect(offered).toEqual([...AUTOMATION_SCOPE_WIRE_STRINGS]);
+  });
+
+  it('labels every scope with its own wire string, so the UI is not a second vocabulary', () => {
+    for (const scope of ALL_SCOPES) {
+      expect(scope.label).toBe(scope.value);
+    }
+  });
 });
 
 describe('AutomationTokensTab listing', () => {

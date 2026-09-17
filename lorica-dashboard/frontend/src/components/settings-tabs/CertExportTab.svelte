@@ -468,8 +468,8 @@
             {#each acls as acl (acl.id)}
               <tr>
                 <td><code>{acl.hostname_pattern}</code></td>
-                <td>{acl.allowed_uid ?? '—'}</td>
-                <td>{acl.allowed_gid ?? '—'}</td>
+                <td>{acl.allowed_uid ?? '-'}</td>
+                <td>{acl.allowed_gid ?? '-'}</td>
                 <td><time datetime={acl.created_at}>{new Date(acl.created_at).toLocaleString()}</time></td>
                 <td class="acl-row-actions">
                   {#if $isSuperAdmin}

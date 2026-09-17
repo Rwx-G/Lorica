@@ -1,8 +1,31 @@
+<script lang="ts" module>
+  import type { AutomationScope } from '../../lib/api';
+
+  /**
+   * The closed scope enum, in the order the create form offers it:
+   * the reads first, because a token that only reads is the one an
+   * operator should reach for by default.
+   *
+   * These strings are the wire spelling, owned by Rust: the
+   * `#[serde(rename = "...")]` attributes on `AutomationScope` in
+   * `lorica-config/src/models/automation_token.rs` and `scope_str` in
+   * `lorica-api/src/automation/scope.rs`. Nothing generates this
+   * client, so `automation-scopes.fixture.ts` beside this file pins
+   * the set and the test fails if a rename lands on one side only.
+   * Exported for that test and for no other reason.
+   */
+  export const ALL_SCOPES: { value: AutomationScope; label: string }[] = [
+    { value: 'environments:read', label: 'environments:read' },
+    { value: 'routes:read', label: 'routes:read' },
+    { value: 'certificates:read', label: 'certificates:read' },
+    { value: 'environments:write', label: 'environments:write' },
+  ];
+</script>
+
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
     api,
-    type AutomationScope,
     type AutomationTokenResponse,
   } from '../../lib/api';
   import ConfirmDialog from '../ConfirmDialog.svelte';
@@ -15,18 +38,6 @@
   }
 
   let { expanded, toggleSection }: Props = $props();
-
-  /**
-   * The closed scope enum, in the order the create form offers it:
-   * the reads first, because a token that only reads is the one an
-   * operator should reach for by default.
-   */
-  const ALL_SCOPES: { value: AutomationScope; label: string }[] = [
-    { value: 'environments:read', label: 'environments:read' },
-    { value: 'routes:read', label: 'routes:read' },
-    { value: 'certificates:read', label: 'certificates:read' },
-    { value: 'environments:write', label: 'environments:write' },
-  ];
 
   let tokens = $state<AutomationTokenResponse[]>([]);
   let loading = $state(false);

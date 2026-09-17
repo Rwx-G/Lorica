@@ -8,7 +8,13 @@
   import CaptureRuleForm from '../components/capture/CaptureRuleForm.svelte';
   import RecentCaptures from '../components/capture/RecentCaptures.svelte';
 
-  /** The counters are flushed to the store every five seconds; poll at that cadence. */
+  /**
+   * The counters are flushed to the store every five seconds; poll at
+   * that cadence. This is the page's only ticker: the recent-captures
+   * table refreshes off `refreshKey` rather than running a second
+   * interval, so one tick is one burst of requests and the cadence has
+   * one place to change.
+   */
   const POLL_MS = 5_000;
 
   let rules: CaptureRuleResponse[] = $state([]);
@@ -17,6 +23,8 @@
   let error = $state('');
   let now = $state(new Date());
   let timer: ReturnType<typeof setInterval> | undefined;
+  /** Bumped once per tick; the recent-captures table refreshes off it. */
+  let refreshKey = $state(0);
 
   let showForm = $state(false);
   let editing: CaptureRuleResponse | null = $state(null);
@@ -37,7 +45,10 @@
 
   onMount(() => {
     void loadData();
-    timer = setInterval(() => void loadData(), POLL_MS);
+    timer = setInterval(() => {
+      refreshKey += 1;
+      void loadData();
+    }, POLL_MS);
   });
 
   onDestroy(() => {
@@ -169,7 +180,7 @@
     </p>
   {/if}
 
-  <RecentCaptures />
+  <RecentCaptures {refreshKey} />
 
   {#if deleting}
     <ConfirmDialog

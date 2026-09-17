@@ -1,47 +1,81 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onDestroy } from 'svelte';
   import { api, type RecentCapture } from '../../lib/api';
   import { formatBytes } from '../../lib/format';
   import { showToast } from '../../lib/toast';
 
-  /** How often the ring is re-read while the page is open. */
-  const POLL_MS = 5_000;
+  interface Props {
+    /**
+     * Bumped once per tick by the page that owns the cadence. This
+     * component runs no interval of its own, so one tick is one burst
+     * of requests for the whole page.
+     */
+    refreshKey: number;
+  }
+
+  let { refreshKey }: Props = $props();
 
   let captures: RecentCapture[] = $state([]);
-  let capacity = $state(50);
+  /**
+   * The ring size the node reports. Null until the first answer, so
+   * nothing is claimed about a capacity this client does not own.
+   */
+  let capacity: number | null = $state(null);
   let loading = $state(true);
   let error = $state('');
   /** The 503 case: a `--workers` node, whose ring lives in the workers. */
   let unavailable = $state('');
   let expanded: string | null = $state(null);
-  let timer: ReturnType<typeof setInterval> | undefined;
 
-  async function load() {
-    const res = await api.listRecentCaptures();
-    loading = false;
-    if (res.error) {
-      if (res.error.code === 'service_unavailable') {
-        unavailable = res.error.message;
-        error = '';
-      } else {
-        error = res.error.message;
+  /** Drops the in-flight read when the page goes away. */
+  const teardown = new AbortController();
+  /** A tick landing while a read is outstanding is skipped, not stacked. */
+  let reading = false;
+
+  async function load(): Promise<void> {
+    if (reading || teardown.signal.aborted) return;
+    reading = true;
+    try {
+      const res = await api.listRecentCaptures(teardown.signal);
+      if (teardown.signal.aborted) return;
+      loading = false;
+      if (res.error) {
+        if (res.error.code === 'service_unavailable') {
+          unavailable = res.error.message;
+          error = '';
+        } else {
+          error = res.error.message;
+        }
+        return;
       }
-      return;
+      unavailable = '';
+      error = '';
+      captures = res.data?.captures ?? [];
+      capacity = res.data?.capacity ?? capacity;
+    } finally {
+      reading = false;
     }
-    unavailable = '';
-    error = '';
-    captures = res.data?.captures ?? [];
-    capacity = res.data?.capacity ?? capacity;
   }
 
-  onMount(() => {
+  $effect(() => {
+    // Read the key so the effect re-runs on every tick of the page's
+    // timer; the mount run is the first load.
+    void refreshKey;
     void load();
-    timer = setInterval(() => void load(), POLL_MS);
   });
 
-  onDestroy(() => {
-    if (timer) clearInterval(timer);
-  });
+  onDestroy(() => teardown.abort());
+
+  /**
+   * What the detail pane says about a body the listing cut. The cap
+   * itself is the node's and is not on the wire, so only the stored
+   * length is named here.
+   */
+  function elidedNote(half: RecentCapture['request'] | RecentCapture['response']): string {
+    const total = half.body_elided_total;
+    const stored = total === undefined ? '' : ` of ${formatBytes(total)} stored`;
+    return `Elided in the list${stored}; download for the whole body.`;
+  }
 
   async function download(c: RecentCapture) {
     const res = await api.downloadRecentCapture(c.request_id, c.rule_id);
@@ -64,7 +98,11 @@
 <section class="recent">
   <div class="page-header">
     <h2>Recent captures</h2>
-    <span class="text-muted small">last {capacity} on this process, bodies cut at 4 KiB in the list</span>
+    {#if capacity !== null}
+      <span class="text-muted small">
+        last {capacity} on this process, long bodies cut in the list and whole in the download
+      </span>
+    {/if}
   </div>
 
   {#if unavailable}
@@ -139,7 +177,7 @@
                       {#if c.request.body !== null}
                         <pre class="body">{c.request.body}</pre>
                         {#if c.request.body_elided}
-                          <p class="hint">Cut at 4 KiB of {c.request.body_elided_total} in the list; download for the whole body.</p>
+                          <p class="hint">{elidedNote(c.request)}</p>
                         {/if}
                       {/if}
                     </div>
@@ -153,7 +191,7 @@
                       {#if c.response.body !== null}
                         <pre class="body">{c.response.body}</pre>
                         {#if c.response.body_elided}
-                          <p class="hint">Cut at 4 KiB of {c.response.body_elided_total} in the list; download for the whole body.</p>
+                          <p class="hint">{elidedNote(c.response)}</p>
                         {/if}
                       {/if}
                       <p class="hint">The response body is the upstream's, before any rewrite this proxy applied.</p>

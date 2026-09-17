@@ -3,14 +3,18 @@ import { describe, it, expect, vi } from 'vitest';
 import type { ComponentProps } from 'svelte';
 
 import NetworkTab from './NetworkTab.svelte';
+import { reactive } from '../../test-reactive.svelte';
 
 type TabProps = ComponentProps<typeof NetworkTab>;
 type FormShape = TabProps['settingsForm'];
 
 const FIELD_LABEL = 'Automation Listener Allowed CIDRs';
 
+/// `settingsForm` is `$bindable`, so it has to arrive as a `$state`
+/// proxy: a plain object makes the component's writes through the
+/// binding unobservable and Svelte warns `binding_property_non_reactive`.
 function form(overrides: Partial<FormShape> = {}): FormShape {
-  return {
+  return reactive({
     trusted_proxies: '',
     connection_deny_cidrs: '',
     connection_allow_cidrs: '',
@@ -26,7 +30,7 @@ function form(overrides: Partial<FormShape> = {}): FormShape {
     mirror_max_concurrent_per_route: 32,
     mirror_max_concurrent_global: 4096,
     ...overrides,
-  };
+  });
 }
 
 function props(overrides: Partial<TabProps> = {}): TabProps {

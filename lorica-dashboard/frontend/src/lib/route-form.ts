@@ -354,7 +354,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
  * to a tab via a small explicit prefix table covering the nested
  * route-config shapes that are not individual form fields.
  *
- * Returns `null` when no match — callers stay on the current tab.
+ * Returns `null` when no match - callers stay on the current tab.
  */
 export function inferTabFromBackendError(message: string): string | null {
   const match = message.trim().match(/^([A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?(?:\.[A-Za-z_][A-Za-z0-9_]*)*)/);
