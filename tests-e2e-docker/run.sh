@@ -12,6 +12,7 @@
 #   --skip-log-sinks    Skip the v1.7.0 Story 9.8 log-sinks profile (faster)
 #   --skip-acme         Skip the v1.7.0 Story 9.1 Pebble ACME profile (faster)
 #   --skip-cluster      Skip the v1.7.0 Epic 9 cluster profile (faster)
+#   --skip-capture      Skip the v1.8.0 Stories 10.1/10.2 capture profile (faster)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -27,6 +28,7 @@ SKIP_HOT_UPGRADE=false
 SKIP_LOG_SINKS=false
 SKIP_ACME=false
 SKIP_CLUSTER=false
+SKIP_CAPTURE=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -41,6 +43,7 @@ for arg in "$@"; do
         --skip-log-sinks)    SKIP_LOG_SINKS=true ;;
         --skip-acme)         SKIP_ACME=true ;;
         --skip-cluster)      SKIP_CLUSTER=true ;;
+        --skip-capture)      SKIP_CAPTURE=true ;;
     esac
 done
 
@@ -51,7 +54,7 @@ EXIT_CODE=0
 # run boots against stale data - e.g. the cert-export smoke rotates the
 # admin password, and a stale volume 401s the next login), and on BUILD a
 # plain `docker compose build` (no profile flags) skips them entirely.
-ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks --profile acme --profile cluster"
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks --profile acme --profile cluster --profile capture"
 
 # `docker compose run` never rebuilds an existing image, so a stale runner
 # would silently run old assertions. With --build, build every service
@@ -356,6 +359,37 @@ if [ "$SKIP_ACME" = false ] && [ "$EXIT_CODE" = "0" ]; then
     docker compose --profile acme run --rm acme-smoke || EXIT_CODE=$?
 fi
 
+# ---- Phase 10: Capture profile (Stories 10.1 IV1-IV3, 10.2 IV1-IV4) --
+# Request capture driven through a real proxy from two source addresses
+# (a network pinned to 172.30.0.0/16 and the e2e one), with the records
+# asserted on stdout, in the syslog collector, in the OTLP collector,
+# in the recent-captures ring and in an `output.dir`, read-only and
+# writable. Opt-out via --skip-capture (default ON).
+if [ "$SKIP_CAPTURE" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (capture profile) ==="
+    echo ""
+
+    docker compose --profile capture up $BUILD_FLAG -d \
+        backend1 syslog-collector-capture otelcol-logs-capture lorica-capture
+
+    echo "Waiting for Lorica (capture) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica-capture curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (capture) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (capture) did not start within 120s"
+            docker compose logs lorica-capture | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    docker compose --profile capture run --rm capture-smoke || EXIT_CODE=$?
+fi
+
 # ---- Phase: cluster (Epic 9 Integration Verification, backlog #66) ----
 # One control plane and two followers, one of them in workers mode. This
 # is the profile stories 9.2 through 9.9 were written against and none
@@ -366,8 +400,11 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo "=== Lorica E2E Tests (cluster profile) ==="
     echo ""
 
+    # backend2 and oidc-issuer serve the automation phase below: the
+    # backend an environment moves its traffic to, and the ID-token
+    # issuer (Story 10.5).
     docker compose --profile cluster up $BUILD_FLAG -d \
-        backend1 challtestsrv pebble lorica-cp lorica-edge-a lorica-edge-b
+        backend1 backend2 challtestsrv pebble oidc-issuer lorica-cp lorica-edge-a lorica-edge-b
 
     # The followers mint and redeem a real join token before they start,
     # so readiness here means the whole enrolment handshake completed,
@@ -415,6 +452,29 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
             docker compose --profile cluster run --rm cluster-restart-smoke control-plane \
                 || EXIT_CODE=$?
         fi
+    fi
+
+    # ---- Automation phase (Epic 10, stories 10.3 to 10.5) ----
+    # The control plane serves the automation listener (see
+    # entrypoint-cluster-cp.sh). Story 10.3 IV3 needs a FOLLOWER started
+    # with --automation-listen, which only run.sh can do: edge-a is
+    # stopped so two processes never share its SQLite file, a throwaway
+    # container runs the binary on edge-a's data volume with the flag,
+    # its exit code and output land on the shared volume for the smoke
+    # to assert, and edge-a is started again. The `sh -c` wrapper is
+    # deliberate for the same MSYS reason as the readiness probe above.
+    if [ "$EXIT_CODE" = "0" ]; then
+        echo ""
+        echo "=== Lorica E2E Tests (automation phase) ==="
+        echo ""
+
+        docker compose --profile cluster stop lorica-edge-a
+        docker compose --profile cluster run --rm -T --no-deps --entrypoint sh lorica-edge-a \
+            -c 'timeout 120 lorica --data-dir /var/lib/lorica --management-port 19443 --automation-listen 0.0.0.0:9446 --automation-listen-any > /shared/edge-a_automation_refusal.log 2>&1; echo $? > /shared/edge-a_automation_refusal.code; tail -c 600 /shared/edge-a_automation_refusal.log' \
+            || true
+        docker compose --profile cluster start lorica-edge-a
+
+        docker compose --profile cluster run --rm automation-smoke || EXIT_CODE=$?
     fi
 
     # ---- Revocation, last: it is terminal for a node, so everything

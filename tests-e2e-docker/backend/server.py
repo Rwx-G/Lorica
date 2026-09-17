@@ -93,6 +93,10 @@ class Handler(BaseHTTPRequestHandler):
             self._echo_response()
         elif self.path == "/error":
             self._json_response(500, {"error": "intentional error"})
+        elif self.path.startswith("/fail"):
+            # Capture e2e (Stories 10.1 / 10.2): a deterministic 502 so a
+            # rule with `emit.status: ["server_error"]` fires on demand.
+            self._json_response(502, {"error": "intentional 502", "backend": BACKEND_ID})
         else:
             self._json_response(200, {
                 "message": f"Hello from {BACKEND_ID}",
@@ -110,13 +114,19 @@ class Handler(BaseHTTPRequestHandler):
         global request_count
         request_count += 1
         content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else ""
+        # Bytes, not a decoded string: the capture e2e posts a 10 MiB
+        # body and a binary one and asserts on the byte count the
+        # upstream received (a decoded length differs, or fails, on both).
+        body = self.rfile.read(content_length) if content_length > 0 else b""
 
         received_headers = {}
         for key, value in self.headers.items():
             received_headers[key.lower()] = value
 
-        self._json_response(200, {
+        # `/fail` is a 502 for the capture e2e (see do_GET); the body
+        # still reports the byte count and the headers the proxy sent.
+        status = 502 if self.path.startswith("/fail") else 200
+        self._json_response(status, {
             "backend": BACKEND_ID,
             "method": "POST",
             "path": self.path,

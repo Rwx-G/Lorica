@@ -343,7 +343,7 @@ services:
   # Bot-protection E2E in WORKER MODE. Same smoke as above, but
   # Lorica runs with `--workers 2` so the SQLite-backed pending
   # stash is exercised across workers. A challenge stashed on one
-  # worker must be consumable on the other — the smoke PoW-solves
+  # worker must be consumable on the other - the smoke PoW-solves
   # after re-configuring the route, which inherently alternates
   # which worker handles each call via the default round-robin
   # connection distribution.
@@ -421,7 +421,7 @@ services:
     profiles: ["rdns"]
     # entrypoint writes /etc/resolv.conf before lorica starts; that
     # requires root for this profile only. The bot-protection
-    # process itself is still unprivileged — the entrypoint sets
+    # process itself is still unprivileged - the entrypoint sets
     # resolv.conf and then `lorica` runs as root in the test image
     # (fine for E2E; production .deb installs still drop privs).
     user: "0:0"
@@ -859,6 +859,105 @@ services:
     networks:
       - e2e
 
+  # ---- Capture E2E (v1.8.0 Stories 10.1 / 10.2) ----------------------
+  # The log-sinks topology again (one `--features otel` node, the socat
+  # syslog collector, the logs-only OTel collector), on its own volumes
+  # so the frames the capture smoke asserts are its own, plus two things
+  # the capture rules need:
+  #   - a second network, `capture-inside`, pinned to 172.30.0.0/16 so a
+  #     rule's `match.source_cidrs: ["172.30.0.0/16"]` is literal: the
+  #     runner dials the node's address on that network for "inside" and
+  #     its e2e address for "outside" (Story 10.1 IV1);
+  #   - a named volume mounted read-only at /captures-ro, the `output.dir`
+  #     a record must be dropped into with a counted drop and no 5xx
+  #     (Story 10.2 IV2); the writable directory is /shared/captures,
+  #     created by entrypoint-capture.sh because the writer never does.
+  #
+  # Run with:
+  #   docker compose --profile capture up --build
+  #   docker compose --profile capture run --rm capture-smoke
+  lorica-capture:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+      args:
+        LORICA_FEATURES: "otel"
+    entrypoint: ["/entrypoint-capture.sh"]
+    profiles: ["capture"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-capture-data:/var/lib/lorica
+      - shared-capture:/shared
+      - capture-ro:/captures-ro:ro
+    depends_on:
+      - backend1
+    # One alias per network: the embedded DNS answers a service name with
+    # a single address, so the runner resolves each alias to dial the
+    # node from the matching source network.
+    networks:
+      e2e:
+        aliases:
+          - lorica-capture-outside
+      capture-inside:
+        aliases:
+          - lorica-capture-inside
+
+  syslog-collector-capture:
+    build:
+      context: ./test-runner
+    profiles: ["capture"]
+    user: "0:0"
+    entrypoint:
+      - "sh"
+      - "-c"
+      - "mkdir -p /shared && : > /shared/syslog.log && exec socat -u TCP-LISTEN:6601,fork,reuseaddr OPEN:/shared/syslog.log,creat,append"
+    volumes:
+      - shared-capture:/shared
+    networks:
+      - e2e
+
+  otelcol-logs-capture:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    profiles: ["capture"]
+    user: "0:0"
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./fixtures/otelcol-logs.yaml:/etc/otelcol/config.yaml:ro
+      - shared-capture:/shared
+    networks:
+      - e2e
+
+  capture-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["capture"]
+    entrypoint: ["bash", "run-capture-smoke.sh"]
+    # Root: the capture files are 0640 owned by the node's unprivileged
+    # user, and the runner has to read them and stat their mode (same
+    # rationale as cert-export-smoke).
+    user: "0:0"
+    depends_on:
+      - lorica-capture
+      - syslog-collector-capture
+      - otelcol-logs-capture
+    volumes:
+      - shared-capture:/shared:ro
+    environment:
+      - LORICA_API=https://lorica-capture:9443
+      - INSIDE_HOST=lorica-capture-inside
+      - OUTSIDE_HOST=lorica-capture-outside
+      - BACKEND1_ADDR=backend1:80
+      - SYSLOG_LOG=/shared/syslog.log
+      - OTLP_LOG=/shared/otlp-logs.json
+      - LORICA_LOG=/shared/lorica.log
+      - CAPTURE_DIR=/shared/captures
+      - CAPTURE_RO_DIR=/captures-ro
+      - INSIDE_CIDR=172.30.0.0/16
+    networks:
+      - e2e
+      - capture-inside
+
   # ---------------------------------------------------------------------
   # ACME profile (Story 9.1 AC #13): Pebble fixture with a mock DNS
   # provider, the repo's first end-to-end ACME coverage (audit M-22).
@@ -992,7 +1091,8 @@ services:
     environment:
       # The control plane runs ACME for the fleet against Pebble, like
       # `lorica-acme` does alone: trust the fixture CA and use Pebble's
-      # directory path behind the staging alias.
+      # directory path behind the staging alias. The same CA signs the
+      # OIDC issuer fixture's leaf (Story 10.5).
       - SSL_CERT_FILE=/acme/pebble-ca.pem
       - LORICA_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/dir
     volumes:
@@ -1002,6 +1102,42 @@ services:
     depends_on:
       - backend1
       - pebble
+    # Two networks (Story 10.3 IV1): the automation listener's source
+    # allowlist is the e2e network's /24, and `automation-outside` is
+    # the address nothing allowlists, so the automation smoke can dial
+    # the same listener from inside and from outside in one container.
+    # One alias per network: Docker's embedded DNS answers a bare
+    # service name with the address on a single network (the first the
+    # querier shares with the target, and `automation-outside` sorts
+    # before `e2e`), so `lorica-cp` from the smoke never yields the e2e
+    # address. An alias declared on a network resolves on that network.
+    networks:
+      e2e:
+        aliases:
+          - lorica-cp-inside
+      automation-outside:
+        aliases:
+          - lorica-cp-outside
+
+  # ---- OIDC issuer fixture (Story 10.5) ------------------------------
+  # A tiny issuer serving a JWKS over HTTPS with a leaf signed by the
+  # same fixture CA Pebble uses, so the control plane's SSL_CERT_FILE
+  # trust covers it. The smoke mints tokens through it (valid, expired,
+  # wrong audience, wrong project, HS256, alg none, a thousand unknown
+  # kids), rotates its key and toggles an outage; the private key never
+  # leaves the container.
+  oidc-issuer:
+    build:
+      context: ./oidc-issuer
+    profiles: ["cluster"]
+    environment:
+      - OIDC_ISSUER_URL=https://oidc-issuer
+      - OIDC_AUDIENCE=lorica-e2e
+    volumes:
+      - shared-acme:/shared:ro
+    depends_on:
+      acme-ca-init:
+        condition: service_completed_successfully
     networks:
       - e2e
 
@@ -1081,6 +1217,42 @@ services:
     networks:
       - e2e
 
+  # The automation phase (Epic 10, stories 10.3 to 10.5): the same fleet
+  # after the restart phase, before revocation. On both networks, see
+  # lorica-cp. Reads the follower refusal run.sh left on the shared
+  # volume.
+  automation-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["cluster"]
+    user: "0:0"
+    entrypoint: ["bash", "run-automation-smoke.sh"]
+    depends_on:
+      - lorica-cp
+      - lorica-edge-a
+      - lorica-edge-b
+      - oidc-issuer
+      - backend2
+    volumes:
+      - shared-cluster:/shared:ro
+    environment:
+      - CP_API=https://lorica-cp-inside:9443
+      - CP_HOST_INSIDE=lorica-cp-inside
+      - CP_HOST_OUTSIDE=lorica-cp-outside
+      - AUTOMATION_PORT=9446
+      - EDGE_A_API=https://lorica-edge-a:9443
+      - EDGE_B_API=https://lorica-edge-b:9443
+      - BACKEND1_ADDR=backend1:80
+      - BACKEND2_ADDR=backend2:80
+      - OIDC_ISSUER=https://oidc-issuer
+      - OIDC_AUDIENCE=lorica-e2e
+      - CHALLTESTSRV=http://challtestsrv:8055
+      - PEBBLE_MGMT=https://pebble:15000
+      - SHARED_DIR=/shared
+    networks:
+      - e2e
+      - automation-outside
+
   cluster-smoke:
     build:
       context: ./test-runner
@@ -1143,6 +1315,9 @@ volumes:
   shared-audit:
   lorica-log-sinks-data:
   shared-log-sinks:
+  lorica-capture-data:
+  shared-capture:
+  capture-ro:
   lorica-cp-data:
   lorica-edge-a-data:
   lorica-edge-b-data:
@@ -1152,3 +1327,14 @@ volumes:
 
 networks:
   e2e:
+  # A second network for the automation smoke's "outside" connection
+  # (Story 10.3 IV1): only lorica-cp and automation-smoke join it, and
+  # its addresses are in no allowlist.
+  automation-outside:
+  # The capture smoke's "inside" network (Story 10.1 IV1), pinned so the
+  # rule under test can name 172.30.0.0/16 literally; only lorica-capture
+  # and capture-smoke join it. Its e2e address is the "outside" one.
+  capture-inside:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

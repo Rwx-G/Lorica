@@ -190,6 +190,11 @@ pub(crate) async fn run_api_server(
     // OCSP refresh is deliberately NOT gated: stapling is a serving
     // concern and followers are the nodes terminating client TLS (AC
     // #4). See `spawn_ocsp_refresh_loop`.
+    // Forced here rather than where each feature starts, so a node
+    // that never captures and never opens the automation listener still
+    // exposes the families at zero; an absent series reads like a
+    // feature that does not exist.
+    lorica_api::metrics::install_capture_and_automation_metrics();
     let is_follower = matches!(
         state.cluster,
         lorica_api::cluster::ClusterRuntime::Follower(_)

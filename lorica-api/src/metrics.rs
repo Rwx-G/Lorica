@@ -490,6 +490,34 @@ struct ClusterPlaneStats {
 /// become a swap that resets the snapshot.
 static CLUSTER_PLANE_STATS: std::sync::OnceLock<ClusterPlaneStats> = std::sync::OnceLock::new();
 
+/// Register the capture and automation families at startup, so they
+/// are present on `/metrics` from the first scrape rather than after the
+/// first event. The cluster families are forced the same way; a series
+/// that appears only once something happened reads on a graph like a
+/// feature that does not exist, and an alert on it cannot be written.
+pub fn install_capture_and_automation_metrics() {
+    Lazy::force(&CAPTURE_RULES_ACTIVE);
+    Lazy::force(&CAPTURES_TOTAL);
+    Lazy::force(&CAPTURE_INFLIGHT_BYTES);
+    Lazy::force(&AUTOMATION_ENVIRONMENTS);
+    Lazy::force(&AUTOMATION_ENVIRONMENT_OPS_TOTAL);
+    Lazy::force(&AUTOMATION_REAPER_RUNS_TOTAL);
+    Lazy::force(&AUTOMATION_REQUESTS_TOTAL);
+    Lazy::force(&AUTOMATION_SOURCE_REFUSED_TOTAL);
+    Lazy::force(&AUTOMATION_REJECTED_CONCURRENT_HANDSHAKES_TOTAL);
+    Lazy::force(&AUTOMATION_REJECTED_PER_SOURCE_TOTAL);
+    Lazy::force(&AUTOMATION_REJECTED_ATTEMPT_WINDOW_TOTAL);
+    Lazy::force(&AUTOMATION_OIDC_REPLAY_EVICTIONS_TOTAL);
+    Lazy::force(&AUTOMATION_OIDC_JWKS_FETCH_TOTAL);
+    Lazy::force(&AUTOMATION_TLS_HANDSHAKE_FAILED_TOTAL);
+    for outcome in ["ok", "unauthenticated", "forbidden", "refused", "error"] {
+        AUTOMATION_REQUESTS_TOTAL.with_label_values(&[outcome]);
+    }
+    for state in ["active", "expired"] {
+        AUTOMATION_ENVIRONMENTS.with_label_values(&[state]);
+    }
+}
+
 /// Hand the running control plane's listener counters to the
 /// Prometheus bridge. Called once at startup when `--cluster-listen`
 /// is set; a second call is ignored (the plane starts once). Every
