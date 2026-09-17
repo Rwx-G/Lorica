@@ -339,7 +339,7 @@ async fn empty_bucket_returns_429_with_retry_after() {
         .unwrap_or(0);
     assert_eq!(retry, 1, "Retry-After for refill=1/s should be 1 second");
 
-    // Exactly 2 origin hits — the 429 short-circuits before the
+    // Exactly 2 origin hits - the 429 short-circuits before the
     // upstream_peer stage.
     assert_eq!(counter.load(Ordering::SeqCst), 2);
 }

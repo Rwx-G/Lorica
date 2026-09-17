@@ -508,7 +508,7 @@ mod tests {
     /// the same candidate gate the proxy uses, with both bodies pushed.
     fn state_with(rules: &[CaptureRule], request: &[u8], response: &[u8]) -> CaptureState {
         let budget: Arc<CaptureBudget> = CaptureBudget::new(1024 * 1024);
-        let compiled = CompiledCaptureRules::compile(rules);
+        let compiled = Arc::new(CompiledCaptureRules::compile(rules));
         let candidates = compiled.candidates_for_request(
             "route-1",
             "POST",
@@ -519,8 +519,8 @@ mod tests {
                 .expect("test setup: a literal address parses"),
             now(),
         );
-        let mut state =
-            CaptureState::new(&budget, &candidates).expect("the rule matches this request");
+        let mut state = CaptureState::new(&budget, &compiled, "route-1", &candidates)
+            .expect("the rule matches this request");
         state.push_request(request);
         state.push_response(response);
         state

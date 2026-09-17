@@ -174,7 +174,7 @@ pub struct RequestCtx {
     /// captured via `Span::current()` at the top of that hook so the
     /// downstream hooks (`upstream_request_filter`, `response_filter`,
     /// `logging`, `fail_to_proxy`) can parent their own `#[instrument]`
-    /// spans under it — producing a clean nested tree in Jaeger /
+    /// spans under it - producing a clean nested tree in Jaeger /
     /// Tempo when the `otel` feature is on (the
     /// `tracing_opentelemetry` bridge installed in `init_logging`
     /// mirrors every tracing span to an OTel span, inheriting the
@@ -198,6 +198,11 @@ pub struct RequestCtx {
     /// the response is known. The two buffers have different caps,
     /// different lifetimes, and different contents (the WAF skips a
     /// body it cannot parse).
+    ///
+    /// It also carries the route it was admitted on and the compiled
+    /// rule set that admitted it, so `logging` does not read
+    /// `route_id` below: that field is set in `upstream_peer`, which a
+    /// request refused inside `request_filter` never reaches.
     ///
     /// Released in `logging`, which moves it out of the context; see the
     /// comment there.

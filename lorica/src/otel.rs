@@ -103,7 +103,7 @@ impl TraceParent {
     /// typically the request_id.
     pub fn child(&self, seed: &str) -> Self {
         // SipHash via DefaultHasher would be stable for the life of
-        // the process but not stable across processes — we need
+        // the process but not stable across processes - we need
         // cross-process determinism so workers agree on the parent-span
         // id. FNV-1a 64 is the cheapest hash that meets that bar.
         let mixed = fnv1a_64(format!("{}{}", self.trace_id, seed).as_bytes());
@@ -137,7 +137,7 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 /// reconstruct the trace even when Lorica itself is not exporting.
 pub fn traceparent_from_request_id(request_id: &str) -> TraceParent {
     // Two independent FNV-1a hashes seeded differently. `_HI` uses the
-    // request_id prefixed with 0x00, `_LO` with 0xff — cheap seed
+    // request_id prefixed with 0x00, `_LO` with 0xff: cheap seed
     // diversification so the two 64-bit halves do not correlate.
     let mut hi_input = Vec::with_capacity(request_id.len() + 1);
     hi_input.push(0x00);
@@ -360,7 +360,7 @@ mod imp {
         // `BoxedTracer` for a real one bound to the freshly
         // installed provider. After this call, every `#[instrument]`
         // span created on the proxy hot path gets mirrored to an
-        // OTel span via the tracing_opentelemetry bridge — without
+        // OTel span via the tracing_opentelemetry bridge - without
         // this swap the bridge would keep sending spans into the
         // per-process noop tracer and nothing would reach the
         // collector.
@@ -667,7 +667,7 @@ mod shutdown_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn init_then_shutdown_round_trips() {
-        // Pointing at a nonexistent endpoint is fine — the batch
+        // Pointing at a nonexistent endpoint is fine - the batch
         // exporter build is lazy wrt connectivity, so init() succeeds
         // as long as the URL parses. shutdown() then flushes + drops
         // the provider without panicking, which is the entire

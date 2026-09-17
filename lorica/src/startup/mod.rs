@@ -883,7 +883,7 @@ pub(crate) fn build_notify_dispatcher(
 /// `GlobalSettings`. No-op when the `otel` Cargo feature is off, the
 /// settings row cannot be read, or `otlp_endpoint` is unset / blank.
 ///
-/// Must be called from inside a Tokio runtime — the OTLP batch
+/// Must be called from inside a Tokio runtime - the OTLP batch
 /// exporter spawns a background flush task. `role` is a free-form
 /// label (`"supervisor"`, `"worker"`, `"single-process"`) included in
 /// the startup log line so multi-process installs can tell which

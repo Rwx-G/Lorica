@@ -125,6 +125,10 @@ rcgen = "0.14"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pki-types = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
+# Scratch directories for the capture sink tests. Already a
+# dev-dependency of lorica-api, lorica-config and lorica-geoip, so it
+# adds nothing to the lock file; it replaces a hand-rolled TempDir.
+tempfile = "3"
 
 [[bench]]
 name = "circuit_breaker"

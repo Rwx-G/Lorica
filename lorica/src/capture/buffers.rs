@@ -33,8 +33,8 @@
 
 use std::sync::Arc;
 
-use super::budget::{CaptureBudget, CaptureReservation};
-use super::rules::CompiledCaptureRule;
+use super::node_ceiling::{CaptureBudget, CaptureReservation};
+use super::rules::{CompiledCaptureRule, CompiledCaptureRules};
 
 /// Why a direction holds no bytes although a rule asked for it.
 ///
@@ -146,11 +146,14 @@ impl CaptureBody {
             *self = Self::Skipped(CaptureSkip::Budget);
             return;
         }
-        // `reserve_exact` rather than letting `extend_from_slice` grow
-        // the vector by doubling: the budget counts the bytes kept, so
-        // the allocation has to match the accounting instead of
-        // overshooting it by up to the buffer's own size.
-        bytes.reserve_exact(keep);
+        // Plain amortised growth, no manual reserve. Reserving `cap` on
+        // the first chunk removed the repeated copying but made a rule
+        // at the 4 MiB ceiling allocate 4 MiB per direction per
+        // in-flight capture for a ten-byte body, and the node ceiling
+        // counts bytes HELD rather than capacity, so that memory was
+        // unaccounted. `Vec`'s doubling keeps capacity within 2x the
+        // bytes held, which the ceiling therefore bounds to within a
+        // factor of two, and the copying is amortised to O(n).
         bytes.extend_from_slice(&chunk[..keep]);
         if keep < chunk.len() {
             *truncated = true;
@@ -179,6 +182,23 @@ pub struct CaptureState {
     /// borrowed rules because the configuration snapshot they came from
     /// can be swapped while the request is in flight.
     pub rule_ids: Vec<String>,
+    /// The route the request was admitted on.
+    ///
+    /// Recorded here because the proxy's own `route_id` is set in
+    /// `upstream_peer`, which a refused request never reaches: every
+    /// early return from `request_filter` (a WAF block, a rate limit, a
+    /// 403 from an IP list, a redirect) would otherwise arrive at
+    /// `logging` with no route to look rules up by, and the exchange the
+    /// operator most wanted would be the one nothing recorded.
+    route_id: String,
+    /// The compiled set the admission was taken from.
+    ///
+    /// An `Arc` clone of the snapshot's own set, so `logging` reads the
+    /// rules that considered this request rather than whatever a reload
+    /// installed while it was in flight. Cheap: one refcount bump per
+    /// captured request, and it keeps the generation alive only as long
+    /// as the exchange it judged.
+    rules: Arc<CompiledCaptureRules>,
     /// The request body, as far as the rules wanted it.
     pub request: CaptureBody,
     /// The response body, as far as the rules wanted it.
@@ -203,8 +223,14 @@ impl CaptureState {
     /// shared, so anything smaller would silently truncate the record of
     /// the rule with the wider cap, and every rule reading a prefix of
     /// the same bytes is exactly what it asked for.
+    ///
+    /// `rules` is the snapshot's compiled set and `route_id` the route
+    /// that matched; both are kept so the emit side can find the same
+    /// rules again without depending on a field a later hook sets.
     pub fn new(
         budget: &Arc<CaptureBudget>,
+        rules: &Arc<CompiledCaptureRules>,
+        route_id: &str,
         candidates: &[&CompiledCaptureRule],
     ) -> Option<CaptureState> {
         if candidates.is_empty() {
@@ -222,6 +248,8 @@ impl CaptureState {
             .max();
         Some(CaptureState {
             rule_ids: candidates.iter().map(|c| c.rule.id.clone()).collect(),
+            route_id: route_id.to_string(),
+            rules: Arc::clone(rules),
             request: CaptureBody::new(request_cap),
             response: CaptureBody::new(response_cap),
             request_received: 0,
@@ -247,6 +275,25 @@ impl CaptureState {
         self.response.skip_with(reason, &mut self.reservation);
     }
 
+    /// The route this request was admitted on.
+    pub fn route_id(&self) -> &str {
+        &self.route_id
+    }
+
+    /// Every rule on the admitting route, from the snapshot that
+    /// admitted the request.
+    ///
+    /// This is what the emit side measures `emit` against. Reading the
+    /// route from here rather than from the proxy context is what lets a
+    /// refused request (a WAF block, a 403, a 429) still be recorded:
+    /// those never reach the hook that sets the context's route. Reading
+    /// the rules from the snapshot kept here rather than from a fresh
+    /// `load()` is what keeps a reload mid-request from judging the
+    /// exchange against rules that did not admit it.
+    pub fn admitted_rules(&self) -> &[CompiledCaptureRule] {
+        self.rules.rules_for_route(&self.route_id)
+    }
+
     /// Bytes this request currently holds against the node budget.
     pub fn held_bytes(&self) -> usize {
         self.reservation.held()
@@ -256,7 +303,7 @@ impl CaptureState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::CompiledCaptureRules;
+    use crate::capture::{CompiledCaptureRule, CompiledCaptureRules};
     use chrono::{DateTime, Duration, Utc};
     use lorica_config::models::{
         CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput, CaptureRedaction, CaptureRule,
@@ -304,7 +351,7 @@ mod tests {
     /// The state a request on `route-1` would carry under `rules`,
     /// going through the same candidate gate the proxy uses.
     fn state_for(budget: &Arc<CaptureBudget>, rules: &[CaptureRule]) -> Option<CaptureState> {
-        let compiled = CompiledCaptureRules::compile(rules);
+        let compiled = Arc::new(CompiledCaptureRules::compile(rules));
         let candidates = compiled.candidates_for_request(
             "route-1",
             "POST",
@@ -315,7 +362,7 @@ mod tests {
                 .expect("test setup: a literal address parses"),
             now(),
         );
-        CaptureState::new(budget, &candidates)
+        CaptureState::new(budget, &compiled, "route-1", &candidates)
     }
 
     /// Feed a body through the request path the way the proxy hook
@@ -334,6 +381,74 @@ mod tests {
             forwarded.extend_from_slice(&out);
         }
         forwarded
+    }
+
+    #[test]
+    fn a_rule_watching_4xx_emits_on_a_refusal_the_proxy_never_routed() {
+        // The proxy's own `route_id` is set in `upstream_peer`, which a
+        // request refused inside `request_filter` (a WAF block, a 403
+        // from an IP list, a 429) never reaches. The state carries the
+        // admitting route itself, so the emit side still finds the rule.
+        let budget = CaptureBudget::new(1024 * 1024);
+        let mut refusing = rule("cap-4xx", 64, 64);
+        refusing.emit.status = vec![StatusMatch::ClientError];
+        let state = state_for(&budget, &[refusing]).expect("the rule matches this request");
+
+        assert_eq!(state.route_id(), "route-1");
+        let emitting: Vec<&CompiledCaptureRule> = state
+            .admitted_rules()
+            .iter()
+            .filter(|candidate| state.rule_ids.iter().any(|id| id == &candidate.rule.id))
+            .filter(|candidate| candidate.should_emit(403, 0, false))
+            .collect();
+        assert_eq!(emitting.len(), 1, "the 403 is recorded");
+        assert_eq!(emitting[0].rule.id, "cap-4xx");
+    }
+
+    #[test]
+    fn a_reload_mid_request_does_not_change_the_rules_that_admitted_it() {
+        let budget = CaptureBudget::new(1024 * 1024);
+        let state =
+            state_for(&budget, &[rule("cap-1", 64, 64)]).expect("the rule matches this request");
+        // A reload installs a snapshot with the rule gone. The state
+        // holds the generation that admitted, so the exchange is still
+        // judged against the rule that asked for it.
+        let after_reload = Arc::new(CompiledCaptureRules::compile(&[]));
+        assert!(after_reload.rules_for_route("route-1").is_empty());
+        assert_eq!(state.admitted_rules().len(), 1);
+        assert_eq!(state.admitted_rules()[0].rule.id, "cap-1");
+    }
+
+    #[test]
+    fn a_chunked_body_grows_amortised_and_reserves_exactly_the_bytes_kept() {
+        // A rule at the 4 MiB ceiling must not allocate 4 MiB for a
+        // body of a few hundred bytes: capacity follows the bytes held,
+        // within the factor of two `Vec`'s doubling costs, so the node
+        // ceiling (which counts bytes held) bounds the real memory too.
+        let budget = CaptureBudget::new(1024 * 1024);
+        let mut state = state_for(&budget, &[rule("cap-1", 4 * 1024 * 1024, 64)])
+            .expect("the rule matches this request");
+        for _ in 0..17 {
+            state.push_request(&[b'x'; 16]);
+        }
+        match &state.request {
+            CaptureBody::Buffered { bytes, .. } => {
+                assert_eq!(bytes.len(), 16 * 17);
+                assert!(
+                    bytes.capacity() <= 2 * bytes.len(),
+                    "capacity {} is more than twice the {} bytes held",
+                    bytes.capacity(),
+                    bytes.len()
+                );
+            }
+            other => panic!("expected a buffered direction, got {other:?}"),
+        }
+        assert_eq!(
+            state.held_bytes(),
+            16 * 17,
+            "the reservation is exactly the bytes kept"
+        );
+        assert_eq!(budget.in_flight(), 16 * 17);
     }
 
     #[test]

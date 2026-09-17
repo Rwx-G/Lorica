@@ -617,45 +617,15 @@ impl ProxyConfig {
             }
         }
 
-        // Parse trusted proxy CIDRs, skipping invalid entries with a warning.
-        // Bare IPs (no /prefix) are converted to single-host networks.
-        let trusted_proxies: Vec<ipnet::IpNet> = trusted_proxy_cidrs
-            .iter()
-            .filter_map(|s| {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                // Try CIDR first, then bare IP -> single-host net
-                if let Ok(net) = trimmed.parse::<ipnet::IpNet>() {
-                    Some(net)
-                } else if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
-                    Some(ipnet::IpNet::from(ip))
-                } else {
-                    warn!(entry = %trimmed, "ignoring invalid trusted_proxies entry");
-                    None
-                }
-            })
-            .collect();
-
-        // Parse WAF whitelist CIDRs (same logic as trusted proxies)
-        let waf_whitelist: Vec<ipnet::IpNet> = waf_whitelist_cidrs
-            .iter()
-            .filter_map(|s| {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                if let Ok(net) = trimmed.parse::<ipnet::IpNet>() {
-                    Some(net)
-                } else if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
-                    Some(ipnet::IpNet::from(ip))
-                } else {
-                    warn!(entry = %trimmed, "ignoring invalid waf_whitelist_ips entry");
-                    None
-                }
-            })
-            .collect();
+        // Both lists answer to the workspace's one address parser,
+        // `lorica_config::connection_filter::parse_cidr`, through the
+        // data plane's skip-and-warn wrapper. A CIDR, a bare address
+        // promoted to its single-host network, a blank dropped in
+        // silence, anything else skipped with the field named.
+        let trusted_proxies: Vec<ipnet::IpNet> =
+            super::filters::parse_cidrs_skipping(&trusted_proxy_cidrs, "trusted_proxies");
+        let waf_whitelist: Vec<ipnet::IpNet> =
+            super::filters::parse_cidrs_skipping(&waf_whitelist_cidrs, "waf_whitelist_ips");
 
         // Story 10.1 AC #7: every operator pattern in a capture rule is
         // compiled here, with the snapshot, so a request only ever reads

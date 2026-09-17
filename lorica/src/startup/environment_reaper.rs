@@ -22,7 +22,8 @@
 //! fleet. The gate is checked twice: at spawn, on the fleet role the
 //! process started with, and at every tick, on the stored identity,
 //! so a node that joins a fleet after boot stops sweeping without a
-//! restart.
+//! restart. Both checks answer to `ConfigStore::is_follower`, which
+//! owns the one fail-closed disposition a read failure gets.
 //!
 //! The sweep itself lives in `lorica_api::automation`, beside the
 //! `DELETE` handler, so both remove exactly the same rows in the same
@@ -33,6 +34,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lorica_api::cluster::ClusterRuntime;
+use lorica_api::db::db_blocking;
+use lorica_api::error::ApiError;
 use lorica_config::ConfigStore;
 use tokio::sync::{watch, Mutex};
 use tokio_util::task::TaskTracker;
@@ -87,18 +90,29 @@ pub fn spawn_environment_reaper(
     }))
 }
 
-/// Whether the store now holds a follower identity. A read failure
-/// counts as a follower: sweeping on a node whose role is unknown is
-/// the worse mistake, and the next tick reads again.
+/// Whether the store now holds a follower identity, read off the
+/// blocking pool.
+///
+/// The disposition on a read failure belongs to
+/// [`ConfigStore::is_follower`], not here: every caller of that
+/// helper answers a read failure with "follower", so a sweep that
+/// invented its own answer would be the fourth disposition the audit
+/// counted.
+///
+/// The read itself goes through [`db_blocking`] because a SQLite
+/// query is blocking work: run inline under `store.lock().await` it
+/// parks a runtime worker thread, which is what every sibling sweep
+/// in this crate already avoids. A join failure is the only error
+/// this can return, and it fails closed for the same reason.
 async fn is_follower_now(store: &Arc<Mutex<ConfigStore>>) -> bool {
-    let guard = store.lock().await;
-    match guard.get_cluster_identity() {
-        Ok(identity) => identity.is_some(),
-        Err(e) => {
-            warn!(error = %e, "environment reaper could not read the fleet identity; skipping this sweep");
-            true
-        }
-    }
+    db_blocking(store, |store| {
+        Ok::<bool, ApiError>(store.is_follower())
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "environment reaper could not read the fleet identity; skipping this sweep");
+        true
+    })
 }
 
 #[cfg(test)]

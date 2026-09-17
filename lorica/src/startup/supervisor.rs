@@ -1949,7 +1949,7 @@ fn spawn_worker_channel_task(
                                 // Pair up the flat ["k","v","k","v",...]
                                 // list back into (String, String) label
                                 // pairs. Odd trailing entries are
-                                // silently dropped — safe default
+                                // silently dropped - safe default
                                 // since a truncated wire payload
                                 // just skips the affected metric.
                                 let gc: Vec<GenericCounterRow> =
@@ -2567,7 +2567,7 @@ async fn handle_breaker_report(
 // result is that the divergence window between workers collapses
 // from ~10-50 ms down to the UDS RTT between workers (microseconds).
 //
-// A failed Prepare aborts the whole reload — workers that did reply
+// A failed Prepare aborts the whole reload - workers that did reply
 // Ok to Prepare are asked to drop their pending slot via a best-effort
 // Commit of the *same* generation so they don't leak a stale pending
 // entry across a subsequent reload.

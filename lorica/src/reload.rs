@@ -99,6 +99,13 @@ pub fn commit_prepared_reload(
         .values()
         .flat_map(|entries| entries.iter().map(|e| e.route.id.clone()))
         .collect();
+    // `lorica_capture_rules_active` is published HERE, at the one place
+    // that arms a snapshot, rather than inside
+    // `CompiledCaptureRules::compile`. The count is the compiled one,
+    // not the stored one: a rule whose pattern does not compile is
+    // dropped by `compile`, so what the node is armed with and what the
+    // database holds are not the same number.
+    lorica_api::metrics::set_capture_rules_active(prepared.config.capture_rules.rule_count() as i64);
     proxy_config.store(Arc::new(prepared.config));
     crate::proxy_wiring::mirror_rewrite::retain_mirror_route_semaphores(&live_route_ids);
     if let Some(filter) = connection_filter {
@@ -182,6 +189,40 @@ pub async fn apply_per_process_reload_state(store: &Arc<Mutex<ConfigStore>>) {
     apply_bot_secret_from_store(store).await;
     rebuild_merged_crawlers(store).await;
     apply_log_sinks_from_store(store).await;
+    apply_automation_allowlist_from_store(store).await;
+}
+
+/// Re-apply `automation_allowed_cidrs` to the automation listener this
+/// process runs, if it runs one.
+///
+/// The allowlist used to be read once, when the socket opened. An
+/// operator narrowing it after an incident got no effect until the
+/// next restart, and nothing in the logs said so. It belongs in this
+/// bundle for the same reason the GeoIP path and the OTel exporter do:
+/// it is per-process state derived from the settings, and every reload
+/// path already calls this function.
+///
+/// A no-op on every process that runs no automation listener, which is
+/// every worker and every node that did not pass `--automation-listen`.
+/// A list that is empty or carries an unreadable entry leaves the
+/// previous allowlist in place and logs at ERROR; the listener never
+/// fails open, live or at start.
+async fn apply_automation_allowlist_from_store(store: &Arc<Mutex<ConfigStore>>) {
+    let allowed_cidrs: Vec<String> = {
+        let guard = store.lock().await;
+        match guard.get_global_settings() {
+            Ok(settings) => settings.automation_allowed_cidrs,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "could not read the global settings for the automation source allowlist; \
+                     the previous allowlist still applies"
+                );
+                return;
+            }
+        }
+    };
+    lorica_api::automation::listener::reload_automation_source_policy(&allowed_cidrs);
 }
 
 /// Supervisor-only alias for [`apply_per_process_reload_state`].
@@ -280,7 +321,7 @@ fn reresolve_environment_certificates(
 }
 
 /// Hot-reload the ASN resolver from `GlobalSettings.asn_db_path`.
-/// Same pattern as `apply_geoip_settings_from_store` — parallels
+/// Same pattern as `apply_geoip_settings_from_store` - parallels
 /// are intentional so both DBs follow one operator-visible model.
 pub(crate) async fn apply_asn_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
     use std::sync::OnceLock;
@@ -360,14 +401,14 @@ pub(crate) async fn apply_asn_settings_from_store(store: &Arc<Mutex<ConfigStore>
 /// install before the bot-protection feature has ever been
 /// enabled), this helper generates a random 32-byte secret, writes
 /// it back to the DB, and installs it in memory. Subsequent
-/// reloads read the same hex and install it (idempotent — dedup is
+/// reloads read the same hex and install it (idempotent - dedup is
 /// by value, not by "already run once").
 ///
 /// Failure modes:
 /// - Hex in the DB is malformed / wrong length: `warn!`, generate a
 ///   fresh one, overwrite. A hand-edited bad row cannot leave the
 ///   secret slot empty. Outstanding cookies signed with the
-///   previous (good) bytes stop validating — acceptable degradation
+///   previous (good) bytes stop validating - acceptable degradation
 ///   for a corrupt config.
 /// - DB write failure: `warn!`, leave the in-memory slot alone.
 ///   The process serves traffic with whatever secret is installed
@@ -448,7 +489,7 @@ pub(crate) async fn apply_bot_secret_from_store(store: &Arc<Mutex<ConfigStore>>)
 }
 
 /// Parse a 64-char hex string into a fixed 32-byte secret. Returns
-/// `None` on malformed hex or wrong length — callers treat that as
+/// `None` on malformed hex or wrong length - callers treat that as
 /// "regenerate". Kept module-private because the wire format is an
 /// internal contract between `GlobalSettings.bot_hmac_secret_hex`
 /// and the in-memory slot.
@@ -1251,7 +1292,7 @@ mod bot_secret_hex_tests {
     #[test]
     fn parse_trims_surrounding_whitespace() {
         // Hex copied from the dashboard form field often carries a
-        // trailing newline — the helper strips it.
+        // trailing newline - the helper strips it.
         let hex = format!("  {}\n", "0".repeat(64));
         parse_bot_secret_hex(&hex).expect("trimmed hex must decode");
     }

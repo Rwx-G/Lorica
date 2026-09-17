@@ -412,7 +412,7 @@ impl LoricaProxy {
     /// task walks the map on `interval` and drops any bucket whose
     /// `last_activity_ns` is older than `idle_ttl`. A future request
     /// from the same key reconstructs a fresh bucket, which starts
-    /// at full capacity — acceptable (and arguably desirable) since
+    /// at full capacity - acceptable (and arguably desirable) since
     /// the client has been idle past the TTL anyway.
     pub fn spawn_rate_limit_prune(
         &self,
@@ -434,7 +434,7 @@ impl LoricaProxy {
                     }
                     RateLimitEngine::Local(_) => {
                         // Worker mode: the supervisor sync task drops
-                        // entries via take_delta returning 0 — the local
+                        // entries via take_delta returning 0 - the local
                         // cache is kept small by the sync loop walking
                         // it. Eviction is supervisor-side (future
                         // follow-up: forward idle-key hints from
@@ -668,7 +668,7 @@ impl ProxyHttp for LoricaProxy {
 
         // Build the per-request tracing span. With the `otel` feature
         // on, the tracing_opentelemetry bridge mirrors this into an
-        // OTel span via `on_new_span` *at span creation time* — and
+        // OTel span via `on_new_span` *at span creation time* - and
         // the bridge latches `trace_id` right then from the currently-
         // attached OTel Context. Calling `OpenTelemetrySpanExt::set_parent`
         // AFTER creation only updates `OtelData.parent_cx`, not the
@@ -679,7 +679,7 @@ impl ProxyHttp for LoricaProxy {
         // Fix: attach the W3C remote span context as the current
         // OTel context BEFORE `info_span!` expansion, via
         // `Context::attach()`. The guard lives just long enough for
-        // the macro to evaluate — `on_new_span` reads
+        // the macro to evaluate - `on_new_span` reads
         // `Context::current()`, picks up our remote parent, and
         // bakes the client's trace_id into the builder. We drop the
         // guard as the `info_span!` expression returns, so nothing
@@ -859,9 +859,21 @@ impl ProxyHttp for LoricaProxy {
                     client_ip,
                     chrono::Utc::now(),
                 );
-                ctx.capture =
-                    crate::capture::CaptureState::new(crate::capture::node_budget(), &candidates)
-                        .map(Box::new);
+                // The route and the compiled set travel WITH the state.
+                // `ctx.route_id` is only set in `upstream_peer`, which
+                // every early return below (websocket gate, redirect,
+                // rate limit, mTLS, forward_auth, maintenance, basic
+                // auth, return_status, robots, IP lists, AI bot, geoip,
+                // bot protection, WAF) skips, so `logging` would
+                // otherwise have no route to look the rules up by and a
+                // rule watching 4xx could never record a refusal.
+                ctx.capture = crate::capture::CaptureState::new(
+                    crate::capture::node_budget(),
+                    &config.capture_rules,
+                    &entry.route.id,
+                    &candidates,
+                )
+                .map(Box::new);
             }
 
             // Block WebSocket upgrades if disabled on this route
@@ -2388,7 +2400,7 @@ impl ProxyHttp for LoricaProxy {
         // node-wide budget through the reservation's `Drop`. There is no
         // release function anyone could forget to call, and no path that
         // can carry the bytes past this hook.
-        let mut capture = ctx.capture.take();
+        let capture = ctx.capture.take();
 
         let elapsed = ctx.start_time.elapsed();
         let downstream = session.as_downstream();
@@ -2457,7 +2469,7 @@ impl ProxyHttp for LoricaProxy {
         // bridge picks them up on span close and exports the OTel
         // span with the full attribute set. The span itself is
         // closed automatically when `request_filter` returns and the
-        // implicit `#[instrument]` guard drops — no explicit `end()`
+        // implicit `#[instrument]` guard drops - no explicit `end()`
         // call needed (the bridge runs on the layer's `on_close`).
         {
             let span = &ctx.root_tracing_span;
@@ -2540,14 +2552,15 @@ impl ProxyHttp for LoricaProxy {
         // `output` rides along: it is the one thing the sinks need that
         // the record does not carry.
         let mut capture_records: Vec<crate::capture::CaptureEmission> = Vec::new();
-        if let (Some(state), Some(entry)) = (capture.as_mut(), access_entry.as_ref()) {
+        if let (Some(state), Some(entry)) = (capture.as_deref(), access_entry.as_ref()) {
             let upstream_error = e.is_some_and(|err| err.esource() == &ErrorSource::Upstream);
-            let config = self.config.load();
-            let rules = ctx
-                .route_id
-                .as_deref()
-                .map(|route_id| config.capture_rules.rules_for_route(route_id))
-                .unwrap_or_default();
+            // The route and the compiled set come from the state, not
+            // from `ctx.route_id` and a fresh `self.config.load()`. The
+            // context's route is `None` on every refusal that returned
+            // before `upstream_peer`, and a reload between admission and
+            // here would otherwise judge the exchange against a
+            // generation that never saw it.
+            let rules = state.admitted_rules();
             let response = session.as_downstream().response_written();
             // The budgets are spent HERE and nowhere else, one call per
             // rule that would emit. `admit` is the single critical

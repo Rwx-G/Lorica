@@ -459,14 +459,24 @@ pub(crate) fn run_cluster_leave(
                 "identity_wiped": wiped,
                 "reason": "control plane deregistered this node",
             });
-            rt.block_on(record_with_store(
-                log_store,
-                &ctx,
-                "cluster.node.leave",
-                ("cluster_node", &identity.node_id),
-                None,
-                Some(&after),
-            ));
+            rt.block_on(async {
+                record_with_store(
+                    log_store.clone(),
+                    &ctx,
+                    "cluster.node.leave",
+                    ("cluster_node", &identity.node_id),
+                    None,
+                    Some(&after),
+                )
+                .await;
+                // `record_with_store` only enqueues. This process is
+                // about to exit, so without the flush the row would
+                // die with the writer thread and the leave would be
+                // audited on the control plane only.
+                if let Some(log_store) = &log_store {
+                    let _ = log_store.flush_audit().await;
+                }
+            });
             println!(
                 "Node {} left the fleet. Restart lorica so it runs standalone.",
                 identity.node_id

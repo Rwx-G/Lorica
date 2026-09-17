@@ -278,14 +278,15 @@ impl CompiledCaptureRules {
                 ),
             }
         }
-        let set = Self { by_route };
-        // `lorica_capture_rules_active` is published here rather than by
-        // the caller because this is the one place that knows what the
-        // node ended up armed with: a rule can be dropped for a pattern
-        // that does not compile, so the stored count and the running
-        // count are not the same number.
-        lorica_api::metrics::set_capture_rules_active(set.rule_count() as i64);
-        set
+        // No metric is published here. `compile` is a pure function of
+        // its argument on purpose: it runs in tests, in doctests and
+        // once per candidate snapshot, and writing the process-global
+        // `lorica_capture_rules_active` from all of those made the
+        // gauge a value any concurrent test could move under the
+        // worker report that reads it. The publish belongs to the one
+        // place that installs a snapshot, `reload::commit_prepared_reload`,
+        // which reads `rule_count()` off the set it is about to arm.
+        Self { by_route }
     }
 
     /// Whether the set holds no rule at all.

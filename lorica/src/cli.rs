@@ -325,9 +325,9 @@ pub(crate) enum AutomationTokenAction {
         hostnames: Vec<String>,
 
         /// A CIDR (or bare address) the token may point a hostname
-        /// at. Repeat the flag for each one. Omit for the node's
-        /// default backend policy.
-        #[arg(long = "backend-cidr")]
+        /// at. Repeat the flag for each one; at least one is
+        /// required.
+        #[arg(long = "backend-cidr", required = true)]
         backend_cidrs: Vec<String>,
 
         /// Ceiling, in seconds, on the lifetime any environment this
@@ -1259,6 +1259,30 @@ mod tests {
         let child = Cli::parse_from(original.hot_upgrade_argv("/tmp/lorica.new", 1));
         assert_eq!(child.automation_listen, original.automation_listen);
         assert!(child.automation_listen_any);
+    }
+
+    #[test]
+    fn minting_a_token_without_a_backend_cidr_is_refused_at_parse_time() {
+        // There is no node-wide default backend policy to fall back
+        // on any more, and the server refuses an empty grant, so the
+        // CLI has to refuse it here rather than send a mint that
+        // cannot succeed.
+        let argv = [
+            "lorica",
+            "automation",
+            "token",
+            "create",
+            "--name",
+            "ci",
+            "--scope",
+            "environments:write",
+            "--hostname",
+            "*.review.example.com",
+        ];
+        assert!(Cli::try_parse_from(argv).is_err());
+        let mut with_cidr = argv.to_vec();
+        with_cidr.extend(["--backend-cidr", "10.0.0.0/8"]);
+        assert!(Cli::try_parse_from(with_cidr).is_ok());
     }
 
     const RESERVED: ReservedPorts = ReservedPorts {

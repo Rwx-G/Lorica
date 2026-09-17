@@ -62,25 +62,51 @@ pub fn ip_to_shmem_key(ip: &str) -> u64 {
     }
 }
 
-/// Precompile a list of allow/deny patterns (bare IPs or CIDRs) into
+/// Parse an operator's address list for the data plane, skipping what
+/// the shared parser cannot read.
+///
+/// The RULE is
+/// [`lorica_config::connection_filter::parse_cidr`]: one definition of
+/// what an address entry is, shared with the TCP pre-filter, the
+/// settings validators and the automation listener. A CIDR is a CIDR,
+/// a bare address is its single-host network, and surrounding
+/// whitespace is ignored.
+///
+/// The DISPOSITION is the runtime one: a bad entry is skipped with a
+/// WARN naming `field`, and the rest of the list stands. These lists
+/// are already stored, so failing the whole reload on one typo would
+/// turn a stale settings row into an outage. The validators at the
+/// write boundary are where a typo is refused.
+///
+/// A blank line is whitespace, not a rule somebody lost, so it is
+/// dropped without a warning.
+pub(crate) fn parse_cidrs_skipping(entries: &[String], field: &str) -> Vec<ipnet::IpNet> {
+    entries
+        .iter()
+        .filter_map(
+            |entry| match lorica_config::connection_filter::parse_cidr(entry) {
+                Ok(net) => Some(net),
+                Err(_) if entry.trim().is_empty() => None,
+                Err(reason) => {
+                    warn!(field, %reason, "ignoring invalid address entry");
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+/// Precompile a route's allow/deny patterns (bare IPs or CIDRs) into
 /// `IpNet` ranges once at config-reload time, so `check_ip_allow_deny`
 /// does not re-parse every entry on each request (audit hot-path finding).
 /// A bare IP becomes a host route (`/32` or `/128`), matching the
 /// exact-equality semantics of `ip_matches` for well-formed client IPs.
-/// Unparseable patterns are dropped; the caller keeps the original list's
-/// emptiness as the allowlist gate, so an all-malformed allowlist still
-/// blocks (fail-closed) rather than degrading to allow-all.
+/// Unparseable patterns are dropped by [`parse_cidrs_skipping`]; the
+/// caller keeps the original list's emptiness as the allowlist gate, so
+/// an all-malformed allowlist still blocks (fail-closed) rather than
+/// degrading to allow-all.
 pub(crate) fn compile_ip_patterns(patterns: &[String]) -> Vec<ipnet::IpNet> {
-    patterns
-        .iter()
-        .filter_map(|p| {
-            if p.contains('/') {
-                p.parse::<ipnet::IpNet>().ok()
-            } else {
-                p.parse::<std::net::IpAddr>().ok().map(ipnet::IpNet::from)
-            }
-        })
-        .collect()
+    parse_cidrs_skipping(patterns, "route ip_allowlist / ip_denylist")
 }
 
 /// Build the `Location` header value for a `redirect_to` rule.
@@ -2338,6 +2364,51 @@ mod tests {
     use super::*;
     use ipnet::IpNet;
     use regex::Regex;
+
+    /// The three data-plane address lists (trusted proxies, WAF
+    /// whitelist, per-route allow/deny) used to carry three copies of
+    /// "CIDR, else bare IP, else drop". They now share one parser, so
+    /// this pins the contract for all three: a CIDR is kept, a bare
+    /// address becomes its single-host network, a typo is skipped and
+    /// the rest of the list survives it.
+    #[test]
+    fn the_data_plane_address_lists_share_one_parser() {
+        for field in ["trusted_proxies", "waf_whitelist_ips", "route ip_allowlist"] {
+            let nets = parse_cidrs_skipping(
+                &[
+                    "10.0.0.0/8".to_string(),
+                    "192.0.2.10".to_string(),
+                    "2001:db8::/32".to_string(),
+                    "  ".to_string(),
+                    "not-an-address".to_string(),
+                    "10.0.0.0/33".to_string(),
+                ],
+                field,
+            );
+            assert_eq!(
+                nets,
+                vec![
+                    "10.0.0.0/8".parse::<IpNet>().expect("test cidr"),
+                    "192.0.2.10/32".parse::<IpNet>().expect("test host route"),
+                    "2001:db8::/32".parse::<IpNet>().expect("test v6 cidr"),
+                ],
+                "{field}: a bad entry is skipped, never fatal, and a bare address is a /32"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_allowlist_of_only_typos_compiles_to_nothing() {
+        // The emptiness of the COMPILED list is not the allowlist
+        // gate: the caller reads the original list's emptiness, so an
+        // all-malformed allowlist blocks instead of degrading to
+        // allow-all. This pins the compile half of that contract.
+        assert!(compile_ip_patterns(&["10.0.0.0/33".to_string()]).is_empty());
+        assert_eq!(
+            compile_ip_patterns(&["203.0.113.7".to_string(), "bad".to_string()]),
+            vec!["203.0.113.7/32".parse::<IpNet>().expect("test host route")]
+        );
+    }
 
     fn crawler(name: &str, verification: MergedVerification) -> MergedCrawler {
         MergedCrawler {

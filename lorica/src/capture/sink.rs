@@ -23,15 +23,17 @@
 //!    rolling file behind a non-blocking writer) in whatever format
 //!    `--log-format` selected. This is the default output and it is
 //!    always on.
-//! 2. The recent-captures ring of `lorica_api::capture_ring`, which
-//!    the dashboard reads. Process-local, bounded, cannot fail: a push
-//!    is a `VecDeque` operation under a mutex nothing else holds for
-//!    longer than a handful of `Arc` clones.
-//! 3. The log-export lanes of `lorica_api::log_sinks`: syslog and OTLP
+//! 2. The log-export lanes of `lorica_api::log_sinks`: syslog and OTLP
 //!    logs, each a `try_send` into a bounded queue. The proxy reaches
 //!    the hub the same way it does for access-log rows: the hub is a
 //!    process-global installed by the reload path, and `publish_*` is
-//!    the whole handle.
+//!    the whole handle. This is the only output that wants the record
+//!    as a `serde_json::Value`, so that conversion happens under its
+//!    `wants` check and nowhere else.
+//! 3. The recent-captures ring of `lorica_api::capture_ring`, which
+//!    the dashboard reads. Process-local, bounded, cannot fail: a push
+//!    is a `VecDeque` operation under a mutex nothing else holds for
+//!    longer than a handful of `Arc` clones.
 //! 4. The rule's `output.dir`: one file per capture, written by a
 //!    dedicated thread fed through a bounded channel. The write itself
 //!    is the only output that touches a disk, and it is the only one
@@ -71,7 +73,10 @@
 //! the running user (`lorica` under the shipped unit). The directory
 //! must already exist: the writer never creates it, because a directory
 //! that appears at the first capture is a directory nobody set the
-//! permissions on. The document is written to a hidden temporary name
+//! permissions on. It must also not BE a symlink, checked on every
+//! write rather than once when the rule is stored, so a link planted at
+//! an operator-supplied path after validation cannot redirect the
+//! captures that follow. The document is written to a hidden temporary name
 //! in the same directory with `create_new`, flushed to disk, then
 //! published under its final name with `hard_link`, which fails when
 //! the name is taken. That gives the final name the `create_new`
@@ -162,14 +167,15 @@ pub fn emit_captures(
     trace_id: Option<&str>,
     span_id: Option<&str>,
 ) {
+    let ring = node_capture_ring();
     for emission in emissions {
-        emit_one(
-            emission,
-            trace_id,
-            span_id,
-            node_dir_writer(),
-            node_capture_ring(),
-        );
+        // The `OnceLock` is touched only for a record that has a
+        // directory to go to, which is what starts the writer thread.
+        // Reaching for it unconditionally would spawn a thread on every
+        // node that captures at all, including the ones whose rules only
+        // ever reach the log and the ring.
+        let dir_writer = emission.output.dir.as_ref().map(|_| node_dir_writer());
+        emit_one(emission, trace_id, span_id, dir_writer, ring);
     }
 }
 
@@ -177,7 +183,7 @@ fn emit_one(
     emission: CaptureEmission,
     trace_id: Option<&str>,
     span_id: Option<&str>,
-    dir_writer: &CaptureDirWriter,
+    dir_writer: Option<&CaptureDirWriter>,
     ring: &CaptureRing,
 ) {
     let CaptureEmission { record, output } = emission;
@@ -185,8 +191,8 @@ fn emit_one(
     // struct keeps its field order and a `Value` sorts its keys, and
     // the record's byte-identity promise covers the file, the log
     // line and the download.
-    let text = match serde_json::to_string(&record) {
-        Ok(text) => text,
+    let text: Arc<str> = match serde_json::to_string(&record) {
+        Ok(text) => Arc::from(text),
         Err(error) => {
             tracing::warn!(
                 target: CAPTURE_TRACING_TARGET,
@@ -212,20 +218,20 @@ fn emit_one(
 
     let file_name = capture_file_name(&record.timestamp, &record.request_id);
 
-    // The ring and the lanes both take the record as a `Value`; it is
-    // built once. A struct that serialised to text above serialises to
-    // a `Value` too, so the `Err` arm is unreachable in practice and
-    // is handled rather than asserted because this is the emit path.
-    match serde_json::to_value(&record) {
-        Ok(document) => {
-            ring.remember(
-                &record.rule_id,
-                &record.request_id,
-                &file_name,
-                document.clone(),
-                text.clone(),
-            );
-            if log_sinks::wants(SinkKind::Capture) {
+    // The file sink is the only consumer that needs the document as
+    // bytes, so the copy is taken only when a directory is configured;
+    // the ring shares the text itself.
+    let file_document: Option<Vec<u8>> = output.dir.as_ref().map(|_| text.as_bytes().to_vec());
+
+    // The export lanes are the only consumer that wants the record as
+    // a `Value`, so it is built only when one is registered: a node
+    // exporting nothing pays one serialisation and no `Value` at all.
+    // A struct that serialised to text above serialises to a `Value`
+    // too, so the `Err` arm is unreachable in practice and is handled
+    // rather than asserted because this is the emit path.
+    if log_sinks::wants(SinkKind::Capture) {
+        match serde_json::to_value(&record) {
+            Ok(document) => {
                 let lost = log_sinks::publish_capture(
                     CaptureSinkRecord {
                         rule_id: record.rule_id.clone(),
@@ -240,27 +246,38 @@ fn emit_one(
                     inc_capture_outcome(&record.rule_id, CAPTURE_DROPPED_SINK_OUTCOME);
                 }
             }
-        }
-        Err(error) => {
-            tracing::warn!(
-                target: CAPTURE_TRACING_TARGET,
-                rule_id = %record.rule_id,
-                error = %error,
-                "capture record failed to serialise for the ring and the export sinks; dropped"
-            );
-            inc_capture_outcome(&record.rule_id, CAPTURE_DROPPED_SINK_OUTCOME);
+            Err(error) => {
+                tracing::warn!(
+                    target: CAPTURE_TRACING_TARGET,
+                    rule_id = %record.rule_id,
+                    error = %error,
+                    "capture record failed to serialise for the export sinks; dropped"
+                );
+                inc_capture_outcome(&record.rule_id, CAPTURE_DROPPED_SINK_OUTCOME);
+            }
         }
     }
 
-    if let Some(dir) = output.dir {
+    // The ring takes the text the log line already built, shared rather
+    // than copied, and derives its listing view only if someone lists.
+    ring.remember(
+        &record.rule_id,
+        &record.request_id,
+        &file_name,
+        Arc::clone(&text),
+    );
+
+    // All three are `Some` together: `file_document` and `dir_writer`
+    // are derived from `output.dir` by the two lines that produced them.
+    if let (Some(dir), Some(document), Some(writer)) = (output.dir, file_document, dir_writer) {
         let job = DirWriteJob {
             dir: PathBuf::from(dir),
             max_dir_bytes: output.max_dir_bytes,
             file_name,
             rule_id: record.rule_id.clone(),
-            document: text.into_bytes(),
+            document,
         };
-        if let Err(refusal) = dir_writer.enqueue(job) {
+        if let Err(refusal) = writer.enqueue(job) {
             tracing::debug!(
                 target: CAPTURE_TRACING_TARGET,
                 rule_id = %record.rule_id,
@@ -331,19 +348,42 @@ pub fn is_capture_file_name(name: &str) -> bool {
         && !request_id.is_empty()
 }
 
+/// The name a capture is written under before it is published.
+///
+/// Hidden, and deliberately NOT ending in `.json`: both the pruner and
+/// any reader of the directory match on that suffix through
+/// [`is_capture_file_name`], so a document still being written is
+/// invisible to them. A test asserts that property rather than trusting
+/// the two sides to keep agreeing.
+fn capture_temp_file_name(file_name: &str) -> String {
+    format!(".{file_name}.tmp")
+}
+
 /// Write `document` under `dir/file_name` as described in the module
 /// doc: temporary name, `create_new`, mode [`CAPTURE_FILE_MODE`],
 /// flushed, then published with `hard_link`. Returns the final path.
 ///
 /// Fails, writing nothing under the final name, when the directory is
-/// missing or not writable, when the disk is full, or when the final
-/// name already exists (`AlreadyExists`). A temporary file never
-/// outlives this call.
+/// missing, is itself a symlink, or is not writable, when the disk is
+/// full, or when the final name already exists (`AlreadyExists`). A
+/// temporary file never outlives this call.
 pub fn write_capture_file(
     dir: &Path,
     file_name: &str,
     document: &[u8],
 ) -> std::io::Result<PathBuf> {
+    // `output.dir` is validated once, when the rule is written. A
+    // symlink planted at that path afterwards would redirect every
+    // capture from then on, under a name and a mode the operator chose
+    // for somewhere else, so the check belongs on the write and not on
+    // the rule. `symlink_metadata` also answers "the directory is
+    // gone", which is the `NotFound` the caller counts as a drop.
+    if dir.symlink_metadata()?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is a symlink", dir.display()),
+        ));
+    }
     let final_path = dir.join(file_name);
     if final_path.symlink_metadata().is_ok() {
         return Err(std::io::Error::new(
@@ -351,7 +391,7 @@ pub fn write_capture_file(
             format!("{} already exists", final_path.display()),
         ));
     }
-    let temp_path = dir.join(format!(".{file_name}.tmp"));
+    let temp_path = dir.join(capture_temp_file_name(file_name));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -603,32 +643,11 @@ mod tests {
     }
 
     /// A fresh directory under the system temp dir, removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("test setup: the clock is after 1970")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "lorica-capture-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&path).expect("test setup: temp dir creates");
-            TempDir(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("lorica-capture-{tag}-"))
+            .tempdir()
+            .expect("test setup: temp dir creates")
     }
 
     const TIMESTAMP: &str = "2026-01-01T00:00:00.123456789+00:00";
@@ -713,7 +732,13 @@ mod tests {
         let writer = CaptureDirWriter::spawn(4, CAPTURE_DIR_QUEUE_MAX_BYTES);
 
         let mut off = log_sinks::register_lane("otlp", true, true, true, false);
-        emit_one(emission("cap-lane-off", None), None, None, &writer, &ring());
+        emit_one(
+            emission("cap-lane-off", None),
+            None,
+            None,
+            Some(&writer),
+            &ring(),
+        );
         assert!(
             off.try_recv().is_err(),
             "a lane with capture off gets nothing"
@@ -729,7 +754,7 @@ mod tests {
             emission("cap-lane-on", None),
             Some("4bf9"),
             Some("00f0"),
-            &writer,
+            Some(&writer),
             &ring(),
         );
         let event = on.try_recv().expect("the lane received the record");
@@ -758,7 +783,7 @@ mod tests {
             emission("cap-lane-gone", None),
             None,
             None,
-            &writer,
+            Some(&writer),
             &ring(),
         );
         assert_eq!(dropped("cap-lane-gone"), 1);
@@ -777,15 +802,17 @@ mod tests {
         log_sinks::install(&log_sinks::LogSinksConfig::default());
         let writer = CaptureDirWriter::spawn(4, CAPTURE_DIR_QUEUE_MAX_BYTES);
         let ring = ring();
-        emit_one(emission("cap-ring", None), None, None, &writer, &ring);
+        emit_one(emission("cap-ring", None), None, None, Some(&writer), &ring);
 
         let entry = ring
             .get(REQUEST_ID, Some("cap-ring"))
             .expect("the record is in the ring");
         assert_eq!(entry.file_name, expected_file_name());
         assert_eq!(
-            entry.document,
-            serde_json::to_string(&record("cap-ring")).expect("a record serialises"),
+            &*entry.document,
+            serde_json::to_string(&record("cap-ring"))
+                .expect("a record serialises")
+                .as_str(),
             "the download is the log line, byte for byte"
         );
         let listed = ring.list();
@@ -853,7 +880,13 @@ mod tests {
         let expected = serde_json::to_string(&record("cap-trace")).expect("a record serialises");
 
         tracing::subscriber::with_default(subscriber, || {
-            emit_one(emission("cap-trace", None), None, None, &writer, &ring());
+            emit_one(
+                emission("cap-trace", None),
+                None,
+                None,
+                Some(&writer),
+                &ring(),
+            );
         });
 
         let seen = tap.seen.lock().expect("event tap lock");
@@ -869,7 +902,7 @@ mod tests {
 
     #[test]
     fn the_directory_writer_names_the_file_sets_its_mode_and_writes_the_record_byte_for_byte() {
-        let dir = TempDir::new("write");
+        let dir = temp_dir("write");
         let document = serde_json::to_vec(&record("cap-file")).expect("a record serialises");
         let name = capture_file_name(TIMESTAMP, REQUEST_ID);
         assert_eq!(name, expected_file_name());
@@ -888,7 +921,7 @@ mod tests {
 
     #[test]
     fn an_existing_name_is_refused_and_left_untouched() {
-        let dir = TempDir::new("exists");
+        let dir = temp_dir("exists");
         let name = expected_file_name();
         std::fs::write(dir.path().join(&name), b"the earlier document").expect("pre-create");
 
@@ -933,7 +966,7 @@ mod tests {
 
     #[test]
     fn pruning_removes_the_oldest_first_keeps_the_newest_and_ignores_foreign_files() {
-        let dir = TempDir::new("prune");
+        let dir = temp_dir("prune");
         let oldest = "20260101T000000.000000000Z-a.json";
         let middle = "20260101T000001.000000000Z-b.json";
         let newest = "20260101T000002.000000000Z-c.json";
@@ -960,7 +993,7 @@ mod tests {
 
     #[test]
     fn pruning_under_budget_removes_nothing_and_a_pass_is_bounded() {
-        let dir = TempDir::new("prune-bounded");
+        let dir = temp_dir("prune-bounded");
         for i in 0..(CAPTURE_PRUNE_MAX_REMOVALS + 10) {
             write_named(
                 dir.path(),
@@ -981,13 +1014,13 @@ mod tests {
     #[test]
     fn the_writer_thread_writes_then_prunes_to_the_rules_budget() {
         let _guard = hub_lock().blocking_lock();
-        let dir = TempDir::new("thread");
+        let dir = temp_dir("thread");
         let older = "20260101T000000.000000000Z-old.json";
         write_named(dir.path(), older, 100_000);
         let writer = CaptureDirWriter::spawn(4, CAPTURE_DIR_QUEUE_MAX_BYTES);
         let mut emission = emission("cap-thread", Some(dir.path()));
         emission.output.max_dir_bytes = Some(50_000);
-        emit_one(emission, None, None, &writer, &ring());
+        emit_one(emission, None, None, Some(&writer), &ring());
 
         let path = dir.path().join(expected_file_name());
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1007,7 +1040,7 @@ mod tests {
     #[test]
     fn a_missing_directory_drops_counts_writes_nothing_and_does_not_panic() {
         let _guard = hub_lock().blocking_lock();
-        let parent = TempDir::new("missing");
+        let parent = temp_dir("missing");
         let missing = parent.path().join("does-not-exist");
         let error = write_capture_file(&missing, &expected_file_name(), b"{}")
             .expect_err("a missing directory is not created");
@@ -1019,7 +1052,7 @@ mod tests {
             emission("cap-missing", Some(&missing)),
             None,
             None,
-            &writer,
+            Some(&writer),
             &ring(),
         );
         assert_eq!(wait_for_drops("cap-missing", 1), 1);
@@ -1027,41 +1060,98 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_directory_drops_and_counts() {
+    fn a_directory_that_refuses_the_write_drops_and_counts() {
         let _guard = hub_lock().blocking_lock();
-        let dir = TempDir::new("readonly");
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
-            .expect("test setup: chmod");
-        // Root ignores directory modes, so the probe decides whether
-        // this container can make a read-only directory at all.
-        if std::fs::write(dir.path().join("probe"), b"x").is_ok() {
-            eprintln!(
-                "skipped: this process writes into a 0500 directory (running as root), \
-                 so a read-only directory cannot be made here"
-            );
-            return;
-        }
+        let parent = temp_dir("unwritable");
+        // A path whose parent is a regular file: every open under it is
+        // ENOTDIR for every user. A 0500 directory would not do, because
+        // root ignores directory modes and the Docker suite runs as
+        // root, which is how this test used to skip itself in CI and
+        // leave the whole drop path unproven.
+        let blocker = parent.path().join("not-a-directory");
+        std::fs::write(&blocker, b"a regular file").expect("test setup: file writes");
+        let dir = blocker.join("captures");
+
+        let error = write_capture_file(&dir, &expected_file_name(), b"{}")
+            .expect_err("a path under a regular file cannot be written");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
 
         let writer = CaptureDirWriter::spawn(4, CAPTURE_DIR_QUEUE_MAX_BYTES);
         emit_one(
-            emission("cap-readonly", Some(dir.path())),
+            emission("cap-unwritable", Some(&dir)),
             None,
             None,
-            &writer,
+            Some(&writer),
             &ring(),
         );
-        assert_eq!(wait_for_drops("cap-readonly", 1), 1);
+        assert_eq!(wait_for_drops("cap-unwritable", 1), 1);
         assert_eq!(
-            std::fs::read_dir(dir.path()).expect("dir lists").count(),
-            0,
+            std::fs::read(&blocker).expect("the blocker reads"),
+            b"a regular file",
             "nothing was written"
         );
     }
 
     #[test]
+    fn a_symlinked_output_directory_is_refused_and_counts_a_drop() {
+        let _guard = hub_lock().blocking_lock();
+        let parent = temp_dir("symlink");
+        let real = parent.path().join("real");
+        std::fs::create_dir(&real).expect("test setup: dir creates");
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("test setup: symlink creates");
+
+        let error = write_capture_file(&link, &expected_file_name(), b"{}")
+            .expect_err("a symlinked output directory is refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_dir(&real).expect("dir lists").count(),
+            0,
+            "the link's target was never written through"
+        );
+
+        let writer = CaptureDirWriter::spawn(4, CAPTURE_DIR_QUEUE_MAX_BYTES);
+        emit_one(
+            emission("cap-symlink", Some(&link)),
+            None,
+            None,
+            Some(&writer),
+            &ring(),
+        );
+        assert_eq!(wait_for_drops("cap-symlink", 1), 1);
+        assert_eq!(std::fs::read_dir(&real).expect("dir lists").count(), 0);
+    }
+
+    #[test]
+    fn the_temporary_name_is_invisible_to_the_pruner_and_to_a_reader() {
+        // The module doc promises a reader sees the complete document or
+        // nothing. That rests on one agreement: the name a partial write
+        // carries must not be a name `is_capture_file_name` accepts, and
+        // the pruner counts and removes exactly those names.
+        let temporary = capture_temp_file_name(&expected_file_name());
+        assert!(
+            !temporary.ends_with(".json"),
+            "a partial write must not carry the suffix both sides match on: {temporary}"
+        );
+        assert!(!is_capture_file_name(&temporary));
+        assert!(temporary.starts_with('.'), "and it stays hidden");
+
+        // And the pruner leaves one where it finds it, rather than
+        // counting a half-written document against the budget.
+        let dir = temp_dir("temp-name");
+        write_named(dir.path(), &temporary, 1_000);
+        assert_eq!(
+            prune_capture_dir(dir.path(), 0, "").expect("prune runs"),
+            0,
+            "a temporary file is not a prune candidate"
+        );
+        assert!(dir.path().join(&temporary).exists());
+    }
+
+    #[test]
     fn a_full_write_queue_drops_and_counts_rather_than_waiting() {
         let _guard = hub_lock().blocking_lock();
-        let dir = TempDir::new("backpressure");
+        let dir = temp_dir("backpressure");
         // Capacity one and a receiver nobody drains: the first job
         // sits in the queue, the second has nowhere to go.
         let (writer, _rx) = CaptureDirWriter::channel(1, CAPTURE_DIR_QUEUE_MAX_BYTES);
@@ -1070,7 +1160,7 @@ mod tests {
             emission("cap-full", Some(dir.path())),
             None,
             None,
-            &writer,
+            Some(&writer),
             &ring(),
         );
         assert_eq!(dropped("cap-full"), 0);
@@ -1078,7 +1168,7 @@ mod tests {
             emission("cap-full", Some(dir.path())),
             None,
             None,
-            &writer,
+            Some(&writer),
             &ring(),
         );
         assert_eq!(dropped("cap-full"), 1);
@@ -1096,13 +1186,13 @@ mod tests {
     #[test]
     fn a_job_over_the_byte_budget_is_refused_and_counted() {
         let _guard = hub_lock().blocking_lock();
-        let dir = TempDir::new("bytes");
+        let dir = temp_dir("bytes");
         let (writer, _rx) = CaptureDirWriter::channel(8, 16);
         emit_one(
             emission("cap-bytes", Some(dir.path())),
             None,
             None,
-            &writer,
+            Some(&writer),
             &ring(),
         );
         assert_eq!(dropped("cap-bytes"), 1);
@@ -1118,12 +1208,12 @@ mod tests {
         let _guard = hub_lock().blocking_lock();
         let (writer, rx) = CaptureDirWriter::channel(8, CAPTURE_DIR_QUEUE_MAX_BYTES);
         drop(rx);
-        let dir = TempDir::new("gone");
+        let dir = temp_dir("gone");
         emit_one(
             emission("cap-gone", Some(dir.path())),
             None,
             None,
-            &writer,
+            Some(&writer),
             &ring(),
         );
         assert_eq!(dropped("cap-gone"), 1);
@@ -1135,7 +1225,7 @@ mod tests {
     async fn a_capture_never_reaches_the_access_log_database() {
         let _guard = hub_lock().lock().await;
         log_sinks::install(&log_sinks::LogSinksConfig::default());
-        let data_dir = TempDir::new("sqlite");
+        let data_dir = temp_dir("sqlite");
         let store = Arc::new(
             lorica_api::log_store::LogStore::open(data_dir.path()).expect("the store opens"),
         );
@@ -1143,7 +1233,13 @@ mod tests {
         let writer = CaptureDirWriter::spawn(4, CAPTURE_DIR_QUEUE_MAX_BYTES);
         let mut lane = log_sinks::register_lane("otlp", true, true, true, true);
 
-        emit_one(emission("cap-sqlite", None), None, None, &writer, &ring());
+        emit_one(
+            emission("cap-sqlite", None),
+            None,
+            None,
+            Some(&writer),
+            &ring(),
+        );
 
         assert_eq!(
             lane.try_recv()

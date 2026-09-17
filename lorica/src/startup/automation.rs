@@ -21,11 +21,16 @@
 //! it. Each of those is a refusal, not a warning: the flag is opt-in,
 //! so an operator who passed it and got a silent no-op would learn
 //! about it from the automation that never connected.
+//!
+//! The allowlist is also published here, so a later settings change
+//! reaches the running accept loop. Narrowing it during an incident
+//! used to need a restart, and nothing said so.
 
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::{Arc, OnceLock};
 
+use lorica_api::automation::listener::publish_automation_source_policy;
 use lorica_api::automation::{
     start_automation_server, AutomationListenerConfig, AutomationListenerError,
 };
@@ -123,10 +128,12 @@ pub(crate) async fn prepare_automation_listener(
 
     let (is_follower, allowed_cidrs) = {
         let store = store.lock().await;
-        let follower = store
-            .get_cluster_identity()
-            .map_err(|e| format!("automation listener: failed to read the fleet identity: {e}"))?
-            .is_some();
+        // `is_follower` rather than a local read of the identity: one
+        // definition of the question, and one fail-closed answer when
+        // the store cannot be read. Here that answer refuses to open
+        // the socket, which is the same "do not write" disposition the
+        // sweeps get.
+        let follower = store.is_follower();
         let settings = store
             .get_global_settings()
             .map_err(|e| format!("automation listener: failed to read the global settings: {e}"))?;
@@ -138,6 +145,12 @@ pub(crate) async fn prepare_automation_listener(
 
     let config: AutomationListenerConfig = AutomationListenerConfig::new(addr, &allowed_cidrs)
         .map_err(|e| format!("automation listener: {e}"))?;
+    // Published BEFORE the accept loop is spawned, so a config reload
+    // that lands during startup narrows the allowlist the loop is
+    // about to read rather than being dropped on the floor. The
+    // reload path reaches the listener through this slot; see
+    // `lorica_api::automation::listener::reload_automation_source_policy`.
+    publish_automation_source_policy(&config.allowed_cidrs);
 
     // Adopt the socket the outgoing supervisor handed over, so this
     // process accepts on the SAME kernel socket instead of racing the
@@ -164,7 +177,7 @@ pub(crate) async fn prepare_automation_listener(
     // operator must be able to spot in the journal.
     warn!(
         addr = %addr,
-        allowed_cidrs = config.allowed_cidrs.allow.len(),
+        allowed_cidrs = config.allowed_cidrs.entries(),
         "automation API enabled: listener bound (bearer tokens only, source-filtered)"
     );
 
@@ -313,10 +326,7 @@ mod tests {
         let store = ConfigStore::open_in_memory().expect("test store opens");
         let settings = store.get_global_settings().expect("settings read");
         assert!(settings.automation_allowed_cidrs.is_empty());
-        let is_follower = store
-            .get_cluster_identity()
-            .expect("identity read")
-            .is_some();
+        let is_follower = store.is_follower();
         assert!(!is_follower);
         assert!(refuse_to_listen(is_follower, &settings.automation_allowed_cidrs).is_some());
 
@@ -335,11 +345,8 @@ mod tests {
         store
             .set_cluster_identity(&follower_identity())
             .expect("identity write");
-        let is_follower = store
-            .get_cluster_identity()
-            .expect("identity re-read")
-            .is_some();
-        assert!(refuse_to_listen(is_follower, &stored.automation_allowed_cidrs).is_some());
+        assert!(store.is_follower());
+        assert!(refuse_to_listen(true, &stored.automation_allowed_cidrs).is_some());
     }
 
     #[test]

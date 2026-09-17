@@ -164,6 +164,46 @@ impl RuleBudget {
     }
 }
 
+/// Decide one admission against `budget` and advance it, returning the
+/// decision and whether THIS call is the one that must queue the rule's
+/// self-disable.
+///
+/// A free function so the caller can reach the budget either by lookup
+/// or by insertion and still run exactly one body over it.
+fn spend(
+    budget: &mut RuleBudget,
+    limits: &CaptureLimits,
+    now: Instant,
+) -> (CaptureAdmission, bool) {
+    let admission = if budget.emitted >= limits.max_captures {
+        CaptureAdmission::DroppedBudget
+    } else if budget.window.try_admit(limits.rate_per_minute, now) {
+        budget.emitted += 1;
+        CaptureAdmission::Emit
+    } else {
+        CaptureAdmission::DroppedRate
+    };
+
+    // The total is spent the moment the last capture is taken, so the
+    // request that took it queues the disable rather than the next one
+    // to be refused. The flag is flipped under the same lock that
+    // decided the admission, so however many requests observe a spent
+    // total, exactly one of them queues the write.
+    let signal = budget.emitted >= limits.max_captures && !budget.disable_signalled;
+    if signal {
+        budget.disable_signalled = true;
+    }
+    (admission, signal)
+}
+
+/// Add one admission to a rule's unflushed deltas.
+fn bump(counters: &mut PendingCounters, admission: CaptureAdmission) {
+    match admission {
+        CaptureAdmission::Emit => counters.emitted += 1,
+        CaptureAdmission::DroppedRate | CaptureAdmission::DroppedBudget => counters.dropped += 1,
+    }
+}
+
 /// What a rule is told when it asks to record one exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureAdmission {
@@ -343,29 +383,26 @@ impl CaptureBudgets {
             return CaptureAdmission::DroppedBudget;
         }
 
-        let budget = state
+        // `get_mut` before `entry`, on both maps below: `entry` takes an
+        // OWNED key, so it allocates a `String` per call whether or not
+        // the rule is new, inside the mutex every capturing request
+        // shares. A rule that is already tracked, which is every call
+        // after the first, now allocates nothing here.
+        let spent = state
             .per_rule
-            .entry(rule_id.to_string())
-            .or_insert_with(|| RuleBudget::new(now));
-
-        let admission = if budget.emitted >= limits.max_captures {
-            CaptureAdmission::DroppedBudget
-        } else if budget.window.try_admit(limits.rate_per_minute, now) {
-            budget.emitted += 1;
-            CaptureAdmission::Emit
-        } else {
-            CaptureAdmission::DroppedRate
+            .get_mut(rule_id)
+            .map(|budget| spend(budget, limits, now));
+        let (admission, signal) = match spent {
+            Some(outcome) => outcome,
+            None => {
+                let budget = state
+                    .per_rule
+                    .entry(rule_id.to_string())
+                    .or_insert_with(|| RuleBudget::new(now));
+                spend(budget, limits, now)
+            }
         };
 
-        // The total is spent the moment the last capture is taken, so
-        // the request that took it queues the disable rather than the
-        // next one to be refused. The flag is flipped under the same
-        // lock that decided the admission, so however many requests
-        // observe a spent total, exactly one of them queues the write.
-        let signal = budget.emitted >= limits.max_captures && !budget.disable_signalled;
-        if signal {
-            budget.disable_signalled = true;
-        }
         if signal {
             state.pending_disable.push(PendingDisable {
                 rule_id: rule_id.to_string(),
@@ -374,19 +411,22 @@ impl CaptureBudgets {
                 limit: limits.max_captures,
             });
         }
-        let counters = state
-            .pending_counters
-            .entry(rule_id.to_string())
-            .or_insert_with(|| PendingCounters {
+
+        let counted = match state.pending_counters.get_mut(rule_id) {
+            Some(counters) => {
+                bump(counters, admission);
+                true
+            }
+            None => false,
+        };
+        if !counted {
+            let mut counters = PendingCounters {
                 rule_id: rule_id.to_string(),
                 emitted: 0,
                 dropped: 0,
-            });
-        match admission {
-            CaptureAdmission::Emit => counters.emitted += 1,
-            CaptureAdmission::DroppedRate | CaptureAdmission::DroppedBudget => {
-                counters.dropped += 1
-            }
+            };
+            bump(&mut counters, admission);
+            state.pending_counters.insert(rule_id.to_string(), counters);
         }
         drop(guard);
 
@@ -405,10 +445,29 @@ impl CaptureBudgets {
     /// is the intent: re-enabling a rule that spent its total is an
     /// operator re-arming it, and an operator who re-arms a rule expects
     /// it to record again.
+    /// The rule's `lorica_captures_total` series go with its entry.
+    /// Prometheus label sets are never garbage-collected, so a fleet
+    /// that retires a capture rule a day would otherwise grow the
+    /// family by four series a day forever, on a metric whose whole
+    /// point is one line per armed rule.
     pub fn retain_rules<'a>(&self, live: impl IntoIterator<Item = &'a str>) {
         let live: HashSet<&str> = live.into_iter().collect();
-        let mut state = self.state.lock();
-        state.per_rule.retain(|id, _| live.contains(id.as_str()));
+        let mut evicted: Vec<String> = Vec::new();
+        {
+            let mut state = self.state.lock();
+            state.per_rule.retain(|id, _| {
+                let keep = live.contains(id.as_str());
+                if !keep {
+                    evicted.push(id.clone());
+                }
+                keep
+            });
+        }
+        // Outside the lock: the registry takes its own, and nothing
+        // about the metric needs the two held together.
+        for rule_id in &evicted {
+            lorica_api::metrics::remove_capture_outcome_series(rule_id);
+        }
     }
 
     /// Take the rules queued for a self-disable, leaving the queue
@@ -519,14 +578,11 @@ mod tests {
     fn the_rate_window_costs_the_same_memory_after_ten_thousand_emissions() {
         let base = Instant::now();
         let mut window = RateWindow::new(base);
-        let before = std::mem::size_of_val(&window);
         // One emission per second for nearly three hours, so the ring
         // wraps well over a hundred times.
         for i in 0..10_000u64 {
             assert!(window.try_admit(u32::MAX, base + Duration::from_secs(i)));
         }
-        assert_eq!(std::mem::size_of_val(&window), before);
-        assert_eq!(before, std::mem::size_of::<RateWindow>());
         assert_eq!(window.buckets.len(), RATE_WINDOW_BUCKETS);
         // A timestamp list would hold all ten thousand. The window holds
         // the last minute and nothing else, whatever came before it.
@@ -647,6 +703,29 @@ mod tests {
 
         budgets.retain_rules(std::iter::empty());
         assert_eq!(budgets.tracked_rules(), 0);
+    }
+
+    #[test]
+    fn an_evicted_rule_loses_its_metric_series_too() {
+        use lorica_api::metrics::capture_outcome_value;
+
+        let budgets = CaptureBudgets::new();
+        // One emit and one drop, so two of the four outcomes carry a
+        // value before the eviction.
+        let limits = limits(1, 10_000);
+        let now = Instant::now();
+        budgets.admit_rule("cap-series", "route-1", &limits, now);
+        budgets.admit_rule("cap-series", "route-1", &limits, now);
+        assert_eq!(capture_outcome_value("cap-series", "emitted"), 1);
+        assert_eq!(capture_outcome_value("cap-series", "dropped_budget"), 1);
+
+        budgets.retain_rules(std::iter::empty());
+
+        // `capture_outcome_value` recreates the series it reads, so the
+        // proof is that it reads zero: a series that survived would
+        // still carry the counts above.
+        assert_eq!(capture_outcome_value("cap-series", "emitted"), 0);
+        assert_eq!(capture_outcome_value("cap-series", "dropped_budget"), 0);
     }
 
     #[test]

@@ -55,7 +55,7 @@ use tokio::sync::Mutex;
 use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
-use super::budgets::{CaptureBudgets, PendingCounters, PendingDisable};
+use super::rule_budgets::{CaptureBudgets, PendingCounters, PendingDisable};
 
 /// Audit action recorded when a rule disarms itself.
 pub const CAPTURE_AUTO_DISABLED_ACTION: &str = "capture.rule.auto_disabled";
@@ -119,19 +119,18 @@ pub async fn disable_expired(
 ) -> Vec<String> {
     let guard = Arc::clone(store).lock_owned().await;
     let swept = tokio::task::spawn_blocking(move || -> Result<Vec<CaptureRule>, String> {
-        let is_follower = guard
-            .get_cluster_identity()
-            .map(|identity| identity.is_some())
-            .map_err(|e| format!("fleet identity unreadable: {e}"))?;
-        if is_follower {
+        if guard.is_follower() {
             return Ok(Vec::new());
         }
         let mut expired = Vec::new();
+        // The store answers with the armed rules that are already past
+        // their expiry, through `idx_capture_rules_expires_at`. On a
+        // node with nothing due, which is nearly every one of these
+        // five-second ticks, that is an index probe rather than a scan
+        // of the table and a JSON decode of every rule on it.
         for rule in guard
-            .list_capture_rules()
+            .list_capture_rules_expiring_before(now)
             .map_err(|e| format!("capture rules unreadable: {e}"))?
-            .into_iter()
-            .filter(|rule| rule.enabled && rule.expires_at <= now)
         {
             match guard.set_capture_rule_enabled(&rule.id, false) {
                 Ok(()) => expired.push(rule),
@@ -273,10 +272,9 @@ async fn disable_one(
 /// Record the [`CAPTURE_AUTO_DISABLED_ACTION`] row for one rule.
 ///
 /// The actor is the node, not an operator: no management session is
-/// behind a budget running out or a deadline passing. The identity
-/// mirrors the one the cluster replica handler uses for its own
-/// node-side events, so an operator reading the audit log sees the
-/// same shape.
+/// behind a budget running out or a deadline passing, which is what
+/// [`lorica_api::audit::AuditContext::node`] spells for every
+/// background actor.
 async fn audit_auto_disable(
     log_store: Option<Arc<lorica_api::log_store::LogStore>>,
     rule_id: &str,
@@ -284,12 +282,7 @@ async fn audit_auto_disable(
 ) {
     lorica_api::audit::record_with_store(
         log_store,
-        &lorica_api::audit::AuditContext {
-            username: "capture".to_string(),
-            role: "node".to_string(),
-            ip: String::new(),
-            user_agent: String::new(),
-        },
+        &lorica_api::audit::AuditContext::node("capture"),
         CAPTURE_AUTO_DISABLED_ACTION,
         ("capture_rule", rule_id),
         None,
@@ -560,6 +553,12 @@ mod tests {
             "the rule is disarmed, not deleted"
         );
 
+        // `record_with_store` only enqueues the row; the flush is what
+        // makes the read below deterministic.
+        log_store
+            .flush_audit()
+            .await
+            .expect("the audit writer drains");
         let (rows, _) = log_store
             .query_audit(&lorica_api::audit::AuditQuery {
                 action_prefix: Some(CAPTURE_AUTO_DISABLED_ACTION.to_string()),

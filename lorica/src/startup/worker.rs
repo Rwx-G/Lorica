@@ -570,7 +570,7 @@ pub(crate) fn run_worker(
     lorica_proxy.rate_limit_buckets = lorica::proxy_wiring::RateLimitEngine::local();
     // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so worker
     // lookups can resolve client IPs to country codes. Each worker
-    // keeps its own copy (the DB is small — ~3 MiB for DB-IP Lite
+    // keeps its own copy (the DB is small - ~3 MiB for DB-IP Lite
     // Country). The resolver handle is stashed in the per-worker
     // `lorica::geoip` static so the config-reload path can hot-swap
     // the DB on setting change, and a periodic 24-hour reload task
@@ -819,7 +819,7 @@ pub(crate) fn run_worker(
     // OTel graceful shutdown in workers (v1.4.0 story 1.6
     // completion): `Server::run_forever()` is `run() + exit(0)`
     // which drops the post-serve flush entirely. We inline the
-    // equivalent — `server.run(RunArgs::default())` drives the
+    // equivalent - `server.run(RunArgs::default())` drives the
     // graceful-drain loop exactly like `run_forever` would, then
     // we call `otel::shutdown()` before `std::process::exit(0)`.
     // Result: the BatchSpanProcessor drains any in-flight spans

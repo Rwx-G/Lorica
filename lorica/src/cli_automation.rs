@@ -66,22 +66,14 @@ pub(crate) fn run_automation_token_create(
         let client = management_client();
         management_login(&client, management_port, &user, &password).await;
         let url = format!("https://127.0.0.1:{management_port}/api/v1/automation/tokens");
-        // Optional fields are omitted rather than sent as null: the
-        // API's `deny_unknown_fields` body takes an absent field as
-        // "use the model's default", and `expires_at` against
-        // `lifetime_days` is a mutual exclusion the server refuses.
-        let mut body = serde_json::json!({
-            "name": name,
-            "scopes": scopes,
-            "allowed_hostnames": hostnames,
-            "allowed_backend_cidrs": backend_cidrs,
-        });
-        if let Some(ttl) = max_ttl_seconds {
-            body["max_ttl_seconds"] = serde_json::json!(ttl);
-        }
-        if let Some(days) = lifetime_days {
-            body["lifetime_days"] = serde_json::json!(days);
-        }
+        let body = mint_request_body(
+            &name,
+            &scopes,
+            &hostnames,
+            &backend_cidrs,
+            max_ttl_seconds,
+            lifetime_days,
+        );
         let response = client
             .post(&url)
             .json(&body)
@@ -96,14 +88,150 @@ pub(crate) fn run_automation_token_create(
 
         // The only thing on stdout.
         println!("{token}");
-        eprintln!(
-            "minted automation token {} (expires {}); it is shown once and cannot be recovered",
-            data.get("public_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?"),
-            data.get("expires_at")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?")
-        );
+        eprintln!("{}", minted_notice(&data));
     });
+}
+
+/// Turn the command's flags into the mint request body.
+///
+/// Optional fields are OMITTED rather than sent as null: the API's
+/// `deny_unknown_fields` body takes an absent field as "use the
+/// model's default", and `expires_at` against `lifetime_days` is a
+/// mutual exclusion the server refuses.
+fn mint_request_body(
+    name: &str,
+    scopes: &[String],
+    hostnames: &[String],
+    backend_cidrs: &[String],
+    max_ttl_seconds: Option<u32>,
+    lifetime_days: Option<i64>,
+) -> serde_json::Value {
+    let mut body: serde_json::Value = serde_json::json!({
+        "name": name,
+        "scopes": scopes,
+        "allowed_hostnames": hostnames,
+        "allowed_backend_cidrs": backend_cidrs,
+    });
+    if let Some(ttl) = max_ttl_seconds {
+        body["max_ttl_seconds"] = serde_json::json!(ttl);
+    }
+    if let Some(days) = lifetime_days {
+        body["lifetime_days"] = serde_json::json!(days);
+    }
+    body
+}
+
+/// The one informational line, for STDERR.
+///
+/// It names the `public_id` an operator would revoke and when the
+/// token expires, and it never carries the secret: stdout is the
+/// credential, stderr is the note about it, and a redirect must be
+/// able to keep the two apart. A field the answer did not carry
+/// prints as `?` rather than failing the mint that already happened;
+/// the token is on stdout either way and cannot be minted twice.
+fn minted_notice(data: &serde_json::Value) -> String {
+    let field = |name: &str| -> String {
+        data.get(name)
+            .and_then(|value| value.as_str())
+            .unwrap_or("?")
+            .to_string()
+    };
+    format!(
+        "minted automation token {} (expires {}); it is shown once and cannot be recovered",
+        field("public_id"),
+        field("expires_at")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "lat_v1_thisisthesecretnobodymayseetwice";
+
+    fn answer() -> serde_json::Value {
+        serde_json::json!({
+            "public_id": "atk_01HZ",
+            "expires_at": "2026-10-01T00:00:00Z",
+            "token": SECRET,
+        })
+    }
+
+    #[test]
+    fn the_flags_become_the_body_the_api_accepts() {
+        let body = mint_request_body(
+            "ci",
+            &["environments:write".to_string()],
+            &["app.example.com".to_string()],
+            &["10.0.0.0/8".to_string()],
+            Some(3600),
+            Some(30),
+        );
+        assert_eq!(body["name"], "ci");
+        assert_eq!(body["scopes"], serde_json::json!(["environments:write"]));
+        assert_eq!(
+            body["allowed_hostnames"],
+            serde_json::json!(["app.example.com"])
+        );
+        assert_eq!(
+            body["allowed_backend_cidrs"],
+            serde_json::json!(["10.0.0.0/8"])
+        );
+        assert_eq!(body["max_ttl_seconds"], 3600);
+        assert_eq!(body["lifetime_days"], 30);
+    }
+
+    #[test]
+    fn an_unset_flag_is_absent_not_null() {
+        // `deny_unknown_fields` reads an absent field as "use the
+        // model's default" and a null as a value; sending null would
+        // refuse the mint or override a default the operator never
+        // touched.
+        let body = mint_request_body("ci", &[], &[], &[], None, None);
+        assert!(body.get("max_ttl_seconds").is_none());
+        assert!(body.get("lifetime_days").is_none());
+        assert_eq!(body["scopes"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn the_notice_names_the_id_and_never_the_secret() {
+        let notice = minted_notice(&answer());
+        assert!(notice.contains("atk_01HZ"), "{notice}");
+        assert!(notice.contains("2026-10-01T00:00:00Z"), "{notice}");
+        assert!(
+            !notice.contains(SECRET),
+            "the informational line must never carry the credential: {notice}"
+        );
+        // One line, so a terminal shows it as one and a log keeps it
+        // as one record.
+        assert_eq!(notice.lines().count(), 1);
+    }
+
+    #[test]
+    fn a_missing_field_degrades_to_a_question_mark() {
+        let notice = minted_notice(&serde_json::json!({ "token": SECRET }));
+        assert!(notice.contains('?'), "{notice}");
+        assert!(!notice.contains(SECRET), "{notice}");
+    }
+
+    #[test]
+    fn stdout_carries_the_token_and_nothing_else() {
+        // The split this command exists to guarantee:
+        // `... > /run/secret` must store exactly the credential, with
+        // no banner, no newline of advice, no trailing confirmation.
+        // stdout is `println!("{token}")`, so what a redirect captures
+        // is the token plus one newline.
+        let data = answer();
+        let token: &str = data
+            .get("token")
+            .and_then(|value| value.as_str())
+            .expect("the answer carries a token");
+        let stdout = format!("{token}\n");
+        assert_eq!(stdout, format!("{SECRET}\n"));
+        assert_eq!(stdout.trim_end_matches('\n'), SECRET);
+
+        let stderr = format!("{}\n", minted_notice(&data));
+        assert!(!stderr.contains(SECRET));
+        assert!(!stdout.contains("minted automation token"));
+    }
 }

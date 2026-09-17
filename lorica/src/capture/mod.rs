@@ -17,8 +17,9 @@
 //! Eight pieces: the compiled predicates a request is measured against
 //! ([`rules`]), the per-request buffers a matched request fills
 //! ([`buffers`]), the node-wide ceiling those buffers reserve from
-//! ([`budget`]), the per-rule total and rate an emission is counted
-//! against ([`budgets`]), the task that publishes the counters and
+//! ([`node_ceiling`]), the per-rule total and rate an emission is
+//! counted against ([`rule_budgets`]), the task that publishes the
+//! counters and
 //! disarms a rule which spent its total ([`self_disable`]), the record
 //! an admitted exchange becomes ([`record`]), the redaction applied to
 //! it before it leaves the proxy ([`redact`]), and the outputs it
@@ -30,26 +31,28 @@
 //! the source length of an operator pattern and this crate applies the
 //! compile-time budget and holds the compiled automaton.
 
-mod budget;
-mod budgets;
 mod buffers;
+mod node_ceiling;
 mod record;
 mod redact;
+mod rule_budgets;
 mod rules;
 mod self_disable;
 mod sink;
 
-pub use budget::{node_budget, CaptureBudget, CaptureReservation, CAPTURE_MAX_INFLIGHT_BYTES};
-pub use budgets::{
-    node_budgets, CaptureAdmission, CaptureBudgets, PendingCounters, PendingDisable,
-    CAPTURE_MAX_TRACKED_RULES,
-};
 pub use buffers::{CaptureBody, CaptureSkip, CaptureState};
+pub use node_ceiling::{
+    node_budget, CaptureBudget, CaptureReservation, CAPTURE_MAX_INFLIGHT_BYTES,
+};
 pub use record::{
     is_textual_content_type, BodyEncoding, BodySkip, CaptureRecord, CapturedRequest,
     CapturedResponse, CAPTURE_RECORD_KIND,
 };
 pub use redact::{is_redacted_header, mask_query, redacted_marker, ALWAYS_REDACTED_HEADERS};
+pub use rule_budgets::{
+    node_budgets, CaptureAdmission, CaptureBudgets, PendingCounters, PendingDisable,
+    CAPTURE_MAX_TRACKED_RULES,
+};
 pub use rules::{CompiledCaptureRule, CompiledCaptureRules, CAPTURE_REGEX_SIZE_LIMIT};
 pub use self_disable::{
     disable_expired, spawn_capture_disable_task, CAPTURE_AUTO_DISABLED_ACTION,
