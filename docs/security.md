@@ -2,32 +2,13 @@
 
 ## Threat Model
 
-### Assets
-- **TLS private keys** - stored AES-256-GCM encrypted in SQLite database
-- **Admin credentials** - argon2-hashed in database, never logged in plaintext
-- **Session tokens** - HttpOnly, Secure, SameSite=Strict cookies
-- **Configuration data** - routes, backends, settings in embedded SQLite
-
-### Trust Boundaries
-1. **Internet -> Lorica proxy** (ports 80/443): untrusted HTTP/HTTPS traffic
-2. **Lorica proxy -> Backends**: internal network, TLS optional per backend
-3. **Localhost -> Management API** (port 9443): trusted admin access only
-4. **Admin browser -> Dashboard**: authenticated session over HTTPS
-
-### Threat Categories
-
-| Threat | Mitigation | Status |
-|--------|-----------|--------|
-| SQL injection via API | Parameterized queries (rusqlite params!) | Implemented |
-| XSS via dashboard | Svelte auto-escapes output, no innerHTML | Implemented |
-| CSRF | SameSite=Strict cookies, no CORS | Implemented |
-| Brute-force login | Rate limiting: 5 attempts/min, then 429 | Implemented |
-| Session hijacking | HttpOnly + Secure + SameSite cookies | Implemented |
-| WAF bypass | 49 OWASP-inspired rules (46 general + 3 header-scoped), per-rule toggle | Implemented |
-| Secret leakage in logs | Private keys never logged, passwords hashed | Verified |
-| Dependency vulnerabilities | `cargo audit` (serde_yml warning - Pingora upstream) | Monitored |
-| Privilege escalation | systemd: NoNewPrivileges, ProtectSystem=strict | Implemented |
-| Memory corruption | Rust memory safety, no unsafe in product code | By design |
+The threat model lives in [docs/security/threat-model.md](security/threat-model.md):
+assets, trust boundaries, and the threat categories T1 to T8 with one
+mitigation table each (network, application, management API, data at rest,
+supply chain, cluster plane, operational, automation plane and request
+capture), followed by the residual risks. It is one document rather than a
+summary here and a copy there, because the copy that used to sit in this
+section stopped being true two releases before anyone noticed.
 
 ### Known Limitations
 

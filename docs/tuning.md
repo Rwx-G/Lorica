@@ -126,7 +126,11 @@ The in-memory cache uses TinyUFO eviction (better than LRU for mixed workloads) 
 
 ### Prometheus
 
-Scrape `/metrics` (no auth required) for real-time visibility:
+Scrape `/metrics` for real-time visibility. Since v1.7.0 the endpoint
+requires authentication by default (`metrics_require_auth`), so the
+scrape job carries `Authorization: Bearer <prometheus_scrape_token>`,
+the token preferably injected through `LORICA_PROMETHEUS_SCRAPE_TOKEN`
+rather than stored in the settings:
 
 - `lorica_http_requests_total{route_id, status_code}` - request throughput
 - `lorica_http_request_duration_seconds` - latency histogram
@@ -146,6 +150,27 @@ sudo ./docs/testing/nfr-validate.sh
 ```
 
 This tests 10k concurrent connections and 10-minute memory stability.
+
+## Request Capture Memory (v1.8.0)
+
+A capture rule is an operator-authored allocation on a node that also
+terminates production TLS, so its budget is sized here rather than
+discovered under load.
+
+- `request_body_max_bytes` and `response_body_max_bytes` default to
+  64 KiB per candidate exchange and are capped at 4 MiB. Both halves of
+  one exchange can be in flight at once.
+- One node-wide ceiling, 64 MiB of in-flight capture bytes, covers
+  every rule together. Past it a candidate is not buffered: the record
+  still goes out if the response-side predicate matches, marked
+  `body_skipped: "budget"`, and `lorica_captures_total{outcome="dropped_budget"}`
+  counts it. The request never waits for the ceiling.
+- Under `--workers N` the ceiling is PER WORKER, because each worker
+  holds its own buffers. Size the host for `N x 64 MiB` in the worst
+  case, not 64 MiB.
+- `lorica_capture_inflight_bytes` is the gauge to watch. A rule that
+  keeps it near the ceiling is a rule matching too much traffic:
+  tighten its request-side predicates rather than raising the caps.
 
 ## Quick Checklist
 

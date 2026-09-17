@@ -49,7 +49,7 @@ sudo systemctl restart lorica
 Hot-scalable workers are tracked as a future enhancement; until then,
 treat `--workers N` as deployment-time configuration.
 
-### Listener ports (`http_port`, `https_port`, `management_port`)
+### Listener ports (`http_port`, `https_port`, `management_port`, `--cluster-listen`, `--automation-listen`)
 
 The TCP listeners are bound by the supervisor before the fork and
 passed to workers as inherited file descriptors. Workers have no
@@ -66,6 +66,15 @@ To change a listener port:
 The dashboard surfaces an "applies on next restart" hint on these
 fields. Backend addresses (per-route upstreams) are not affected -
 those reload live via the normal config reload path.
+
+The cluster plane (v1.7.0) and the automation listener (v1.8.0) are
+bound the same way, before the fork, but they come from command-line
+flags rather than from settings: moving one means editing the unit and
+restarting. What those listeners ENFORCE does reload live, which is the
+distinction worth holding on to. `automation_allowed_cidrs` is a
+setting, so narrowing the automation plane's source allowlist during an
+incident bites on the next connection without a restart; the address it
+listens on does not.
 
 ---
 

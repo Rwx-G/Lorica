@@ -1,12 +1,12 @@
 # Lorica Threat Model
 
 **Author:** Romain G.
-**Version:** 1.0
-**Date:** 2026-03-31
+**Version:** 1.1
+**Date:** 2026-09-17
 
 ## Overview
 
-Lorica is a reverse proxy that sits between the Internet and backend services. It terminates TLS, routes HTTP traffic, provides WAF protection, and exposes a management dashboard on localhost. Since v1.7.0 a node can additionally participate in a multi-node cluster over a dedicated, mutually authenticated cluster plane. This document identifies threat categories and mitigations.
+Lorica is a reverse proxy that sits between the Internet and backend services. It terminates TLS, routes HTTP traffic, provides WAF protection, and exposes a management dashboard on localhost. Since v1.7.0 a node can additionally participate in a multi-node cluster over a dedicated, mutually authenticated cluster plane. Since v1.8.0 it can additionally serve a CI automation API on a listener of its own. This document identifies threat categories and mitigations.
 
 ## Trust Boundaries
 
@@ -20,6 +20,10 @@ Internet  -->  [ Lorica Proxy (8080/8443) ]  -->  Backend Services
 Follower nodes  -->  [ Cluster plane (--cluster-listen, opt-in) ]
    (outbound only)         operational listener: mTLS mandatory
                            enrollment listener: token-gated window
+
+CI runners  -->  [ Automation plane (--automation-listen, opt-in) ]
+                           source allowlist before the handshake
+                           bearer or OIDC ID token, scope-gated
 ```
 
 1. **Internet to Proxy** - Untrusted. All inbound traffic is potentially malicious.
@@ -28,6 +32,8 @@ Follower nodes  -->  [ Cluster plane (--cluster-listen, opt-in) ]
 4. **Database** - Trusted. SQLite on local filesystem with WAL mode.
 5. **Follower to Control Plane (cluster plane)** - Authenticated by mutual TLS against the fleet's own cluster CA; no public or system CA is trusted on this plane. Disabled by default; only exists when the operator passes `--cluster-listen` on the control plane. Followers dial OUT to the control plane and expose no inbound port of their own.
 6. **Enrollment listener** - The only unauthenticated network surface in the product. It is a separate listener from the operational one, is closed unless at least one join token is live, auto-closes when the last unexpired token is burned or expires, and enforces pre-authentication budgets (handshake timeout, concurrent-handshake cap, in-flight enrollment cap, per-connection byte and time budgets) before any token verification runs.
+7. **CI runner to Automation plane** - Remote, and authenticated per request by a scoped bearer token or a GitLab ID token; no session, no cookie, no CSRF pairing. Disabled by default; only exists when the operator passes `--automation-listen`, and refuses to open without a source allowlist or on a node holding a follower identity. What a credential may reach is bounded by its own grant (scopes, hostname patterns, backend CIDRs), not by a role.
+8. **Capture records** - A capture record holds request and response bodies taken after TLS termination, so it carries whatever the traffic carried. It crosses whatever boundary its sink does: the process log, a syslog or OTLP collector, or a directory on the node.
 
 ## Threat Categories
 
@@ -152,7 +158,7 @@ The automation plane is opt-in twice over: the listener does not open unless the
 | A capture sink writing outside where the operator meant | `output.dir` must be absolute and must not be a symlink, checked on every write rather than once at configuration time, so a symlink planted after the fact cannot redirect the stream | Implemented |
 | A compromised follower self-reporting the configuration it applied | Unchanged from T6: outside a commit round the applied generation and hash are the follower's own claim. The automation plane does not open on a follower, so this is the cluster residual, not a new one | Accepted, documented |
 | The captured body itself | A capture file holds request and response bodies by design: that is the feature. Redaction covers credentials, not payload content, so a capture of a route carrying personal data is a file holding personal data. The operator decides where it lands, and the sink refuses anything but an absolute, non-symlinked directory | Accepted, documented |
-| A hostile identity provider or a hijacked JWKS endpoint | The JWKS fetch trusts the issuer's TLS: there is no pinned key for the endpoint itself. An attacker who can present a valid certificate for the issuer's JWKS host can serve a key of their choosing. Mitigation is the issuer allowlist (only configured issuers are consulted) and the bound claims a token must still carry | Accepted, documented |
+| A hostile identity provider or a hijacked JWKS endpoint | An issuer entry that pins `ca_pem` trusts that CA alone for its own JWKS fetch, so a certificate from any other authority is refused. An entry that pins nothing trusts the platform roots: whoever can present a valid certificate for the JWKS host can serve a key of their choosing, leaving the issuer allowlist and the bound claims as the remaining mitigations. Pinning is the documented posture for a self-hosted instance | Implemented, residual without `ca_pem` |
 
 ## Residual Risks
 

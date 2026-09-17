@@ -50,6 +50,39 @@ Enrollment hygiene (Story 9.3):
 - Revoke decommissioned nodes on the control plane before wiping them (`DELETE /api/v1/cluster/nodes/{id}`); `lorica cluster leave` on the node then proves the deregistration and wipes the fleet identity.
 - Revocation cuts access, not possession: a revoked node keeps the certificate private keys it was entitled to. The revocation response and the `cluster.node.revoke` audit row list them as `certificates_to_reissue`; re-issue every one before considering the incident closed. A node you cannot run `leave` on is exactly the case this bullet is for.
 
+### Automation Plane (v1.8.0+, opt-in)
+
+The automation plane only exists when a node is started with
+`--automation-listen <host:port>` (9446 in the examples below, the port
+`docs/automation.md` uses). It is the only listener in the product a CI runner
+is meant to reach, and unlike the management API it is expected to be remote,
+so its controls sit in the process rather than in the firewall alone.
+
+- **The source allowlist is mandatory and runs before the TLS handshake.**
+  `automation_allowed_cidrs` names the runner networks; the listener refuses to
+  open on an empty list, and an address outside it gets no handshake, no
+  certificate and no byte read from it. Keep it as narrow as the runner fleet
+  allows. It is a setting, not a flag, so narrowing it during an incident takes
+  effect on the next connection with no restart.
+- **Credentials are bearer-only.** A scoped token minted on the management
+  plane, or a GitLab ID token from a registered issuer. There is no session, no
+  cookie and no CSRF pairing on this plane, so a stolen dashboard session
+  cannot be replayed against it.
+- **The token's grant is the real boundary, not the listener.** Scopes, the
+  hostname patterns it may bind and the backend CIDRs it may point at all
+  travel with the token, and an empty backend CIDR list means deny-all, not
+  allow-all. Mint one token per pipeline with the narrowest hostname pattern
+  that works; revoke a decommissioned runner's token rather than reusing it.
+- **Prefer OIDC to a static token** where the CI platform supports it. The job
+  authenticates with its own short-lived ID token bound to project, ref and
+  environment, which removes the shared secret from the CI variables
+  altogether. On a self-hosted GitLab, pin the issuer's CA with `ca_pem` on the
+  issuer entry so the JWKS fetch does not rest on the platform root store.
+- **A follower refuses to open the listener at all.** The automation plane
+  belongs on a standalone node or on the control plane; a follower's
+  configuration is replaced at the next replication round, so a write there
+  would be silently undone.
+
 ### Firewall Rules
 
 ```bash
@@ -73,6 +106,14 @@ iptables -A INPUT -p tcp --dport 9444 -j DROP
 # burned.
 iptables -I INPUT -p tcp --dport 9445 -s 192.0.2.12 -j ACCEPT
 iptables -A INPUT -p tcp --dport 9445 -j DROP
+
+# Automation plane (when --automation-listen is set): default-deny,
+# allow only the CI runner sources. 192.0.2.20 stands in for your
+# runner network. This mirrors automation_allowed_cidrs rather than
+# replacing it: the process-side list is the one that still holds
+# when a firewall rule is flushed by mistake.
+iptables -A INPUT -p tcp --dport 9446 -s 192.0.2.20 -j ACCEPT
+iptables -A INPUT -p tcp --dport 9446 -j DROP
 ```
 
 The same policy in nftables form:
@@ -85,6 +126,9 @@ nft add rule inet filter input tcp dport 9444 drop
 # Enrollment window only (remove after the token is burned):
 nft add rule inet filter input ip saddr 192.0.2.12 tcp dport 9445 accept
 nft add rule inet filter input tcp dport 9445 drop
+# Automation plane (when --automation-listen is set):
+nft add rule inet filter input ip saddr 192.0.2.20 tcp dport 9446 accept
+nft add rule inet filter input tcp dport 9446 drop
 ```
 
 ## 2. TLS Configuration
@@ -220,8 +264,15 @@ systemctl show lorica | grep -E '(Protect|Restrict|Private|Capability|SystemCall
 
 ### Prometheus Metrics
 
-- The `/metrics` endpoint is accessible without authentication
-- If exposed, ensure network-level access control (firewall or Prometheus scrape config)
+- The `/metrics` endpoint requires authentication by default since v1.7.0
+  (`metrics_require_auth`, default `true`). A scrape presents either a
+  dashboard session cookie or `Authorization: Bearer <prometheus_scrape_token>`,
+  and the token is best injected through `LORICA_PROMETHEUS_SCRAPE_TOKEN`
+  rather than stored in the settings. Leave the setting on: the document
+  exposes the full backend topology and the certificate inventory, which on a
+  shared host any local user could otherwise read
+- Keep network-level access control on top of it (firewall or the Prometheus
+  scrape config), not instead of it
 - Key metrics to alert on:
   - `lorica_http_requests_total` with high error rates
   - `lorica_backend_health` transitions to unhealthy
@@ -232,6 +283,35 @@ systemctl show lorica | grep -E '(Protect|Restrict|Private|Capability|SystemCall
 - Use built-in load testing with **safe limits** (configurable in settings)
 - The **CPU circuit breaker** (90% threshold) automatically aborts tests that threaten proxy performance
 - Always test in staging before production
+
+### Log Export and Capture Sinks (v1.7.0+)
+
+Everything below leaves the node by an operator's decision, which makes each
+one a boundary to scope deliberately.
+
+- **Syslog export.** Prefer TCP with TLS, and mutual TLS where the collector
+  supports it. Plain UDP is neither authenticated nor encrypted: on anything
+  but a trusted management segment it publishes the access log, the WAF events
+  and the audit trail to whoever is on the path.
+- **OTLP log export.** Set the exporter's `Authorization` header when the
+  collector expects one. The records carry the same content as the syslog lane.
+- **Capture records (v1.8.0) are the most sensitive thing this proxy emits.**
+  A record is a copy of a request and its response taken after TLS
+  termination. Redaction covers credentials (`Authorization`, `Cookie`,
+  `Set-Cookie`, the session and CSRF names, plus whatever the rule adds) and no
+  rule can turn that off, but it does NOT cover bodies: a capture of a route
+  carrying personal data is a file holding personal data. Point the sink where
+  that is acceptable, and keep the rule's TTL as short as the investigation
+  needs.
+- **`output.dir` writes files, so treat it as a data store.** The directory
+  must be absolute and must not be a symlink, checked on every write rather
+  than once at configuration time; files land mode `0640` owned by the service
+  user. Set `max_dir_bytes` so it prunes oldest-first, and keep it off shared
+  or network storage.
+- **A stalled sink never becomes a 5xx.** A full disk, a wedged collector or a
+  read-only mount increments `lorica_captures_total{outcome="dropped_sink"}`
+  and drops the record. Alert on that counter: silence there means captures are
+  being lost, not that nothing matched.
 
 ## 7. Backup and Recovery
 
@@ -266,6 +346,11 @@ Run this checklist periodically:
 - [ ] Worker mode enabled for production
 - [ ] File permissions correct on data directory
 - [ ] Prometheus metrics collected by monitoring system
+- [ ] `/metrics` authentication left on, scrape token injected out of band
 - [ ] Config backup taken within last 7 days
 - [ ] (Clustered) Cluster port reachable from enrolled-node sources only
 - [ ] (Clustered) No enrollment window left open (no live join token, enrollment listener closed)
+- [ ] (Automation) Listener reachable from CI runner sources only, and `automation_allowed_cidrs` no wider than the runner fleet
+- [ ] (Automation) One token per pipeline, tokens of decommissioned runners revoked, OIDC used instead of a static secret where the platform allows it
+- [ ] (Capture) No rule left armed past the investigation that justified it, and every `output.dir` sized, pruned and off shared storage
+- [ ] (Capture) `lorica_captures_total{outcome="dropped_sink"}` alerted on

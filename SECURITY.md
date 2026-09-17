@@ -4,7 +4,11 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.6.x   | Yes       |
+| 1.7.x   | Yes       |
+
+Only the current minor line receives fixes. Upgrade before reporting an issue
+against an older one; the `.deb` and `.rpm` packages preserve the data
+directory across upgrades.
 
 ## Reporting a Vulnerability
 
