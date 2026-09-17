@@ -1,10 +1,16 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-08-13 | Lorica v1.6.0
+> Last updated: 2026-09-17 | Lorica v1.8.0 (unreleased)
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin/Module (not built-in)
 >
 > **Competitors:** Pingora (framework), Sozu, Nginx OSS, Traefik OSS v3, BunkerWeb, Caddy v2, HAProxy CE
+>
+> Every cell describes the FREE edition as documented by its own project. The
+> Pingora column is a framework, not a shipped proxy: an `N` there usually
+> means "no module exists to build on", not "a product is missing a feature".
+> The HAProxy management rows rest on the Data Plane API (Apache-2.0, free and
+> official), not on the `haproxy` binary.
 
 ---
 
@@ -91,6 +97,7 @@
 | Request body scanning | Y | N | N | Plug | Plug | Y | N | N |
 | mTLS client verification | Y | Y | N | Y | Y | Y | Y | Y |
 | Connection pre-filter (pre-TLS CIDR) | Y | P | P | P | N | N | N | Y |
+| AI / LLM crawler deny-list (verified) | Y | N | N | N | Plug | P | Plug | Paid |
 
 ### Lorica Strengths
 
@@ -99,6 +106,7 @@
 - **IP blocklist auto-fetch** - Only BunkerWeb has equivalent (Blacklist plugin + BunkerNet).
 - **Slowloris detection** - Rare built-in feature.
 - **Connection pre-filter at TCP accept** - CIDR allow/deny evaluated before the TLS handshake, hot-reloaded without rebuilding listeners.
+- **AI / LLM crawler deny-list** (v1.6.0) - the only built-in curated list with per-vendor verification outside HAProxy's Enterprise Bot Management Module. BunkerWeb's free `robotstxt` plugin ships community AI-crawler lists but only ADVERTISES them in `robots.txt`; Lorica serves the same advisory file AND enforces the policy per route, with forward-confirmed rDNS or published IP ranges per vendor and an explicit stance on a spoofed User-Agent.
 
 ### Gaps for Lorica
 
@@ -173,6 +181,9 @@
 | SLA breach alerts | Y | N | N | N | N | N | N | N |
 | OpenTelemetry tracing (OTLP) | Y | P | Y | Y | Y | N | P | Y |
 | Structured JSON logs | Y | P | Y | Y | Y | Y | Y | Y |
+| Syslog export (RFC 5424, TCP + TLS) | Y | N | N | N | N | P | N | Y |
+| OTLP log export (logs signal) | Y | N | N | N | Y | N | Plug | P |
+| Conditional request + response capture | Y | N | N | P | P | P | P | P |
 
 ### Lorica Strengths
 
@@ -181,10 +192,14 @@
 - **Built-in load testing** - Unique. No competitor includes this.
 - **Real-time WebSocket log streaming** - Unique dashboard feature.
 - **SLA breach alerts** - Unique automated alerting.
+- **Syslog in RFC 5424 over TCP and TLS** (v1.7.0) - HAProxy is the only competitor that frames RFC 5424 and can wrap a log ring in TLS. Nginx's `syslog:` emits an RFC 3164 header over UDP or a unix datagram socket with no TLS path at all, BunkerWeb inherits exactly that, and Traefik and Caddy ship no syslog sink (Caddy's `net` writer is raw bytes with no framing).
+- **OTLP LOG records** (v1.7.0, `--features otel`) - Traefik v3.3+ is the only other first-party logs exporter, and it is still behind `experimental.otlpLogs`. HAProxy's is an out-of-tree addon that requires rebuilding HAProxy; Caddy's is a third-party module. Everyone else exports traces or metrics and stops there.
+- **Conditional capture of the whole exchange** (v1.8.0) - competitors log headers, and Nginx and Caddy can log a REQUEST body; none of them waits for the response to decide whether to keep anything, and none keeps the response body. Caddy's `log_append` comes closest and its own documentation labels it debug-only. Lorica decides buffering on request-side predicates, emission on the status, latency or upstream error, redacts credentials, and emits one structured record that joins the access-log row on `request_id`.
 
 ### Gaps for Lorica
 
 - ~~OpenTelemetry tracing~~ - Implemented in v1.4.0 as an off-by-default Cargo feature (`otel`). W3C trace context propagation, per-request spans with OTel HTTP semconv, log/trace correlation. Non-OTel users do not pay the dep-graph cost.
+- ~~SIEM export~~ - Implemented in v1.7.0 (syslog RFC 5424 over UDP / TCP / TCP+TLS, and OTLP log records under `--features otel`), extended in v1.8.0 with capture records and a per-event-kind switch on each sink.
 - ~~Structured JSON logs to file/syslog~~ - Implemented in v1.2.0.
 
 ---
@@ -200,6 +215,11 @@
 | Notification channels | Y | N | N | N | N | N | N | N |
 | SMTP/Slack/Webhook alerts | Y | N | N | N | N | N | N | N |
 | CLI management | Y | N | Y | Y | Y | Y | Y | Y |
+| Multi-user RBAC (management plane) | Y | N | N | N | Paid | Paid | P | P |
+| Tamper-evident audit log (hash chain) | Y | N | P | N | N | N | N | P |
+| Multi-node control plane (built-in) | Y | N | N | N | N | Y | P | Paid |
+| Scoped API tokens (management plane) | Y | N | N | N | N | Y | P | P |
+| OIDC / workload identity for CI | Y | N | N | N | N | N | N | N |
 | **Docker label discovery** | **N** | N | N | N | Y | Y | N | N |
 | **Kubernetes Ingress** | **N** | N | N | Y | Y | Y | N | Y |
 | **Config providers (etcd/Consul)** | **N** | N | N | N | Y | N | N | N |
@@ -210,6 +230,11 @@
 - **Nginx config import** - Unique feature. No competitor offers migration tooling.
 - **Notification channels** (SMTP, Slack, Webhook) - Unique. No competitor has built-in alerting.
 - **Config export/import with diff preview** - Unique.
+- **Multi-user RBAC** (v1.6.0) - three roles on the product's own management plane. Traefik's OSS dashboard has no accounts at all (RBAC is Hub), BunkerWeb's free edition is a single super-admin (roles need the PRO User Manager), and HAProxy's Data Plane API authenticates several users who are all full admins. Caddy scopes remote admin per client certificate, which is an ACL, not an account model.
+- **Tamper-evident audit log** (v1.6.0) - Sozu records every command-socket mutation and HAProxy's Data Plane API versions each configuration with an MD5 and keeps backups, but neither CHAINS its entries nor ships a verification command. Lorica's chain is verifiable end to end and localises the earliest broken row; in a fleet each node's trail is its own chain, verified separately.
+- **Multi-node control plane** (v1.7.0) - BunkerWeb is the only competitor with a built-in equivalent: its scheduler pushes rendered configuration to instances listed in `BUNKERWEB_INSTANCES`, authenticated by an IP allowlist and an optional shared bearer token mirrored on every node. Lorica enrolls each follower under the fleet's own CA, so every node holds a distinct identity and the plane is mutually authenticated, and since v1.8.0 the control plane cuts the payload per recipient: a follower receives only the routes, backends, certificates and rules it serves, and never the rest of the fleet's topology. Caddy coordinates ACME through shared storage and can push a configuration to one known address, but enumerates no roster; HAProxy's configuration push is Fusion, which is paid. `peers` synchronises stick tables, not configuration.
+- **Scoped API tokens** (v1.8.0) - BunkerWeb's free API is the one real peer, issuing Biscuit tokens with a TTL and per-resource permissions. Caddy's remote admin scopes paths and methods but the credential is a client certificate, and its local endpoint is unauthenticated; HAProxy's Data Plane API declares basic auth or mTLS with no scopes. Lorica's token carries its scopes, the hostname patterns and the backend CIDRs it may reach, and answers on a listener of its own so the dashboard's plane can stay on loopback.
+- **OIDC workload identity for CI** (v1.8.0) - unique. Every competitor's OIDC or JWT support authenticates PROXIED application traffic; none of them lets a CI job authenticate to the management plane with its own short-lived ID token. Lorica accepts a GitLab ID token under RS256 with a pinned issuer, audience and bound claims on project, ref and environment, which removes the shared secret from the CI variables entirely.
 
 ### Out of Scope by Design
 
@@ -282,12 +307,19 @@ These features are either unique to Lorica or extremely rare among competitors:
 | Per-route mTLS with hot-reload policy (required + org allowlist) | Lorica only |
 | Forward-auth verdict cache (opt-in, TTL-capped, cookie-keyed) | Lorica only |
 | Connection pre-filter at TCP accept (hot-reloaded CIDR) | Lorica, HAProxy |
+| Tamper-evident, verifiable admin audit chain | Lorica only |
+| Multi-node control plane with per-recipient configuration cuts | Lorica only (BunkerWeb pushes one fleet-wide configuration) |
+| Conditional request AND response capture as structured records | Lorica only |
+| Scoped automation API on a listener of its own | Lorica only (BunkerWeb scopes tokens on the same API) |
+| OIDC workload identity for the management plane | Lorica only |
+| Syslog RFC 5424 over TCP/TLS and OTLP log records | Lorica only (HAProxy syslog only, Traefik OTLP only) |
+| AI / LLM crawler deny-list with per-vendor verification | Lorica, HAProxy Enterprise |
 
 ---
 
 ## Summary: Remaining Gaps
 
-All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.6.0 are shipped (v1.6.0 added the hot binary upgrade, multi-user RBAC with three roles, and the AI/LLM crawler deny-list; v1.5.1 + v1.5.2 were audit-closure cycles: worker-mode cert hot-reload, SMTP encryption modes, security defense-in-depth pass, reactor-stall + reload pass, deps bumped). Remaining gaps are by design or planned for future versions.
+All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.8.0 are shipped: v1.6.0 added the hot binary upgrade, multi-user RBAC and the AI/LLM crawler deny-list; v1.7.0 added the multi-node cluster and the syslog / OTLP log export; v1.8.0 added conditional request capture and the CI automation API with GitLab OIDC. Remaining gaps are by design or planned for future versions.
 
 | Gap | Plan |
 |---|---|

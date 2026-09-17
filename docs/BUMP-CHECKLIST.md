@@ -20,8 +20,8 @@ When bumping the version, update ALL of these files:
 - [ ] `lorica-cluster/Cargo.toml` - `version` (first-party; follows product since v1.7.0)
 
 ## Internal dependency references (cross-crate deps)
-- [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-bench, lorica-worker, lorica-command, lorica-shmem, lorica-geoip, lorica-challenge, lorica-waf, lorica-notify versions
-- [ ] `lorica-api/Cargo.toml` - lorica-acme, lorica-config, lorica-dashboard, lorica-bench, lorica-metrics, lorica-waf, lorica-notify versions
+- [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-bench, lorica-worker, lorica-command, lorica-cluster, lorica-shmem, lorica-geoip, lorica-challenge, lorica-waf, lorica-notify versions
+- [ ] `lorica-api/Cargo.toml` - lorica-acme, lorica-config, lorica-dashboard, lorica-bench, lorica-cluster, lorica-metrics, lorica-waf, lorica-notify versions
 - [ ] `lorica-bench/Cargo.toml` - lorica-config, lorica-metrics, lorica-notify versions
 - [ ] `lorica-notify/Cargo.toml` - lorica-metrics version
 
@@ -29,10 +29,18 @@ When bumping the version, update ALL of these files:
 - [ ] `lorica-dashboard/frontend/package.json` - `version`
 - [ ] `lorica-dashboard/frontend/package-lock.json` - the root `version`, twice: once at the top of the file and once in the `packages.""` entry (`pnpm-lock.yaml` does not record it). **Do not blind-replace**: a dependency can carry the same version string (at 1.7.0 it was `node_modules/esquery`), so replace the two root entries and leave the rest.
 - [ ] `lorica-api/openapi.yaml` - `version`
+- [ ] `lorica-api/openapi-automation.yaml` - `version` (added in v1.8.0; it is a
+      second spec with its own `info.version`, easy to leave behind)
 
 ## Documentation
 - [ ] `README.md` - version badge
+- [ ] `README.md` - the roadmap table: the shipped row moves to `Shipped`, and
+      the next version gets its own row
 - [ ] `CHANGELOG.md` - move `[Unreleased]` to `[x.y.z] - YYYY-MM-DD`
+- [ ] `COMPARISON.md` - the `Last updated` line (date and version), and any
+      table row the cycle moved. It sat at v1.6.0 until v1.8.0 because nothing
+      on this list pointed at it: a feature comparison ages silently, no test
+      fails and no reader of the repo can tell it is two releases behind
 
 ## Packaging
 - [ ] `dist/rpm/lorica.spec` - `Version` field

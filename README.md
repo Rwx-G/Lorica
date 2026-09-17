@@ -9,8 +9,8 @@
   <img src="https://img.shields.io/badge/version-1.7.4-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-2034-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-658-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-2632-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-748-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -710,7 +710,7 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (2073 tests, Lorica-native)
+# Product crates only (2632 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-limits -p lorica-shmem \
@@ -729,7 +729,7 @@ cargo test -p lorica-core -p lorica-proxy -p lorica-http \
 # wire corpus (every message's encoding, pinned)
 cargo test -p lorica-cluster --tests
 
-# Frontend (423 Vitest cases across 15 files) and its gates
+# Frontend (480 Vitest cases across 25 files) and its gates
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 
@@ -757,8 +757,10 @@ runs them all in sequence; each `--skip-<profile>` flag drops one.
 | hot-upgrade | 29 | signature verification, socket handover, rollback of a failing binary |
 | log-sinks | 23 | RFC 5424 syslog over TCP and OTLP logs, delivered to real collectors |
 | acme | 15 | HTTP-01 and manual DNS-01 issuance against the Pebble fixture |
-| cluster | 56 | a control plane and two followers (one in workers mode): enrollment, activation, replication, an HTTP-01 order validated through the selected follower, need-to-know key distribution, telemetry and audit fan-in, a load phase at 300 rps per follower, per-node SLA reads, break-glass, revocation |
-| cluster restart + revocation | 16 | the same fleet across a process boundary: a follower re-opens its session unaided and keeps its generation, SLA history and served certificate; a restarted control plane reports its policy-state reset, takes its followers back and clears the flag after a round; then revocation, last because it is terminal for a node |
+| capture | 163 | two-phase matching from two source addresses, a 10 MiB body truncated at the cap while the upstream still receives all of it, credential headers and named query parameters redacted on every sink, a binary body round-tripping through base64, the per-rule budget and the TTL each self-disabling their rule, the recent-captures ring, and an `output.dir` that is read-only and then writable |
+| cluster | 64 | a control plane and two followers (one in workers mode): enrollment, activation, replication, an HTTP-01 order validated through the selected follower, need-to-know key distribution, telemetry and audit fan-in, a load phase at 300 rps per follower, per-node SLA reads, break-glass, revocation |
+| automation | 104 | on the same fleet fixture, since the listener belongs to the control plane: the source allowlist refusing a foreign address before the TLS handshake, bearer-only authentication and the scope gate, the idempotent environment `PUT` with `If-Match`, hostname and backend-CIDR grants, the TTL reaper, the management API refusing to edit a managed row, GitLab ID tokens against a local issuer fixture with a replayed `jti` refused, and a follower refusing to open the listener at all |
+| cluster restart + revocation | 22 | the same fleet across a process boundary: a follower re-opens its session unaided and keeps its generation, SLA history and served certificate; a restarted control plane reports its policy-state reset, takes its followers back and clears the flag after a round; then revocation, last because it is terminal for a node |
 | bot, bot-workers, geoip, rdns, otel, otel-workers | 29, 29, 16, 7, 16, 16 | bot challenges, country policy, rDNS bypass, OTLP traces; run individually with `docker compose --profile <name> run --rm <name>-smoke` |
 
 The two intentional gaps in the Docker harness are:
