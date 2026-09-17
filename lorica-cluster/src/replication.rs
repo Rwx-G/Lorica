@@ -126,8 +126,23 @@ pub struct ConfigPayload {
 pub trait PayloadSource: Send + Sync {
     /// The generation every recipient in this round is offered.
     fn generation(&self) -> u64;
-    /// The payload for one recipient.
+    /// The payload for one recipient, blob included.
+    ///
+    /// Call this only where the BYTES are wanted: a Prepare, or a
+    /// convergence pull. Everything that wants to know what a node
+    /// should be holding calls [`Self::expected_version_for`].
     fn payload_for(&self, node_id: &str) -> ConfigPayload;
+    /// What one recipient should be holding at this generation,
+    /// WITHOUT its blob.
+    ///
+    /// Separate from [`Self::payload_for`] because the callers that
+    /// only compare a generation and a hash vastly outnumber the ones
+    /// that send bytes: the Commit exchange, the drift verdict, every
+    /// `HelloAck` and `HeartbeatAck`, and each dashboard render. Going
+    /// through the payload for those copied one node's whole cut per
+    /// call, which at fleet scale is the configuration copied once per
+    /// node per answer.
+    fn expected_version_for(&self, node_id: &str) -> ConfigVersion;
     /// The hash of the control plane's own full view, used as the
     /// fleet's identity and for change detection. Not what any single
     /// recipient reports back.
@@ -143,6 +158,10 @@ impl PayloadSource for ConfigPayload {
 
     fn payload_for(&self, _node_id: &str) -> ConfigPayload {
         self.clone()
+    }
+
+    fn expected_version_for(&self, _node_id: &str) -> ConfigVersion {
+        self.version()
     }
 
     fn fleet_hash(&self) -> String {
@@ -238,12 +257,21 @@ impl AcceptedConfig {
     ///
     /// Every answer addressed to a node compares against this rather
     /// than against [`Self::version`], because since Story 10.0 the
-    /// fleet hash is the hash of a blob no follower receives. A node
-    /// the accepted source has nothing for, and a listener with no
-    /// fleet layer, fall back to the fleet version.
+    /// fleet hash is the hash of a blob no follower receives. A
+    /// listener with no fleet layer, asking before the first
+    /// publication, falls back to the fleet version.
+    ///
+    /// This is the hot path of the pair: a heartbeat, a handshake and
+    /// a dashboard render all land here, and none of them wants the
+    /// bytes, so it asks the source for the version alone.
     pub fn expected_for(&self, node_id: &str) -> ConfigVersion {
-        match self.payload_for(node_id) {
-            Some(payload) => payload.version(),
+        let source = self
+            .source
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        match source {
+            Some(source) => source.expected_version_for(node_id),
             None => self.version(),
         }
     }
@@ -606,7 +634,11 @@ impl Replicator {
         let mut commits: JoinSet<(String, Result<AppliedConfig, String>)> = JoinSet::new();
         for (node_id, endpoint) in prepared {
             let deadline = self.per_node_deadline;
-            let mine = payloads.payload_for(&node_id);
+            // The version, not the payload: Commit carries a
+            // generation and checks the acknowledged hash, and asking
+            // for the payload here copied the node's whole cut to read
+            // two scalars off it.
+            let mine = payloads.expected_version_for(&node_id);
             let generation = mine.generation;
             let hash = mine.hash;
             commits.spawn(async move {
@@ -1345,6 +1377,28 @@ mod tests {
                 generation: 3,
                 hash: HASH.to_string()
             }
+        );
+    }
+
+    #[test]
+    fn the_blob_free_expectation_agrees_with_the_payload_it_skips() {
+        // The two answers must never diverge: one is what the node is
+        // told to hold, the other is what it is sent.
+        let source = payload(11);
+        assert_eq!(
+            source.expected_version_for("node-a"),
+            source.payload_for("node-a").version()
+        );
+        let accepted = AcceptedConfig::new();
+        assert_eq!(
+            accepted.expected_for("node-a"),
+            ConfigVersion::default(),
+            "before the first publication there is nothing to expect"
+        );
+        accepted.publish(Arc::new(payload(11)));
+        assert_eq!(
+            accepted.expected_for("node-a"),
+            accepted.payload_for("node-a").expect("published").version()
         );
     }
 

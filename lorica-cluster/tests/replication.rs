@@ -174,6 +174,12 @@ impl PayloadSource for PerRecipient {
         }
     }
 
+    fn expected_version_for(&self, node_id: &str) -> ConfigVersion {
+        // Derived from the same cut the payload is, so the two cannot
+        // answer differently for one node.
+        self.payload_for(node_id).version()
+    }
+
     fn fleet_hash(&self) -> String {
         self.fleet_hash.clone()
     }
