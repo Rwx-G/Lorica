@@ -284,6 +284,12 @@ impl WorkerMetricsCtx {
             lorica_api::metrics::capture_rules_active_value().max(0) as u64;
         report.capture_inflight_bytes =
             lorica_api::metrics::capture_inflight_bytes_value().max(0) as u64;
+        // Same story for the WAF body-scan budget (Story 10.6): the
+        // reservation is a worker-side process-global, so the
+        // supervisor's own gauge is 0 and only this field lets
+        // `/metrics` report what the node actually holds.
+        report.waf_body_scan_inflight_bytes =
+            lorica_api::metrics::waf_body_scan_inflight_bytes_value().max(0) as u64;
         // Cross-worker counter aggregation (v1.4.0 follow-up). Ships
         // every non-typed per-worker counter (bot_challenge,
         // geoip_block, forward_auth_cache, ...) to the supervisor so
@@ -588,11 +594,13 @@ mod tests {
         // fleet figure reaches the scrape.
         lorica_api::metrics::set_capture_rules_active(6);
         lorica_api::metrics::set_capture_inflight_bytes(65_536);
+        lorica_api::metrics::set_waf_body_scan_inflight_bytes(16_384);
 
         let report = empty_ctx().build_report(3);
 
         assert_eq!(report.capture_rules_active, 6);
         assert_eq!(report.capture_inflight_bytes, 65_536);
+        assert_eq!(report.waf_body_scan_inflight_bytes, 16_384);
     }
 
     #[test]
@@ -602,10 +610,12 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         lorica_api::metrics::set_capture_rules_active(0);
         lorica_api::metrics::set_capture_inflight_bytes(0);
+        lorica_api::metrics::set_waf_body_scan_inflight_bytes(0);
 
         let report = empty_ctx().build_report(3);
 
         assert_eq!(report.capture_rules_active, 0);
         assert_eq!(report.capture_inflight_bytes, 0);
+        assert_eq!(report.waf_body_scan_inflight_bytes, 0);
     }
 }

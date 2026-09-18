@@ -98,13 +98,39 @@ pub struct RequestCtx {
     /// read this field instead of re-deriving the answer per chunk.
     ///
     /// `false` means the body is never buffered, never counted
-    /// against `WAF_BODY_SCAN_MAX`, and never handed to
+    /// against `waf_body_scan_max`, and never handed to
     /// `evaluate_body` - which would have returned `Pass` on it
     /// anyway. The route's `max_request_body_bytes` is then the only
     /// ceiling that applies.
+    ///
+    /// It is also cleared mid-body when the node-wide scan budget
+    /// refuses the next chunk, which is how the fail-open path stops
+    /// every later stage from buffering, capping or scanning.
     pub waf_body_inspect: bool,
+    /// Bytes of this request's body the WAF will buffer at most.
+    ///
+    /// Resolved once in `check_body_limits` from the route's
+    /// `waf_body_scan_max_bytes`, falling back to
+    /// `WAF_BODY_SCAN_DEFAULT` (Story 10.6 AC #5). Both the
+    /// Content-Length path and the chunked path read this field, so
+    /// neither re-reads the route snapshot per chunk and neither can
+    /// enforce a different cap than the other.
+    pub waf_body_scan_max: usize,
+    /// Bytes this request holds against the node-wide WAF scan budget.
+    ///
+    /// `None` until the first chunk is actually buffered, so a request
+    /// with no inspectable body costs no reservation at all. Dropping
+    /// it releases the bytes, which is why the release is never
+    /// written out: the context is dropped whatever path the request
+    /// took, including a connection the client abandoned mid-body.
+    pub waf_body_reservation: Option<crate::byte_budget::ByteReservation>,
+    /// Set to true the first time the scan budget refuses this
+    /// request's body, so the `ScanSkippedBudget` event is emitted
+    /// once per request rather than once per chunk. Its neighbour
+    /// `waf_body_truncated` does the same job for truncation.
+    pub waf_body_scan_skipped_budget: bool,
     /// Set to true the first time the request body crosses
-    /// `WAF_BODY_SCAN_MAX` in Detection mode, so the corresponding
+    /// `waf_body_scan_max` in Detection mode, so the corresponding
     /// `WafEvent` (`BodyTruncated`) is emitted once per request
     /// rather than on every subsequent chunk. Has no effect in
     /// Blocking mode (the request is rejected with 413 instead).

@@ -39,6 +39,7 @@
 pub mod ai_bot;
 pub mod bot;
 pub mod bot_rdns;
+pub mod byte_budget;
 pub mod capture;
 pub mod connection_filter;
 pub mod geoip;

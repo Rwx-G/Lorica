@@ -28,7 +28,7 @@ use super::{
     bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest,
     evaluate_mtls, extract_host, mirror_sample_hit, render_error_body, request_has_body,
     run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome, LoricaProxy, MirrorBodyState,
-    MirrorPending, ProxyConfig, RequestCtx, RouteEntry, VerdictCacheEngine, WAF_BODY_SCAN_MAX,
+    MirrorPending, ProxyConfig, RequestCtx, RouteEntry, VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
 };
 use crate::ai_bot::build_robots_txt_from_names;
 
@@ -160,8 +160,8 @@ impl LoricaProxy {
         lorica_api::log_sinks::publish_waf(ev, None, None);
     }
 
-    /// Record that a request body crossed `WAF_BODY_SCAN_MAX` while
-    /// the route's WAF was in Detection mode (v1.5.1 audit H-2).
+    /// Record that a request body crossed `ctx.waf_body_scan_max`
+    /// while the route's WAF was in Detection mode (v1.5.1 audit H-2).
     ///
     /// Idempotent per request via `ctx.waf_body_truncated` so that a
     /// streaming chunked body that produces N chunks past the cap
@@ -169,7 +169,7 @@ impl LoricaProxy {
     /// dashboard with one event per chunk). Mirrors ModSecurity's
     /// `ProcessPartial` action and AWS WAF's `Continue`
     /// oversize-handling : the request proceeds with whatever the
-    /// scanner already buffered (the first `WAF_BODY_SCAN_MAX`
+    /// scanner already buffered (the first `ctx.waf_body_scan_max`
     /// bytes), but the operator gets a first-class signal in the
     /// WAF event log so they can decide to flip the route to
     /// Blocking or raise the cap.
@@ -184,15 +184,17 @@ impl LoricaProxy {
             return;
         }
         ctx.waf_body_truncated = true;
+        let cap = ctx.waf_body_scan_max;
 
         warn!(
             received = observed_size,
-            cap = WAF_BODY_SCAN_MAX,
+            cap = cap,
             route_id = route_id,
             "request body exceeds WAF scan window (partial scan, detection mode)"
         );
 
         lorica_api::metrics::record_waf_event("protocol_violation", "detected");
+        lorica_api::metrics::inc_waf_body_scan_outcome("truncated");
         self.waf_counts
             .entry(("protocol_violation".to_string(), "detected".to_string()))
             .or_insert_with(|| AtomicU64::new(0))
@@ -201,7 +203,7 @@ impl LoricaProxy {
         let ev = lorica_waf::WafEvent {
             rule_id: 0,
             description: format!(
-                "request body ({observed_size} bytes) exceeded WAF scan window ({WAF_BODY_SCAN_MAX} bytes); partial scan only"
+                "request body ({observed_size} bytes) exceeded WAF scan window ({cap} bytes); partial scan only"
             ),
             category: lorica_waf::RuleCategory::ProtocolViolation,
             severity: 5,
@@ -211,6 +213,63 @@ impl LoricaProxy {
             client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
             route_hostname: route_hostname.to_string(),
             action: "detected".to_string(),
+        };
+        self.persist_waf_event(&ev);
+    }
+
+    /// Record that the node-wide scan budget refused this request's
+    /// body, which is why it was forwarded unscanned (Story 10.6 AC
+    /// #7, the `ScanSkippedBudget` event).
+    ///
+    /// Idempotent per request via `ctx.waf_body_scan_skipped_budget`,
+    /// for the same reason its neighbour
+    /// [`Self::record_waf_body_truncated`] is: a chunked body would
+    /// otherwise produce one event per chunk.
+    ///
+    /// The action reads `skipped`, not `detected` or `blocked`: no
+    /// rule fired and nothing was refused, the node declined to look.
+    /// That distinction is the whole value of the event, because the
+    /// operator reading it has a scan gap to size, not an attack to
+    /// investigate.
+    pub(super) fn record_waf_body_scan_skipped_budget(
+        &self,
+        ctx: &mut RequestCtx,
+        route_id: &str,
+        route_hostname: &str,
+        observed_size: u64,
+    ) {
+        if ctx.waf_body_scan_skipped_budget {
+            return;
+        }
+        ctx.waf_body_scan_skipped_budget = true;
+
+        warn!(
+            received = observed_size,
+            budget = crate::proxy_wiring::waf_body_budget().ceiling(),
+            route_id = route_id,
+            "WAF scan buffer budget exhausted; request forwarded unscanned"
+        );
+
+        lorica_api::metrics::record_waf_event("protocol_violation", "skipped");
+        lorica_api::metrics::inc_waf_body_scan_outcome("skipped_budget");
+        self.waf_counts
+            .entry(("protocol_violation".to_string(), "skipped".to_string()))
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+
+        let ev = lorica_waf::WafEvent {
+            rule_id: 0,
+            description: format!(
+                "request body ({observed_size} bytes) not scanned: the node-wide WAF scan buffer budget was exhausted; request forwarded"
+            ),
+            category: lorica_waf::RuleCategory::ProtocolViolation,
+            severity: 5,
+            matched_field: "body_size".to_string(),
+            matched_value: observed_size.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
+            route_hostname: route_hostname.to_string(),
+            action: "skipped".to_string(),
         };
         self.persist_waf_event(&ev);
     }
@@ -2098,8 +2157,9 @@ impl LoricaProxy {
     /// chunked / no-Content-Length case is caught downstream in
     /// `request_body_filter` by the same caps.
     ///
-    /// This is also where `ctx.waf_body_inspect` is decided, because
-    /// it is the last stage that holds the request header, and the
+    /// This is also where `ctx.waf_body_inspect` and
+    /// `ctx.waf_body_scan_max` are decided, because it is the last
+    /// stage that holds both the request header and the route, and the
     /// decision has to be made before the first body chunk arrives.
     /// Terminal: 413.
     pub(super) async fn check_body_limits(
@@ -2140,21 +2200,43 @@ impl LoricaProxy {
                     .and_then(|v| v.to_str().ok()),
             );
 
+        // The effective scan window for this request, resolved once
+        // (Story 10.6 AC #5). `None` on the route means the crate
+        // default; a stored value larger than this platform's `usize`
+        // is clamped rather than wrapped. Every later site reads this
+        // field, never the route and never the constant.
+        ctx.waf_body_scan_max = entry
+            .route
+            .waf_body_scan_max_bytes
+            .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
+            .unwrap_or(WAF_BODY_SCAN_DEFAULT);
+
+        // A body the engine cannot parse is a decision, not a
+        // non-event: it is the one outcome an operator reading
+        // `lorica_waf_body_scans_total` needs in order to tell "the
+        // WAF is watching this route" from "the WAF is watching this
+        // route and never sees its uploads". Only requests that carry
+        // a body count, so a GET flood cannot drown the series.
+        if entry.route.waf_enabled && !ctx.waf_body_inspect && request_has_body(req) {
+            lorica_api::metrics::inc_waf_body_scan_outcome("skipped_content_type");
+        }
+
         // WAF body-scan cap on the advertised Content-Length.
         // Fail-fast here avoids buffering bytes we would reject
         // anyway in `request_body_filter`.
         if ctx.waf_body_inspect {
             if let Some(cl) = req.headers.get("content-length") {
                 if let Ok(len) = cl.to_str().unwrap_or("0").parse::<u64>() {
-                    if len > WAF_BODY_SCAN_MAX as u64 {
+                    if len > ctx.waf_body_scan_max as u64 {
                         match entry.route.waf_mode {
                             WafMode::Blocking => {
                                 warn!(
                                     content_length = len,
-                                    cap = WAF_BODY_SCAN_MAX,
+                                    cap = ctx.waf_body_scan_max,
                                     route_id = %entry.route.id,
                                     "request body exceeds WAF scan window (413, blocking, advertised CL)"
                                 );
+                                lorica_api::metrics::inc_waf_body_scan_outcome("rejected");
                                 let header = lorica_http::ResponseHeader::build(413, None)?;
                                 session
                                     .write_response_header(Box::new(header), true)

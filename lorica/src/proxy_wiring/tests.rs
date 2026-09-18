@@ -74,6 +74,7 @@ fn make_route(id: &str, hostname: &str, path: &str, enabled: bool) -> Route {
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         managed_by: None,
+        waf_body_scan_max_bytes: None,
         created_at: now,
         updated_at: now,
     }

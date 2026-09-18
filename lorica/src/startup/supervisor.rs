@@ -1941,6 +1941,7 @@ fn spawn_worker_channel_task(
                                         req_counts,
                                         waf_counts,
                                         capture_gauges_from(&report),
+                                        report.waf_body_scan_inflight_bytes,
                                     )
                                     .await;
                                 // Cross-worker generic-counter
@@ -2852,6 +2853,7 @@ async fn pull_all_metrics_via_rpc(
                             req_counts,
                             waf_counts,
                             capture_gauges_from(&report),
+                            report.waf_body_scan_inflight_bytes,
                         )
                         .await;
                     // Cross-worker counter aggregation (v1.4.0

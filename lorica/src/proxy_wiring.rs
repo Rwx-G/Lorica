@@ -49,25 +49,32 @@ use tracing::{info, warn};
 /// Entries beyond this threshold are evicted in LRU order.
 const CACHE_SIZE_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
 
-/// Maximum request body size buffered for WAF scanning (1 MiB).
+/// Request body bytes buffered for WAF scanning when the route says
+/// nothing else (1 MiB).
+///
+/// The effective cap is the route's `waf_body_scan_max_bytes` when it
+/// carries one, this value otherwise. It is resolved once per request
+/// into `ctx.waf_body_scan_max` (Story 10.6 AC #5), and every
+/// enforcement site reads that field rather than this constant, so the
+/// route snapshot is not re-read per chunk.
 ///
 /// Applies only to bodies the engine can parse, that is those whose
 /// declared `Content-Type` passes `lorica_waf::body_is_inspectable`.
 /// A body outside that set is never buffered and never measured
-/// against this cap: `evaluate_body` passes on anything that is not
+/// against the cap: `evaluate_body` passes on anything that is not
 /// UTF-8, so the buffer would be wasted and the oversize rejection
 /// below would be a false positive with no rule behind it.
 ///
 /// When a route has the WAF on, the body IS inspectable, and it
-/// exceeds this cap, the action depends on the route's `waf_mode`
-/// (v1.5.1 audit H-2) :
+/// exceeds the effective cap, the action depends on the route's
+/// `waf_mode` (v1.5.1 audit H-2) :
 ///
 /// - **Blocking** : the proxy returns `413 Payload Too Large` and
 ///   never forwards a single byte upstream (mirrors ModSecurity's
 ///   `SecRequestBodyLimitAction = Reject`).
 /// - **Detection** : the proxy emits a single `BodyTruncated`
 ///   `WafEvent`, lets the request through, and runs the body scan
-///   on the first `WAF_BODY_SCAN_MAX` bytes (mirrors ModSecurity's
+///   on the first `ctx.waf_body_scan_max` bytes (mirrors ModSecurity's
 ///   `ProcessPartial` and AWS WAF's Continue oversize-handling).
 ///
 /// The previous behaviour was to scan the first MiB and silently
@@ -75,9 +82,8 @@ const CACHE_SIZE_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
 /// attacker could prefix 1 MiB of inert padding before a malicious
 /// payload and slip past every WAF rule. That padding bypass stays
 /// closed: the prefix is text, so the body is inspectable, so the cap
-/// still applies to it. An operator-tunable per-route cap is Story
-/// 10.6 AC #5.
-const WAF_BODY_SCAN_MAX: usize = 1_048_576;
+/// still applies to it, at whatever value the route set.
+const WAF_BODY_SCAN_DEFAULT: usize = 1_048_576;
 
 /// In-memory cache storage backend (leaked to 'static for the Storage trait).
 pub static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
@@ -308,6 +314,9 @@ pub mod filters;
 #[cfg(test)]
 pub(crate) use filters::build_redirect_location;
 pub use filters::ip_to_shmem_key;
+
+pub mod waf_body_budget;
+pub use waf_body_budget::{waf_body_budget, WAF_BODY_SCAN_DEFAULT_INFLIGHT_BYTES};
 
 pub mod worker_rpc;
 #[cfg(test)]
@@ -621,6 +630,9 @@ impl ProxyHttp for LoricaProxy {
             body_bytes_received: 0,
             waf_body_buffer: None,
             waf_body_inspect: false,
+            waf_body_scan_max: WAF_BODY_SCAN_DEFAULT,
+            waf_body_reservation: None,
+            waf_body_scan_skipped_budget: false,
             waf_body_truncated: false,
             sticky_backend_id: None,
             forward_auth_inject: Vec::new(),
@@ -1015,16 +1027,18 @@ impl ProxyHttp for LoricaProxy {
     /// This method performs three functions:
     /// 1. Enforces `max_request_body_bytes` for chunked transfer encoding
     ///    (Content-Length-based enforcement is done in `request_filter`).
-    /// 2. Enforces the WAF body-scan cap (`WAF_BODY_SCAN_MAX`) when
-    ///    `ctx.waf_body_inspect` says the engine will read this body
-    ///    (v1.5.1 audit H-2). Action depends on `route.waf_mode` :
-    ///    Blocking returns 413 ; Detection emits a `BodyTruncated`
-    ///    `WafEvent` once and lets the request through with a partial
-    ///    scan (matches ModSecurity `ProcessPartial` and AWS WAF
-    ///    Continue).
+    /// 2. Enforces the WAF body-scan cap (`ctx.waf_body_scan_max`,
+    ///    resolved once from the route) when `ctx.waf_body_inspect`
+    ///    says the engine will read this body (v1.5.1 audit H-2).
+    ///    Action depends on `route.waf_mode` : Blocking returns 413 ;
+    ///    Detection emits a `BodyTruncated` `WafEvent` once and lets
+    ///    the request through with a partial scan (matches ModSecurity
+    ///    `ProcessPartial` and AWS WAF Continue).
     /// 3. Buffers the request body for WAF scanning, under the same
-    ///    condition. When the full body is received (`end_of_stream`),
-    ///    the WAF engine evaluates the buffered body.
+    ///    condition and under the node-wide in-flight budget. When the
+    ///    full body is received (`end_of_stream`), the WAF engine
+    ///    evaluates the buffered body. A body the budget cannot admit
+    ///    is forwarded unscanned in both modes (Story 10.6 AC #7).
     ///
     /// Steps 2 and 3 are skipped entirely for a body the engine
     /// cannot parse: no buffer, no cap, no scan, and the route's
@@ -1084,23 +1098,25 @@ impl ProxyHttp for LoricaProxy {
             // snapshot, so a body the engine cannot parse pays for
             // none of this and the route fields are cloned only on
             // the oversize path rather than on every chunk.
-            let cap_meta =
-                if ctx.waf_body_inspect && ctx.body_bytes_received > WAF_BODY_SCAN_MAX as u64 {
-                    ctx.route_snapshot
-                        .as_ref()
-                        .map(|r| (r.waf_mode.clone(), r.id.clone(), r.hostname.clone()))
-                } else {
-                    None
-                };
+            let cap_meta = if ctx.waf_body_inspect
+                && ctx.body_bytes_received > ctx.waf_body_scan_max as u64
+            {
+                ctx.route_snapshot
+                    .as_ref()
+                    .map(|r| (r.waf_mode.clone(), r.id.clone(), r.hostname.clone()))
+            } else {
+                None
+            };
             if let Some((waf_mode, route_id, route_hostname)) = cap_meta {
                 match waf_mode {
                     WafMode::Blocking => {
                         warn!(
                             received = ctx.body_bytes_received,
-                            cap = WAF_BODY_SCAN_MAX,
+                            cap = ctx.waf_body_scan_max,
                             route_id = %route_id,
                             "request body exceeds WAF scan window (413, blocking, streaming)"
                         );
+                        lorica_api::metrics::inc_waf_body_scan_outcome("rejected");
                         let header = lorica_http::ResponseHeader::build(413, None)?;
                         session
                             .write_response_header(Box::new(header), true)
@@ -1121,19 +1137,53 @@ impl ProxyHttp for LoricaProxy {
             }
 
             // Buffer body for WAF scanning (only when the engine
-            // will read it). The `buf.len() < WAF_BODY_SCAN_MAX`
+            // will read it). The `buffered < ctx.waf_body_scan_max`
             // guard caps the buffer growth so Detection-mode requests
-            // past the cap keep the first-`WAF_BODY_SCAN_MAX`-byte
+            // past the cap keep the first-`waf_body_scan_max`-byte
             // prefix and discard the rest. Blocking-mode requests
             // already returned with 413 above so the guard is moot in
             // that branch ; keep it as defense-in-depth in case a
             // future refactor changes the return semantics.
+            //
+            // Every byte kept is reserved from the node-wide budget
+            // first (Story 10.6 AC #7). One atomic read-modify-write
+            // per buffered chunk, no lock, nothing held across the
+            // upstream write. Over budget, the request is forwarded
+            // unscanned rather than rejected; the reasoning for that
+            // direction is on `waf_body_budget`.
             if ctx.waf_body_inspect {
-                let buf = ctx.waf_body_buffer.get_or_insert_with(Vec::new);
-                if buf.len() < WAF_BODY_SCAN_MAX {
-                    let remaining = WAF_BODY_SCAN_MAX - buf.len();
-                    let to_copy = chunk.len().min(remaining);
-                    buf.extend_from_slice(&chunk[..to_copy]);
+                let buffered = ctx.waf_body_buffer.as_ref().map_or(0, Vec::len);
+                if buffered < ctx.waf_body_scan_max {
+                    let to_copy = chunk.len().min(ctx.waf_body_scan_max - buffered);
+                    let reservation = ctx
+                        .waf_body_reservation
+                        .get_or_insert_with(|| waf_body_budget().reservation());
+                    if reservation.grow(to_copy) {
+                        ctx.waf_body_buffer
+                            .get_or_insert_with(Vec::new)
+                            .extend_from_slice(&chunk[..to_copy]);
+                    } else {
+                        let observed = ctx.body_bytes_received;
+                        let route_meta = ctx
+                            .route_snapshot
+                            .as_ref()
+                            .map(|r| (r.id.clone(), r.hostname.clone()));
+                        let (route_id, route_hostname) =
+                            route_meta.unwrap_or_else(|| ("-".to_string(), "-".to_string()));
+                        self.record_waf_body_scan_skipped_budget(
+                            ctx,
+                            &route_id,
+                            &route_hostname,
+                            observed,
+                        );
+                        // Nothing further is buffered, measured or
+                        // scanned for this request, in either WAF
+                        // mode. Dropping the reservation returns the
+                        // prefix it had already taken.
+                        ctx.waf_body_inspect = false;
+                        ctx.waf_body_buffer = None;
+                        ctx.waf_body_reservation = None;
+                    }
                 }
             }
 
@@ -1228,6 +1278,11 @@ impl ProxyHttp for LoricaProxy {
                         _ => lorica_waf::WafMode::Detection,
                     };
 
+                    // One `scanned` per request that actually reached
+                    // the engine, so the five outcomes of
+                    // `lorica_waf_body_scans_total` partition the
+                    // bodies a WAF-enabled route saw.
+                    lorica_api::metrics::inc_waf_body_scan_outcome("scanned");
                     let mut verdict = self
                         .waf_engine
                         .evaluate_body(waf_mode, buf, host, client_ip);

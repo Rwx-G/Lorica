@@ -1031,6 +1031,14 @@ async fn build_proxy_config_inner(
                 .map(|s| s.mirror_max_concurrent_global)
                 .unwrap_or(4096),
             capture_rules,
+            // Story 10.6 AC #7. A store that did not answer leaves the
+            // process-wide WAF scan budget on its built-in default
+            // rather than on zero, which would skip every body scan on
+            // the node.
+            waf_body_scan_max_inflight_bytes: settings
+                .as_ref()
+                .map(|s| s.waf_body_scan_max_inflight_bytes)
+                .unwrap_or(0),
         },
     );
 
@@ -1437,6 +1445,7 @@ mod environment_certificate_tests {
             managed_by: Some(lorica_config::models::ManagedBy::Automation {
                 environment: "pr-42".to_string(),
             }),
+            waf_body_scan_max_bytes: None,
             created_at: now,
             updated_at: now,
         }

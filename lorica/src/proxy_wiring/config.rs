@@ -275,6 +275,11 @@ pub struct ProxyConfigGlobals {
     /// Story 10.1. The stored capture rules, compiled once by
     /// `from_store`.
     pub capture_rules: Vec<lorica_config::models::CaptureRule>,
+    /// Story 10.6 AC #7. The node-wide ceiling on bytes held in WAF
+    /// scan buffers. Not a `ProxyConfig` field: the budget it feeds is
+    /// a process-wide static, because a reservation outlives the
+    /// snapshot it was taken under. `from_store` hands it over.
+    pub waf_body_scan_max_inflight_bytes: u64,
 }
 
 impl Default for ProxyConfigGlobals {
@@ -306,6 +311,12 @@ impl Default for ProxyConfigGlobals {
             mirror_max_concurrent_per_route: 32,
             mirror_max_concurrent_global: 4096,
             capture_rules: Vec::new(),
+            // Same reason as the mirror caps above: the production
+            // default, not `0`, so config built in tests and fallback
+            // paths runs under the ceiling a real node runs under
+            // rather than one that skips every scan.
+            waf_body_scan_max_inflight_bytes:
+                super::waf_body_budget::WAF_BODY_SCAN_DEFAULT_INFLIGHT_BYTES as u64,
         }
     }
 }
@@ -340,6 +351,7 @@ impl ProxyConfig {
             mirror_max_concurrent_per_route,
             mirror_max_concurrent_global,
             capture_rules,
+            waf_body_scan_max_inflight_bytes,
         } = globals;
         let backend_map: HashMap<String, Backend> = backends
             .into_iter()
@@ -639,6 +651,13 @@ impl ProxyConfig {
         // the configuration have to be dropped here, or the map grows
         // with every rule an operator ever created.
         crate::capture::node_budgets().retain_rules(capture_rules.rule_ids());
+
+        // Story 10.6 AC #7, and here for the same reason the capture
+        // budgets are: the WAF scan budget is a process-wide static,
+        // so a reloaded ceiling is applied to it rather than carried
+        // on the snapshot. Reservations taken under the old value keep
+        // theirs until their requests end.
+        super::waf_body_budget::set_ceiling_from_settings(waf_body_scan_max_inflight_bytes);
 
         ProxyConfig {
             routes_by_host,
