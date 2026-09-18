@@ -1088,6 +1088,125 @@ fn validate_rate_limit_bounds(
     Ok(())
 }
 
+/// Smallest `waf_body_scan_max_bytes` a route may set: 4 KiB.
+///
+/// Below this the window is narrower than a single TLS record and most
+/// real JSON payloads, so every inspected body would be truncated and
+/// the WAF would report oversize on traffic it was asked to scan. A
+/// floor is friendlier than letting an operator configure a cap that
+/// can only produce false oversize.
+const WAF_BODY_SCAN_MAX_BYTES_MIN: u64 = 4_096;
+
+/// Largest `waf_body_scan_max_bytes` a route may set: 64 MiB.
+///
+/// The ceiling exists because the cost is `value x concurrent
+/// inspectable requests on the route`: 64 MiB against 500 concurrent
+/// requests is already 32 GB of buffers. The global
+/// `waf_body_scan_max_inflight_bytes` budget is what actually bounds
+/// that total; this bound only keeps one route from asking for an
+/// absurd shape.
+const WAF_BODY_SCAN_MAX_BYTES_MAX: u64 = 67_108_864;
+
+/// Validate the per-route WAF body-scan window (Story 10.6 AC #5).
+///
+/// Kept out of [`validate_route_numeric_bounds`] for the reason
+/// [`validate_rate_limit_bounds`] is: that validator is already at its
+/// `too_many_arguments` allowance, and a 16th positional `Option`
+/// would have to be threaded through every one of its call sites for
+/// no gain in readability.
+///
+/// `waf_body_scan_max_bytes` caps how much of an *inspectable* request
+/// body the WAF reads. It is orthogonal to `max_request_body_bytes`,
+/// which caps what the proxy accepts at all: a body the WAF stops
+/// reading at this value still reaches the upstream whole. That is why
+/// the two have different bounds, and why this one is measured in
+/// megabytes rather than gigabytes.
+///
+/// `None` means "the field was not sent", and `Some(0)` is the clear
+/// sentinel the dashboard emits to fall back to the crate default
+/// (`WAF_BODY_SCAN_DEFAULT`, 1 MiB), exactly as `max_request_body_bytes`
+/// treats `0`. Both are accepted here and normalised to `None` by the
+/// create and update handlers.
+///
+/// # Status code
+///
+/// An out-of-range value answers 422, not the 400 its twin answers.
+/// The rule documented on [`ApiError::Unprocessable`] decides it: the
+/// server understood the request perfectly and refuses it on its
+/// merits, which is a 422, and the same endpoint already answers 422
+/// when axum rejects a server-owned field. The 400 on
+/// `max_request_body_bytes` predates that rule and is explicitly in
+/// the "not being swept" set, so the twin is followed on shape and the
+/// rule on status.
+fn validate_waf_body_scan_max_bytes(value: Option<u64>) -> Result<(), ApiError> {
+    let Some(v) = value else {
+        return Ok(());
+    };
+    if v == 0 || (WAF_BODY_SCAN_MAX_BYTES_MIN..=WAF_BODY_SCAN_MAX_BYTES_MAX).contains(&v) {
+        return Ok(());
+    }
+    Err(ApiError::Unprocessable(format!(
+        "waf_body_scan_max_bytes must be 0 (use the built-in 1 MiB default) or in \
+         {WAF_BODY_SCAN_MAX_BYTES_MIN}..={WAF_BODY_SCAN_MAX_BYTES_MAX}"
+    )))
+}
+
+#[cfg(test)]
+mod waf_body_scan_bounds_tests {
+    use super::*;
+
+    /// The refusal must be 422 and must name the field, because the
+    /// dashboard attaches the message to the input it came from.
+    fn expect_unprocessable(value: u64) {
+        match validate_waf_body_scan_max_bytes(Some(value)) {
+            Err(ApiError::Unprocessable(m)) => assert!(
+                m.contains("waf_body_scan_max_bytes"),
+                "message must name the field, got {m:?}"
+            ),
+            other => panic!("expected Unprocessable for {value}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_is_accepted() {
+        validate_waf_body_scan_max_bytes(None).expect("an unsent field is not a refusal");
+    }
+
+    #[test]
+    fn zero_is_accepted_as_the_clear_sentinel() {
+        validate_waf_body_scan_max_bytes(Some(0))
+            .expect("0 clears the override back to the crate default");
+    }
+
+    #[test]
+    fn both_bounds_are_inclusive() {
+        validate_waf_body_scan_max_bytes(Some(WAF_BODY_SCAN_MAX_BYTES_MIN))
+            .expect("4 KiB is the documented floor and must be accepted");
+        validate_waf_body_scan_max_bytes(Some(WAF_BODY_SCAN_MAX_BYTES_MAX))
+            .expect("64 MiB is the documented ceiling and must be accepted");
+    }
+
+    #[test]
+    fn below_the_floor_is_refused() {
+        expect_unprocessable(WAF_BODY_SCAN_MAX_BYTES_MIN - 1);
+        expect_unprocessable(1);
+    }
+
+    #[test]
+    fn above_the_ceiling_is_refused() {
+        expect_unprocessable(WAF_BODY_SCAN_MAX_BYTES_MAX + 1);
+        // The value `max_request_body_bytes` accepts as its ceiling:
+        // the two fields are orthogonal and do not share bounds.
+        expect_unprocessable(137_438_953_472);
+    }
+
+    #[test]
+    fn a_mid_range_value_is_accepted() {
+        validate_waf_body_scan_max_bytes(Some(8_388_608))
+            .expect("8 MiB is the story's worked example (IV2)");
+    }
+}
+
 /// Validate a CORS origin entry. Accepts `*`, `null`, or a full
 /// `scheme://host[:port]` URL without path / query / fragment. The
 /// CORS spec only attaches meaning to origin-equality, so an origin
@@ -2806,6 +2925,11 @@ pub struct RouteResponse {
     pub response_headers_remove: Vec<String>,
     /// Mirror of `Route.max_request_body_bytes`.
     pub max_request_body_bytes: Option<u64>,
+    /// Mirror of `Route.waf_body_scan_max_bytes`. `null` means the
+    /// built-in 1 MiB window; the dashboard round-trips the field so an
+    /// operator sees what the route actually enforces rather than the
+    /// value they last typed.
+    pub waf_body_scan_max_bytes: Option<u64>,
     /// Mirror of `Route.websocket_enabled`.
     pub websocket_enabled: bool,
     /// Mirror of `Route.rate_limit_rps`.
@@ -3014,6 +3138,11 @@ pub struct CreateRouteRequest {
     pub response_headers_remove: Option<Vec<String>>,
     /// Hard cap on request body (bytes).
     pub max_request_body_bytes: Option<u64>,
+    /// Bytes of an inspectable request body the WAF reads on this
+    /// route. Orthogonal to `max_request_body_bytes`: this one only
+    /// widens the inspection window, it never rejects. Omit or send
+    /// `0` for the built-in 1 MiB default.
+    pub waf_body_scan_max_bytes: Option<u64>,
     /// Allow `Upgrade: websocket` requests.
     pub websocket_enabled: Option<bool>,
     /// Per-client RPS rate limit.
@@ -3170,6 +3299,10 @@ pub struct UpdateRouteRequest {
     pub response_headers_remove: Option<Vec<String>>,
     /// Hard cap on request body (bytes).
     pub max_request_body_bytes: Option<u64>,
+    /// Bytes of an inspectable request body the WAF reads on this
+    /// route. `0` clears it back to the built-in 1 MiB default, the
+    /// same clear convention `max_request_body_bytes` uses.
+    pub waf_body_scan_max_bytes: Option<u64>,
     /// Allow WebSocket upgrades.
     pub websocket_enabled: Option<bool>,
     /// Per-client RPS rate limit.
@@ -3333,6 +3466,7 @@ fn route_to_response(
         proxy_headers_remove: route.proxy_headers_remove.clone(),
         response_headers_remove: route.response_headers_remove.clone(),
         max_request_body_bytes: route.max_request_body_bytes,
+        waf_body_scan_max_bytes: route.waf_body_scan_max_bytes,
         websocket_enabled: route.websocket_enabled,
         rate_limit_rps: route.rate_limit_rps,
         rate_limit_burst: route.rate_limit_burst,
@@ -3658,6 +3792,7 @@ pub async fn create_route(
         body.max_request_body_bytes,
     )?;
     validate_rate_limit_bounds(body.rate_limit_rps, body.rate_limit_burst)?;
+    validate_waf_body_scan_max_bytes(body.waf_body_scan_max_bytes)?;
 
     let path_rules = if let Some(ref prs) = body.path_rules {
         build_path_rules(prs)?
@@ -3724,6 +3859,7 @@ pub async fn create_route(
         // `Some(0)` because 0 is a valid configuration there
         // (no retries / preflight-uncached).
         max_request_body_bytes: body.max_request_body_bytes.filter(|&v| v != 0),
+        waf_body_scan_max_bytes: body.waf_body_scan_max_bytes.filter(|&v| v != 0),
         websocket_enabled: body.websocket_enabled.unwrap_or(true),
         rate_limit_rps: body.rate_limit_rps.filter(|&v| v != 0),
         rate_limit_burst: body.rate_limit_burst.filter(|&v| v != 0),
@@ -3941,6 +4077,7 @@ pub async fn update_route(
             body.max_request_body_bytes,
         )?;
         validate_rate_limit_bounds(body.rate_limit_rps, body.rate_limit_burst)?;
+        validate_waf_body_scan_max_bytes(body.waf_body_scan_max_bytes)?;
 
         if let Some(hostname) = body.hostname {
             route.hostname = hostname;
@@ -4059,6 +4196,13 @@ pub async fn update_route(
                 None
             } else {
                 Some(max_request_body_bytes)
+            };
+        }
+        if let Some(waf_body_scan_max_bytes) = body.waf_body_scan_max_bytes {
+            route.waf_body_scan_max_bytes = if waf_body_scan_max_bytes == 0 {
+                None
+            } else {
+                Some(waf_body_scan_max_bytes)
             };
         }
         if let Some(websocket_enabled) = body.websocket_enabled {

@@ -6579,11 +6579,27 @@ async fn test_settings_schema_bounds_match_validator() {
     // max and reject just past the max for every field carrying both
     // bounds. If `update_settings` ever diverges from `settings_schema`
     // the status flips and this fails.
-    for field in [
-        "health_max_concurrent_probes",
-        "header_timeout_s",
-        "flood_strict_rps",
-        "sla_purge_retention_days",
+    //
+    // The rejection status is part of the table rather than one constant
+    // for the whole list. The project's rule, written on `ApiError`, is
+    // that a value the caller could have got right is 422; the older
+    // handlers still answer 400 and are corrected when they are touched
+    // for another reason. With a single expected status, the first field
+    // to follow the rule could only be left OUT of the list, and an
+    // anti-drift test that grows an exception per new field stops
+    // covering the thing it exists for.
+    for (field, rejected) in [
+        (
+            "health_max_concurrent_probes",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("header_timeout_s", StatusCode::BAD_REQUEST),
+        ("flood_strict_rps", StatusCode::BAD_REQUEST),
+        ("sla_purge_retention_days", StatusCode::BAD_REQUEST),
+        (
+            "waf_body_scan_max_inflight_bytes",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
     ] {
         let min = schema[field]["min"].as_i64().expect("schema min");
         let max = schema[field]["max"].as_i64().expect("schema max");
@@ -6591,7 +6607,7 @@ async fn test_settings_schema_bounds_match_validator() {
         for (value, expected) in [
             (min, StatusCode::OK),
             (max, StatusCode::OK),
-            (max + 1, StatusCode::BAD_REQUEST),
+            (max + 1, rejected),
         ] {
             let mut map = serde_json::Map::new();
             map.insert(field.to_string(), serde_json::json!(value));
@@ -9498,4 +9514,217 @@ async fn every_automation_request_lands_in_the_audit_log() {
         .iter()
         .filter(|row| row.action == "automation.request.unauthenticated")
         .all(|row| row.operator_username == "-"));
+}
+
+// ---- Story 10.6 AC #9: the WAF body-scan budget on the settings surface ----
+
+/// The global in-flight budget is operator-tunable, round-trips through
+/// `GET /settings`, and refuses an out-of-range value with 422 (the
+/// rule on `ApiError::Unprocessable`: the server understood the request
+/// and refuses it on its merits). It is a capacity figure, not a
+/// credential, so it is never masked.
+#[tokio::test]
+async fn test_update_settings_waf_body_scan_budget_bounds() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let schema = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            "/api/v1/settings/schema",
+            &admin,
+            None,
+        )
+        .await,
+    )
+    .await;
+    let field = "waf_body_scan_max_inflight_bytes";
+    let min = schema[field]["min"].as_u64().expect("schema min");
+    let max = schema[field]["max"].as_u64().expect("schema max");
+    assert_eq!(
+        schema[field]["default"].as_u64(),
+        Some(268_435_456),
+        "the advertised default must stay 256 MiB"
+    );
+
+    for (value, expected) in [
+        (min, StatusCode::OK),
+        (max, StatusCode::OK),
+        (min - 1, StatusCode::UNPROCESSABLE_ENTITY),
+        (max + 1, StatusCode::UNPROCESSABLE_ENTITY),
+        (0, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "PUT",
+            "/api/v1/settings",
+            &admin,
+            Some(serde_json::json!({ field: value })),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            expected,
+            "{field}={value} should map to {expected}"
+        );
+    }
+
+    // An absent field leaves the stored value alone, and the value the
+    // last accepted PUT wrote (`max`) reads back unmasked.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        "/api/v1/settings",
+        &admin,
+        Some(serde_json::json!({ "waf_ban_threshold": 3 })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let settings = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            "/api/v1/settings",
+            &admin,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(settings[field].as_u64(), Some(max));
+}
+
+/// The per-route cap on the create and update payloads: every arm of
+/// the validator over the wire, plus the read-path round trip.
+#[tokio::test]
+async fn test_route_waf_body_scan_max_bytes_over_the_api() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Absent on create: the route stores `null` and runs the crate
+    // default.
+    let created = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/routes",
+            &admin,
+            Some(serde_json::json!({ "hostname": "scan-default.example.com" })),
+        )
+        .await,
+    )
+    .await;
+    assert!(created["waf_body_scan_max_bytes"].is_null());
+    let route_id = created["id"].as_str().expect("created route id").to_string();
+
+    for (value, expected) in [
+        (4_096_u64, StatusCode::OK),
+        (67_108_864, StatusCode::OK),
+        (8_388_608, StatusCode::OK),
+        (0, StatusCode::OK),
+        (4_095, StatusCode::UNPROCESSABLE_ENTITY),
+        (67_108_865, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "PUT",
+            &format!("/api/v1/routes/{route_id}"),
+            &admin,
+            Some(serde_json::json!({ "waf_body_scan_max_bytes": value })),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            expected,
+            "waf_body_scan_max_bytes={value} should map to {expected}"
+        );
+    }
+
+    // `0` normalised to `None`, exactly as `max_request_body_bytes` is:
+    // the last accepted PUT above sent `0`, so the read path answers
+    // `null` rather than `0`.
+    let read = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            &format!("/api/v1/routes/{route_id}"),
+            &admin,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        read["waf_body_scan_max_bytes"].is_null(),
+        "0 must clear the override back to the crate default"
+    );
+
+    // Same normalisation on create, and a real value round-trips.
+    let created = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/routes",
+            &admin,
+            Some(serde_json::json!({
+                "hostname": "scan-zero.example.com",
+                "waf_body_scan_max_bytes": 0,
+            })),
+        )
+        .await,
+    )
+    .await;
+    assert!(created["waf_body_scan_max_bytes"].is_null());
+
+    let created = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/routes",
+            &admin,
+            Some(serde_json::json!({
+                "hostname": "scan-8m.example.com",
+                "waf_body_scan_max_bytes": 8_388_608,
+            })),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(created["waf_body_scan_max_bytes"].as_u64(), Some(8_388_608));
+
+    // Out of range on create is refused before the row exists.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(serde_json::json!({
+            "hostname": "scan-too-big.example.com",
+            "waf_body_scan_max_bytes": 134_217_728_u64,
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

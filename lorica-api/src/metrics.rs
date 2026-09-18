@@ -1321,6 +1321,13 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     // packaged deployment - a feature that works and looks like it does
     // not.
     "lorica_captures_total",
+    // WAF body-inspection decisions (Story 10.6 AC #8). Every one of
+    // the five outcomes is produced inside `request_filter` /
+    // `request_body_filter`, which run in the workers, so without
+    // aggregation the supervisor's /metrics would read 0 - including
+    // for `skipped_budget`, the fail-open series an operator is
+    // supposed to alarm on.
+    "lorica_waf_body_scans_total",
     // The automation plane's counters (`lorica_automation_*`, Story
     // 10.3 / 10.4) are absent on purpose, not forgotten: the listener,
     // the environment handlers and the reaper all run on the supervisor
@@ -1406,6 +1413,9 @@ fn resolve_per_worker_counter(
         }
         "lorica_captures_total" => {
             Some((&["rule_id", "outcome"], CounterTarget::Vec(&CAPTURES_TOTAL)))
+        }
+        "lorica_waf_body_scans_total" => {
+            Some((&["outcome"], CounterTarget::Vec(&WAF_BODY_SCANS_TOTAL)))
         }
         _ => None,
     }
@@ -2150,6 +2160,92 @@ pub fn capture_inflight_bytes_value() -> i64 {
     CAPTURE_INFLIGHT_BYTES.get()
 }
 
+// ---- WAF body inspection (Story 10.6 AC #8) ----
+
+/// What the WAF did with a request body. Labels: outcome.
+static WAF_BODY_SCANS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "waf_body_scans_total",
+        "WAF request-body inspection decisions (outcome=scanned|skipped_content_type|\
+         skipped_budget|truncated|rejected)",
+        &["outcome"],
+    )
+});
+
+/// Every `outcome` a `lorica_waf_body_scans_total` series can carry.
+///
+/// Spelled out so the label set stays a closed enum: the call sites
+/// pass one of these and nothing else, which is what keeps the series
+/// count fixed at five whatever traffic the node sees.
+pub const WAF_BODY_SCAN_OUTCOMES: [&str; 5] = [
+    // The engine read the buffered body.
+    "scanned",
+    // The declared `Content-Type` is not one the engine can parse, so
+    // the body was never buffered (Story 10.6 AC #1).
+    "skipped_content_type",
+    // The node-wide in-flight budget was full, so the body was not
+    // buffered and the request was forwarded unscanned (AC #7). This
+    // is the fail-open series: an operator alarms on it.
+    "skipped_budget",
+    // Detection mode, body past the effective scan cap: the prefix was
+    // scanned and the rest forwarded.
+    "truncated",
+    // Blocking mode, body past the effective scan cap: 413.
+    "rejected",
+];
+
+/// Record one WAF body-inspection decision.
+///
+/// `outcome` MUST be one of [`WAF_BODY_SCAN_OUTCOMES`]; the counter API
+/// does not constrain it, so the call sites in the proxy's body filters
+/// do. Exactly one outcome is recorded per request that carried a body
+/// on a WAF-enabled route, so the five series sum to the number of such
+/// requests.
+pub fn inc_waf_body_scan_outcome(outcome: &str) {
+    WAF_BODY_SCANS_TOTAL.with_label_values(&[outcome]).inc();
+}
+
+/// Read back this process's `lorica_waf_body_scans_total{outcome}`.
+pub fn waf_body_scan_outcome_value(outcome: &str) -> u64 {
+    WAF_BODY_SCANS_TOTAL.with_label_values(&[outcome]).get()
+}
+
+/// Bytes held by in-flight WAF body-scan buffers on this process.
+static WAF_BODY_SCAN_INFLIGHT_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "waf_body_scan_inflight_bytes",
+        "Bytes held by in-flight WAF body-scan buffers on this process",
+    )
+});
+
+/// Publish the WAF body-scan budget's current reservation.
+///
+/// Written by the proxy's scan reservation on every grow and release
+/// (`lorica::proxy_wiring::waf_body_budget`), for the same reason the
+/// capture gauge is: the budget is a process-wide static this crate has
+/// no handle on.
+///
+/// FLEET SEMANTICS (`--workers`): per worker and additive, like
+/// `lorica_capture_inflight_bytes`, and aggregated the same way
+/// ([`crate::workers::AggregatedMetrics::total_waf_body_scan_inflight_bytes`]).
+/// Each worker runs its own budget against its own copy of the
+/// `waf_body_scan_max_inflight_bytes` ceiling, so a node running eight
+/// workers can hold eight times the configured value. Size the box
+/// against workers x ceiling, not against the ceiling.
+pub fn set_waf_body_scan_inflight_bytes(bytes: i64) {
+    WAF_BODY_SCAN_INFLIGHT_BYTES.set(bytes);
+}
+
+/// Read back this process's `lorica_waf_body_scan_inflight_bytes`.
+///
+/// A worker calls this when building its `MetricsReport`: the budget
+/// that writes the gauge lives in the worker, so the value has to
+/// travel over the report for the supervisor's scrape to describe the
+/// fleet.
+pub fn waf_body_scan_inflight_bytes_value() -> i64 {
+    WAF_BODY_SCAN_INFLIGHT_BYTES.get()
+}
+
 // ---- Automation plane (Story 10.3 listener, Story 10.4 AC #10) ----
 //
 // Every label set below is a closed enum spelled out at the call site,
@@ -2365,20 +2461,24 @@ pub(crate) fn gathered_counter(name: &str, labels: &[(&str, &str)]) -> u64 {
         .map_or(0, |metric| metric.get_counter().value() as u64)
 }
 
-/// Mirror the fleet's capture gauges into the supervisor's registry
+/// Mirror the gauges the workers own into the supervisor's registry
 /// before a scrape encodes it.
 ///
+/// Every gauge here is written by worker-side code the supervisor never
+/// runs, so the supervisor's own value is always 0 and the fleet figure
+/// only exists in the `MetricsReport`s the aggregator holds.
+///
 /// `aggregated` is `None` in single-process mode, where the proxy runs
-/// in this very process and both gauges already hold the live local
+/// in this very process and the gauges already hold the live local
 /// values: the function returns without touching them. In worker mode
 /// it overwrites them with the fleet figures, each aggregated the way
-/// its own semantics demand (max for the rule count, sum for the
-/// in-flight bytes; see the two setters above).
+/// its own semantics demand (max for the capture rule count, sum for
+/// both byte reservations; see the setters above).
 ///
 /// This is the same shape as the `active_connections` refresh that
 /// [`get_metrics`] does a few lines down, and for the same reason: the
 /// value is produced in a process the scrape does not run in.
-async fn refresh_capture_gauges(
+async fn refresh_worker_gauges(
     aggregated: Option<&std::sync::Arc<crate::workers::AggregatedMetrics>>,
 ) {
     let Some(agg) = aggregated else {
@@ -2386,6 +2486,7 @@ async fn refresh_capture_gauges(
     };
     set_capture_rules_active(agg.max_capture_rules_active().await as i64);
     set_capture_inflight_bytes(agg.total_capture_inflight_bytes().await as i64);
+    set_waf_body_scan_inflight_bytes(agg.total_waf_body_scan_inflight_bytes().await as i64);
 }
 
 /// GET /metrics - Prometheus scrape endpoint.
@@ -2425,7 +2526,7 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
     // feature runs in the worker processes, so without this the
     // supervisor would report its own two zeros and a dashboard would
     // read as a feature that does not work.
-    refresh_capture_gauges(state.aggregated_metrics()).await;
+    refresh_worker_gauges(state.aggregated_metrics()).await;
 
     // Refresh aggregated EWMA scores from workers
     if let Some(agg) = state.aggregated_metrics() {
@@ -2557,12 +2658,12 @@ mod tests {
 
     // ---- Traffic-capture gauges under --workers ----
 
-    /// The four tests below all drive the two process-global capture
-    /// gauges. Rust runs tests in parallel inside one process, so
-    /// without this guard one test's `set_` would land between another's
+    /// The tests below all drive the process-global gauges the workers
+    /// own. Rust runs tests in parallel inside one process, so without
+    /// this guard one test's `set_` would land between another's
     /// refresh and its assertion.
     /// A tokio mutex, not a std one: the guard is held across the
-    /// `refresh_capture_gauges` await.
+    /// `refresh_worker_gauges` await.
     static CAPTURE_GAUGE_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Record a worker whose capture gauges hold the given values.
@@ -2571,6 +2672,18 @@ mod tests {
         worker_id: u32,
         rules_active: u64,
         inflight_bytes: u64,
+    ) {
+        report_worker_gauges(agg, worker_id, rules_active, inflight_bytes, 0).await;
+    }
+
+    /// Record a worker's capture gauges plus its WAF body-scan
+    /// reservation.
+    async fn report_worker_gauges(
+        agg: &crate::workers::AggregatedMetrics,
+        worker_id: u32,
+        rules_active: u64,
+        inflight_bytes: u64,
+        waf_body_scan_inflight_bytes: u64,
     ) {
         agg.update_worker(
             worker_id,
@@ -2586,6 +2699,7 @@ mod tests {
                 rules_active,
                 inflight_bytes,
             },
+            waf_body_scan_inflight_bytes,
         )
         .await;
     }
@@ -2613,7 +2727,7 @@ mod tests {
         report_capture(&agg, 0, 4, 2_048).await;
         report_capture(&agg, 1, 4, 6_144).await;
 
-        refresh_capture_gauges(Some(&agg)).await;
+        refresh_worker_gauges(Some(&agg)).await;
 
         assert_eq!(rendered_gauge("lorica_capture_rules_active"), Some(4.0));
         assert_eq!(
@@ -2634,7 +2748,7 @@ mod tests {
             report_capture(&agg, worker_id, 3, 0).await;
         }
 
-        refresh_capture_gauges(Some(&agg)).await;
+        refresh_worker_gauges(Some(&agg)).await;
 
         assert_eq!(rendered_gauge("lorica_capture_rules_active"), Some(3.0));
     }
@@ -2651,11 +2765,33 @@ mod tests {
         report_capture(&agg, 1, 1, 2_000).await;
         report_capture(&agg, 2, 1, 3_000).await;
 
-        refresh_capture_gauges(Some(&agg)).await;
+        refresh_worker_gauges(Some(&agg)).await;
 
         assert_eq!(
             rendered_gauge("lorica_capture_inflight_bytes"),
             Some(6000.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn waf_body_scan_inflight_bytes_is_summed_across_workers() {
+        let _guard = CAPTURE_GAUGE_TEST_GUARD.lock().await;
+        // The supervisor never buffers a request body, so its own gauge
+        // sits at zero and only the reports describe the node. Each
+        // worker's reservation is memory held at the same moment, so
+        // the node figure is the total.
+        set_waf_body_scan_inflight_bytes(0);
+
+        let agg = std::sync::Arc::new(crate::workers::AggregatedMetrics::new());
+        report_worker_gauges(&agg, 0, 1, 0, 1_500).await;
+        report_worker_gauges(&agg, 1, 1, 0, 2_500).await;
+        report_worker_gauges(&agg, 2, 1, 0, 4_000).await;
+
+        refresh_worker_gauges(Some(&agg)).await;
+
+        assert_eq!(
+            rendered_gauge("lorica_waf_body_scan_inflight_bytes"),
+            Some(8000.0)
         );
     }
 
@@ -2667,10 +2803,15 @@ mod tests {
         // there, and the refresh must leave them exactly as published.
         set_capture_rules_active(7);
         set_capture_inflight_bytes(4_096);
+        set_waf_body_scan_inflight_bytes(2_048);
 
-        refresh_capture_gauges(None).await;
+        refresh_worker_gauges(None).await;
 
         assert_eq!(rendered_gauge("lorica_capture_rules_active"), Some(7.0));
+        assert_eq!(
+            rendered_gauge("lorica_waf_body_scan_inflight_bytes"),
+            Some(2048.0)
+        );
         assert_eq!(
             rendered_gauge("lorica_capture_inflight_bytes"),
             Some(4096.0)

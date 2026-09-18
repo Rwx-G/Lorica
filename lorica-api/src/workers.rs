@@ -143,6 +143,9 @@ struct WorkerSnapshot {
     active_connections: u64,
     /// Traffic-capture gauges as of this worker's last report.
     capture: CaptureGauges,
+    /// Bytes held in in-flight WAF body-scan buffers as of this
+    /// worker's last report.
+    waf_body_scan_inflight_bytes: u64,
     /// (ip, remaining_seconds, ban_duration_seconds, reason)
     ban_entries: Vec<(String, u64, u64, crate::ban::BanReason)>,
     /// backend_address -> score_us
@@ -183,6 +186,7 @@ impl AggregatedMetrics {
         request_counts: Vec<(String, u32, u64)>,
         waf_counts: Vec<(String, String, u64)>,
         capture: CaptureGauges,
+        waf_body_scan_inflight_bytes: u64,
     ) {
         let mut map = self.inner.write().await;
         map.insert(
@@ -192,6 +196,7 @@ impl AggregatedMetrics {
                 cache_misses,
                 active_connections,
                 capture,
+                waf_body_scan_inflight_bytes,
                 ban_entries,
                 ewma_scores,
                 backend_connections,
@@ -265,6 +270,23 @@ impl AggregatedMetrics {
             .await
             .values()
             .map(|w| w.capture.inflight_bytes)
+            .sum()
+    }
+
+    /// Bytes held in in-flight WAF body-scan buffers across the fleet,
+    /// summed.
+    ///
+    /// Same reasoning as [`Self::total_capture_inflight_bytes`]: each
+    /// worker holds its own buffers against its own copy of the
+    /// `waf_body_scan_max_inflight_bytes` ceiling, so what an operator
+    /// needs to see on the node is the total held at that moment, and
+    /// the configured ceiling applies per worker rather than per node.
+    pub async fn total_waf_body_scan_inflight_bytes(&self) -> u64 {
+        self.inner
+            .read()
+            .await
+            .values()
+            .map(|w| w.waf_body_scan_inflight_bytes)
             .sum()
     }
 
@@ -367,6 +389,17 @@ mod tests {
     /// gauges, so the aggregation assertions below read as the numbers
     /// they are about.
     async fn report_capture(agg: &AggregatedMetrics, worker_id: u32, capture: CaptureGauges) {
+        report_gauges(agg, worker_id, capture, 0).await;
+    }
+
+    /// Record a worker's capture gauges plus its WAF body-scan
+    /// reservation, for the assertions that are about the latter.
+    async fn report_gauges(
+        agg: &AggregatedMetrics,
+        worker_id: u32,
+        capture: CaptureGauges,
+        waf_body_scan_inflight_bytes: u64,
+    ) {
         agg.update_worker(
             worker_id,
             0,
@@ -378,6 +411,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             capture,
+            waf_body_scan_inflight_bytes,
         )
         .await;
     }
@@ -458,6 +492,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waf_body_scan_inflight_bytes_is_summed_across_workers() {
+        // Each worker buffers request bodies against its own copy of
+        // the ceiling, and all of it is memory the node holds at the
+        // same moment, so the fleet figure is the total.
+        let agg = AggregatedMetrics::new();
+        report_gauges(&agg, 0, CaptureGauges::default(), 8_192).await;
+        report_gauges(&agg, 1, CaptureGauges::default(), 2_048).await;
+        report_gauges(&agg, 2, CaptureGauges::default(), 1_024).await;
+
+        assert_eq!(agg.total_waf_body_scan_inflight_bytes().await, 11_264);
+
+        agg.remove_worker(0).await;
+        agg.remove_worker(1).await;
+        agg.remove_worker(2).await;
+        assert_eq!(agg.total_waf_body_scan_inflight_bytes().await, 0);
+    }
+
+    #[tokio::test]
     async fn merged_ban_list_carries_reason() {
         let agg = AggregatedMetrics::new();
         agg.update_worker(
@@ -471,6 +523,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             CaptureGauges::default(),
+            0,
         )
         .await;
 

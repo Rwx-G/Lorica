@@ -480,6 +480,12 @@ pub struct MetricsReport {
     /// its own ceiling, so the supervisor sums these.
     #[prost(uint64, tag = "14")]
     pub capture_inflight_bytes: u64,
+    /// Bytes this worker holds in in-flight WAF body-scan buffers
+    /// (`lorica_waf_body_scan_inflight_bytes`). Same shape as
+    /// `capture_inflight_bytes`: each worker reserves against its own
+    /// copy of the ceiling, so the supervisor sums these.
+    #[prost(uint64, tag = "15")]
+    pub waf_body_scan_inflight_bytes: u64,
 }
 
 /// One generic counter delta in a [`MetricsReport`]. `labels` is
@@ -519,6 +525,7 @@ impl MetricsReport {
             generic_counters: Vec::new(),
             capture_rules_active: 0,
             capture_inflight_bytes: 0,
+            waf_body_scan_inflight_bytes: 0,
         }
     }
 }
@@ -870,6 +877,7 @@ mod tests {
             generic_counters: Vec::new(),
             capture_rules_active: 3,
             capture_inflight_bytes: 4096,
+            waf_body_scan_inflight_bytes: 8192,
         };
         let encoded = report.encode_to_vec();
         let decoded = MetricsReport::decode(&encoded[..]).expect("decode failed");
@@ -879,6 +887,7 @@ mod tests {
         assert_eq!(decoded.cache_hits, 3000);
         assert_eq!(decoded.capture_rules_active, 3);
         assert_eq!(decoded.capture_inflight_bytes, 4096);
+        assert_eq!(decoded.waf_body_scan_inflight_bytes, 8192);
     }
 
     #[test]

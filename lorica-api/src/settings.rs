@@ -35,6 +35,16 @@ const WAF_BAN_THRESHOLD_MIN: i32 = 0;
 const WAF_BAN_DURATION_S_MIN: i32 = 0;
 const ACCESS_LOG_RETENTION_MIN: i64 = 0;
 const WAF_EVENT_RETENTION_MIN: i64 = 0;
+// Story 10.6 AC #7. The budget is a byte ceiling over every in-flight
+// WAF body buffer in one process. The floor is the crate's own
+// 1 MiB default scan window: below it no default-configured route
+// could ever buffer a body, so the setting would silently disable WAF
+// body inspection fleet-wide rather than bound it, which is not what
+// an operator lowering a memory budget is asking for. The ceiling is
+// 16 GiB, far above any sane buffer allowance and far below the point
+// where the running total could overflow the `u64` accounting.
+const WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN: u64 = 1_048_576;
+const WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX: u64 = 17_179_869_184;
 const SLA_PURGE_RETENTION_DAYS_MIN: i32 = 1;
 const SLA_PURGE_RETENTION_DAYS_MAX: i32 = 3650;
 const OTLP_SAMPLING_RATIO_MIN: f64 = 0.0;
@@ -142,6 +152,12 @@ pub fn settings_schema() -> serde_json::Value {
             "type": "integer",
             "min": WAF_EVENT_RETENTION_MIN,
             "default": d.waf_event_retention,
+        },
+        "waf_body_scan_max_inflight_bytes": {
+            "type": "integer",
+            "min": WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN,
+            "max": WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX,
+            "default": d.waf_body_scan_max_inflight_bytes,
         },
         "sla_purge_enabled": {
             "type": "boolean",
@@ -482,6 +498,13 @@ pub struct UpdateSettingsRequest {
     /// Backlog #50. Ship traffic capture records on the OTLP logs
     /// lane.
     pub otlp_logs_capture_enabled: Option<bool>,
+    /// Story 10.6 AC #7. Process-wide ceiling, in bytes, on every
+    /// in-flight WAF body-scan buffer taken together. A request that
+    /// would push the total past it is forwarded UNSCANNED rather than
+    /// refused, so lowering this trades inspection coverage for memory,
+    /// never availability. Per process: under `--workers N` the
+    /// effective fleet ceiling is N times this value.
+    pub waf_body_scan_max_inflight_bytes: Option<u64>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -599,6 +622,17 @@ pub async fn update_settings(
             &mut settings.waf_event_retention,
             WAF_EVENT_RETENTION_MIN,
             "waf_event_retention",
+        )?;
+        // Story 10.6 AC #7. Not a secret and not masked: the budget is
+        // a capacity figure an operator has to be able to read back to
+        // reason about the `skipped_budget` scan outcome.
+        apply_ranged_u64(
+            body.waf_body_scan_max_inflight_bytes,
+            &mut settings.waf_body_scan_max_inflight_bytes,
+            WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN..=WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX,
+            &format!(
+                "waf_body_scan_max_inflight_bytes must be in {WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN}..={WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX}"
+            ),
         )?;
         apply_plain(body.sla_purge_enabled, &mut settings.sla_purge_enabled);
         apply_ranged_i32(
@@ -924,6 +958,31 @@ fn apply_ranged_u32(
     if let Some(v) = value {
         if !range.contains(&v) {
             return Err(ApiError::BadRequest(error_msg.to_string()));
+        }
+        *target = v;
+    }
+    Ok(())
+}
+
+/// `u64` variant of [`apply_ranged_i32`] for byte-denominated budgets
+/// (`waf_body_scan_max_inflight_bytes`), which are `u64` on
+/// `GlobalSettings` because a byte count has no business being signed.
+///
+/// It answers `422`, not the `400` its `i32` and `u32` siblings
+/// answer. The rule on [`ApiError::Unprocessable`] decides it: a cap
+/// over its documented limit is a request the server understood and
+/// refuses on its merits. The siblings predate that rule and are in
+/// the set the doc comment explicitly leaves unswept, so they are not
+/// changed here; new fields use the rule.
+fn apply_ranged_u64(
+    value: Option<u64>,
+    target: &mut u64,
+    range: std::ops::RangeInclusive<u64>,
+    error_msg: &str,
+) -> Result<(), ApiError> {
+    if let Some(v) = value {
+        if !range.contains(&v) {
+            return Err(ApiError::Unprocessable(error_msg.to_string()));
         }
         *target = v;
     }
