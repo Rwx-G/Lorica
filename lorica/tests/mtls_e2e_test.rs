@@ -29,6 +29,10 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::reserve_port;
+
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
@@ -254,6 +258,7 @@ fn mtls_route(ca_pem: &str, required: bool, orgs: Vec<&str>) -> Route {
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         managed_by: None,
+        waf_body_scan_max_bytes: None,
         created_at: now,
         updated_at: now,
     }
@@ -518,11 +523,6 @@ impl ShutdownSignalWatch for ManualShutdown {
         }
         ShutdownSignal::FastShutdown
     }
-}
-
-fn reserve_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
 }
 
 async fn wait_for_port(port: u16) {

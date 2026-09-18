@@ -37,6 +37,21 @@
 #   roles     an Operator can disable and cannot create; a Viewer cannot
 #             read the ring
 #
+# CAPTURE_SMOKE_WORKERS=1 runs the same assertions against a node started
+# with `--workers 2` (the `capture-workers` compose profile). Three things
+# differ there and nothing else does (docs/capture.md):
+#   - the recent-captures ring is per worker and this API runs in the
+#     supervisor, whose ring is empty, so both `/capture/recent`
+#     endpoints answer 503. The records are read from the always-on
+#     `lorica::capture` stdout sink instead, which holds the same
+#     documents byte for byte;
+#   - `max_captures` is spent per worker, so a rule stops somewhere
+#     between its budget and CAPTURE_WORKERS times its budget, and each
+#     worker that spends its own copy queues its own auto-disable;
+#   - a configuration change reaches the workers over the supervisor RPC
+#     rather than in-process, so the settle after a write is longer.
+# What only a workers node can show lives in run-capture-workers-smoke.sh.
+#
 # The syslog file is RFC 6587 octet-counted frames with no separator, so
 # a small Python parser walks it; the OTLP file and the node log are one
 # JSON document per line and are grepped. Every audit row keeps SHA-256
@@ -59,6 +74,16 @@ LORICA_LOG="${LORICA_LOG:-/shared/lorica.log}"
 CAPTURE_DIR="${CAPTURE_DIR:-/shared/captures}"
 CAPTURE_RO_DIR="${CAPTURE_RO_DIR:-/captures-ro}"
 INSIDE_CIDR="${INSIDE_CIDR:-172.30.0.0/16}"
+SYSLOG_ENDPOINT="${SYSLOG_ENDPOINT:-syslog-collector-capture:6601}"
+OTLP_ENDPOINT="${OTLP_ENDPOINT:-http://otelcol-logs-capture:4318}"
+
+# Worker mode: see the header. CAPTURE_WORKERS is the node's worker
+# count, the multiplier every per-process budget is spent against.
+WORKERS_MODE=false
+if [ "${CAPTURE_SMOKE_WORKERS:-0}" = "1" ]; then
+    WORKERS_MODE=true
+fi
+CAPTURE_WORKERS="${CAPTURE_WORKERS:-1}"
 
 HOST_R="capture-r.local"
 HOST_S="capture-s.local"
@@ -67,106 +92,39 @@ KIB64=65536
 MIB10=10485760
 
 # ---------------------------------------------------------------------
-# Helpers specific to this smoke.
+# Helpers shared with run-capture-workers-smoke.sh: the syslog-frame and
+# stdout-record readers, the proxy driver, login and the rule helpers.
+# Sourced after the paths they read are set.
 # ---------------------------------------------------------------------
+source "$SCRIPT_DIR/capture-helpers.sh"
 
-# Walk the octet-counted syslog file. Usage:
-#   python3 $FRAMES FILE MSGID NEEDLE        -> prints the match count
-#   python3 $FRAMES FILE MSGID NEEDLE body   -> prints the first match's
-#                                               JSON body
-FRAMES=$(mktemp)
-cat > "$FRAMES" <<'PYEOF'
-import sys
-
-path, msgid, needle = sys.argv[1:4]
-want_body = len(sys.argv) > 4 and sys.argv[4] == "body"
-try:
-    with open(path, "rb") as handle:
-        data = handle.read()
-except OSError:
-    data = b""
-pos = 0
-count = 0
-first_body = None
-while pos < len(data):
-    space = data.find(b" ", pos)
-    if space < 0:
-        break
-    try:
-        length = int(data[pos:space])
-    except ValueError:
-        break
-    message = data[space + 1:space + 1 + length]
-    pos = space + 1 + length
-    parts = message.split(b" ", 6)
-    if len(parts) < 7 or parts[5].decode("ascii", "replace") != msgid:
-        continue
-    if needle.encode("utf-8") not in message:
-        continue
-    count += 1
-    if first_body is None:
-        rest = parts[6]
-        close = rest.find(b"] ")
-        first_body = rest[close + 2:] if close >= 0 else rest
-if want_body:
-    sys.stdout.write((first_body or b"").decode("utf-8", "replace"))
-else:
-    print(count)
-PYEOF
-
-syslog_count() { python3 "$FRAMES" "$SYSLOG_LOG" "$1" "$2"; }
-syslog_body()  { python3 "$FRAMES" "$SYSLOG_LOG" "$1" "$2" body; }
-
-resolve_v4() { getent hosts "$1" | awk '{print $1}' | head -1; }
-in_cidr() {
-    python3 -c 'import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]) in ipaddress.ip_network(sys.argv[2]) else 1)' "$1" "$2"
-}
-
-# login_as <username> <password> -> echoes "lorica_session=..." or "".
-login_as() {
-    local username="$1" password="$2"
-    local headers http
-    headers=$(mktemp)
-    http=$(curl -s -o /dev/null -D "$headers" -w '%{http_code}' \
-        "$API/api/v1/auth/login" -X POST \
-        -H "Content-Type: application/json" \
-        -d "{\"username\":\"$username\",\"password\":\"$password\"}")
-    if [ "$http" = "200" ]; then
-        grep -i 'Set-Cookie:' "$headers" | grep -o 'lorica_session=[^;]*' | head -1
+# Wait for a configuration write to reach the process that enforces it.
+# In single-process mode that is this very process; under `--workers` the
+# snapshot travels to each worker over the supervisor RPC first.
+settle() {
+    if [ "$WORKERS_MODE" = true ]; then
+        sleep 5
+    else
+        sleep 2
     fi
-    rm -f "$headers"
 }
+disable_rule() { api_post "/api/v1/capture/rules/$1/disable" '{}' >/dev/null; settle; }
 
-# One request through the proxy. $1 proxy base, $2 Host, $3 path, then
-# extra curl args. Leaves PX_CODE and PX_BODY behind.
-PX_CODE=""
-PX_BODY=""
-px() {
-    local proxy="$1" host="$2" path="$3"
-    shift 3
-    local body_file
-    body_file=$(mktemp)
-    PX_CODE=$(curl -s --max-time 120 -o "$body_file" -w '%{http_code}' \
-        -H "Host: $host" "$@" "${proxy}${path}" 2>/dev/null || echo "000")
-    PX_BODY=$(cat "$body_file")
-    rm -f "$body_file"
+# Every record this node emitted, in the ring's listing shape.
+#
+# On a single-process node that is the ring itself. On a `--workers` node
+# the ring lives in the workers and this API runs in the supervisor,
+# which answers 503, so the records come from the stdout sink instead.
+# The two sources carry the same documents; the stdout one is not capped
+# at CAPTURE_RING_CAPACITY and never elides a body, which only ever makes
+# the assertions below stricter.
+ring() {
+    if [ "$WORKERS_MODE" = true ]; then
+        stdout_records
+    else
+        api_get /api/v1/capture/recent
+    fi
 }
-# The request id the proxy injected upstream, echoed by the backend.
-px_request_id() { echo "$PX_BODY" | jq -r '.received_headers["x-request-id"] // empty'; }
-
-# Create a capture rule from a JSON body. Leaves RULE_ID ("" on refusal)
-# and RULE_OUT (the response) behind; globals, not an echo, so the
-# response survives (a command substitution would run it in a subshell).
-RULE_ID=""
-RULE_OUT=""
-mk_rule() {
-    RULE_OUT=$(api_post /api/v1/capture/rules "$1")
-    RULE_ID=$(echo "$RULE_OUT" | jq -r '.data.id // empty')
-}
-rule_get() { api_get "/api/v1/capture/rules/$1"; }
-disable_rule() { api_post "/api/v1/capture/rules/$1/disable" '{}' >/dev/null; sleep 2; }
-
-ring() { api_get /api/v1/capture/recent; }
 ring_count_for_rule() { ring | jq -r --arg r "$1" '[(.data.captures // [])[] | select(.rule_id == $r)] | length'; }
 ring_count_for_request() { ring | jq -r --arg id "$1" '[(.data.captures // [])[] | select(.request_id == $id)] | length'; }
 ring_size() { ring | jq -r '(.data.captures // []) | length'; }
@@ -183,7 +141,16 @@ wait_ring() {
 # The full record one rule produced for one request, to a file.
 download_record() {
     # $1 request id, $2 rule id, $3 out file. Leaves DL_HEADERS behind.
+    # On a workers node the download endpoint answers 503 like the
+    # listing, so the record is taken from the stdout sink: the same
+    # bytes, which is what the byte-identity assertions compare. The
+    # headers file is created empty there, and the assertion that reads
+    # it is skipped at its call site.
     DL_HEADERS=$(mktemp)
+    if [ "$WORKERS_MODE" = true ]; then
+        stdout_record_text "$1" "$2" > "$3"
+        return
+    fi
     curl -sk -b "$SESSION" -D "$DL_HEADERS" -o "$3" \
         "$API/api/v1/capture/recent/$1?rule_id=$2" 2>/dev/null || true
 }
@@ -287,16 +254,16 @@ log "=== capture smoke: sinks ==="
 SETTINGS=$(api_get /api/v1/settings)
 assert_json "$SETTINGS" '.data.syslog_capture_enabled' 'true' 'syslog_capture_enabled defaults to true'
 assert_json "$SETTINGS" '.data.otlp_logs_capture_enabled' 'true' 'otlp_logs_capture_enabled defaults to true'
-SINKS_UPDATE=$(api_put /api/v1/settings '{
-    "syslog_endpoint": "syslog-collector-capture:6601",
-    "syslog_transport": "tcp",
-    "otlp_endpoint": "http://otelcol-logs-capture:4318",
-    "otlp_protocol": "http-proto",
-    "otlp_logs_enabled": true
-}')
-assert_json "$SINKS_UPDATE" '.data.syslog_endpoint' 'syslog-collector-capture:6601' 'syslog sink configured'
+SINKS_UPDATE=$(api_put /api/v1/settings "{
+    \"syslog_endpoint\": \"${SYSLOG_ENDPOINT}\",
+    \"syslog_transport\": \"tcp\",
+    \"otlp_endpoint\": \"${OTLP_ENDPOINT}\",
+    \"otlp_protocol\": \"http-proto\",
+    \"otlp_logs_enabled\": true
+}")
+assert_json "$SINKS_UPDATE" '.data.syslog_endpoint' "$SYSLOG_ENDPOINT" 'syslog sink configured'
 assert_json "$SINKS_UPDATE" '.data.otlp_logs_enabled' 'true' 'OTLP logs sink configured'
-sleep 2
+settle
 
 # --- Backend and the three routes ---
 log "=== capture smoke: backend and routes ==="
@@ -327,7 +294,7 @@ else
     fail "route creation: R='$ROUTE_R' S='$ROUTE_S' W='$ROUTE_W'"
     print_results
 fi
-sleep 2
+settle
 px "$PROXY_IN" "$HOST_R" /ok
 [ "$PX_CODE" = "200" ] && ok "route R answers 200 on /ok" || fail "route R /ok answered $PX_CODE"
 px "$PROXY_IN" "$HOST_R" /fail
@@ -363,7 +330,7 @@ assert_json "$RULE_OUT" '.data.capture.request_body_max_bytes' "$KIB64" 'capture
 assert_json "$RULE_OUT" '.data.limits.max_captures' '100' 'capture defaults: max_captures 100'
 assert_json "$RULE_OUT" '.data.limits.rate_per_minute' '10' 'capture defaults: rate_per_minute 10'
 assert_json "$RULE_OUT" '.data.limits.ttl_seconds' '3600' 'capture defaults: ttl_seconds 3600'
-sleep 2
+settle
 
 declare -a IN_FAIL_IDS=() IN_FAIL_BODIES=() IN_OK_IDS=() OUT_FAIL_IDS=()
 for n in 1 2 3; do
@@ -465,7 +432,7 @@ disable_rule "$RULE1"
 log "=== 10.1 IV2: a 10 MiB body against the 64 KiB cap ==="
 mk_rule "{\"name\":\"cap 64k\",\"route_id\":\"$ROUTE_R\",\"emit\":{\"status\":[\"server_error\"]},\"limits\":{\"max_captures\":100,\"rate_per_minute\":100,\"ttl_seconds\":3600}}"; RULE2="$RULE_ID"
 [ -n "$RULE2" ] && ok "rule with default caps created (id=$RULE2)" || fail "rule create: $RULE_OUT"
-sleep 2
+settle
 BIG=$(mktemp)
 head -c "$MIB10" /dev/zero | tr '\0' 'a' > "$BIG"
 px "$PROXY_IN" "$HOST_R" /fail -X POST -H 'Content-Type: text/plain' --data-binary "@$BIG"
@@ -493,7 +460,7 @@ for n in 1 2 3; do
     [ "$PX_CODE" = "502" ] || fail "sibling POST /fail #$n answered $PX_CODE"
     SIB_IDS+=("$(px_request_id)")
 done
-sleep 2
+settle
 SIZE_AFTER=$(ring_size)
 [ "$SIZE_AFTER" = "$SIZE_BEFORE" ] && ok "the ring did not grow for the sibling route ($SIZE_BEFORE records)" \
     || fail "the ring grew from $SIZE_BEFORE to $SIZE_AFTER on the sibling route"
@@ -509,7 +476,7 @@ disable_rule "$RULE2"
 log "=== 10.1 IV3: max_captures 3 ==="
 mk_rule "{\"name\":\"three then stop\",\"route_id\":\"$ROUTE_R\",\"emit\":{\"status\":[\"server_error\"]},\"limits\":{\"max_captures\":3,\"rate_per_minute\":100,\"ttl_seconds\":3600}}"; RULE3="$RULE_ID"
 [ -n "$RULE3" ] && ok "rule with max_captures 3 created (id=$RULE3)" || fail "rule create: $RULE_OUT"
-sleep 2
+settle
 for n in 1 2 3 4 5; do
     px "$PROXY_IN" "$HOST_R" /fail -X POST -H 'Content-Type: application/json' -d "{\"budget\":$n}"
     [ "$PX_CODE" = "502" ] || fail "budget POST /fail #$n answered $PX_CODE"
@@ -521,19 +488,41 @@ for _ in $(seq 1 20); do
 done
 [ "$DISABLED" = "true" ] && ok "the rule disabled itself after spending max_captures" \
     || fail "the rule is still enabled 20 s after five 5xx exchanges"
-[ "$(ring_count_for_rule "$RULE3")" = "3" ] && ok "exactly three records were emitted" \
-    || fail "$(ring_count_for_rule "$RULE3") records for the rule, expected 3"
-assert_json "$(rule_get "$RULE3")" '.data.captures_emitted' '3' 'captures_emitted is 3'
+# The budget is per process, so under `--workers` each worker spends its
+# own copy of max_captures and the node emits more than three: at least
+# the budget (some worker spent all of it, which is what disabled the
+# rule), at most the budget times the worker count, and never more than
+# the five exchanges that were sent. In single-process mode both bounds
+# collapse to exactly three. This is the documented semantics
+# (docs/capture.md, "Budgets"), not a miscount.
+EMIT_LOW=3
+EMIT_HIGH=$(( 3 * CAPTURE_WORKERS ))
+[ "$EMIT_HIGH" -gt 5 ] && EMIT_HIGH=5
+EMITTED=$(ring_count_for_rule "$RULE3")
+if [ "${EMITTED:-0}" -ge "$EMIT_LOW" ] && [ "${EMITTED:-0}" -le "$EMIT_HIGH" ]; then
+    ok "$EMITTED record(s) emitted, within the per-process budget [$EMIT_LOW, $EMIT_HIGH]"
+else
+    fail "$EMITTED records for the rule, expected between $EMIT_LOW and $EMIT_HIGH"
+fi
+STORED=$(rule_get "$RULE3" | jq -r '.data.captures_emitted')
+if [ "${STORED:-0}" -ge "$EMIT_LOW" ] && [ "${STORED:-0}" -le "$EMIT_HIGH" ]; then
+    ok "captures_emitted is $STORED, the sum of what each process flushed"
+else
+    fail "captures_emitted is '$STORED', expected between $EMIT_LOW and $EMIT_HIGH"
+fi
 ROWS=""
 for _ in $(seq 1 10); do
     ROWS=$(audit_rows capture.rule.auto_disabled "$RULE3")
     [ "$(echo "$ROWS" | jq 'length')" -ge 1 ] && break
     sleep 1
 done
-if [ "$(echo "$ROWS" | jq 'length')" = "1" ]; then
-    ok "one capture.rule.auto_disabled audit row names the rule"
+# One row per process that spent its own copy of the budget: exactly one
+# in single-process mode, up to one per worker otherwise.
+ROW_COUNT=$(echo "$ROWS" | jq 'length')
+if [ "${ROW_COUNT:-0}" -ge 1 ] && [ "${ROW_COUNT:-0}" -le "$CAPTURE_WORKERS" ]; then
+    ok "$ROW_COUNT capture.rule.auto_disabled audit row(s) name the rule"
 else
-    fail "$(echo "$ROWS" | jq 'length') auto_disabled row(s) for the rule, expected 1"
+    fail "$ROW_COUNT auto_disabled row(s) for the rule, expected between 1 and $CAPTURE_WORKERS"
 fi
 EXPECTED=$(jq -nc --arg r "$ROUTE_R" --arg id "$RULE3" '{budget:"max_captures",enabled:false,limit:3,route_id:$r,rule_id:$id}')
 ROW_HASH=$(echo "$ROWS" | jq -r '.[0].after_payload_hash // ""')
@@ -550,7 +539,7 @@ assert_json "$ROWS" '.[0].operator_username' 'capture' 'the actor is the node (c
 log "=== 10.2 IV1: Authorization and Cookie are redacted on stdout, syslog and OTLP ==="
 mk_rule "{\"name\":\"redaction\",\"route_id\":\"$ROUTE_R\",\"emit\":{\"status\":[\"server_error\"]},\"limits\":{\"max_captures\":100,\"rate_per_minute\":100,\"ttl_seconds\":3600}}"; RULE5="$RULE_ID"
 [ -n "$RULE5" ] && ok "redaction rule created (id=$RULE5)" || fail "rule create: $RULE_OUT"
-sleep 2
+settle
 # A GET, on purpose: the fixture backend echoes the request headers in
 # its POST responses, and a response body is never redacted, so a POST
 # would put the raw bearer value in the record legitimately. The
@@ -651,7 +640,14 @@ assert_status POST "$API/api/v1/capture/rules" 403 "an Operator cannot POST a ru
     -H "Content-Type: application/json" -d "{\"name\":\"nope\",\"route_id\":\"$ROUTE_R\",\"emit\":{\"always\":true}}"
 assert_status GET "$API/api/v1/capture/rules/$RULE5" 403 "an Operator cannot read one rule"
 assert_status GET "$API/api/v1/capture/rules" 200 "an Operator can list the rules"
-assert_status GET "$API/api/v1/capture/recent" 200 "an Operator can read the ring"
+# The role check runs in middleware, ahead of the handler that refuses
+# the supervisor's empty ring, so an Operator is let through either way
+# and the code that comes back is the node's, not the role's.
+if [ "$WORKERS_MODE" = true ]; then
+    assert_status GET "$API/api/v1/capture/recent" 503 "an Operator reaches the ring and the workers node refuses it"
+else
+    assert_status GET "$API/api/v1/capture/recent" 200 "an Operator can read the ring"
+fi
 OP_DISABLE=$(api_post "/api/v1/capture/rules/$RULE5/disable" '{}')
 assert_json "$OP_DISABLE" '.data.enabled' 'false' 'an Operator can POST .../disable'
 assert_json "$OP_DISABLE" '.data.id' "$RULE5" 'the disable answers with the rule'
@@ -661,7 +657,7 @@ assert_status GET "$API/api/v1/capture/recent" 403 "a Viewer cannot read the rin
 assert_status GET "$API/api/v1/capture/rules" 403 "a Viewer cannot list the rules"
 assert_status POST "$API/api/v1/capture/rules/$RULE5/disable" 403 "a Viewer cannot disable a rule"
 SESSION="$ADMIN_SESSION"
-sleep 2
+settle
 
 # ---------------------------------------------------------------------
 # Story 10.2 IV2: the directory sink, read-only then writable.
@@ -669,7 +665,7 @@ sleep 2
 log "=== 10.2 IV2: output.dir on a read-only mount ==="
 mk_rule "{\"name\":\"ro dir\",\"route_id\":\"$ROUTE_R\",\"emit\":{\"always\":true},\"limits\":{\"max_captures\":100,\"rate_per_minute\":100,\"ttl_seconds\":3600},\"output\":{\"dir\":\"$CAPTURE_RO_DIR\"}}"; RULE6="$RULE_ID"
 [ -n "$RULE6" ] && ok "rule with output.dir $CAPTURE_RO_DIR created (id=$RULE6)" || fail "rule create: $RULE_OUT"
-sleep 2
+settle
 DROPPED_BEFORE=$(metric_dropped_sink "$RULE6")
 NON_2XX=0
 for n in 1 2 3 4 5; do
@@ -695,7 +691,7 @@ disable_rule "$RULE6"
 log "=== 10.2 IV2: output.dir on a writable directory ==="
 mk_rule "{\"name\":\"rw dir\",\"route_id\":\"$ROUTE_R\",\"emit\":{\"always\":true},\"limits\":{\"max_captures\":100,\"rate_per_minute\":100,\"ttl_seconds\":3600},\"output\":{\"dir\":\"$CAPTURE_DIR\"}}"; RULE7="$RULE_ID"
 [ -n "$RULE7" ] && ok "rule with output.dir $CAPTURE_DIR created (id=$RULE7)" || fail "rule create: $RULE_OUT"
-sleep 2
+settle
 declare -a RW_IDS=()
 for n in 1 2 3; do
     px "$PROXY_IN" "$HOST_R" /ok -X POST -H 'Content-Type: application/json' -d "{\"rw\":$n}"
@@ -729,8 +725,14 @@ for RID in "${RW_IDS[@]}"; do
     else
         fail "$NAME differs from the ring download ($(wc -c < "$FILE") vs $(wc -c < "$DL") bytes)"
     fi
-    assert_header_value "$(cat "$DL_HEADERS")" "Content-Disposition" "attachment; filename=\"$NAME\"" \
-        "the download is served under the same file name"
+    # The download's own headers only exist when the record came from
+    # the endpoint; on a workers node it came from the stdout sink,
+    # because the endpoint answers 503 there and the file name is
+    # asserted against the sink's own naming above.
+    if [ "$WORKERS_MODE" = false ]; then
+        assert_header_value "$(cat "$DL_HEADERS")" "Content-Disposition" "attachment; filename=\"$NAME\"" \
+            "the download is served under the same file name"
+    fi
     # The name's stamp is the record's UTC timestamp in basic ISO 8601
     # with nine fractional digits: strip the offset, drop `-` and `:`,
     # right-pad the fraction with zeros.
@@ -753,7 +755,7 @@ disable_rule "$RULE7"
 log "=== 10.2 IV3: application/octet-stream through base64 ==="
 mk_rule "{\"name\":\"binary\",\"route_id\":\"$ROUTE_R\",\"emit\":{\"always\":true},\"limits\":{\"max_captures\":100,\"rate_per_minute\":100,\"ttl_seconds\":3600}}"; RULE8="$RULE_ID"
 [ -n "$RULE8" ] && ok "binary rule created (id=$RULE8)" || fail "rule create: $RULE_OUT"
-sleep 2
+settle
 RAW=$(mktemp)
 head -c 32768 /dev/urandom > "$RAW"
 px "$PROXY_IN" "$HOST_R" /ok -X POST -H 'Content-Type: application/octet-stream' --data-binary "@$RAW"
@@ -783,7 +785,7 @@ disable_rule "$RULE8"
 log "=== 10.2 IV4: redact.headers [X-Api-Key] adds, never subtracts ==="
 mk_rule "{\"name\":\"x-api-key\",\"route_id\":\"$ROUTE_R\",\"emit\":{\"always\":true},\"limits\":{\"max_captures\":100,\"rate_per_minute\":100,\"ttl_seconds\":3600},\"redact\":{\"headers\":[\"X-Api-Key\"]}}"; RULE9="$RULE_ID"
 [ -n "$RULE9" ] && ok "rule naming X-Api-Key created (id=$RULE9)" || fail "rule create: $RULE_OUT"
-sleep 2
+settle
 px "$PROXY_IN" "$HOST_R" /ok -X POST -H 'Content-Type: application/json' \
     -H 'X-Api-Key: k-123' -H 'Authorization: Bearer abc' -H 'X-Plain: visible' -d '{}'
 [ "$PX_CODE" = "200" ] || fail "the X-Api-Key POST answered $PX_CODE"
@@ -806,7 +808,7 @@ disable_rule "$RULE9"
 log "=== audit C1: a WAF block on a 4xx rule ==="
 mk_rule "{\"name\":\"waf 4xx\",\"route_id\":\"$ROUTE_W\",\"emit\":{\"status\":[\"client_error\"]},\"limits\":{\"max_captures\":100,\"rate_per_minute\":100,\"ttl_seconds\":3600}}"; RULE10="$RULE_ID"
 [ -n "$RULE10" ] && ok "rule with status [client_error] on the WAF route created (id=$RULE10)" || fail "rule create: $RULE_OUT"
-sleep 2
+settle
 px "$PROXY_IN" "$HOST_W" "/search?q=1%27%20OR%201%3D1--"
 [ "$PX_CODE" = "403" ] && ok "the WAF blocked the SQLi probe (403)" || fail "the SQLi probe answered $PX_CODE, expected 403"
 wait_ring "$RULE10" 1 && ok "the block produced a record" || fail "no record for the WAF block"
@@ -842,8 +844,17 @@ for _ in $(seq 1 10); do
     [ "$(echo "$ROWS" | jq 'length')" -ge 1 ] && break
     sleep 1
 done
-[ "$(echo "$ROWS" | jq 'length')" = "1" ] && ok "one capture.rule.auto_disabled row names the ttl rule" \
-    || fail "$(echo "$ROWS" | jq 'length') auto_disabled row(s) for the ttl rule, expected 1"
+# Every process that enforces capture runs the expiry sweep, and the
+# store's own `enabled = 1` filter is what keeps a second sweeper from
+# auditing the same rule twice; under `--workers` two sweepers can still
+# race for it, so the count is bounded by the worker count rather than
+# pinned at one.
+ROW_COUNT=$(echo "$ROWS" | jq 'length')
+if [ "${ROW_COUNT:-0}" -ge 1 ] && [ "${ROW_COUNT:-0}" -le "$CAPTURE_WORKERS" ]; then
+    ok "$ROW_COUNT capture.rule.auto_disabled row(s) name the ttl rule"
+else
+    fail "$ROW_COUNT auto_disabled row(s) for the ttl rule, expected between 1 and $CAPTURE_WORKERS"
+fi
 # The audited instant is `to_rfc3339()`, offset spelled `+00:00`; the
 # API serialises the same DateTime<Utc> and spells it that way too, so
 # the value is used as is, with a `Z` rewritten only if one appears.
@@ -876,7 +887,7 @@ fi
 [ "$(api_get /api/v1/capture/rules | jq -r --arg id "$RULE_TTL" '[(.data.rules // [])[] | select(.id == $id)] | length')" = "1" ] \
     && ok "the expired rule is still listed, disabled, not deleted" || fail "the expired rule vanished from the listing"
 
-rm -f "$FRAMES"
+capture_helpers_cleanup
 
 # --- Summary ---
 log "=== capture smoke: summary ==="

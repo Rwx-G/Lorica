@@ -92,6 +92,7 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str, enabled: bool) -> Rou
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         managed_by: None,
+        waf_body_scan_max_bytes: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

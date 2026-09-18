@@ -12,17 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Regression: a client that aborts an in-flight request (navigates away
-//! while a slow page is still loading) must NOT be counted as a backend
-//! failure by the circuit breaker.
+//! True HTTP end-to-end for the node-wide WAF scan budget
+//! (Story 10.6 AC #7, IV5).
 //!
-//! Reproduces the production report: loading a slow-first-load site (GitLab)
-//! and clicking elsewhere mid-load yields a 502 for ~the breaker cooldown,
-//! even though the backend is healthy. The local breaker opens after 5
-//! consecutive failures (`BreakerEngine::local(5, 10)`); if each client abort
-//! is mis-recorded as a backend failure, five aborts open the breaker and the
-//! only backend is denied, so the next request gets a spurious
-//! "no healthy backends" 502.
+//! A file of its own rather than more tests in
+//! `waf_body_inspection_e2e_test.rs`, and the reason is the thing under
+//! test: the budget is a process-wide static, on purpose, because a
+//! reservation outlives the configuration snapshot it was taken under.
+//! Lowering it is therefore not a per-test setting, it is a change
+//! every test in the same binary would see. One integration file is one
+//! binary, so this one runs the whole process under a 4 KiB ceiling and
+//! nothing else has to know.
+//!
+//! What it asserts is the fail-open direction, which is the part of AC
+//! #7 that is a decision rather than a mechanism: over budget, a body
+//! carrying a payload the WAF would certainly have blocked is forwarded
+//! to the upstream instead, on a Blocking route, with the skip counted.
+//! Failing closed would turn a saturated shared budget into a
+//! node-wide 413 storm.
 
 #![cfg(unix)]
 
@@ -31,7 +38,7 @@ mod common;
 use common::reserve_port;
 
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,15 +47,20 @@ use async_trait::async_trait;
 use lorica::proxy_wiring::{LoricaProxy, ProxyConfig, ProxyConfigGlobals};
 use lorica_config::models::*;
 use lorica_core::server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+/// Small enough that the first buffered chunk of any real body is
+/// refused, so the outcome does not depend on chunk sizing.
+const TINY_BUDGET: u64 = 4_096;
 
 // ---------------------------------------------------------------------------
-// Slow origin: reads the request, waits `delay`, then answers 200. The delay
-// keeps the request in flight long enough for the client to abort it.
+// Origin that counts the body bytes it receives.
 // ---------------------------------------------------------------------------
 
-async fn spawn_slow_origin(delay: Duration) -> SocketAddr {
+async fn spawn_body_counting_origin() -> (SocketAddr, Arc<AtomicU64>) {
+    let received = Arc::new(AtomicU64::new(0));
+    let received_c = Arc::clone(&received);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -57,55 +69,93 @@ async fn spawn_slow_origin(delay: Duration) -> SocketAddr {
                 Ok(p) => p,
                 Err(_) => return,
             };
+            let received = Arc::clone(&received_c);
             tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = stream.read(&mut buf).await {
-                    if n == 0 {
-                        return;
+                let mut buf: Vec<u8> = Vec::new();
+                let mut scratch = [0u8; 16384];
+                let header_end = loop {
+                    match stream.read(&mut scratch).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&scratch[..n]),
                     }
-                    if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+                let want = headers
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|rest| rest.split("\r\n").next())
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut have = buf.len() - header_end;
+                while have < want {
+                    match stream.read(&mut scratch).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => have += n,
                     }
                 }
-                tokio::time::sleep(delay).await;
+                received.fetch_add(have as u64, Ordering::SeqCst);
                 let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                 let _ = stream.write_all(resp.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
         }
     });
-    addr
-}
-
-/// Open a connection to the proxy, send a complete request, then reset it
-/// while the upstream response is still pending - exactly a browser cancelling
-/// an in-flight page load. `set_linger(0)` forces a TCP RST so the proxy sees a
-/// downstream connection error rather than an ambiguous half-close.
-async fn abort_inflight_request(port: u16) {
-    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let mut stream = stream;
-    stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: _\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    stream.flush().await.unwrap();
-    // Let the proxy select the backend, dial the (slow) origin, and enter the
-    // duplex loop, so the abort lands strictly mid-flight.
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    // Tokio deprecated set_linger because SO_LINGER can block the thread
-    // on drop; a 0-second linger never blocks, and the RST it forces on
-    // drop is exactly the client-abort signal this test simulates.
-    #[allow(deprecated)]
-    let _ = stream.set_linger(Some(Duration::from_secs(0)));
-    drop(stream);
-    // Small gap so the proxy finishes its failure bookkeeping before the next
-    // abort, keeping the five failures consecutive.
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    (addr, received)
 }
 
 // ---------------------------------------------------------------------------
-// Shared harness (duplicated from other e2e files; matches their pattern).
+// Raw client (same shape as the sibling e2e file).
+// ---------------------------------------------------------------------------
+
+async fn send_request(port: u16, request: Vec<u8>) -> u16 {
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+    // Parks rather than returning: dropping the write half would look
+    // like a client that went away and the proxy would abandon the
+    // upstream request mid-flight.
+    let writer = tokio::spawn(async move {
+        let _ = wr.write_all(&request).await;
+        let _ = wr.flush().await;
+        std::future::pending::<()>().await;
+    });
+
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 4096];
+    let status = loop {
+        match tokio::time::timeout(Duration::from_secs(10), rd.read(&mut scratch)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break 0u16,
+            Ok(Ok(n)) => buf.extend_from_slice(&scratch[..n]),
+        }
+        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+            let line = String::from_utf8_lossy(&buf[..pos]).to_string();
+            break line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse::<u16>().ok())
+                .unwrap_or(0);
+        }
+    };
+    writer.abort();
+    status
+}
+
+fn sized_request(port: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut req = format!(
+        "PUT /upload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(body);
+    req
+}
+
+// ---------------------------------------------------------------------------
+// Harness.
 // ---------------------------------------------------------------------------
 
 struct ManualShutdown {
@@ -184,10 +234,6 @@ impl ProxyHarness {
             thread: Some(thread),
         }
     }
-
-    fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/", self.port)
-    }
 }
 
 impl Drop for ProxyHarness {
@@ -201,15 +247,15 @@ impl Drop for ProxyHarness {
     }
 }
 
-fn test_route() -> Route {
+fn waf_route() -> Route {
     Route {
-        id: "r-cb".into(),
+        id: "r-waf-budget".into(),
         hostname: "_".into(),
         path_prefix: "/".into(),
         certificate_id: None,
         load_balancing: LoadBalancing::RoundRobin,
-        waf_enabled: false,
-        waf_mode: WafMode::Detection,
+        waf_enabled: true,
+        waf_mode: WafMode::Blocking,
         enabled: true,
         force_https: false,
         redirect_hostname: None,
@@ -228,7 +274,7 @@ fn test_route() -> Route {
         access_log_enabled: false,
         proxy_headers_remove: Vec::new(),
         response_headers_remove: Vec::new(),
-        max_request_body_bytes: None,
+        max_request_body_bytes: Some(8 * 1_048_576),
         websocket_enabled: false,
         rate_limit_rps: None,
         rate_limit_burst: None,
@@ -243,7 +289,7 @@ fn test_route() -> Route {
         cache_ttl_s: 300,
         cache_max_bytes: 52_428_800,
         max_connections: None,
-        slowloris_threshold_ms: 5_000,
+        slowloris_threshold_ms: 60_000,
         auto_ban_threshold: None,
         auto_ban_duration_s: 3_600,
         path_rules: vec![],
@@ -266,13 +312,13 @@ fn test_route() -> Route {
         rate_limit: None,
         geoip: None,
         bot_protection: None,
+        group_name: String::new(),
+        node_selector: Vec::new(),
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         managed_by: None,
         waf_body_scan_max_bytes: None,
-        group_name: String::new(),
-        node_selector: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -301,44 +347,73 @@ fn test_backend(id: &str, addr: SocketAddr) -> Backend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_cancel_must_not_open_circuit_breaker() {
-    // Slow origin keeps each request in flight while the client aborts it.
-    let origin = spawn_slow_origin(Duration::from_millis(1500)).await;
-    let route = test_route();
-    let backends = vec![test_backend("b-primary", origin)];
-    let links = vec![("r-cb".into(), "b-primary".into())];
+/// Builds the snapshot, which is also what lowers the process-wide
+/// ceiling: `ProxyConfig::from_store` is the reload hook for it.
+async fn harness_under_a_tiny_budget() -> (ProxyHarness, Arc<AtomicU64>) {
+    let (origin, received) = spawn_body_counting_origin().await;
     let config = ProxyConfig::from_store(
-        vec![route],
-        backends,
+        vec![waf_route()],
+        vec![test_backend("b-primary", origin)],
         vec![],
-        links,
-        ProxyConfigGlobals::default(),
+        vec![("r-waf-budget".into(), "b-primary".into())],
+        ProxyConfigGlobals {
+            waf_body_scan_max_inflight_bytes: TINY_BUDGET,
+            ..ProxyConfigGlobals::default()
+        },
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
+    (harness, received)
+}
 
-    // Five in-flight aborts. The breaker threshold is 5: if a client abort is
-    // mis-recorded as a backend failure, the breaker opens after these.
-    for _ in 0..5 {
-        abort_inflight_request(harness.port).await;
-    }
+fn sqli_json() -> Vec<u8> {
+    br#"{"q":"1' UNION SELECT password FROM users--"}"#.to_vec()
+}
 
-    // A healthy follow-up must still reach the backend and get 200. With the
-    // bug, the breaker is Open and this returns a spurious 502 immediately.
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    let r = client.get(harness.url()).send().await.unwrap();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn over_budget_the_body_is_forwarded_unscanned_instead_of_rejected() {
+    // IV5. A JSON body the WAF would block, on a Blocking route, with
+    // the node's scan budget too small to hold it. The request must be
+    // answered by the upstream, not by a 413 and not by a 403: the
+    // budget is a memory bound, not a policy, and a shared bound that
+    // rejected traffic would be a self-inflicted outage.
+    let (harness, received) = harness_under_a_tiny_budget().await;
+    let before = lorica_api::metrics::waf_body_scan_outcome_value("skipped_budget");
+    let mut body = sqli_json();
+    body.resize(64 * 1024, b'a');
+
+    let status = send_request(
+        harness.port,
+        sized_request(harness.port, "application/json", &body),
+    )
+    .await;
+
     assert_eq!(
-        r.status(),
-        200,
-        "client-cancelled requests must not trip the circuit breaker (got {})",
-        r.status()
+        status, 200,
+        "over budget the request is allowed through, not rejected"
+    );
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        body.len() as u64,
+        "the upstream receives the body whole"
+    );
+    assert_eq!(
+        lorica_api::metrics::waf_body_scan_outcome_value("skipped_budget"),
+        before + 1,
+        "the skip is counted exactly once, which is what an operator alarms on"
+    );
+
+    // The status line reaches this task before the proxy has finished
+    // dropping the request context the reservation lives on, so the
+    // gauge is read with a bounded wait rather than on the same tick.
+    for _ in 0..40 {
+        if lorica_api::metrics::waf_body_scan_inflight_bytes_value() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        lorica_api::metrics::waf_body_scan_inflight_bytes_value(),
+        0,
+        "the reservation is released once the request ends"
     );
 }

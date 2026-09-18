@@ -28,6 +28,10 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::reserve_port;
+
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -167,11 +171,6 @@ impl ShutdownSignalWatch for ManualShutdown {
     }
 }
 
-fn reserve_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 async fn wait_for_port(port: u16) {
     for _ in 0..100 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -264,6 +263,7 @@ fn test_route(rewrite: Option<ResponseRewriteConfig>) -> Route {
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
         managed_by: None,
+        waf_body_scan_max_bytes: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

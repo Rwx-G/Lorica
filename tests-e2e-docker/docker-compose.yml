@@ -958,6 +958,148 @@ services:
       - e2e
       - capture-inside
 
+  # ---- Capture E2E in WORKER MODE (v1.8.0 Epic 10 e2e section) -------
+  # The same topology as the `capture` profile, on its own volumes, with
+  # the node started by entrypoint-capture-workers.sh (`--workers 2`).
+  #
+  # The epic PRD asks for this variant because body buffering and the
+  # per-worker budget semantics are precisely the kind of thing that
+  # passes in single-process mode and breaks in a worker. Three things
+  # genuinely differ on such a node (docs/capture.md):
+  #   - the recent-captures ring is per worker and the management API
+  #     runs in the supervisor, whose ring stays empty, so both
+  #     /api/v1/capture/recent endpoints answer 503;
+  #   - `max_captures` and `rate_per_minute` are spent per worker, so a
+  #     node emits up to workers times the per-rule budget;
+  #   - every record is produced in a worker, so the stdout, syslog,
+  #     OTLP and output.dir sinks are the only places it appears.
+  #
+  # Two runners drive it: `capture-smoke-workers` re-runs the whole
+  # single-process smoke with CAPTURE_SMOKE_WORKERS=1 (which reads the
+  # records from the `lorica::capture` stdout sink instead of the ring
+  # and relaxes the per-node counts to per-worker ones), and
+  # `capture-workers-smoke` asserts what only a workers node can show.
+  #
+  # The `capture-inside` network and the read-only `capture-ro` volume
+  # are shared with the single-process profile: the two phases never run
+  # at the same time, the aliases are distinct, and the volume is only
+  # ever mounted read-only.
+  #
+  # Run with:
+  #   docker compose --profile capture-workers up --build
+  #   docker compose --profile capture-workers run --rm capture-smoke-workers
+  #   docker compose --profile capture-workers run --rm capture-workers-smoke
+  lorica-capture-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+      args:
+        LORICA_FEATURES: "otel"
+    entrypoint: ["/entrypoint-capture-workers.sh"]
+    profiles: ["capture-workers"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-capture-workers-data:/var/lib/lorica
+      - shared-capture-workers:/shared
+      - capture-ro:/captures-ro:ro
+    depends_on:
+      - backend1
+    networks:
+      e2e:
+        aliases:
+          - lorica-capture-workers-outside
+      capture-inside:
+        aliases:
+          - lorica-capture-workers-inside
+
+  syslog-collector-capture-workers:
+    build:
+      context: ./test-runner
+    profiles: ["capture-workers"]
+    user: "0:0"
+    entrypoint:
+      - "sh"
+      - "-c"
+      - "mkdir -p /shared && : > /shared/syslog.log && exec socat -u TCP-LISTEN:6601,fork,reuseaddr OPEN:/shared/syslog.log,creat,append"
+    volumes:
+      - shared-capture-workers:/shared
+    networks:
+      - e2e
+
+  otelcol-logs-capture-workers:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    profiles: ["capture-workers"]
+    user: "0:0"
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./fixtures/otelcol-logs.yaml:/etc/otelcol/config.yaml:ro
+      - shared-capture-workers:/shared
+    networks:
+      - e2e
+
+  capture-smoke-workers:
+    build:
+      context: ./test-runner
+    profiles: ["capture-workers"]
+    entrypoint: ["bash", "run-capture-smoke.sh"]
+    # Root, same rationale as the single-process runner: the capture
+    # files are 0640 owned by the node's unprivileged user.
+    user: "0:0"
+    depends_on:
+      - lorica-capture-workers
+      - syslog-collector-capture-workers
+      - otelcol-logs-capture-workers
+    volumes:
+      - shared-capture-workers:/shared:ro
+    environment:
+      - LORICA_API=https://lorica-capture-workers:9443
+      - INSIDE_HOST=lorica-capture-workers-inside
+      - OUTSIDE_HOST=lorica-capture-workers-outside
+      - BACKEND1_ADDR=backend1:80
+      - SYSLOG_LOG=/shared/syslog.log
+      - OTLP_LOG=/shared/otlp-logs.json
+      - LORICA_LOG=/shared/lorica.log
+      - CAPTURE_DIR=/shared/captures
+      - CAPTURE_RO_DIR=/captures-ro
+      - INSIDE_CIDR=172.30.0.0/16
+      - SYSLOG_ENDPOINT=syslog-collector-capture-workers:6601
+      - OTLP_ENDPOINT=http://otelcol-logs-capture-workers:4318
+      - CAPTURE_SMOKE_WORKERS=1
+      - CAPTURE_WORKERS=2
+    networks:
+      - e2e
+      - capture-inside
+
+  capture-workers-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["capture-workers"]
+    entrypoint: ["bash", "run-capture-workers-smoke.sh"]
+    user: "0:0"
+    depends_on:
+      - lorica-capture-workers
+      - syslog-collector-capture-workers
+      - otelcol-logs-capture-workers
+    volumes:
+      - shared-capture-workers:/shared:ro
+    environment:
+      - LORICA_API=https://lorica-capture-workers:9443
+      - INSIDE_HOST=lorica-capture-workers-inside
+      - OUTSIDE_HOST=lorica-capture-workers-outside
+      - BACKEND1_ADDR=backend1:80
+      - SYSLOG_LOG=/shared/syslog.log
+      - OTLP_LOG=/shared/otlp-logs.json
+      - LORICA_LOG=/shared/lorica.log
+      - CAPTURE_DIR=/shared/captures
+      - INSIDE_CIDR=172.30.0.0/16
+      - SYSLOG_ENDPOINT=syslog-collector-capture-workers:6601
+      - OTLP_ENDPOINT=http://otelcol-logs-capture-workers:4318
+      - CAPTURE_WORKERS=2
+    networks:
+      - e2e
+      - capture-inside
+
   # ---------------------------------------------------------------------
   # ACME profile (Story 9.1 AC #13): Pebble fixture with a mock DNS
   # provider, the repo's first end-to-end ACME coverage (audit M-22).
@@ -1318,6 +1460,8 @@ volumes:
   lorica-capture-data:
   shared-capture:
   capture-ro:
+  lorica-capture-workers-data:
+  shared-capture-workers:
   lorica-cp-data:
   lorica-edge-a-data:
   lorica-edge-b-data:
@@ -1332,8 +1476,9 @@ networks:
   # its addresses are in no allowlist.
   automation-outside:
   # The capture smoke's "inside" network (Story 10.1 IV1), pinned so the
-  # rule under test can name 172.30.0.0/16 literally; only lorica-capture
-  # and capture-smoke join it. Its e2e address is the "outside" one.
+  # rule under test can name 172.30.0.0/16 literally; only the two
+  # capture nodes and their runners join it, each under its own alias.
+  # A node's e2e address is its "outside" one.
   capture-inside:
     ipam:
       config:
