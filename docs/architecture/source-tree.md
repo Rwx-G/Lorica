@@ -59,7 +59,7 @@ in `lorica/src/capture/`.
 preserve upstream Pingora structure to stay rebaseable. `lorica-tls`
 additionally carries the native cert resolver + OCSP stapling.
 `lorica-worker` and `lorica-command` are first-party process/IPC crates
-and follow the product version (1.7.4 on this branch, bumped with the
+and follow the product version (1.8.0 on this branch, bumped with the
 product per `docs/BUMP-CHECKLIST.md`), not the forked-crate 0.1.0 pin.
 
 ## Tests
