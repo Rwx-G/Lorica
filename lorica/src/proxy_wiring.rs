@@ -1098,15 +1098,14 @@ impl ProxyHttp for LoricaProxy {
             // snapshot, so a body the engine cannot parse pays for
             // none of this and the route fields are cloned only on
             // the oversize path rather than on every chunk.
-            let cap_meta = if ctx.waf_body_inspect
-                && ctx.body_bytes_received > ctx.waf_body_scan_max as u64
-            {
-                ctx.route_snapshot
-                    .as_ref()
-                    .map(|r| (r.waf_mode.clone(), r.id.clone(), r.hostname.clone()))
-            } else {
-                None
-            };
+            let cap_meta =
+                if ctx.waf_body_inspect && ctx.body_bytes_received > ctx.waf_body_scan_max as u64 {
+                    ctx.route_snapshot
+                        .as_ref()
+                        .map(|r| (r.waf_mode.clone(), r.id.clone(), r.hostname.clone()))
+                } else {
+                    None
+                };
             if let Some((waf_mode, route_id, route_hostname)) = cap_meta {
                 match waf_mode {
                     WafMode::Blocking => {

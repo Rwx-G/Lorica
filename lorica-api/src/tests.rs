@@ -6589,10 +6589,7 @@ async fn test_settings_schema_bounds_match_validator() {
     // anti-drift test that grows an exception per new field stops
     // covering the thing it exists for.
     for (field, rejected) in [
-        (
-            "health_max_concurrent_probes",
-            StatusCode::BAD_REQUEST,
-        ),
+        ("health_max_concurrent_probes", StatusCode::BAD_REQUEST),
         ("header_timeout_s", StatusCode::BAD_REQUEST),
         ("flood_strict_rps", StatusCode::BAD_REQUEST),
         ("sla_purge_retention_days", StatusCode::BAD_REQUEST),
@@ -9627,7 +9624,10 @@ async fn test_route_waf_body_scan_max_bytes_over_the_api() {
     )
     .await;
     assert!(created["waf_body_scan_max_bytes"].is_null());
-    let route_id = created["id"].as_str().expect("created route id").to_string();
+    let route_id = created["id"]
+        .as_str()
+        .expect("created route id")
+        .to_string();
 
     for (value, expected) in [
         (4_096_u64, StatusCode::OK),
