@@ -21,8 +21,10 @@
 //! module is the single source of truth for one such cluster;
 //! mode-specific differences are explicit parameters, never copies.
 
+pub(crate) mod automation;
 pub(crate) mod cluster_follower;
 pub(crate) mod cluster_plane;
+pub(crate) mod environment_reaper;
 pub(crate) mod hot_upgrade;
 pub(crate) mod single;
 pub(crate) mod supervisor;
@@ -188,6 +190,11 @@ pub(crate) async fn run_api_server(
     // OCSP refresh is deliberately NOT gated: stapling is a serving
     // concern and followers are the nodes terminating client TLS (AC
     // #4). See `spawn_ocsp_refresh_loop`.
+    // Forced here rather than where each feature starts, so a node
+    // that never captures and never opens the automation listener still
+    // exposes the families at zero; an absent series reads like a
+    // feature that does not exist.
+    lorica_api::metrics::install_capture_and_automation_metrics();
     let is_follower = matches!(
         state.cluster,
         lorica_api::cluster::ClusterRuntime::Follower(_)
@@ -881,7 +888,7 @@ pub(crate) fn build_notify_dispatcher(
 /// `GlobalSettings`. No-op when the `otel` Cargo feature is off, the
 /// settings row cannot be read, or `otlp_endpoint` is unset / blank.
 ///
-/// Must be called from inside a Tokio runtime — the OTLP batch
+/// Must be called from inside a Tokio runtime - the OTLP batch
 /// exporter spawns a background flush task. `role` is a free-form
 /// label (`"supervisor"`, `"worker"`, `"single-process"`) included in
 /// the startup log line so multi-process installs can tell which

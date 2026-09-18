@@ -60,6 +60,23 @@ fn decode_ban_report_entry(
     )
 }
 
+/// Lift a worker's traffic-capture gauges out of its
+/// [`lorica_command::MetricsReport`].
+///
+/// Both metrics-report ingestion sites need the same two fields, and
+/// the supervisor's own gauges are always zero (the capture feature
+/// runs in the workers), so this is where the fleet figure comes from.
+/// The aggregation each one gets is decided in
+/// [`lorica_api::workers::AggregatedMetrics`], not here.
+fn capture_gauges_from(
+    report: &lorica_command::MetricsReport,
+) -> lorica_api::workers::CaptureGauges {
+    lorica_api::workers::CaptureGauges {
+        rules_active: report.capture_rules_active,
+        inflight_bytes: report.capture_inflight_bytes,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Supervisor mode (Unix only): forks workers, runs API server, monitors workers
 // ---------------------------------------------------------------------------
@@ -93,6 +110,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     // socket is only bound while a join token is
                     // live, and it rebinds on the next liveness edge).
                     cluster_listeners = i.cluster.len(),
+                    automation_listeners = i.automation.len(),
                     "hot upgrade: pulled inherited listeners from outgoing supervisor"
                 );
                 Some(i)
@@ -1017,6 +1035,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     management: management_port,
                     http: hu_cli.http_port,
                     https: hu_cli.https_port,
+                    // These are the cluster plane's own binds, and the
+                    // automation API is not started yet, so neither
+                    // port exists for them to collide with.
+                    cluster: None,
+                    automation: None,
                 },
                 inherited_operational,
                 auto_activate: hu_cli.cluster_auto_activate,
@@ -1043,6 +1066,46 @@ pub(crate) fn run_supervisor(cli: Cli) {
             lorica_api::cluster::ClusterRuntime::ControlPlane(runtime) => runtime.telemetry.clone(),
             _ => None,
         };
+
+        // Story 10.4 AC #7: collect environments past their expiry.
+        // Gated on the fleet role here and on the stored identity at
+        // every tick; a follower never sweeps, replication does.
+        let _environment_reaper = startup::environment_reaper::spawn_environment_reaper(
+            &cluster_runtime,
+            Arc::clone(&store),
+            log_store.clone(),
+            config_reload_tx.clone(),
+            &task_tracker,
+            startup::environment_reaper::ENVIRONMENT_REAPER_INTERVAL,
+        );
+
+        // The automation listener's inherited sockets, partitioned out
+        // of the pulled FD table beside the cluster ones above. Every
+        // entry is handed to `prepare_automation_listener`, which
+        // adopts or closes each by comparing it to the configured
+        // bind: a descriptor that reaches neither would leak for the
+        // process lifetime.
+        let inherited_automation: Vec<(String, RawFd)> = inherited
+            .as_ref()
+            .map(|i| i.automation.clone())
+            .unwrap_or_default();
+        let automation_listen = hu_cli.automation_listen.clone();
+        let automation_listen_any = hu_cli.automation_listen_any;
+        let automation_store = Arc::clone(&store);
+        // The listener opens inside the API task below, and the
+        // upgrade that hands its socket to the next binary runs out
+        // here, so the dup travels through this slot rather than a
+        // return value.
+        let automation_handoff = Arc::new(startup::automation::AutomationHandoff::default());
+        let task_automation_handoff = Arc::clone(&automation_handoff);
+        let automation_http_port = hu_cli.http_port;
+        let automation_https_port = hu_cli.https_port;
+        // Read before the plane moves into the API task: the
+        // automation bind must not land on the port the cluster plane
+        // just took.
+        let cluster_operational_port: Option<u16> =
+            cluster_plane.as_ref().map(|plane| plane.operational_port());
+        let oidc_verifier = super::single::build_oidc_verifier();
 
         let api_handle = tokio::spawn(async move {
             let state = AppState {
@@ -1078,7 +1141,35 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 log_writer: None,
                 task_tracker: api_task_tracker,
                 cluster: cluster_runtime,
+                oidc: oidc_verifier,
             };
+            // The automation API rides the same `AppState` as the
+            // management API and starts before it, so a refused
+            // listener stops the process instead of leaving the
+            // operator with a management API and no automation plane.
+            let automation = startup::automation::prepare_automation_listener(
+                startup::automation::AutomationOptions {
+                    automation_listen,
+                    listen_any: automation_listen_any,
+                    reserved: crate::cli::ReservedPorts {
+                        management: management_port,
+                        http: automation_http_port,
+                        https: automation_https_port,
+                        cluster: cluster_operational_port,
+                        automation: None,
+                    },
+                    inherited: inherited_automation,
+                    handoff: task_automation_handoff,
+                },
+                &automation_store,
+                state.clone(),
+            )
+            .await;
+            if let Err(e) = automation {
+                error!(error = %e, "automation listener failed to start");
+                std::process::exit(1);
+            }
+
             // Session store + ACME auto-renewal + cert-expiry notifier
             // + server loop, shared with single-process mode (audit
             // H-9, see `startup::run_api_server`). The management listener
@@ -1470,6 +1561,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             .as_ref()
                             .map(|plane| plane.handoff_fds())
                             .unwrap_or_default(),
+                        // The automation listener rides the same FD
+                        // handoff. Empty when the node runs without
+                        // `--automation-listen`, in which case the new
+                        // side binds nothing either.
+                        automation_fds: automation_handoff.fds(),
                         child_argv,
                     })
                     .await;
@@ -1844,6 +1940,8 @@ fn spawn_worker_channel_task(
                                         backend_conns,
                                         req_counts,
                                         waf_counts,
+                                        capture_gauges_from(&report),
+                                        report.waf_body_scan_inflight_bytes,
                                     )
                                     .await;
                                 // Cross-worker generic-counter
@@ -1852,7 +1950,7 @@ fn spawn_worker_channel_task(
                                 // Pair up the flat ["k","v","k","v",...]
                                 // list back into (String, String) label
                                 // pairs. Odd trailing entries are
-                                // silently dropped — safe default
+                                // silently dropped - safe default
                                 // since a truncated wire payload
                                 // just skips the affected metric.
                                 let gc: Vec<GenericCounterRow> =
@@ -2470,7 +2568,7 @@ async fn handle_breaker_report(
 // result is that the divergence window between workers collapses
 // from ~10-50 ms down to the UDS RTT between workers (microseconds).
 //
-// A failed Prepare aborts the whole reload — workers that did reply
+// A failed Prepare aborts the whole reload - workers that did reply
 // Ok to Prepare are asked to drop their pending slot via a best-effort
 // Commit of the *same* generation so they don't leak a stale pending
 // entry across a subsequent reload.
@@ -2754,6 +2852,8 @@ async fn pull_all_metrics_via_rpc(
                             backend_conns,
                             req_counts,
                             waf_counts,
+                            capture_gauges_from(&report),
+                            report.waf_body_scan_inflight_bytes,
                         )
                         .await;
                     // Cross-worker counter aggregation (v1.4.0

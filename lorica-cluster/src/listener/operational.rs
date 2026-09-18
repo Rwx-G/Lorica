@@ -49,7 +49,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
@@ -69,7 +68,7 @@ use crate::messages::{
     HeartbeatAck, LeaveAck, RenewAck, TelemetryPushAck,
 };
 use crate::preauth::{accept_error_pause, PreAuthBudgets, SourceGate, SourceSlot};
-use crate::replication::{AppliedConfig, ConfigVersion};
+use crate::replication::{AcceptedConfig, AppliedConfig, ConfigVersion};
 use crate::roster::{
     NodeIdentity, NodeState, Roster, SessionGuard, SessionRegistry, SESSION_RATE_WINDOW,
 };
@@ -250,13 +249,20 @@ pub struct OperationalConfig {
     /// Fleet-size hint handed to peers (loaded per handshake and
     /// heartbeat so it tracks roster growth). Default 0.
     pub fleet_size: Arc<AtomicU32>,
-    /// The configuration version every `HelloAck` and `HeartbeatAck`
-    /// advertises (Story 9.4 AC #7), read per answer so a follower
-    /// converges within one heartbeat of a commit it missed. Default:
-    /// generation 0 with an empty hash, which is what a transport-only
-    /// listener (no fleet layer) reports. A control plane shares its
-    /// own slot through [`crate::roster::ControlPlane::config_version_handle`].
-    pub config_version: Arc<ArcSwap<ConfigVersion>>,
+    /// What the fleet has accepted, which is what every `HelloAck`,
+    /// `HeartbeatAck` and up-to-date `ConfigPullAck` advertises (Story
+    /// 9.4 AC #7), read per answer so a follower converges within one
+    /// heartbeat of a commit it missed.
+    ///
+    /// The version advertised is the PEER'S, not the fleet's: since
+    /// Story 10.0 each node holds its own cut, so telling every node
+    /// the hash of the control plane's full view would leave them all
+    /// permanently behind. Default: an empty slot, generation 0 with
+    /// an empty hash, which is what a transport-only listener (no
+    /// fleet layer) reports. A control plane shares its own slot by
+    /// cloning [`crate::roster::ControlPlane::accepted`], whose
+    /// interior is shared.
+    pub accepted: Arc<AcceptedConfig>,
     /// Convergence admission control (AC #10). Default: the
     /// `DEFAULT_ADMISSION_*` constants.
     pub admission: Arc<AdmissionGate>,
@@ -294,7 +300,7 @@ impl OperationalConfig {
             acceptor,
             handshake,
             fleet_size: Arc::new(AtomicU32::new(0)),
-            config_version: Arc::new(ArcSwap::from_pointee(ConfigVersion::default())),
+            accepted: Arc::new(AcceptedConfig::new()),
             admission: Arc::new(AdmissionGate::new(
                 DEFAULT_ADMISSION_MAX_CONCURRENT,
                 DEFAULT_ADMISSION_QUEUE_DEPTH,
@@ -328,7 +334,7 @@ struct OperationalShared {
     acceptor: Arc<SwappableAcceptor>,
     handshake: HandshakeConfig,
     fleet_size: Arc<AtomicU32>,
-    config_version: Arc<ArcSwap<ConfigVersion>>,
+    accepted: Arc<AcceptedConfig>,
     admission: Arc<AdmissionGate>,
     stats: Arc<OperationalStats>,
     budgets: PreAuthBudgets,
@@ -350,7 +356,7 @@ impl OperationalListener {
             acceptor,
             handshake,
             fleet_size,
-            config_version,
+            accepted,
             admission,
             stats,
             budgets,
@@ -365,7 +371,7 @@ impl OperationalListener {
             acceptor,
             handshake,
             fleet_size,
-            config_version,
+            accepted,
             admission,
             stats,
             budgets,
@@ -582,7 +588,7 @@ async fn serve_operational_conn(
     };
 
     let hint = shared.fleet_size.load(Ordering::Relaxed);
-    let current = (**shared.config_version.load()).clone();
+    let current = advertised_version(&shared.accepted, node.as_ref());
     let (ack, hello) = match serve_hello(opener, &shared.handshake, hint, &current).await {
         Ok(Ok(admitted)) => admitted,
         Ok(Err(status)) => {
@@ -785,6 +791,18 @@ fn node_is_active(ctx: &SessionContext, guard: Option<&SessionGuard>) -> bool {
     }
 }
 
+/// The version to advertise to one peer.
+///
+/// A peer mTLS has named is told what IT should be holding; a peer
+/// with no identity, which a transport-only listener accepts, is told
+/// the fleet's, since there is no cut to speak of.
+fn advertised_version(accepted: &AcceptedConfig, node: Option<&NodeIdentity>) -> ConfigVersion {
+    match node {
+        Some(identity) => accepted.expected_for(&identity.node_id),
+        None => accepted.version(),
+    }
+}
+
 /// Serve one inbound request; `Some` ends the session.
 async fn serve_request(
     request: IncomingRequest<ClusterFrame>,
@@ -811,7 +829,7 @@ async fn serve_request(
                 guard.entry().record_applied(applied);
                 guard.entry().record_resources(resources);
             }
-            let current = shared.config_version.load();
+            let current = advertised_version(&shared.accepted, ctx.node.as_ref());
             let ack = HeartbeatAck {
                 timestamp_ms,
                 fleet_size_hint: shared.fleet_size.load(Ordering::Relaxed),
@@ -876,10 +894,10 @@ async fn serve_request(
                 }
                 Ok(None) => {
                     stats.config_pulls_served.fetch_add(1, Ordering::Relaxed);
-                    let current = shared.config_version.load();
+                    let current = shared.accepted.expected_for(node_id);
                     ClusterResponse::ok(cluster_response::Body::ConfigPullAck(ConfigPullAck {
                         generation: current.generation,
-                        hash: current.hash.clone(),
+                        hash: current.hash,
                         blob: Vec::new(),
                         up_to_date: true,
                     }))

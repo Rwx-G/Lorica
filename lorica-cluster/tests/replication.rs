@@ -35,6 +35,14 @@
 //! another refuses it, reported per node so the ACME solver can refuse
 //! the order rather than let the authority fail opaquely.
 //!
+//! Story 10.0 rides the same harness again: the round is driven by a
+//! `PayloadSource` that cuts a different blob per recipient, so the
+//! assertions are about WHICH bytes each node received, that two nodes
+//! at one generation with two hashes both read as in sync, and that a
+//! pull answers the caller with its own cut. A plain `ConfigPayload`
+//! source keeps the single-blob behaviour covered, which is what a
+//! 1.8.0 follower sees under a 1.7.x control plane.
+//!
 //! Test hygiene: every await that depends on another task sits under an
 //! explicit timeout, so a regression fails in seconds instead of
 //! hanging a CI run.
@@ -57,7 +65,8 @@ use lorica_cluster::messages::{
     MAX_CONFIG_HASH_BYTES,
 };
 use lorica_cluster::replication::{
-    AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, ReplicationReport, Replicator,
+    AcceptedConfig, AppliedConfig, ConfigPayload, ConfigVersion, PayloadSource, ReplicationReport,
+    Replicator,
 };
 use lorica_cluster::{
     operational_server_config, ClusterCa, ClusterRequest, ConfigPull, Dialer, DialerConfig,
@@ -97,6 +106,82 @@ fn payload(generation: u64) -> ConfigPayload {
         generation,
         hash: hash_for(generation),
         blob: vec![7, 8, 9],
+    }
+}
+
+/// The cuts two nodes get when `node_selector` sends them different
+/// routes: different bytes, so a round that confuses the two recipients
+/// cannot pass unnoticed.
+const CUT_A: &[u8] = b"the routes node-a is entitled to";
+const CUT_B: &[u8] = b"the routes node-b is entitled to";
+
+/// A stand-in for the canonical `sha256_hex`: the crate's hashing
+/// dependency is not reachable from an integration test and no new one
+/// is warranted here. What the assertions need is that two blobs get
+/// two hashes in the shape the wire accepts (lowercase hex, within
+/// `MAX_CONFIG_HASH_BYTES`), which FNV-1a gives.
+fn blob_hash(blob: &[u8]) -> String {
+    let mut state: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in blob {
+        state ^= u64::from(*byte);
+        state = state.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{state:064x}")
+}
+
+/// A control plane that cuts a different blob for each recipient, the
+/// way `FleetPayloads` does in the binary.
+struct PerRecipient {
+    generation: u64,
+    fleet_hash: String,
+    cuts: HashMap<String, Vec<u8>>,
+}
+
+impl PerRecipient {
+    /// The two-node fleet every Story 10.0 test here runs on.
+    fn two_nodes(generation: u64) -> Self {
+        let cuts: HashMap<String, Vec<u8>> = [
+            ("node-a".to_string(), CUT_A.to_vec()),
+            ("node-b".to_string(), CUT_B.to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        // The fleet hash covers the control plane's whole view, so it
+        // matches no recipient's cut: that is the point of AC #7.
+        let mut whole = CUT_A.to_vec();
+        whole.extend_from_slice(CUT_B);
+        Self {
+            generation,
+            fleet_hash: blob_hash(&whole),
+            cuts,
+        }
+    }
+}
+
+impl PayloadSource for PerRecipient {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// A node the selector matched nothing for is entitled to an empty
+    /// configuration, not to the fleet's.
+    fn payload_for(&self, node_id: &str) -> ConfigPayload {
+        let blob = self.cuts.get(node_id).cloned().unwrap_or_default();
+        ConfigPayload {
+            generation: self.generation,
+            hash: blob_hash(&blob),
+            blob,
+        }
+    }
+
+    fn expected_version_for(&self, node_id: &str) -> ConfigVersion {
+        // Derived from the same cut the payload is, so the two cannot
+        // answer differently for one node.
+        self.payload_for(node_id).version()
+    }
+
+    fn fleet_hash(&self) -> String {
+        self.fleet_hash.clone()
     }
 }
 
@@ -160,6 +245,12 @@ async fn eventually<F: FnMut() -> bool>(what: &str, mut f: F) {
 struct ControlPlaneHooks {
     /// What a pull hands back. `None` answers "you are up to date".
     available: Mutex<Option<ConfigPayload>>,
+    /// When set, a pull is answered from the accepted source keyed on
+    /// the caller, the way the binary's handler does it, and
+    /// `available` is ignored. The two cannot both be honoured: one
+    /// serves every caller the same bytes, the other serves each
+    /// caller its own.
+    serve_from: Mutex<Option<AcceptedConfig>>,
     pulls: AtomicUsize,
     /// What a certificate pull hands back, whatever was asked for:
     /// entitlement is resolved control-plane side (Story 9.5 D3), so
@@ -213,12 +304,20 @@ impl SessionHandler for ControlPlaneHooks {
 
     fn on_config_pull(
         &self,
-        _node_id: &str,
-        _applied: AppliedConfig,
+        node_id: &str,
+        applied: AppliedConfig,
     ) -> BoxFuture<'_, Result<Option<ConfigPayload>, String>> {
+        let node_id = node_id.to_string();
         Box::pin(async move {
             self.pulls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.available.lock().expect("lock").clone())
+            let accepted = self.serve_from.lock().expect("lock").clone();
+            let Some(accepted) = accepted else {
+                return Ok(self.available.lock().expect("lock").clone());
+            };
+            if !accepted.expected_for(&node_id).is_behind(&applied) {
+                return Ok(None);
+            }
+            Ok(accepted.payload_for(&node_id))
         })
     }
 
@@ -278,7 +377,12 @@ impl Fleet {
     /// Publish an accepted configuration, the way the binary does at
     /// boot from what the store already holds.
     fn publish(&self, payload: ConfigPayload) {
-        self.accepted.publish(payload);
+        self.publish_source(Arc::new(payload));
+    }
+
+    /// Publish an accepted configuration that is cut per recipient.
+    fn publish_source(&self, source: Arc<dyn PayloadSource>) {
+        self.accepted.publish(source);
     }
 
     /// The version the handshake and every heartbeat advertise.
@@ -287,10 +391,14 @@ impl Fleet {
     }
 
     async fn replicate(&self, payload: ConfigPayload) -> ReplicationReport {
+        self.replicate_source(Arc::new(payload)).await
+    }
+
+    async fn replicate_source(&self, source: Arc<dyn PayloadSource>) -> ReplicationReport {
         tokio::time::timeout(
             WAIT,
             self.replicator
-                .replicate(&self.sessions, &self.accepted, payload),
+                .replicate(&self.sessions, &self.accepted, source),
         )
         .await
         .expect("a replication round must finish inside the test budget")
@@ -345,16 +453,14 @@ async fn spawn_control_plane_with_state(
     // The listener reads the SAME slot the coordinator publishes into,
     // exactly as `ControlPlane` wires it in the binary.
     let accepted = AcceptedConfig::new();
-    config.config_version = accepted.version_handle();
+    config.accepted = Arc::new(accepted.clone());
     let stats = Arc::clone(&config.stats);
     let handle = OperationalListener::spawn(config);
 
-    let mut replicator = Replicator::new();
     // A wedged follower must not stall the whole suite; the eviction
     // path is unit-tested at length in `src/replication.rs`.
-    replicator.per_node_deadline = Duration::from_secs(5);
-    let mut distributor = CertDistributor::new();
-    distributor.per_node_deadline = Duration::from_secs(5);
+    let replicator = Replicator::new().with_per_node_deadline(Duration::from_secs(5));
+    let distributor = CertDistributor::new().with_per_node_deadline(Duration::from_secs(5));
     Fleet {
         addr,
         stats,
@@ -363,9 +469,7 @@ async fn spawn_control_plane_with_state(
         accepted,
         replicator,
         distributor,
-        challenges: ChallengeFanout {
-            per_node_deadline: Duration::from_secs(5),
-        },
+        challenges: ChallengeFanout::default().with_per_node_deadline(Duration::from_secs(5)),
         handle,
     }
 }
@@ -377,6 +481,10 @@ struct TestFollower {
     reject: bool,
     applied: Mutex<AppliedConfig>,
     staged: Mutex<Option<ConfigPayload>>,
+    /// Every payload a Prepare carried, kept because `staged` is
+    /// consumed by the commit: a test asserting on the bytes this node
+    /// was offered has nowhere else to look.
+    offered: Mutex<Vec<ConfigPayload>>,
     prepares: AtomicUsize,
     commits: AtomicUsize,
     aborts: AtomicUsize,
@@ -425,6 +533,7 @@ impl TestFollower {
                 break_glass,
             }),
             staged: Mutex::new(None),
+            offered: Mutex::new(Vec::new()),
             prepares: AtomicUsize::new(0),
             commits: AtomicUsize::new(0),
             aborts: AtomicUsize::new(0),
@@ -443,6 +552,16 @@ impl TestFollower {
 
     fn applied(&self) -> AppliedConfig {
         self.applied.lock().expect("lock").clone()
+    }
+
+    /// The blobs this node was offered by a Prepare, in order.
+    fn offered_blobs(&self) -> Vec<Vec<u8>> {
+        self.offered
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|payload| payload.blob.clone())
+            .collect()
     }
 
     fn installed_ids(&self) -> Vec<String> {
@@ -471,6 +590,7 @@ impl FollowerHandler for TestFollower {
     fn on_prepare(&self, payload: ConfigPayload) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             self.prepares.fetch_add(1, Ordering::SeqCst);
+            self.offered.lock().expect("lock").push(payload.clone());
             if self.reject {
                 return Err("unknown field in the pushed configuration".to_string());
             }
@@ -1186,4 +1306,245 @@ async fn a_pending_node_is_refused_the_configuration_it_asks_for() {
 
     dialer.shutdown();
     fleet.handle.shutdown();
+}
+
+/// Two live Active followers on one control plane: the shape every
+/// Story 10.0 test below needs, because a per-recipient cut cannot be
+/// observed with a single recipient.
+struct TwoNodeFleet {
+    cp: Fleet,
+    a: Arc<TestFollower>,
+    b: Arc<TestFollower>,
+    a_dialer: DialerHandle,
+    b_dialer: DialerHandle,
+}
+
+impl TwoNodeFleet {
+    async fn spawn(pki: &ControlPlanePki, heartbeat_interval: Duration) -> Self {
+        let a_node = issue_node(pki, "node-a");
+        let b_node = issue_node(pki, "node-b");
+        let cp = spawn_control_plane(pki, &[&a_node, &b_node]).await;
+
+        let a = TestFollower::new(false, false);
+        let b = TestFollower::new(false, false);
+        let a_dialer = spawn_follower(pki, &a_node, cp.addr, Arc::clone(&a), heartbeat_interval);
+        let b_dialer = spawn_follower(pki, &b_node, cp.addr, Arc::clone(&b), heartbeat_interval);
+        eventually("both followers to register", || {
+            cp.sessions.is_connected("node-a") && cp.sessions.is_connected("node-b")
+        })
+        .await;
+
+        Self {
+            cp,
+            a,
+            b,
+            a_dialer,
+            b_dialer,
+        }
+    }
+
+    fn shutdown(self) {
+        self.a_dialer.shutdown();
+        self.b_dialer.shutdown();
+        self.cp.handle.shutdown();
+    }
+}
+
+/// `report.offered` is in the order the round addressed the nodes,
+/// which is the session registry's order and not an assertion's
+/// business.
+fn offered_by_node(report: &ReplicationReport) -> Vec<(String, String)> {
+    let mut offered = report.offered.clone();
+    offered.sort();
+    offered
+}
+
+#[tokio::test]
+async fn each_follower_receives_only_the_blob_the_control_plane_cut_for_it() {
+    install_ring();
+    let pki = control_plane_pki();
+    let fleet = TwoNodeFleet::spawn(&pki, QUIET).await;
+
+    let report = fleet
+        .cp
+        .replicate_source(Arc::new(PerRecipient::two_nodes(7)))
+        .await;
+    assert!(!report.aborted, "nothing rejected: {report:?}");
+    assert_eq!(
+        report.committed,
+        vec!["node-a".to_string(), "node-b".to_string()]
+    );
+
+    assert_eq!(
+        fleet.a.offered_blobs(),
+        vec![CUT_A.to_vec()],
+        "node-a is sent its own cut and nothing else"
+    );
+    assert_eq!(
+        fleet.b.offered_blobs(),
+        vec![CUT_B.to_vec()],
+        "node-b is sent its own cut and nothing else"
+    );
+    assert_eq!(
+        offered_by_node(&report),
+        vec![
+            ("node-a".to_string(), blob_hash(CUT_A)),
+            ("node-b".to_string(), blob_hash(CUT_B)),
+        ],
+        "the round reports the hash each node was actually offered"
+    );
+    // The commit carries the recipient's own hash too, so what the
+    // registry records as applied is comparable to what that node was
+    // offered rather than to the fleet's blob.
+    assert_eq!(fleet.a.applied().hash, blob_hash(CUT_A));
+    assert_eq!(fleet.b.applied().hash, blob_hash(CUT_B));
+    assert_ne!(report.hash, blob_hash(CUT_A));
+    assert_ne!(report.hash, blob_hash(CUT_B));
+
+    fleet.shutdown();
+}
+
+#[tokio::test]
+async fn two_followers_at_one_generation_with_different_hashes_are_both_in_sync() {
+    install_ring();
+    let pki = control_plane_pki();
+    let fleet = TwoNodeFleet::spawn(&pki, QUIET).await;
+
+    let report = fleet
+        .cp
+        .replicate_source(Arc::new(PerRecipient::two_nodes(8)))
+        .await;
+    assert!(!report.aborted, "nothing rejected: {report:?}");
+
+    let a_expected = fleet.cp.accepted.expected_for("node-a");
+    let b_expected = fleet.cp.accepted.expected_for("node-b");
+    assert_eq!(
+        a_expected.generation, b_expected.generation,
+        "one generation for the fleet"
+    );
+    assert_ne!(
+        a_expected.hash, b_expected.hash,
+        "two cuts, two hashes, at the same generation"
+    );
+    // Drift is per node from here on: comparing either follower against
+    // the fleet hash would report the whole fleet permanently behind.
+    assert!(
+        !a_expected.is_behind(&fleet.a.applied()),
+        "node-a holds what it is expected to hold"
+    );
+    assert!(
+        !b_expected.is_behind(&fleet.b.applied()),
+        "node-b holds what it is expected to hold"
+    );
+    assert!(
+        fleet.cp.advertised().is_behind(&fleet.a.applied()),
+        "the fleet hash is nobody's cut, which is why nothing compares against it"
+    );
+
+    fleet.shutdown();
+}
+
+#[tokio::test]
+async fn a_pull_is_answered_with_the_caller_s_own_cut_not_the_fleet_s() {
+    install_ring();
+    let pki = control_plane_pki();
+    let a_node = issue_node(&pki, "node-a");
+    let b_node = issue_node(&pki, "node-b");
+    let cp = spawn_control_plane(&pki, &[&a_node, &b_node]).await;
+
+    // Generation 9 accepted with nobody pushed to: both followers learn
+    // it from their HelloAck and converge by pull, which is the path a
+    // node that joined after the round takes.
+    cp.publish_source(Arc::new(PerRecipient::two_nodes(9)));
+    *cp.hooks.serve_from.lock().expect("lock") = Some(cp.accepted.clone());
+
+    let a = TestFollower::new(false, false);
+    let b = TestFollower::new(false, false);
+    let heartbeat = Duration::from_millis(200);
+    let a_dialer = spawn_follower(&pki, &a_node, cp.addr, Arc::clone(&a), heartbeat);
+    let b_dialer = spawn_follower(&pki, &b_node, cp.addr, Arc::clone(&b), heartbeat);
+
+    eventually("both pulls to be served and applied", || {
+        a.applied().generation == 9 && b.applied().generation == 9
+    })
+    .await;
+
+    assert_eq!(
+        a.pulled
+            .lock()
+            .expect("lock")
+            .as_ref()
+            .map(|p| p.blob.clone()),
+        Some(CUT_A.to_vec()),
+        "the pull hands node-a its own cut"
+    );
+    assert_eq!(
+        b.pulled
+            .lock()
+            .expect("lock")
+            .as_ref()
+            .map(|p| p.blob.clone()),
+        Some(CUT_B.to_vec()),
+        "the pull hands node-b its own cut"
+    );
+    assert_eq!(a.applied().hash, blob_hash(CUT_A));
+    assert_eq!(b.applied().hash, blob_hash(CUT_B));
+    assert_eq!(
+        cp.accepted.payload_for("node-a").map(|p| p.blob),
+        Some(CUT_A.to_vec())
+    );
+    assert_eq!(
+        cp.accepted.payload_for("node-b").map(|p| p.blob),
+        Some(CUT_B.to_vec())
+    );
+
+    // Each node is now where its own expected version says it should
+    // be, so the pulling stops instead of looping on a fleet hash it
+    // can never hold.
+    let settled = (count(&a.behind), count(&b.behind));
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        (count(&a.behind), count(&b.behind)),
+        settled,
+        "a follower holding its own cut is converged"
+    );
+
+    a_dialer.shutdown();
+    b_dialer.shutdown();
+    cp.handle.shutdown();
+}
+
+#[tokio::test]
+async fn one_blob_for_everyone_still_works_for_a_control_plane_with_nothing_to_filter() {
+    install_ring();
+    let pki = control_plane_pki();
+    let fleet = TwoNodeFleet::spawn(&pki, QUIET).await;
+
+    // A plain payload is a payload source: this is the 1.7.x control
+    // plane a 1.8.0 follower may still be talking to, and the round it
+    // drives must stay a single-blob round.
+    let report = fleet.cp.replicate(payload(6)).await;
+    assert!(!report.aborted, "nothing rejected: {report:?}");
+
+    assert_eq!(fleet.a.offered_blobs(), fleet.b.offered_blobs());
+    assert_eq!(fleet.a.offered_blobs(), vec![payload(6).blob]);
+    assert_eq!(
+        offered_by_node(&report),
+        vec![
+            ("node-a".to_string(), hash_for(6)),
+            ("node-b".to_string(), hash_for(6)),
+        ],
+        "one hash, offered to everyone"
+    );
+    assert_eq!(report.hash, hash_for(6), "and it is the fleet's own hash");
+    assert_eq!(
+        fleet.cp.accepted.expected_for("node-a"),
+        payload(6).version()
+    );
+    assert_eq!(
+        fleet.cp.accepted.expected_for("node-a"),
+        fleet.cp.accepted.expected_for("node-b")
+    );
+
+    fleet.shutdown();
 }

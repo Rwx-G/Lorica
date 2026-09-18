@@ -468,12 +468,30 @@ pub struct MetricsReport {
     /// `lorica_cache_predictor_bypass_total`).
     #[prost(message, repeated, tag = "12")]
     pub generic_counters: Vec<GenericCounterEntry>,
+    /// Capture rules this worker currently has armed
+    /// (`lorica_capture_rules_active`). Every worker compiles the same
+    /// configuration snapshot, so the supervisor takes the maximum
+    /// rather than the sum: summing would multiply the operator's rule
+    /// count by the worker count.
+    #[prost(uint64, tag = "13")]
+    pub capture_rules_active: u64,
+    /// Bytes this worker holds in in-flight capture buffers
+    /// (`lorica_capture_inflight_bytes`). Each worker reserves against
+    /// its own ceiling, so the supervisor sums these.
+    #[prost(uint64, tag = "14")]
+    pub capture_inflight_bytes: u64,
+    /// Bytes this worker holds in in-flight WAF body-scan buffers
+    /// (`lorica_waf_body_scan_inflight_bytes`). Same shape as
+    /// `capture_inflight_bytes`: each worker reserves against its own
+    /// copy of the ceiling, so the supervisor sums these.
+    #[prost(uint64, tag = "15")]
+    pub waf_body_scan_inflight_bytes: u64,
 }
 
 /// One generic counter delta in a [`MetricsReport`]. `labels` is
 /// an ordered list of label values matching the registration order
 /// the supervisor uses when it declared the counter. `value` is
-/// the cumulative count on the worker (not a delta) — the
+/// the cumulative count on the worker (not a delta) - the
 /// supervisor reconciles by replacing the per-worker snapshot and
 /// re-summing on every scrape.
 #[derive(Clone, PartialEq, prost::Message)]
@@ -505,6 +523,9 @@ impl MetricsReport {
             request_entries: Vec::new(),
             waf_entries: Vec::new(),
             generic_counters: Vec::new(),
+            capture_rules_active: 0,
+            capture_inflight_bytes: 0,
+            waf_body_scan_inflight_bytes: 0,
         }
     }
 }
@@ -854,6 +875,9 @@ mod tests {
             request_entries: Vec::new(),
             waf_entries: Vec::new(),
             generic_counters: Vec::new(),
+            capture_rules_active: 3,
+            capture_inflight_bytes: 4096,
+            waf_body_scan_inflight_bytes: 8192,
         };
         let encoded = report.encode_to_vec();
         let decoded = MetricsReport::decode(&encoded[..]).expect("decode failed");
@@ -861,6 +885,9 @@ mod tests {
         assert_eq!(decoded.ban_entries.len(), 1);
         assert_eq!(decoded.ewma_entries.len(), 2);
         assert_eq!(decoded.cache_hits, 3000);
+        assert_eq!(decoded.capture_rules_active, 3);
+        assert_eq!(decoded.capture_inflight_bytes, 4096);
+        assert_eq!(decoded.waf_body_scan_inflight_bytes, 8192);
     }
 
     #[test]

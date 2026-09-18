@@ -66,15 +66,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ConfigError, Result};
 use crate::models::{
-    Backend, CertExportAcl, Certificate, CustomCrawler, DnsProvider, GlobalSettings,
-    NotificationConfig, ProbeConfig, Route, RouteBackend, SecurityHeaderPreset, SlaConfig,
-    SpoofedFallback,
+    AutomationEnvironment, Backend, CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput,
+    CaptureRedaction, CaptureRule, CaptureScope, CertExportAcl, Certificate, CustomCrawler,
+    DnsProvider, GlobalSettings, NotificationConfig, ProbeConfig, Route, RouteBackend,
+    SecurityHeaderPreset, SlaConfig, SpoofedFallback,
 };
 use crate::store::ConfigStore;
 
 /// Version stamped into every canonical blob so a future shape change
 /// is detectable instead of silently mis-decoded.
-pub const CANONICAL_FORMAT_VERSION: u32 = 1;
+///
+/// Raised to 2 by Story 10.1, which adds `capture_rules` to
+/// [`CanonicalConfig`]. The struct is `deny_unknown_fields`, so a node
+/// still on 1 must refuse a version-2 blob BY VERSION rather than by
+/// whichever unknown field its decoder happens to reach first; the
+/// tolerant peek in [`decode_canonical`] is what makes that the
+/// reported reason.
+///
+/// Story 10.4 adds `managed_by` on routes and backends and the
+/// `automation_environments` table WITHOUT moving this number: 2 is
+/// the shape of the 1.8.0 blob, and everything that release adds rides
+/// it. A second bump inside one release would tell a mixed-version
+/// fleet that two incompatible things happened when only one did. If
+/// 10.1 and 10.4 ever ship in different releases, that changes, and
+/// `story_10_4_rides_format_version_two_without_a_second_bump` is the
+/// test to revisit.
+///
+/// This integer names a SHAPE, and nothing about the integer enforces
+/// that. Four migrations (56 to 59) changed [`CanonicalConfig`] under
+/// this one number, and a test that pins the number would have passed
+/// on every one of them. What ties the two together is
+/// `the_canonical_shape_digest_matches_the_blob_s_field_set` below:
+/// it digests the field-name set of the blob's whole type inventory,
+/// so a shape change that leaves this number alone fails there and the
+/// decision has to be taken deliberately.
+pub const CANONICAL_FORMAT_VERSION: u32 = 2;
 
 /// One WAF custom rule in canonical form. The store keeps these as
 /// bare tuples; the blob needs a named, strict shape.
@@ -93,6 +119,99 @@ pub struct CanonicalWafRule {
     pub severity: u8,
     /// Whether the rule is active.
     pub enabled: bool,
+}
+
+/// One traffic-capture rule in canonical form: every field of
+/// [`CaptureRule`] EXCEPT `captures_emitted` and `captures_dropped`.
+///
+/// Those two counters are per process and per node. They say how many
+/// captures THIS node has written and dropped, which is exactly the
+/// kind of local observation that must not travel: replicating them
+/// would have the control plane's own traffic overwrite each
+/// follower's counts on every round, and every node in the fleet would
+/// report the control plane's numbers back as its own. Leaving them out
+/// of the projection means they cannot be reached from the blob at all,
+/// the same by-construction argument [`CanonicalGlobalSettings`] makes
+/// for node-local settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalCaptureRule {
+    /// Stable UUID; primary key of the `capture_rules` table.
+    pub id: String,
+    /// Operator-facing label.
+    pub name: String,
+    /// `Route.id` this rule records.
+    pub route_id: String,
+    /// Whether the rule is currently recording.
+    pub enabled: bool,
+    /// Which requests the rule considers.
+    #[serde(rename = "match")]
+    pub match_: CaptureMatch,
+    /// Which of those are written out.
+    pub emit: CaptureEmit,
+    /// How much of each exchange is kept.
+    pub capture: CaptureScope,
+    /// What stops the rule.
+    pub limits: CaptureLimits,
+    /// Where captures land.
+    pub output: CaptureOutput,
+    /// Names redacted on top of the always-redacted set.
+    pub redact: CaptureRedaction,
+    /// Username of the operator who created the rule.
+    pub created_by: String,
+    /// Insert timestamp.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Absolute UTC instant after which the rule records nothing.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<&CaptureRule> for CanonicalCaptureRule {
+    fn from(rule: &CaptureRule) -> Self {
+        Self {
+            id: rule.id.clone(),
+            name: rule.name.clone(),
+            route_id: rule.route_id.clone(),
+            enabled: rule.enabled,
+            match_: rule.match_.clone(),
+            emit: rule.emit.clone(),
+            capture: rule.capture.clone(),
+            limits: rule.limits.clone(),
+            output: rule.output.clone(),
+            redact: rule.redact.clone(),
+            created_by: rule.created_by.clone(),
+            created_at: rule.created_at,
+            expires_at: rule.expires_at,
+        }
+    }
+}
+
+impl CanonicalCaptureRule {
+    /// The storable rule this projection describes, with both counters
+    /// at zero.
+    ///
+    /// Zero is the value for a rule this node has never seen. For one it
+    /// already holds, the recipient must keep its own counts, which is
+    /// why `ConfigStore::update_capture_rule` does not write them at
+    /// all.
+    pub fn to_rule(&self) -> CaptureRule {
+        CaptureRule {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            route_id: self.route_id.clone(),
+            enabled: self.enabled,
+            match_: self.match_.clone(),
+            emit: self.emit.clone(),
+            capture: self.capture.clone(),
+            limits: self.limits.clone(),
+            output: self.output.clone(),
+            redact: self.redact.clone(),
+            created_by: self.created_by.clone(),
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            captures_emitted: 0,
+            captures_dropped: 0,
+        }
+    }
 }
 
 /// The fleet-policy subset of [`GlobalSettings`]. Node-local fields
@@ -163,6 +282,8 @@ pub struct CanonicalGlobalSettings {
     pub connection_allow_cidrs: Vec<String>,
     /// Per-source-IP TCP connection cap.
     pub connection_limits_per_ip: Option<u32>,
+    /// Process-wide ceiling on concurrent WAF body-scan buffers.
+    pub waf_body_scan_max_inflight_bytes: u64,
     /// Global spoofed-AI-bot fallback policy.
     pub ai_bot_treat_spoofed_as: SpoofedFallback,
     /// Whether verified-bot headers are injected upstream.
@@ -211,6 +332,7 @@ impl From<&GlobalSettings> for CanonicalGlobalSettings {
             connection_deny_cidrs: s.connection_deny_cidrs.clone(),
             connection_allow_cidrs: s.connection_allow_cidrs.clone(),
             connection_limits_per_ip: s.connection_limits_per_ip,
+            waf_body_scan_max_inflight_bytes: s.waf_body_scan_max_inflight_bytes,
             ai_bot_treat_spoofed_as: s.ai_bot_treat_spoofed_as,
             ai_bot_inject_headers: s.ai_bot_inject_headers,
             password_min_length: s.password_min_length,
@@ -261,6 +383,7 @@ impl CanonicalGlobalSettings {
         settings.connection_deny_cidrs = self.connection_deny_cidrs.clone();
         settings.connection_allow_cidrs = self.connection_allow_cidrs.clone();
         settings.connection_limits_per_ip = self.connection_limits_per_ip;
+        settings.waf_body_scan_max_inflight_bytes = self.waf_body_scan_max_inflight_bytes;
         settings.ai_bot_treat_spoofed_as = self.ai_bot_treat_spoofed_as;
         settings.ai_bot_inject_headers = self.ai_bot_inject_headers;
         settings.password_min_length = self.password_min_length;
@@ -271,6 +394,36 @@ impl CanonicalGlobalSettings {
         settings.mirror_max_concurrent_per_route = self.mirror_max_concurrent_per_route;
         settings.mirror_max_concurrent_global = self.mirror_max_concurrent_global;
         before != *self
+    }
+
+    /// Every address list this projection carries, each paired with its
+    /// field name: the replicated subset of
+    /// [`GlobalSettings::cidr_lists`].
+    ///
+    /// `ConfigStore::prepare_replica` refuses a blob whose lists do not
+    /// validate, so this is the list of settings a control plane cannot
+    /// widen by shipping something the parser will silently drop
+    /// (backlog #88). The `every_replicated_cidr_setting_is_validated`
+    /// test ties it to `GlobalSettings::cidr_lists`, so a new address
+    /// setting that reaches the blob cannot skip the refusal.
+    pub fn cidr_lists(&self) -> [(&'static str, &[String]); 3] {
+        [
+            ("waf_whitelist_ips", &self.waf_whitelist_ips),
+            ("connection_deny_cidrs", &self.connection_deny_cidrs),
+            ("connection_allow_cidrs", &self.connection_allow_cidrs),
+        ]
+    }
+
+    /// Refuse the first malformed entry in any replicated address list.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing reason, naming the setting.
+    pub fn validate_cidr_lists(&self) -> std::result::Result<(), String> {
+        for (field, entries) in self.cidr_lists() {
+            crate::connection_filter::validate_cidr_list(entries, field)?;
+        }
+        Ok(())
     }
 }
 
@@ -314,6 +467,14 @@ pub struct CanonicalConfig {
     pub probe_configs: Vec<ProbeConfig>,
     /// SLA target definitions.
     pub sla_configs: Vec<SlaConfig>,
+    /// Traffic-capture rules, without their per-node counters.
+    pub capture_rules: Vec<CanonicalCaptureRule>,
+    /// Automation environments (Story 10.4), cut per recipient with
+    /// the route each one owns. A follower serving that route needs
+    /// the row so its dashboard shows the badge with the environment
+    /// name and the expiry, and refuses the in-place edit the next
+    /// pipeline `PUT` would overwrite.
+    pub automation_environments: Vec<AutomationEnvironment>,
 }
 
 /// Recursively rewrite every JSON object with its keys in sorted
@@ -481,6 +642,12 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
         ai_crawlers_custom: store.list_custom_crawlers()?,
         probe_configs: store.list_probe_configs()?,
         sla_configs: store.list_sla_configs()?,
+        capture_rules: store
+            .list_capture_rules()?
+            .iter()
+            .map(CanonicalCaptureRule::from)
+            .collect(),
+        automation_environments: store.list_automation_environments()?,
     };
 
     // Replace secret material with digests BEFORE sorting so the
@@ -510,17 +677,228 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
     sort_by_canonical_repr(&mut cfg.ai_crawlers_custom);
     sort_by_canonical_repr(&mut cfg.probe_configs);
     sort_by_canonical_repr(&mut cfg.sla_configs);
+    sort_by_canonical_repr(&mut cfg.capture_rules);
+    sort_by_canonical_repr(&mut cfg.automation_environments);
 
     Ok(cfg)
 }
 
 /// Encode the store's current configuration to canonical bytes.
 pub fn canonical_bytes(store: &ConfigStore) -> Result<Vec<u8>> {
-    let cfg = canonical_config(store)?;
-    let value = serde_json::to_value(&cfg)
+    encode_canonical(&canonical_config(store)?)
+}
+
+/// Encode a configuration that is already in hand.
+///
+/// Split out of [`canonical_bytes`] because a control plane building
+/// one payload per recipient reads the store once and encodes N times
+/// (Story 10.0).
+pub fn encode_canonical(cfg: &CanonicalConfig) -> Result<Vec<u8>> {
+    let value = serde_json::to_value(cfg)
         .map_err(|e| ConfigError::Validation(format!("canonical encode failed: {e}")))?;
     serde_json::to_vec(&sort_object_keys(value))
         .map_err(|e| ConfigError::Validation(format!("canonical encode failed: {e}")))
+}
+
+/// Which node id each `node_selector` name resolves to, resolved once
+/// per round against `cluster_nodes`.
+///
+/// A name is not an identity: `cluster_nodes.name` is chosen by the
+/// joining node and carries no UNIQUE constraint, so a name matching no
+/// row or more than one resolves to nothing and targets nobody. Story
+/// 9.5 decision D3 reached the same conclusion for certificate
+/// distribution; Story 10.0 applies it to the configuration payload.
+#[derive(Debug, Default, Clone)]
+pub struct SelectorResolution {
+    by_name: std::collections::HashMap<String, Option<String>>,
+}
+
+impl SelectorResolution {
+    /// Build from `(name, node_id)` rows. A name seen twice resolves to
+    /// `None` for both.
+    pub fn from_rows<I>(rows: I) -> Self
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let mut by_name: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        for (name, node_id) in rows {
+            by_name
+                .entry(name)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(node_id));
+        }
+        Self { by_name }
+    }
+
+    /// Whether a route carrying `selector` is served by `node_id`.
+    /// An empty selector is fleet-wide.
+    pub fn targets(&self, selector: &[String], node_id: &str) -> bool {
+        if selector.is_empty() {
+            return true;
+        }
+        selector
+            .iter()
+            .any(|name| self.by_name.get(name).and_then(|id| id.as_deref()) == Some(node_id))
+    }
+
+    /// Selector entries that name nobody, for the caller to log or
+    /// refuse. An entry here is either a typo or a name shared by two
+    /// rows, and both are configuration errors rather than a silent
+    /// omission at replication time (Story 10.0 AC #2).
+    pub fn unresolvable<'a>(&self, selector: &'a [String]) -> Vec<&'a str> {
+        selector
+            .iter()
+            .filter(|name| self.by_name.get(*name).and_then(|id| id.as_ref()).is_none())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// The subset of `cfg` that `node_id` is entitled to receive.
+///
+/// The recipient used to be handed the whole fleet's configuration and
+/// filter it on arrival, which scoped serving and not disclosure: a
+/// compromised edge held every other node's upstream addresses, IP
+/// lists, mTLS configuration and Basic-auth hashes. This does the
+/// filtering on the control plane instead (Story 10.0, backlog #56).
+///
+/// Restricted: routes the node serves, the links of those routes, the
+/// backends those links reference, the certificates those routes bind,
+/// and the capture rules attached to those routes. Left fleet-wide:
+/// global policy, WAF rules and disabled ids, export ACL patterns, AI
+/// crawler entries, probe and SLA definitions, notification channels
+/// and DNS providers. Those are fleet policy or carry digests only, and
+/// a node that cannot see them cannot tell whether it is behind.
+///
+/// Capture rules are cut WITH their route (Story 10.1). A rule names a
+/// route id and carries its match predicates: source CIDRs, paths,
+/// header names and values. Sending every node the fleet's rules would
+/// reopen exactly the disclosure Story 10.0 closed, one story after
+/// closing it.
+///
+/// Automation environments are cut the same way (Story 10.4): the row
+/// names its route and carries the owner principal and the labels,
+/// which a node not serving the route has no reason to hold.
+pub fn restrict_for_recipient(
+    cfg: &CanonicalConfig,
+    node_id: &str,
+    resolution: &SelectorResolution,
+) -> CanonicalConfig {
+    let routes: Vec<Route> = cfg
+        .routes
+        .iter()
+        .filter(|r| resolution.targets(&r.node_selector, node_id))
+        .cloned()
+        .collect();
+    let kept: std::collections::HashSet<&str> = routes.iter().map(|r| r.id.as_str()).collect();
+
+    let route_backends: Vec<RouteBackend> = cfg
+        .route_backends
+        .iter()
+        .filter(|rb| kept.contains(rb.route_id.as_str()))
+        .cloned()
+        .collect();
+    let backend_ids: std::collections::HashSet<&str> = route_backends
+        .iter()
+        .map(|rb| rb.backend_id.as_str())
+        .collect();
+    let backends: Vec<Backend> = cfg
+        .backends
+        .iter()
+        .filter(|b| backend_ids.contains(b.id.as_str()))
+        .cloned()
+        .collect();
+    let cert_ids: std::collections::HashSet<&str> = routes
+        .iter()
+        .filter_map(|r| r.certificate_id.as_deref())
+        .collect();
+    let certificates: Vec<Certificate> = cfg
+        .certificates
+        .iter()
+        .filter(|c| cert_ids.contains(c.id.as_str()))
+        .cloned()
+        .collect();
+
+    let capture_rules: Vec<CanonicalCaptureRule> = cfg
+        .capture_rules
+        .iter()
+        .filter(|rule| kept.contains(rule.route_id.as_str()))
+        .cloned()
+        .collect();
+    let automation_environments: Vec<AutomationEnvironment> = cfg
+        .automation_environments
+        .iter()
+        .filter(|environment| kept.contains(environment.route_id.as_str()))
+        .cloned()
+        .collect();
+
+    // Every fleet-wide field is listed rather than filled from
+    // `..cfg.clone()`: the struct update syntax clones the WHOLE
+    // source first, six large tables included, and then drops the six
+    // the literal above already replaced. At 50 nodes that is 50
+    // pointless deep clones of the fleet's routes, backends, links,
+    // certificates, capture rules and environments per round. The cost
+    // of spelling the fleet-wide half out is that a new field must be
+    // added here; that is the right place to be asked "is this one
+    // fleet-wide or is it cut with the route?".
+    CanonicalConfig {
+        version: cfg.version,
+        global: cfg.global.clone(),
+        routes,
+        backends,
+        route_backends,
+        certificates,
+        notification_configs: cfg.notification_configs.clone(),
+        dns_providers: cfg.dns_providers.clone(),
+        waf_custom_rules: cfg.waf_custom_rules.clone(),
+        waf_disabled_rules: cfg.waf_disabled_rules.clone(),
+        cert_export_acls: cfg.cert_export_acls.clone(),
+        ai_crawlers_custom: cfg.ai_crawlers_custom.clone(),
+        probe_configs: cfg.probe_configs.clone(),
+        sla_configs: cfg.sla_configs.clone(),
+        capture_rules,
+        automation_environments,
+    }
+}
+
+/// The identity of what the fleet replicates: the canonical blob's
+/// hash folded together with the `(name, node_id)` roster rows the
+/// per-recipient cuts are resolved against.
+///
+/// # Why the roster is part of the fleet's identity
+///
+/// Since Story 10.0 a recipient's payload is a function of two
+/// sources, not one: the canonical configuration AND the roster that
+/// turns a `node_selector` name into a node id. The generation is a
+/// counter over changes to the first. Left at that, a roster change
+/// (a node enrolling under a name a route already selects) would move
+/// every cut without moving the generation, and two processes reading
+/// the store at different moments would compute two different payloads
+/// for one generation: the node holds the cut it was sent, a restarted
+/// control plane expects the cut it recomputes. That is a drift alert
+/// for a fleet that never drifted.
+///
+/// Folding the roster into the hash the reload path compares makes a
+/// roster change a configuration change, so the generation advances
+/// with it and the source can no longer move underneath one.
+///
+/// The rows are sorted before hashing, so the value does not depend on
+/// the order the store happened to return them in.
+pub fn fleet_identity_hash(blob_hash: &str, node_rows: &[(String, String)]) -> String {
+    let mut rows: Vec<&(String, String)> = node_rows.iter().collect();
+    rows.sort();
+    let mut material = String::with_capacity(blob_hash.len() + rows.len() * 64);
+    material.push_str(blob_hash);
+    for (name, node_id) in rows {
+        // A separator that cannot occur in either half, so
+        // ("ab", "c") and ("a", "bc") cannot hash alike.
+        material.push('\u{1f}');
+        material.push_str(name);
+        material.push('\u{1e}');
+        material.push_str(node_id);
+    }
+    sha256_hex(material.as_bytes())
 }
 
 /// SHA-256 of [`canonical_bytes`], lowercase hex. The value compared
@@ -582,7 +960,9 @@ mod tests {
 
     use super::*;
     use crate::models::{
-        HealthStatus, LifecycleState, LoadBalancing, NotificationChannel, PathRule, WafMode,
+        CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput, CaptureRedaction, CaptureScope,
+        CertificateMode, EnvironmentOwner, HealthStatus, LifecycleState, LoadBalancing, ManagedBy,
+        NotificationChannel, OwnerKind, PathRule, StatusMatch, WafMode,
     };
 
     /// Fixed timestamp so the same logical entity inserted into two
@@ -632,6 +1012,7 @@ mod tests {
             proxy_headers_remove: Vec::new(),
             response_headers_remove: Vec::new(),
             max_request_body_bytes: None,
+            waf_body_scan_max_bytes: None,
             websocket_enabled: true,
             rate_limit_rps: None,
             rate_limit_burst: None,
@@ -678,8 +1059,712 @@ mod tests {
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            managed_by: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Story 10.0: per-recipient payloads
+    // -----------------------------------------------------------------
+
+    fn resolution() -> SelectorResolution {
+        SelectorResolution::from_rows([
+            ("edge-a".to_string(), "id-a".to_string()),
+            ("edge-b".to_string(), "id-b".to_string()),
+            // Two rows have carried this name. A name is not an
+            // identity: it is chosen by the joining node and carries no
+            // UNIQUE constraint.
+            ("twin".to_string(), "id-c".to_string()),
+            ("twin".to_string(), "id-d".to_string()),
+        ])
+    }
+
+    #[test]
+    fn an_empty_selector_is_fleet_wide() {
+        let r = resolution();
+        assert!(r.targets(&[], "id-a"));
+        assert!(r.targets(&[], "a-node-that-just-joined"));
+    }
+
+    #[test]
+    fn a_selector_targets_the_id_its_name_resolves_to() {
+        let r = resolution();
+        let sel = vec!["edge-a".to_string()];
+        assert!(r.targets(&sel, "id-a"));
+        assert!(!r.targets(&sel, "id-b"));
+    }
+
+    #[test]
+    fn a_name_two_rows_share_targets_neither_and_is_reported() {
+        // Without this rule, a node joining under a name some selector
+        // already lists would be entitled to those routes.
+        let r = resolution();
+        let sel = vec!["twin".to_string()];
+        assert!(!r.targets(&sel, "id-c"));
+        assert!(!r.targets(&sel, "id-d"));
+        assert_eq!(r.unresolvable(&sel), vec!["twin"]);
+    }
+
+    #[test]
+    fn a_name_no_row_carries_targets_nobody_and_is_reported() {
+        let r = resolution();
+        let sel = vec!["typo".to_string()];
+        assert!(!r.targets(&sel, "id-a"));
+        assert_eq!(r.unresolvable(&sel), vec!["typo"]);
+    }
+
+    /// A capture rule whose predicates name a real source range and a
+    /// real path: the disclosure the per-recipient cut has to prevent.
+    fn make_capture_rule(id: &str, route_id: &str) -> CanonicalCaptureRule {
+        CanonicalCaptureRule {
+            id: id.to_string(),
+            name: format!("rule {id}"),
+            route_id: route_id.to_string(),
+            enabled: true,
+            match_: CaptureMatch {
+                source_cidrs: vec!["10.0.0.0/8".to_string()],
+                methods: vec!["POST".to_string()],
+                path_prefix: Some("/internal/admin".to_string()),
+                path_regex: None,
+                headers: Vec::new(),
+            },
+            emit: CaptureEmit {
+                always: false,
+                status: vec![StatusMatch::ServerError],
+                min_latency_ms: None,
+                upstream_error: false,
+            },
+            capture: CaptureScope::default(),
+            limits: CaptureLimits::default(),
+            output: CaptureOutput::default(),
+            redact: CaptureRedaction::default(),
+            created_by: "admin".to_string(),
+            created_at: fixed_now(),
+            expires_at: fixed_now(),
+        }
+    }
+
+    /// An environment owning `route_id`, with the owner principal and
+    /// the labels the per-recipient cut has to keep off other nodes.
+    fn make_environment(name: &str, route_id: &str) -> AutomationEnvironment {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("team".to_string(), "acme".to_string());
+        AutomationEnvironment {
+            name: name.to_string(),
+            route_id: route_id.to_string(),
+            owner: EnvironmentOwner {
+                kind: OwnerKind::StaticToken,
+                principal: "acme-ci".to_string(),
+            },
+            certificate_mode: CertificateMode::Auto,
+            labels,
+            expires_at: fixed_now(),
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+            last_pipeline: Some("pipeline-7".to_string()),
+            pipeline: None,
+        }
+    }
+
+    /// Three routes: one fleet-wide, one for each edge, each with its
+    /// own backend and certificate. The two edge routes and their
+    /// backends are automation-managed, each by its own environment.
+    fn fleet_config() -> CanonicalConfig {
+        let mut fleet = make_route("r-fleet", "fleet.example");
+        fleet.node_selector = Vec::new();
+        fleet.certificate_id = None;
+        let mut a = make_route("r-a", "a.example");
+        a.node_selector = vec!["edge-a".to_string()];
+        a.certificate_id = Some("cert-a".to_string());
+        a.managed_by = Some(ManagedBy::Automation {
+            environment: "env-a".to_string(),
+        });
+        let mut b = make_route("r-b", "b.example");
+        b.node_selector = vec!["edge-b".to_string()];
+        b.certificate_id = Some("cert-b".to_string());
+        b.managed_by = Some(ManagedBy::Automation {
+            environment: "env-b".to_string(),
+        });
+        let mut backend_a = make_backend("b-a", "10.0.0.10:8080");
+        backend_a.managed_by = Some(ManagedBy::Automation {
+            environment: "env-a".to_string(),
+        });
+        let mut backend_b = make_backend("b-b", "10.0.0.11:8080");
+        backend_b.managed_by = Some(ManagedBy::Automation {
+            environment: "env-b".to_string(),
+        });
+
+        CanonicalConfig {
+            version: CANONICAL_FORMAT_VERSION,
+            global: CanonicalGlobalSettings::from(&GlobalSettings::default()),
+            routes: vec![fleet, a, b],
+            backends: vec![backend_a, backend_b],
+            route_backends: vec![
+                RouteBackend {
+                    route_id: "r-a".to_string(),
+                    backend_id: "b-a".to_string(),
+                },
+                RouteBackend {
+                    route_id: "r-b".to_string(),
+                    backend_id: "b-b".to_string(),
+                },
+            ],
+            certificates: vec![
+                make_certificate("cert-a", "aa:bb"),
+                make_certificate("cert-b", "cc:dd"),
+            ],
+            notification_configs: Vec::new(),
+            dns_providers: Vec::new(),
+            waf_custom_rules: Vec::new(),
+            waf_disabled_rules: vec![1, 2],
+            cert_export_acls: Vec::new(),
+            ai_crawlers_custom: Vec::new(),
+            probe_configs: Vec::new(),
+            sla_configs: Vec::new(),
+            capture_rules: vec![
+                make_capture_rule("cap-a", "r-a"),
+                make_capture_rule("cap-b", "r-b"),
+            ],
+            automation_environments: vec![
+                make_environment("env-a", "r-a"),
+                make_environment("env-b", "r-b"),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_recipient_receives_its_own_routes_and_the_fleet_wide_ones() {
+        let cut = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let ids: Vec<&str> = cut.routes.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["r-fleet", "r-a"]);
+    }
+
+    #[test]
+    fn what_a_recipient_does_not_serve_is_not_on_the_wire() {
+        // Backlog #56: this used to travel to every node and be
+        // filtered on arrival, which scoped serving and not disclosure.
+        let cut = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        assert!(!cut.routes.iter().any(|r| r.id == "r-b"));
+        assert!(
+            !cut.backends.iter().any(|b| b.id == "b-b"),
+            "another node's upstream address"
+        );
+        assert!(!cut.route_backends.iter().any(|rb| rb.route_id == "r-b"));
+        assert!(
+            !cut.certificates.iter().any(|c| c.id == "cert-b"),
+            "another node's certificate metadata, SANs included"
+        );
+    }
+
+    #[test]
+    fn a_capture_rule_on_another_nodes_route_is_not_on_the_wire() {
+        // Story 10.1: a rule names a route id and carries its match
+        // predicates, so it is cut with its route or it reopens the
+        // disclosure Story 10.0 just closed.
+        let cut = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let ids: Vec<&str> = cut.capture_rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["cap-a"]);
+
+        let other = restrict_for_recipient(&fleet_config(), "id-b", &resolution());
+        assert!(
+            !other.capture_rules.iter().any(|r| r.id == "cap-a"),
+            "edge-b must not see the rule on edge-a's route"
+        );
+    }
+
+    #[test]
+    fn a_capture_rule_survives_an_encode_decode_round_trip_byte_identically() {
+        let cfg = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("test setup: decode");
+        assert_eq!(decoded.capture_rules, cfg.capture_rules);
+        let again = encode_canonical(&decoded).expect("test setup: re-encode");
+        assert_eq!(bytes, again);
+    }
+
+    #[test]
+    fn the_waf_body_scan_caps_survive_an_encode_decode_round_trip() {
+        // Story 10.6: a follower that decodes either cap as its own
+        // default computes a different config hash from the control
+        // plane's and the pair loops on replication.
+        let mut cfg = fleet_config();
+        cfg.global.waf_body_scan_max_inflight_bytes = 33_554_432;
+        cfg.routes[1].waf_body_scan_max_bytes = Some(8_388_608);
+
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("test setup: decode");
+
+        assert_eq!(decoded.global.waf_body_scan_max_inflight_bytes, 33_554_432);
+        assert_eq!(decoded.routes[1].waf_body_scan_max_bytes, Some(8_388_608));
+        assert!(decoded.routes[0].waf_body_scan_max_bytes.is_none());
+
+        let mut settings = GlobalSettings::default();
+        assert!(decoded.global.apply_to(&mut settings));
+        assert_eq!(settings.waf_body_scan_max_inflight_bytes, 33_554_432);
+    }
+
+    #[test]
+    fn the_per_node_capture_counters_are_absent_from_the_encoded_blob() {
+        // Replicating them would have the control plane's own traffic
+        // overwrite every follower's counts on each round.
+        let bytes = encode_canonical(&fleet_config()).expect("test setup: encode");
+        let text = String::from_utf8(bytes).expect("test setup: the blob is UTF-8 JSON");
+        assert!(!text.contains("captures_emitted"), "{text}");
+        assert!(!text.contains("captures_dropped"), "{text}");
+    }
+
+    #[test]
+    fn the_canonical_format_version_is_two() {
+        let bytes = encode_canonical(&fleet_config()).expect("test setup: encode");
+        let peek: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        assert_eq!(peek["version"], 2);
+        assert_eq!(CANONICAL_FORMAT_VERSION, 2);
+    }
+
+    /// The field-name set of every type the canonical blob carries,
+    /// digested. Update it ONLY together with a deliberate answer to
+    /// the question the failure message asks.
+    ///
+    /// Story 10.6 moved it: `Route.waf_body_scan_max_bytes` and
+    /// `CanonicalGlobalSettings.waf_body_scan_max_inflight_bytes`
+    /// joined the blob. The digest is updated and
+    /// `CANONICAL_FORMAT_VERSION` stays at 2, because version 2 has
+    /// never been released. v1.7.4 ships version 1; the 1 to 2 move
+    /// happened earlier in this same unreleased v1.8.0 cycle. The
+    /// project bumps the format version once per release, not once per
+    /// field, and no peer anywhere holds a version 2 blob of the older
+    /// shape, so a second bump would protect nothing.
+    const CANONICAL_SHAPE_DIGEST: &str =
+        "6e20386dd9a665ad7f29274780f99a39c10f6441eda917dbf902884222149482";
+
+    /// Every field name `T` accepts, read from the type itself rather
+    /// than from the JSON of some fixture.
+    ///
+    /// A struct carrying `deny_unknown_fields` answers an unknown key
+    /// with the list of the ones it expects, so what comes back is the
+    /// DESERIALIZE shape: a field with `skip_serializing_if`, and an
+    /// `Option` a fixture happens to leave `None`, are both in it,
+    /// where the JSON of one particular value would carry neither.
+    fn field_names<T: serde::de::DeserializeOwned>(type_name: &str) -> Vec<String> {
+        const PROBE: &str = "__lorica_shape_probe__";
+        let Err(error) = serde_json::from_str::<T>(&format!("{{\"{PROBE}\": null}}")) else {
+            panic!(
+                "{type_name} accepted an unknown field, so it carries no \
+                 #[serde(deny_unknown_fields)] and the shape guard cannot read it. Add the \
+                 attribute (the blob's strict decode wants it anyway) or drop the type from \
+                 the inventory and say why"
+            );
+        };
+        let message = error.to_string();
+        // "unknown field `X`, expected one of `a`, `b` at line .."
+        // Every odd-indexed split on a backtick is a quoted name; the
+        // first of them is the probe.
+        let mut names: Vec<String> = message
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(PROBE),
+            "{type_name}: serde did not answer the probe with an unknown-field error: {message}"
+        );
+        names.remove(0);
+        assert!(
+            !names.is_empty(),
+            "{type_name}: no field names came back from {message}"
+        );
+        names.sort();
+        names
+    }
+
+    /// One line per type, `Type(field,field,...)`, sorted twice so the
+    /// digest depends on the shape and on nothing else.
+    fn shape_lines() -> Vec<String> {
+        macro_rules! shapes {
+            ($($t:ty),+ $(,)?) => {{
+                let mut lines: Vec<String> = Vec::new();
+                $(
+                    let name = stringify!($t);
+                    lines.push(format!("{name}({})", field_names::<$t>(name).join(",")));
+                )+
+                lines.sort();
+                lines
+            }};
+        }
+        // The blob's type inventory: `CanonicalConfig` and everything
+        // reachable from its fields. A canonical type absent from this
+        // list is a type the guard does not watch, so adding one is
+        // part of adding a replicated table.
+        shapes![
+            CanonicalConfig,
+            CanonicalGlobalSettings,
+            CanonicalWafRule,
+            CanonicalCaptureRule,
+            crate::models::Route,
+            crate::models::PathRule,
+            crate::models::Backend,
+            crate::models::RouteBackend,
+            crate::models::Certificate,
+            crate::models::NotificationConfig,
+            crate::models::DnsProvider,
+            crate::models::CertExportAcl,
+            crate::models::CustomCrawler,
+            crate::models::ProbeConfig,
+            crate::models::SlaConfig,
+            crate::models::AutomationEnvironment,
+            crate::models::EnvironmentOwner,
+            crate::models::SecurityHeaderPreset,
+            crate::models::CaptureMatch,
+            crate::models::CaptureEmit,
+            crate::models::CaptureScope,
+            crate::models::CaptureLimits,
+            crate::models::CaptureOutput,
+            crate::models::CaptureRedaction,
+        ]
+    }
+
+    /// The guard `CANONICAL_FORMAT_VERSION` cannot be on its own.
+    ///
+    /// Migrations 56 to 59 each changed the blob's shape under version
+    /// 2, and a test that pins the integer passes on every one of
+    /// them. The window that opens is narrow and nasty: a dev build
+    /// stamps 2 on a blob missing a field, a later build is
+    /// schema-ahead of it and still admitted by the version gate, and
+    /// the failure surfaces as the confusing per-field decode error
+    /// AC #10 exists to prevent.
+    #[test]
+    fn the_canonical_shape_digest_matches_the_blob_s_field_set() {
+        let digest = sha256_hex(shape_lines().join("\n").as_bytes());
+        assert_eq!(
+            digest,
+            CANONICAL_SHAPE_DIGEST,
+            "the canonical blob's shape moved. Either bump CANONICAL_FORMAT_VERSION because a \
+             peer on the old shape must refuse this blob, or update CANONICAL_SHAPE_DIGEST to \
+             {digest} and say in the commit message why the old shape is still compatible.\n\
+             Current inventory:\n{}",
+            shape_lines().join("\n")
+        );
+    }
+
+    #[test]
+    fn the_fleet_identity_hash_moves_with_the_roster_and_not_with_its_order() {
+        let blob = "abcd";
+        let rows = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(n, i)| ((*n).to_string(), (*i).to_string()))
+                .collect()
+        };
+        let two = rows(&[("edge-a", "id-a"), ("edge-b", "id-b")]);
+        let reversed = rows(&[("edge-b", "id-b"), ("edge-a", "id-a")]);
+        assert_eq!(
+            fleet_identity_hash(blob, &two),
+            fleet_identity_hash(blob, &reversed),
+            "the store's row order must not change the fleet's identity"
+        );
+        let three = rows(&[("edge-a", "id-a"), ("edge-b", "id-b"), ("edge-c", "id-c")]);
+        assert_ne!(
+            fleet_identity_hash(blob, &two),
+            fleet_identity_hash(blob, &three),
+            "a node enrolling changes what every cut can resolve to"
+        );
+        assert_ne!(
+            fleet_identity_hash(blob, &two),
+            fleet_identity_hash("dcba", &two),
+            "and so does the configuration itself"
+        );
+        // A name and an id that are two rows must not hash like the
+        // one row whose halves concatenate to the same text.
+        assert_ne!(
+            fleet_identity_hash(blob, &rows(&[("ab", "c")])),
+            fleet_identity_hash(blob, &rows(&[("a", "bc")])),
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Story 10.4: ownership marks and the environment row
+    // -----------------------------------------------------------------
+
+    /// A GUARD, not an accident: Story 10.4 adds `managed_by` and
+    /// `automation_environments` to the blob under the SAME version
+    /// Story 10.1 set, because both ship in 1.8.0 and a second bump
+    /// inside one release would lie to a mixed-version fleet. A future
+    /// change that moves this number must be deliberate about it; this
+    /// test is where that deliberation gets recorded.
+    #[test]
+    fn story_10_4_rides_format_version_two_without_a_second_bump() {
+        assert_eq!(CANONICAL_FORMAT_VERSION, 2);
+        let cfg = fleet_config();
+        assert!(
+            cfg.routes.iter().any(|r| r.managed_by.is_some()),
+            "the fixture carries a managed_by mark"
+        );
+        assert!(
+            !cfg.automation_environments.is_empty(),
+            "the fixture carries an environment row"
+        );
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let peek: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        assert_eq!(peek["version"], 2, "a 10.4 blob is still a version-2 blob");
+        decode_canonical(&bytes).expect("a version-2 decoder accepts a 10.4 blob");
+    }
+
+    #[test]
+    fn an_environment_on_another_nodes_route_is_not_on_the_wire() {
+        // The row names its route and carries the owner principal and
+        // the labels, so it is cut with the route.
+        let cut = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let names: Vec<&str> = cut
+            .automation_environments
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["env-a"]);
+
+        let other = restrict_for_recipient(&fleet_config(), "id-b", &resolution());
+        assert!(
+            !other
+                .automation_environments
+                .iter()
+                .any(|e| e.name == "env-a"),
+            "edge-b must not see the environment on edge-a's route"
+        );
+    }
+
+    #[test]
+    fn an_environment_survives_an_encode_decode_round_trip_byte_identically() {
+        let cfg = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("test setup: decode");
+        assert_eq!(decoded.automation_environments, cfg.automation_environments);
+        let again = encode_canonical(&decoded).expect("test setup: re-encode");
+        assert_eq!(bytes, again);
+    }
+
+    #[test]
+    fn managed_by_survives_the_canonical_round_trip_byte_identically() {
+        // A follower must know a route is automation-managed so its own
+        // dashboard shows the badge and refuses in-place edits.
+        let cfg = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("test setup: decode");
+
+        let route = decoded
+            .routes
+            .iter()
+            .find(|r| r.id == "r-a")
+            .expect("edge-a's route is on the wire");
+        assert_eq!(
+            route.managed_by,
+            Some(ManagedBy::Automation {
+                environment: "env-a".to_string()
+            })
+        );
+        let backend = decoded
+            .backends
+            .iter()
+            .find(|b| b.id == "b-a")
+            .expect("edge-a's backend is on the wire");
+        assert_eq!(
+            backend.managed_by,
+            Some(ManagedBy::Automation {
+                environment: "env-a".to_string()
+            })
+        );
+        let fleet = decoded
+            .routes
+            .iter()
+            .find(|r| r.id == "r-fleet")
+            .expect("the fleet route is on the wire");
+        assert_eq!(fleet.managed_by, None, "an operator route stays unmarked");
+
+        let again = encode_canonical(&decoded).expect("test setup: re-encode");
+        assert_eq!(bytes, again);
+    }
+
+    #[test]
+    fn an_operator_managed_row_encodes_without_a_managed_by_key() {
+        // `None` is the operator's mark and is elided, so a fleet with
+        // no automation encodes exactly as it did before Story 10.4.
+        let mut cfg = fleet_config();
+        cfg.routes.retain(|r| r.id == "r-fleet");
+        cfg.backends.clear();
+        cfg.automation_environments.clear();
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let text = String::from_utf8(bytes).expect("test setup: the blob is UTF-8 JSON");
+        assert!(!text.contains("managed_by"), "{text}");
+    }
+
+    #[test]
+    fn a_blob_stamped_version_one_is_refused_by_version() {
+        // A 1.7.x node encodes version 1. The refusal must name the
+        // version, not whichever unknown field the strict decoder would
+        // otherwise reach first.
+        let mut cfg = fleet_config();
+        cfg.version = 1;
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let err = decode_canonical(&bytes).expect_err("a version 1 blob is refused");
+        let message = err.to_string();
+        assert!(message.contains("format version 1"), "{message}");
+        assert!(message.contains("supports 2"), "{message}");
+    }
+
+    #[test]
+    fn fleet_policy_stays_fleet_wide() {
+        // A node that cannot see the policy it is judged against
+        // cannot tell whether it is behind.
+        let cfg = fleet_config();
+        let cut = restrict_for_recipient(&cfg, "id-a", &resolution());
+        assert_eq!(cut.version, cfg.version);
+        assert_eq!(cut.waf_disabled_rules, cfg.waf_disabled_rules);
+    }
+
+    #[test]
+    fn two_recipients_at_one_generation_hold_different_bytes() {
+        // The consequence that makes this a story rather than a filter
+        // moved by one hop: the single fleet-wide hash is over.
+        let cfg = fleet_config();
+        let r = resolution();
+        let a = encode_canonical(&restrict_for_recipient(&cfg, "id-a", &r)).unwrap();
+        let b = encode_canonical(&restrict_for_recipient(&cfg, "id-b", &r)).unwrap();
+        assert_ne!(sha256_hex(&a), sha256_hex(&b));
+    }
+
+    #[test]
+    fn the_same_recipient_encodes_identically_twice() {
+        let cfg = fleet_config();
+        let r = resolution();
+        let once = encode_canonical(&restrict_for_recipient(&cfg, "id-a", &r)).unwrap();
+        let twice = encode_canonical(&restrict_for_recipient(&cfg, "id-a", &r)).unwrap();
+        assert_eq!(sha256_hex(&once), sha256_hex(&twice));
+    }
+
+    /// Story 10.0 turned one fleet-wide encode per replication round
+    /// into one encode per recipient. This prints what that costs at
+    /// three fleet sizes.
+    ///
+    /// Ignored because it is a measurement and not a gate: a shared
+    /// CI runner under load would make any time-based assertion flap,
+    /// so it asserts none. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test --release -p lorica-config \
+    ///     per_recipient_encoding_cost_at_fleet_scale -- --ignored --nocapture
+    /// ```
+    ///
+    /// A debug build measures the unoptimised serde path, so only the
+    /// `--release` numbers describe production cost.
+    #[test]
+    #[ignore = "measurement, not a gate: timing-sensitive, prints a cost table"]
+    fn per_recipient_encoding_cost_at_fleet_scale() {
+        use std::time::Instant;
+
+        /// Routes pinned to one node by `node_selector`.
+        const PINNED_PER_NODE: usize = 20;
+        /// Routes with an empty selector, which every recipient keeps.
+        const FLEET_WIDE_ROUTES: usize = 10;
+
+        for fleet_size in [2usize, 10, 50] {
+            let mut rows: Vec<(String, String)> = Vec::with_capacity(fleet_size);
+            let mut routes: Vec<Route> = Vec::new();
+            let mut backends: Vec<Backend> = Vec::new();
+            let mut route_backends: Vec<RouteBackend> = Vec::new();
+            let mut certificates: Vec<Certificate> = Vec::new();
+
+            for node in 0..fleet_size {
+                let name = format!("edge-{node}");
+                let node_id = format!("id-{node}");
+                for slot in 0..PINNED_PER_NODE {
+                    let route_id = format!("r-{node}-{slot}");
+                    let backend_id = format!("b-{node}-{slot}");
+                    let cert_id = format!("cert-{node}-{slot}");
+                    let mut route = make_route(&route_id, &format!("h{slot}.node{node}.example"));
+                    route.node_selector = vec![name.clone()];
+                    route.certificate_id = Some(cert_id.clone());
+                    routes.push(route);
+                    backends.push(make_backend(
+                        &backend_id,
+                        &format!("10.0.{node}.{slot}:8080"),
+                    ));
+                    route_backends.push(RouteBackend {
+                        route_id,
+                        backend_id,
+                    });
+                    certificates.push(make_certificate(&cert_id, &format!("sha256:{node}-{slot}")));
+                }
+                rows.push((name, node_id));
+            }
+            for slot in 0..FLEET_WIDE_ROUTES {
+                let mut route =
+                    make_route(&format!("r-fleet-{slot}"), &format!("fleet{slot}.example"));
+                route.node_selector = Vec::new();
+                route.certificate_id = None;
+                routes.push(route);
+            }
+
+            let cfg = CanonicalConfig {
+                version: CANONICAL_FORMAT_VERSION,
+                global: CanonicalGlobalSettings::from(&GlobalSettings::default()),
+                routes,
+                backends,
+                route_backends,
+                certificates,
+                notification_configs: Vec::new(),
+                dns_providers: Vec::new(),
+                waf_custom_rules: Vec::new(),
+                waf_disabled_rules: vec![1, 2, 3, 4, 5],
+                cert_export_acls: Vec::new(),
+                ai_crawlers_custom: Vec::new(),
+                probe_configs: Vec::new(),
+                sla_configs: Vec::new(),
+                capture_rules: Vec::new(),
+                automation_environments: Vec::new(),
+            };
+            let resolution = SelectorResolution::from_rows(rows.clone());
+
+            // What the old design paid per round: one encode, one hash.
+            let started = Instant::now();
+            let fleet_blob = encode_canonical(&cfg).expect("fleet-wide encode");
+            let fleet_hash = sha256_hex(&fleet_blob);
+            let fleet_encode = started.elapsed();
+
+            // What the new design pays per round: one cut, encode and
+            // hash per recipient.
+            let started = Instant::now();
+            let mut total_bytes = 0usize;
+            let mut hashes: Vec<String> = Vec::with_capacity(fleet_size);
+            for (_, node_id) in &rows {
+                let cut = restrict_for_recipient(&cfg, node_id, &resolution);
+                let blob = encode_canonical(&cut).expect("per-recipient encode");
+                total_bytes += blob.len();
+                hashes.push(sha256_hex(&blob));
+            }
+            let per_recipient_total = started.elapsed();
+
+            let divisor = u32::try_from(fleet_size).expect("fleet size fits a u32");
+            let per_recipient_mean = per_recipient_total / divisor;
+            let mean_bytes = total_bytes / fleet_size;
+
+            println!(
+                "N={fleet_size} routes={routes} fleet_encode={fleet_encode:?} \
+per_recipient_total={per_recipient_total:?} per_recipient_mean={per_recipient_mean:?} \
+fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
+                routes = cfg.routes.len(),
+                fleet_bytes = fleet_blob.len(),
+            );
+
+            assert_eq!(fleet_hash.len(), 64);
+            assert_eq!(hashes.len(), fleet_size);
+            assert!(
+                mean_bytes < fleet_blob.len(),
+                "a recipient holds a strict subset of the fleet blob"
+            );
         }
     }
 
@@ -701,6 +1786,7 @@ mod tests {
             tls_skip_verify: false,
             tls_sni: None,
             h2_upstream: false,
+            managed_by: None,
             created_at: now,
             updated_at: now,
         }
@@ -923,6 +2009,7 @@ mod tests {
             connection_deny_cidrs: _,
             connection_allow_cidrs: _,
             connection_limits_per_ip: _,
+            waf_body_scan_max_inflight_bytes: _,
             ai_bot_treat_spoofed_as: _,
             ai_bot_inject_headers: _,
             password_min_length: _,
@@ -965,13 +2052,53 @@ mod tests {
             syslog_access_enabled: _,
             syslog_waf_enabled: _,
             syslog_audit_enabled: _,
+            syslog_capture_enabled: _,
             syslog_tls_ca_pem: _,
             syslog_tls_client_cert_pem: _,
             syslog_tls_client_key_pem: _,
             syslog_extra_sd: _,
             otlp_logs_enabled: _,
             otlp_logs_auth_header: _,
+            otlp_logs_access_enabled: _,
+            otlp_logs_waf_enabled: _,
+            otlp_logs_audit_enabled: _,
+            otlp_logs_capture_enabled: _,
+            // The automation listener only ever runs on a control
+            // plane (a follower refuses to start it), and the set of
+            // machines allowed to reach THIS node's socket is a
+            // property of where the node sits, not of fleet policy.
+            automation_allowed_cidrs: _,
         } = GlobalSettings::default();
+    }
+
+    #[test]
+    fn every_replicated_cidr_setting_is_validated() {
+        let settings = GlobalSettings::default();
+        let canonical = CanonicalGlobalSettings::from(&settings);
+        let covered: Vec<&str> = canonical.cidr_lists().iter().map(|(f, _)| *f).collect();
+        let value = serde_json::to_value(&canonical).expect("canonical settings serialise");
+        let object = value.as_object().expect("canonical settings are an object");
+
+        // Whatever `GlobalSettings` calls an address list and the blob
+        // carries, `prepare_replica` must be able to refuse. The two
+        // enumerations are tied here rather than by memory.
+        for (field, _) in settings.cidr_lists() {
+            if object.contains_key(field) {
+                assert!(
+                    covered.contains(&field),
+                    "`{field}` rides the canonical blob but \
+                     `CanonicalGlobalSettings::cidr_lists` does not name it, so a malformed \
+                     entry replicates unchecked"
+                );
+            }
+        }
+
+        for field in covered {
+            assert!(
+                object.contains_key(field),
+                "`{field}` is enumerated but the blob does not carry it any more"
+            );
+        }
     }
 
     #[test]

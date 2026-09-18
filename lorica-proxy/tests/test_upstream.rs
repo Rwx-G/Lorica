@@ -469,7 +469,7 @@ async fn test_h2_upstream_no_end_stream_read_timeout() {
                             send_stream
                                 .send_data(bytes::Bytes::from("hello world"), false)
                                 .unwrap();
-                            // Hold the stream open — simulates an origin that sent all CL
+                            // Hold the stream open - simulates an origin that sent all CL
                             // bytes but hasn't closed the stream.
                             tokio::time::sleep(Duration::from_secs(30)).await;
                         } else {

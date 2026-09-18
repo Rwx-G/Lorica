@@ -1804,25 +1804,27 @@ PY
 # =============================================================================
     log "=== 33. Backend Validation ==="
 
-    # Try to create backend without port - should be rejected
+    # Try to create backend without port - should be rejected. The
+    # address parsed as JSON and a store rule refuses it, so it is a
+    # 422 (a payload that cannot be parsed is the 400).
     BAD_BACKEND_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
         -X POST -H "Content-Type: application/json" \
         -d '{"address":"192.168.1.1"}' \
         "$API/api/v1/backends" 2>/dev/null || true)
-    if [ "$BAD_BACKEND_STATUS" = "400" ]; then
-        ok "Backend without port rejected (400)"
+    if [ "$BAD_BACKEND_STATUS" = "422" ]; then
+        ok "Backend without port rejected (422)"
     else
-        fail "Backend without port should be rejected (got $BAD_BACKEND_STATUS)"
+        fail "Backend without port should be rejected with 422 (got $BAD_BACKEND_STATUS)"
     fi
 
     BAD_PORT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
         -X POST -H "Content-Type: application/json" \
         -d '{"address":"192.168.1.1:abc"}' \
         "$API/api/v1/backends" 2>/dev/null || true)
-    if [ "$BAD_PORT_STATUS" = "400" ]; then
-        ok "Backend with invalid port rejected (400)"
+    if [ "$BAD_PORT_STATUS" = "422" ]; then
+        ok "Backend with invalid port rejected (422)"
     else
-        fail "Backend with invalid port should be rejected (got $BAD_PORT_STATUS)"
+        fail "Backend with invalid port should be rejected with 422 (got $BAD_PORT_STATUS)"
     fi
 
 # =============================================================================

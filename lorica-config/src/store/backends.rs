@@ -3,9 +3,16 @@
 use rusqlite::{params, OptionalExtension};
 
 use super::row_helpers::row_to_backend;
-use super::ConfigStore;
+use super::{serialize_optional_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::*;
+
+/// The column list every backend read binds, in the order
+/// `row_to_backend` expects.
+const BACKEND_COLUMNS: &str = "id, address, name, group_name, weight, health_status, \
+     health_check_enabled, health_check_interval_s, health_check_path, \
+     lifecycle_state, active_connections, tls_upstream, created_at, updated_at, h2_upstream, \
+     tls_sni, tls_skip_verify, managed_by";
 
 impl ConfigStore {
     /// Validate that a backend address contains a port (ip:port format).
@@ -27,11 +34,13 @@ impl ConfigStore {
     /// Insert a new backend into the database.
     pub fn create_backend(&self, backend: &Backend) -> Result<()> {
         Self::validate_backend_address(&backend.address)?;
+        let managed_by_json = serialize_optional_field("managed_by", backend.managed_by.as_ref())?;
         self.conn.execute(
             "INSERT INTO backends (id, address, name, group_name, weight, health_status,
              health_check_enabled, health_check_interval_s, health_check_path,
-             lifecycle_state, active_connections, tls_upstream, h2_upstream, created_at, updated_at, tls_sni, tls_skip_verify)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             lifecycle_state, active_connections, tls_upstream, h2_upstream, created_at, updated_at, tls_sni, tls_skip_verify,
+             managed_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 backend.id,
                 backend.address,
@@ -50,6 +59,7 @@ impl ConfigStore {
                 backend.updated_at.to_rfc3339(),
                 backend.tls_sni.as_deref().unwrap_or(""),
                 backend.tls_skip_verify,
+                managed_by_json,
             ],
         )?;
         Ok(())
@@ -57,27 +67,17 @@ impl ConfigStore {
 
     /// Fetch a backend by ID, or `None` if not found.
     pub fn get_backend(&self, id: &str) -> Result<Option<Backend>> {
+        let sql = format!("SELECT {BACKEND_COLUMNS} FROM backends WHERE id = ?1");
         self.conn
-            .query_row(
-                "SELECT id, address, name, group_name, weight, health_status,
-                 health_check_enabled, health_check_interval_s, health_check_path,
-                 lifecycle_state, active_connections, tls_upstream, created_at, updated_at, h2_upstream, tls_sni, tls_skip_verify
-                 FROM backends WHERE id = ?1",
-                params![id],
-                |row| Ok(row_to_backend(row)),
-            )
+            .query_row(&sql, params![id], |row| Ok(row_to_backend(row)))
             .optional()?
             .transpose()
     }
 
     /// List all backends, ordered by address.
     pub fn list_backends(&self) -> Result<Vec<Backend>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, address, name, group_name, weight, health_status,
-             health_check_enabled, health_check_interval_s, health_check_path,
-             lifecycle_state, active_connections, tls_upstream, created_at, updated_at, h2_upstream, tls_sni, tls_skip_verify
-             FROM backends ORDER BY address",
-        )?;
+        let sql = format!("SELECT {BACKEND_COLUMNS} FROM backends ORDER BY address");
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| Ok(row_to_backend(row)))?;
         let mut backends = Vec::new();
         for r in rows {
@@ -89,11 +89,13 @@ impl ConfigStore {
     /// Update an existing backend. Returns `NotFound` if the ID does not exist.
     pub fn update_backend(&self, backend: &Backend) -> Result<()> {
         Self::validate_backend_address(&backend.address)?;
+        let managed_by_json = serialize_optional_field("managed_by", backend.managed_by.as_ref())?;
         let changed = self.conn.execute(
             "UPDATE backends SET address=?2, name=?3, group_name=?4, weight=?5,
              health_status=?6, health_check_enabled=?7, health_check_interval_s=?8,
              health_check_path=?9, lifecycle_state=?10, active_connections=?11,
-             tls_upstream=?12, h2_upstream=?13, updated_at=?14, tls_sni=?15, tls_skip_verify=?16 WHERE id=?1",
+             tls_upstream=?12, h2_upstream=?13, updated_at=?14, tls_sni=?15, tls_skip_verify=?16,
+             managed_by=?17 WHERE id=?1",
             params![
                 backend.id,
                 backend.address,
@@ -111,6 +113,7 @@ impl ConfigStore {
                 backend.updated_at.to_rfc3339(),
                 backend.tls_sni.as_deref().unwrap_or(""),
                 backend.tls_skip_verify,
+                managed_by_json,
             ],
         )?;
         if changed == 0 {

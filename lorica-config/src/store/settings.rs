@@ -25,26 +25,30 @@ impl ConfigStore {
             match key.as_str() {
                 "management_port" => {
                     settings.management_port = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!("invalid management_port {value:?}: {e}"))
+                        ConfigError::Corrupt(format!(
+                            "stored management_port {value:?} is not a number: {e}"
+                        ))
                     })?;
                 }
                 "log_level" => settings.log_level = value,
                 "default_health_check_interval_s" => {
                     settings.default_health_check_interval_s = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!(
-                            "invalid default_health_check_interval_s {value:?}: {e}"
+                        ConfigError::Corrupt(format!(
+                            "stored default_health_check_interval_s {value:?} is not a number: {e}"
                         ))
                     })?;
                 }
                 "cert_warning_days" => {
                     settings.cert_warning_days = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!("invalid cert_warning_days {value:?}: {e}"))
+                        ConfigError::Corrupt(format!(
+                            "stored cert_warning_days {value:?} is not a number: {e}"
+                        ))
                     })?;
                 }
                 "cert_critical_days" => {
                     settings.cert_critical_days = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!(
-                            "invalid cert_critical_days {value:?}: {e}"
+                        ConfigError::Corrupt(format!(
+                            "stored cert_critical_days {value:?} is not a number: {e}"
                         ))
                     })?;
                 }
@@ -53,15 +57,15 @@ impl ConfigStore {
                 }
                 "max_global_connections" => {
                     settings.max_global_connections = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!(
-                            "invalid max_global_connections {value:?}: {e}"
+                        ConfigError::Corrupt(format!(
+                            "stored max_global_connections {value:?} is not a number: {e}"
                         ))
                     })?;
                 }
                 "flood_threshold_rps" => {
                     settings.flood_threshold_rps = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!(
-                            "invalid flood_threshold_rps {value:?}: {e}"
+                        ConfigError::Corrupt(format!(
+                            "stored flood_threshold_rps {value:?} is not a number: {e}"
                         ))
                     })?;
                 }
@@ -73,35 +77,37 @@ impl ConfigStore {
                 }
                 "waf_ban_threshold" => {
                     settings.waf_ban_threshold = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!("invalid waf_ban_threshold {value:?}: {e}"))
+                        ConfigError::Corrupt(format!(
+                            "stored waf_ban_threshold {value:?} is not a number: {e}"
+                        ))
                     })?;
                 }
                 "waf_ban_duration_s" => {
                     settings.waf_ban_duration_s = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!(
-                            "invalid waf_ban_duration_s {value:?}: {e}"
+                        ConfigError::Corrupt(format!(
+                            "stored waf_ban_duration_s {value:?} is not a number: {e}"
                         ))
                     })?;
                 }
                 "custom_security_presets" => {
                     settings.custom_security_presets =
                         serde_json::from_str(&value).map_err(|e| {
-                            ConfigError::Validation(format!(
+                            ConfigError::Corrupt(format!(
                                 "invalid custom_security_presets JSON: {e}"
                             ))
                         })?;
                 }
                 "access_log_retention" => {
                     settings.access_log_retention = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!(
-                            "invalid access_log_retention {value:?}: {e}"
+                        ConfigError::Corrupt(format!(
+                            "stored access_log_retention {value:?} is not a number: {e}"
                         ))
                     })?;
                 }
                 "waf_event_retention" => {
                     settings.waf_event_retention = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!(
-                            "invalid waf_event_retention {value:?}: {e}"
+                        ConfigError::Corrupt(format!(
+                            "stored waf_event_retention {value:?} is not a number: {e}"
                         ))
                     })?;
                 }
@@ -110,8 +116,8 @@ impl ConfigStore {
                 }
                 "sla_purge_retention_days" => {
                     settings.sla_purge_retention_days = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!(
-                            "invalid sla_purge_retention_days {value:?}: {e}"
+                        ConfigError::Corrupt(format!(
+                            "stored sla_purge_retention_days {value:?} is not a number: {e}"
                         ))
                     })?;
                 }
@@ -120,24 +126,32 @@ impl ConfigStore {
                 }
                 "trusted_proxies" => {
                     settings.trusted_proxies = serde_json::from_str(&value).map_err(|e| {
-                        ConfigError::Validation(format!("invalid trusted_proxies JSON: {e}"))
+                        ConfigError::Corrupt(format!("invalid trusted_proxies JSON: {e}"))
                     })?;
                 }
                 "waf_whitelist_ips" => {
                     settings.waf_whitelist_ips = serde_json::from_str(&value).map_err(|e| {
-                        ConfigError::Validation(format!("invalid waf_whitelist_ips JSON: {e}"))
+                        ConfigError::Corrupt(format!("invalid waf_whitelist_ips JSON: {e}"))
                     })?;
                 }
                 "connection_deny_cidrs" => {
                     settings.connection_deny_cidrs = serde_json::from_str(&value).map_err(|e| {
-                        ConfigError::Validation(format!("invalid connection_deny_cidrs JSON: {e}"))
+                        ConfigError::Corrupt(format!("invalid connection_deny_cidrs JSON: {e}"))
                     })?;
                 }
                 "connection_allow_cidrs" => {
                     settings.connection_allow_cidrs =
                         serde_json::from_str(&value).map_err(|e| {
-                            ConfigError::Validation(format!(
+                            ConfigError::Corrupt(format!(
                                 "invalid connection_allow_cidrs JSON: {e}"
+                            ))
+                        })?;
+                }
+                "automation_allowed_cidrs" => {
+                    settings.automation_allowed_cidrs =
+                        serde_json::from_str(&value).map_err(|e| {
+                            ConfigError::Corrupt(format!(
+                                "invalid automation_allowed_cidrs JSON: {e}"
                             ))
                         })?;
                 }
@@ -148,8 +162,8 @@ impl ConfigStore {
                 "otlp_service_name" => settings.otlp_service_name = value,
                 "otlp_sampling_ratio" => {
                     settings.otlp_sampling_ratio = value.parse().map_err(|e| {
-                        ConfigError::Validation(format!(
-                            "invalid otlp_sampling_ratio {value:?}: {e}"
+                        ConfigError::Corrupt(format!(
+                            "stored otlp_sampling_ratio {value:?} is not a number: {e}"
                         ))
                     })?;
                 }
@@ -287,6 +301,9 @@ impl ConfigStore {
                 "syslog_audit_enabled" => {
                     settings.syslog_audit_enabled = value == "true" || value == "1";
                 }
+                "syslog_capture_enabled" => {
+                    settings.syslog_capture_enabled = value == "true" || value == "1";
+                }
                 "syslog_tls_ca_pem" => {
                     settings.syslog_tls_ca_pem = if value.is_empty() { None } else { Some(value) };
                 }
@@ -320,6 +337,27 @@ impl ConfigStore {
                     } else {
                         Some(self.decrypt_config(&value).unwrap_or(value))
                     };
+                }
+                "otlp_logs_access_enabled" => {
+                    settings.otlp_logs_access_enabled = value == "true" || value == "1";
+                }
+                "otlp_logs_waf_enabled" => {
+                    settings.otlp_logs_waf_enabled = value == "true" || value == "1";
+                }
+                "otlp_logs_audit_enabled" => {
+                    settings.otlp_logs_audit_enabled = value == "true" || value == "1";
+                }
+                "otlp_logs_capture_enabled" => {
+                    settings.otlp_logs_capture_enabled = value == "true" || value == "1";
+                }
+                "waf_body_scan_max_inflight_bytes" => {
+                    // A stored value that no longer parses (hand-edited
+                    // database, downgrade) falls back to the shipped
+                    // default rather than to 0, which would read as
+                    // "budget exhausted" and skip every body scan.
+                    settings.waf_body_scan_max_inflight_bytes = value
+                        .parse()
+                        .unwrap_or(settings.waf_body_scan_max_inflight_bytes);
                 }
                 _ => {}
             }
@@ -440,6 +478,16 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('connection_allow_cidrs', ?1)",
             params![connection_allow_json],
+        )?;
+        let automation_allowed_json = serde_json::to_string(&settings.automation_allowed_cidrs)
+            .map_err(|e| {
+                ConfigError::Validation(format!(
+                    "failed to serialize automation_allowed_cidrs: {e}"
+                ))
+            })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('automation_allowed_cidrs', ?1)",
+            params![automation_allowed_json],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_endpoint', ?1)",
@@ -629,6 +677,10 @@ impl ConfigStore {
             params![settings.syslog_audit_enabled.to_string()],
         )?;
         self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_capture_enabled', ?1)",
+            params![settings.syslog_capture_enabled.to_string()],
+        )?;
+        self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_tls_ca_pem', ?1)",
             params![settings.syslog_tls_ca_pem.as_deref().unwrap_or("")],
         )?;
@@ -662,6 +714,26 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_auth_header', ?1)",
             params![otlp_auth_stored],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_access_enabled', ?1)",
+            params![settings.otlp_logs_access_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_waf_enabled', ?1)",
+            params![settings.otlp_logs_waf_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_audit_enabled', ?1)",
+            params![settings.otlp_logs_audit_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_capture_enabled', ?1)",
+            params![settings.otlp_logs_capture_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_body_scan_max_inflight_bytes', ?1)",
+            params![settings.waf_body_scan_max_inflight_bytes.to_string()],
         )?;
         Ok(())
     }

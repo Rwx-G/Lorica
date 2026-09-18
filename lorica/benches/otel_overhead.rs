@@ -23,7 +23,7 @@
 //! # Baseline: no OTel feature, just the W3C wire-format helpers.
 //! cargo bench --bench otel_overhead
 //!
-//! # With the feature (no behaviour change for these primitives —
+//! # With the feature (no behaviour change for these primitives;
 //! # they are always on regardless of the feature):
 //! cargo bench --bench otel_overhead --features otel
 //! ```

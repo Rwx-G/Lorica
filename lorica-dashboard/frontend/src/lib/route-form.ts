@@ -15,6 +15,55 @@ import {
   validateGroupName,
 } from './validators';
 
+/**
+ * Byte range the API accepts for the per-route WAF body-scan cap
+ * (`waf_body_scan_max_bytes`, Story 10.6 AC #5). Anything outside it
+ * is answered 422, so the form converts its MB value to bytes and
+ * checks the result against these before a save is attempted.
+ */
+export const WAF_BODY_SCAN_MIN_BYTES = 4_096;
+export const WAF_BODY_SCAN_MAX_BYTES = 67_108_864;
+
+/** The same bounds in the MB unit the form input is denominated in. */
+export const WAF_BODY_SCAN_MIN_MB = WAF_BODY_SCAN_MIN_BYTES / (1024 * 1024);
+export const WAF_BODY_SCAN_MAX_MB = WAF_BODY_SCAN_MAX_BYTES / (1024 * 1024);
+
+/**
+ * Convert the MB-denominated form value to the byte value the API
+ * takes. `null` means "leave it to the engine default": an empty
+ * input, and the `0` the server itself normalises to unset. Text that
+ * is not a number also maps to `null` rather than to a NaN payload;
+ * `validateWafBodyScanMb` rejects it before a save gets this far.
+ */
+export function wafBodyScanMbToBytes(mb: string): number | null {
+  const raw = mb.trim();
+  if (raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n === 0) return null;
+  return Math.round(n * 1024 * 1024);
+}
+
+/**
+ * `null` when the WAF body-scan field holds something the API will
+ * accept, otherwise the message to show. Shared by the two form
+ * validators and the Protection tab's blur handler so the three
+ * cannot drift apart.
+ */
+export function validateWafBodyScanMb(mb: string): string | null {
+  const raw = mb.trim();
+  if (raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    return 'WAF body scan limit must be a number of MB';
+  }
+  if (n === 0) return null;
+  const bytes = Math.round(n * 1024 * 1024);
+  if (bytes < WAF_BODY_SCAN_MIN_BYTES || bytes > WAF_BODY_SCAN_MAX_BYTES) {
+    return `WAF body scan limit must be between ${WAF_BODY_SCAN_MIN_MB} MB (4 KiB) and ${WAF_BODY_SCAN_MAX_MB} MB (64 MiB)`;
+  }
+  return null;
+}
+
 export interface PathRuleFormState {
   path: string;
   match_type: string;
@@ -80,6 +129,7 @@ export interface RouteFormState {
   retry_attempts: string;
   security_headers: string;
   max_body_mb: string;
+  waf_body_scan_max_mb: string;
   rate_limit_rps: string;
   rate_limit_burst: string;
   ip_allowlist: string;
@@ -191,6 +241,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   retry_attempts: '',
   security_headers: 'moderate',
   max_body_mb: '',
+  waf_body_scan_max_mb: '',
   rate_limit_rps: '',
   rate_limit_burst: '',
   ip_allowlist: '',
@@ -318,6 +369,8 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'max_connections', 'slowloris_threshold_ms',
     // Body size limit (absorbed from Security in pass 4)
     'max_body_mb',
+    // WAF body inspection: how much of an accepted body is scanned.
+    'waf_body_scan_max_mb',
     // Auto-ban (depends on WAF being enabled; warning banner when not)
     'auto_ban_threshold', 'auto_ban_duration_s',
     // GeoIP
@@ -354,7 +407,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
  * to a tab via a small explicit prefix table covering the nested
  * route-config shapes that are not individual form fields.
  *
- * Returns `null` when no match — callers stay on the current tab.
+ * Returns `null` when no match - callers stay on the current tab.
  */
 export function inferTabFromBackendError(message: string): string | null {
   const match = message.trim().match(/^([A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?(?:\.[A-Za-z_][A-Za-z0-9_]*)*)/);
@@ -377,6 +430,9 @@ export function inferTabFromBackendError(message: string): string | null {
   const prefixToTab: Array<[string, string]> = [
     ['bot_protection', 'protection'],
     ['rate_limit', 'protection'],
+    // `waf_body_scan_max_bytes` is `waf_body_scan_max_mb` in the form,
+    // so the flat lookup above cannot match the backend's field name.
+    ['waf_body_scan', 'protection'],
     ['geoip', 'protection'],
     ['forward_auth', 'security'],
     ['mtls', 'security'],
@@ -466,6 +522,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     retry_attempts: route.retry_attempts != null ? String(route.retry_attempts) : '',
     security_headers: route.security_headers,
     max_body_mb: route.max_request_body_bytes != null ? String(route.max_request_body_bytes / (1024 * 1024)) : '',
+    waf_body_scan_max_mb: route.waf_body_scan_max_bytes != null ? String(route.waf_body_scan_max_bytes / (1024 * 1024)) : '',
     rate_limit_rps: route.rate_limit_rps != null ? String(route.rate_limit_rps) : '',
     rate_limit_burst: route.rate_limit_burst != null ? String(route.rate_limit_burst) : '',
     ip_allowlist: route.ip_allowlist.join('\n'),
@@ -705,6 +762,10 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     path_rewrite_replacement: form.path_rewrite_replacement || (isUpdate ? '' : undefined),
     security_headers: form.security_headers,
     max_request_body_bytes: form.max_body_mb ? Math.round(Number(form.max_body_mb) * 1024 * 1024) : empty(0),
+    // `null` here is "unset", which the API spells as the 0 it
+    // normalises back to `None`, so an untouched field round-trips
+    // as unset instead of being written as a literal 0.
+    waf_body_scan_max_bytes: wafBodyScanMbToBytes(form.waf_body_scan_max_mb) ?? empty(0),
     rate_limit_rps: form.rate_limit_rps ? Number(form.rate_limit_rps) : empty(0),
     rate_limit_burst: form.rate_limit_burst ? Number(form.rate_limit_burst) : empty(0),
     ip_allowlist: linesToArray(form.ip_allowlist).length > 0 ? linesToArray(form.ip_allowlist) : empty([]),
@@ -1109,6 +1170,8 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
   if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return r('Read timeout must be between 1 and 3600', 'upstream');
   if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return r('Send timeout must be between 1 and 3600', 'upstream');
   if (form.max_body_mb && Number(form.max_body_mb) <= 0) return r('Max body size must be greater than 0', 'protection');
+  const wafBodyScanErr = validateWafBodyScanMb(form.waf_body_scan_max_mb);
+  if (wafBodyScanErr) return r(wafBodyScanErr, 'protection');
   // Cache TTL / max size : 0 is a valid sentinel (always-
   // revalidate for TTL, no size cap for max_size). See the
   // matching backend comment in `validate_route_numeric_bounds`.
@@ -1302,6 +1365,8 @@ export function validateRouteForm(form: RouteFormState): string {
   if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return 'Read timeout must be between 1 and 3600';
   if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return 'Send timeout must be between 1 and 3600';
   if (form.max_body_mb && Number(form.max_body_mb) <= 0) return 'Max body size must be greater than 0';
+  const wafBodyScanErr = validateWafBodyScanMb(form.waf_body_scan_max_mb);
+  if (wafBodyScanErr) return wafBodyScanErr;
   if (form.cache_ttl_s < 0 || form.cache_ttl_s > 31_536_000) return 'Cache TTL must be between 0 and 31536000 (1 year)';
   if (form.cache_max_mb < 0 || form.cache_max_mb > 131_072) return 'Cache max size must be between 0 and 131072 MiB (128 GiB)';
   if (form.stale_while_revalidate_s < 0 || form.stale_while_revalidate_s > 86_400) return 'Stale-while-revalidate must be between 0 and 86400 (1 day)';

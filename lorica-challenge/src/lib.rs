@@ -26,7 +26,7 @@
 //! a 32-byte random key, hot-swappable via [`secret::rotate`] on
 //! certificate renewal, readable lock-free from the hot path via
 //! [`secret::handle`]. Rotation invalidates all outstanding
-//! verdict cookies — a documented, bounded UX cost tied to cert
+//! verdict cookies - a documented, bounded UX cost tied to cert
 //! renewal cadence (≤ 90 days on default Let's Encrypt).
 //!
 //! ## Threading
@@ -65,7 +65,7 @@ use thiserror::Error;
 pub enum ChallengeError {
     /// Cookie / PoW / captcha payload failed shape validation
     /// (wrong length, not base64, not UTF-8, missing field). Fail
-    /// silently on the hot path — clients that tamper with the
+    /// silently on the hot path - clients that tamper with the
     /// cookie just get a new challenge.
     #[error("payload malformed: {0}")]
     Malformed(&'static str),

@@ -130,7 +130,7 @@ fn validate_bot_protection(
 
     // Hard caps matching `lorica_challenge::pow` constants (the
     // crate constants are not re-exported here to avoid forcing
-    // lorica-api to depend on lorica-challenge at compile time —
+    // lorica-api to depend on lorica-challenge at compile time;
     // the values are tiny and duplicated as named constants below).
     // Audit L-23 : the `BOT_*` and `BYPASS_*` constants are public
     // so OpenAPI / SDK generators can read the same upper bounds
@@ -213,8 +213,7 @@ fn validate_bot_protection(
                 "bot_protection.bypass.ip_cidrs: empty entry".into(),
             ));
         }
-        if trimmed.parse::<ipnet::IpNet>().is_err() && trimmed.parse::<std::net::IpAddr>().is_err()
-        {
+        if lorica_config::connection_filter::parse_cidr(trimmed).is_err() {
             return Err(ApiError::BadRequest(format!(
                 "bot_protection.bypass.ip_cidrs: '{trimmed}' is not a valid IP or CIDR"
             )));
@@ -226,8 +225,8 @@ fn validate_bot_protection(
     // `lorica_geoip::AsnResolver` loaded from
     // `GlobalSettings.asn_db_path`. When the DB is missing at
     // request time, `asn_handle().lookup_asn()` returns `None` and
-    // the request falls through to the remaining bypass categories
-    // — the config is accepted, it just does not fire until the
+    // the request falls through to the remaining bypass categories;
+    // the config is accepted, it just does not fire until the
     // operator points `asn_db_path` at an ASN `.mmdb`.
     check_cap("asns", cfg.bypass.asns.len())?;
     for n in &cfg.bypass.asns {
@@ -272,7 +271,7 @@ fn validate_bot_protection(
     // confirmation is enforced in-process by
     // `lorica::bot_rdns::RdnsResolver` (resolve PTR then confirm
     // one of the resulting names forward-resolves back to the
-    // client IP — without this a hostile resolver could trivially
+    // client IP - without this a hostile resolver could trivially
     // spoof any PTR and bypass).
     //
     // Shape rules: printable ASCII, no leading dot, contains at
@@ -388,7 +387,7 @@ fn validate_rate_limit(
 /// since v1.2 without validation; this helper applies the new rule
 /// to both routes and backends going forward. Returns the trimmed
 /// value.
-fn validate_group_name(raw: &str) -> Result<String, ApiError> {
+pub(crate) fn validate_group_name(raw: &str) -> Result<String, ApiError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(String::new());
@@ -416,8 +415,18 @@ fn validate_group_name(raw: &str) -> Result<String, ApiError> {
 /// cannot exist. Each surviving entry must satisfy the same rule as
 /// `group_name`, and the list is capped at
 /// [`lorica_config::models::NODE_SELECTOR_MAX_ENTRIES`] entries.
+///
+/// `roster` carries the enrolled nodes when this node owns an
+/// authoritative registry (see [`selector_roster`]); it turns on the
+/// existence check of Story 10.0 AC #2. An entry that names nobody, or
+/// names two rows and so identifies nobody, would otherwise be stored
+/// happily and then deliver the route to no node at all.
+///
 /// Returns the normalised list.
-fn validate_node_selector(raw: &[String]) -> Result<Vec<String>, ApiError> {
+fn validate_node_selector(
+    raw: &[String],
+    roster: Option<&[lorica_config::models::ClusterNode]>,
+) -> Result<Vec<String>, ApiError> {
     let names: Vec<String> = raw
         .iter()
         .map(|n| n.trim().to_string())
@@ -429,7 +438,126 @@ fn validate_node_selector(raw: &[String]) -> Result<Vec<String>, ApiError> {
     // the follower's `prepare_replica` refuses, which aborts the round
     // for the whole fleet.
     lorica_config::models::validate_node_selector_names(&names).map_err(ApiError::BadRequest)?;
+
+    let Some(nodes) = roster else {
+        return Ok(names);
+    };
+    // Same resolver the replication path narrows a payload with, so
+    // "the API accepted it" and "somebody receives it" cannot disagree.
+    let resolution = lorica_config::canonical::SelectorResolution::from_rows(
+        nodes.iter().map(|n| (n.name.clone(), n.node_id.clone())),
+    );
+    if let Some(entry) = resolution.unresolvable(&names).first() {
+        // The resolver reports "resolves to no single node" without
+        // saying which of the two cases it is, and the operator's next
+        // move differs: fix a typo, or rename one of the two rows.
+        let matched = nodes.iter().filter(|n| n.name == **entry).count();
+        return Err(ApiError::BadRequest(if matched == 0 {
+            format!("node_selector entry `{entry}` matches no enrolled cluster node")
+        } else {
+            format!(
+                "node_selector entry `{entry}` matches more than one enrolled cluster node; \
+                 a display name is not an identity"
+            )
+        }));
+    }
     Ok(names)
+}
+
+/// The node registry a `node_selector` is checked against, or `None`
+/// when this node holds no authoritative one.
+///
+/// Only a control plane owns the roster. A standalone node has an
+/// empty `cluster_nodes` table and a follower carries whatever the
+/// last replication round left, so running the existence check there
+/// would refuse a selector naming a node that exists in the fleet.
+/// An operator also legitimately pins a route before the node it names
+/// has enrolled, and the control plane is the one place where "not in
+/// the roster" really means "nobody".
+async fn selector_roster(
+    state: &AppState,
+) -> Result<Option<Vec<lorica_config::models::ClusterNode>>, ApiError> {
+    if !matches!(
+        state.cluster,
+        crate::cluster::ClusterRuntime::ControlPlane(_)
+    ) {
+        return Ok(None);
+    }
+    db_blocking(&state.store, |store| store.list_cluster_nodes())
+        .await
+        .map(Some)
+}
+
+#[cfg(test)]
+mod node_selector_validation_tests {
+    use super::*;
+
+    /// A roster row carrying only what the resolution reads.
+    fn node(node_id: &str, name: &str) -> lorica_config::models::ClusterNode {
+        let now = Utc::now();
+        lorica_config::models::ClusterNode {
+            node_id: node_id.to_string(),
+            name: name.to_string(),
+            cert_fingerprint: String::new(),
+            cert_serial: String::new(),
+            prev_cert_fingerprint: None,
+            prev_cert_serial: None,
+            address: String::new(),
+            version: String::new(),
+            schema_version: 0,
+            status: lorica_config::models::NodeStatus::Active,
+            enrolled_at: now,
+            last_seen_at: None,
+            applied_config_generation: 0,
+            applied_config_hash: String::new(),
+            cert_not_after: now,
+            revoked_at: None,
+        }
+    }
+
+    fn expect_err(raw: &[&str], roster: &[lorica_config::models::ClusterNode]) -> String {
+        let raw: Vec<String> = raw.iter().map(|s| (*s).to_string()).collect();
+        match validate_node_selector(&raw, Some(roster)) {
+            Err(ApiError::BadRequest(msg)) => msg,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_entry_carried_by_two_roster_rows_names_nobody() {
+        // `cluster_nodes.name` is UNIQUE at the current schema head, so
+        // this shape only reaches the validator from a roster that lost
+        // the index. The resolution still refuses it, because a name
+        // two rows answer to translates to no single `node_id` and the
+        // route would reach neither node.
+        let roster = [node("node-a", "edge-1"), node("node-b", "edge-1")];
+        assert_eq!(
+            expect_err(&["edge-1"], &roster),
+            "node_selector entry `edge-1` matches more than one enrolled cluster node; \
+             a display name is not an identity"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_nothing_is_reported_as_unknown_not_ambiguous() {
+        let roster = [node("node-a", "edge-1")];
+        assert_eq!(
+            expect_err(&["edge-2"], &roster),
+            "node_selector entry `edge-2` matches no enrolled cluster node"
+        );
+    }
+
+    #[test]
+    fn normalisation_runs_before_the_existence_check() {
+        // A blank entry is dropped rather than resolved, so padding in
+        // the request body cannot turn into "matches no enrolled node".
+        let roster = [node("node-a", "edge-1")];
+        let raw = vec!["  edge-1 ".to_string(), "   ".to_string()];
+        assert_eq!(
+            validate_node_selector(&raw, Some(&roster)).expect("selector resolves"),
+            vec!["edge-1".to_string()]
+        );
+    }
 }
 
 /// Knobs for `validate_dns_hostname` (audit M-23 closure).
@@ -958,6 +1086,125 @@ fn validate_rate_limit_bounds(
         check_range(v, 0, 1_000_000, "rate_limit_burst")?;
     }
     Ok(())
+}
+
+/// Smallest `waf_body_scan_max_bytes` a route may set: 4 KiB.
+///
+/// Below this the window is narrower than a single TLS record and most
+/// real JSON payloads, so every inspected body would be truncated and
+/// the WAF would report oversize on traffic it was asked to scan. A
+/// floor is friendlier than letting an operator configure a cap that
+/// can only produce false oversize.
+const WAF_BODY_SCAN_MAX_BYTES_MIN: u64 = 4_096;
+
+/// Largest `waf_body_scan_max_bytes` a route may set: 64 MiB.
+///
+/// The ceiling exists because the cost is `value x concurrent
+/// inspectable requests on the route`: 64 MiB against 500 concurrent
+/// requests is already 32 GB of buffers. The global
+/// `waf_body_scan_max_inflight_bytes` budget is what actually bounds
+/// that total; this bound only keeps one route from asking for an
+/// absurd shape.
+const WAF_BODY_SCAN_MAX_BYTES_MAX: u64 = 67_108_864;
+
+/// Validate the per-route WAF body-scan window (Story 10.6 AC #5).
+///
+/// Kept out of [`validate_route_numeric_bounds`] for the reason
+/// [`validate_rate_limit_bounds`] is: that validator is already at its
+/// `too_many_arguments` allowance, and a 16th positional `Option`
+/// would have to be threaded through every one of its call sites for
+/// no gain in readability.
+///
+/// `waf_body_scan_max_bytes` caps how much of an *inspectable* request
+/// body the WAF reads. It is orthogonal to `max_request_body_bytes`,
+/// which caps what the proxy accepts at all: a body the WAF stops
+/// reading at this value still reaches the upstream whole. That is why
+/// the two have different bounds, and why this one is measured in
+/// megabytes rather than gigabytes.
+///
+/// `None` means "the field was not sent", and `Some(0)` is the clear
+/// sentinel the dashboard emits to fall back to the crate default
+/// (`WAF_BODY_SCAN_DEFAULT`, 1 MiB), exactly as `max_request_body_bytes`
+/// treats `0`. Both are accepted here and normalised to `None` by the
+/// create and update handlers.
+///
+/// # Status code
+///
+/// An out-of-range value answers 422, not the 400 its twin answers.
+/// The rule documented on [`ApiError::Unprocessable`] decides it: the
+/// server understood the request perfectly and refuses it on its
+/// merits, which is a 422, and the same endpoint already answers 422
+/// when axum rejects a server-owned field. The 400 on
+/// `max_request_body_bytes` predates that rule and is explicitly in
+/// the "not being swept" set, so the twin is followed on shape and the
+/// rule on status.
+fn validate_waf_body_scan_max_bytes(value: Option<u64>) -> Result<(), ApiError> {
+    let Some(v) = value else {
+        return Ok(());
+    };
+    if v == 0 || (WAF_BODY_SCAN_MAX_BYTES_MIN..=WAF_BODY_SCAN_MAX_BYTES_MAX).contains(&v) {
+        return Ok(());
+    }
+    Err(ApiError::Unprocessable(format!(
+        "waf_body_scan_max_bytes must be 0 (use the built-in 1 MiB default) or in \
+         {WAF_BODY_SCAN_MAX_BYTES_MIN}..={WAF_BODY_SCAN_MAX_BYTES_MAX}"
+    )))
+}
+
+#[cfg(test)]
+mod waf_body_scan_bounds_tests {
+    use super::*;
+
+    /// The refusal must be 422 and must name the field, because the
+    /// dashboard attaches the message to the input it came from.
+    fn expect_unprocessable(value: u64) {
+        match validate_waf_body_scan_max_bytes(Some(value)) {
+            Err(ApiError::Unprocessable(m)) => assert!(
+                m.contains("waf_body_scan_max_bytes"),
+                "message must name the field, got {m:?}"
+            ),
+            other => panic!("expected Unprocessable for {value}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_is_accepted() {
+        validate_waf_body_scan_max_bytes(None).expect("an unsent field is not a refusal");
+    }
+
+    #[test]
+    fn zero_is_accepted_as_the_clear_sentinel() {
+        validate_waf_body_scan_max_bytes(Some(0))
+            .expect("0 clears the override back to the crate default");
+    }
+
+    #[test]
+    fn both_bounds_are_inclusive() {
+        validate_waf_body_scan_max_bytes(Some(WAF_BODY_SCAN_MAX_BYTES_MIN))
+            .expect("4 KiB is the documented floor and must be accepted");
+        validate_waf_body_scan_max_bytes(Some(WAF_BODY_SCAN_MAX_BYTES_MAX))
+            .expect("64 MiB is the documented ceiling and must be accepted");
+    }
+
+    #[test]
+    fn below_the_floor_is_refused() {
+        expect_unprocessable(WAF_BODY_SCAN_MAX_BYTES_MIN - 1);
+        expect_unprocessable(1);
+    }
+
+    #[test]
+    fn above_the_ceiling_is_refused() {
+        expect_unprocessable(WAF_BODY_SCAN_MAX_BYTES_MAX + 1);
+        // The value `max_request_body_bytes` accepts as its ceiling:
+        // the two fields are orthogonal and do not share bounds.
+        expect_unprocessable(137_438_953_472);
+    }
+
+    #[test]
+    fn a_mid_range_value_is_accepted() {
+        validate_waf_body_scan_max_bytes(Some(8_388_608))
+            .expect("8 MiB is the story's worked example (IV2)");
+    }
 }
 
 /// Validate a CORS origin entry. Accepts `*`, `null`, or a full
@@ -2530,7 +2777,7 @@ mod bot_protection_validation_tests {
 
     #[test]
     fn rejects_bare_trailing_dot_tld_in_rdns() {
-        // `com.` is a TLD with canonical trailing dot — still a
+        // `com.` is a TLD with canonical trailing dot - still a
         // bare TLD that would match every .com host.
         let mut c = baseline();
         c.bypass.rdns = vec!["com.".to_string()];
@@ -2678,6 +2925,11 @@ pub struct RouteResponse {
     pub response_headers_remove: Vec<String>,
     /// Mirror of `Route.max_request_body_bytes`.
     pub max_request_body_bytes: Option<u64>,
+    /// Mirror of `Route.waf_body_scan_max_bytes`. `null` means the
+    /// built-in 1 MiB window; the dashboard round-trips the field so an
+    /// operator sees what the route actually enforces rather than the
+    /// value they last typed.
+    pub waf_body_scan_max_bytes: Option<u64>,
     /// Mirror of `Route.websocket_enabled`.
     pub websocket_enabled: bool,
     /// Mirror of `Route.rate_limit_rps`.
@@ -2780,10 +3032,54 @@ pub struct RouteResponse {
     /// (Story 8.2 AC #10). Default `false` = passthrough to backend.
     #[serde(default)]
     pub serve_robots_txt: bool,
+    /// Who manages this route when it is not the operator (Story 10.4
+    /// AC #8). Absent on an operator-managed row. A `Some` is badged by
+    /// the dashboard and refused in-place edits by this API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<lorica_config::models::ManagedBy>,
     /// RFC 3339 insert timestamp.
     pub created_at: String,
     /// RFC 3339 last-write timestamp.
     pub updated_at: String,
+}
+
+/// The 422 a client gets for sending `managed_by` on a route or a
+/// backend body.
+///
+/// The mark is server-owned: only the automation API sets it, on the
+/// rows it creates. A client that could set it would either forge an
+/// environment's ownership over a plain row or clear the mark to slip
+/// past the refusal below, so the field is refused rather than ignored.
+pub(crate) fn refuse_client_managed_by(
+    managed_by: Option<&serde_json::Value>,
+) -> Result<(), ApiError> {
+    if managed_by.is_some() {
+        return Err(ApiError::Unprocessable(
+            "managed_by is set by the automation API and cannot be sent through the \
+             management API"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The 409 an in-place edit of an automation-managed row gets.
+///
+/// `verb` names what was refused (`update`, `delete`); `kind` is
+/// `route` or `backend`; `remedy` says what the caller should do
+/// instead. The environment is named so the operator knows which
+/// pipeline owns the row.
+pub(crate) fn managed_row_conflict(
+    verb: &str,
+    kind: &str,
+    managed_by: &lorica_config::models::ManagedBy,
+    remedy: &str,
+) -> ApiError {
+    let lorica_config::models::ManagedBy::Automation { environment } = managed_by;
+    ApiError::Conflict(format!(
+        "cannot {verb} this {kind}: it is managed by the automation API for environment \
+         `{environment}`. {remedy}"
+    ))
 }
 
 /// JSON body for `POST /api/v1/routes`. Most fields are optional and
@@ -2842,6 +3138,11 @@ pub struct CreateRouteRequest {
     pub response_headers_remove: Option<Vec<String>>,
     /// Hard cap on request body (bytes).
     pub max_request_body_bytes: Option<u64>,
+    /// Bytes of an inspectable request body the WAF reads on this
+    /// route. Orthogonal to `max_request_body_bytes`: this one only
+    /// widens the inspection window, it never rejects. Omit or send
+    /// `0` for the built-in 1 MiB default.
+    pub waf_body_scan_max_bytes: Option<u64>,
     /// Allow `Upgrade: websocket` requests.
     pub websocket_enabled: Option<bool>,
     /// Per-client RPS rate limit.
@@ -2934,6 +3235,11 @@ pub struct CreateRouteRequest {
     /// Auto-serve a Lorica-generated `/robots.txt` for this route
     /// (Story 8.2 AC #10). Default `false` = passthrough to backend.
     pub serve_robots_txt: Option<bool>,
+    /// Refused with 422 when present: the mark is server-owned (see
+    /// [`refuse_client_managed_by`]). Declared so the refusal is a
+    /// deliberate check and not a silently dropped unknown field.
+    #[serde(default)]
+    pub managed_by: Option<serde_json::Value>,
 }
 
 /// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are
@@ -2993,6 +3299,10 @@ pub struct UpdateRouteRequest {
     pub response_headers_remove: Option<Vec<String>>,
     /// Hard cap on request body (bytes).
     pub max_request_body_bytes: Option<u64>,
+    /// Bytes of an inspectable request body the WAF reads on this
+    /// route. `0` clears it back to the built-in 1 MiB default, the
+    /// same clear convention `max_request_body_bytes` uses.
+    pub waf_body_scan_max_bytes: Option<u64>,
     /// Allow WebSocket upgrades.
     pub websocket_enabled: Option<bool>,
     /// Per-client RPS rate limit.
@@ -3118,6 +3428,10 @@ pub struct UpdateRouteRequest {
     /// Auto-serve a Lorica-generated `/robots.txt` for this route
     /// (Story 8.2 AC #10). `None` leaves alone.
     pub serve_robots_txt: Option<bool>,
+    /// Refused with 422 when present: the mark is server-owned (see
+    /// [`refuse_client_managed_by`]).
+    #[serde(default)]
+    pub managed_by: Option<serde_json::Value>,
 }
 
 fn route_to_response(
@@ -3152,6 +3466,7 @@ fn route_to_response(
         proxy_headers_remove: route.proxy_headers_remove.clone(),
         response_headers_remove: route.response_headers_remove.clone(),
         max_request_body_bytes: route.max_request_body_bytes,
+        waf_body_scan_max_bytes: route.waf_body_scan_max_bytes,
         websocket_enabled: route.websocket_enabled,
         rate_limit_rps: route.rate_limit_rps,
         rate_limit_burst: route.rate_limit_burst,
@@ -3273,6 +3588,7 @@ fn route_to_response(
         ai_bot_policy: route.ai_bot_policy,
         ai_bot_spoofed_fallback: route.ai_bot_spoofed_fallback,
         serve_robots_txt: route.serve_robots_txt,
+        managed_by: route.managed_by.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -3336,6 +3652,7 @@ pub async fn create_route(
     Extension(session): Extension<Session>,
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    refuse_client_managed_by(body.managed_by.as_ref())?;
     if body.hostname.is_empty() {
         return Err(ApiError::BadRequest("hostname is required".into()));
     }
@@ -3475,11 +3792,20 @@ pub async fn create_route(
         body.max_request_body_bytes,
     )?;
     validate_rate_limit_bounds(body.rate_limit_rps, body.rate_limit_burst)?;
+    validate_waf_body_scan_max_bytes(body.waf_body_scan_max_bytes)?;
 
     let path_rules = if let Some(ref prs) = body.path_rules {
         build_path_rules(prs)?
     } else {
         Vec::new()
+    };
+
+    // Read before the insert closure takes the store lock, and only
+    // when the request actually pins the route.
+    let node_roster = if body.node_selector.is_some() {
+        selector_roster(&state).await?
+    } else {
+        None
     };
 
     let now = Utc::now();
@@ -3533,6 +3859,7 @@ pub async fn create_route(
         // `Some(0)` because 0 is a valid configuration there
         // (no retries / preflight-uncached).
         max_request_body_bytes: body.max_request_body_bytes.filter(|&v| v != 0),
+        waf_body_scan_max_bytes: body.waf_body_scan_max_bytes.filter(|&v| v != 0),
         websocket_enabled: body.websocket_enabled.unwrap_or(true),
         rate_limit_rps: body.rate_limit_rps.filter(|&v| v != 0),
         rate_limit_burst: body.rate_limit_burst.filter(|&v| v != 0),
@@ -3630,7 +3957,7 @@ pub async fn create_route(
             None => String::new(),
         },
         node_selector: match body.node_selector.as_deref() {
-            Some(names) => validate_node_selector(names)?,
+            Some(names) => validate_node_selector(names, node_roster.as_deref())?,
             None => Vec::new(),
         },
         // Story 8.2 AC #2 / #3 / #10. None at the route level is the
@@ -3640,6 +3967,9 @@ pub async fn create_route(
         ai_bot_policy: body.ai_bot_policy,
         ai_bot_spoofed_fallback: body.ai_bot_spoofed_fallback,
         serve_robots_txt: body.serve_robots_txt.unwrap_or(false),
+        // The dashboard and the operator API only ever create
+        // operator-managed rows; the automation API sets the mark.
+        managed_by: None,
         created_at: now,
         updated_at: now,
     };
@@ -3702,10 +4032,31 @@ pub async fn update_route(
     Path(id): Path<String>,
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    refuse_client_managed_by(body.managed_by.as_ref())?;
+    // Read before the update closure takes the store lock, and only
+    // when the patch actually touches the pinning.
+    let node_roster = if body.node_selector.is_some() {
+        selector_roster(&state).await?
+    } else {
+        None
+    };
+
     let (before_route, route, backend_ids) = db_blocking(&state.store, move |store| {
         let mut route = store
             .get_route(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
+        // Story 10.4 AC #8. Every in-place mutation of a route, the
+        // maintenance toggle included, goes through this handler, so
+        // this one check is the whole guard: the next automation PUT
+        // would overwrite whatever an operator changed here.
+        if let Some(managed_by) = &route.managed_by {
+            return Err(managed_row_conflict(
+                "update",
+                "route",
+                managed_by,
+                "Update the environment through the pipeline instead.",
+            ));
+        }
         let before_route = route.clone();
 
         validate_route_numeric_bounds(
@@ -3726,6 +4077,7 @@ pub async fn update_route(
             body.max_request_body_bytes,
         )?;
         validate_rate_limit_bounds(body.rate_limit_rps, body.rate_limit_burst)?;
+        validate_waf_body_scan_max_bytes(body.waf_body_scan_max_bytes)?;
 
         if let Some(hostname) = body.hostname {
             route.hostname = hostname;
@@ -3844,6 +4196,13 @@ pub async fn update_route(
                 None
             } else {
                 Some(max_request_body_bytes)
+            };
+        }
+        if let Some(waf_body_scan_max_bytes) = body.waf_body_scan_max_bytes {
+            route.waf_body_scan_max_bytes = if waf_body_scan_max_bytes == 0 {
+                None
+            } else {
+                Some(waf_body_scan_max_bytes)
             };
         }
         if let Some(websocket_enabled) = body.websocket_enabled {
@@ -4064,7 +4423,7 @@ pub async fn update_route(
             // operator toggles bot-protection OFF on a route that
             // previously had a config. Mutually exclusive with
             // sending a new `bot_protection` body (would be a
-            // contradiction — `disable` wins so the API contract
+            // contradiction - `disable` wins so the API contract
             // stays predictable).
             route.bot_protection = None;
         } else if let Some(ref b) = body.bot_protection {
@@ -4076,7 +4435,7 @@ pub async fn update_route(
         // Story 9.4 AC #13. An explicit empty list widens the route
         // back to fleet-wide; absent leaves the pinning alone.
         if let Some(ref names) = body.node_selector {
-            route.node_selector = validate_node_selector(names)?;
+            route.node_selector = validate_node_selector(names, node_roster.as_deref())?;
         }
         // Story 8.2 AC #2 / #3 / #10. None on the patch leaves alone ;
         // explicit Some(_) installs. The serde-derived enum guards the
@@ -4138,6 +4497,13 @@ pub async fn update_route(
 }
 
 /// DELETE /api/v1/routes/:id - delete a route and notify the proxy.
+///
+/// A managed route is deletable (Story 10.4 AC #8): the
+/// `automation_environments` row cascades away with it, so the delete
+/// is the same transaction the environment's own `DELETE` runs, and
+/// the pipeline's next `PUT` recreates the environment from scratch.
+/// The audit row names the environment so the operator can see which
+/// review app went with the route.
 pub async fn delete_route(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
@@ -4145,17 +4511,33 @@ pub async fn delete_route(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let route_id = id.clone();
-    db_blocking(&state.store, move |store| store.delete_route(&id)).await?;
+    let route = db_blocking(&state.store, move |store| {
+        let route = store
+            .get_route(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
+        store.delete_route(&id)?;
+        Ok::<_, ApiError>(route)
+    })
+    .await?;
     state.notify_config_changed();
 
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let mut before = serde_json::to_value(route_to_response(&route, Vec::new())).ok();
+    if let (Some(serde_json::Value::Object(payload)), Some(managed_by)) =
+        (before.as_mut(), &route.managed_by)
+    {
+        let lorica_config::models::ManagedBy::Automation { environment } = managed_by;
+        payload.insert(
+            "environment".to_string(),
+            serde_json::Value::String(environment.clone()),
+        );
+    }
     crate::audit::record(
         &state,
         &audit_ctx,
         "route.delete",
-        ("route", &route_id),
-        None,
+        ("route", &route.id),
+        before.as_ref(),
         None,
     )
     .await;

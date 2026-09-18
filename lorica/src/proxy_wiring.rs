@@ -49,25 +49,32 @@ use tracing::{info, warn};
 /// Entries beyond this threshold are evicted in LRU order.
 const CACHE_SIZE_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
 
-/// Maximum request body size buffered for WAF scanning (1 MiB).
+/// Request body bytes buffered for WAF scanning when the route says
+/// nothing else (1 MiB).
+///
+/// The effective cap is the route's `waf_body_scan_max_bytes` when it
+/// carries one, this value otherwise. It is resolved once per request
+/// into `ctx.waf_body_scan_max` (Story 10.6 AC #5), and every
+/// enforcement site reads that field rather than this constant, so the
+/// route snapshot is not re-read per chunk.
 ///
 /// Applies only to bodies the engine can parse, that is those whose
 /// declared `Content-Type` passes `lorica_waf::body_is_inspectable`.
 /// A body outside that set is never buffered and never measured
-/// against this cap: `evaluate_body` passes on anything that is not
+/// against the cap: `evaluate_body` passes on anything that is not
 /// UTF-8, so the buffer would be wasted and the oversize rejection
 /// below would be a false positive with no rule behind it.
 ///
 /// When a route has the WAF on, the body IS inspectable, and it
-/// exceeds this cap, the action depends on the route's `waf_mode`
-/// (v1.5.1 audit H-2) :
+/// exceeds the effective cap, the action depends on the route's
+/// `waf_mode` (v1.5.1 audit H-2) :
 ///
 /// - **Blocking** : the proxy returns `413 Payload Too Large` and
 ///   never forwards a single byte upstream (mirrors ModSecurity's
 ///   `SecRequestBodyLimitAction = Reject`).
 /// - **Detection** : the proxy emits a single `BodyTruncated`
 ///   `WafEvent`, lets the request through, and runs the body scan
-///   on the first `WAF_BODY_SCAN_MAX` bytes (mirrors ModSecurity's
+///   on the first `ctx.waf_body_scan_max` bytes (mirrors ModSecurity's
 ///   `ProcessPartial` and AWS WAF's Continue oversize-handling).
 ///
 /// The previous behaviour was to scan the first MiB and silently
@@ -75,9 +82,8 @@ const CACHE_SIZE_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
 /// attacker could prefix 1 MiB of inert padding before a malicious
 /// payload and slip past every WAF rule. That padding bypass stays
 /// closed: the prefix is text, so the body is inspectable, so the cap
-/// still applies to it. An operator-tunable per-route cap is Story
-/// 10.6 AC #5.
-const WAF_BODY_SCAN_MAX: usize = 1_048_576;
+/// still applies to it, at whatever value the route set.
+const WAF_BODY_SCAN_DEFAULT: usize = 1_048_576;
 
 /// In-memory cache storage backend (leaked to 'static for the Storage trait).
 pub static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
@@ -266,9 +272,9 @@ pub mod mirror_rewrite;
 #[cfg(test)]
 pub(crate) use mirror_rewrite::build_mirror_url;
 pub(crate) use mirror_rewrite::{
-    apply_response_rewrites, build_mirror_forward_headers, compile_rewrite_rule, mirror_sample_hit,
-    request_has_body, should_rewrite_response, spawn_mirrors, CompiledRewriteRule, MirrorBodyState,
-    MirrorPending, ResponseRewriteState,
+    apply_response_rewrites, build_mirror_forward_headers, compile_rewrite_rule,
+    is_stream_content_type, mirror_sample_hit, request_has_body, should_rewrite_response,
+    spawn_mirrors, CompiledRewriteRule, MirrorBodyState, MirrorPending, ResponseRewriteState,
 };
 
 pub mod helpers;
@@ -308,6 +314,9 @@ pub mod filters;
 #[cfg(test)]
 pub(crate) use filters::build_redirect_location;
 pub use filters::ip_to_shmem_key;
+
+pub mod waf_body_budget;
+pub use waf_body_budget::{waf_body_budget, WAF_BODY_SCAN_DEFAULT_INFLIGHT_BYTES};
 
 pub mod worker_rpc;
 #[cfg(test)]
@@ -412,7 +421,7 @@ impl LoricaProxy {
     /// task walks the map on `interval` and drops any bucket whose
     /// `last_activity_ns` is older than `idle_ttl`. A future request
     /// from the same key reconstructs a fresh bucket, which starts
-    /// at full capacity — acceptable (and arguably desirable) since
+    /// at full capacity - acceptable (and arguably desirable) since
     /// the client has been idle past the TTL anyway.
     pub fn spawn_rate_limit_prune(
         &self,
@@ -434,7 +443,7 @@ impl LoricaProxy {
                     }
                     RateLimitEngine::Local(_) => {
                         // Worker mode: the supervisor sync task drops
-                        // entries via take_delta returning 0 — the local
+                        // entries via take_delta returning 0 - the local
                         // cache is kept small by the sync loop walking
                         // it. Eviction is supervisor-side (future
                         // follow-up: forward idle-key hints from
@@ -621,6 +630,9 @@ impl ProxyHttp for LoricaProxy {
             body_bytes_received: 0,
             waf_body_buffer: None,
             waf_body_inspect: false,
+            waf_body_scan_max: WAF_BODY_SCAN_DEFAULT,
+            waf_body_reservation: None,
+            waf_body_scan_skipped_budget: false,
             waf_body_truncated: false,
             sticky_backend_id: None,
             forward_auth_inject: Vec::new(),
@@ -634,6 +646,7 @@ impl ProxyHttp for LoricaProxy {
             incoming_traceparent: None,
             traceparent_from_client: false,
             root_tracing_span: tracing::Span::none(),
+            capture: None,
         }
     }
 
@@ -667,7 +680,7 @@ impl ProxyHttp for LoricaProxy {
 
         // Build the per-request tracing span. With the `otel` feature
         // on, the tracing_opentelemetry bridge mirrors this into an
-        // OTel span via `on_new_span` *at span creation time* — and
+        // OTel span via `on_new_span` *at span creation time* - and
         // the bridge latches `trace_id` right then from the currently-
         // attached OTel Context. Calling `OpenTelemetrySpanExt::set_parent`
         // AFTER creation only updates `OtelData.parent_cx`, not the
@@ -678,7 +691,7 @@ impl ProxyHttp for LoricaProxy {
         // Fix: attach the W3C remote span context as the current
         // OTel context BEFORE `info_span!` expansion, via
         // `Context::attach()`. The guard lives just long enough for
-        // the macro to evaluate — `on_new_span` reads
+        // the macro to evaluate - `on_new_span` reads
         // `Context::current()`, picks up our remote parent, and
         // bakes the client's trace_id into the builder. We drop the
         // guard as the `info_span!` expression returns, so nothing
@@ -831,6 +844,50 @@ impl ProxyHttp for LoricaProxy {
             ctx.path_rewrite_regex = entry.path_rewrite_regex.clone(); // Arc::clone, cheap
             ctx.access_log_enabled = entry.route.access_log_enabled;
 
+            // Traffic capture, phase one (Story 10.1). A node with no
+            // capture rule at all pays one length check; a node that has
+            // some, but none on this route, pays one hash lookup. Either
+            // way the request allocates nothing and the body filters see
+            // one `None` check per chunk. The decision is taken once
+            // here and never re-evaluated per chunk.
+            if !config.capture_rules.is_empty()
+                && config.capture_rules.has_rules_for_route(&entry.route.id)
+            {
+                // The access log's address, not the TCP peer: behind a
+                // trusted proxy those differ, and a rule's `source_cidrs`
+                // has to name the same client an operator reading the log
+                // sees. An address that did not resolve reads as
+                // 0.0.0.0, which satisfies no narrowing CIDR - the same
+                // stance the header matcher takes on a value it cannot
+                // read.
+                let client_ip = ctx
+                    .client_ip_addr
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                let candidates = config.capture_rules.candidates_for_request(
+                    &entry.route.id,
+                    req.method.as_str(),
+                    path,
+                    &req.headers,
+                    client_ip,
+                    chrono::Utc::now(),
+                );
+                // The route and the compiled set travel WITH the state.
+                // `ctx.route_id` is only set in `upstream_peer`, which
+                // every early return below (websocket gate, redirect,
+                // rate limit, mTLS, forward_auth, maintenance, basic
+                // auth, return_status, robots, IP lists, AI bot, geoip,
+                // bot protection, WAF) skips, so `logging` would
+                // otherwise have no route to look the rules up by and a
+                // rule watching 4xx could never record a refusal.
+                ctx.capture = crate::capture::CaptureState::new(
+                    crate::capture::node_budget(),
+                    &config.capture_rules,
+                    &entry.route.id,
+                    &candidates,
+                )
+                .map(Box::new);
+            }
+
             // Block WebSocket upgrades if disabled on this route
             if let Some(handled) = self.check_websocket_gate(session, ctx, entry).await? {
                 return Ok(handled);
@@ -970,16 +1027,18 @@ impl ProxyHttp for LoricaProxy {
     /// This method performs three functions:
     /// 1. Enforces `max_request_body_bytes` for chunked transfer encoding
     ///    (Content-Length-based enforcement is done in `request_filter`).
-    /// 2. Enforces the WAF body-scan cap (`WAF_BODY_SCAN_MAX`) when
-    ///    `ctx.waf_body_inspect` says the engine will read this body
-    ///    (v1.5.1 audit H-2). Action depends on `route.waf_mode` :
-    ///    Blocking returns 413 ; Detection emits a `BodyTruncated`
-    ///    `WafEvent` once and lets the request through with a partial
-    ///    scan (matches ModSecurity `ProcessPartial` and AWS WAF
-    ///    Continue).
+    /// 2. Enforces the WAF body-scan cap (`ctx.waf_body_scan_max`,
+    ///    resolved once from the route) when `ctx.waf_body_inspect`
+    ///    says the engine will read this body (v1.5.1 audit H-2).
+    ///    Action depends on `route.waf_mode` : Blocking returns 413 ;
+    ///    Detection emits a `BodyTruncated` `WafEvent` once and lets
+    ///    the request through with a partial scan (matches ModSecurity
+    ///    `ProcessPartial` and AWS WAF Continue).
     /// 3. Buffers the request body for WAF scanning, under the same
-    ///    condition. When the full body is received (`end_of_stream`),
-    ///    the WAF engine evaluates the buffered body.
+    ///    condition and under the node-wide in-flight budget. When the
+    ///    full body is received (`end_of_stream`), the WAF engine
+    ///    evaluates the buffered body. A body the budget cannot admit
+    ///    is forwarded unscanned in both modes (Story 10.6 AC #7).
     ///
     /// Steps 2 and 3 are skipped entirely for a body the engine
     /// cannot parse: no buffer, no cap, no scan, and the route's
@@ -1040,7 +1099,7 @@ impl ProxyHttp for LoricaProxy {
             // none of this and the route fields are cloned only on
             // the oversize path rather than on every chunk.
             let cap_meta =
-                if ctx.waf_body_inspect && ctx.body_bytes_received > WAF_BODY_SCAN_MAX as u64 {
+                if ctx.waf_body_inspect && ctx.body_bytes_received > ctx.waf_body_scan_max as u64 {
                     ctx.route_snapshot
                         .as_ref()
                         .map(|r| (r.waf_mode.clone(), r.id.clone(), r.hostname.clone()))
@@ -1052,10 +1111,11 @@ impl ProxyHttp for LoricaProxy {
                     WafMode::Blocking => {
                         warn!(
                             received = ctx.body_bytes_received,
-                            cap = WAF_BODY_SCAN_MAX,
+                            cap = ctx.waf_body_scan_max,
                             route_id = %route_id,
                             "request body exceeds WAF scan window (413, blocking, streaming)"
                         );
+                        lorica_api::metrics::inc_waf_body_scan_outcome("rejected");
                         let header = lorica_http::ResponseHeader::build(413, None)?;
                         session
                             .write_response_header(Box::new(header), true)
@@ -1076,20 +1136,63 @@ impl ProxyHttp for LoricaProxy {
             }
 
             // Buffer body for WAF scanning (only when the engine
-            // will read it). The `buf.len() < WAF_BODY_SCAN_MAX`
+            // will read it). The `buffered < ctx.waf_body_scan_max`
             // guard caps the buffer growth so Detection-mode requests
-            // past the cap keep the first-`WAF_BODY_SCAN_MAX`-byte
+            // past the cap keep the first-`waf_body_scan_max`-byte
             // prefix and discard the rest. Blocking-mode requests
             // already returned with 413 above so the guard is moot in
             // that branch ; keep it as defense-in-depth in case a
             // future refactor changes the return semantics.
+            //
+            // Every byte kept is reserved from the node-wide budget
+            // first (Story 10.6 AC #7). One atomic read-modify-write
+            // per buffered chunk, no lock, nothing held across the
+            // upstream write. Over budget, the request is forwarded
+            // unscanned rather than rejected; the reasoning for that
+            // direction is on `waf_body_budget`.
             if ctx.waf_body_inspect {
-                let buf = ctx.waf_body_buffer.get_or_insert_with(Vec::new);
-                if buf.len() < WAF_BODY_SCAN_MAX {
-                    let remaining = WAF_BODY_SCAN_MAX - buf.len();
-                    let to_copy = chunk.len().min(remaining);
-                    buf.extend_from_slice(&chunk[..to_copy]);
+                let buffered = ctx.waf_body_buffer.as_ref().map_or(0, Vec::len);
+                if buffered < ctx.waf_body_scan_max {
+                    let to_copy = chunk.len().min(ctx.waf_body_scan_max - buffered);
+                    let reservation = ctx
+                        .waf_body_reservation
+                        .get_or_insert_with(|| waf_body_budget().reservation());
+                    if reservation.grow(to_copy) {
+                        ctx.waf_body_buffer
+                            .get_or_insert_with(Vec::new)
+                            .extend_from_slice(&chunk[..to_copy]);
+                    } else {
+                        let observed = ctx.body_bytes_received;
+                        let route_meta = ctx
+                            .route_snapshot
+                            .as_ref()
+                            .map(|r| (r.id.clone(), r.hostname.clone()));
+                        let (route_id, route_hostname) =
+                            route_meta.unwrap_or_else(|| ("-".to_string(), "-".to_string()));
+                        self.record_waf_body_scan_skipped_budget(
+                            ctx,
+                            &route_id,
+                            &route_hostname,
+                            observed,
+                        );
+                        // Nothing further is buffered, measured or
+                        // scanned for this request, in either WAF
+                        // mode. Dropping the reservation returns the
+                        // prefix it had already taken.
+                        ctx.waf_body_inspect = false;
+                        ctx.waf_body_buffer = None;
+                        ctx.waf_body_reservation = None;
+                    }
                 }
+            }
+
+            // Traffic capture, request side (Story 10.1). The chunk is
+            // read, never replaced: a request being captured reaches the
+            // upstream byte for byte, including the bytes past the
+            // rule's cap. Buffering stops at the cap and at the
+            // node-wide ceiling; both are decided inside `push_request`.
+            if let Some(ref mut capture) = ctx.capture {
+                capture.push_request(chunk);
             }
 
             // Buffer body for mirror sub-request. Independent of WAF
@@ -1174,6 +1277,11 @@ impl ProxyHttp for LoricaProxy {
                         _ => lorica_waf::WafMode::Detection,
                     };
 
+                    // One `scanned` per request that actually reached
+                    // the engine, so the five outcomes of
+                    // `lorica_waf_body_scans_total` partition the
+                    // bodies a WAF-enabled route saw.
+                    lorica_api::metrics::inc_waf_body_scan_outcome("scanned");
                     let mut verdict = self
                         .waf_engine
                         .evaluate_body(waf_mode, buf, host, client_ip);
@@ -2019,6 +2127,24 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
+        // Traffic capture, response side (Story 10.1). A stream-by-design
+        // body is never buffered, for the reason
+        // `STREAM_CONTENT_TYPE_PREFIXES` exists: it has no end, so
+        // holding it would hold the client's bytes forever. Recorded as
+        // a skip rather than left as an empty body so the record can say
+        // which of the two it was. Runs before `route` is borrowed out of
+        // the context so the capture state can be taken mutably.
+        if let Some(ref mut capture) = ctx.capture {
+            let content_type = upstream_response
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if is_stream_content_type(content_type) {
+                capture.skip_response(crate::capture::CaptureSkip::Streaming);
+            }
+        }
+
         let route = match ctx.route_snapshot {
             Some(ref r) => r,
             None => return Ok(()),
@@ -2177,6 +2303,17 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Traffic capture, response side (Story 10.1). Ahead of the
+        // rewrite fast path for two reasons: a route with no rewrite
+        // rule still captures, and the bytes recorded are the ones the
+        // upstream sent, before any rewrite rule edits them. The chunk
+        // is read, never replaced.
+        if let Some(ref mut capture) = ctx.capture {
+            if let Some(ref chunk) = *body {
+                capture.push_response(chunk);
+            }
+        }
+
         // Fast path: feature off for this response.
         if ctx.response_rewrite_state.is_none() {
             return Ok(None);
@@ -2307,6 +2444,18 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Traffic capture release (Story 10.1). The buffers leave the
+        // context on the first line of `logging`, on every path into it:
+        // a normal response, an early return from any filter, a WAF
+        // block, `fail_to_proxy`. What guarantees the release is
+        // ownership, not a call: `capture` is a local from here on, the
+        // compiler drops it however this function returns (including a
+        // panic unwind), and dropping it returns its bytes to the
+        // node-wide budget through the reservation's `Drop`. There is no
+        // release function anyone could forget to call, and no path that
+        // can carry the bytes past this hook.
+        let capture = ctx.capture.take();
+
         let elapsed = ctx.start_time.elapsed();
         let downstream = session.as_downstream();
         let req = downstream.req_header();
@@ -2374,7 +2523,7 @@ impl ProxyHttp for LoricaProxy {
         // bridge picks them up on span close and exports the OTel
         // span with the full attribute set. The span itself is
         // closed automatically when `request_filter` returns and the
-        // implicit `#[instrument]` guard drops — no explicit `end()`
+        // implicit `#[instrument]` guard drops - no explicit `end()`
         // call needed (the bridge runs on the layer's `on_close`).
         {
             let span = &ctx.root_tracing_span;
@@ -2412,6 +2561,113 @@ impl ProxyHttp for LoricaProxy {
             if let Some(ref err) = error_str {
                 span.record("error.message", err.as_str());
             }
+        }
+
+        // The access-log row. Built ahead of the consumers that want it
+        // because the capture record (below) is made FROM it: a capture
+        // joins the row on `request_id` and must agree with it on the
+        // client address, the backend, the latency and the error, and
+        // one struct read by both is how that agreement is kept rather
+        // than checked. The sink export is deliberately NOT gated on
+        // `ctx.access_log_enabled` (QA finding: a compliance-relevant
+        // SIEM export must not be switched off by the unrelated
+        // local-log toggle); the row is only built when at least one
+        // consumer wants it.
+        let sinks_want_access =
+            lorica_api::log_sinks::wants(lorica_api::log_sinks::SinkKind::Access);
+        let access_entry =
+            (ctx.access_log_enabled || sinks_want_access || capture.is_some()).then(|| LogEntry {
+                id: 0, // assigned by LogBuffer
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                method: method.to_string(),
+                path: path.to_string(),
+                host: host.to_string(),
+                status,
+                latency_ms,
+                backend: backend_addr.to_string(),
+                error: error_str,
+                client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
+                is_xff: ctx.is_xff,
+                xff_proxy_ip: ctx.xff_proxy_ip.as_deref().unwrap_or("").to_string(),
+                source: ctx.source.clone(),
+                request_id: ctx.request_id.clone(),
+            });
+
+        // Traffic capture, the record (Story 10.2). One record per rule
+        // the budgets admit, built from the buffers, the rule and the
+        // access-log row. The `emit` predicates are read by the rule ids
+        // the request recorded at `request_filter`, so the `match` block
+        // is not evaluated a second time.
+        //
+        // Each record owns its copy of the bytes it keeps, which is a
+        // second copy while `capture` is alive; the buffer dies at the
+        // end of this function and the record has to outlive it, so the
+        // copy is the price of the hand-off and not a leak. The rule's
+        // `output` rides along: it is the one thing the sinks need that
+        // the record does not carry.
+        let mut capture_records: Vec<crate::capture::CaptureEmission> = Vec::new();
+        if let (Some(state), Some(entry)) = (capture.as_deref(), access_entry.as_ref()) {
+            let upstream_error = e.is_some_and(|err| err.esource() == &ErrorSource::Upstream);
+            // The route and the compiled set come from the state, not
+            // from `ctx.route_id` and a fresh `self.config.load()`. The
+            // context's route is `None` on every refusal that returned
+            // before `upstream_peer`, and a reload between admission and
+            // here would otherwise judge the exchange against a
+            // generation that never saw it.
+            let rules = state.admitted_rules();
+            let response = session.as_downstream().response_written();
+            // The budgets are spent HERE and nowhere else, one call per
+            // rule that would emit. `admit` is the single critical
+            // section that reads the total, reads the rate window and
+            // advances both, so two requests racing for the last
+            // capture cannot both take it.
+            // A loop, not `any`: that one short-circuits, so the first
+            // rule to emit would leave every other matching rule's
+            // budget unspent and its counters wrong. Each rule that
+            // would emit consults its own.
+            let now = std::time::Instant::now();
+            for rule in rules
+                .iter()
+                .filter(|rule| state.rule_ids.iter().any(|id| id == &rule.rule.id))
+                .filter(|rule| rule.should_emit(status, latency_ms, upstream_error))
+            {
+                if crate::capture::node_budgets().admit(rule, now).emitted() {
+                    capture_records.push(crate::capture::CaptureEmission {
+                        record: crate::capture::CaptureRecord::build(
+                            &rule.rule, state, entry, req, response,
+                        ),
+                        output: rule.rule.output.clone(),
+                    });
+                }
+            }
+            tracing::debug!(
+                request_id = %ctx.request_id,
+                capture_rules = state.rule_ids.len(),
+                request_body_bytes = state.request.len(),
+                request_body_truncated = state.request.truncated(),
+                response_body_bytes = state.response.len(),
+                response_body_truncated = state.response.truncated(),
+                held_bytes = state.held_bytes(),
+                records = capture_records.len(),
+                "traffic capture buffered this exchange"
+            );
+        }
+
+        // Traffic capture, the outputs (Story 10.2 AC #3 and #4). The
+        // log line and the lane offers happen here, synchronously and
+        // without blocking; the directory write is queued to its own
+        // thread. Every failure on that path is a counted drop, so
+        // nothing below waits on a sink.
+        if !capture_records.is_empty() {
+            crate::capture::emit_captures(
+                capture_records,
+                ctx.outgoing_traceparent
+                    .as_ref()
+                    .map(|t| t.trace_id.as_str()),
+                ctx.outgoing_traceparent
+                    .as_ref()
+                    .map(|t| t.parent_id.as_str()),
+            );
         }
 
         // Decrement per-route connection counter (max_connections enforcement)
@@ -2457,30 +2713,9 @@ impl ProxyHttp for LoricaProxy {
         }
 
         // Push to the in-memory log buffer for dashboard viewing (if
-        // enabled) and offer to the log-export sinks. The sink export
-        // is deliberately NOT gated on `ctx.access_log_enabled` (QA
-        // finding: a compliance-relevant SIEM export must not be
-        // switched off by the unrelated local-log toggle); the entry
-        // is only built when at least one consumer wants it.
-        let sinks_want_access =
-            lorica_api::log_sinks::wants(lorica_api::log_sinks::SinkKind::Access);
-        if ctx.access_log_enabled || sinks_want_access {
-            let entry = LogEntry {
-                id: 0, // assigned by LogBuffer
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                method: method.to_string(),
-                path: path.to_string(),
-                host: host.to_string(),
-                status,
-                latency_ms,
-                backend: backend_addr.to_string(),
-                error: error_str,
-                client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
-                is_xff: ctx.is_xff,
-                xff_proxy_ip: ctx.xff_proxy_ip.as_deref().unwrap_or("").to_string(),
-                source: ctx.source.clone(),
-                request_id: ctx.request_id.clone(),
-            };
+        // enabled) and offer to the log-export sinks. A row built only
+        // for a capture goes to neither.
+        if let Some(entry) = access_entry {
             if sinks_want_access {
                 // Story 9.8: trace context is captured here - the sink
                 // consumer thread has no ambient span to read it from.

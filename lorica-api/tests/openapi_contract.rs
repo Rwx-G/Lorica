@@ -14,7 +14,18 @@
 //! reasons about the routing contract (path shape + method), not the
 //! spelling of a parameter identifier, which is not part of the wire
 //! contract.
+//!
+//! The automation plane (Story 10.3) is a second socket with a second
+//! credential, so it has a second document, `openapi-automation.yaml`,
+//! and a second gate below. It reuses every extractor here: the router
+//! is an axum router and the document is an OpenAPI document, so the
+//! two sides are the same shape as the management pair. What it adds
+//! is a scope check, because on that plane the scope a path requires
+//! is part of the contract an automation reads, and a scope that
+//! drifts from [`lorica_api::automation::required_scope`] is a 403
+//! nobody predicted.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 /// Route/method pairs that live in the router but are intentionally
@@ -106,6 +117,176 @@ fn openapi_spec_matches_routes() {
         );
         panic!("{msg}");
     }
+}
+
+#[test]
+fn automation_openapi_matches_automation_routes() {
+    let router_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/automation/router.rs"
+    ));
+    let spec_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/openapi-automation.yaml"
+    ));
+
+    let routes: BTreeSet<(String, String)> = extract_routes(router_src);
+    let spec: BTreeSet<(String, String)> = extract_spec_paths(spec_src);
+
+    // Same extraction sanity as the management gate: two empty sets
+    // compare equal, and a silently broken parser must not read as a
+    // clean contract.
+    assert!(
+        !routes.is_empty(),
+        "route extraction looks broken: no (method, path) pair found in src/automation/router.rs"
+    );
+    assert!(
+        !spec.is_empty(),
+        "spec extraction looks broken: no (method, path) pair found in openapi-automation.yaml"
+    );
+
+    // No allowlist and no known-drift list here. The automation plane
+    // serves REST operations only, and it is new enough to carry no
+    // pre-existing debt; either list would be a place to hide drift
+    // that has no reason to exist yet.
+    let mut missing_from_spec: Vec<(String, String)> = routes.difference(&spec).cloned().collect();
+    let mut spec_without_route: Vec<(String, String)> = spec.difference(&routes).cloned().collect();
+    missing_from_spec.sort();
+    spec_without_route.sort();
+
+    if !missing_from_spec.is_empty() || !spec_without_route.is_empty() {
+        let mut msg = String::from("\nAutomation API contract drift detected.\n");
+        msg.push_str(&format!(
+            "\nRoutes missing from openapi-automation.yaml ({}):\n",
+            missing_from_spec.len()
+        ));
+        for (method, path) in &missing_from_spec {
+            msg.push_str(&format!("  {method:<7} {path}\n"));
+        }
+        msg.push_str(&format!(
+            "\nOpenapi paths with no route ({}):\n",
+            spec_without_route.len()
+        ));
+        for (method, path) in &spec_without_route {
+            msg.push_str(&format!("  {method:<7} {path}\n"));
+        }
+        msg.push_str(
+            "\nEither document the route in openapi-automation.yaml or remove the \
+             stale spec entry. Automation paths never belong in openapi.yaml: that \
+             document describes the management plane, a different socket with a \
+             different credential.\n",
+        );
+        panic!("{msg}");
+    }
+}
+
+#[test]
+fn automation_openapi_declares_the_scope_the_gate_enforces() {
+    let spec_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/openapi-automation.yaml"
+    ));
+
+    let declared: BTreeMap<(String, String), String> = extract_declared_scopes(spec_src);
+    assert!(
+        !declared.is_empty(),
+        "no x-required-scope found in openapi-automation.yaml: every documented \
+         operation must name the scope it requires"
+    );
+
+    let documented: BTreeSet<(String, String)> = extract_spec_paths(spec_src);
+    let without_scope: Vec<&(String, String)> = documented
+        .iter()
+        .filter(|pair| !declared.contains_key(*pair))
+        .collect();
+    assert!(
+        without_scope.is_empty(),
+        "documented operations with no x-required-scope: {without_scope:?}. \
+         A path with no declared scope is reachable by no token, so leaving it \
+         undocumented promises a caller something the scope gate refuses."
+    );
+
+    for ((method, path), spelled) in &declared {
+        let method: http::Method = method.parse().expect("documented method parses");
+        let enforced: Option<String> =
+            lorica_api::automation::required_scope(&method, path).map(|scope| {
+                serde_json::to_value(scope)
+                    .expect("scope serialises")
+                    .as_str()
+                    .expect("scope serialises to a string")
+                    .to_string()
+            });
+        assert_eq!(
+            enforced.as_deref(),
+            Some(spelled.as_str()),
+            "openapi-automation.yaml says {method} {path} needs {spelled:?}, \
+             but the scope gate enforces {enforced:?}"
+        );
+    }
+}
+
+/// Collect the `x-required-scope` an operation declares, keyed by the
+/// `(METHOD, path)` pair that owns it.
+///
+/// Same strict-indent hand-parse as [`extract_spec_paths`], one level
+/// deeper: the extension is a 6-space-indented child of the operation.
+fn extract_declared_scopes(yaml: &str) -> BTreeMap<(String, String), String> {
+    const MARKER: &str = "x-required-scope:";
+
+    let mut out = BTreeMap::new();
+    let mut in_paths = false;
+    let mut current_path: Option<String> = None;
+    let mut current_method: Option<String> = None;
+
+    for line in yaml.lines() {
+        let first = line.as_bytes().first().copied();
+        if let Some(c) = first {
+            if c != b' ' && c != b'#' {
+                in_paths = line.starts_with("paths:");
+                current_path = None;
+                current_method = None;
+                continue;
+            }
+        } else {
+            continue; // blank line
+        }
+        if !in_paths {
+            continue;
+        }
+
+        if let Some(rest) = strip_exact_indent(line, 2) {
+            if let Some(key) = rest.trim_end().strip_suffix(':') {
+                if key.starts_with('/') {
+                    current_path = Some(normalize_path(key));
+                    current_method = None;
+                }
+            }
+            continue;
+        }
+
+        if let Some(rest) = strip_exact_indent(line, 4) {
+            if let Some(key) = rest.trim_end().strip_suffix(':') {
+                if HTTP_METHODS.contains(&key) {
+                    current_method = Some(key.to_uppercase());
+                } else {
+                    current_method = None;
+                }
+            }
+            continue;
+        }
+
+        if let Some(rest) = strip_exact_indent(line, 6) {
+            if let Some(value) = rest.trim_end().strip_prefix(MARKER) {
+                if let (Some(path), Some(method)) = (&current_path, &current_method) {
+                    out.insert(
+                        (method.clone(), path.clone()),
+                        value.trim().trim_matches('"').to_string(),
+                    );
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Collapse an allow/known-drift slice into an owned set.

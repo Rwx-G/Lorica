@@ -75,9 +75,9 @@ impl AsnResolver {
         })?;
 
         let sanity_probes: &[&str] = &[
-            "8.8.8.8",        // Google (AS15169) — every real ASN DB
-            "1.1.1.1",        // Cloudflare (AS13335) — fallback
-            "208.67.222.222", // OpenDNS (AS36692) — second fallback
+            "8.8.8.8",        // Google (AS15169) - every real ASN DB
+            "1.1.1.1",        // Cloudflare (AS13335) - fallback
+            "208.67.222.222", // OpenDNS (AS36692) - second fallback
             "1.0.0.1",        // MaxMind GeoLite2-ASN-Test fixture hit
                               // (AS15169 in the open test dataset we
                               // ship under tests-e2e-docker/fixtures/).
@@ -119,7 +119,7 @@ impl AsnResolver {
     /// Look up the ASN for an IP. Returns `None` when no DB is
     /// loaded OR the IP is not indexed (reserved / private). The
     /// `autonomous_system_number` field in both MaxMind GeoLite2
-    /// and DB-IP ASN Lite is a `u32` — capped by real IANA
+    /// and DB-IP ASN Lite is a `u32` - capped by real IANA
     /// allocations at ~400k ASNs, well within u32 range.
     pub fn lookup_asn(&self, ip: IpAddr) -> Option<u32> {
         let guard = self.inner.load();
@@ -139,7 +139,7 @@ impl Default for AsnResolver {
 }
 
 /// Module-private lookup helper. Decodes only the
-/// `autonomous_system_number` field — ~2x cheaper than deserialising
+/// `autonomous_system_number` field - ~2x cheaper than deserialising
 /// the full record and no struct boilerplate to keep in sync.
 fn lookup_asn_inner(reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> Option<u32> {
     use maxminddb::PathElement;

@@ -300,7 +300,7 @@ fn decode_verification(id: i64, kind: &str, data: Option<&str>) -> Result<Custom
                 suffixes: Vec<String>,
             }
             let parsed: Shape = serde_json::from_str(json).map_err(|e| {
-                ConfigError::Validation(format!("verification_data rdns parse: {e}"))
+                ConfigError::Corrupt(format!("stored {kind} verification_data is not JSON: {e}"))
             })?;
             CustomVerification::Rdns {
                 suffixes: parsed.suffixes,
@@ -312,15 +312,15 @@ fn decode_verification(id: i64, kind: &str, data: Option<&str>) -> Result<Custom
                 cidrs: Vec<String>,
             }
             let parsed: Shape = serde_json::from_str(json).map_err(|e| {
-                ConfigError::Validation(format!("verification_data ip_ranges parse: {e}"))
+                ConfigError::Corrupt(format!("stored {kind} verification_data is not JSON: {e}"))
             })?;
             CustomVerification::IpRanges {
                 cidrs: parsed.cidrs,
             }
         }
         (k, _) => {
-            return Err(ConfigError::Validation(format!(
-                "unknown verification_kind {k:?} on ai_crawlers_custom row {id}"
+            return Err(ConfigError::Corrupt(format!(
+                "stored verification_kind {k:?} on ai_crawlers_custom row {id} is unknown"
             )));
         }
     };
@@ -330,7 +330,7 @@ fn decode_verification(id: i64, kind: &str, data: Option<&str>) -> Result<Custom
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| ConfigError::Validation(format!("invalid datetime {s:?}: {e}")))
+        .map_err(|e| ConfigError::Corrupt(format!("stored datetime {s:?} is invalid: {e}")))
 }
 
 #[cfg(test)]

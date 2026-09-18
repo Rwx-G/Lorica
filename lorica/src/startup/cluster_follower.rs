@@ -327,12 +327,7 @@ impl ReplicaHandler {
     async fn audit(&self, action: &str, after: serde_json::Value) {
         lorica_api::audit::record_with_store(
             self.log_store.clone(),
-            &lorica_api::audit::AuditContext {
-                username: "cluster".to_string(),
-                role: "node".to_string(),
-                ip: String::new(),
-                user_agent: String::new(),
-            },
+            &lorica_api::audit::AuditContext::node("cluster"),
             action,
             ("cluster_node", &self.node_id),
             None,

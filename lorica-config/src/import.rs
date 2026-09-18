@@ -168,6 +168,16 @@ fn validate(data: &ImportData) -> Result<()> {
         ));
     }
 
+    // Refuse a malformed address entry before it reaches the store.
+    // The management API has always refused one; an import wrote
+    // `global_settings` verbatim, so a typo in `connection_allow_cidrs`
+    // parsed to an EMPTY allow list at reload, which the connection
+    // filter reads as default-allow: the TCP allowlist silently stopped
+    // filtering, with one WARN as the only trace (backlog #88).
+    data.global_settings
+        .validate_cidr_lists()
+        .map_err(|reason| ConfigError::Validation(format!("global_settings: {reason}")))?;
+
     // Validate certificate references in routes
     for route in &data.routes {
         if let Some(cert_id) = &route.certificate_id {

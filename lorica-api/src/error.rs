@@ -13,7 +13,20 @@ pub enum ApiError {
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// 400 Bad Request: payload failed validation (bad enum, malformed regex, etc.).
+    /// 400 Bad Request: the request itself could not be understood.
+    ///
+    /// A malformed path parameter, an unparseable value, a body the
+    /// server could not make sense of. See [`ApiError::Unprocessable`]
+    /// for the other half of the split and the rule that decides
+    /// between them.
+    ///
+    /// Most of this crate predates that split and answers 400 for
+    /// semantic refusals too. Those call sites are not being swept:
+    /// reclassifying them one by one is a behaviour change on a public
+    /// API for no gain to the caller, both being 4xx and every client
+    /// in this repository reading the body rather than branching on the
+    /// code. New handlers follow the rule below; old ones are corrected
+    /// when they are touched for another reason.
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -29,6 +42,26 @@ pub enum ApiError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// 422 Unprocessable Entity: the body parsed, and its content is
+    /// refused by a model rule.
+    ///
+    /// # The rule
+    ///
+    /// Ask whether the server understood the request. If it did not,
+    /// that is 400. If it understood it perfectly and refuses it on its
+    /// merits, a cap over its limit, a predicate that constrains
+    /// nothing, an identifier naming no row, that is 422.
+    ///
+    /// The split is not a preference. Axum already answers 422 when a
+    /// `deny_unknown_fields` body carries a field the server owns, such
+    /// as a client-supplied `expires_at` or a runtime counter. A
+    /// handler that then answered 400 for a cap over its limit would
+    /// split one class of refusal across two statuses on the same
+    /// endpoint, and a caller could not tell from the code which kind
+    /// of mistake they made.
+    #[error("unprocessable: {0}")]
+    Unprocessable(String),
+
     /// 429 Too Many Requests: client exceeded a per-bucket rate
     /// limiter. The inner `u64` is the Retry-After value in
     /// seconds (0 if unknown; the response still emits the
@@ -39,13 +72,37 @@ pub enum ApiError {
     /// 500 Internal Server Error: unexpected failure (DB, IO, serialization).
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// 503 Service Unavailable: the resource exists in the product but
+    /// not in this process, and the message names where to read it
+    /// instead. The recent-captures ring under `--workers` is the one
+    /// case today: the ring is per worker and the API runs in the
+    /// supervisor, which holds an empty one.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 impl From<lorica_config::ConfigError> for ApiError {
     fn from(err: lorica_config::ConfigError) -> Self {
         match &err {
             lorica_config::ConfigError::NotFound(_) => ApiError::NotFound(err.to_string()),
-            lorica_config::ConfigError::Validation(_) => ApiError::BadRequest(err.to_string()),
+            // The store's two input refusals land on the two halves of
+            // the rule documented on `Unprocessable` above. A rule the
+            // store enforces (uniqueness, a cap, a reference naming no
+            // row) is a request the server understood and refuses on
+            // its merits: 422. A payload the store could not read is a
+            // request the server did not understand: 400. Mapping both
+            // to 400, as this did, split one class of refusal across
+            // two statuses on the same endpoint depending on whether
+            // the handler or the store caught it.
+            lorica_config::ConfigError::Validation(_) => ApiError::Unprocessable(err.to_string()),
+            lorica_config::ConfigError::Malformed(_) => ApiError::BadRequest(err.to_string()),
+            // A stored column this process itself wrote back that no
+            // longer decodes is not the caller's doing: no payload they
+            // could send would make it succeed. 500, with the same
+            // wording the store used, so the operator reads "the
+            // database is damaged" rather than "your request is bad".
+            lorica_config::ConfigError::Corrupt(_) => ApiError::Internal(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }
     }
@@ -82,8 +139,10 @@ impl ApiError {
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -94,8 +153,10 @@ impl ApiError {
             ApiError::Unauthorized(_) => "unauthorized",
             ApiError::Forbidden(_) => "forbidden",
             ApiError::Conflict(_) => "conflict",
+            ApiError::Unprocessable(_) => "unprocessable_entity",
             ApiError::RateLimited(_) => "rate_limited",
             ApiError::Internal(_) => "internal_error",
+            ApiError::ServiceUnavailable(_) => "service_unavailable",
         }
     }
 }
@@ -197,12 +258,20 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(
+            ApiError::Unprocessable("x".into()).status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
             ApiError::RateLimited(30).status_code(),
             StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(
             ApiError::Internal("x".into()).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            ApiError::ServiceUnavailable("x".into()).status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
@@ -213,8 +282,16 @@ mod tests {
         assert_eq!(ApiError::Unauthorized("x".into()).code(), "unauthorized");
         assert_eq!(ApiError::Forbidden("x".into()).code(), "forbidden");
         assert_eq!(ApiError::Conflict("x".into()).code(), "conflict");
+        assert_eq!(
+            ApiError::Unprocessable("x".into()).code(),
+            "unprocessable_entity"
+        );
         assert_eq!(ApiError::RateLimited(30).code(), "rate_limited");
         assert_eq!(ApiError::Internal("x".into()).code(), "internal_error");
+        assert_eq!(
+            ApiError::ServiceUnavailable("x".into()).code(),
+            "service_unavailable"
+        );
     }
 
     #[test]
@@ -328,9 +405,29 @@ mod tests {
     }
 
     #[test]
-    fn test_config_error_validation_converts() {
+    fn test_config_error_validation_converts_to_unprocessable() {
+        // A store-level rule refusal is a request the server
+        // understood: the same 422 a handler-level refusal answers.
         let err: ApiError = lorica_config::ConfigError::Validation("bad ref".into()).into();
+        assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn test_config_error_malformed_converts_to_bad_request() {
+        let err: ApiError = lorica_config::ConfigError::Malformed("not JSON".into()).into();
         assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_config_error_corrupt_converts_to_internal() {
+        // A JSON column this process wrote back and can no longer read
+        // is a damaged or downgraded database, not a bad request: the
+        // caller has nothing to fix, so it is a 500 and never a 4xx.
+        let err: ApiError =
+            lorica_config::ConfigError::Corrupt("invalid path_rules JSON: eof".into()).into();
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_ne!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]

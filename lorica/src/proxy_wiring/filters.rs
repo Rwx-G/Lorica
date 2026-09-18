@@ -28,7 +28,7 @@ use super::{
     bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest,
     evaluate_mtls, extract_host, mirror_sample_hit, render_error_body, request_has_body,
     run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome, LoricaProxy, MirrorBodyState,
-    MirrorPending, ProxyConfig, RequestCtx, RouteEntry, VerdictCacheEngine, WAF_BODY_SCAN_MAX,
+    MirrorPending, ProxyConfig, RequestCtx, RouteEntry, VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
 };
 use crate::ai_bot::build_robots_txt_from_names;
 
@@ -62,25 +62,51 @@ pub fn ip_to_shmem_key(ip: &str) -> u64 {
     }
 }
 
-/// Precompile a list of allow/deny patterns (bare IPs or CIDRs) into
+/// Parse an operator's address list for the data plane, skipping what
+/// the shared parser cannot read.
+///
+/// The RULE is
+/// [`lorica_config::connection_filter::parse_cidr`]: one definition of
+/// what an address entry is, shared with the TCP pre-filter, the
+/// settings validators and the automation listener. A CIDR is a CIDR,
+/// a bare address is its single-host network, and surrounding
+/// whitespace is ignored.
+///
+/// The DISPOSITION is the runtime one: a bad entry is skipped with a
+/// WARN naming `field`, and the rest of the list stands. These lists
+/// are already stored, so failing the whole reload on one typo would
+/// turn a stale settings row into an outage. The validators at the
+/// write boundary are where a typo is refused.
+///
+/// A blank line is whitespace, not a rule somebody lost, so it is
+/// dropped without a warning.
+pub(crate) fn parse_cidrs_skipping(entries: &[String], field: &str) -> Vec<ipnet::IpNet> {
+    entries
+        .iter()
+        .filter_map(
+            |entry| match lorica_config::connection_filter::parse_cidr(entry) {
+                Ok(net) => Some(net),
+                Err(_) if entry.trim().is_empty() => None,
+                Err(reason) => {
+                    warn!(field, %reason, "ignoring invalid address entry");
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+/// Precompile a route's allow/deny patterns (bare IPs or CIDRs) into
 /// `IpNet` ranges once at config-reload time, so `check_ip_allow_deny`
 /// does not re-parse every entry on each request (audit hot-path finding).
 /// A bare IP becomes a host route (`/32` or `/128`), matching the
 /// exact-equality semantics of `ip_matches` for well-formed client IPs.
-/// Unparseable patterns are dropped; the caller keeps the original list's
-/// emptiness as the allowlist gate, so an all-malformed allowlist still
-/// blocks (fail-closed) rather than degrading to allow-all.
+/// Unparseable patterns are dropped by [`parse_cidrs_skipping`]; the
+/// caller keeps the original list's emptiness as the allowlist gate, so
+/// an all-malformed allowlist still blocks (fail-closed) rather than
+/// degrading to allow-all.
 pub(crate) fn compile_ip_patterns(patterns: &[String]) -> Vec<ipnet::IpNet> {
-    patterns
-        .iter()
-        .filter_map(|p| {
-            if p.contains('/') {
-                p.parse::<ipnet::IpNet>().ok()
-            } else {
-                p.parse::<std::net::IpAddr>().ok().map(ipnet::IpNet::from)
-            }
-        })
-        .collect()
+    parse_cidrs_skipping(patterns, "route ip_allowlist / ip_denylist")
 }
 
 /// Build the `Location` header value for a `redirect_to` rule.
@@ -134,8 +160,8 @@ impl LoricaProxy {
         lorica_api::log_sinks::publish_waf(ev, None, None);
     }
 
-    /// Record that a request body crossed `WAF_BODY_SCAN_MAX` while
-    /// the route's WAF was in Detection mode (v1.5.1 audit H-2).
+    /// Record that a request body crossed `ctx.waf_body_scan_max`
+    /// while the route's WAF was in Detection mode (v1.5.1 audit H-2).
     ///
     /// Idempotent per request via `ctx.waf_body_truncated` so that a
     /// streaming chunked body that produces N chunks past the cap
@@ -143,7 +169,7 @@ impl LoricaProxy {
     /// dashboard with one event per chunk). Mirrors ModSecurity's
     /// `ProcessPartial` action and AWS WAF's `Continue`
     /// oversize-handling : the request proceeds with whatever the
-    /// scanner already buffered (the first `WAF_BODY_SCAN_MAX`
+    /// scanner already buffered (the first `ctx.waf_body_scan_max`
     /// bytes), but the operator gets a first-class signal in the
     /// WAF event log so they can decide to flip the route to
     /// Blocking or raise the cap.
@@ -158,15 +184,17 @@ impl LoricaProxy {
             return;
         }
         ctx.waf_body_truncated = true;
+        let cap = ctx.waf_body_scan_max;
 
         warn!(
             received = observed_size,
-            cap = WAF_BODY_SCAN_MAX,
+            cap = cap,
             route_id = route_id,
             "request body exceeds WAF scan window (partial scan, detection mode)"
         );
 
         lorica_api::metrics::record_waf_event("protocol_violation", "detected");
+        lorica_api::metrics::inc_waf_body_scan_outcome("truncated");
         self.waf_counts
             .entry(("protocol_violation".to_string(), "detected".to_string()))
             .or_insert_with(|| AtomicU64::new(0))
@@ -175,7 +203,7 @@ impl LoricaProxy {
         let ev = lorica_waf::WafEvent {
             rule_id: 0,
             description: format!(
-                "request body ({observed_size} bytes) exceeded WAF scan window ({WAF_BODY_SCAN_MAX} bytes); partial scan only"
+                "request body ({observed_size} bytes) exceeded WAF scan window ({cap} bytes); partial scan only"
             ),
             category: lorica_waf::RuleCategory::ProtocolViolation,
             severity: 5,
@@ -185,6 +213,63 @@ impl LoricaProxy {
             client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
             route_hostname: route_hostname.to_string(),
             action: "detected".to_string(),
+        };
+        self.persist_waf_event(&ev);
+    }
+
+    /// Record that the node-wide scan budget refused this request's
+    /// body, which is why it was forwarded unscanned (Story 10.6 AC
+    /// #7, the `ScanSkippedBudget` event).
+    ///
+    /// Idempotent per request via `ctx.waf_body_scan_skipped_budget`,
+    /// for the same reason its neighbour
+    /// [`Self::record_waf_body_truncated`] is: a chunked body would
+    /// otherwise produce one event per chunk.
+    ///
+    /// The action reads `skipped`, not `detected` or `blocked`: no
+    /// rule fired and nothing was refused, the node declined to look.
+    /// That distinction is the whole value of the event, because the
+    /// operator reading it has a scan gap to size, not an attack to
+    /// investigate.
+    pub(super) fn record_waf_body_scan_skipped_budget(
+        &self,
+        ctx: &mut RequestCtx,
+        route_id: &str,
+        route_hostname: &str,
+        observed_size: u64,
+    ) {
+        if ctx.waf_body_scan_skipped_budget {
+            return;
+        }
+        ctx.waf_body_scan_skipped_budget = true;
+
+        warn!(
+            received = observed_size,
+            budget = crate::proxy_wiring::waf_body_budget().ceiling(),
+            route_id = route_id,
+            "WAF scan buffer budget exhausted; request forwarded unscanned"
+        );
+
+        lorica_api::metrics::record_waf_event("protocol_violation", "skipped");
+        lorica_api::metrics::inc_waf_body_scan_outcome("skipped_budget");
+        self.waf_counts
+            .entry(("protocol_violation".to_string(), "skipped".to_string()))
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+
+        let ev = lorica_waf::WafEvent {
+            rule_id: 0,
+            description: format!(
+                "request body ({observed_size} bytes) not scanned: the node-wide WAF scan buffer budget was exhausted; request forwarded"
+            ),
+            category: lorica_waf::RuleCategory::ProtocolViolation,
+            severity: 5,
+            matched_field: "body_size".to_string(),
+            matched_value: observed_size.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
+            route_hostname: route_hostname.to_string(),
+            action: "skipped".to_string(),
         };
         self.persist_waf_event(&ev);
     }
@@ -2072,8 +2157,9 @@ impl LoricaProxy {
     /// chunked / no-Content-Length case is caught downstream in
     /// `request_body_filter` by the same caps.
     ///
-    /// This is also where `ctx.waf_body_inspect` is decided, because
-    /// it is the last stage that holds the request header, and the
+    /// This is also where `ctx.waf_body_inspect` and
+    /// `ctx.waf_body_scan_max` are decided, because it is the last
+    /// stage that holds both the request header and the route, and the
     /// decision has to be made before the first body chunk arrives.
     /// Terminal: 413.
     pub(super) async fn check_body_limits(
@@ -2114,21 +2200,43 @@ impl LoricaProxy {
                     .and_then(|v| v.to_str().ok()),
             );
 
+        // The effective scan window for this request, resolved once
+        // (Story 10.6 AC #5). `None` on the route means the crate
+        // default; a stored value larger than this platform's `usize`
+        // is clamped rather than wrapped. Every later site reads this
+        // field, never the route and never the constant.
+        ctx.waf_body_scan_max = entry
+            .route
+            .waf_body_scan_max_bytes
+            .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
+            .unwrap_or(WAF_BODY_SCAN_DEFAULT);
+
+        // A body the engine cannot parse is a decision, not a
+        // non-event: it is the one outcome an operator reading
+        // `lorica_waf_body_scans_total` needs in order to tell "the
+        // WAF is watching this route" from "the WAF is watching this
+        // route and never sees its uploads". Only requests that carry
+        // a body count, so a GET flood cannot drown the series.
+        if entry.route.waf_enabled && !ctx.waf_body_inspect && request_has_body(req) {
+            lorica_api::metrics::inc_waf_body_scan_outcome("skipped_content_type");
+        }
+
         // WAF body-scan cap on the advertised Content-Length.
         // Fail-fast here avoids buffering bytes we would reject
         // anyway in `request_body_filter`.
         if ctx.waf_body_inspect {
             if let Some(cl) = req.headers.get("content-length") {
                 if let Ok(len) = cl.to_str().unwrap_or("0").parse::<u64>() {
-                    if len > WAF_BODY_SCAN_MAX as u64 {
+                    if len > ctx.waf_body_scan_max as u64 {
                         match entry.route.waf_mode {
                             WafMode::Blocking => {
                                 warn!(
                                     content_length = len,
-                                    cap = WAF_BODY_SCAN_MAX,
+                                    cap = ctx.waf_body_scan_max,
                                     route_id = %entry.route.id,
                                     "request body exceeds WAF scan window (413, blocking, advertised CL)"
                                 );
+                                lorica_api::metrics::inc_waf_body_scan_outcome("rejected");
                                 let header = lorica_http::ResponseHeader::build(413, None)?;
                                 session
                                     .write_response_header(Box::new(header), true)
@@ -2338,6 +2446,51 @@ mod tests {
     use super::*;
     use ipnet::IpNet;
     use regex::Regex;
+
+    /// The three data-plane address lists (trusted proxies, WAF
+    /// whitelist, per-route allow/deny) used to carry three copies of
+    /// "CIDR, else bare IP, else drop". They now share one parser, so
+    /// this pins the contract for all three: a CIDR is kept, a bare
+    /// address becomes its single-host network, a typo is skipped and
+    /// the rest of the list survives it.
+    #[test]
+    fn the_data_plane_address_lists_share_one_parser() {
+        for field in ["trusted_proxies", "waf_whitelist_ips", "route ip_allowlist"] {
+            let nets = parse_cidrs_skipping(
+                &[
+                    "10.0.0.0/8".to_string(),
+                    "192.0.2.10".to_string(),
+                    "2001:db8::/32".to_string(),
+                    "  ".to_string(),
+                    "not-an-address".to_string(),
+                    "10.0.0.0/33".to_string(),
+                ],
+                field,
+            );
+            assert_eq!(
+                nets,
+                vec![
+                    "10.0.0.0/8".parse::<IpNet>().expect("test cidr"),
+                    "192.0.2.10/32".parse::<IpNet>().expect("test host route"),
+                    "2001:db8::/32".parse::<IpNet>().expect("test v6 cidr"),
+                ],
+                "{field}: a bad entry is skipped, never fatal, and a bare address is a /32"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_allowlist_of_only_typos_compiles_to_nothing() {
+        // The emptiness of the COMPILED list is not the allowlist
+        // gate: the caller reads the original list's emptiness, so an
+        // all-malformed allowlist blocks instead of degrading to
+        // allow-all. This pins the compile half of that contract.
+        assert!(compile_ip_patterns(&["10.0.0.0/33".to_string()]).is_empty());
+        assert_eq!(
+            compile_ip_patterns(&["203.0.113.7".to_string(), "bad".to_string()]),
+            vec!["203.0.113.7/32".parse::<IpNet>().expect("test host route")]
+        );
+    }
 
     fn crawler(name: &str, verification: MergedVerification) -> MergedCrawler {
         MergedCrawler {

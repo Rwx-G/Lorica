@@ -29,9 +29,8 @@ impl ConfigStore {
             )
             .optional()?;
         match json {
-            Some(s) => serde_json::from_str(&s).map_err(|e| {
-                ConfigError::Validation(format!("invalid waf_disabled_rules JSON: {e}"))
-            }),
+            Some(s) => serde_json::from_str(&s)
+                .map_err(|e| ConfigError::Corrupt(format!("invalid waf_disabled_rules JSON: {e}"))),
             None => Ok(Vec::new()),
         }
     }

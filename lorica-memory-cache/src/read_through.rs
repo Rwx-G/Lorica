@@ -770,10 +770,46 @@ mod tests {
         assert_eq!(hit, CacheStatus::Expired);
     }
 
+    /// Wait until the value the background refresh writes is actually
+    /// in the cache, or fail saying so.
+    ///
+    /// This replaces a fixed grace period. The refreshed entry starts
+    /// its own TTL the moment the background task writes it, so a
+    /// fixed sleep spends part of that TTL waiting and leaves the
+    /// remainder for the assertion: on a loaded host the entry could
+    /// expire before the test read it, and the same test then reported
+    /// `Expired` and a third lookup instead of the `Hit` it asserts.
+    /// Polling the inner cache observes exactly the condition the
+    /// assertion needs, costs nothing when the task has already run,
+    /// and triggers no lookup of its own (which `get` would).
+    async fn await_refreshed_value(
+        cache: &RTCache<i32, i32, TestCB, ExtraOpt>,
+        key: &i32,
+        expected: i32,
+    ) {
+        const GIVE_UP_AFTER: Duration = Duration::from_secs(5);
+        let deadline = Instant::now() + GIVE_UP_AFTER;
+        loop {
+            if let (Some(value), CacheStatus::Hit) = cache.inner.get(key) {
+                if value == expected {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the background refresh did not store {expected} within {GIVE_UP_AFTER:?}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
     async fn test_get_stale_while_update() {
         use once_cell::sync::Lazy;
-        let ttl = Some(Duration::from_millis(100));
+        // A TTL wide enough that the assertion after the refresh is
+        // not racing the refreshed entry's own expiry; the staleness
+        // this test needs comes from sleeping past it, just later.
+        let ttl = Some(Duration::from_millis(500));
         static CACHE: Lazy<RTCache<i32, i32, TestCB, ExtraOpt>> =
             Lazy::new(|| RTCache::new(10, None, None));
         let opt = Some(ExtraOpt {
@@ -788,15 +824,17 @@ mod tests {
         let (res, hit) = CACHE.get(&1, ttl, opt.as_ref()).await;
         assert_eq!(res.unwrap(), 1);
         assert_eq!(hit, CacheStatus::Hit);
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         let (res, hit) = CACHE
             .get_stale_while_update(&1, ttl, opt.as_ref(), Duration::from_millis(1000))
             .await;
         assert_eq!(res.unwrap(), 1);
         assert!(hit.stale().is_some());
 
-        // allow the background lookup to finish
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // The synchronisation point: the background lookup has stored
+        // its result, so the read below is a hit on a fresh entry and
+        // not a race with the task that writes it.
+        await_refreshed_value(&CACHE, &1, 2).await;
 
         let (res, hit) = CACHE.get(&1, ttl, opt.as_ref()).await;
         assert_eq!(res.unwrap(), 2);

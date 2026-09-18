@@ -308,7 +308,7 @@ impl WorkerManager {
                 }
                 fd_passing::send_worker_fds(supervisor_cmd.as_raw_fd(), &entries)?;
                 // Supervisor no longer needs its copy of the worker's RPC
-                // FD — it was duplicated into the worker's table via SCM_RIGHTS.
+                // FD - it was duplicated into the worker's table via SCM_RIGHTS.
                 drop(worker_rpc);
 
                 info!(worker_id = id, pid = child.as_raw(), "worker spawned");
@@ -327,7 +327,7 @@ impl WorkerManager {
             ForkResult::Child => {
                 // Child: close supervisor ends, prepare for exec. The worker's
                 // RPC FD is received via SCM_RIGHTS (inside `recv_worker_fds`),
-                // so the direct `worker_rpc` handle here is redundant — drop it
+                // so the direct `worker_rpc` handle here is redundant - drop it
                 // so the child's fd table stays clean.
                 drop(supervisor_cmd);
                 drop(supervisor_rpc);

@@ -121,9 +121,14 @@ impl SelectorUnion {
     /// degrades an unreadable selector to `[]`, i.e. fleet-wide, so a
     /// corrupt row still serves traffic; doing that here would hand key
     /// material or a challenge token to every node in the fleet.
+    ///
+    /// The error is [`ConfigError::Corrupt`], not `Validation`: this
+    /// process wrote the column, so a column it cannot read back says
+    /// the database is damaged, not that a caller sent a bad request.
+    /// The API turns that into a 500, which is the honest answer.
     fn add(&mut self, route_id: &str, raw_selector: &str) -> Result<()> {
         let names: Vec<String> = serde_json::from_str(raw_selector).map_err(|e| {
-            ConfigError::Validation(format!(
+            ConfigError::Corrupt(format!(
                 "node_selector of route {route_id} is not a JSON array of node names: {e}"
             ))
         })?;
@@ -169,9 +174,9 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> Result<ClusterNode> {
         address: row.get(6)?,
         version: row.get(7)?,
         schema_version: row.get(8)?,
-        status: status
-            .parse()
-            .map_err(|e: String| ConfigError::Validation(e))?,
+        // A stored `status` this process wrote and cannot parse back is
+        // a damaged row, not a caller's mistake, so it answers 500.
+        status: status.parse().map_err(ConfigError::Corrupt)?,
         enrolled_at: parse_datetime(&row.get::<_, String>(10)?)?,
         last_seen_at: parse_optional_datetime(row.get(11)?)?,
         applied_config_generation: row.get(12)?,
@@ -472,7 +477,7 @@ impl ConfigStore {
     /// # Errors
     ///
     /// Returns [`ConfigError::Database`] on a read failure, and
-    /// [`ConfigError::Validation`] when a stored `node_selector` is not
+    /// [`ConfigError::Corrupt`] when a stored `node_selector` is not
     /// a JSON array of strings. That case fails closed on purpose:
     /// `row_to_route` degrades an unreadable selector to "fleet-wide"
     /// so a corrupt row still serves traffic, but doing the same here
@@ -514,7 +519,7 @@ impl ConfigStore {
     /// # Errors
     ///
     /// Returns [`ConfigError::Database`] on a read failure, and
-    /// [`ConfigError::Validation`] when a stored `node_selector` is not
+    /// [`ConfigError::Corrupt`] when a stored `node_selector` is not
     /// a JSON array of strings, failing closed for the same reason
     /// [`ConfigStore::cert_key_recipients`] does.
     pub fn certificates_entitling_node(&self, node_id: &str) -> Result<Vec<String>> {
@@ -542,7 +547,7 @@ impl ConfigStore {
     /// # Errors
     ///
     /// Returns [`ConfigError::Database`] on a read failure, and
-    /// [`ConfigError::Validation`] when a stored `node_selector` is not
+    /// [`ConfigError::Corrupt`] when a stored `node_selector` is not
     /// a JSON array of strings, failing closed for the same reason
     /// [`ConfigStore::cert_key_recipients`] does.
     pub fn certificates_by_node(&self) -> Result<BTreeMap<String, Vec<String>>> {
@@ -636,7 +641,7 @@ impl ConfigStore {
     /// # Errors
     ///
     /// Returns [`ConfigError::Database`] on a read failure, and
-    /// [`ConfigError::Validation`] when a stored `node_selector` is not
+    /// [`ConfigError::Corrupt`] when a stored `node_selector` is not
     /// a JSON array of strings, failing closed for the same reason
     /// [`ConfigStore::cert_key_recipients`] does.
     pub fn challenge_recipients(&self, hostname: &str) -> Result<Vec<String>> {
@@ -654,7 +659,7 @@ impl ConfigStore {
             for row in rows {
                 let (route_id, route_hostname, raw_aliases, raw_selector) = row?;
                 let aliases: Vec<String> = serde_json::from_str(&raw_aliases).map_err(|e| {
-                    ConfigError::Validation(format!(
+                    ConfigError::Corrupt(format!(
                         "hostname_aliases of route {route_id} is not a JSON array of \
                          hostnames: {e}"
                     ))

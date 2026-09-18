@@ -263,7 +263,30 @@ pub struct CertDistributor {
     round: tokio::sync::Mutex<()>,
     /// Bound on one push exchange with one node. Default
     /// [`crate::replication::DEFAULT_PER_NODE_DEADLINE`].
-    pub per_node_deadline: Duration,
+    ///
+    /// Not operator configuration: there is no flag, no setting and no
+    /// construction site that sets it other than [`Default`]. It is
+    /// `pub(crate)` so this crate's tests can shrink it, and no wider,
+    /// because a `pub` field on a production struct reads as a knob
+    /// somebody can turn (backlog #57). Threading real tuning from the
+    /// CLI is a separate decision, wanted the day a high-latency WAN
+    /// link makes a slow node look like a quarantined one.
+    pub(crate) per_node_deadline: Duration,
+}
+
+impl CertDistributor {
+    /// Shorten the per-node deadline.
+    ///
+    /// Consuming, so it can only be set while the object is being
+    /// built, never on one that is running a round. It exists for
+    /// tests that must not wait out a real deadline, and it is the
+    /// shape operator tuning would take if it is ever threaded from
+    /// the CLI (backlog #57). It is not that tuning today: no flag and
+    /// no setting reaches it.
+    pub fn with_per_node_deadline(mut self, deadline: Duration) -> Self {
+        self.per_node_deadline = deadline;
+        self
+    }
 }
 
 impl Default for CertDistributor {
@@ -617,8 +640,10 @@ mod tests {
         }
     }
 
-    fn fast(distributor: &mut CertDistributor) {
-        distributor.per_node_deadline = Duration::from_millis(300);
+    /// A distributor whose deadline is short enough not to stall the
+    /// suite on a deliberately wedged peer.
+    fn fast() -> CertDistributor {
+        CertDistributor::new().with_per_node_deadline(Duration::from_millis(300))
     }
 
     fn names(nodes: &[&str]) -> Vec<String> {
@@ -642,8 +667,7 @@ mod tests {
             Behaviour::Accept,
             AppliedConfig::default(),
         );
-        let mut distributor = CertDistributor::new();
-        fast(&mut distributor);
+        let distributor = fast();
 
         let report = distributor
             .push(&registry, &names(&["node-a"]), vec![bundle("cert-1")])
@@ -678,8 +702,7 @@ mod tests {
             Behaviour::Silent,
             AppliedConfig::default(),
         );
-        let mut distributor = CertDistributor::new();
-        fast(&mut distributor);
+        let distributor = fast();
 
         let report = distributor
             .push(
@@ -714,8 +737,7 @@ mod tests {
             Behaviour::Accept,
             AppliedConfig::default(),
         );
-        let mut distributor = CertDistributor::new();
-        fast(&mut distributor);
+        let distributor = fast();
 
         // Named as a recipient AND connected, and still not addressed:
         // a node awaiting operator activation receives no key material
@@ -746,8 +768,7 @@ mod tests {
                 break_glass: true,
             },
         );
-        let mut distributor = CertDistributor::new();
-        fast(&mut distributor);
+        let distributor = fast();
 
         let report = distributor
             .push(&registry, &names(&["node-a"]), vec![bundle("cert-1")])
@@ -768,8 +789,7 @@ mod tests {
             Behaviour::Accept,
             AppliedConfig::default(),
         );
-        let mut distributor = CertDistributor::new();
-        fast(&mut distributor);
+        let distributor = fast();
 
         let oversized: Vec<CertBundle> = (0..=MAX_CERT_BUNDLES)
             .map(|i| bundle(&format!("cert-{i}")))
@@ -799,8 +819,7 @@ mod tests {
             Behaviour::Accept,
             AppliedConfig::default(),
         );
-        let mut distributor = CertDistributor::new();
-        fast(&mut distributor);
+        let distributor = fast();
 
         let mut broken = bundle("cert-1");
         broken.key_digest = "not-a-digest".to_string();
@@ -835,8 +854,7 @@ mod tests {
             Behaviour::RefuseAll,
             AppliedConfig::default(),
         );
-        let mut distributor = CertDistributor::new();
-        fast(&mut distributor);
+        let distributor = fast();
 
         let report = distributor
             .push(
@@ -869,8 +887,7 @@ mod tests {
             Behaviour::OverLongAck,
             AppliedConfig::default(),
         );
-        let mut distributor = CertDistributor::new();
-        fast(&mut distributor);
+        let distributor = fast();
 
         let report = distributor
             .push(&registry, &names(&["node-a"]), vec![bundle("cert-1")])

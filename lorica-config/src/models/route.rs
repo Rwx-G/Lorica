@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::automation_environment::ManagedBy;
 use super::enums::{HeaderMatchType, LoadBalancing, PathMatchType, WafMode};
 
 /// Per-path override that layers on top of a [`Route`]. A matching rule
@@ -396,7 +397,7 @@ fn default_forward_auth_timeout_ms() -> u32 {
 ///
 /// When `scope = PerIp`, each client IP gets its own bucket. When
 /// `scope = PerRoute`, a single shared bucket caps aggregate route
-/// traffic regardless of client — useful to protect an origin that
+/// traffic regardless of client - useful to protect an origin that
 /// cannot handle more than X rps total.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -444,7 +445,7 @@ impl RateLimit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RateLimitScope {
-    /// One bucket per `(route_id, client_ip)`. Default — protects
+    /// One bucket per `(route_id, client_ip)`. Default: protects
     /// against a single abusive client without penalising the rest.
     #[default]
     PerIp,
@@ -618,6 +619,21 @@ pub struct Route {
     /// Hard cap on request body size in bytes. `None` = no limit.
     #[serde(default)]
     pub max_request_body_bytes: Option<u64>,
+    /// How many bytes of an inspectable request body the WAF may
+    /// buffer on this route before the oversize path takes over.
+    /// `None` = the crate default in `lorica-waf`.
+    ///
+    /// Per route rather than global because the memory cost is
+    /// `value x concurrent inspectable requests on this route`: an
+    /// API that legitimately posts 5 MB of JSON needs a wider window
+    /// than the default, and granting it fleet-wide would multiply
+    /// the worst case across every route that never needed it. It is
+    /// not a body size limit; `max_request_body_bytes` is, and the
+    /// two are independent. Content-Type gating decides whether a
+    /// body is buffered at all, so this only widens the window for
+    /// bodies the engine can actually parse.
+    #[serde(default)]
+    pub waf_body_scan_max_bytes: Option<u64>,
     /// Whether `Upgrade: websocket` requests are proxied.
     #[serde(default = "default_websocket_enabled")]
     pub websocket_enabled: bool,
@@ -830,6 +846,15 @@ pub struct Route {
     /// [`NODE_SELECTOR_MAX_ENTRIES`] entries.
     #[serde(default)]
     pub node_selector: Vec<String>,
+    /// Who manages this route when it is not the operator (Story 10.4
+    /// AC #8). `None` is operator-managed: every row written before
+    /// the mark existed, and every row the dashboard creates. A
+    /// `Some` is shown as a badge and refused in-place edits, so a
+    /// manual fix is not silently overwritten by the next pipeline
+    /// `PUT`. Replicates with the row so a follower's dashboard
+    /// applies the same refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<ManagedBy>,
     /// First-insert timestamp (DB-assigned).
     pub created_at: DateTime<Utc>,
     /// Last-write timestamp (refreshed on every UPDATE).
@@ -954,7 +979,7 @@ pub enum BotProtectionMode {
 }
 
 /// Five-category bypass rule set. Each non-empty field is a
-/// separate early-exit to the backend — the order of evaluation is
+/// separate early-exit to the backend - the order of evaluation is
 /// documented in the architecture doc § 6.3. A request matching ANY
 /// rule skips the challenge entirely. Rules are additive: setting
 /// `ip_cidrs` does not disable the other categories.
@@ -1034,7 +1059,7 @@ pub struct BotProtectionConfig {
     /// Captcha modes but persisted.
     #[serde(default = "default_captcha_alphabet")]
     pub captcha_alphabet: String,
-    /// Bypass matrix. All categories default to empty lists — the
+    /// Bypass matrix. All categories default to empty lists - the
     /// feature starts in "challenge every request" mode and the
     /// operator whitelists over time.
     #[serde(default)]

@@ -15,6 +15,9 @@ pub mod ai_crawler_registry;
 /// Byte-stable canonical config encoder for cluster drift detection
 /// and replication (Epic 9).
 pub mod canonical;
+/// The one definition of an operator-supplied CIDR entry, plus the
+/// pure connection-filter policy built on it.
+pub mod connection_filter;
 /// AES-GCM encryption primitives for sensitive fields at rest.
 pub mod crypto;
 /// Typed diff between two configuration snapshots.
@@ -34,8 +37,11 @@ pub mod store;
 mod tests;
 
 pub use canonical::{
-    canonical_bytes, canonical_config, canonical_hash, decode_canonical, CanonicalConfig,
-    CanonicalGlobalSettings, CanonicalWafRule, CANONICAL_FORMAT_VERSION,
+    canonical_bytes, canonical_config, canonical_hash, decode_canonical, CanonicalCaptureRule,
+    CanonicalConfig, CanonicalGlobalSettings, CanonicalWafRule, CANONICAL_FORMAT_VERSION,
+};
+pub use connection_filter::{
+    parse_cidr, validate_cidr, validate_cidr_list, ConnectionFilterPolicy,
 };
 pub use crypto::EncryptionKey;
 pub use error::{ConfigError, Result};

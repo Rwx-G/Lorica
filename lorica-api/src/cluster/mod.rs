@@ -312,6 +312,19 @@ pub struct NodeResponse {
     pub node: ClusterNode,
     /// Whether the node holds an operational session right now.
     pub connected: bool,
+    /// The control plane's own drift verdict for this node, formed the
+    /// same way `/cluster/drift` forms it: generation and hash, taken
+    /// from the live session when there is one and from the registry
+    /// row otherwise.
+    ///
+    /// Present so a reader does not have to recompute it. The
+    /// dashboard did, from the registry generation alone, and answered
+    /// a different question: it kept a drift pill for up to the 30 s
+    /// flush interval after a node converged by pull, and never showed
+    /// one for a divergence that kept the generation and changed the
+    /// hash (backlog #71).
+    #[serde(flatten)]
+    pub drift: crate::cluster::runtime::DriftVerdict,
     /// The live session's peer address, when connected.
     pub session_peer: Option<String>,
     /// Unix seconds of the live session's last activity.
@@ -373,8 +386,16 @@ fn node_responses(
         .into_iter()
         .map(|node| {
             let session = live.get(&node.node_id);
+            let expected = control.expected_config_version(&node.node_id);
+            let drift = crate::cluster::runtime::evaluate_drift(
+                &expected,
+                node.applied_config_generation,
+                &node.applied_config_hash,
+                session.map(|s| &s.applied),
+            );
             NodeResponse {
                 connected: session.is_some(),
+                drift,
                 session_peer: session.map(|s| s.peer_addr.to_string()),
                 session_last_seen_unix: session.map(|s| s.last_seen_unix),
                 resources: (role >= Role::Operator)

@@ -10,6 +10,8 @@
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import RouteDrawer from '../components/RouteDrawer.svelte';
   import NginxImportWizard from '../components/NginxImportWizard.svelte';
+  import AutomationBadge from '../components/AutomationBadge.svelte';
+  import { managedEditHint } from '../lib/managed-by';
   import { showToast } from '../lib/toast';
   import { canWrite } from '../lib/auth';
 
@@ -52,7 +54,7 @@
   let togglingRouteId: string | null = $state(null);
 
   function requestMaintenanceToggle(route: RouteResponse) {
-    if (togglingRouteId === route.id) return;
+    if (togglingRouteId === route.id || route.managed_by) return;
     if (route.maintenance_mode) {
       // Turning OFF: safe, restores normal service, fire immediately.
       void applyMaintenance(route, false);
@@ -115,6 +117,9 @@
   }
 
   function openEditForm(route: RouteResponse) {
+    // The button is disabled for a managed route; this guard covers a
+    // keyboard or scripted click that bypasses the attribute.
+    if (route.managed_by) return;
     editingRoute = route;
     showDrawer = true;
   }
@@ -129,6 +134,14 @@
     }
     deletingRoute = null;
     await loadData();
+  }
+
+  function deleteRouteMessage(route: RouteResponse): string {
+    const target = `${route.hostname}${route.path_prefix}`;
+    if (route.managed_by) {
+      return `Delete the route for ${target}? It is managed by the automation API: the whole environment "${route.managed_by.environment}" is deleted with it, and the pipeline will have to recreate it. This action cannot be undone.`;
+    }
+    return `Are you sure you want to delete the route for ${target}? This action cannot be undone.`;
   }
 
   function certLabel(id: string): string {
@@ -291,6 +304,9 @@
                 {#if route.maintenance_mode}
                   <span class="maintenance-badge" title="Route is in maintenance: all requests return 503">MAINT</span>
                 {/if}
+                {#if route.managed_by}
+                  <AutomationBadge managedBy={route.managed_by} />
+                {/if}
               </td>
               <td class="mono">{route.path_prefix}</td>
               <td>
@@ -322,23 +338,29 @@
               </td>
               <td class="actions">
                 {#if $canWrite}
-                  <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => openEditForm(route)}>
+                  <button
+                    class="btn-icon"
+                    title={route.managed_by ? managedEditHint(route.managed_by) : 'Edit'}
+                    aria-label="Edit {route.hostname}{route.path_prefix}"
+                    disabled={!!route.managed_by}
+                    onclick={() => openEditForm(route)}
+                  >
                     <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                     {@html editIcon}
                   </button>
                   <button
                     class="btn-icon btn-icon-maintenance"
                     class:active={route.maintenance_mode}
-                    title={route.maintenance_mode ? 'Disable maintenance mode' : 'Enable maintenance mode (returns 503 to all requests)'}
+                    title={route.managed_by ? managedEditHint(route.managed_by) : route.maintenance_mode ? 'Disable maintenance mode' : 'Enable maintenance mode (returns 503 to all requests)'}
                     aria-label={route.maintenance_mode ? 'Disable maintenance' : 'Enable maintenance'}
                     aria-pressed={route.maintenance_mode}
-                    disabled={togglingRouteId === route.id}
+                    disabled={togglingRouteId === route.id || !!route.managed_by}
                     onclick={() => requestMaintenanceToggle(route)}
                   >
                     <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                     {@html wrenchIcon}
                   </button>
-                  <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => { deletingRoute = route; }}>
+                  <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete {route.hostname}{route.path_prefix}" onclick={() => { deletingRoute = route; }}>
                     <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                     {@html trashIcon}
                   </button>
@@ -370,7 +392,7 @@
 {#if deletingRoute}
   <ConfirmDialog
     title="Delete Route"
-    message="Are you sure you want to delete the route for {deletingRoute.hostname}{deletingRoute.path_prefix}? This action cannot be undone."
+    message={deleteRouteMessage(deletingRoute)}
     onconfirm={handleDelete}
     oncancel={() => { deletingRoute = null; }}
   />
@@ -518,5 +540,16 @@
 
   .btn-icon-maintenance.active {
     color: var(--color-orange);
+  }
+
+  /* A managed row keeps its action buttons visible but inert, so the
+     operator reads the tooltip instead of wondering where Edit went. */
+  .btn-icon:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .btn-icon:disabled:hover {
+    background: none;
+    color: var(--color-text-muted);
   }
 </style>

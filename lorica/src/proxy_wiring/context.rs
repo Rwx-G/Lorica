@@ -98,13 +98,39 @@ pub struct RequestCtx {
     /// read this field instead of re-deriving the answer per chunk.
     ///
     /// `false` means the body is never buffered, never counted
-    /// against `WAF_BODY_SCAN_MAX`, and never handed to
+    /// against `waf_body_scan_max`, and never handed to
     /// `evaluate_body` - which would have returned `Pass` on it
     /// anyway. The route's `max_request_body_bytes` is then the only
     /// ceiling that applies.
+    ///
+    /// It is also cleared mid-body when the node-wide scan budget
+    /// refuses the next chunk, which is how the fail-open path stops
+    /// every later stage from buffering, capping or scanning.
     pub waf_body_inspect: bool,
+    /// Bytes of this request's body the WAF will buffer at most.
+    ///
+    /// Resolved once in `check_body_limits` from the route's
+    /// `waf_body_scan_max_bytes`, falling back to
+    /// `WAF_BODY_SCAN_DEFAULT` (Story 10.6 AC #5). Both the
+    /// Content-Length path and the chunked path read this field, so
+    /// neither re-reads the route snapshot per chunk and neither can
+    /// enforce a different cap than the other.
+    pub waf_body_scan_max: usize,
+    /// Bytes this request holds against the node-wide WAF scan budget.
+    ///
+    /// `None` until the first chunk is actually buffered, so a request
+    /// with no inspectable body costs no reservation at all. Dropping
+    /// it releases the bytes, which is why the release is never
+    /// written out: the context is dropped whatever path the request
+    /// took, including a connection the client abandoned mid-body.
+    pub waf_body_reservation: Option<crate::byte_budget::ByteReservation>,
+    /// Set to true the first time the scan budget refuses this
+    /// request's body, so the `ScanSkippedBudget` event is emitted
+    /// once per request rather than once per chunk. Its neighbour
+    /// `waf_body_truncated` does the same job for truncation.
+    pub waf_body_scan_skipped_budget: bool,
     /// Set to true the first time the request body crosses
-    /// `WAF_BODY_SCAN_MAX` in Detection mode, so the corresponding
+    /// `waf_body_scan_max` in Detection mode, so the corresponding
     /// `WafEvent` (`BodyTruncated`) is emitted once per request
     /// rather than on every subsequent chunk. Has no effect in
     /// Blocking mode (the request is rejected with 413 instead).
@@ -174,7 +200,7 @@ pub struct RequestCtx {
     /// captured via `Span::current()` at the top of that hook so the
     /// downstream hooks (`upstream_request_filter`, `response_filter`,
     /// `logging`, `fail_to_proxy`) can parent their own `#[instrument]`
-    /// spans under it — producing a clean nested tree in Jaeger /
+    /// spans under it - producing a clean nested tree in Jaeger /
     /// Tempo when the `otel` feature is on (the
     /// `tracing_opentelemetry` bridge installed in `init_logging`
     /// mirrors every tracing span to an OTel span, inheriting the
@@ -183,4 +209,28 @@ pub struct RequestCtx {
     /// field starts as `tracing::Span::none()` in `new_ctx` and is
     /// replaced at the top of `request_filter`.
     pub root_tracing_span: tracing::Span,
+    /// Traffic capture state (Story 10.1). `Some` only for a request at
+    /// least one capture rule considered, decided once in
+    /// `request_filter` and never revisited per body chunk.
+    ///
+    /// `Box` so the overwhelmingly common case - no capture rule on the
+    /// route - costs one null pointer check per hook and no allocation,
+    /// instead of widening every `RequestCtx` by the buffers, the rule
+    /// ids and the budget reservation.
+    ///
+    /// Separate from `waf_body_buffer` on purpose: the WAF reads the
+    /// request body while the request is still being forwarded and has
+    /// no use for it afterwards, while a capture is only decided once
+    /// the response is known. The two buffers have different caps,
+    /// different lifetimes, and different contents (the WAF skips a
+    /// body it cannot parse).
+    ///
+    /// It also carries the route it was admitted on and the compiled
+    /// rule set that admitted it, so `logging` does not read
+    /// `route_id` below: that field is set in `upstream_peer`, which a
+    /// request refused inside `request_filter` never reaches.
+    ///
+    /// Released in `logging`, which moves it out of the context; see the
+    /// comment there.
+    pub capture: Option<Box<crate::capture::CaptureState>>,
 }

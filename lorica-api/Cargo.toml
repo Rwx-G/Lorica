@@ -1,6 +1,6 @@
 [package]
 name = "lorica-api"
-version = "1.7.4"
+version = "1.8.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -8,15 +8,15 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
-lorica-acme = { version = "1.7.4", path = "../lorica-acme" }
+lorica-acme = { version = "1.8.0", path = "../lorica-acme" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-config = { version = "1.7.4", path = "../lorica-config" }
-lorica-dashboard = { version = "1.7.4", path = "../lorica-dashboard" }
-lorica-metrics = { version = "1.7.4", path = "../lorica-metrics" }
-lorica-waf = { version = "1.7.4", path = "../lorica-waf" }
-lorica-notify = { version = "1.7.4", path = "../lorica-notify" }
-lorica-bench = { version = "1.7.4", path = "../lorica-bench" }
-lorica-cluster = { version = "1.7.4", path = "../lorica-cluster" }
+lorica-config = { version = "1.8.0", path = "../lorica-config" }
+lorica-dashboard = { version = "1.8.0", path = "../lorica-dashboard" }
+lorica-metrics = { version = "1.8.0", path = "../lorica-metrics" }
+lorica-waf = { version = "1.8.0", path = "../lorica-waf" }
+lorica-notify = { version = "1.8.0", path = "../lorica-notify" }
+lorica-bench = { version = "1.8.0", path = "../lorica-bench" }
+lorica-cluster = { version = "1.8.0", path = "../lorica-cluster" }
 # Used in `certificates.rs::validate_certificate_bundle` to gate
 # every cert upload (POST /certificates, PUT /certificates/{id},
 # POST /config/import) with the exact loader the worker uses :
@@ -30,7 +30,11 @@ lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 axum = { version = "0.8", features = ["multipart", "ws"] }
 futures-util = "0.3"
 tower = "0.5"
-tower-http = { version = "0.7", features = ["cors"] }
+# `catch-panic` is the automation plane's panic net (Story 10.5 audit
+# A2): the audit layer promises every request lands a row, which an
+# unwinding handler would break in the one case an operator most wants
+# the row. Feature on a crate already here, not a new dependency.
+tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
 # `net` was added for the Story 9.8 log-export sinks (UDP / TCP /
 # TCP+TLS syslog client sockets); no new crate, tokio already ships it.
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time", "net"] }
@@ -58,6 +62,15 @@ argon2 = "0.6"
 # `generate`, so the optional `rand_core` feature stays off and no
 # extra RNG dep is pulled.
 ed25519-dalek = "3"
+# GitLab OIDC ID tokens on the automation listener (Story 10.5).
+# Approved by the maintainer on 2026-09-16. Pinned to the current
+# stable major. `aws_lc_rs` is the backend rather than `rust_crypto`
+# because the latter pulls the `rsa` crate, which carries the open
+# RUSTSEC-2023-0071 (Marvin) advisory with no patched release, and
+# `cargo audit` is a CI gate. `aws-lc-rs` is already in the lockfile
+# through the `route53` feature path. No `use_pem`: the verifier
+# builds its keys from JWK components, never from PEM.
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
 rand = "0.9"
 rand_chacha = "0.9"
 rcgen = "0.14"
@@ -79,7 +92,17 @@ sysinfo = "0.39"
 # `#![deny(unsafe_code)]` stays intact.
 nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
 thiserror = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+# `rustls-tls-native-roots` sits beside the webpki bundle rather than
+# replacing it: with both on, reqwest seeds its root store from
+# webpki-roots AND from the platform store, which is where a
+# distribution's CA bundle and anything `SSL_CERT_FILE` points at
+# land. Without it the OIDC JWKS fetch (Story 10.5) trusts webpki's
+# public roots only, so a self-hosted GitLab under a corporate PKI
+# answered every ID token with `jwks_unavailable` however the host was
+# configured. `rustls-native-certs` is already in the lockfile through
+# the cluster TLS stack, so this is a feature flag and not a new
+# dependency.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots", "json"] }
 async-trait = { workspace = true }
 base64 = "0.23"
 dashmap = "6"
@@ -113,6 +136,13 @@ default = []
 route53 = ["lorica-acme/route53"]
 
 [dev-dependencies]
+# Test-only RSA key generation for the OIDC verifier tests (Story
+# 10.5): the mock issuer needs a signing key and neither `ring` nor
+# `jsonwebtoken` can generate one. Not a new crate in the tree: it is
+# the backend `jsonwebtoken` already builds above, named here so the
+# tests can reach it directly instead of checking a private key into
+# the repository.
+aws-lc-rs = "1"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 hyper = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }

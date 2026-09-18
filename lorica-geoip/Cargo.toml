@@ -1,6 +1,6 @@
 [package]
 name = "lorica-geoip"
-version = "1.7.4"
+version = "1.8.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "GeoIP country-code lookup for Lorica, wrapping maxminddb"
@@ -25,7 +25,7 @@ serde = { version = "1", features = ["derive"] }
 # the rest of the workspace (forward_auth, ACME, OTel exporter); we
 # reuse the rustls-webpki-roots feature so the download path reuses
 # the same TLS stack Lorica already depends on. `flate2` decompresses
-# the .mmdb.gz payload — no zlib / gzip dep otherwise.
+# the .mmdb.gz payload - no zlib / gzip dep otherwise.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
 flate2 = "1"
 tokio = { version = "1", features = ["fs", "io-util", "time", "rt"] }

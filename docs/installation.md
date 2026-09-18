@@ -22,6 +22,15 @@ The post-install hook enables and starts the service. Lorica listens on
 only). The initial admin password is written to
 `/var/lib/lorica/initial-admin-password` (mode 0600).
 
+Two further listeners exist and neither opens unless you ask for it on
+the command line. `--cluster-listen` (v1.7.0) serves the fleet's control
+plane, 9444 and 9445 by convention, and only a control plane needs it:
+followers dial out and expose nothing. `--automation-listen` (v1.8.0)
+serves the CI automation API, 9446 by convention, and refuses to open
+until `automation_allowed_cidrs` names the sources allowed to reach it.
+See `docs/cluster.md` and `docs/automation.md`; both surfaces are
+covered by `docs/security/hardening-guide.md`.
+
 The management plane on 9443 is served over TLS. On first boot Lorica
 generates a self-signed certificate (SANs `localhost`, the machine
 hostname, `127.0.0.1`, `::1`) under `/var/lib/lorica/management/` and

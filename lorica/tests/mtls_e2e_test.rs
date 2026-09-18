@@ -29,6 +29,10 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::reserve_port;
+
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
@@ -253,6 +257,8 @@ fn mtls_route(ca_pem: &str, required: bool, orgs: Vec<&str>) -> Route {
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        managed_by: None,
+        waf_body_scan_max_bytes: None,
         created_at: now,
         updated_at: now,
     }
@@ -519,11 +525,6 @@ impl ShutdownSignalWatch for ManualShutdown {
     }
 }
 
-fn reserve_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 async fn wait_for_port(port: u16) {
     for _ in 0..100 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -614,6 +615,7 @@ fn upstream_backend(id: &str, addr: std::net::SocketAddr) -> Backend {
         active_connections: 0,
         tls_upstream: false,
         tls_skip_verify: false,
+        managed_by: None,
         tls_sni: None,
         h2_upstream: false,
         created_at: now,

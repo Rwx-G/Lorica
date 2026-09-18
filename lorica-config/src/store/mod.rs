@@ -27,8 +27,11 @@ use crate::error::{ConfigError, Result};
 
 mod acme_challenges;
 mod ai_crawlers;
+mod automation_environment;
+mod automation_token;
 mod backends;
 pub mod bot_stash;
+mod capture;
 mod cert_export_acls;
 mod certs;
 mod cluster_ca;
@@ -40,6 +43,7 @@ pub use cluster_nodes::LiveNodeFacts;
 mod dns_providers;
 mod loadtest;
 mod notifications;
+mod oidc_issuer;
 mod preferences;
 mod probes;
 mod replica;
@@ -175,6 +179,12 @@ const MIGRATIONS: &[Migration] = &[
     (53, migrate_cluster_node_name_unique),
     (54, migrate_acme_challenge_expiry),
     (55, migrate_sla_buckets_drop_route_cascade),
+    (56, migrate_capture_rules),
+    (57, migrate_api_tokens),
+    (58, migrate_automation_environments),
+    (59, migrate_oidc_issuers),
+    (60, migrate_oidc_issuer_ca_pem),
+    (61, migrate_route_waf_body_scan_cap),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -946,6 +956,203 @@ fn migrate_sla_buckets_drop_route_cascade(conn: &Connection) -> rusqlite::Result
     )
 }
 
+/// Story 10.1: traffic-capture rules.
+///
+/// `route_id` is `ON DELETE CASCADE` because a capture rule describes
+/// what to record on one route: a rule outliving its route is a
+/// recorder pointed at nothing, and the operator who deleted the route
+/// has already said what should happen to it. This is the `sla_configs`
+/// stance, not the `sla_buckets` one (migration 55): configuration for
+/// a route cascades, a record of what that route served does not.
+///
+/// The nested blocks are JSON columns, matching how `routes` stores
+/// `path_rules` and `header_rules`. The two counters are plain integer
+/// columns because they are the one part of the row a hot path writes.
+fn migrate_capture_rules(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS capture_rules (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            route_id TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            match_json TEXT NOT NULL,
+            emit_json TEXT NOT NULL,
+            capture_json TEXT NOT NULL,
+            limits_json TEXT NOT NULL,
+            output_json TEXT NOT NULL,
+            redact_json TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            captures_emitted INTEGER NOT NULL DEFAULT 0,
+            captures_dropped INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_capture_rules_route
+            ON capture_rules(route_id);
+        CREATE INDEX IF NOT EXISTS idx_capture_rules_expires_at
+            ON capture_rules(expires_at);",
+    )
+}
+
+/// Story 10.3: scoped automation tokens.
+///
+/// No foreign key and no cascade: a token is a credential held by
+/// something outside this node, not configuration attached to a route,
+/// so nothing here should be able to delete one as a side effect.
+///
+/// The lists are JSON columns because nothing queries inside them:
+/// every read is by `public_id` (one presentation, one lookup) or is
+/// the operator's full listing. The index carries the "which tokens can
+/// still be used" question, which is the only filtered read.
+///
+/// `revoked_at` is a timestamp rather than a boolean so the listing can
+/// say when a credential was withdrawn, and the row outlives the
+/// revocation for exactly that reason.
+fn migrate_api_tokens(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS api_tokens (
+            public_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            secret_hmac TEXT NOT NULL,
+            scopes_json TEXT NOT NULL,
+            allowed_hostnames_json TEXT NOT NULL,
+            allowed_backend_cidrs_json TEXT NOT NULL,
+            max_ttl_seconds INTEGER NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_used_at TEXT,
+            revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_tokens_live
+            ON api_tokens(revoked_at, expires_at);",
+    )
+}
+
+/// Story 10.4: the environment resource and its ownership marks.
+///
+/// `managed_by` is a nullable JSON column on both `routes` and
+/// `backends`. NULL means operator-managed, which is what every row
+/// written before this migration is, so no backfill: the absence of a
+/// mark IS the operator's mark. JSON rather than a bare string because
+/// the mark carries the environment name today and is an enum on the
+/// model, so the next manager is a variant and not a third column.
+///
+/// `automation_environments.route_id` is `ON DELETE CASCADE` for the
+/// same reason `capture_rules` is (migration 56): the row is
+/// configuration attached to one route, and an environment whose route
+/// is gone has nothing left to describe. It is also UNIQUE, because one
+/// route is owned by at most one environment; two environments claiming
+/// one route would each believe the other's `PUT` was theirs.
+///
+/// The owner, the certificate mode and the labels are JSON columns:
+/// nothing queries inside them. The only filtered reads are by name
+/// and by expiry, which the index carries for the reaper.
+fn migrate_automation_environments(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "routes", "managed_by", "TEXT DEFAULT NULL")?;
+    add_column_if_absent(conn, "backends", "managed_by", "TEXT DEFAULT NULL")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automation_environments (
+            name TEXT PRIMARY KEY,
+            route_id TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+            owner_json TEXT NOT NULL,
+            certificate_mode_json TEXT NOT NULL,
+            labels_json TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_pipeline TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_automation_environments_route
+            ON automation_environments(route_id);
+        CREATE INDEX IF NOT EXISTS idx_automation_environments_expires_at
+            ON automation_environments(expires_at);",
+    )
+}
+
+/// Story 10.5: OIDC issuer entries, and the CI job identity an
+/// environment row records.
+///
+/// `oidc_issuers` has no foreign key and no cascade for the same
+/// reason `api_tokens` has none: an entry is a trust decision about
+/// something outside this node, and nothing here should delete one as
+/// a side effect. The bound claims and the three grant lists are JSON
+/// columns because nothing queries inside them; the one filtered read
+/// is by `audience`, which is what a presented token names first, and
+/// the index carries it.
+///
+/// `automation_environments.pipeline_json` is nullable: a row written
+/// by a static token has no job behind it, and every row written before
+/// this migration is such a row, so there is no backfill.
+fn migrate_oidc_issuers(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "automation_environments",
+        "pipeline_json",
+        "TEXT DEFAULT NULL",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS oidc_issuers (
+            id TEXT PRIMARY KEY,
+            issuer TEXT NOT NULL,
+            audience TEXT NOT NULL,
+            jwks_url TEXT NOT NULL,
+            bound_claims_json TEXT NOT NULL,
+            scopes_json TEXT NOT NULL,
+            allowed_hostnames_json TEXT NOT NULL,
+            allowed_backend_cidrs_json TEXT NOT NULL,
+            max_ttl_seconds INTEGER NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_oidc_issuers_audience
+            ON oidc_issuers(audience);",
+    )
+}
+
+/// Story 10.5 follow-up: the CA an issuer entry pins for its own JWKS
+/// fetch.
+///
+/// Nullable with no backfill, and that is the meaning of the column
+/// rather than an accident of ordering: `NULL` says "fetch on the
+/// node's trust roots", which is what every row written before this
+/// migration did and what a public GitLab wants. A value says "this CA
+/// and nothing else signs that endpoint".
+///
+/// Its own migration rather than an edit of 59: a database created
+/// earlier in the v1.8.0 cycle already carries the table at version 59,
+/// and `CREATE TABLE IF NOT EXISTS` would leave it without the column.
+fn migrate_oidc_issuer_ca_pem(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "oidc_issuers", "ca_pem", "TEXT DEFAULT NULL")
+}
+
+/// Story 10.6 AC #5: the per-route ceiling on how much of an
+/// inspectable request body the WAF buffers.
+///
+/// Nullable with no backfill, and `NULL` is a value rather than a gap:
+/// it says "use the crate default", which is exactly what every route
+/// written before this migration did under the compiled-in constant.
+/// Writing the current default into every row instead would freeze
+/// today's number into the database and silently ignore a later change
+/// to it.
+///
+/// Appended at the end of the table on purpose. `row_to_route` reads
+/// the `routes` columns positionally, so inserting anywhere else would
+/// shift every index after it.
+///
+/// AC #7's `waf_body_scan_max_inflight_bytes` needs no DDL here: global
+/// settings live in the `global_settings` key-value table, and
+/// `get_global_settings` fills a missing key from
+/// `GlobalSettings::default`.
+fn migrate_route_waf_body_scan_cap(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "routes",
+        "waf_body_scan_max_bytes",
+        "INTEGER DEFAULT NULL",
+    )
+}
+
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {
     // Story 9.5 AC #6 / D11: `acme_challenges` carried no timestamp, no
     // index and no purge, so an order that died between the write and
@@ -1153,11 +1360,11 @@ impl ConfigStore {
             Some(key) => {
                 let plaintext = key.decrypt(data)?;
                 String::from_utf8(plaintext).map_err(|e| {
-                    ConfigError::Validation(format!("decrypted key_pem is not valid UTF-8: {e}"))
+                    ConfigError::Corrupt(format!("decrypted key_pem is not UTF-8: {e}"))
                 })
             }
             None => String::from_utf8(data.to_vec())
-                .map_err(|e| ConfigError::Validation(format!("key_pem is not valid UTF-8: {e}"))),
+                .map_err(|e| ConfigError::Corrupt(format!("stored key_pem is not UTF-8: {e}"))),
         }
     }
 
@@ -1192,10 +1399,12 @@ impl ConfigStore {
             Some(key) => {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(stored)
-                    .map_err(|e| ConfigError::Validation(format!("invalid base64 config: {e}")))?;
+                    .map_err(|e| {
+                        ConfigError::Corrupt(format!("stored config is not valid base64: {e}"))
+                    })?;
                 let plaintext = key.decrypt(&decoded)?;
                 String::from_utf8(plaintext).map_err(|e| {
-                    ConfigError::Validation(format!("decrypted config not UTF-8: {e}"))
+                    ConfigError::Corrupt(format!("decrypted config is not UTF-8: {e}"))
                 })
             }
             None => Ok(stored.to_string()),
@@ -1469,6 +1678,40 @@ impl ConfigStore {
         Ok(value.max(0) as u64)
     }
 
+    /// Run `f` inside ONE SQLite transaction: every store call it makes
+    /// commits together, or none of them does.
+    ///
+    /// Story 10.4 AC #2 is the caller this exists for: an environment
+    /// `PUT` touches four tables, and a failure after the backends are
+    /// staged must leave nothing. Every `ConfigStore` method writes
+    /// through the same connection the transaction is opened on, so a
+    /// caller composes the existing methods and gets atomicity without
+    /// this crate growing a second, transactional copy of each.
+    ///
+    /// The error type is the caller's: a handler keeps its own 4xx
+    /// refusals and still rolls back on them, because returning `Err`
+    /// drops the transaction before `commit`. Nesting is not supported;
+    /// SQLite refuses a `BEGIN` inside a `BEGIN`, so `f` must not call
+    /// this method again.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` returns, plus a database error when the
+    /// transaction cannot begin or commit.
+    pub fn in_transaction<T, E, F>(&self, f: F) -> std::result::Result<T, E>
+    where
+        E: From<ConfigError>,
+        F: FnOnce(&ConfigStore) -> std::result::Result<T, E>,
+    {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(ConfigError::from)?;
+        let out = f(self)?;
+        tx.commit().map_err(ConfigError::from)?;
+        Ok(out)
+    }
+
     /// Clear all importable data before applying a TOML import.
     ///
     /// "Importable" here means : every table whose rows are part of
@@ -1540,6 +1783,7 @@ mod migration_tests {
         "serve_robots_txt",
         "group_name",
         "node_selector",
+        "managed_by",
     ];
 
     fn max_migration_version() -> i64 {
@@ -1596,6 +1840,11 @@ mod migration_tests {
             column_count(&store.conn, "sessions", "role"),
             1,
             "sessions.role must exist after a fresh migration run"
+        );
+        assert_eq!(
+            column_count(&store.conn, "backends", "managed_by"),
+            1,
+            "backends.managed_by must exist after a fresh migration run"
         );
     }
 

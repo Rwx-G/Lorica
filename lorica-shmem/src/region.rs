@@ -116,7 +116,7 @@ impl SharedRegion {
     ///
     /// Called once by the supervisor at startup before any worker is
     /// spawned. The returned `&'static SharedRegion` has the lifetime
-    /// of the process — the supervisor must not unmap it.
+    /// of the process - the supervisor must not unmap it.
     pub fn create_supervisor() -> Result<(&'static SharedRegion, OwnedFd), SharedRegionError> {
         use nix::sys::memfd::{memfd_create, MFdFlags};
 
@@ -233,7 +233,7 @@ mod tests {
         // `dup` takes an `AsFd` and yields an `OwnedFd`; `open_worker`
         // adopts a `RawFd`, so release ownership with `into_raw_fd`.
         let dup_fd = nix::unistd::dup(&fd).expect("dup").into_raw_fd();
-        // The test "worker" shares the same process — in production
+        // The test "worker" shares the same process - in production
         // this fd travels via SCM_RIGHTS to a forked child.
         let worker = unsafe { SharedRegion::open_worker(dup_fd) }.expect("worker open");
         assert_eq!(worker.hash_key, sup.hash_key);

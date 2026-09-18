@@ -103,6 +103,59 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
         return Role::Operator;
     }
 
+    // Traffic-capture rules (Story 10.1). A capture rule writes real
+    // request and response bodies to disk, so arming or editing one is
+    // SuperAdmin, and so is reading one back: the stored rule spells
+    // out the paths, headers and source ranges a node records.
+    //
+    // Two openings sit below that floor, both deliberate. The listing
+    // is Operator+ so an on-call operator can see WHICH rules are
+    // armed without being able to read what any of them records. And
+    // `disable` is Operator+ because stopping a recorder is the safe
+    // direction: someone paged at 3am about a capture filling a disk
+    // must be able to end it without waking the SuperAdmin who armed
+    // it. Arming still takes the higher role.
+    if path == "/api/v1/capture/rules"
+        && (method == http::Method::GET || method == http::Method::HEAD)
+    {
+        return Role::Operator;
+    }
+    if path.starts_with("/api/v1/capture/rules/") && path.ends_with("/disable") {
+        return Role::Operator;
+    }
+    if path == "/api/v1/capture/rules" || path.starts_with("/api/v1/capture/rules/") {
+        return Role::SuperAdmin;
+    }
+    // The recent-captures ring (Story 10.2 AC #5) is Operator+, the
+    // same floor as the listing: a record is what an operator
+    // debugging an incident came for, it has already been redacted,
+    // and a Viewer is not someone who reads production bodies. Stated
+    // explicitly because the GET default below is Viewer.
+    if path == "/api/v1/capture/recent" || path.starts_with("/api/v1/capture/recent/") {
+        return Role::Operator;
+    }
+
+    // Automation tokens (Story 10.3 AC #6) are credentials, so every
+    // method is SuperAdmin, listing included. The listing names which
+    // hostnames each token may claim and which backends it may point
+    // them at, which is the map of what a stolen token is worth; and
+    // minting one hands out authority over a name, which is the same
+    // decision a join token makes and sits at the same floor.
+    if path == "/api/v1/automation/tokens" || path.starts_with("/api/v1/automation/tokens/") {
+        return Role::SuperAdmin;
+    }
+    // OIDC issuer entries (Story 10.5 AC #1) sit at the same floor,
+    // listing included: an entry names the identity provider whose
+    // signed statements this node acts on and the exact claims that
+    // unlock it, which is the map of what a forged or stolen ID token
+    // would be worth. Registering one hands authority over a name to
+    // whoever the issuer says, with no secret this node ever sees.
+    if path == "/api/v1/automation/oidc-issuers"
+        || path.starts_with("/api/v1/automation/oidc-issuers/")
+    {
+        return Role::SuperAdmin;
+    }
+
     if method == http::Method::GET || method == http::Method::HEAD {
         // `format=key` / `format=full` return the private key; the
         // whole download endpoint is treated as secret material
@@ -432,6 +485,27 @@ mod tests {
             Role::Viewer
         );
         assert_eq!(required_role(&Method::GET, "/api/v1/logs/ws"), Role::Viewer);
+    }
+
+    #[test]
+    fn the_recent_captures_ring_is_operator_and_never_viewer() {
+        // Stated because the GET default is Viewer: without the
+        // explicit clause a Viewer would read production bodies.
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/capture/recent"),
+            Role::Operator
+        );
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/capture/recent/0123abcd"),
+            Role::Operator
+        );
+        // Reading one stored rule stays above the ring: the rule spells
+        // out what the node records, the record has already been
+        // redacted.
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/capture/rules/abc"),
+            Role::SuperAdmin
+        );
     }
 
     #[test]

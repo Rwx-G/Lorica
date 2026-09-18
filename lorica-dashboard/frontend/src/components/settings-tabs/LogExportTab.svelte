@@ -13,12 +13,17 @@
     syslog_access_enabled: boolean;
     syslog_waf_enabled: boolean;
     syslog_audit_enabled: boolean;
+    syslog_capture_enabled: boolean;
     syslog_tls_ca_pem: string;
     syslog_tls_client_cert_pem: string;
     syslog_tls_client_key_pem: string;
     syslog_extra_sd: string;
     otlp_logs_enabled: boolean;
     otlp_logs_auth_header: string;
+    otlp_logs_access_enabled: boolean;
+    otlp_logs_waf_enabled: boolean;
+    otlp_logs_audit_enabled: boolean;
+    otlp_logs_capture_enabled: boolean;
   }
 
   interface Props {
@@ -225,6 +230,13 @@
         </label>
       </div>
 
+      <div class="settings-form-row">
+        <label class="toggle-row">
+          <input type="checkbox" bind:checked={settingsForm.syslog_capture_enabled} />
+          Export capture records
+        </label>
+      </div>
+
       {#if settingsForm.syslog_transport === 'tcp-tls'}
         <div class="settings-form-row">
           <label for="syslog-tls-ca">TLS CA bundle (PEM)</label>
@@ -305,6 +317,34 @@
           the Observability section. Requires a Lorica binary built
           with the <code>otel</code> feature.
         </span>
+      </div>
+
+      <div class="settings-form-row">
+        <label class="toggle-row">
+          <input type="checkbox" bind:checked={settingsForm.otlp_logs_access_enabled} />
+          Export access logs via OTLP
+        </label>
+      </div>
+
+      <div class="settings-form-row">
+        <label class="toggle-row">
+          <input type="checkbox" bind:checked={settingsForm.otlp_logs_waf_enabled} />
+          Export WAF events via OTLP
+        </label>
+      </div>
+
+      <div class="settings-form-row">
+        <label class="toggle-row">
+          <input type="checkbox" bind:checked={settingsForm.otlp_logs_audit_enabled} />
+          Export audit logs via OTLP
+        </label>
+      </div>
+
+      <div class="settings-form-row">
+        <label class="toggle-row">
+          <input type="checkbox" bind:checked={settingsForm.otlp_logs_capture_enabled} />
+          Export capture records via OTLP
+        </label>
       </div>
 
       <div class="settings-form-row">

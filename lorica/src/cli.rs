@@ -161,6 +161,20 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) cluster_auto_activate: bool,
 
+    /// Automation API listen address as an explicit `host:port`
+    /// (Story 10.3, opt-in; the API is disabled when absent). A bare
+    /// port is refused; a wildcard host (`0.0.0.0` / `::`) is refused
+    /// unless `--automation-listen-any` is also passed; the management,
+    /// proxy and cluster-plane ports are refused.
+    #[arg(long)]
+    pub(crate) automation_listen: Option<String>,
+
+    /// Explicitly allow a wildcard host in `--automation-listen`.
+    /// Without it the automation API can never be exposed on every
+    /// interface by accident.
+    #[arg(long)]
+    pub(crate) automation_listen_any: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -262,6 +276,87 @@ pub(crate) enum Commands {
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
+    },
+    /// Automation-plane management commands (Story 10.3).
+    Automation {
+        #[command(subcommand)]
+        action: AutomationAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum AutomationAction {
+    /// Automation token management.
+    Token {
+        #[command(subcommand)]
+        action: AutomationTokenAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum AutomationTokenAction {
+    /// Mint a scoped automation token through the local management
+    /// API (SuperAdmin). The token is printed once on standard
+    /// output, alone, so the command can be piped straight into a
+    /// file or a secret store.
+    ///
+    /// There is deliberately NO `--token` flag on this command, and
+    /// none should be added. The secret is only ever an OUTPUT here:
+    /// nothing about minting requires the operator to supply one, so
+    /// there is nothing to keep off argv on the way in. The command
+    /// that CONSUMES a token is the automation's own client, and that
+    /// one reads it from a file, standard input or the environment.
+    Create {
+        /// Operator-facing label for the token.
+        #[arg(long)]
+        name: String,
+
+        /// A scope the token carries. Repeat the flag for each one;
+        /// at least one is required. Accepted values:
+        /// `environments:write`, `environments:read`, `routes:read`,
+        /// `certificates:read`.
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<String>,
+
+        /// A hostname pattern the token may claim. Repeat the flag
+        /// for each one; at least one is required. An exact name or a
+        /// single leading `*.` wildcard.
+        #[arg(long = "hostname", required = true)]
+        hostnames: Vec<String>,
+
+        /// A CIDR (or bare address) the token may point a hostname
+        /// at. Repeat the flag for each one; at least one is
+        /// required.
+        #[arg(long = "backend-cidr", required = true)]
+        backend_cidrs: Vec<String>,
+
+        /// Ceiling, in seconds, on the lifetime any environment this
+        /// token creates may request. Defaults to seven days.
+        #[arg(long)]
+        max_ttl_seconds: Option<u32>,
+
+        /// The token's own lifetime in days. Defaults to 365.
+        #[arg(long)]
+        lifetime_days: Option<i64>,
+
+        /// SuperAdmin username on the local management API.
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// Read the SuperAdmin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the SuperAdmin password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// SuperAdmin password on the command line (discouraged: it
+        /// mints a credential, and argv is readable through /proc and
+        /// lands in shell history; `LORICA_ADMIN_PASSWORD` is also
+        /// read).
+        #[arg(long)]
+        password: Option<String>,
     },
 }
 
@@ -484,6 +579,13 @@ impl Cli {
         if self.cluster_auto_activate {
             argv.push("--cluster-auto-activate".to_string());
         }
+        if let Some(ref automation_listen) = self.automation_listen {
+            argv.push("--automation-listen".to_string());
+            argv.push(automation_listen.clone());
+        }
+        if self.automation_listen_any {
+            argv.push("--automation-listen-any".to_string());
+        }
         argv
     }
 }
@@ -501,8 +603,10 @@ pub(crate) struct ClusterBinds {
     pub advertise_host: String,
 }
 
-/// Ports the cluster plane must never share: the management API and
-/// the two proxy listeners.
+/// Ports a listener must never share: the management API, the two
+/// proxy listeners, and the opt-in control listeners. The last two are
+/// `Option` because either may be off, in which case there is no port
+/// to collide with.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReservedPorts {
     /// The loopback management API port.
@@ -511,13 +615,60 @@ pub(crate) struct ReservedPorts {
     pub http: u16,
     /// The HTTPS proxy listener port.
     pub https: u16,
+    /// The cluster plane's operational port, when the plane is on.
+    pub cluster: Option<u16>,
+    /// The automation API's port, when it is on.
+    pub automation: Option<u16>,
 }
 
-fn parse_cluster_bind(
-    flag: &str,
+/// How one listener family names itself in a refusal: the flag
+/// carrying the bind, the flag that opts into a wildcard host, and the
+/// name an operator knows the listener by.
+///
+/// `flag` and `any_flag` are separate fields rather than one derived
+/// from the other because the cluster plane's enrollment bind has its
+/// own flag but shares the cluster wildcard opt-in.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ListenFlag<'a> {
+    /// The flag whose value is being validated, e.g. `--cluster-listen`.
+    pub flag: &'a str,
+    /// The flag that deliberately allows a wildcard host here.
+    pub any_flag: &'a str,
+    /// What this listener is, for the body of the refusal.
+    pub subject: &'a str,
+}
+
+const CLUSTER_LISTEN: ListenFlag<'static> = ListenFlag {
+    flag: "--cluster-listen",
+    any_flag: "--cluster-listen-any",
+    subject: "the cluster plane",
+};
+
+const CLUSTER_ENROLLMENT_LISTEN: ListenFlag<'static> = ListenFlag {
+    flag: "--cluster-enrollment-listen",
+    any_flag: "--cluster-listen-any",
+    subject: "the cluster plane",
+};
+
+const AUTOMATION_LISTEN: ListenFlag<'static> = ListenFlag {
+    flag: "--automation-listen",
+    any_flag: "--automation-listen-any",
+    subject: "the automation API",
+};
+
+/// The one definition of a refused listener bind, shared by every
+/// listener family Lorica exposes so the rule cannot drift between
+/// them. A bare port, an unparseable address, port 0 and a wildcard
+/// host without this family's opt-in are all refused, as is a port
+/// another listener already holds - named, so the operator knows
+/// which one.
+pub(crate) fn validate_listen_bind(
+    listen: ListenFlag<'_>,
     value: &str,
+    reserved: ReservedPorts,
     allow_any: bool,
 ) -> Result<std::net::SocketAddr, String> {
+    let flag = listen.flag;
     if !value.contains(':') {
         return Err(format!(
             "{flag} `{value}`: a bare port is refused; pass an explicit host:port \
@@ -536,16 +687,19 @@ fn parse_cluster_bind(
         ));
     }
     if addr.ip().is_unspecified() && !allow_any {
+        let subject = listen.subject;
+        let any_flag = listen.any_flag;
         return Err(format!(
-            "{flag} `{value}`: a wildcard host exposes the cluster plane on every \
-             interface; pass --cluster-listen-any to do that deliberately"
+            "{flag} `{value}`: a wildcard host exposes {subject} on every \
+             interface; pass {any_flag} to do that deliberately"
         ));
     }
+    refuse_reserved(listen, addr, reserved)?;
     Ok(addr)
 }
 
 fn refuse_reserved(
-    flag: &str,
+    listen: ListenFlag<'_>,
     addr: std::net::SocketAddr,
     reserved: ReservedPorts,
 ) -> Result<(), String> {
@@ -554,15 +708,43 @@ fn refuse_reserved(
         Some("the management API port")
     } else if port == reserved.http || port == reserved.https {
         Some("a proxy listener port")
+    } else if reserved.cluster == Some(port) {
+        Some("the cluster plane port")
+    } else if reserved.automation == Some(port) {
+        Some("the automation API port")
     } else {
         None
     };
     match clash {
-        Some(what) => Err(format!(
-            "{flag} `{addr}`: port {port} is {what}; the cluster plane must not share it"
-        )),
+        Some(what) => {
+            let flag = listen.flag;
+            let subject = listen.subject;
+            Err(format!(
+                "{flag} `{addr}`: port {port} is {what}; {subject} must not share it"
+            ))
+        }
         None => Ok(()),
     }
+}
+
+/// Validate `--automation-listen` (Story 10.3). Same rules as every
+/// other listener family: an explicit `host:port`, a non-zero port, a
+/// wildcard host only under `--automation-listen-any`, and no port
+/// another listener in this process already holds.
+///
+/// `reserved` describes the whole process; `reserved.automation` is
+/// cleared here because a listener does not collide with itself, so a
+/// caller can pass one `ReservedPorts` everywhere.
+pub(crate) fn validate_automation_listen(
+    value: &str,
+    reserved: ReservedPorts,
+    allow_any: bool,
+) -> Result<std::net::SocketAddr, String> {
+    let reserved = ReservedPorts {
+        automation: None,
+        ..reserved
+    };
+    validate_listen_bind(AUTOMATION_LISTEN, value, reserved, allow_any)
 }
 
 /// Validate the cluster-plane CLI per Story 9.2 AC #11. Both binds
@@ -580,11 +762,20 @@ pub(crate) fn validate_cluster_listen(
     reserved: ReservedPorts,
     allow_any: bool,
 ) -> Result<ClusterBinds, String> {
-    let operational = parse_cluster_bind("--cluster-listen", value, allow_any)?;
-    refuse_reserved("--cluster-listen", operational, reserved)?;
+    // `reserved.cluster` is this family's own bind, and a listener does
+    // not collide with itself. Clearing it here lets a caller pass one
+    // `ReservedPorts` describing every listener in the process without
+    // the cluster binds refusing themselves.
+    let reserved = ReservedPorts {
+        cluster: None,
+        ..reserved
+    };
+    let operational = validate_listen_bind(CLUSTER_LISTEN, value, reserved, allow_any)?;
 
     let enrollment = match enrollment_override {
-        Some(explicit) => parse_cluster_bind("--cluster-enrollment-listen", explicit, allow_any)?,
+        Some(explicit) => {
+            validate_listen_bind(CLUSTER_ENROLLMENT_LISTEN, explicit, reserved, allow_any)?
+        }
         None => {
             let port = operational.port().checked_add(1).ok_or_else(|| {
                 format!(
@@ -592,10 +783,11 @@ pub(crate) fn validate_cluster_listen(
                      overflows; pass --cluster-enrollment-listen explicitly"
                 )
             })?;
-            std::net::SocketAddr::new(operational.ip(), port)
+            let derived = std::net::SocketAddr::new(operational.ip(), port);
+            refuse_reserved(CLUSTER_ENROLLMENT_LISTEN, derived, reserved)?;
+            derived
         }
     };
-    refuse_reserved("--cluster-enrollment-listen", enrollment, reserved)?;
     if enrollment == operational {
         return Err(format!(
             "--cluster-enrollment-listen `{enrollment}`: the enrollment and operational \
@@ -1056,11 +1248,158 @@ mod tests {
         assert_eq!(child.cluster_advertise, original.cluster_advertise);
     }
 
+    #[test]
+    fn hot_upgrade_argv_inherits_the_automation_flags() {
+        let original = Cli::parse_from([
+            "lorica",
+            "--automation-listen",
+            "192.0.2.10:9600",
+            "--automation-listen-any",
+        ]);
+        let child = Cli::parse_from(original.hot_upgrade_argv("/tmp/lorica.new", 1));
+        assert_eq!(child.automation_listen, original.automation_listen);
+        assert!(child.automation_listen_any);
+    }
+
+    #[test]
+    fn minting_a_token_without_a_backend_cidr_is_refused_at_parse_time() {
+        // There is no node-wide default backend policy to fall back
+        // on any more, and the server refuses an empty grant, so the
+        // CLI has to refuse it here rather than send a mint that
+        // cannot succeed.
+        let argv = [
+            "lorica",
+            "automation",
+            "token",
+            "create",
+            "--name",
+            "ci",
+            "--scope",
+            "environments:write",
+            "--hostname",
+            "*.review.example.com",
+        ];
+        assert!(Cli::try_parse_from(argv).is_err());
+        let mut with_cidr = argv.to_vec();
+        with_cidr.extend(["--backend-cidr", "10.0.0.0/8"]);
+        assert!(Cli::try_parse_from(with_cidr).is_ok());
+    }
+
     const RESERVED: ReservedPorts = ReservedPorts {
         management: 9443,
         http: 8080,
         https: 8443,
+        cluster: None,
+        automation: None,
     };
+
+    #[test]
+    fn a_non_cluster_listener_is_refused_under_its_own_flag_names() {
+        // The refusal matrix belongs to every listener family, and each
+        // one must see its own flags in the message: an operator told
+        // to pass --cluster-listen-any for an automation bind has been
+        // told to do something impossible.
+        let bare = validate_listen_bind(AUTOMATION_LISTEN, "9600", RESERVED, false)
+            .expect_err("a bare port is refused");
+        assert!(bare.contains("bare port"), "{bare}");
+        assert!(bare.starts_with("--automation-listen "), "{bare}");
+
+        let wildcard = validate_listen_bind(AUTOMATION_LISTEN, "0.0.0.0:9600", RESERVED, false)
+            .expect_err("a wildcard host needs the opt-in");
+        assert!(wildcard.contains("--automation-listen-any"), "{wildcard}");
+        assert!(wildcard.contains("the automation API"), "{wildcard}");
+        assert!(!wildcard.contains("--cluster"), "{wildcard}");
+
+        let zero = validate_listen_bind(AUTOMATION_LISTEN, "192.0.2.10:0", RESERVED, false)
+            .expect_err("port 0 is refused");
+        assert!(zero.contains("non-zero"), "{zero}");
+
+        assert!(validate_listen_bind(AUTOMATION_LISTEN, "0.0.0.0:9600", RESERVED, true).is_ok());
+        assert!(
+            validate_listen_bind(AUTOMATION_LISTEN, "192.0.2.10:9600", RESERVED, false).is_ok()
+        );
+    }
+
+    #[test]
+    fn a_bind_on_another_control_listener_port_is_refused_by_name() {
+        // Before ReservedPorts knew about them, these two ports were
+        // invisible to the validator and the collision only surfaced as
+        // an EADDRINUSE at bind time.
+        let reserved = ReservedPorts {
+            cluster: Some(9444),
+            automation: Some(9600),
+            ..RESERVED
+        };
+        let on_cluster =
+            validate_listen_bind(AUTOMATION_LISTEN, "192.0.2.10:9444", reserved, false)
+                .expect_err("the cluster plane already holds 9444");
+        assert!(
+            on_cluster.contains("the cluster plane port"),
+            "{on_cluster}"
+        );
+
+        let on_automation =
+            validate_listen_bind(CLUSTER_LISTEN, "192.0.2.10:9600", reserved, false)
+                .expect_err("the automation API already holds 9600");
+        assert!(
+            on_automation.contains("the automation API port"),
+            "{on_automation}"
+        );
+    }
+
+    #[test]
+    fn the_automation_bind_refuses_every_port_but_its_own() {
+        // The startup path hands `validate_automation_listen` one
+        // ReservedPorts describing the whole process. The cluster and
+        // management ports must be refused by name; the automation
+        // port in that same struct is this listener's OWN bind, so it
+        // must not refuse itself.
+        let reserved = ReservedPorts {
+            cluster: Some(9444),
+            automation: Some(9600),
+            ..RESERVED
+        };
+
+        let on_cluster = validate_automation_listen("192.0.2.10:9444", reserved, false)
+            .expect_err("the cluster plane already holds 9444");
+        assert!(
+            on_cluster.contains("the cluster plane port"),
+            "{on_cluster}"
+        );
+
+        let on_management = validate_automation_listen("192.0.2.10:9443", reserved, false)
+            .expect_err("the management API already holds 9443");
+        assert!(
+            on_management.contains("the management API port"),
+            "{on_management}"
+        );
+
+        let own = validate_automation_listen("192.0.2.10:9600", reserved, false)
+            .expect("a listener does not collide with itself");
+        assert_eq!(own.port(), 9600);
+    }
+
+    #[test]
+    fn the_cluster_bind_is_never_refused_against_the_cluster_port() {
+        // A caller may hand `validate_cluster_listen` one ReservedPorts
+        // describing every listener in the process, this one included.
+        let reserved = ReservedPorts {
+            cluster: Some(9444),
+            automation: Some(9600),
+            ..RESERVED
+        };
+        let binds = validate_cluster_listen("192.0.2.10:9444", None, None, reserved, false)
+            .expect("a listener does not collide with itself");
+        assert_eq!(binds.operational.port(), 9444);
+        assert_eq!(binds.enrollment.port(), 9445);
+        // The automation port still applies to the derived enrollment
+        // bind: only the cluster family's own port is exempt.
+        assert!(
+            validate_cluster_listen("192.0.2.10:9599", None, None, reserved, false)
+                .expect_err("the derived enrollment bind would land on 9600")
+                .contains("the automation API port")
+        );
+    }
 
     fn validate(value: &str, allow_any: bool) -> Result<ClusterBinds, String> {
         validate_cluster_listen(value, None, None, RESERVED, allow_any)

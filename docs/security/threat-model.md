@@ -1,12 +1,12 @@
 # Lorica Threat Model
 
 **Author:** Romain G.
-**Version:** 1.0
-**Date:** 2026-03-31
+**Version:** 1.1
+**Date:** 2026-09-17
 
 ## Overview
 
-Lorica is a reverse proxy that sits between the Internet and backend services. It terminates TLS, routes HTTP traffic, provides WAF protection, and exposes a management dashboard on localhost. Since v1.7.0 a node can additionally participate in a multi-node cluster over a dedicated, mutually authenticated cluster plane. This document identifies threat categories and mitigations.
+Lorica is a reverse proxy that sits between the Internet and backend services. It terminates TLS, routes HTTP traffic, provides WAF protection, and exposes a management dashboard on localhost. Since v1.7.0 a node can additionally participate in a multi-node cluster over a dedicated, mutually authenticated cluster plane. Since v1.8.0 it can additionally serve a CI automation API on a listener of its own. This document identifies threat categories and mitigations.
 
 ## Trust Boundaries
 
@@ -20,6 +20,10 @@ Internet  -->  [ Lorica Proxy (8080/8443) ]  -->  Backend Services
 Follower nodes  -->  [ Cluster plane (--cluster-listen, opt-in) ]
    (outbound only)         operational listener: mTLS mandatory
                            enrollment listener: token-gated window
+
+CI runners  -->  [ Automation plane (--automation-listen, opt-in) ]
+                           source allowlist before the handshake
+                           bearer or OIDC ID token, scope-gated
 ```
 
 1. **Internet to Proxy** - Untrusted. All inbound traffic is potentially malicious.
@@ -28,6 +32,8 @@ Follower nodes  -->  [ Cluster plane (--cluster-listen, opt-in) ]
 4. **Database** - Trusted. SQLite on local filesystem with WAL mode.
 5. **Follower to Control Plane (cluster plane)** - Authenticated by mutual TLS against the fleet's own cluster CA; no public or system CA is trusted on this plane. Disabled by default; only exists when the operator passes `--cluster-listen` on the control plane. Followers dial OUT to the control plane and expose no inbound port of their own.
 6. **Enrollment listener** - The only unauthenticated network surface in the product. It is a separate listener from the operational one, is closed unless at least one join token is live, auto-closes when the last unexpired token is burned or expires, and enforces pre-authentication budgets (handshake timeout, concurrent-handshake cap, in-flight enrollment cap, per-connection byte and time budgets) before any token verification runs.
+7. **CI runner to Automation plane** - Remote, and authenticated per request by a scoped bearer token or a GitLab ID token; no session, no cookie, no CSRF pairing. Disabled by default; only exists when the operator passes `--automation-listen`, and refuses to open without a source allowlist or on a node holding a follower identity. What a credential may reach is bounded by its own grant (scopes, hostname patterns, backend CIDRs), not by a role.
+8. **Capture records** - A capture record holds request and response bodies taken after TLS termination, so it carries whatever the traffic carried. It crosses whatever boundary its sink does: the process log, a syslog or OTLP collector, or a directory on the node.
 
 ## Threat Categories
 
@@ -112,6 +118,7 @@ The cluster plane is opt-in: none of these surfaces exist unless the operator st
 | A revoked node keeping access | Revocation puts the node's serials on a CA-signed CRL, rebuilds the operational verifier `with_crls` and arc-swaps it; the live session is ended synchronously through the session registry. Access is cut; key material is NOT recovered: the node keeps the certificate private keys it held, so the response, the audit row and the alert name them as `certificates_to_reissue` and the operator re-issues them | Implemented, with the residual stated |
 | A compromised follower reporting a generation it does not run | Outside a commit round the applied generation and hash are the follower's own claim (heartbeat), and the registry row is refreshed from it; there is no attestation. The anchor for a node's real state is its own audit stream, which records every apply on that node. `docs/cluster.md` "Convergence" states this | Accepted, documented |
 | Node impersonation via a payload `node_id` | Identity is the certificate fingerprint recorded at enrollment; payloads carry no trusted identity; a valid certificate with no roster entry, or a revoked one, is dropped before any byte is read and audited | Implemented |
+| A compromised follower disclosing the fleet's routing topology | The control plane cuts one configuration payload per recipient: `node_selector` is resolved server-side against the `node_id` the certificate proves, so another node's routes, upstream addresses, IP allow and deny lists, mTLS configuration and Basic-auth password hashes are never sent. An entry that resolves to no single node targets nobody. What a taken node still holds is its own routes and their backends, the fleet-wide policy objects (global settings, WAF rules, certificate export ACLs, AI crawler entries, probe and SLA definitions, notification channels and DNS providers, all as digests where they carry secrets), the current generation and the fact that other generations exist | Implemented |
 | A local shell dropping a node while keeping fleet keys | `lorica cluster leave` requires a SuperAdmin credential on the local API (the instance notifies the control plane) or proof of control-plane-side deregistration; it wipes the identity and audits on both sides | Implemented |
 
 ### T7: Operational
@@ -123,6 +130,35 @@ The cluster plane is opt-in: none of these surfaces exist unless the operator st
 | Worker process crash | Supervisor auto-restart with exponential backoff | Implemented |
 | Config corruption | TOML import with preview/diff before apply | Implemented |
 | Certificate expiry | Configurable warning/critical thresholds, ACME auto-renewal | Implemented |
+
+### T8: Automation Plane and Request Capture (v1.8.0+)
+
+The automation plane is opt-in twice over: the listener does not open unless the operator passes `--automation-listen`, and it refuses to open until `automation_allowed_cidrs` names the sources allowed to reach it. Request capture is off until a capture rule is created and armed. See `docs/automation.md` and `docs/capture.md` for the full operator model.
+
+| Threat | Mitigation | Status |
+|--------|-----------|--------|
+| Reaching the automation socket from an unexpected host | The source allowlist is checked on accept, BEFORE the TLS handshake: an address outside it gets no handshake, no certificate and no byte read from it. The allowlist is mandatory and default-deny (an empty list refuses to open the listener and is refused live), and it reloads with the configuration so narrowing it during an incident bites on the next connection instead of on the next restart | Implemented |
+| Automation socket as a resource-exhaustion primitive | The cluster plane's pre-auth budgets, in the same order and held across the handshake: a global handshake permit, a per-source concurrency slot, a per-source attempt window, a handshake timeout. Each refusal has its own counter so an operator can tell which budget is biting | Implemented |
+| Session credentials crossing onto the automation plane | The plane accepts bearer credentials only. A `lorica_session` cookie presented here authenticates nothing: the automation router has no session store, no cookie layer and no CSRF pairing, which is why it is a separate listener rather than a path on the management API | Implemented |
+| Automation writes on a node whose configuration is replaced by replication | A node holding a follower identity refuses to open the listener, naming the control plane as the place the writes belong. The same question is asked through one `ConfigStore::is_follower`, whose answer on an unreadable store is "follower", so an unreadable node never writes | Implemented |
+| Theft of a static automation token from the database | Only the HMAC-SHA256 digest is stored, under a dedicated key that is encrypted at rest and rotated with the master key. Verification is constant time against a dummy digest when the `public_id` is unknown, so a lookup miss and a bad secret take the same path | Implemented |
+| A minted token leaking through argv, logs or history | The secret is only ever an output: there is no flag that takes one. It is printed once on stdout with nothing else on that stream, the informational line naming the `public_id` goes to stderr, and the server logs and audits the `public_id` only | Implemented |
+| A revoked token still being accepted | Revocation is a store write the next request reads; there is no token cache in front of it. The audit row names the `public_id` | Implemented |
+| A forged or downgraded OIDC ID token | RS256 is pinned twice, in the header check and in the validation handed to the library, so `none` and every symmetric algorithm are refused before any key work. Issuer, audience and subject must match a configured issuer entry; the bound claims are required, not optional | Implemented |
+| JWKS endpoint abused as an outbound amplifier or a stall | The refetch on an unknown `kid` is capped and rate-limited per issuer, the cache is bounded, and a fetch failure fails the verification closed rather than falling back to a cached-but-unpinned key | Implemented |
+| ID token replay | A bounded `jti` set remembers each token until its own `exp`, purging expired entries before evicting live ones so a flood cannot push a live `jti` out of the set | Implemented |
+| An automation grant reaching hostnames or backends it was not given | The environment resource is grant-scoped: hostnames must match the grant's allowed hostnames and backend addresses must sit inside the grant's allowed CIDRs. A grant with an EMPTY backend CIDR list is deny-all, not allow-all | Implemented |
+| A half-created environment leaving orphan routes or backends | Create, update and delete each run in ONE transaction: the route, its backends, the link rows and the environment row commit together or not at all | Implemented |
+| One principal editing another's environment | Ownership is the exact principal recorded at creation, not the token name or the scope; a different principal gets the same answer as a caller naming a row that does not exist | Implemented |
+| An automation filling the node with environments | Per-principal and global quotas on environments, plus a TTL on every environment and a reaper that removes the expired ones, so a pipeline that forgets to clean up does not accumulate forever | Implemented |
+| Drift between an automation-managed row and a dashboard edit | Rows an environment manages are flagged managed and the management API refuses edits to them, so the automation's view of what it owns cannot be silently rewritten underneath it | Implemented |
+| Request capture as a memory-exhaustion primitive | Captured bodies are held under a per-worker ceiling; past it the capture is dropped and counted, never the request. Each rule also carries its own budget, and a rule that exhausts it self-disables and audits | Implemented |
+| Credentials landing in a capture file | An always-redacted set covers the headers and fields that carry credentials (authorization, cookies, the session and CSRF names, and the rest), applied before anything is written, in addition to the operator's own redaction patterns | Implemented |
+| A capture sink failure taking the request with it | The sink is best-effort by construction: a write error, a full disk, a refused directory are counted and logged, and the request path never observes them | Implemented |
+| A capture sink writing outside where the operator meant | `output.dir` must be absolute and must not be a symlink, checked on every write rather than once at configuration time, so a symlink planted after the fact cannot redirect the stream | Implemented |
+| A compromised follower self-reporting the configuration it applied | Unchanged from T6: outside a commit round the applied generation and hash are the follower's own claim. The automation plane does not open on a follower, so this is the cluster residual, not a new one | Accepted, documented |
+| The captured body itself | A capture file holds request and response bodies by design: that is the feature. Redaction covers credentials, not payload content, so a capture of a route carrying personal data is a file holding personal data. The operator decides where it lands, and the sink refuses anything but an absolute, non-symlinked directory | Accepted, documented |
+| A hostile identity provider or a hijacked JWKS endpoint | An issuer entry that pins `ca_pem` trusts that CA alone for its own JWKS fetch, so a certificate from any other authority is refused. An entry that pins nothing trusts the platform roots: whoever can present a valid certificate for the JWKS host can serve a key of their choosing, leaving the issuer allowlist and the bound claims as the remaining mitigations. Pinning is the documented posture for a self-hosted instance | Implemented, residual without `ca_pem` |
 
 ## Residual Risks
 

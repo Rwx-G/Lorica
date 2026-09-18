@@ -35,6 +35,16 @@ const WAF_BAN_THRESHOLD_MIN: i32 = 0;
 const WAF_BAN_DURATION_S_MIN: i32 = 0;
 const ACCESS_LOG_RETENTION_MIN: i64 = 0;
 const WAF_EVENT_RETENTION_MIN: i64 = 0;
+// Story 10.6 AC #7. The budget is a byte ceiling over every in-flight
+// WAF body buffer in one process. The floor is the crate's own
+// 1 MiB default scan window: below it no default-configured route
+// could ever buffer a body, so the setting would silently disable WAF
+// body inspection fleet-wide rather than bound it, which is not what
+// an operator lowering a memory budget is asking for. The ceiling is
+// 16 GiB, far above any sane buffer allowance and far below the point
+// where the running total could overflow the `u64` accounting.
+const WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN: u64 = 1_048_576;
+const WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX: u64 = 17_179_869_184;
 const SLA_PURGE_RETENTION_DAYS_MIN: i32 = 1;
 const SLA_PURGE_RETENTION_DAYS_MAX: i32 = 3650;
 const OTLP_SAMPLING_RATIO_MIN: f64 = 0.0;
@@ -142,6 +152,12 @@ pub fn settings_schema() -> serde_json::Value {
             "type": "integer",
             "min": WAF_EVENT_RETENTION_MIN,
             "default": d.waf_event_retention,
+        },
+        "waf_body_scan_max_inflight_bytes": {
+            "type": "integer",
+            "min": WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN,
+            "max": WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX,
+            "default": d.waf_body_scan_max_inflight_bytes,
         },
         "sla_purge_enabled": {
             "type": "boolean",
@@ -364,6 +380,17 @@ pub struct UpdateSettingsRequest {
     pub connection_deny_cidrs: Option<Vec<String>>,
     /// CIDRs allowed at TCP accept time (default-deny when non-empty).
     pub connection_allow_cidrs: Option<Vec<String>>,
+    /// Source networks allowed to reach the automation API listener
+    /// (`--automation-listen`). Always default-deny: the listener
+    /// refuses to open while this is empty.
+    ///
+    /// Applied live. A narrower list bites on the next accepted
+    /// connection, with no restart, which is what an incident needs.
+    /// Emptying it does NOT close the socket: an empty allow list
+    /// reads as default-allow, so the listener keeps the previous list
+    /// and logs at ERROR rather than widening itself to every source.
+    /// Stopping the plane means dropping `--automation-listen`.
+    pub automation_allowed_cidrs: Option<Vec<String>>,
     /// OTLP collector endpoint URL.
     pub otlp_endpoint: Option<String>,
     /// OTLP transport protocol (`grpc` / `http-proto` / `http-json`).
@@ -439,6 +466,8 @@ pub struct UpdateSettingsRequest {
     pub syslog_waf_enabled: Option<bool>,
     /// Story 9.8 AC #1. Ship audit entries to syslog.
     pub syslog_audit_enabled: Option<bool>,
+    /// Backlog #50. Ship traffic capture records to syslog.
+    pub syslog_capture_enabled: Option<bool>,
     /// Story 9.8 AC #1. PEM CA bundle trusted for `tcp-tls`. Empty
     /// clears it (platform trust store).
     pub syslog_tls_ca_pem: Option<String>,
@@ -460,6 +489,22 @@ pub struct UpdateSettingsRequest {
     /// exporter. Secret: empty clears, `**REDACTED**` leaves
     /// unchanged.
     pub otlp_logs_auth_header: Option<String>,
+    /// Backlog #50. Ship access-log rows on the OTLP logs lane.
+    pub otlp_logs_access_enabled: Option<bool>,
+    /// Backlog #50. Ship WAF events on the OTLP logs lane.
+    pub otlp_logs_waf_enabled: Option<bool>,
+    /// Backlog #50. Ship audit entries on the OTLP logs lane.
+    pub otlp_logs_audit_enabled: Option<bool>,
+    /// Backlog #50. Ship traffic capture records on the OTLP logs
+    /// lane.
+    pub otlp_logs_capture_enabled: Option<bool>,
+    /// Story 10.6 AC #7. Process-wide ceiling, in bytes, on every
+    /// in-flight WAF body-scan buffer taken together. A request that
+    /// would push the total past it is forwarded UNSCANNED rather than
+    /// refused, so lowering this trades inspection coverage for memory,
+    /// never availability. Per process: under `--workers N` the
+    /// effective fleet ceiling is N times this value.
+    pub waf_body_scan_max_inflight_bytes: Option<u64>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -578,6 +623,17 @@ pub async fn update_settings(
             WAF_EVENT_RETENTION_MIN,
             "waf_event_retention",
         )?;
+        // Story 10.6 AC #7. Not a secret and not masked: the budget is
+        // a capacity figure an operator has to be able to read back to
+        // reason about the `skipped_budget` scan outcome.
+        apply_ranged_u64(
+            body.waf_body_scan_max_inflight_bytes,
+            &mut settings.waf_body_scan_max_inflight_bytes,
+            WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN..=WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX,
+            &format!(
+                "waf_body_scan_max_inflight_bytes must be in {WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN}..={WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX}"
+            ),
+        )?;
         apply_plain(body.sla_purge_enabled, &mut settings.sla_purge_enabled);
         apply_ranged_i32(
             body.sla_purge_retention_days,
@@ -595,12 +651,12 @@ pub async fn update_settings(
         apply_cidr_list(
             body.trusted_proxies,
             &mut settings.trusted_proxies,
-            "trusted proxy",
+            "trusted_proxies",
         )?;
         apply_cidr_list(
             body.waf_whitelist_ips,
             &mut settings.waf_whitelist_ips,
-            "WAF whitelist",
+            "waf_whitelist_ips",
         )?;
         apply_cidr_list(
             body.connection_deny_cidrs,
@@ -611,6 +667,11 @@ pub async fn update_settings(
             body.connection_allow_cidrs,
             &mut settings.connection_allow_cidrs,
             "connection_allow_cidrs",
+        )?;
+        apply_cidr_list(
+            body.automation_allowed_cidrs,
+            &mut settings.automation_allowed_cidrs,
+            "automation_allowed_cidrs",
         )?;
         apply_otlp_endpoint(body.otlp_endpoint, &mut settings.otlp_endpoint)?;
         apply_string_choice(
@@ -723,6 +784,10 @@ pub async fn update_settings(
         apply_plain(body.syslog_access_enabled, &mut settings.syslog_access_enabled);
         apply_plain(body.syslog_waf_enabled, &mut settings.syslog_waf_enabled);
         apply_plain(body.syslog_audit_enabled, &mut settings.syslog_audit_enabled);
+        apply_plain(
+            body.syslog_capture_enabled,
+            &mut settings.syslog_capture_enabled,
+        );
         apply_optional_pem(
             body.syslog_tls_ca_pem,
             &mut settings.syslog_tls_ca_pem,
@@ -745,6 +810,22 @@ pub async fn update_settings(
         apply_syslog_extra_sd(body.syslog_extra_sd, &mut settings.syslog_extra_sd)?;
         apply_plain(body.otlp_logs_enabled, &mut settings.otlp_logs_enabled);
         apply_secret_token(body.otlp_logs_auth_header, &mut settings.otlp_logs_auth_header);
+        apply_plain(
+            body.otlp_logs_access_enabled,
+            &mut settings.otlp_logs_access_enabled,
+        );
+        apply_plain(
+            body.otlp_logs_waf_enabled,
+            &mut settings.otlp_logs_waf_enabled,
+        );
+        apply_plain(
+            body.otlp_logs_audit_enabled,
+            &mut settings.otlp_logs_audit_enabled,
+        );
+        apply_plain(
+            body.otlp_logs_capture_enabled,
+            &mut settings.otlp_logs_capture_enabled,
+        );
 
         // Cross-field invariants (backlog #48). Per-field bounds are applied
         // above; these reject a partial update that inverts a related pair
@@ -883,6 +964,31 @@ fn apply_ranged_u32(
     Ok(())
 }
 
+/// `u64` variant of [`apply_ranged_i32`] for byte-denominated budgets
+/// (`waf_body_scan_max_inflight_bytes`), which are `u64` on
+/// `GlobalSettings` because a byte count has no business being signed.
+///
+/// It answers `422`, not the `400` its `i32` and `u32` siblings
+/// answer. The rule on [`ApiError::Unprocessable`] decides it: a cap
+/// over its documented limit is a request the server understood and
+/// refuses on its merits. The siblings predate that rule and are in
+/// the set the doc comment explicitly leaves unswept, so they are not
+/// changed here; new fields use the rule.
+fn apply_ranged_u64(
+    value: Option<u64>,
+    target: &mut u64,
+    range: std::ops::RangeInclusive<u64>,
+    error_msg: &str,
+) -> Result<(), ApiError> {
+    if let Some(v) = value {
+        if !range.contains(&v) {
+            return Err(ApiError::Unprocessable(error_msg.to_string()));
+        }
+        *target = v;
+    }
+    Ok(())
+}
+
 /// Assign a string field when present, rejecting values not in
 /// `valid` with `400 "invalid <label>: <value>. Must be one of:
 /// <valid:?>"`.
@@ -904,8 +1010,9 @@ fn apply_string_choice(
 }
 
 /// Assign a CIDR/IP list field when present. Every non-empty entry
-/// must parse as a bare IP (1.2.3.4) or CIDR (1.2.3.0/24); the first
-/// invalid entry yields `400 "invalid <label> CIDR or IP: <entry>"`.
+/// must parse as a bare IP (1.2.3.4) or CIDR (1.2.3.0/24) per
+/// `lorica_config::connection_filter`; the first invalid entry yields
+/// `400` naming the field and the entry.
 fn apply_cidr_list(
     value: Option<Vec<String>>,
     target: &mut Vec<String>,
@@ -1212,12 +1319,12 @@ fn apply_otlp_sampling_ratio(value: Option<f64>, target: &mut f64) -> Result<(),
 /// "Test connection" button. Does NOT mutate state; does NOT
 /// re-init the OTel provider. Just opens a plain HTTP(S)
 /// connection to the endpoint's `/v1/traces` path (for http-proto
-/// / http-json) or to the base URL (grpc — we cannot speak the
+/// / http-json) or to the base URL (grpc: we cannot speak the
 /// HTTP/2 gRPC preamble from reqwest so "TCP open" is all we
 /// assert) and reports status + round-trip latency.
 ///
 /// Any HTTP status code (including 4xx and 5xx) counts as
-/// "reachable" — the collector is answering, even if it does not
+/// "reachable" - the collector is answering, even if it does not
 /// like our empty request. Connection refused, DNS failure or
 /// timeout count as "unreachable".
 pub async fn test_otel_connection(
@@ -1447,19 +1554,12 @@ pub async fn test_otlp_logs_connection(
 }
 
 fn validate_cidr_list(entries: &[String], field: &str) -> Result<(), ApiError> {
-    for entry in entries {
-        let trimmed = entry.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.parse::<std::net::IpAddr>().is_err() && trimmed.parse::<ipnet::IpNet>().is_err()
-        {
-            return Err(ApiError::BadRequest(format!(
-                "invalid {field} CIDR or IP: {trimmed}"
-            )));
-        }
-    }
-    Ok(())
+    // The store-side definition, so the API and every other writer
+    // (import, replica apply) cannot drift on what an address is. The
+    // API refuses a bad entry; the data plane skips it. They disagree
+    // on the disposition on purpose, never on the verdict.
+    lorica_config::connection_filter::validate_cidr_list(entries, field)
+        .map_err(ApiError::BadRequest)
 }
 
 // ---- Notification Configs ----

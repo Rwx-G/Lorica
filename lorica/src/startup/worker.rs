@@ -570,7 +570,7 @@ pub(crate) fn run_worker(
     lorica_proxy.rate_limit_buckets = lorica::proxy_wiring::RateLimitEngine::local();
     // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so worker
     // lookups can resolve client IPs to country codes. Each worker
-    // keeps its own copy (the DB is small — ~3 MiB for DB-IP Lite
+    // keeps its own copy (the DB is small - ~3 MiB for DB-IP Lite
     // Country). The resolver handle is stashed in the per-worker
     // `lorica::geoip` static so the config-reload path can hot-swap
     // the DB on setting change, and a periodic 24-hour reload task
@@ -724,12 +724,33 @@ pub(crate) fn run_worker(
     // route_hostname and action stamped). SQLite WAL mode allows concurrent
     // writes from multiple worker processes. Writes go through the
     // per-worker background log writer (backlog #24).
-    lorica_proxy.log_writer = match lorica_api::log_store::LogStore::open(&data_dir) {
-        Ok(s) => Some(lorica_api::log_writer::spawn_log_writer(Arc::new(s))),
-        Err(e) => {
-            warn!(error = %e, "worker: failed to open log store, WAF event persistence disabled");
-            None
-        }
+    let worker_log_store: Option<Arc<lorica_api::log_store::LogStore>> =
+        match lorica_api::log_store::LogStore::open(&data_dir) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                warn!(error = %e, "worker: failed to open log store, WAF event persistence disabled");
+                None
+            }
+        };
+    lorica_proxy.log_writer = worker_log_store
+        .as_ref()
+        .map(|store| lorica_api::log_writer::spawn_log_writer(Arc::clone(store)));
+    // The capture self-disable writer. Capture admission happens in
+    // this process, so the queue it drains is this process's; without
+    // the task a rule that spent its total keeps its stored `enabled`
+    // flag and never produces the audit row that says why it stopped.
+    // Registered here rather than beside the prunes above because it
+    // needs the log store opened just now, and `_rt_guard` is already
+    // gone by this point.
+    let _capture_disable = {
+        let _rt_guard = rt.enter();
+        lorica::capture::spawn_capture_disable_task(
+            Arc::clone(lorica::capture::node_budgets()),
+            Arc::clone(&store),
+            worker_log_store,
+            &worker_auth_prune_tracker,
+            lorica::capture::CAPTURE_DISABLE_INTERVAL,
+        )
     };
     // ACME challenge store backed by SQLite - workers can read challenges set by supervisor
     lorica_proxy.acme_challenge_store = Some(lorica_api::acme::AcmeChallengeStore::with_db_path(
@@ -798,7 +819,7 @@ pub(crate) fn run_worker(
     // OTel graceful shutdown in workers (v1.4.0 story 1.6
     // completion): `Server::run_forever()` is `run() + exit(0)`
     // which drops the post-serve flush entirely. We inline the
-    // equivalent — `server.run(RunArgs::default())` drives the
+    // equivalent - `server.run(RunArgs::default())` drives the
     // graceful-drain loop exactly like `run_forever` would, then
     // we call `otel::shutdown()` before `std::process::exit(0)`.
     // Result: the BatchSpanProcessor drains any in-flight spans

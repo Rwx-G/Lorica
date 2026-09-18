@@ -11,7 +11,7 @@
 //!
 //! Two things live here:
 //!
-//! 1. [`BotEngine`] — the pending-challenge stash. Keyed by a
+//! 1. [`BotEngine`]: the pending-challenge stash. Keyed by a
 //!    server-side nonce (separate from the PoW nonce to keep the
 //!    two namespaces orthogonal). An entry is consumed on the
 //!    first verify attempt regardless of outcome so a failed
@@ -21,18 +21,18 @@
 //!
 //!    The backend is pluggable via [`StashBackend`]. Production
 //!    deployments use [`StashBackend::Sqlite`] so pending entries
-//!    are visible to every worker in the pool — a client solving
+//!    are visible to every worker in the pool - a client solving
 //!    on worker A can submit on worker B, and the atomic
 //!    DELETE...RETURNING on `take()` gives "first solver wins"
 //!    cross-worker replay defence. Unit tests and the single-
 //!    process path can use [`StashBackend::InMemory`] which keeps
 //!    the O(1) hashmap behaviour without a DB dep.
 //!
-//! 2. [`evaluate`] — the pure-logic decision function called from
+//! 2. [`evaluate`]: the pure-logic decision function called from
 //!    `proxy_wiring::request_filter`. Returns one of:
 //!    - [`Decision::Pass`] (valid cookie, bypass match, or
-//!      `only_country` gate missed) — forward to the backend
-//!    - [`Decision::Challenge`] — render a challenge page; caller
+//!      `only_country` gate missed): forward to the backend
+//!    - [`Decision::Challenge`]: render a challenge page; caller
 //!      is responsible for stashing the pending entry and writing
 //!      the HTML
 //!
@@ -173,7 +173,7 @@ where
 }
 
 impl BotEngine {
-    /// In-memory backend — single-process mode / tests. The engine
+    /// In-memory backend - single-process mode / tests. The engine
     /// drops every entry on process exit.
     pub fn new() -> Self {
         Self {
@@ -181,7 +181,7 @@ impl BotEngine {
         }
     }
 
-    /// SQLite-backed backend — multi-worker mode. The store is
+    /// SQLite-backed backend - multi-worker mode. The store is
     /// the same `ConfigStore` every worker holds, so pending rows
     /// propagate via the shared DB file's WAL.
     pub fn with_sqlite(store: Arc<tokio::sync::Mutex<ConfigStore>>) -> Self {
@@ -416,7 +416,7 @@ fn to_stash(nonce: &str, entry: &PendingEntry) -> lorica_config::BotStashEntry {
     }
 }
 
-/// Inverse of [`to_stash`]. `None` on malformed wire data — caller
+/// Inverse of [`to_stash`]. `None` on malformed wire data - caller
 /// treats that as "no stashed entry" which collapses to 403 at
 /// verify time.
 fn from_stash(stash: &lorica_config::BotStashEntry) -> Option<PendingEntry> {
@@ -514,7 +514,7 @@ impl PassReason {
 }
 
 /// Inputs to the evaluator, bundled so the function signature stays
-/// readable. All fields are borrowed — the evaluator never owns
+/// readable. All fields are borrowed - the evaluator never owns
 /// state beyond what the caller provides.
 pub struct EvalInputs<'a> {
     /// Parsed client IP (already through the trusted_proxies XFF
@@ -555,7 +555,7 @@ pub struct EvalInputs<'a> {
     pub now: i64,
     /// Pre-shared HMAC secret for cookie verify. Evaluator refuses
     /// to validate cookies when the secret slot is empty (early
-    /// boot, mis-seeded config) — returns `Decision::Challenge` to
+    /// boot, mis-seeded config) - returns `Decision::Challenge` to
     /// play safe.
     pub hmac_secret: Option<&'a [u8; 32]>,
     /// The route's `id` (for cookie binding).
@@ -570,7 +570,7 @@ pub struct EvalInputs<'a> {
 }
 
 /// Evaluate bot-protection policy for a single request. Pure
-/// decision function with no I/O — the caller owns request /
+/// decision function with no I/O - the caller owns request /
 /// response machinery and the pending-challenge stash.
 ///
 /// Order of checks (mirrors `docs/architecture/bot-protection.md`
@@ -752,7 +752,7 @@ pub fn route_id_bytes(route_id: &str) -> [u8; 16] {
 /// HMAC-tag) triple. Verification itself is already ~1 µs, but
 /// bypassing it shaves the cost at steady state to a single hash-
 /// map read + a timestamp compare (~50 ns). FIFO-bounded at 16 384
-/// entries — same shape as `forward_auth::FORWARD_AUTH_VERDICT_CACHE`,
+/// entries, same shape as `forward_auth::FORWARD_AUTH_VERDICT_CACHE`,
 /// so the memory ceiling is deterministic and tiny.
 ///
 /// This is the `Local` path of the cache. The worker-mode `Rpc`
@@ -764,7 +764,7 @@ pub fn route_id_bytes(route_id: &str) -> [u8; 16] {
 /// verifies, the request_filter fire-and-forgets a push via
 /// [`rpc_cache_push`]. This matches the design-doc § 3.6
 /// requirement that bot verdict state propagates across workers
-/// using the existing `VerdictCacheEngine::Rpc` plumbing — no new
+/// using the existing `VerdictCacheEngine::Rpc` plumbing - no new
 /// RPC endpoint needed, the supervisor just stores opaque
 /// (route_id, cookie) tuples and we flavour the route_id with a
 /// `bot\0` prefix so our entries cannot collide with forward_auth's.
@@ -790,7 +790,7 @@ static VERDICT_ORDER: Lazy<Mutex<std::collections::VecDeque<String>>> =
 /// same fixed offset at the end of the pre-encoding payload, and
 /// base64url-encoding it a second time has the same bytes as the
 /// original cookie's tail). We just take the last 21 or 22 chars
-/// of the cookie string — 21 for v4 IP (16 B tag = 22 base64url
+/// of the cookie string: 21 for v4 IP (16 B tag = 22 base64url
 /// chars, minus 1 pad-free adjustment = 21 or 22 depending on
 /// alignment). Simpler: hash the cookie string itself into 16
 /// bytes and use that as the tag stand-in.
@@ -819,7 +819,7 @@ fn verdict_cache_key(route_id: &str, ip_prefix: &IpPrefix, cookie: &str) -> Stri
 
 /// Return the cached `expires_at` for a verdict key if it is
 /// present AND still valid per `now`. Returns `None` on cache miss
-/// or on a stale entry (which is NOT evicted here — the next
+/// or on a stale entry (which is NOT evicted here - the next
 /// verify's `cache_insert` does not touch the stale slot; the FIFO
 /// reclaim will catch it eventually).
 #[doc(hidden)]
@@ -881,7 +881,7 @@ fn rpc_verdict_route_id(route_id: &str, ip_prefix: &IpPrefix) -> String {
 
 /// RPC cache lookup (worker mode). Delegates to the supervisor's
 /// verdict cache via the existing `VerdictLookup` wire protocol.
-/// The supervisor is oblivious to bot-vs-forward_auth — the
+/// The supervisor is oblivious to bot-vs-forward_auth - the
 /// `bot\0` route_id prefix is enough to partition namespaces. Returns
 /// the cached cookie's `expires_at` in seconds on Allow-hit, `None`
 /// on miss or any RPC failure (fail-open: a flaky supervisor
@@ -897,7 +897,7 @@ pub async fn rpc_cache_check(
     let key_route = rpc_verdict_route_id(route_id, ip_prefix);
     match engine {
         // Local path is handled inside `evaluate()` via the sync
-        // `cache_check` helper — the request_filter should call
+        // `cache_check` helper - the request_filter should call
         // this function only when it knows the engine is `Rpc`.
         // For completeness we also honour `Local` here by
         // delegating to the sync path.
@@ -956,7 +956,7 @@ pub async fn rpc_cache_push(
                     route_id: key_route,
                     cookie: cookie.to_string(),
                     verdict: lorica_command::Verdict::Allow as i32,
-                    // Bot verdicts carry no response headers — the
+                    // Bot verdicts carry no response headers - the
                     // cookie IS the verdict. Empty vec keeps the
                     // wire payload minimal.
                     response_headers: Vec::<lorica_command::ForwardAuthHeader>::new(),
@@ -980,7 +980,7 @@ pub async fn rpc_cache_push(
 
 /// Check whether `ip` matches a CIDR string. Accepts both bare IPs
 /// (treated as /32 or /128) and `addr/len` forms. Returns false on
-/// any parse error — validator-enforced input should never fail to
+/// any parse error - validator-enforced input should never fail to
 /// parse here, so a false from a non-empty config is a "wasn't
 /// actually a match" signal, not a data-shape problem.
 fn ip_matches_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
@@ -996,7 +996,7 @@ fn ip_matches_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
 
 /// Extract the verdict cookie value from a `Cookie:` header. Scans
 /// for `lorica_bot_verdict=<value>` with tolerant whitespace
-/// handling — different browsers space the cookie separators
+/// handling - different browsers space the cookie separators
 /// differently (`; ` vs `;`). Returns the FIRST match (RFC 6265
 /// leaves "same-name duplicates" implementation-defined; first-
 /// wins matches how most servers treat it).
@@ -1123,7 +1123,7 @@ mod tests {
     #[test]
     fn bypass_asn_no_db_loaded_falls_through() {
         // When the ASN resolver has no DB loaded, `inputs.asn` is
-        // None and the config's asn list must not match — the
+        // None and the config's asn list must not match - the
         // evaluator skips straight to the remaining categories.
         let mut c = cfg();
         c.bypass.asns = vec![15169];
@@ -1147,7 +1147,7 @@ mod tests {
     fn bypass_rdns_ignores_unconfirmed_lookup() {
         // When the request filter could not cache a forward-
         // confirmed name (miss, or lookup in flight), rdns_name
-        // stays None — the evaluator must NOT grant the bypass.
+        // stays None - the evaluator must NOT grant the bypass.
         let mut c = cfg();
         c.bypass.rdns = vec!["googlebot.com".to_string()];
         let i = inputs(&c, ""); // rdns_name = None per default
@@ -1448,7 +1448,7 @@ mod tests {
         }
         assert_eq!(taken.route_id, "r-sql");
         assert_eq!(taken.return_url, "/back");
-        // Second take returns None — replay defence.
+        // Second take returns None - replay defence.
         assert!(e.take(&nonce).await.is_none());
     }
 

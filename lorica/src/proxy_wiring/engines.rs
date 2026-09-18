@@ -202,7 +202,7 @@ impl VerdictCacheEngine {
 
 /// Per-route rate-limit engine: either the local authoritative state
 /// (single-process) or a CAS-based local cache synced with the
-/// supervisor (worker mode). `Clone` is cheap — the inner `DashMap` is
+/// supervisor (worker mode). `Clone` is cheap - the inner `DashMap` is
 /// wrapped in `Arc`.
 #[derive(Clone)]
 pub enum RateLimitEngine {

@@ -100,6 +100,13 @@ are exposed only as private internals on `LoricaProxy`. Adding a
 paths ; no owner scheduled yet, reopen when someone needs the
 numbers.
 
+The request-capture engine (v1.8.0) has no bench either. It is the
+one addition that buffers bytes on the request path, so the number
+worth having is the cost on a route where a rule matches but nothing
+is ever emitted: that is the case an operator pays for continuously,
+and the one the design is built around. `docs/capture.md` describes
+the caps that bound it.
+
 ## Adding a new bench
 
 1. `<crate>/benches/<name>.rs` with `criterion_group!` + `criterion_main!`.

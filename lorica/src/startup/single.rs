@@ -38,6 +38,21 @@ use crate::startup::{
 // Single-process mode (original behavior, no workers)
 // ---------------------------------------------------------------------------
 
+/// The GitLab ID-token verifier the automation listener shares with
+/// the management API's `AppState` (Story 10.5). Built once per
+/// process, outside the API task, so a broken TLS backend is a
+/// startup failure with a message and not a panic inside a spawned
+/// task.
+pub(crate) fn build_oidc_verifier() -> Arc<lorica_api::automation::OidcVerifier> {
+    match lorica_api::automation::OidcVerifier::with_http_fetcher() {
+        Ok(verifier) => Arc::new(verifier),
+        Err(e) => {
+            tracing::error!(error = %e, "OIDC JWKS client could not be built");
+            std::process::exit(1);
+        }
+    }
+}
+
 pub(crate) fn run_single_process(cli: Cli) {
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async move {
@@ -249,6 +264,18 @@ pub(crate) fn run_single_process(cli: Cli) {
             Duration::from_secs(5 * 60),
         );
         let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&single_task_tracker);
+        // A capture rule that spends its total stops recording under
+        // the budget lock, but the stored `enabled` flag and the audit
+        // row are written here: the request path must never wait on a
+        // SQLite UPDATE. Without this task an operator sees a rule that
+        // still claims to be armed and no line saying why it stopped.
+        let _capture_disable = lorica::capture::spawn_capture_disable_task(
+            Arc::clone(lorica::capture::node_budgets()),
+            Arc::clone(&store),
+            log_store.clone(),
+            &single_task_tracker,
+            lorica::capture::CAPTURE_DISABLE_INTERVAL,
+        );
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
@@ -290,7 +317,7 @@ pub(crate) fn run_single_process(cli: Cli) {
             // Build the optional mTLS verifier from the union of per-route
             // CA bundles. `store` is a `tokio::sync::Mutex`, and we are
             // inside the `rt.block_on(async move { ... })` runtime
-            // context — so we must `await` the lock instead of using
+            // context - so we must `await` the lock instead of using
             // the blocking_lock which panics from within a runtime.
             let (mtls_verifier, startup_fp) = {
                 let routes = store.lock().await.list_routes().unwrap_or_default();
@@ -382,6 +409,11 @@ pub(crate) fn run_single_process(cli: Cli) {
                     management: management_port,
                     http: http_port,
                     https: https_port,
+                    // These are the cluster plane's own binds, and the
+                    // automation API is not started yet, so neither
+                    // port exists for them to collide with.
+                    cluster: None,
+                    automation: None,
                 },
                 // Single-process mode never hot-upgrades (it binds the
                 // management port fresh), so there is nothing to adopt.
@@ -406,6 +438,27 @@ pub(crate) fn run_single_process(cli: Cli) {
             lorica_api::cluster::ClusterRuntime::ControlPlane(runtime) => runtime.telemetry.clone(),
             _ => None,
         };
+
+        // Story 10.4 AC #7: collect environments past their expiry.
+        // Gated on the fleet role here and on the stored identity at
+        // every tick; a follower never sweeps, replication does.
+        let _environment_reaper = startup::environment_reaper::spawn_environment_reaper(
+            &cluster_runtime,
+            Arc::clone(&store),
+            log_store.clone(),
+            config_reload_tx.clone(),
+            &single_task_tracker,
+            startup::environment_reaper::ENVIRONMENT_REAPER_INTERVAL,
+        );
+
+        let automation_listen = cli.automation_listen.clone();
+        let automation_listen_any = cli.automation_listen_any;
+        let automation_store = Arc::clone(&store);
+        // Read before the plane moves out of scope: the automation
+        // bind must not land on the port the cluster plane just took.
+        let cluster_operational_port: Option<u16> =
+            cluster_plane.as_ref().map(|plane| plane.operational_port());
+        let oidc_verifier = build_oidc_verifier();
 
         let api_handle = tokio::spawn(async move {
             let state = AppState {
@@ -442,7 +495,38 @@ pub(crate) fn run_single_process(cli: Cli) {
                 log_writer: log_writer.clone(),
                 task_tracker: api_task_tracker,
                 cluster: cluster_runtime,
+                oidc: oidc_verifier,
             };
+
+            // The automation API rides the same `AppState` as the
+            // management API and starts before it, so a refused
+            // listener stops the process instead of leaving the
+            // operator with a management API and no automation plane.
+            // Single-process mode never hot-upgrades, so it inherits
+            // nothing to adopt and nothing reads back the handoff slot
+            // it publishes into.
+            let automation = startup::automation::prepare_automation_listener(
+                startup::automation::AutomationOptions {
+                    automation_listen,
+                    listen_any: automation_listen_any,
+                    reserved: crate::cli::ReservedPorts {
+                        management: management_port,
+                        http: http_port,
+                        https: https_port,
+                        cluster: cluster_operational_port,
+                        automation: None,
+                    },
+                    inherited: Vec::new(),
+                    handoff: Arc::new(startup::automation::AutomationHandoff::default()),
+                },
+                &automation_store,
+                state.clone(),
+            )
+            .await;
+            if let Err(e) = automation {
+                error!(error = %e, "automation listener failed to start");
+                std::process::exit(1);
+            }
 
             // Session store + ACME auto-renewal + cert-expiry notifier
             // + server loop, shared with supervisor mode (audit H-9,

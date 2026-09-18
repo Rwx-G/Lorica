@@ -103,7 +103,7 @@ impl TraceParent {
     /// typically the request_id.
     pub fn child(&self, seed: &str) -> Self {
         // SipHash via DefaultHasher would be stable for the life of
-        // the process but not stable across processes — we need
+        // the process but not stable across processes - we need
         // cross-process determinism so workers agree on the parent-span
         // id. FNV-1a 64 is the cheapest hash that meets that bar.
         let mixed = fnv1a_64(format!("{}{}", self.trace_id, seed).as_bytes());
@@ -137,7 +137,7 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 /// reconstruct the trace even when Lorica itself is not exporting.
 pub fn traceparent_from_request_id(request_id: &str) -> TraceParent {
     // Two independent FNV-1a hashes seeded differently. `_HI` uses the
-    // request_id prefixed with 0x00, `_LO` with 0xff — cheap seed
+    // request_id prefixed with 0x00, `_LO` with 0xff: cheap seed
     // diversification so the two 64-bit halves do not correlate.
     let mut hi_input = Vec::with_capacity(request_id.len() + 1);
     hi_input.push(0x00);
@@ -237,6 +237,11 @@ pub struct OtelLogsConfig {
     pub service_name: String,
     /// Optional `Authorization` header value.
     pub auth_header: Option<String>,
+    /// Which event kinds the lane ships, from the
+    /// `otlp_logs_{access,waf,audit,capture}_enabled` settings
+    /// (backlog #50). Applied at `register_lane` time, so a change
+    /// takes effect on the reload that re-installs the sinks.
+    pub kinds: lorica_api::log_sinks::SinkKindToggles,
 }
 
 /// Hook installed by `init_logging` when the `otel` feature is built
@@ -355,7 +360,7 @@ mod imp {
         // `BoxedTracer` for a real one bound to the freshly
         // installed provider. After this call, every `#[instrument]`
         // span created on the proxy hot path gets mirrored to an
-        // OTel span via the tracing_opentelemetry bridge — without
+        // OTel span via the tracing_opentelemetry bridge - without
         // this swap the bridge would keep sending spans into the
         // per-process noop tracer and nothing would reach the
         // collector.
@@ -421,10 +426,7 @@ mod imp {
     /// Safe to call repeatedly: a previous provider is flushed and
     /// replaced, and the previous consumer thread exits with its
     /// closed lane.
-    pub fn init_logs(
-        cfg: &OtelLogsConfig,
-        mut rx: tokio::sync::mpsc::Receiver<SinkEvent>,
-    ) -> Result<(), String> {
+    pub fn init_logs(cfg: &OtelLogsConfig) -> Result<(), String> {
         if cfg.endpoint.trim().is_empty() {
             return Ok(());
         }
@@ -488,6 +490,17 @@ mod imp {
             .build();
 
         let logger = provider.logger("lorica");
+        // Everything that can fail has succeeded: only now does a lane
+        // exist to publish into. Registering earlier is what left a
+        // queue with no reader behind it (backlog #51).
+        let kinds = cfg.kinds;
+        let mut rx = lorica_api::log_sinks::register_lane(
+            "otlp",
+            kinds.access,
+            kinds.waf,
+            kinds.audit,
+            kinds.capture,
+        );
         let spawned = std::thread::Builder::new()
             .name("lorica-otlp-logs-sink".into())
             .spawn(move || {
@@ -549,10 +562,11 @@ mod imp {
     /// record's trace correlation (Story 9.8 AC #2).
     fn emit_sink_event(logger: &opentelemetry_sdk::logs::SdkLogger, event: &SinkEvent) {
         let kind = event.kind();
-        let (severity, severity_text, raw_ts) = match &event.payload {
+        let (severity, severity_text, raw_ts) = match &*event.payload {
             SinkPayload::Access(entry) => (Severity::Info, "INFO", entry.timestamp.as_str()),
             SinkPayload::Waf(waf) => (Severity::Warn, "WARN", waf.timestamp.as_str()),
             SinkPayload::Audit(audit) => (Severity::Info, "INFO", audit.timestamp.as_str()),
+            SinkPayload::Capture(capture) => (Severity::Info, "INFO", capture.timestamp.as_str()),
         };
         let mut record = logger.create_log_record();
         record.set_severity_number(severity);
@@ -592,12 +606,10 @@ mod imp {
 
     /// No-op stub. The reload path never requests an OTLP logs lane
     /// when the `otel` feature is off (`LogSinksConfig::from_settings`
-    /// is called with `otlp_available = false`), so this only exists
-    /// so call sites compile; the receiver is dropped unread.
-    pub fn init_logs(
-        _cfg: &OtelLogsConfig,
-        _rx: tokio::sync::mpsc::Receiver<lorica_api::log_sinks::SinkEvent>,
-    ) -> Result<(), String> {
+    /// is called with `otlp_available = false`), so this only exists so
+    /// call sites compile. It registers no lane, which is now the same
+    /// statement as "it consumes nothing".
+    pub fn init_logs(_cfg: &OtelLogsConfig) -> Result<(), String> {
         Ok(())
     }
 
@@ -655,7 +667,7 @@ mod shutdown_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn init_then_shutdown_round_trips() {
-        // Pointing at a nonexistent endpoint is fine — the batch
+        // Pointing at a nonexistent endpoint is fine - the batch
         // exporter build is lazy wrt connectivity, so init() succeeds
         // as long as the URL parses. shutdown() then flushes + drops
         // the provider without panicking, which is the entire

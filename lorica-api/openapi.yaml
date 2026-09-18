@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Lorica API
   description: REST API for Lorica reverse proxy management
-  version: "1.7.4"
+  version: "1.8.0"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -54,6 +54,20 @@ tags:
     description: Admin audit log (tamper-evident hash chain)
   - name: Cluster
     description: Fleet registry, join tokens and node lifecycle (control plane), fleet status and leave (follower)
+  - name: Capture
+    description: Traffic-capture rules (Story 10.1); a rule records real request and response bodies, so every operation names its role floor
+  - name: AutomationTokens
+    description: >-
+      Administration of the credentials the automation plane accepts (Story 10.3).
+      These are management-plane operations on purpose: a token able to mint tokens
+      would outlive its own revocation, so the automation listener serves none of them.
+  - name: AutomationOidcIssuers
+    description: >-
+      The trust configuration behind a GitLab ID token on the automation plane
+      (Story 10.5). One entry is one authorisation policy: an issuer, an audience,
+      the claims that must match exactly, and the same grant a static token carries.
+      Management-plane only, for the same reason as tokens: an entry decides who
+      needs no secret at all to act on this node.
 
 paths:
   # ---------------------------------------------------------------------------
@@ -446,6 +460,62 @@ paths:
                     type: string
                   description: When non-empty, only listed IPs are accepted at TCP accept (default-deny mode). Leave empty for default-allow.
                   example: ["10.0.0.0/8", "192.168.0.0/16"]
+                automation_allowed_cidrs:
+                  type: array
+                  items:
+                    type: string
+                  description: Source networks allowed to reach the automation API listener (--automation-listen). Always default-deny; the listener refuses to open while this is empty.
+                  example: ["10.0.0.0/8", "192.0.2.10"]
+                syslog_access_enabled:
+                  type: boolean
+                  default: true
+                  description: Ship access-log rows to the syslog sink (Story 9.8). Only meaningful while `syslog_endpoint` is set.
+                syslog_waf_enabled:
+                  type: boolean
+                  default: true
+                  description: Ship WAF events to the syslog sink.
+                syslog_audit_enabled:
+                  type: boolean
+                  default: true
+                  description: Ship audit entries to the syslog sink.
+                syslog_capture_enabled:
+                  type: boolean
+                  default: true
+                  description: Ship traffic capture records (Story 10.2) to the syslog sink. Its own toggle since backlog #50 closed; it used to follow `syslog_access_enabled`.
+                otlp_logs_enabled:
+                  type: boolean
+                  default: false
+                  description: Export logs as OTLP log records to the `otlp_endpoint` collector (needs a binary built with `--features otel`).
+                otlp_logs_access_enabled:
+                  type: boolean
+                  default: true
+                  description: Ship access-log rows on the OTLP logs lane (backlog #50). Only meaningful while `otlp_logs_enabled` is set.
+                otlp_logs_waf_enabled:
+                  type: boolean
+                  default: true
+                  description: Ship WAF events on the OTLP logs lane.
+                otlp_logs_audit_enabled:
+                  type: boolean
+                  default: true
+                  description: Ship audit entries on the OTLP logs lane.
+                otlp_logs_capture_enabled:
+                  type: boolean
+                  default: true
+                  description: Ship traffic capture records on the OTLP logs lane.
+                waf_body_scan_max_inflight_bytes:
+                  type: integer
+                  format: int64
+                  minimum: 1048576
+                  maximum: 17179869184
+                  default: 268435456
+                  description: >-
+                    Process-wide ceiling, in bytes, on every in-flight WAF
+                    body-scan buffer taken together (Story 10.6). A request that
+                    would push the total past it is forwarded unscanned rather
+                    than refused, so lowering this trades inspection coverage for
+                    memory, never availability. Per process: under `--workers N`
+                    the effective fleet ceiling is N times this value.
+                  example: 268435456
       responses:
         "200":
           description: Settings updated
@@ -457,6 +527,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
 
   /api/v1/settings/schema:
     get:
@@ -540,6 +612,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
 
   /api/v1/routes/{id}:
     parameters:
@@ -588,9 +662,21 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: The route is managed by the automation API; update its environment through the pipeline
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
     delete:
       tags: [Routes]
       summary: Delete route
+      description: >-
+        A route the automation API manages is deletable: its environment
+        row cascades away with it and the pipeline's next PUT recreates
+        the environment. The audit row names the environment.
       security:
         - sessionCookie: []
       responses:
@@ -602,6 +688,489 @@ paths:
                 $ref: "#/components/schemas/MessageResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Capture rules (Story 10.1)
+  # ---------------------------------------------------------------------------
+  /api/v1/capture/rules:
+    get:
+      tags: [Capture]
+      summary: List the capture rules on this node (Operator+)
+      description: >-
+        The listing sits one role below reading a single rule: an on-call
+        operator has to see WHICH recorders are armed without being able to
+        read the paths, headers and source ranges any of them matches.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Every capture rule, oldest id first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      rules:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/CaptureRule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Capture]
+      summary: Arm a new capture rule (SuperAdmin)
+      description: >-
+        `expires_at` is materialised server-side from `limits.ttl_seconds`
+        and cannot be supplied; neither can the two capture counters. The
+        body is `deny_unknown_fields`, so sending any of them is a 422.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CaptureRuleRequest"
+      responses:
+        "201":
+          description: Capture rule created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CaptureRule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/capture/rules/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [Capture]
+      summary: Read one capture rule (SuperAdmin)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The capture rule
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CaptureRule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Capture]
+      summary: Replace one capture rule (SuperAdmin)
+      description: >-
+        A full replace, not a patch. `created_at`, `created_by` and both
+        capture counters are kept from the stored row, and `expires_at` is
+        recomputed as `created_at` plus the submitted `limits.ttl_seconds`,
+        so no sequence of edits carries a rule past the seven-day retention
+        ceiling from when it was created.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CaptureRuleRequest"
+      responses:
+        "200":
+          description: The replaced capture rule
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CaptureRule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+    delete:
+      tags: [Capture]
+      summary: Delete one capture rule (SuperAdmin)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Capture rule deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/capture/rules/{id}/disable:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    post:
+      tags: [Capture]
+      summary: Stop one capture rule (Operator+)
+      description: >-
+        Deliberately one role below creating a rule. Arming a recorder
+        decides that production bodies get written to disk; stopping one
+        only decides that they stop, and an operator paged about a capture
+        filling a disk must be able to end it without waking a SuperAdmin.
+        Idempotent: disabling an already-disabled rule is a 200.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The rule, now disabled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CaptureRule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/capture/recent:
+    get:
+      tags: [Capture]
+      summary: The last capture records this process emitted (Operator+)
+      description: >-
+        A bounded in-memory ring of the last 50 records, newest first, with
+        each body cut at 4 KiB of its JSON string form and marked
+        (`body_elided`, `body_elided_total`). The full record is one
+        download away while it is still in the ring. The ring is per
+        process: under `--workers` each worker fills its own and the
+        supervisor serving this API holds an empty one, so a `--workers`
+        node answers 503 and names the sinks that do carry the records,
+        rather than showing an empty ring on a node that is capturing.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The ring, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      captures:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/RecentCapture"
+                      capacity:
+                        type: integer
+                        description: How many records the ring keeps before evicting the oldest.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/capture/recent/{request_id}:
+    parameters:
+      - name: request_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: The record's `request_id`, the same value as its access-log row.
+      - name: rule_id
+        in: query
+        required: false
+        schema:
+          type: string
+        description: >-
+          Narrow to the record one rule produced. Two rules admitting the
+          same exchange produce two records with the same `request_id`;
+          absent, the newest of them is returned.
+    get:
+      tags: [Capture]
+      summary: Download one full capture record (Operator+)
+      description: >-
+        The record exactly as the sinks received it, as an attachment named
+        `<timestamp>-<request_id>.json`, the name the directory sink writes.
+        404 once the ring has evicted the record; 503 under `--workers`, as
+        for the listing.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The capture record
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: attachment; filename="<timestamp>-<request_id>.json"
+          content:
+            application/json:
+              schema:
+                type: object
+                description: The capture record. See docs/capture.md for every field.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ---------------------------------------------------------------------------
+  # Automation tokens (Story 10.3 AC #6)
+  # ---------------------------------------------------------------------------
+  /api/v1/automation/tokens:
+    get:
+      tags: [AutomationTokens]
+      summary: List the automation tokens on this node (SuperAdmin)
+      description: >-
+        Safe to render: no row carries the secret or its HMAC. `last_used_at`
+        and `revoked_at` are always present so a stale or withdrawn credential
+        is visible without a second request.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Every automation token, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      tokens:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/AutomationToken"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [AutomationTokens]
+      summary: Mint an automation token (SuperAdmin); the token is shown once
+      description: >-
+        The answer is the ONLY place the full `<public_id>.<secret>` string ever
+        appears. The node stores HMAC-SHA256 of the secret half and nothing else,
+        so no later read can produce it again and there is no recovery path: an
+        operator who loses it mints a new token. Hand it to the automation through
+        a file, standard input or a secret store, never on a command line.
+
+
+        The body is `deny_unknown_fields`, so the server-owned facts (`public_id`,
+        `secret_hmac`, `created_by`, `last_used_at`, `revoked_at`) are refused on
+        input. Every other rule belongs to the model's validator and is a 422
+        naming the offending field.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AutomationTokenRequest"
+      responses:
+        "201":
+          description: Token minted (shown once)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    allOf:
+                      - type: object
+                        properties:
+                          token:
+                            type: string
+                            description: The full token. Never stored, never logged, never returned again.
+                      - $ref: "#/components/schemas/AutomationToken"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/automation/tokens/{public_id}:
+    parameters:
+      - name: public_id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      tags: [AutomationTokens]
+      summary: Revoke an automation token (SuperAdmin)
+      description: >-
+        Revocation, not deletion: `revoked_at` is stamped and the row stays, so
+        after an incident the audit trail still names the credential, who minted
+        it and when it was last presented. Nothing caches the token, so the
+        listener refuses it on its very next request.
+
+
+        Revoking twice is a 200 and keeps the first stamp; moving it forward
+        would rewrite when the credential actually stopped working. A `public_id`
+        naming no row is a 404, because a typo must not read as a revocation.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The token, now revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/AutomationToken"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # OIDC issuer entries (Story 10.5 AC #1)
+  # ---------------------------------------------------------------------------
+  /api/v1/automation/oidc-issuers:
+    get:
+      tags: [AutomationOidcIssuers]
+      summary: List the OIDC issuer entries on this node (SuperAdmin)
+      description: >-
+        Every entry, oldest first, which is the order the bearer gate tries
+        them in for a token naming their audience. Nothing here is secret, but
+        everything here is authority: the listing says which identity provider
+        this node believes and which claims unlock it.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Every issuer entry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      issuers:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/OidcIssuer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [AutomationOidcIssuers]
+      summary: Register an OIDC issuer entry (SuperAdmin)
+      description: >-
+        `issuer` and `jwks_url` must be `https`; `jwks_url` defaults to
+        `<issuer>/oauth/discovery/keys`, which is where GitLab publishes its
+        signing keys. `bound_claims` is an exact-match map over `project_path`,
+        `namespace_path`, `ref_protected`, `environment_protected` and
+        `deployment_tier`; a `*` glob is accepted in `project_path` ONLY, because
+        the other four are booleans and enums whose whole value is being exact.
+        Several entries may share an issuer and an audience with different bound
+        claims; the first whose claims all hold accepts a token.
+
+
+        The body is `deny_unknown_fields`, so the server-owned facts (`id`,
+        `created_by`, `created_at`) are refused on input. Every other rule belongs
+        to the model's validator and is a 422 naming the offending field.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OidcIssuerRequest"
+      responses:
+        "201":
+          description: Entry registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/OidcIssuer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/automation/oidc-issuers/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      tags: [AutomationOidcIssuers]
+      summary: Remove an OIDC issuer entry (SuperAdmin)
+      description: >-
+        A real delete, unlike a token revocation: the row holds no credential
+        whose history matters, and the audit row keeps everything the entry
+        said. The bearer gate reads the entries for a token's audience from the
+        store on every request and caches nothing, so the very next ID token
+        this entry would have accepted is refused. An unknown id is a 404, so a
+        typo cannot read as a removal.
+      security:
+        - sessionCookie: []
+      responses:
+        "204":
+          description: Entry removed
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -704,6 +1273,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: The backend is managed by the automation API; update its environment through the pipeline
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
     delete:
       tags: [Backends]
       summary: Delete backend
@@ -720,6 +1297,12 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: The backend is managed by the automation API; delete the environment or update it through the pipeline
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   # ---------------------------------------------------------------------------
   # Certificates
@@ -4272,6 +4855,27 @@ components:
         session_last_seen_unix:
           type: integer
           nullable: true
+        drifted:
+          type: boolean
+          description: >-
+            The control plane's own drift verdict for this node, formed
+            the same way `/cluster/drift` forms it: generation and hash,
+            from the live session when there is one and from the
+            registry row otherwise. Read it rather than recomputing it
+            from the registry fields, which answers a different question
+            (backlog #71).
+        applied_generation:
+          type: integer
+          description: The generation the verdict above was formed against.
+        applied_hash:
+          type: string
+          description: The hash the verdict above was formed against.
+        from_live_session:
+          type: boolean
+          description: >-
+            Whether that generation and hash came from the node's live
+            session or from the registry row, which a timer writes and
+            which can therefore lag a node that has already converged.
         selected_for_hostnames:
           type: array
           description: >-
@@ -4785,6 +5389,19 @@ components:
           enum: [round_robin, consistent_hash, random, peak_ewma]
         waf_enabled:
           type: boolean
+        waf_body_scan_max_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 4096
+          maximum: 67108864
+          description: >-
+            Bytes of an inspectable request body the WAF reads on this route
+            (Story 10.6). `null` means the built-in 1 MiB window. Orthogonal to
+            `max_request_body_bytes`, which caps what the proxy accepts at all:
+            a body the WAF stops reading at this value still reaches the
+            upstream whole.
+          example: 8388608
         enabled:
           type: boolean
         redirect_to:
@@ -4800,12 +5417,31 @@ components:
           items:
             $ref: '#/components/schemas/PathRule'
           description: Ordered list of sub-path overrides. First matching rule wins.
+        managed_by:
+          $ref: "#/components/schemas/ManagedBy"
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    ManagedBy:
+      type: object
+      description: >-
+        Present only on a row the automation API owns (Story 10.4 AC #8).
+        The management API answers 409 to an in-place update of such a
+        row, and to a delete of a managed backend; a managed route may be
+        deleted, which removes its environment with it. The field is
+        server-owned: sending it on a request body is a 422.
+      required: [kind, environment]
+      properties:
+        kind:
+          type: string
+          enum: [automation]
+        environment:
+          type: string
+          description: The automation environment name that owns the row.
 
     CreateRouteRequest:
       type: object
@@ -4834,6 +5470,16 @@ components:
         return_status:
           type: integer
           description: If set, respond with this HTTP status code directly.
+        waf_body_scan_max_bytes:
+          type: integer
+          format: int64
+          minimum: 4096
+          maximum: 67108864
+          description: >-
+            Bytes of an inspectable request body the WAF reads on this route
+            (Story 10.6). Omit or send `0` for the built-in 1 MiB window. Any
+            other value outside 4096..=67108864 is refused with 422.
+          example: 8388608
         path_rules:
           type: array
           items:
@@ -4865,6 +5511,16 @@ components:
         return_status:
           type: integer
           description: If set, respond with this HTTP status code directly.
+        waf_body_scan_max_bytes:
+          type: integer
+          format: int64
+          minimum: 4096
+          maximum: 67108864
+          description: >-
+            Bytes of an inspectable request body the WAF reads on this route
+            (Story 10.6). `0` clears the override back to the built-in 1 MiB
+            window; any other value outside 4096..=67108864 is refused with 422.
+          example: 8388608
         path_rules:
           type: array
           items:
@@ -4907,6 +5563,487 @@ components:
         return_status:
           type: integer
 
+    CaptureMatch:
+      type: object
+      description: Which requests a rule considers. Every populated field narrows; an empty block considers every request on the route.
+      properties:
+        source_cidrs:
+          type: array
+          description: Client source addresses as CIDRs or bare IPs. Empty means any.
+          items:
+            type: string
+        methods:
+          type: array
+          description: Uppercase HTTP methods. Empty means any.
+          items:
+            type: string
+        path_prefix:
+          type: string
+          nullable: true
+        path_regex:
+          type: string
+          nullable: true
+          description: Regex over the request path, at most 4096 bytes of source.
+        headers:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              match_type:
+                type: string
+                enum: [exact, prefix, regex]
+              value:
+                type: string
+
+    CaptureEmit:
+      type: object
+      description: >-
+        Which of the considered requests are written out. Exactly one
+        shape is legal: `always: true` alone, or at least one of the other
+        three with `always` false.
+      properties:
+        always:
+          type: boolean
+        status:
+          type: array
+          items:
+            oneOf:
+              - type: string
+                enum: [client_error, server_error, client_aborted]
+              - type: object
+                properties:
+                  exact:
+                    type: integer
+        min_latency_ms:
+          type: integer
+          nullable: true
+        upstream_error:
+          type: boolean
+
+    CaptureScope:
+      type: object
+      description: How much of a captured exchange is kept. Headers and the request line are always kept.
+      properties:
+        request_body:
+          type: boolean
+        response_body:
+          type: boolean
+        request_body_max_bytes:
+          type: integer
+          description: Non-zero, at most 4194304.
+        response_body_max_bytes:
+          type: integer
+          description: Non-zero, at most 4194304.
+
+    CaptureLimits:
+      type: object
+      description: What stops a rule - a total, a rate, and a clock.
+      properties:
+        max_captures:
+          type: integer
+          description: Non-zero, at most 10000.
+        rate_per_minute:
+          type: integer
+          description: Non-zero, at most 10000. Zero is refused rather than read as unlimited.
+        ttl_seconds:
+          type: integer
+          description: Non-zero, at most 604800 (seven days). Becomes the absolute `expires_at`.
+
+    CaptureOutput:
+      type: object
+      description: >-
+        Where captures land beyond the structured log, the export lanes and
+        the recent-captures ring, which every record reaches. `dir` absent
+        means no file is written; present, one file per capture under a
+        directory that must already exist, pruned oldest-first to
+        `max_dir_bytes` when set.
+      properties:
+        dir:
+          type: string
+          nullable: true
+        max_dir_bytes:
+          type: integer
+          nullable: true
+
+    CaptureRedaction:
+      type: object
+      description: >-
+        Names redacted IN ADDITION to the always-redacted set the capture
+        writer applies. An empty block still produces a redacted capture.
+      properties:
+        headers:
+          type: array
+          items:
+            type: string
+        query:
+          type: array
+          items:
+            type: string
+
+    CaptureRuleRequest:
+      type: object
+      description: >-
+        Body for creating or replacing a capture rule. Unknown fields are
+        refused, which is what makes `expires_at`, `captures_emitted` and
+        `captures_dropped` server-owned rather than merely ignored.
+      required: [name, route_id]
+      properties:
+        name:
+          type: string
+        route_id:
+          type: string
+          description: Must name an existing route; a route that does not exist is a 422 on this field.
+        enabled:
+          type: boolean
+          default: true
+        match:
+          $ref: "#/components/schemas/CaptureMatch"
+        emit:
+          $ref: "#/components/schemas/CaptureEmit"
+        capture:
+          $ref: "#/components/schemas/CaptureScope"
+        limits:
+          $ref: "#/components/schemas/CaptureLimits"
+        output:
+          $ref: "#/components/schemas/CaptureOutput"
+        redact:
+          $ref: "#/components/schemas/CaptureRedaction"
+
+    CaptureRule:
+      type: object
+      description: One traffic-capture rule, always bound to exactly one route.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        route_id:
+          type: string
+        enabled:
+          type: boolean
+        match:
+          $ref: "#/components/schemas/CaptureMatch"
+        emit:
+          $ref: "#/components/schemas/CaptureEmit"
+        capture:
+          $ref: "#/components/schemas/CaptureScope"
+        limits:
+          $ref: "#/components/schemas/CaptureLimits"
+        output:
+          $ref: "#/components/schemas/CaptureOutput"
+        redact:
+          $ref: "#/components/schemas/CaptureRedaction"
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: Absolute UTC instant, so every node in a fleet stops the rule at the same moment.
+        captures_emitted:
+          type: integer
+          readOnly: true
+          description: This node's process counter. Read-only; refused on input.
+        captures_dropped:
+          type: integer
+          readOnly: true
+          description: This node's process counter. Read-only; refused on input.
+
+    RecentCaptureHalf:
+      type: object
+      description: >-
+        One direction of a capture record as the ring lists it. The record's
+        own fields (`docs/capture.md`) plus the two elision markers the
+        listing adds.
+      properties:
+        method:
+          type: string
+          description: Request half only.
+        uri:
+          type: string
+          description: Request half only; named query parameters masked.
+        version:
+          type: string
+          description: Request half only.
+        status:
+          type: integer
+          description: Response half only; the status written downstream.
+        headers:
+          type: array
+          description: Ordered `[name, value]` pairs; duplicates kept; credentials replaced by `<redacted:N bytes>`.
+          items:
+            type: array
+            items:
+              type: string
+        body:
+          type: string
+          nullable: true
+          description: The kept bytes in `body_encoding`, cut at 4 KiB in the listing when `body_elided`.
+        body_encoding:
+          type: string
+          nullable: true
+          enum: [utf8, base64]
+        body_bytes_total:
+          type: integer
+          description: Bytes the body carried on the wire.
+        truncated:
+          type: boolean
+          description: Whether the record's body is a prefix of what was sent (the rule's cap).
+        body_skipped:
+          type: string
+          nullable: true
+          enum: [streaming, budget, disabled]
+        body_elided:
+          type: boolean
+          description: Whether the listing cut `body`. Absent when `body` is null.
+        body_elided_total:
+          type: integer
+          description: Length of the stored `body` string before the cut. Present only when `body_elided`.
+
+    RecentCapture:
+      type: object
+      description: One capture record as the ring lists it; the download returns the same record with whole bodies.
+      properties:
+        kind:
+          type: string
+          enum: [capture]
+        rule_id:
+          type: string
+        rule_name:
+          type: string
+        route_id:
+          type: string
+        request_id:
+          type: string
+          description: The access-log row's `request_id`; the join key and the download key.
+        timestamp:
+          type: string
+          format: date-time
+        client_ip:
+          type: string
+        is_xff:
+          type: boolean
+        backend:
+          type: string
+        latency_ms:
+          type: integer
+        error:
+          type: string
+          nullable: true
+        request:
+          $ref: "#/components/schemas/RecentCaptureHalf"
+        response:
+          $ref: "#/components/schemas/RecentCaptureHalf"
+
+    AutomationScope:
+      type: string
+      description: >-
+        What an automation token may do. The enum is closed and these four are
+        the whole surface for 1.8.0; an unknown string is refused rather than
+        dropped, so a token written against a newer Lorica fails loudly instead
+        of silently losing a grant.
+      enum:
+        - environments:write
+        - environments:read
+        - routes:read
+        - certificates:read
+
+    AutomationTokenRequest:
+      type: object
+      description: >-
+        Body for minting an automation token. Unknown fields are refused, which
+        is what makes the server-owned facts server-owned rather than ignored.
+      required: [name, scopes, allowed_hostnames]
+      properties:
+        name:
+          type: string
+          description: Operator-facing label.
+        scopes:
+          type: array
+          description: At least one; a token that grants nothing can do nothing.
+          items:
+            $ref: "#/components/schemas/AutomationScope"
+        allowed_hostnames:
+          type: array
+          description: >-
+            At least one. An exact name (`api.example.com`) or a single leading
+            wildcard (`*.preview.example.com`), read with TLS wildcard semantics:
+            one label. A bare `*` is refused.
+          items:
+            type: string
+        allowed_backend_cidrs:
+          type: array
+          description: "CIDRs (or bare addresses) this token may point a hostname at. At least one: there is no node-wide default backend policy, and an empty list would be read as every address."
+          minItems: 1
+          items:
+            type: string
+        max_ttl_seconds:
+          type: integer
+          description: Ceiling on the lifetime any environment this token creates may request. Defaults to seven days; the model caps it at thirty.
+        expires_at:
+          type: string
+          format: date-time
+          description: Absolute instant the token stops being accepted. Mutually exclusive with `lifetime_days`.
+        lifetime_days:
+          type: integer
+          description: Lifetime from now, in days. Mutually exclusive with `expires_at`. Defaults to 365 when neither is sent.
+
+    AutomationToken:
+      type: object
+      description: >-
+        One automation token's public facts. There is deliberately no field for
+        the secret and none for its HMAC: the secret exists once, in the answer
+        that minted it, and the HMAC is the node's private means of recognising
+        it.
+      properties:
+        public_id:
+          type: string
+          description: The lookup half, and the id a revocation names.
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            $ref: "#/components/schemas/AutomationScope"
+        allowed_hostnames:
+          type: array
+          items:
+            type: string
+        allowed_backend_cidrs:
+          type: array
+          items:
+            type: string
+        max_ttl_seconds:
+          type: integer
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the token was last accepted, or null if never presented.
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When an operator withdrew it, or null while it stands.
+
+    OidcIssuerRequest:
+      type: object
+      description: >-
+        Body for registering an OIDC issuer entry. Unknown fields are refused,
+        which is what makes the server-owned facts server-owned rather than
+        ignored.
+      required: [issuer, audience, allowed_hostnames, scopes]
+      properties:
+        issuer:
+          type: string
+          description: The GitLab instance URL, which is the token's `iss`. Must be `https`.
+        audience:
+          type: string
+          description: The value the job puts in `id_tokens.<NAME>.aud`. Identifies this Lorica instance.
+        jwks_url:
+          type: string
+          description: Where the signing keys are fetched from. Must be `https`. Defaults to `<issuer>/oauth/discovery/keys`.
+        ca_pem:
+          type: string
+          nullable: true
+          description: >-
+            One or more PEM certificates that become the ONLY trust anchors for
+            this entry's JWKS fetch, replacing the node's own roots for it.
+            Omit it on a public GitLab, or on a self-hosted one whose CA the
+            node already trusts. At least one certificate must parse, and the
+            whole field is capped at 64 KiB. It is never returned: `GET`
+            answers with `ca_fingerprint`.
+        bound_claims:
+          type: object
+          additionalProperties:
+            type: string
+          description: >-
+            Claims that must match exactly, keyed by `project_path`,
+            `namespace_path`, `ref_protected`, `environment_protected` or
+            `deployment_tier`. A `*` glob is accepted in `project_path` only;
+            the two `_protected` claims take exactly `true` or `false`.
+        allowed_hostnames:
+          type: array
+          description: At least one; the same one-label wildcard rule as a static token.
+          items:
+            type: string
+        allowed_backend_cidrs:
+          type: array
+          description: "CIDRs a token from this entry may point a hostname at. At least one: there is no node-wide default backend policy, and an empty list would be read as every address."
+          minItems: 1
+          items:
+            type: string
+        max_ttl_seconds:
+          type: integer
+          description: Ceiling on the lifetime any environment a token from this entry creates may request. Defaults to seven days; the model caps it at thirty.
+        scopes:
+          type: array
+          description: At least one; an entry that grants nothing can do nothing.
+          items:
+            $ref: "#/components/schemas/AutomationScope"
+
+    OidcIssuer:
+      type: object
+      description: >-
+        One OIDC issuer entry as the API answers it. There is no secret in it,
+        and the pinned CA is reported as a fingerprint rather than as the PEM.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The id a removal names.
+        issuer:
+          type: string
+        audience:
+          type: string
+        jwks_url:
+          type: string
+        ca_fingerprint:
+          type: string
+          nullable: true
+          description: >-
+            Lowercase-hex SHA-256 of the first pinned certificate's DER, which
+            is what `openssl x509 -fingerprint -sha256` prints, so an operator
+            can confirm which CA is pinned without the PEM leaving the node.
+            Null when the entry fetches on the node's own trust roots. The
+            `ca_pem` itself is never returned.
+        bound_claims:
+          type: object
+          additionalProperties:
+            type: string
+        allowed_hostnames:
+          type: array
+          items:
+            type: string
+        allowed_backend_cidrs:
+          type: array
+          items:
+            type: string
+        max_ttl_seconds:
+          type: integer
+        scopes:
+          type: array
+          items:
+            $ref: "#/components/schemas/AutomationScope"
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
     Backend:
       type: object
       properties:
@@ -4926,6 +6063,8 @@ components:
           type: integer
         tls_upstream:
           type: boolean
+        managed_by:
+          $ref: "#/components/schemas/ManagedBy"
         created_at:
           type: string
           format: date-time
@@ -5224,8 +6363,22 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    Unprocessable:
+      description: The body parsed but a model rule refuses its content
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
     RateLimited:
       description: Too many requests
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ServiceUnavailable:
+      description: >-
+        The resource exists in the product but not in this process; the
+        message names where to read it instead.
       content:
         application/json:
           schema:

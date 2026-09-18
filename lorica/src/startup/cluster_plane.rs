@@ -69,11 +69,12 @@ use lorica_cluster::enroll::{
 };
 use lorica_cluster::IngestQuota;
 use lorica_cluster::{
-    token, AppliedConfig, CertBundle, ClusterCa, ConfigPayload, ControlPlane, EnrollmentHandle,
-    EnrollmentListener, EnrollmentStats, FleetHooks, HandshakeConfig, IssuedLeaf,
-    OperationalConfig, OperationalHandle, OperationalListener, OperationalStats, PreAuthBudgets,
-    SwappableAcceptor,
+    token, AppliedConfig, CertBundle, ClusterCa, ConfigPayload, ConfigVersion, ControlPlane,
+    EnrollmentHandle, EnrollmentListener, EnrollmentStats, FleetHooks, HandshakeConfig, IssuedLeaf,
+    OperationalConfig, OperationalHandle, OperationalListener, OperationalStats, PayloadSource,
+    PreAuthBudgets, SwappableAcceptor,
 };
+use lorica_config::canonical::{restrict_for_recipient, CanonicalConfig, SelectorResolution};
 use lorica_config::models::{ClusterNode, NodeStatus};
 use lorica_config::store::{ConfigStore, LiveNodeFacts};
 use lorica_notify::events::{AlertEvent, AlertType};
@@ -203,6 +204,12 @@ impl ClusterPlane {
         )]
     }
 
+    /// The operational bind's port, so another listener family's
+    /// validator can refuse to share it (`ReservedPorts::cluster`).
+    pub fn operational_port(&self) -> u16 {
+        self.operational_bind.port()
+    }
+
     /// Stop both listeners, every established session and the
     /// background tasks.
     pub fn shutdown(self) {
@@ -244,10 +251,8 @@ fn new_node_id() -> String {
 /// `node`, the peer address as the source.
 fn plane_audit_ctx(peer: SocketAddr) -> AuditContext {
     AuditContext {
-        username: "cluster".to_string(),
-        role: "node".to_string(),
         ip: peer.ip().to_string(),
-        user_agent: String::new(),
+        ..AuditContext::node("cluster")
     }
 }
 
@@ -585,6 +590,11 @@ struct FleetHandlers {
     quota: IngestQuota,
     /// Where the fan-in database lives, for the storage watermark.
     data_dir: std::path::PathBuf,
+    /// The same reload signal every configuration mutation fires, so a
+    /// roster write that changes what a `node_selector` resolves to
+    /// runs a replication round like any other configuration change
+    /// (Story 10.0).
+    config_reload: watch::Sender<u64>,
 }
 
 impl FleetHandlers {
@@ -592,6 +602,27 @@ impl FleetHandlers {
         if let Err(e) = refresh_control_plane(&self.control, &self.store).await {
             error!(error = %e, "cluster plane: roster/CRL refresh failed");
         }
+    }
+
+    /// Fire the reload signal, the way `ApiState::notify_config_changed`
+    /// does for a configuration mutation.
+    ///
+    /// # Which roster writes need this, and which do not
+    ///
+    /// `SelectorResolution::from_rows` is built from the
+    /// `(name, node_id)` rows of `cluster_nodes`, every status
+    /// included, so only a write that ADDS, REMOVES or RENAMES a row
+    /// can change what a selector entry resolves to. Enrolment
+    /// (`create_cluster_node`, the one call below) is the only runtime
+    /// write that does. Activation and revocation flip `status` and
+    /// leave the name and the id alone, so they change no cut and
+    /// firing for them would cost the whole fleet a reload for
+    /// nothing. The migration-53 duplicate-name rename runs at boot,
+    /// before any signal could be delivered, and is caught by
+    /// [`seed_accepted_config`] instead.
+    fn signal_fleet_change(&self) {
+        let next = *self.config_reload.borrow() + 1;
+        let _ = self.config_reload.send(next);
     }
 
     async fn audit(
@@ -641,6 +672,11 @@ impl EnrollmentHandler for FleetHandlers {
             let public_id = request.public_id.clone();
             let grant = redeem_with_store(&self.store, &self.control, request, Utc::now()).await?;
             self.refresh().await;
+            // A new `(name, node_id)` row is a change to what every
+            // `node_selector` resolves to, which is half of what a
+            // per-recipient payload is a function of. Left unsignalled
+            // it would move every cut without moving the generation.
+            self.signal_fleet_change();
             match publish_token_liveness(&self.control, &self.store).await {
                 Ok(live) => info!(live_tokens = live, "join token redeemed"),
                 Err(e) => error!(error = %e, "token liveness recount failed"),
@@ -1064,7 +1100,7 @@ impl SessionHandler for FleetHandlers {
         let node_id = node_id.to_string();
         Box::pin(async move {
             let accepted = &self.control.accepted;
-            if !accepted.version().is_behind(&applied) {
+            if !accepted.expected_for(&node_id).is_behind(&applied) {
                 // The node is where the fleet is. If it was quarantined
                 // for slow or refused Prepares, it has converged on its
                 // own and belongs back in the commit set, which is the
@@ -1077,12 +1113,13 @@ impl SessionHandler for FleetHandlers {
                 }
                 return Ok(None);
             }
-            // Served from the ACCEPTED payload, never re-encoded from
-            // the store. Two reasons: a pull must not be able to make
-            // the control plane walk every replicated table under the
-            // store lock, and it must never hand out a generation the
-            // fleet aborted.
-            let Some(payload) = accepted.payload() else {
+            // Served from the ACCEPTED source, never re-read from the
+            // store. Three reasons: a pull must not be able to make the
+            // control plane walk every replicated table under the store
+            // lock, it must never hand out a generation the fleet
+            // aborted, and what it hands out is the caller's own cut
+            // (Story 10.0), not the fleet's configuration.
+            let Some(payload) = accepted.payload_for(&node_id) else {
                 return Err("no configuration has been accepted by the fleet yet".to_string());
             };
             info!(
@@ -1092,7 +1129,7 @@ impl SessionHandler for FleetHandlers {
                 "serving a configuration pull"
             );
             lorica_api::metrics::inc_cluster_config_apply(&node_id, "pulled");
-            Ok(Some((*payload).clone()))
+            Ok(Some(payload))
         })
     }
 }
@@ -1214,31 +1251,66 @@ pub(crate) async fn replicate_after_reload(
     //
     // The encode comes first because the reload signal also fires for
     // changes that never replicate (an operator account, a session, a
-    // GeoIP database downloaded by the auto-updater), and the canonical
-    // hash is exactly the identity of what does replicate: an unchanged
-    // hash means there is nothing for the fleet to apply, so the
-    // generation does not move and no round runs.
+    // GeoIP database downloaded by the auto-updater), and the fleet
+    // identity hash is exactly the identity of what does replicate: an
+    // unchanged identity means there is nothing for the fleet to
+    // apply, so the generation does not move and no round runs.
     let accepted_hash = control.accepted.version().hash;
     let encoded = db_blocking(store, move |store| {
-        let blob = lorica_config::canonical::canonical_bytes(store).map_err(internal)?;
+        let cfg = lorica_config::canonical::canonical_config(store).map_err(internal)?;
+        let blob = lorica_config::canonical::encode_canonical(&cfg).map_err(internal)?;
         // From the bytes we already hold: `canonical_hash` would walk
         // every replicated table and serialise it a second time.
-        let hash = lorica_config::canonical::sha256_hex(&blob);
+        let blob_hash = lorica_config::canonical::sha256_hex(&blob);
+        let nodes = node_rows(store)?;
+        // The ROSTER is part of what is compared, not just the blob.
+        // A recipient's payload is a function of two sources since
+        // Story 10.0: the configuration, and the roster that turns a
+        // `node_selector` name into a node id. A node enrolling under
+        // a name a route already selects changes every cut without
+        // touching one byte of configuration, and comparing the blob
+        // alone would call that "nothing to replicate". The fleet
+        // would then hold cuts that the next boot, reading the roster
+        // as it is THEN, recomputes differently at the same
+        // generation, and every node would read as drifted. Folding
+        // the roster in makes a roster change a configuration change,
+        // so the generation advances with it.
+        let hash = lorica_config::canonical::fleet_identity_hash(&blob_hash, &nodes);
         if hash == accepted_hash {
             return Ok::<_, ApiError>(None);
+        }
+        // A follower refuses a blob whose address lists do not parse
+        // (backlog #88), which aborts the round for the whole fleet.
+        // The API, the importer and the replica apply all validate, so
+        // reaching this means a store written before they did; say so
+        // HERE, where the setting and the node are known, instead of
+        // leaving the operator with N identical refusals and no cause.
+        if let Err(reason) = cfg.global.validate_cidr_lists() {
+            warn!(
+                %reason,
+                "a replicated setting carries a malformed CIDR; every follower will refuse this \
+                 configuration until it is corrected through the settings API"
+            );
         }
         let generation = store
             .increment_cluster_config_generation()
             .map_err(internal)?;
-        Ok(Some(ConfigPayload {
-            generation,
-            hash,
-            blob,
-        }))
+        // Recorded under the same store lock as the increment, so the
+        // pair a restart reads back is the pair this round is about to
+        // publish. The increment comes FIRST on purpose: a crash
+        // between the two leaves the persisted hash behind the
+        // generation, which the boot seed reads as "a round is owed"
+        // and repairs by publishing. The reverse order would leave a
+        // hash claiming a generation that was never encoded, and the
+        // seed would believe it.
+        store
+            .set_cluster_published_fleet_hash(&hash)
+            .map_err(internal)?;
+        Ok(Some(FleetPayloads::new(generation, hash, cfg, &nodes)))
     })
     .await;
-    let payload = match encoded {
-        Ok(Some(payload)) => payload,
+    let payloads: Arc<FleetPayloads> = match encoded {
+        Ok(Some(payloads)) => Arc::new(payloads),
         Ok(None) => {
             info!("configuration reload changed nothing the fleet replicates; no round");
             return;
@@ -1249,10 +1321,10 @@ pub(crate) async fn replicate_after_reload(
         }
     };
 
-    let generation = payload.generation;
+    let generation = payloads.generation;
     // The round publishes the version itself, and only once Prepare
     // has succeeded fleet-wide: see `AcceptedConfig`.
-    let report = control.replicate(payload).await;
+    let report = control.replicate(payloads).await;
     for node_id in &report.committed {
         lorica_api::metrics::inc_cluster_config_apply(node_id, "committed");
     }
@@ -1290,6 +1362,197 @@ pub(crate) async fn replicate_after_reload(
             skipped_quarantined = report.skipped_quarantined.len(),
             "cluster configuration replicated"
         );
+    }
+}
+
+/// The `(name, node_id)` rows a round resolves `node_selector`
+/// against. Read under the same store lock as the configuration, so
+/// the entitlement a payload is cut on matches the roster the
+/// generation was encoded from.
+fn node_rows(store: &ConfigStore) -> Result<Vec<(String, String)>, ApiError> {
+    Ok(store
+        .list_cluster_nodes()
+        .map_err(internal)?
+        .into_iter()
+        .map(|node| (node.name, node.node_id))
+        .collect())
+}
+
+/// Publish the generation the store already holds, so the accepted
+/// configuration exists before the first session is admitted.
+///
+/// Two reasons it cannot wait: a follower that connects during startup
+/// must not be told the control plane is at generation 0 and wipe
+/// itself, and a convergence pull is answered from this payload rather
+/// than from the store, so it has to exist before anyone can ask.
+///
+/// What the store holds at boot IS the accepted state: it is the
+/// configuration this process is about to serve, and the fleet either
+/// converged on it before the restart or converges on it now. That
+/// holds only while the persisted generation still describes the
+/// persisted content, which is what the fleet identity hash records
+/// and what this repairs when it does not. Returns the generation
+/// published.
+async fn seed_accepted_config(
+    control: &Arc<ControlPlane>,
+    store: &Arc<Mutex<ConfigStore>>,
+) -> Result<u64, String> {
+    let s = store.lock().await;
+    let mut generation = s
+        .cluster_config_generation()
+        .map_err(|e| format!("cluster plane: configuration generation: {e}"))?;
+    let cfg = lorica_config::canonical::canonical_config(&s)
+        .map_err(|e| format!("cluster plane: canonical read: {e}"))?;
+    let blob = lorica_config::canonical::encode_canonical(&cfg)
+        .map_err(|e| format!("cluster plane: canonical encode: {e}"))?;
+    let nodes = node_rows(&s).map_err(|e| format!("cluster plane: {e}"))?;
+    let hash = lorica_config::canonical::fleet_identity_hash(
+        &lorica_config::canonical::sha256_hex(&blob),
+        &nodes,
+    );
+    // Is this seed FAITHFUL to what the fleet was last told? The
+    // generation is a counter over changes to the fleet's identity,
+    // and the seed rebuilds a generation's payloads from the store.
+    // The two agree only if nothing moved the identity without moving
+    // the counter, which is exactly what the persisted hash records. A
+    // crash between a roster write and the round it owed is that
+    // window, and so is the migration-53 duplicate-name rename, which
+    // renames rows at boot before this runs.
+    let published = s
+        .cluster_published_fleet_hash()
+        .map_err(|e| format!("cluster plane: published fleet hash: {e}"))?;
+    if published.is_empty() {
+        // Nothing to compare against: a control plane that has never
+        // published, or a database written before the key existed.
+        // Record what is being published rather than inventing a round
+        // nobody owes.
+        s.set_cluster_published_fleet_hash(&hash)
+            .map_err(|e| format!("cluster plane: published fleet hash: {e}"))?;
+    } else if published != hash {
+        generation = s
+            .increment_cluster_config_generation()
+            .map_err(|e| format!("cluster plane: configuration generation: {e}"))?;
+        s.set_cluster_published_fleet_hash(&hash)
+            .map_err(|e| format!("cluster plane: published fleet hash: {e}"))?;
+        warn!(
+            generation,
+            "cluster plane: what the fleet replicates changed since the last round was published, \
+             so a round is OWED. Seeding the previous generation would tell every node it is in \
+             sync while holding a cut this process no longer computes, so the generation is \
+             advanced instead and the fleet converges by pull or on the next mutation"
+        );
+    }
+    control
+        .accepted
+        .publish(Arc::new(FleetPayloads::new(generation, hash, cfg, &nodes)));
+    Ok(generation)
+}
+
+/// One generation's payloads, cut per recipient (Story 10.0).
+///
+/// Holds the control plane's full canonical view plus the round's
+/// name-to-id resolution, and encodes a recipient's cut on demand. The
+/// memo matters because the same node is asked for more than once: the
+/// Prepare, then the Commit, then every convergence pull answered from
+/// this source until the next generation replaces it.
+pub(crate) struct FleetPayloads {
+    generation: u64,
+    /// The fleet's IDENTITY: the canonical blob's hash folded with the
+    /// roster rows `resolution` was built from
+    /// (`lorica_config::canonical::fleet_identity_hash`).
+    ///
+    /// It is not the hash of any blob on the wire, and has not been
+    /// since Story 10.0 made the payload per recipient. Its two jobs
+    /// are change detection on the reload path and the "where the
+    /// fleet is" header of `/cluster/drift` and `/cluster/replication`.
+    /// The roster belongs in it because a cut is a function of the
+    /// roster as much as of the configuration.
+    fleet_hash: String,
+    config: CanonicalConfig,
+    resolution: SelectorResolution,
+    /// Behind an `Arc` so the expectation path can read a generation
+    /// and a hash off a cut without copying the cut's blob: at fleet
+    /// scale that copy happened once per node per heartbeat, pull,
+    /// handshake and dashboard render.
+    memo: StdMutex<HashMap<String, Arc<ConfigPayload>>>,
+}
+
+impl FleetPayloads {
+    fn new(
+        generation: u64,
+        fleet_hash: String,
+        config: CanonicalConfig,
+        node_rows: &[(String, String)],
+    ) -> Self {
+        let resolution = SelectorResolution::from_rows(node_rows.iter().cloned());
+        // A selector entry naming no single node reaches nobody. That
+        // is the safe direction, but silence would leave an operator
+        // debugging a route that is simply never delivered, so the
+        // round says so once per encode of the fleet's view.
+        for route in &config.routes {
+            for name in resolution.unresolvable(&route.node_selector) {
+                warn!(
+                    route_id = %route.id,
+                    selector_entry = %name,
+                    "node_selector entry resolves to no single node; this route is delivered to nobody through it"
+                );
+            }
+        }
+        Self {
+            generation,
+            fleet_hash,
+            config,
+            resolution,
+            memo: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// One recipient's cut, encoded once and shared thereafter.
+    ///
+    /// The only place a cut is built. Both trait methods go through
+    /// here, so the bytes a node is sent and the hash it is told to
+    /// hold cannot come from two different computations.
+    fn cut(&self, node_id: &str) -> Arc<ConfigPayload> {
+        {
+            let memo = self.memo.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(found) = memo.get(node_id) {
+                return Arc::clone(found);
+            }
+        }
+        let cut = restrict_for_recipient(&self.config, node_id, &self.resolution);
+        // An encode failure here would mean a configuration this
+        // process just read cannot be serialised. The empty blob that
+        // results is refused by the recipient's strict decode, which
+        // fails the round, rather than applied as "nothing configured".
+        let blob = lorica_config::canonical::encode_canonical(&cut).unwrap_or_default();
+        let payload = Arc::new(ConfigPayload {
+            generation: self.generation,
+            hash: lorica_config::canonical::sha256_hex(&blob),
+            blob,
+        });
+        self.memo
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(node_id.to_string(), Arc::clone(&payload));
+        payload
+    }
+}
+
+impl PayloadSource for FleetPayloads {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn fleet_hash(&self) -> String {
+        self.fleet_hash.clone()
+    }
+
+    fn payload_for(&self, node_id: &str) -> ConfigPayload {
+        (*self.cut(node_id)).clone()
+    }
+
+    fn expected_version_for(&self, node_id: &str) -> ConfigVersion {
+        self.cut(node_id).version()
     }
 }
 
@@ -1352,6 +1615,14 @@ fn spawn_drift_watch(
     alert_sender: AlertSender,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // The one task entitled to advance the alert backoff. Claimed
+        // before the loop: if something else already holds it, this
+        // process would be alerting twice on one budget, which is a
+        // wiring bug and not a condition to paper over at runtime.
+        let Some(alerter) = runtime.claim_drift_alerter() else {
+            error!("drift alerter already claimed; this watch task will not run");
+            return;
+        };
         loop {
             tokio::time::sleep(DRIFT_CHECK_INTERVAL).await;
             let report = match lorica_api::cluster::runtime::drift_report(&runtime, &store).await {
@@ -1363,7 +1634,7 @@ fn spawn_drift_watch(
             };
             lorica_api::metrics::set_cluster_drift_nodes(report.drifted.len());
             let ids: Vec<String> = report.drifted.iter().map(|d| d.node_id.clone()).collect();
-            for node_id in runtime.drift.observe(&ids, Utc::now()) {
+            for node_id in alerter.due(&ids, Utc::now()) {
                 let Some(entry) = report.drifted.iter().find(|d| d.node_id == node_id) else {
                     continue;
                 };
@@ -1672,30 +1943,7 @@ pub(crate) async fn spawn_cluster_plane(
     refresh_control_plane(&control, store)
         .await
         .map_err(|e| format!("cluster plane: {e}"))?;
-    // Seed the accepted configuration before the first session is
-    // admitted, for two reasons: a follower that connects during
-    // startup must not be told the control plane is at generation 0
-    // and wipe itself, and a convergence pull is answered from this
-    // payload rather than from the store, so it has to exist before
-    // anyone can ask.
-    //
-    // What the store holds at boot IS the accepted state: it is the
-    // configuration this process is about to serve, and the fleet
-    // either converged on it before the restart or converges on it now.
-    {
-        let s = store.lock().await;
-        let generation = s
-            .cluster_config_generation()
-            .map_err(|e| format!("cluster plane: configuration generation: {e}"))?;
-        let blob = lorica_config::canonical::canonical_bytes(&s)
-            .map_err(|e| format!("cluster plane: canonical encode: {e}"))?;
-        let hash = lorica_config::canonical::sha256_hex(&blob);
-        control.accepted.publish(ConfigPayload {
-            generation,
-            hash,
-            blob,
-        });
-    }
+    seed_accepted_config(&control, store).await?;
     let telemetry = match ClusterTelemetryStore::open(&opts.data_dir) {
         Ok(store) => Some(Arc::new(store)),
         Err(e) => {
@@ -1721,6 +1969,7 @@ pub(crate) async fn spawn_cluster_plane(
         telemetry,
         quota: IngestQuota::new(),
         data_dir: opts.data_dir.clone(),
+        config_reload: opts.config_reload.clone(),
     });
 
     let operational_stats = Arc::new(OperationalStats::default());
@@ -1737,7 +1986,7 @@ pub(crate) async fn spawn_cluster_plane(
     // the version below, so a follower that is behind pulls instead of
     // drifting. One slot shared with the control-plane handle, swapped
     // by the coordinator after each round.
-    operational_config.config_version = control.config_version_handle();
+    operational_config.accepted = Arc::new(control.accepted.clone());
     operational_config.fleet = Some(FleetHooks {
         roster: Arc::clone(&control.roster),
         sessions: Arc::clone(&control.sessions),
@@ -1812,6 +2061,9 @@ pub(crate) async fn spawn_cluster_plane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lorica_cluster::messages::{ClusterResponse, ConfigCommitAck, ConfigPrepareAck};
+    use lorica_cluster::{ClusterFrame, NodeIdentity, NodeState, SessionGuard};
+    use lorica_command::RpcEndpoint;
     use lorica_config::models::{JoinToken, TokenState};
 
     fn test_control(auto_activate: bool) -> Arc<ControlPlane> {
@@ -2155,5 +2407,298 @@ mod tests {
 
         drop(log_store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Story 10.0 follow-up: the roster is part of the fleet's identity
+    // -----------------------------------------------------------------
+
+    /// A route carrying only the fields that have no serde default,
+    /// plus the selector under test. Spelling out all seventy-odd of
+    /// `Route`'s fields in a test that cares about one of them would
+    /// bury what it asserts.
+    fn route_selected_for(
+        id: &str,
+        hostname: &str,
+        selector: &[&str],
+    ) -> lorica_config::models::Route {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "hostname": hostname,
+            "path_prefix": "/",
+            "certificate_id": null,
+            "load_balancing": "round_robin",
+            "waf_enabled": false,
+            "waf_mode": "detection",
+            "enabled": true,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "node_selector": selector,
+        }))
+        .expect("test setup: route")
+    }
+
+    /// A registry row, which is all a selector resolution reads: the
+    /// name and the id.
+    fn roster_row(node_id: &str, name: &str) -> ClusterNode {
+        let now = Utc::now();
+        ClusterNode {
+            node_id: node_id.to_string(),
+            name: name.to_string(),
+            cert_fingerprint: format!("fp-{node_id}"),
+            cert_serial: format!("serial-{node_id}"),
+            prev_cert_fingerprint: None,
+            prev_cert_serial: None,
+            address: "192.0.2.10:9443".to_string(),
+            version: "test".to_string(),
+            schema_version: 50,
+            status: NodeStatus::Active,
+            enrolled_at: now,
+            last_seen_at: None,
+            applied_config_generation: 0,
+            applied_config_hash: String::new(),
+            cert_not_after: now + chrono::Duration::days(30),
+            revoked_at: None,
+        }
+    }
+
+    async fn add_route(store: &Arc<Mutex<ConfigStore>>, id: &str, selector: &[&str]) {
+        let s = store.lock().await;
+        s.create_route(&route_selected_for(
+            id,
+            &format!("{id}.example.com"),
+            selector,
+        ))
+        .expect("test setup: route");
+    }
+
+    async fn add_node(store: &Arc<Mutex<ConfigStore>>, node_id: &str, name: &str) {
+        let s = store.lock().await;
+        s.create_cluster_node(&roster_row(node_id, name))
+            .expect("test setup: node");
+    }
+
+    #[tokio::test]
+    async fn a_roster_change_alone_runs_a_round_and_an_unchanged_fleet_runs_none() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let runtime = Arc::new(ControlPlaneRuntime::new(Arc::clone(&control)));
+        assert_eq!(
+            seed_accepted_config(&control, &store).await.expect("seed"),
+            0
+        );
+
+        // Nothing changed: no generation, no round.
+        replicate_after_reload(&runtime, &store).await;
+        assert_eq!(control.config_version().generation, 0);
+        assert!(
+            control.replication.last_report().is_none(),
+            "an unchanged fleet must not be made to run a round"
+        );
+
+        // A configuration change with an unchanged roster: one round.
+        add_route(&store, "route-a", &["edge-a"]).await;
+        replicate_after_reload(&runtime, &store).await;
+        assert_eq!(control.config_version().generation, 1);
+        assert_eq!(
+            control.replication.last_report().map(|r| r.generation),
+            Some(1)
+        );
+
+        // A ROSTER change with an unchanged configuration: also one
+        // round. Not one byte of the blob moves, but "edge-a" resolves
+        // to a node now, so the cut of route-a changes for everyone.
+        add_node(&store, "id-a", "edge-a").await;
+        replicate_after_reload(&runtime, &store).await;
+        assert_eq!(
+            control.config_version().generation,
+            2,
+            "a roster change that can change a cut IS a configuration change"
+        );
+        assert_eq!(
+            control.replication.last_report().map(|r| r.generation),
+            Some(2)
+        );
+
+        // And nothing again is nothing again.
+        replicate_after_reload(&runtime, &store).await;
+        assert_eq!(control.config_version().generation, 2);
+        assert_eq!(
+            control.replication.last_report().map(|r| r.generation),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_boot_seed_bumps_only_when_a_change_landed_without_a_round() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let runtime = Arc::new(ControlPlaneRuntime::new(Arc::clone(&control)));
+        seed_accepted_config(&control, &store).await.expect("seed");
+        add_route(&store, "route-a", &["edge-a"]).await;
+        replicate_after_reload(&runtime, &store).await;
+        assert_eq!(control.config_version().generation, 1);
+
+        // A restart with nothing moved under the generation: the seed
+        // is faithful, so it publishes the stored generation unchanged
+        // and no node reads as drifted.
+        let restarted = test_control(false);
+        assert_eq!(
+            seed_accepted_config(&restarted, &store)
+                .await
+                .expect("seed"),
+            1
+        );
+
+        // A roster row written with no round behind it: the shape a
+        // crash between the registry write and the round leaves.
+        add_node(&store, "id-a", "edge-a").await;
+        let crashed = test_control(false);
+        assert_eq!(
+            seed_accepted_config(&crashed, &store).await.expect("seed"),
+            2,
+            "a change the fleet was never told about owes a round"
+        );
+
+        // The repair is recorded, so the boot after it is faithful
+        // again rather than bumping on every start.
+        let again = test_control(false);
+        assert_eq!(seed_accepted_config(&again, &store).await.expect("seed"), 2);
+    }
+
+    /// The production `PayloadSource` against the canonical filter it
+    /// is supposed to implement.
+    ///
+    /// The `lorica-cluster` suite asserts the round's contract against
+    /// a hand-written double, which can only prove the double
+    /// consistent with itself. This drives the real `Replicator` over
+    /// a real `FleetPayloads` built from a real store, and checks the
+    /// hash each node is OFFERED against `restrict_for_recipient`, so
+    /// the two cannot diverge silently.
+    #[tokio::test]
+    async fn each_node_is_offered_the_hash_of_its_own_restricted_cut() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let runtime = Arc::new(ControlPlaneRuntime::new(Arc::clone(&control)));
+        add_node(&store, "id-a", "edge-a").await;
+        add_node(&store, "id-b", "edge-b").await;
+        add_route(&store, "pinned", &["edge-a"]).await;
+        add_route(&store, "fleetwide", &[]).await;
+        seed_accepted_config(&control, &store).await.expect("seed");
+
+        // Two live sessions, so the round addresses both and the
+        // report carries what each one was offered.
+        let a = spawn_scripted_follower(&control, "id-a");
+        let b = spawn_scripted_follower(&control, "id-b");
+        add_route(&store, "later", &["edge-b"]).await;
+        replicate_after_reload(&runtime, &store).await;
+        let report = control.replication.last_report().expect("a round ran");
+        assert!(!report.aborted, "nothing rejected: {report:?}");
+        assert_eq!(report.committed, vec!["id-a", "id-b"]);
+
+        let (cfg, nodes) = {
+            let s = store.lock().await;
+            (
+                lorica_config::canonical::canonical_config(&s).expect("canonical"),
+                node_rows(&s).expect("rows"),
+            )
+        };
+        let resolution = SelectorResolution::from_rows(nodes.iter().cloned());
+        let offered: HashMap<String, String> = report.offered.into_iter().collect();
+        for node_id in ["id-a", "id-b"] {
+            let cut = restrict_for_recipient(&cfg, node_id, &resolution);
+            let expected = lorica_config::canonical::sha256_hex(
+                &lorica_config::canonical::encode_canonical(&cut).expect("encode"),
+            );
+            assert_eq!(
+                offered.get(node_id),
+                Some(&expected),
+                "{node_id} was offered a blob the canonical filter does not produce"
+            );
+            assert_eq!(control.expected_config_version(node_id).hash, expected);
+            assert_eq!(
+                control
+                    .accepted
+                    .payload_for(node_id)
+                    .expect("published")
+                    .hash,
+                expected
+            );
+        }
+        assert_ne!(
+            control.expected_config_version("id-a").hash,
+            control.expected_config_version("id-b").hash,
+            "each node is selected for a route the other is not"
+        );
+        assert_ne!(
+            control.config_version().hash,
+            control.expected_config_version("id-a").hash,
+            "the fleet identity is not any recipient's cut"
+        );
+        drop((a, b));
+    }
+
+    /// A follower that stages and applies whatever it is sent, over an
+    /// in-process duplex. Enough for a round to complete: what these
+    /// assertions are about is what was OFFERED, not what a real node
+    /// does with it.
+    fn spawn_scripted_follower(
+        control: &Arc<ControlPlane>,
+        node_id: &str,
+    ) -> (SessionGuard, RpcEndpoint<ClusterFrame>) {
+        use lorica_cluster::messages::{cluster_request, cluster_response};
+        let (cp_side, follower_side) = tokio::io::duplex(1024 * 1024);
+        let (cp_endpoint, _cp_incoming) =
+            RpcEndpoint::<ClusterFrame>::with_limits(cp_side, lorica_cluster::cluster_rpc_limits());
+        let (follower_endpoint, mut incoming) = RpcEndpoint::<ClusterFrame>::with_limits(
+            follower_side,
+            lorica_cluster::cluster_rpc_limits(),
+        );
+        let identity = NodeIdentity {
+            node_id: node_id.to_string(),
+            name: node_id.to_string(),
+            state: NodeState::Active,
+            via_previous_certificate: false,
+        };
+        let peer: SocketAddr = "192.0.2.10:9443".parse().expect("test setup: peer");
+        let guard = control.sessions.register(
+            &identity,
+            peer,
+            cp_endpoint,
+            "test",
+            50,
+            AppliedConfig::default(),
+        );
+        tokio::spawn(async move {
+            let mut staged: Option<(u64, String)> = None;
+            while let Some(request) = incoming.recv().await {
+                let reply = match &request.request().body {
+                    Some(cluster_request::Body::ConfigPrepare(prepare)) => {
+                        staged = Some((prepare.generation, prepare.hash.clone()));
+                        ClusterResponse::ok(cluster_response::Body::ConfigPrepareAck(
+                            ConfigPrepareAck {
+                                accepted: true,
+                                reason: String::new(),
+                            },
+                        ))
+                    }
+                    Some(cluster_request::Body::ConfigCommit(commit)) => {
+                        let (generation, hash) =
+                            staged.clone().unwrap_or((commit.generation, String::new()));
+                        ClusterResponse::ok(cluster_response::Body::ConfigCommitAck(
+                            ConfigCommitAck {
+                                applied_generation: generation,
+                                applied_hash: hash,
+                            },
+                        ))
+                    }
+                    _ => ClusterResponse::refusal(lorica_cluster::ClusterStatus::UnsupportedMethod),
+                };
+                if request.reply_frame(reply).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (guard, follower_endpoint)
     }
 }

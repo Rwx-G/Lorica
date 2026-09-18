@@ -121,11 +121,31 @@ pub struct AggregatedMetrics {
     inner: RwLock<HashMap<u32, WorkerSnapshot>>,
 }
 
+/// The traffic-capture gauges one worker reported in its
+/// `MetricsReport` (Story 10.1 AC #9 follow-up).
+///
+/// The two fields aggregate differently on the supervisor side, which
+/// is why they travel together in a named type rather than as two bare
+/// `u64` arguments: see [`AggregatedMetrics::max_capture_rules_active`]
+/// and [`AggregatedMetrics::total_capture_inflight_bytes`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureGauges {
+    /// Capture rules the worker currently has armed.
+    pub rules_active: u64,
+    /// Bytes the worker holds in in-flight capture buffers.
+    pub inflight_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 struct WorkerSnapshot {
     cache_hits: u64,
     cache_misses: u64,
     active_connections: u64,
+    /// Traffic-capture gauges as of this worker's last report.
+    capture: CaptureGauges,
+    /// Bytes held in in-flight WAF body-scan buffers as of this
+    /// worker's last report.
+    waf_body_scan_inflight_bytes: u64,
     /// (ip, remaining_seconds, ban_duration_seconds, reason)
     ban_entries: Vec<(String, u64, u64, crate::ban::BanReason)>,
     /// backend_address -> score_us
@@ -165,6 +185,8 @@ impl AggregatedMetrics {
         backend_connections: HashMap<String, u64>,
         request_counts: Vec<(String, u32, u64)>,
         waf_counts: Vec<(String, String, u64)>,
+        capture: CaptureGauges,
+        waf_body_scan_inflight_bytes: u64,
     ) {
         let mut map = self.inner.write().await;
         map.insert(
@@ -173,6 +195,8 @@ impl AggregatedMetrics {
                 cache_hits,
                 cache_misses,
                 active_connections,
+                capture,
+                waf_body_scan_inflight_bytes,
                 ban_entries,
                 ewma_scores,
                 backend_connections,
@@ -209,6 +233,60 @@ impl AggregatedMetrics {
             .await
             .values()
             .map(|w| w.active_connections)
+            .sum()
+    }
+
+    /// Capture rules armed across the fleet, as a MAXIMUM, not a sum.
+    ///
+    /// Every worker compiles the same configuration snapshot, so the
+    /// figure is the same in each of them and summing would report the
+    /// operator's rule count multiplied by the worker count. The
+    /// maximum is preferred over "read worker 0" because there is no
+    /// worker whose report is guaranteed to be present: a worker that
+    /// has just been respawned, or one whose report timed out, has no
+    /// snapshot yet, and a fixed pick would read 0 for the whole node
+    /// while the rest of the fleet is armed. The maximum equals the
+    /// common value as soon as any worker has reported, and during a
+    /// rolling config reload it reports the larger of the two rule sets
+    /// rather than a torn number from whichever worker was polled.
+    pub async fn max_capture_rules_active(&self) -> u64 {
+        self.inner
+            .read()
+            .await
+            .values()
+            .map(|w| w.capture.rules_active)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Bytes held in in-flight capture buffers across the fleet, summed.
+    ///
+    /// Unlike the rule count this is genuinely per worker: each worker
+    /// reserves against its own copy of the node budget, so the fleet
+    /// figure is the sum and the configured ceiling applies per worker.
+    pub async fn total_capture_inflight_bytes(&self) -> u64 {
+        self.inner
+            .read()
+            .await
+            .values()
+            .map(|w| w.capture.inflight_bytes)
+            .sum()
+    }
+
+    /// Bytes held in in-flight WAF body-scan buffers across the fleet,
+    /// summed.
+    ///
+    /// Same reasoning as [`Self::total_capture_inflight_bytes`]: each
+    /// worker holds its own buffers against its own copy of the
+    /// `waf_body_scan_max_inflight_bytes` ceiling, so what an operator
+    /// needs to see on the node is the total held at that moment, and
+    /// the configured ceiling applies per worker rather than per node.
+    pub async fn total_waf_body_scan_inflight_bytes(&self) -> u64 {
+        self.inner
+            .read()
+            .await
+            .values()
+            .map(|w| w.waf_body_scan_inflight_bytes)
             .sum()
     }
 
@@ -303,9 +381,133 @@ pub async fn get_workers(
 
 #[cfg(test)]
 mod tests {
-    use super::AggregatedMetrics;
+    use super::{AggregatedMetrics, CaptureGauges};
     use crate::ban::BanReason;
     use std::collections::HashMap;
+
+    /// Record a worker whose only interesting content is its capture
+    /// gauges, so the aggregation assertions below read as the numbers
+    /// they are about.
+    async fn report_capture(agg: &AggregatedMetrics, worker_id: u32, capture: CaptureGauges) {
+        report_gauges(agg, worker_id, capture, 0).await;
+    }
+
+    /// Record a worker's capture gauges plus its WAF body-scan
+    /// reservation, for the assertions that are about the latter.
+    async fn report_gauges(
+        agg: &AggregatedMetrics,
+        worker_id: u32,
+        capture: CaptureGauges,
+        waf_body_scan_inflight_bytes: u64,
+    ) {
+        agg.update_worker(
+            worker_id,
+            0,
+            0,
+            0,
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            capture,
+            waf_body_scan_inflight_bytes,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn capture_rules_active_is_maxed_not_summed_across_workers() {
+        // Every worker compiles the same snapshot, so four workers each
+        // reporting three armed rules describe a node with three rules,
+        // not twelve.
+        let agg = AggregatedMetrics::new();
+        for worker_id in 0..4 {
+            report_capture(
+                &agg,
+                worker_id,
+                CaptureGauges {
+                    rules_active: 3,
+                    inflight_bytes: 0,
+                },
+            )
+            .await;
+        }
+
+        assert_eq!(agg.max_capture_rules_active().await, 3);
+    }
+
+    #[tokio::test]
+    async fn capture_rules_active_survives_a_worker_that_has_not_reported() {
+        // A respawned worker's snapshot starts at zero. The fleet value
+        // must stay at what the armed workers report rather than drop to
+        // that worker's zero.
+        let agg = AggregatedMetrics::new();
+        report_capture(
+            &agg,
+            0,
+            CaptureGauges {
+                rules_active: 5,
+                inflight_bytes: 0,
+            },
+        )
+        .await;
+        report_capture(&agg, 1, CaptureGauges::default()).await;
+
+        assert_eq!(agg.max_capture_rules_active().await, 5);
+    }
+
+    #[tokio::test]
+    async fn capture_inflight_bytes_is_summed_across_workers() {
+        // Each worker holds its own bytes under its own ceiling, so the
+        // fleet figure is the total held on the node.
+        let agg = AggregatedMetrics::new();
+        report_capture(
+            &agg,
+            0,
+            CaptureGauges {
+                rules_active: 2,
+                inflight_bytes: 4_096,
+            },
+        )
+        .await;
+        report_capture(
+            &agg,
+            1,
+            CaptureGauges {
+                rules_active: 2,
+                inflight_bytes: 1_024,
+            },
+        )
+        .await;
+
+        assert_eq!(agg.total_capture_inflight_bytes().await, 5_120);
+    }
+
+    #[tokio::test]
+    async fn capture_gauges_are_zero_before_any_worker_reports() {
+        let agg = AggregatedMetrics::new();
+        assert_eq!(agg.max_capture_rules_active().await, 0);
+        assert_eq!(agg.total_capture_inflight_bytes().await, 0);
+    }
+
+    #[tokio::test]
+    async fn waf_body_scan_inflight_bytes_is_summed_across_workers() {
+        // Each worker buffers request bodies against its own copy of
+        // the ceiling, and all of it is memory the node holds at the
+        // same moment, so the fleet figure is the total.
+        let agg = AggregatedMetrics::new();
+        report_gauges(&agg, 0, CaptureGauges::default(), 8_192).await;
+        report_gauges(&agg, 1, CaptureGauges::default(), 2_048).await;
+        report_gauges(&agg, 2, CaptureGauges::default(), 1_024).await;
+
+        assert_eq!(agg.total_waf_body_scan_inflight_bytes().await, 11_264);
+
+        agg.remove_worker(0).await;
+        agg.remove_worker(1).await;
+        agg.remove_worker(2).await;
+        assert_eq!(agg.total_waf_body_scan_inflight_bytes().await, 0);
+    }
 
     #[tokio::test]
     async fn merged_ban_list_carries_reason() {
@@ -320,6 +522,8 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
+            CaptureGauges::default(),
+            0,
         )
         .await;
 

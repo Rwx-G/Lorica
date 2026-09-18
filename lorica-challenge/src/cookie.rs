@@ -25,7 +25,7 @@
 //! - v6 client: 16 + 1 + 8 + 4 + 1 + 16 = **46 bytes**  (~62 base64 chars)
 //!
 //! The `ip_disc` discriminator is redundant with the payload length
-//! but avoids relying on length arithmetic in the parser — a future
+//! but avoids relying on length arithmetic in the parser - a future
 //! protocol tweak (e.g. adding nonce bytes) would otherwise shift
 //! every field.
 //!
@@ -34,7 +34,7 @@
 //! - **Integrity.** HMAC-SHA256 with a 32-byte secret. Tag
 //!   truncated to 128 bits, which is the standard "enough against
 //!   collision search" length for authenticated tokens.
-//! - **Confidentiality.** None — the payload is plaintext. This is
+//! - **Confidentiality.** None: the payload is plaintext. This is
 //!   intentional: the payload contains nothing secret (route_id
 //!   is already in the response headers, IP prefix is public,
 //!   expires_at is trivial, mode is a UX signal). Encrypting adds
@@ -407,7 +407,7 @@ mod tests {
         let cookie = sign(&p, &secret).unwrap();
         let got = verify(&cookie, &secret, 1_900_000_000).unwrap();
         // Caller will separately compare got.ip_prefix with
-        // IpPrefix::from_ip(new_client_ip) — they must be equal.
+        // IpPrefix::from_ip(new_client_ip) - they must be equal.
         assert_eq!(
             got.ip_prefix,
             IpPrefix::from_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)))

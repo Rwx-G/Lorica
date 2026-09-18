@@ -1,42 +1,92 @@
 # Data Models and Schema Changes
 
-> **Status: HISTORICAL (v1.0 schema baseline) - partially out of date
-> as of v1.5.2.**
+> **Status: the per-table sections below are HISTORICAL. They are the
+> v1.0 design round (7 tables, 4 indexes) and are not maintained.**
 >
-> This document was written against the v1.0 schema (7 tables, 4
-> indexes). The current schema as of v1.5.2 is substantially larger
-> (16+ tables, multiple migrations adding columns to existing rows) ;
-> the per-table column lists below reflect what was in v1.0, not what
-> the running database carries today. Audit M-24 (v1.5.2).
+> Read them for the reasoning behind the original shape. Do not read
+> them as a description of the running database: the column lists are
+> v1.0 columns. Audit M-24 (v1.5.2) prepended the first version of this
+> banner ; it was refreshed during the v1.8.0 cycle.
 >
-> For the **canonical current schema**, the source of truth lives in :
+> **What is true today.** The configuration database holds 34 tables
+> and its schema version is 61. Captured traffic is not one of them: a
+> capture rule is a row, the captured bodies are files on disk.
 >
-> - `lorica-config/src/migrations/` - every migration applied since
->   v1.0 (001 through 019 as of v1.5.2). Read in numeric order, this
->   tells you the current shape of every column, index, and table.
-> - `lorica-config/src/store/mod.rs` - the inline `ALTER TABLE` /
->   `CREATE INDEX IF NOT EXISTS` calls that live alongside the
->   migrations (some indexes are only added at runtime, e.g. session
->   indexes per audit L-1 / sessions.rs).
-> - `lorica-config/src/store/{routes,backends,certs,...}.rs` - one
->   module per table, each holding the SELECT / INSERT / UPDATE
->   queries against the current column set.
+> ## Where the migrations actually live
+>
+> The authoritative list is the `MIGRATIONS` constant in
+> `lorica-config/src/store/mod.rs`: a slice of `(version, fn)` pairs,
+> 1 through 60 in ascending order, applied by
+> `ConfigStore::run_migrations`. Start there. It is the only place that
+> enumerates the whole history.
+>
+> **`lorica-config/src/migrations/` is not that list.** The directory
+> holds 18 `.sql` batch files and they cover schema versions 1-16, 19
+> and 21 only. Every other version (17, 18, 20, and 22 through 60) is a
+> Rust function in `store/mod.rs` carrying its DDL inline. A reader who
+> follows the directory alone sees 18 of the 60 migrations and misses
+> every table added since v1.6.0. The filenames also drift from the
+> version numbers past 16: `017_acme_method.sql` is version 19 and
+> `019_sessions.sql` is version 21, and no `018_*.sql` exists.
+>
+> ## The rest of the current sources
+>
+> - `lorica-config/src/store/mod.rs` - besides `MIGRATIONS`, the
+>   `column_exists` / `add_column_if_absent` helpers that make the
+>   post-22 migrations idempotent for databases upgraded from the
+>   pre-tracked runner, which already carry those columns.
+> - `lorica-config/src/store/*.rs` - roughly one module per table
+>   (`routes.rs`, `backends.rs`, `certs.rs`, `capture.rs`,
+>   `automation_token.rs`, `oidc_issuer.rs`, `cluster_*.rs`, ...), each
+>   holding the SELECT / INSERT / UPDATE queries against the current
+>   column set.
 > - `lorica-config/src/models/` - the Rust struct shape that round-
 >   trips through serde for the API. Field names match the column
 >   names ; field doc-comments explain when each was added.
+> - `lorica-config/src/canonical.rs` - the cluster replication blob.
+>   `CANONICAL_FORMAT_VERSION` is `2`; it moved from 1 to 2 during the
+>   v1.8.0 cycle and the whole of that release rides the same number,
+>   guarded by a shape digest rather than by the integer alone.
 >
-> Notable additions since v1.0 not described in this document :
-> `sessions`, `bot_pending_challenges`, `cert_export_acls`,
-> `dns_providers`, `probe_configs`, `probe_results`, `sla_buckets`,
-> `load_test_configs`, `load_test_results`. The `Route` table grew
-> from 9 columns to 30+ (basic-auth, stale-while-revalidate,
-> rate-limit struct, geoip, mTLS, forward-auth, mirror, response-
-> rewrite, header-rules, traffic-splits, bot-protection,
-> group-name, ...). The `NotificationChannel` enum gained `Slack`
-> (v1.4.0) ; `UserPreference.value` gained additional variants.
+> Two further SQLite databases exist outside `lorica-config` and are
+> not migrated by `MIGRATIONS`. They create their tables with
+> `CREATE TABLE IF NOT EXISTS` at open time:
+>
+> - `access-log.db` via `lorica-api/src/log_store.rs`: `access_logs`,
+>   `waf_events`, `notification_history`, `audit_log`, `audit_log_meta`.
+> - `cluster-telemetry.db` via `lorica-api/src/cluster_telemetry_store.rs`
+>   on a control-plane node: `fleet_access_logs`, `fleet_waf_events`,
+>   `fleet_bans`.
+>
+> ## Notable additions since v1.0, by cycle
+>
+> - Through v1.5.x: `sessions`, `bot_pending_challenges`,
+>   `cert_export_acls`, `dns_providers`, `probe_configs`,
+>   `probe_results`, `sla_buckets`, `sla_configs`, `load_test_configs`,
+>   `load_test_results`, `waf_custom_rules`, `ai_crawlers_custom`.
+> - v1.6.0 (migrations up to 46): `users` replaced `admin_users`
+>   (migration 22, RBAC backfill, `admin_users` dropped), and sessions
+>   gained a role column.
+> - v1.7.0 (migrations 47-54, cluster): `acme_challenges`,
+>   `cluster_state`, `cluster_ca`, `cluster_nodes`,
+>   `cluster_join_tokens`, `cluster_revoked_serials`,
+>   `cluster_identity`, `cluster_secrets`, `cluster_replica`.
+> - v1.8.0 (migrations 56-60, capture and CI automation):
+>   `capture_rules`, `api_tokens`, `automation_environments`,
+>   `oidc_issuers` (plus its `ca_pem` column at 60). Routes and
+>   backends gained `managed_by`, and `CANONICAL_FORMAT_VERSION`
+>   became 2.
+>
+> The `Route` table grew from 9 columns to 30+ (basic-auth,
+> stale-while-revalidate, rate-limit struct, geoip, mTLS, forward-auth,
+> mirror, response-rewrite, header-rules, traffic-splits,
+> bot-protection, group-name, `managed_by`, ...). The
+> `NotificationChannel` enum gained `Slack` (v1.4.0) ;
+> `UserPreference.value` gained additional variants.
 >
 > A full rewrite is `feat`-shaped and tracked in `docs/backlog.md` ;
-> for now, treat this file as the v1.0 reference baseline.
+> for now, treat the sections below as the v1.0 reference baseline and
+> the pointers above as current.
 
 ## New Data Models
 
@@ -150,7 +200,7 @@
 - **New Tables:** `routes`, `backends`, `route_backends` (join), `certificates`, `notification_configs`, `user_preferences`, `users`, `schema_migrations`
 - **Modified Tables:** None (new database)
 - **New Indexes:** `idx_routes_hostname`, `idx_backends_health_status`, `idx_certificates_domain`, `idx_certificates_not_after`
-- **Migration Strategy:** Embedded migrations using a simple version table (`schema_migrations`). Migrations run automatically on startup. Each migration is a SQL file compiled into the binary.
+- **Migration Strategy:** Embedded migrations using a simple version table (`schema_migrations`). Migrations run automatically on startup. Each migration was a SQL file compiled into the binary at v1.0; today only versions 1-16, 19 and 21 still are, and every other version is a Rust function in the `MIGRATIONS` slice (see the banner).
 
 **Backward Compatibility:**
 - TOML export format is versioned (field `version` in export file)

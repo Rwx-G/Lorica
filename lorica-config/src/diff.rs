@@ -313,6 +313,7 @@ fn route_eq(a: &Route, b: &Route) -> bool {
         && a.return_status == b.return_status
         && a.group_name == b.group_name
         && a.node_selector == b.node_selector
+        && a.managed_by == b.managed_by
 }
 
 fn backend_eq(a: &Backend, b: &Backend) -> bool {
@@ -324,6 +325,7 @@ fn backend_eq(a: &Backend, b: &Backend) -> bool {
         && a.health_check_interval_s == b.health_check_interval_s
         && a.tls_upstream == b.tls_upstream
         && a.h2_upstream == b.h2_upstream
+        && a.managed_by == b.managed_by
 }
 
 fn cert_eq(a: &Certificate, b: &Certificate) -> bool {

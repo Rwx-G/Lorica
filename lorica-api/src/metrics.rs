@@ -490,6 +490,34 @@ struct ClusterPlaneStats {
 /// become a swap that resets the snapshot.
 static CLUSTER_PLANE_STATS: std::sync::OnceLock<ClusterPlaneStats> = std::sync::OnceLock::new();
 
+/// Register the capture and automation families at startup, so they
+/// are present on `/metrics` from the first scrape rather than after the
+/// first event. The cluster families are forced the same way; a series
+/// that appears only once something happened reads on a graph like a
+/// feature that does not exist, and an alert on it cannot be written.
+pub fn install_capture_and_automation_metrics() {
+    Lazy::force(&CAPTURE_RULES_ACTIVE);
+    Lazy::force(&CAPTURES_TOTAL);
+    Lazy::force(&CAPTURE_INFLIGHT_BYTES);
+    Lazy::force(&AUTOMATION_ENVIRONMENTS);
+    Lazy::force(&AUTOMATION_ENVIRONMENT_OPS_TOTAL);
+    Lazy::force(&AUTOMATION_REAPER_RUNS_TOTAL);
+    Lazy::force(&AUTOMATION_REQUESTS_TOTAL);
+    Lazy::force(&AUTOMATION_SOURCE_REFUSED_TOTAL);
+    Lazy::force(&AUTOMATION_REJECTED_CONCURRENT_HANDSHAKES_TOTAL);
+    Lazy::force(&AUTOMATION_REJECTED_PER_SOURCE_TOTAL);
+    Lazy::force(&AUTOMATION_REJECTED_ATTEMPT_WINDOW_TOTAL);
+    Lazy::force(&AUTOMATION_OIDC_REPLAY_EVICTIONS_TOTAL);
+    Lazy::force(&AUTOMATION_OIDC_JWKS_FETCH_TOTAL);
+    Lazy::force(&AUTOMATION_TLS_HANDSHAKE_FAILED_TOTAL);
+    for outcome in ["ok", "unauthenticated", "forbidden", "refused", "error"] {
+        AUTOMATION_REQUESTS_TOTAL.with_label_values(&[outcome]);
+    }
+    for state in ["active", "expired"] {
+        AUTOMATION_ENVIRONMENTS.with_label_values(&[state]);
+    }
+}
+
 /// Hand the running control plane's listener counters to the
 /// Prometheus bridge. Called once at startup when `--cluster-listen`
 /// is set; a second call is ignored (the plane starts once). Every
@@ -1200,7 +1228,7 @@ pub fn inc_geoip_block(route_id: &str, country: &str, mode: &str) {
 /// - `outcome`: `"shown"` (challenge page served), `"passed"`
 ///   (verdict cookie verified OR solve succeeded), `"failed"`
 ///   (wrong PoW / captcha answer, or cookie scope mismatch), or
-///   `"bypassed"` (one of the five bypass categories matched —
+///   `"bypassed"` (one of the five bypass categories matched;
 ///   detail carried on the OTel span, not the metric).
 ///
 /// Cardinality bound: routes × 3 modes × 4 outcomes, well inside
@@ -1229,7 +1257,7 @@ pub fn inc_bot_challenge(route_id: &str, mode: &str, outcome: &str) {
 //
 // In worker mode, each of the `IntCounterVec` statics above lives
 // in the worker process that incremented it. The supervisor's
-// `/metrics` handler scrapes the supervisor's own registry — which
+// `/metrics` handler scrapes the supervisor's own registry - which
 // does NOT see worker-side increments for these counters because
 // the existing `MetricsReport` wire format only carries the typed
 // fields (cache_hits, active_connections, per-route request counts,
@@ -1239,10 +1267,10 @@ pub fn inc_bot_challenge(route_id: &str, mode: &str, outcome: &str) {
 // per-worker counters into `Vec<GenericCounterEntry>` (cheap: iter
 // the `IntCounterVec::get_metric_with_label_values`-style family
 // readback via `prometheus::core::Collector::collect()`), and let
-// the supervisor apply that snapshot to its OWN registry — keyed
+// the supervisor apply that snapshot to its OWN registry - keyed
 // per-worker so successive scrapes replace instead of double-count.
 //
-// The supervisor's apply path does not just `inc_by` — that would
+// The supervisor's apply path does not just `inc_by` - that would
 // double-count on the second scrape. Instead it tracks per-worker
 // snapshots (worker_id -> metric_name -> label_tuple -> value) and
 // on every apply it computes the delta to reach the new value; if
@@ -1252,7 +1280,7 @@ pub fn inc_bot_challenge(route_id: &str, mode: &str, outcome: &str) {
 
 /// Names of the per-worker counter vecs whose deltas ship on the
 /// wire. Kept as a const array so worker snapshot and supervisor
-/// apply look at the same list — a counter added here without
+/// apply look at the same list - a counter added here without
 /// being added to both snapshot + apply logic will simply not
 /// aggregate.
 pub const PER_WORKER_COUNTERS: &[&str] = &[
@@ -1287,6 +1315,25 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     "lorica_log_sink_dropped_total",
     "lorica_log_sink_sent_total",
     "lorica_log_sink_truncated_total",
+    // Capture decisions (Story 10.1 AC #9). The budget is consulted in
+    // `logging`, which runs in the workers, so without aggregation the
+    // supervisor's /metrics would read 0 for every rule in the default
+    // packaged deployment - a feature that works and looks like it does
+    // not.
+    "lorica_captures_total",
+    // WAF body-inspection decisions (Story 10.6 AC #8). Every one of
+    // the five outcomes is produced inside `request_filter` /
+    // `request_body_filter`, which run in the workers, so without
+    // aggregation the supervisor's /metrics would read 0 - including
+    // for `skipped_budget`, the fail-open series an operator is
+    // supposed to alarm on.
+    "lorica_waf_body_scans_total",
+    // The automation plane's counters (`lorica_automation_*`, Story
+    // 10.3 / 10.4) are absent on purpose, not forgotten: the listener,
+    // the environment handlers and the reaper all run on the supervisor
+    // (or the single process), never in a worker, so the supervisor's
+    // own registry is the only one that ever increments them and there
+    // is nothing to ship.
 ];
 
 /// Re-export of the worker -> supervisor wire tuple. The lorica
@@ -1363,6 +1410,12 @@ fn resolve_per_worker_counter(
         }
         "lorica_log_sink_truncated_total" => {
             Some((&["sink"], CounterTarget::Vec(&LOG_SINK_TRUNCATED_TOTAL)))
+        }
+        "lorica_captures_total" => {
+            Some((&["rule_id", "outcome"], CounterTarget::Vec(&CAPTURES_TOTAL)))
+        }
+        "lorica_waf_body_scans_total" => {
+            Some((&["outcome"], CounterTarget::Vec(&WAF_BODY_SCANS_TOTAL)))
         }
         _ => None,
     }
@@ -1447,13 +1500,14 @@ pub fn inc_log_write_dropped(kind: &str) {
 static LOG_SINK_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
         "log_sink_dropped_total",
-        "Events dropped by a log-export sink (sink=syslog|otlp, kind=access|waf|audit)",
+        "Events dropped by a log-export sink (sink=syslog|otlp, kind=access|waf|audit|capture)",
         &["sink", "kind"],
     )
 });
 
 /// Bump the dropped-sink-event counter for `sink` (`"syslog"` /
-/// `"otlp"`) and `kind` (`"access"` / `"waf"` / `"audit"`).
+/// `"otlp"`) and `kind` (`"access"` / `"waf"` / `"audit"` /
+/// `"capture"`).
 pub fn inc_log_sink_dropped(sink: &str, kind: &str) {
     LOG_SINK_DROPPED_TOTAL
         .with_label_values(&[sink, kind])
@@ -1758,6 +1812,32 @@ pub fn inc_audit_insert_failed() {
     AUDIT_INSERT_FAILED_TOTAL.inc();
 }
 
+/// Counter: audit rows dropped because the write queue was full.
+///
+/// The row never reached the chain, so unlike a broken hash this
+/// leaves NO evidence in the table: an operator who does not watch
+/// this counter cannot tell a quiet period from a shed one. Any
+/// non-zero value means the SQLite writer fell behind a burst on the
+/// management API or the automation plane, and the trail has a gap
+/// exactly there.
+static AUDIT_ROWS_DROPPED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "audit_rows_dropped_total",
+        "Audit rows dropped on write-queue overflow (the mutation still succeeded)",
+    )
+});
+
+/// Bump the dropped-audit-row counter.
+pub fn inc_audit_rows_dropped() {
+    AUDIT_ROWS_DROPPED_TOTAL.inc();
+}
+
+/// Read the dropped-audit-row counter, for the queue's drop-path test.
+#[cfg(test)]
+pub fn audit_rows_dropped_total() -> u64 {
+    AUDIT_ROWS_DROPPED_TOTAL.get()
+}
+
 /// Counter: management-plane TLS handshakes that failed (client aborted,
 /// spoke plaintext, or trusted the wrong cert). The management listener
 /// is loopback-only, so this mainly surfaces local handshake churn - a
@@ -1942,6 +2022,473 @@ pub fn observe_hot_upgrade_drain(seconds: f64) {
     HOT_UPGRADE_DRAIN_SECONDS.observe(seconds);
 }
 
+// ---- Traffic capture (Story 10.1 AC #9) ----
+//
+// Cardinality discipline: `rule_id` is operator-controlled but bounded,
+// because it is the primary key of a `capture_rules` row and the proxy
+// only ever reports ids for rules it is tracking a budget for, which is
+// itself capped (`lorica::capture::CAPTURE_MAX_TRACKED_RULES`). Do NOT
+// add a label derived from a request - route, path, status, client -
+// to this family: those are unbounded in a way the rule id is not, and
+// this is the one metric family fed from the per-request path.
+
+/// Capture rules loaded and enabled on this node.
+static CAPTURE_RULES_ACTIVE: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "capture_rules_active",
+        "Capture rules loaded and enabled on this node",
+    )
+});
+
+/// Publish how many capture rules this node currently has loaded.
+///
+/// Set when a configuration snapshot is built, which is the only moment
+/// the set changes. A gauge rather than a counter: it answers "is
+/// anything recording right now", which is the question an operator
+/// asks before looking at the capture directory.
+///
+/// FLEET SEMANTICS (`--workers`): every worker compiles the same
+/// configuration snapshot, so this is the SAME value in every worker
+/// and the fleet figure is NOT a sum. Summing would report the
+/// operator's rule count multiplied by the worker count: eight workers
+/// with three rules each are one node with three rules. The supervisor
+/// therefore reports the MAXIMUM across the workers that have reported
+/// ([`crate::workers::AggregatedMetrics::max_capture_rules_active`]),
+/// which equals the common value and does not read 0 just because a
+/// freshly respawned worker has no snapshot yet.
+pub fn set_capture_rules_active(count: i64) {
+    CAPTURE_RULES_ACTIVE.set(count);
+}
+
+/// Read back this process's `lorica_capture_rules_active`.
+///
+/// A worker calls this when building its `MetricsReport`: the gauge is
+/// published from the config-compile path, which the supervisor never
+/// runs, so the value has to travel over the report for the
+/// supervisor's scrape to describe the fleet.
+pub fn capture_rules_active_value() -> i64 {
+    CAPTURE_RULES_ACTIVE.get()
+}
+
+/// Capture decisions per rule. Labels: rule_id, outcome.
+static CAPTURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "captures_total",
+        "Capture decisions per rule (outcome=emitted|dropped_rate|dropped_budget|dropped_sink)",
+        &["rule_id", "outcome"],
+    )
+});
+
+/// Record one capture decision.
+///
+/// `outcome` MUST be one of `emitted | dropped_rate | dropped_budget |
+/// dropped_sink`; the counter API does not constrain it, so the call
+/// site enforces (`CaptureAdmission::metric_outcome` is the one that
+/// does for the first three).
+///
+/// `dropped_sink` is produced by the capture emitter
+/// (`lorica::capture::sink`), once per copy of a record a sink lost:
+/// a full or dead lane, a directory that is missing or read-only, a
+/// failed write. It is counted IN ADDITION to the `emitted` decision
+/// the admission recorded, so `emitted - dropped_sink` is not "records
+/// delivered" when more than one sink is on; the counter answers "how
+/// many deliveries failed", which is what an operator watching a sink
+/// needs.
+pub fn inc_capture_outcome(rule_id: &str, outcome: &str) {
+    CAPTURES_TOTAL.with_label_values(&[rule_id, outcome]).inc();
+}
+
+/// Read back this process's `lorica_captures_total{rule_id, outcome}`.
+pub fn capture_outcome_value(rule_id: &str, outcome: &str) -> u64 {
+    CAPTURES_TOTAL.with_label_values(&[rule_id, outcome]).get()
+}
+
+/// Every `outcome` a `lorica_captures_total` series can carry, so the
+/// removal below covers the family and a new outcome cannot be added
+/// without landing here.
+const CAPTURE_OUTCOMES: [&str; 4] = ["emitted", "dropped_rate", "dropped_budget", "dropped_sink"];
+
+/// Forget every `lorica_captures_total` series for `rule_id`.
+///
+/// Called when the budgets evict a rule, which is when a configuration
+/// snapshot no longer carries it. A `CounterVec` never drops a label set
+/// on its own, so without this a node that creates and retires capture
+/// rules keeps exporting four series per retired rule for the life of
+/// the process. A rule that comes back starts from zero, which matches
+/// the budget entry it comes back with.
+pub fn remove_capture_outcome_series(rule_id: &str) {
+    for outcome in CAPTURE_OUTCOMES {
+        // `Err` means the series was never created (the rule was
+        // evicted without ever recording an outcome), which is the
+        // state this function wants anyway.
+        let _ = CAPTURES_TOTAL.remove_label_values(&[rule_id, outcome]);
+    }
+}
+
+/// Bytes held by in-flight capture buffers on this process.
+static CAPTURE_INFLIGHT_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "capture_inflight_bytes",
+        "Bytes held by in-flight capture buffers on this process",
+    )
+});
+
+/// Publish the capture budget's current reservation in this process.
+///
+/// Written by the proxy's capture reservation on every grow and
+/// release.
+///
+/// FLEET SEMANTICS (`--workers`): this one IS per worker and additive.
+/// Each worker runs its own budget and holds its own bytes against its
+/// own copy of the ceiling, so the fleet figure is the SUM
+/// ([`crate::workers::AggregatedMetrics::total_capture_inflight_bytes`]).
+/// The ceiling is per worker too, which is the part worth saying out
+/// loud: `CAPTURE_MAX_INFLIGHT_BYTES` is 64 MiB, so a node running
+/// eight workers can hold up to 512 MiB of capture buffers, not 64.
+/// Size the box against workers x ceiling, not against the ceiling.
+pub fn set_capture_inflight_bytes(bytes: i64) {
+    CAPTURE_INFLIGHT_BYTES.set(bytes);
+}
+
+/// Read back this process's `lorica_capture_inflight_bytes`.
+///
+/// A worker calls this when building its `MetricsReport`: the budget
+/// that writes the gauge lives in the worker, so the value has to
+/// travel over the report for the supervisor's scrape to describe the
+/// fleet.
+pub fn capture_inflight_bytes_value() -> i64 {
+    CAPTURE_INFLIGHT_BYTES.get()
+}
+
+// ---- WAF body inspection (Story 10.6 AC #8) ----
+
+/// What the WAF did with a request body. Labels: outcome.
+static WAF_BODY_SCANS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "waf_body_scans_total",
+        "WAF request-body inspection decisions (outcome=scanned|skipped_content_type|\
+         skipped_budget|truncated|rejected)",
+        &["outcome"],
+    )
+});
+
+/// Every `outcome` a `lorica_waf_body_scans_total` series can carry.
+///
+/// Spelled out so the label set stays a closed enum: the call sites
+/// pass one of these and nothing else, which is what keeps the series
+/// count fixed at five whatever traffic the node sees.
+pub const WAF_BODY_SCAN_OUTCOMES: [&str; 5] = [
+    // The engine read the buffered body.
+    "scanned",
+    // The declared `Content-Type` is not one the engine can parse, so
+    // the body was never buffered (Story 10.6 AC #1).
+    "skipped_content_type",
+    // The node-wide in-flight budget was full, so the body was not
+    // buffered and the request was forwarded unscanned (AC #7). This
+    // is the fail-open series: an operator alarms on it.
+    "skipped_budget",
+    // Detection mode, body past the effective scan cap: the prefix was
+    // scanned and the rest forwarded.
+    "truncated",
+    // Blocking mode, body past the effective scan cap: 413.
+    "rejected",
+];
+
+/// Record one WAF body-inspection decision.
+///
+/// `outcome` MUST be one of [`WAF_BODY_SCAN_OUTCOMES`]; the counter API
+/// does not constrain it, so the call sites in the proxy's body filters
+/// do. Exactly one outcome is recorded per request that carried a body
+/// on a WAF-enabled route, so the five series sum to the number of such
+/// requests.
+pub fn inc_waf_body_scan_outcome(outcome: &str) {
+    WAF_BODY_SCANS_TOTAL.with_label_values(&[outcome]).inc();
+}
+
+/// Read back this process's `lorica_waf_body_scans_total{outcome}`.
+pub fn waf_body_scan_outcome_value(outcome: &str) -> u64 {
+    WAF_BODY_SCANS_TOTAL.with_label_values(&[outcome]).get()
+}
+
+/// Bytes held by in-flight WAF body-scan buffers on this process.
+static WAF_BODY_SCAN_INFLIGHT_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge(
+        "waf_body_scan_inflight_bytes",
+        "Bytes held by in-flight WAF body-scan buffers on this process",
+    )
+});
+
+/// Publish the WAF body-scan budget's current reservation.
+///
+/// Written by the proxy's scan reservation on every grow and release
+/// (`lorica::proxy_wiring::waf_body_budget`), for the same reason the
+/// capture gauge is: the budget is a process-wide static this crate has
+/// no handle on.
+///
+/// FLEET SEMANTICS (`--workers`): per worker and additive, like
+/// `lorica_capture_inflight_bytes`, and aggregated the same way
+/// ([`crate::workers::AggregatedMetrics::total_waf_body_scan_inflight_bytes`]).
+/// Each worker runs its own budget against its own copy of the
+/// `waf_body_scan_max_inflight_bytes` ceiling, so a node running eight
+/// workers can hold eight times the configured value. Size the box
+/// against workers x ceiling, not against the ceiling.
+pub fn set_waf_body_scan_inflight_bytes(bytes: i64) {
+    WAF_BODY_SCAN_INFLIGHT_BYTES.set(bytes);
+}
+
+/// Read back this process's `lorica_waf_body_scan_inflight_bytes`.
+///
+/// A worker calls this when building its `MetricsReport`: the budget
+/// that writes the gauge lives in the worker, so the value has to
+/// travel over the report for the supervisor's scrape to describe the
+/// fleet.
+pub fn waf_body_scan_inflight_bytes_value() -> i64 {
+    WAF_BODY_SCAN_INFLIGHT_BYTES.get()
+}
+
+// ---- Automation plane (Story 10.3 listener, Story 10.4 AC #10) ----
+//
+// Every label set below is a closed enum spelled out at the call site,
+// so the cardinality is bounded by construction: no token name, no
+// environment name, no hostname ever becomes a label. All of these are
+// supervisor-only (see the note at the end of `PER_WORKER_COUNTERS`).
+
+/// Automation environments by state. Labels: state.
+static AUTOMATION_ENVIRONMENTS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge_vec(
+        "automation_environments",
+        "Automation environments by state (state=active|expired)",
+        &["state"],
+    )
+});
+
+/// Publish the environment counts.
+///
+/// `expired` is past `expires_at` and not yet reaped, a window of at
+/// most one reaper interval on a healthy node; a value that stays
+/// above zero across scrapes means the reaper cannot remove a row.
+/// Refreshed by `lorica_api::automation::publish_environment_gauges`
+/// after every write that changes the set: a `PUT`, a `DELETE`, and a
+/// reaper sweep.
+pub fn set_automation_environments(active: i64, expired: i64) {
+    AUTOMATION_ENVIRONMENTS
+        .with_label_values(&["active"])
+        .set(active);
+    AUTOMATION_ENVIRONMENTS
+        .with_label_values(&["expired"])
+        .set(expired);
+}
+
+/// Environment operations. Labels: op, outcome.
+static AUTOMATION_ENVIRONMENT_OPS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "automation_environment_ops_total",
+        "Automation environment operations (op=create|update|delete|expire, \
+         outcome=ok|refused|error)",
+        &["op", "outcome"],
+    )
+});
+
+/// Record one environment operation.
+///
+/// `op` MUST be one of `create | update | delete | expire` and `outcome`
+/// one of `ok | refused | error`; the counter API does not constrain
+/// them, so the call sites in `lorica_api::automation::environments`
+/// do. `refused` is a 4xx the caller provoked, `error` is a failure on
+/// the node's side.
+pub fn inc_automation_environment_op(op: &str, outcome: &str) {
+    AUTOMATION_ENVIRONMENT_OPS_TOTAL
+        .with_label_values(&[op, outcome])
+        .inc();
+}
+
+/// Reaper sweeps, whether or not one removed anything.
+static AUTOMATION_REAPER_RUNS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "automation_reaper_runs_total",
+        "Automation environment reaper sweeps",
+    )
+});
+
+/// Record one reaper sweep. A counter that stops moving on a control
+/// plane is the reaper task having died, which nothing else reports.
+pub fn inc_automation_reaper_run() {
+    AUTOMATION_REAPER_RUNS_TOTAL.inc();
+}
+
+/// Requests on the automation listener by outcome. Labels: outcome.
+static AUTOMATION_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "automation_requests_total",
+        "Automation API requests (outcome=ok|unauthenticated|forbidden|refused|error)",
+        &["outcome"],
+    )
+});
+
+/// Record one automation request. `outcome` is the word the audit
+/// layer derives from the response status, so the counter and the
+/// audit row always agree on what happened.
+pub fn inc_automation_request(outcome: &str) {
+    AUTOMATION_REQUESTS_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Connections dropped before the handshake because the source was
+/// outside `automation_allowed_cidrs`.
+static AUTOMATION_SOURCE_REFUSED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "automation_source_refused_total",
+        "Automation connections refused by the source allowlist",
+    )
+});
+
+/// Record one source-allowlist refusal on the automation listener.
+pub fn inc_automation_source_refused() {
+    AUTOMATION_SOURCE_REFUSED_TOTAL.inc();
+}
+
+/// Connections dropped because every handshake permit was taken.
+static AUTOMATION_REJECTED_CONCURRENT_HANDSHAKES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "automation_rejected_concurrent_handshakes_total",
+        "Automation connections rejected by the concurrent-handshake budget",
+    )
+});
+
+/// Record one rejection by the global handshake budget.
+pub fn inc_automation_rejected_concurrent_handshakes() {
+    AUTOMATION_REJECTED_CONCURRENT_HANDSHAKES_TOTAL.inc();
+}
+
+/// Connections dropped because their source already held every
+/// per-source slot.
+static AUTOMATION_REJECTED_PER_SOURCE_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "automation_rejected_per_source_total",
+        "Automation connections rejected by the per-source concurrency budget",
+    )
+});
+
+/// Record one rejection by the per-source concurrency budget.
+pub fn inc_automation_rejected_per_source() {
+    AUTOMATION_REJECTED_PER_SOURCE_TOTAL.inc();
+}
+
+/// Connections dropped because their source exhausted the attempt
+/// window.
+static AUTOMATION_REJECTED_ATTEMPT_WINDOW_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "automation_rejected_attempt_window_total",
+        "Automation connections rejected by the per-source attempt window",
+    )
+});
+
+/// Record one rejection by the per-source attempt window.
+pub fn inc_automation_rejected_attempt_window() {
+    AUTOMATION_REJECTED_ATTEMPT_WINDOW_TOTAL.inc();
+}
+
+/// `jti` entries evicted from the OIDC replay set because it reached
+/// its cap (Story 10.5 AC #4).
+static AUTOMATION_OIDC_REPLAY_EVICTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "automation_oidc_replay_evictions_total",
+        "OIDC replay-set entries evicted before their expiry because the set was full",
+    )
+});
+
+/// Record `count` evictions from the OIDC replay set.
+///
+/// A value that moves at all is worth an alert: every evicted `jti`
+/// was still valid, so the window between the eviction and that
+/// token's `exp` is a replay window. A silent eviction would turn a
+/// full set into exactly that, which is why the count is here.
+pub fn inc_automation_oidc_replay_evictions(count: u64) {
+    AUTOMATION_OIDC_REPLAY_EVICTIONS_TOTAL.inc_by(count);
+}
+
+/// JWKS fetches by outcome. Labels: outcome.
+static AUTOMATION_OIDC_JWKS_FETCH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "automation_oidc_jwks_fetch_total",
+        "OIDC JWKS fetches from registered issuers (outcome=ok|error)",
+        &["outcome"],
+    )
+});
+
+/// Record one JWKS fetch. `outcome` is `ok` or `error`.
+pub fn inc_automation_oidc_jwks_fetch(outcome: &str) {
+    AUTOMATION_OIDC_JWKS_FETCH_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// TLS handshakes on the automation listener that failed or timed out.
+static AUTOMATION_TLS_HANDSHAKE_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "automation_tls_handshake_failed_total",
+        "Automation listener TLS handshakes that failed or timed out",
+    )
+});
+
+/// Record one failed or timed-out TLS handshake on the automation
+/// listener.
+pub fn inc_automation_tls_handshake_failed() {
+    AUTOMATION_TLS_HANDSHAKE_FAILED_TOTAL.inc();
+}
+
+/// The gathered value of one counter series, or 0 when the family or
+/// the label set has never been touched. Test seam shared by this
+/// module's tests and the automation plane's, which assert on the same
+/// registry a Prometheus server reads.
+#[cfg(test)]
+pub(crate) fn gathered_counter(name: &str, labels: &[(&str, &str)]) -> u64 {
+    REGISTRY
+        .gather()
+        .iter()
+        .find(|family| family.name() == name)
+        .and_then(|family| {
+            family.get_metric().iter().find(|metric| {
+                labels.iter().all(|(key, value)| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|pair| pair.name() == *key && pair.value() == *value)
+                })
+            })
+        })
+        .map_or(0, |metric| metric.get_counter().value() as u64)
+}
+
+/// Mirror the gauges the workers own into the supervisor's registry
+/// before a scrape encodes it.
+///
+/// Every gauge here is written by worker-side code the supervisor never
+/// runs, so the supervisor's own value is always 0 and the fleet figure
+/// only exists in the `MetricsReport`s the aggregator holds.
+///
+/// `aggregated` is `None` in single-process mode, where the proxy runs
+/// in this very process and the gauges already hold the live local
+/// values: the function returns without touching them. In worker mode
+/// it overwrites them with the fleet figures, each aggregated the way
+/// its own semantics demand (max for the capture rule count, sum for
+/// both byte reservations; see the setters above).
+///
+/// This is the same shape as the `active_connections` refresh that
+/// [`get_metrics`] does a few lines down, and for the same reason: the
+/// value is produced in a process the scrape does not run in.
+async fn refresh_worker_gauges(
+    aggregated: Option<&std::sync::Arc<crate::workers::AggregatedMetrics>>,
+) {
+    let Some(agg) = aggregated else {
+        return;
+    };
+    set_capture_rules_active(agg.max_capture_rules_active().await as i64);
+    set_capture_inflight_bytes(agg.total_capture_inflight_bytes().await as i64);
+    set_waf_body_scan_inflight_bytes(agg.total_waf_body_scan_inflight_bytes().await as i64);
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,
@@ -1974,6 +2521,12 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
             .load(std::sync::atomic::Ordering::Relaxed) as i64
     };
     set_active_connections(active_conns);
+
+    // Refresh the traffic-capture gauges from workers. The capture
+    // feature runs in the worker processes, so without this the
+    // supervisor would report its own two zeros and a dashboard would
+    // read as a feature that does not work.
+    refresh_worker_gauges(state.aggregated_metrics()).await;
 
     // Refresh aggregated EWMA scores from workers
     if let Some(agg) = state.aggregated_metrics() {
@@ -2102,6 +2655,168 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Traffic-capture gauges under --workers ----
+
+    /// The tests below all drive the process-global gauges the workers
+    /// own. Rust runs tests in parallel inside one process, so without
+    /// this guard one test's `set_` would land between another's
+    /// refresh and its assertion.
+    /// A tokio mutex, not a std one: the guard is held across the
+    /// `refresh_worker_gauges` await.
+    static CAPTURE_GAUGE_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Record a worker whose capture gauges hold the given values.
+    async fn report_capture(
+        agg: &crate::workers::AggregatedMetrics,
+        worker_id: u32,
+        rules_active: u64,
+        inflight_bytes: u64,
+    ) {
+        report_worker_gauges(agg, worker_id, rules_active, inflight_bytes, 0).await;
+    }
+
+    /// Record a worker's capture gauges plus its WAF body-scan
+    /// reservation.
+    async fn report_worker_gauges(
+        agg: &crate::workers::AggregatedMetrics,
+        worker_id: u32,
+        rules_active: u64,
+        inflight_bytes: u64,
+        waf_body_scan_inflight_bytes: u64,
+    ) {
+        agg.update_worker(
+            worker_id,
+            0,
+            0,
+            0,
+            Vec::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            crate::workers::CaptureGauges {
+                rules_active,
+                inflight_bytes,
+            },
+            waf_body_scan_inflight_bytes,
+        )
+        .await;
+    }
+
+    /// The value the named label-less gauge family currently renders in
+    /// the encoded scrape, which is what a Prometheus server reads.
+    fn rendered_gauge(name: &str) -> Option<f64> {
+        REGISTRY
+            .gather()
+            .iter()
+            .find(|family| family.name() == name)
+            .and_then(|family| family.get_metric().first().map(|m| m.get_gauge().value()))
+    }
+
+    #[tokio::test]
+    async fn worker_capture_gauges_reach_the_supervisor_rendering() {
+        let _guard = CAPTURE_GAUGE_TEST_GUARD.lock().await;
+        // The supervisor's own gauges are zero: the capture feature runs
+        // in the workers. This is the state an operator saw on every
+        // scrape before the report carried these two fields.
+        set_capture_rules_active(0);
+        set_capture_inflight_bytes(0);
+
+        let agg = std::sync::Arc::new(crate::workers::AggregatedMetrics::new());
+        report_capture(&agg, 0, 4, 2_048).await;
+        report_capture(&agg, 1, 4, 6_144).await;
+
+        refresh_worker_gauges(Some(&agg)).await;
+
+        assert_eq!(rendered_gauge("lorica_capture_rules_active"), Some(4.0));
+        assert_eq!(
+            rendered_gauge("lorica_capture_inflight_bytes"),
+            Some(8192.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_rules_active_is_not_summed_across_workers() {
+        let _guard = CAPTURE_GAUGE_TEST_GUARD.lock().await;
+        set_capture_rules_active(0);
+
+        // Eight workers all compiled the same snapshot of three rules.
+        // The node has three rules, not twenty-four.
+        let agg = std::sync::Arc::new(crate::workers::AggregatedMetrics::new());
+        for worker_id in 0..8 {
+            report_capture(&agg, worker_id, 3, 0).await;
+        }
+
+        refresh_worker_gauges(Some(&agg)).await;
+
+        assert_eq!(rendered_gauge("lorica_capture_rules_active"), Some(3.0));
+    }
+
+    #[tokio::test]
+    async fn capture_inflight_bytes_is_summed_across_workers() {
+        let _guard = CAPTURE_GAUGE_TEST_GUARD.lock().await;
+        set_capture_inflight_bytes(0);
+
+        // Each worker holds its own bytes under its own ceiling, so the
+        // node figure is the total.
+        let agg = std::sync::Arc::new(crate::workers::AggregatedMetrics::new());
+        report_capture(&agg, 0, 1, 1_000).await;
+        report_capture(&agg, 1, 1, 2_000).await;
+        report_capture(&agg, 2, 1, 3_000).await;
+
+        refresh_worker_gauges(Some(&agg)).await;
+
+        assert_eq!(
+            rendered_gauge("lorica_capture_inflight_bytes"),
+            Some(6000.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn waf_body_scan_inflight_bytes_is_summed_across_workers() {
+        let _guard = CAPTURE_GAUGE_TEST_GUARD.lock().await;
+        // The supervisor never buffers a request body, so its own gauge
+        // sits at zero and only the reports describe the node. Each
+        // worker's reservation is memory held at the same moment, so
+        // the node figure is the total.
+        set_waf_body_scan_inflight_bytes(0);
+
+        let agg = std::sync::Arc::new(crate::workers::AggregatedMetrics::new());
+        report_worker_gauges(&agg, 0, 1, 0, 1_500).await;
+        report_worker_gauges(&agg, 1, 1, 0, 2_500).await;
+        report_worker_gauges(&agg, 2, 1, 0, 4_000).await;
+
+        refresh_worker_gauges(Some(&agg)).await;
+
+        assert_eq!(
+            rendered_gauge("lorica_waf_body_scan_inflight_bytes"),
+            Some(8000.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn single_process_mode_keeps_the_local_capture_gauges() {
+        let _guard = CAPTURE_GAUGE_TEST_GUARD.lock().await;
+        // Without workers the proxy runs in this process and the gauges
+        // already hold the live values. `aggregated_metrics()` is None
+        // there, and the refresh must leave them exactly as published.
+        set_capture_rules_active(7);
+        set_capture_inflight_bytes(4_096);
+        set_waf_body_scan_inflight_bytes(2_048);
+
+        refresh_worker_gauges(None).await;
+
+        assert_eq!(rendered_gauge("lorica_capture_rules_active"), Some(7.0));
+        assert_eq!(
+            rendered_gauge("lorica_waf_body_scan_inflight_bytes"),
+            Some(2048.0)
+        );
+        assert_eq!(
+            rendered_gauge("lorica_capture_inflight_bytes"),
+            Some(4096.0)
+        );
+    }
 
     /// Epic 9 close: every cluster family was registered with a
     /// `lorica_` prefix while the registry adds the `lorica` namespace
@@ -2361,7 +3076,7 @@ mod tests {
             "regressed snapshot must not decrement supervisor counter"
         );
 
-        // Forgetting worker 2 clears its snapshot — but the
+        // Forgetting worker 2 clears its snapshot - but the
         // supervisor counter stays where it is (Prometheus
         // counters can't decrement). A later worker 2 snapshot
         // will therefore push full value again as new delta.
@@ -2384,7 +3099,7 @@ mod tests {
         // Before forget: 4 (w1) + 5 (w2) = 9.
         // After forget + w2 resend 7: 4 + 5 + 7 = 16 (the
         // forget wiped w2's prev=5 so the full 7 reappears as
-        // delta). This is the correct semantics — a crashed
+        // delta). This is the correct semantics - a crashed
         // worker's counts are NOT lost at the supervisor.
         assert_eq!(v, 16);
     }
@@ -2446,7 +3161,7 @@ mod tests {
     #[test]
     fn test_snapshot_emits_only_non_zero() {
         // Snapshot should skip counter entries that have never
-        // been incremented — that keeps the RPC payload small
+        // been incremented - that keeps the RPC payload small
         // under steady state.
         inc_bot_challenge("snapshot-test", "javascript", "passed");
         let snap = snapshot_per_worker_counters();
@@ -2457,7 +3172,7 @@ mod tests {
             hit.is_some(),
             "incremented counter should appear in snapshot"
         );
-        // None of the entries should have value 0 — that's the
+        // None of the entries should have value 0 - that's the
         // skip-zero-entries guard.
         for (_, _, v) in &snap {
             assert!(*v > 0, "snapshot must not emit zero entries");
@@ -2479,5 +3194,59 @@ mod tests {
             .encode(&families, &mut buf)
             .expect("test setup: encode metrics");
         assert!(!buf.is_empty());
+    }
+
+    // ---- Automation plane (Story 10.4 AC #10) ----
+
+    #[test]
+    fn the_automation_listener_counters_each_move_on_their_own_path() {
+        // The accept loop that owns these needs a bound socket, so the
+        // registrations are exercised through their entry points: each
+        // family exists, carries the documented name, and moves by one.
+        let before = [
+            gathered_counter("lorica_automation_source_refused_total", &[]),
+            gathered_counter(
+                "lorica_automation_rejected_concurrent_handshakes_total",
+                &[],
+            ),
+            gathered_counter("lorica_automation_rejected_per_source_total", &[]),
+            gathered_counter("lorica_automation_rejected_attempt_window_total", &[]),
+            gathered_counter("lorica_automation_tls_handshake_failed_total", &[]),
+        ];
+        inc_automation_source_refused();
+        inc_automation_rejected_concurrent_handshakes();
+        inc_automation_rejected_per_source();
+        inc_automation_rejected_attempt_window();
+        inc_automation_tls_handshake_failed();
+        let after = [
+            gathered_counter("lorica_automation_source_refused_total", &[]),
+            gathered_counter(
+                "lorica_automation_rejected_concurrent_handshakes_total",
+                &[],
+            ),
+            gathered_counter("lorica_automation_rejected_per_source_total", &[]),
+            gathered_counter("lorica_automation_rejected_attempt_window_total", &[]),
+            gathered_counter("lorica_automation_tls_handshake_failed_total", &[]),
+        ];
+        for (index, (b, a)) in before.iter().zip(after.iter()).enumerate() {
+            assert_eq!(*a, b + 1, "listener counter {index} must move by one");
+        }
+    }
+
+    #[test]
+    fn the_automation_environment_gauge_renders_both_states() {
+        set_automation_environments(3, 1);
+        let families = REGISTRY.gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "lorica_automation_environments")
+            .expect("the gauge family is registered");
+        let states: Vec<&str> = family
+            .get_metric()
+            .iter()
+            .flat_map(|metric| metric.get_label().iter().map(|pair| pair.value()))
+            .collect();
+        assert!(states.contains(&"active"), "states rendered: {states:?}");
+        assert!(states.contains(&"expired"), "states rendered: {states:?}");
     }
 }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod cli;
+mod cli_automation;
 mod cli_client;
 mod cli_cluster;
 mod health;
@@ -21,8 +22,8 @@ mod startup;
 use clap::Parser;
 
 use crate::cli::{
-    init_logging, run_rotate_key, run_unban, run_upgrade, startup_banner, Cli, ClusterAction,
-    Commands,
+    init_logging, run_rotate_key, run_unban, run_upgrade, startup_banner, AutomationAction,
+    AutomationTokenAction, Cli, ClusterAction, Commands,
 };
 
 fn main() {
@@ -177,6 +178,40 @@ fn main() {
                     password,
                 );
             }
+        },
+        Some(Commands::Automation { action }) => match action {
+            AutomationAction::Token { action } => match action {
+                AutomationTokenAction::Create {
+                    name,
+                    scopes,
+                    hostnames,
+                    backend_cidrs,
+                    max_ttl_seconds,
+                    lifetime_days,
+                    user,
+                    password_file,
+                    password_stdin,
+                    password,
+                } => {
+                    let password = cli_client::read_admin_password(
+                        password,
+                        password_file.as_deref(),
+                        password_stdin,
+                    )
+                    .unwrap_or_else(|e| cli_client::fail(e));
+                    cli_automation::run_automation_token_create(
+                        cli.management_port,
+                        name,
+                        scopes,
+                        hostnames,
+                        backend_cidrs,
+                        max_ttl_seconds,
+                        lifetime_days,
+                        user,
+                        password,
+                    );
+                }
+            },
         },
         None => {
             init_logging(&cli.log_level, &cli.log_format, cli.log_file.as_deref());

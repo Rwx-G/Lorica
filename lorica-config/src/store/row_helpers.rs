@@ -43,8 +43,8 @@ pub(super) fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
     if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
         return Ok(naive.and_utc());
     }
-    Err(ConfigError::Validation(format!(
-        "invalid datetime '{s}': expected RFC3339 (2026-04-17T19:13:17Z) or SQLite format (2026-04-17 19:13:17)"
+    Err(ConfigError::Corrupt(format!(
+        "stored datetime '{s}' is neither RFC3339 (2026-04-17T19:13:17Z) nor SQLite format (2026-04-17 19:13:17)"
     )))
 }
 
@@ -66,6 +66,12 @@ pub(super) fn parse_optional_datetime(s: Option<String>) -> Result<Option<DateTi
 /// protection on a route meant to enforce it. A load error is caught
 /// by the two-phase config reload, which keeps the previously
 /// committed config active instead of serving the route unprotected.
+///
+/// The error is [`ConfigError::Corrupt`], not `Validation`: this code
+/// wrote the blob, so a blob that will not decode says the database is
+/// damaged or was written by a newer schema. The API turns that into a
+/// 500, which is the honest answer; as a 422 it told an operator their
+/// request was wrong when nothing about the request was.
 pub(super) fn parse_optional_json_field<T: serde::de::DeserializeOwned>(
     raw: Option<String>,
     field: &str,
@@ -73,55 +79,84 @@ pub(super) fn parse_optional_json_field<T: serde::de::DeserializeOwned>(
     match raw {
         Some(s) => serde_json::from_str(&s)
             .map(Some)
-            .map_err(|e| ConfigError::Validation(format!("invalid {field} JSON: {e}"))),
+            .map_err(|e| ConfigError::Corrupt(format!("invalid {field} JSON: {e}"))),
         None => Ok(None),
     }
+}
+
+/// Decode one NOT NULL JSON column of a row into a typed value.
+///
+/// `entity` names the table's subject and `field` the column, so the
+/// error reads the way the four call sites used to spell it by hand
+/// ("invalid capture emit JSON", "invalid oidc issuer scopes JSON").
+///
+/// A malformed column is an error rather than a default everywhere this
+/// is used, and for one reason in every case: these columns carry the
+/// authority or the ceiling of the row they belong to (a rule's
+/// redaction list and size caps, a token's scopes and CIDRs, an issuer's
+/// bound claims, an environment's owner). Degrading one to "empty"
+/// either strands the row or widens what it reaches, and neither is a
+/// safe reading of a corrupted blob. Same stance as
+/// [`parse_optional_json_field`], which draws the NULL / malformed line
+/// for the nullable columns, and the same [`ConfigError::Corrupt`] for
+/// the same reason: both failures here, the column that will not read
+/// and the blob that will not decode, are facts about the database and
+/// not about the request that happened to touch the row.
+pub(super) fn json_column<T: serde::de::DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    entity: &str,
+    field: &str,
+) -> Result<T> {
+    let raw: String = row
+        .get(index)
+        .map_err(|e| ConfigError::Corrupt(format!("{entity} {field} unreadable: {e}")))?;
+    serde_json::from_str(&raw)
+        .map_err(|e| ConfigError::Corrupt(format!("invalid {entity} {field} JSON: {e}")))
 }
 
 pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
     let hostname_aliases_json: String = row.get(11)?;
     let hostname_aliases: Vec<String> = serde_json::from_str(&hostname_aliases_json)
-        .map_err(|e| ConfigError::Validation(format!("invalid hostname_aliases JSON: {e}")))?;
+        .map_err(|e| ConfigError::Corrupt(format!("invalid hostname_aliases JSON: {e}")))?;
 
     let proxy_headers_json: String = row.get(12)?;
     let proxy_headers: std::collections::HashMap<String, String> =
         serde_json::from_str(&proxy_headers_json)
-            .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers JSON: {e}")))?;
+            .map_err(|e| ConfigError::Corrupt(format!("invalid proxy_headers JSON: {e}")))?;
 
     let response_headers_json: String = row.get(13)?;
     let response_headers: std::collections::HashMap<String, String> =
         serde_json::from_str(&response_headers_json)
-            .map_err(|e| ConfigError::Validation(format!("invalid response_headers JSON: {e}")))?;
+            .map_err(|e| ConfigError::Corrupt(format!("invalid response_headers JSON: {e}")))?;
 
     let proxy_headers_remove_json: String = row.get(23)?;
     let proxy_headers_remove: Vec<String> = serde_json::from_str(&proxy_headers_remove_json)
-        .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers_remove JSON: {e}")))?;
+        .map_err(|e| ConfigError::Corrupt(format!("invalid proxy_headers_remove JSON: {e}")))?;
 
     let response_headers_remove_json: String = row.get(24)?;
     let response_headers_remove: Vec<String> = serde_json::from_str(&response_headers_remove_json)
-        .map_err(|e| {
-            ConfigError::Validation(format!("invalid response_headers_remove JSON: {e}"))
-        })?;
+        .map_err(|e| ConfigError::Corrupt(format!("invalid response_headers_remove JSON: {e}")))?;
 
     let ip_allowlist_json: String = row.get(29)?;
     let ip_allowlist: Vec<String> = serde_json::from_str(&ip_allowlist_json)
-        .map_err(|e| ConfigError::Validation(format!("invalid ip_allowlist JSON: {e}")))?;
+        .map_err(|e| ConfigError::Corrupt(format!("invalid ip_allowlist JSON: {e}")))?;
 
     let ip_denylist_json: String = row.get(30)?;
     let ip_denylist: Vec<String> = serde_json::from_str(&ip_denylist_json)
-        .map_err(|e| ConfigError::Validation(format!("invalid ip_denylist JSON: {e}")))?;
+        .map_err(|e| ConfigError::Corrupt(format!("invalid ip_denylist JSON: {e}")))?;
 
     let cors_allowed_origins_json: String = row.get(31)?;
     let cors_allowed_origins: Vec<String> = serde_json::from_str(&cors_allowed_origins_json)
-        .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_origins JSON: {e}")))?;
+        .map_err(|e| ConfigError::Corrupt(format!("invalid cors_allowed_origins JSON: {e}")))?;
 
     let cors_allowed_methods_json: String = row.get(32)?;
     let cors_allowed_methods: Vec<String> = serde_json::from_str(&cors_allowed_methods_json)
-        .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_methods JSON: {e}")))?;
+        .map_err(|e| ConfigError::Corrupt(format!("invalid cors_allowed_methods JSON: {e}")))?;
 
     let path_rules_json: String = row.get(45)?;
     let path_rules: Vec<PathRule> = serde_json::from_str(&path_rules_json)
-        .map_err(|e| ConfigError::Validation(format!("invalid path_rules JSON: {e}")))?;
+        .map_err(|e| ConfigError::Corrupt(format!("invalid path_rules JSON: {e}")))?;
     let return_status: Option<u16> = row.get::<_, Option<i32>>(46)?.map(|v| v as u16);
 
     Ok(Route {
@@ -130,10 +165,10 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         path_prefix: row.get(2)?,
         certificate_id: row.get(3)?,
         load_balancing: LoadBalancing::from_str(&row.get::<_, String>(4)?)
-            .map_err(|e| ConfigError::Validation(format!("invalid load_balancing: {e}")))?,
+            .map_err(|e| ConfigError::Corrupt(format!("stored load_balancing is invalid: {e}")))?,
         waf_enabled: row.get(5)?,
         waf_mode: WafMode::from_str(&row.get::<_, String>(6)?)
-            .map_err(|e| ConfigError::Validation(format!("invalid waf_mode: {e}")))?,
+            .map_err(|e| ConfigError::Corrupt(format!("stored waf_mode is invalid: {e}")))?,
         enabled: row.get(7)?,
         force_https: row.get(8)?,
         redirect_hostname: row.get(9)?,
@@ -282,6 +317,22 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
                 .unwrap_or_else(|_| "[]".to_string());
             serde_json::from_str(&json).unwrap_or_default()
         },
+        // Column index 70 (Story 10.4 migration V58). NULL is
+        // operator-managed. A present-but-corrupt mark is a hard error
+        // like the security blobs above: silently reading it as `None`
+        // would let the dashboard edit a row the next pipeline `PUT`
+        // will overwrite.
+        managed_by: parse_optional_json_field(
+            row.get::<_, Option<String>>(70).unwrap_or(None),
+            "managed_by",
+        )?,
+        // Column index 71 (Story 10.6 migration V61). `None` means
+        // "use the crate default", which is also what a pre-V61 row on
+        // a bisect build reads as, so `unwrap_or(None)` loses nothing.
+        waf_body_scan_max_bytes: row
+            .get::<_, Option<i64>>(71)
+            .unwrap_or(None)
+            .map(|v| v as u64),
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })
@@ -295,12 +346,12 @@ pub(super) fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
         group_name: row.get(3)?,
         weight: row.get(4)?,
         health_status: HealthStatus::from_str(&row.get::<_, String>(5)?)
-            .map_err(|e| ConfigError::Validation(format!("invalid health_status: {e}")))?,
+            .map_err(|e| ConfigError::Corrupt(format!("stored health_status is invalid: {e}")))?,
         health_check_enabled: row.get(6)?,
         health_check_interval_s: row.get(7)?,
         health_check_path: row.get(8)?,
         lifecycle_state: LifecycleState::from_str(&row.get::<_, String>(9)?)
-            .map_err(|e| ConfigError::Validation(format!("invalid lifecycle_state: {e}")))?,
+            .map_err(|e| ConfigError::Corrupt(format!("stored lifecycle_state is invalid: {e}")))?,
         active_connections: row.get(10)?,
         tls_upstream: row.get(11)?,
         created_at: parse_datetime(&row.get::<_, String>(12)?)?,
@@ -315,17 +366,23 @@ pub(super) fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
             }
         },
         tls_skip_verify: row.get::<_, bool>(16).unwrap_or(false),
+        // Column index 17 (Story 10.4 migration V58); same contract as
+        // the route column.
+        managed_by: parse_optional_json_field(
+            row.get::<_, Option<String>>(17).unwrap_or(None),
+            "managed_by",
+        )?,
     })
 }
 
 pub(super) fn row_to_notification_config(row: &rusqlite::Row<'_>) -> Result<NotificationConfig> {
     let alert_json: String = row.get(4)?;
     let alert_types: Vec<String> = serde_json::from_str(&alert_json)
-        .map_err(|e| ConfigError::Validation(format!("invalid alert_types JSON: {e}")))?;
+        .map_err(|e| ConfigError::Corrupt(format!("invalid alert_types JSON: {e}")))?;
     Ok(NotificationConfig {
         id: row.get(0)?,
         channel: NotificationChannel::from_str(&row.get::<_, String>(1)?)
-            .map_err(|e| ConfigError::Validation(format!("invalid notification channel: {e}")))?,
+            .map_err(|e| ConfigError::Corrupt(format!("stored channel is invalid: {e}")))?,
         enabled: row.get(2)?,
         config: row.get(3)?,
         alert_types,
@@ -337,7 +394,7 @@ pub(super) fn row_to_user_preference(row: &rusqlite::Row<'_>) -> Result<UserPref
         id: row.get(0)?,
         preference_key: row.get(1)?,
         value: PreferenceValue::from_str(&row.get::<_, String>(2)?)
-            .map_err(|e| ConfigError::Validation(format!("invalid preference value: {e}")))?,
+            .map_err(|e| ConfigError::Corrupt(format!("stored preference value invalid: {e}")))?,
         created_at: parse_datetime(&row.get::<_, String>(3)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(4)?)?,
     })
@@ -353,7 +410,7 @@ pub(super) fn row_to_user(row: &rusqlite::Row<'_>) -> Result<User> {
         username: row.get(1)?,
         password_hash: row.get(2)?,
         role: Role::from_str(&row.get::<_, String>(3)?)
-            .map_err(|e| ConfigError::Validation(format!("invalid user role: {e}")))?,
+            .map_err(|e| ConfigError::Corrupt(format!("stored user role is invalid: {e}")))?,
         must_change_password: row.get(4)?,
         created_at: parse_datetime(&row.get::<_, String>(5)?)?,
         last_login_at: parse_optional_datetime(row.get(6)?)?,
@@ -370,7 +427,7 @@ pub(super) fn row_to_load_test_config(
         match serde_json::from_str(&headers_json) {
             Ok(h) => h,
             Err(e) => {
-                return Ok(Err(ConfigError::Validation(format!(
+                return Ok(Err(ConfigError::Corrupt(format!(
                     "invalid headers JSON: {e}"
                 ))))
             }
@@ -537,8 +594,12 @@ mod tests {
     #[test]
     fn parse_datetime_garbage_rejected() {
         let err = parse_datetime("not a datetime").expect_err("garbage should reject");
-        let msg = format!("{err:?}");
-        assert!(msg.contains("invalid datetime"), "{msg}");
+        // A timestamp column this process wrote and can no longer read is a
+        // damaged row, not a caller mistake, so the API must answer 500.
+        assert!(
+            matches!(err, ConfigError::Corrupt(ref msg) if msg.contains("stored datetime")),
+            "{err:?}"
+        );
     }
 
     #[test]

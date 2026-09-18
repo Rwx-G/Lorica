@@ -308,7 +308,7 @@ mod tests {
             .check_bucket("acme", "192.0.2.1", 3, 60)
             .await
             .is_err());
-        // Different bucket, same IP — fresh budget.
+        // Different bucket, same IP - fresh budget.
         assert!(limiter
             .check_bucket("config_import", "192.0.2.1", 3, 60)
             .await

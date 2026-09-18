@@ -43,6 +43,13 @@ function node(id: string, name: string, certificateIds: string[] = []): ClusterN
     connected: true,
     session_peer: '192.0.2.10:9444',
     session_last_seen_unix: null,
+    // The server's verdict, flattened onto the row like the registry
+    // fields above it. A fixture that omits it is a shape the API
+    // never sends.
+    drifted: false,
+    applied_generation: 4,
+    applied_hash: 'abc',
+    from_live_session: true,
     selected_for_hostnames: [],
     certificate_ids: certificateIds,
     resources: null,

@@ -209,7 +209,7 @@ async fn rpc_cache_check_empty_returns_none() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rpc_cache_check_ignores_non_allow_verdict() {
     // Supervisor seeded with a Deny verdict. The bot wrapper only
-    // treats `Allow` as "cached cookie valid" — any other variant
+    // treats `Allow` as "cached cookie valid" - any other variant
     // must surface as None so the data-plane falls through to full
     // HMAC verify. A Deny cached as a hit would incorrectly short-
     // circuit the evaluator and block a request that might now pass.
@@ -244,7 +244,7 @@ async fn rpc_cache_check_ignores_non_allow_verdict() {
 async fn rpc_cache_partitions_by_ip_prefix() {
     // Two clients behind different /24 prefixes with the SAME cookie
     // and route must NOT share a verdict. This is why the wrapper
-    // folds the IP prefix into the wire route_id — a collision here
+    // folds the IP prefix into the wire route_id - a collision here
     // would mean one NAT tenant's verdict bleeds to another.
     let (sup_ep, sup_inc, wk_ep, _wk_inc) = socketpair();
     let vc = Arc::new(VerdictCache::default());
@@ -276,7 +276,7 @@ async fn rpc_cache_check_returns_none_on_rpc_timeout() {
     // The supervisor task is intentionally NOT spawned: any RPC call
     // will block waiting for a reply that never comes and time out.
     // The wrapper must fail open (return None) so the data plane
-    // falls through to local verify — never DoS a request on transport
+    // falls through to local verify - never DoS a request on transport
     // errors.
     let (_sup_ep, _sup_inc, wk_ep, _wk_inc) = socketpair();
     let engine = VerdictCacheEngine::rpc(wk_ep, Duration::from_millis(100));

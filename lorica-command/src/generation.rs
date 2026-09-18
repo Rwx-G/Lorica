@@ -38,7 +38,7 @@ pub enum StaleGeneration {
 /// ConfigReloadPrepare/Commit; the gate accepts strictly increasing
 /// generations and rejects anything else.
 ///
-/// The gate does not distinguish Prepare from Commit — both must carry
+/// The gate does not distinguish Prepare from Commit - both must carry
 /// the same generation and both advance the highest-seen watermark on
 /// acceptance. The caller is responsible for pairing a Commit with the
 /// Prepare that preceded it (see WPAR-8 coordinator logic).
@@ -93,7 +93,7 @@ impl GenerationGate {
 
     /// Like `observe`, but accepts a generation equal to the current
     /// highest. Use for Commit when the same generation was already
-    /// Prepared (and thus advanced the watermark) — this variant just
+    /// Prepared (and thus advanced the watermark) - this variant just
     /// verifies that the Commit is for the Prepared gen, not an older
     /// one.
     pub fn observe_commit(&self, gen: u64) -> Result<(), StaleGeneration> {

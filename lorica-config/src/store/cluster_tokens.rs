@@ -22,9 +22,7 @@ fn row_to_token(row: &rusqlite::Row<'_>) -> Result<JoinToken> {
     Ok(JoinToken {
         public_id: row.get(0)?,
         secret_hmac: row.get(1)?,
-        state: state
-            .parse()
-            .map_err(|e: String| ConfigError::Validation(e))?,
+        state: state.parse().map_err(ConfigError::Corrupt)?,
         created_at: parse_datetime(&row.get::<_, String>(3)?)?,
         expires_at: parse_datetime(&row.get::<_, String>(4)?)?,
         created_by: row.get(5)?,

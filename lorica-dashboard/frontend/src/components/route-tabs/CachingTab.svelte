@@ -246,7 +246,7 @@
       minute stale, 3600 s for daily reports, 86400 s for fully
       static content. Setting <code>0</code> caches the entry but
       marks it already expired on every request, forcing
-      revalidation — equivalent to the backend sending
+      revalidation - equivalent to the backend sending
       <code>Cache-Control: max-age=0</code>, useful paired with
       stale-while-revalidate so the stale copy is served while
       the revalidation happens in the background.
@@ -265,7 +265,7 @@
       means memory pressure. 10-100 MB per route is typical for
       text-heavy responses; 500-1000 MB for asset-heavy routes.
       Setting <code>0</code> disables the per-entry size cap
-      entirely — the global in-memory LRU still bounds the whole
+      entirely - the global in-memory LRU still bounds the whole
       cache, but individual responses of any size are admitted.
     </p>
   </HelpModal>

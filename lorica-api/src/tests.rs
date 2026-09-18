@@ -28,7 +28,7 @@ const TEST_KEY_RSA_PEM: &str = include_str!("../../lorica-tls/tests/test-key-rsa
 const TEST_CERT_EC_PEM: &str = include_str!("../../lorica-tls/tests/test-cert.pem");
 const TEST_KEY_EC_PEM: &str = include_str!("../../lorica-tls/tests/test-key.pem");
 
-async fn test_state() -> (AppState, SessionStore, RateLimiter) {
+pub(crate) async fn test_state() -> (AppState, SessionStore, RateLimiter) {
     let store = lorica_config::ConfigStore::open_in_memory().expect("test setup");
     let store = Arc::new(Mutex::new(store));
     let state = AppState {
@@ -54,6 +54,7 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
+        oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -305,7 +306,7 @@ async fn test_change_password_rotates_session_cookie() {
     let cookie_a_value = extract_session_cookie(&response).expect("test setup");
     let cookie_a = format!("lorica_session={cookie_a_value}");
 
-    // Change password — the response carries a fresh Set-Cookie
+    // Change password - the response carries a fresh Set-Cookie
     // whose session id differs from cookie_A.
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({
@@ -1224,6 +1225,494 @@ async fn test_backends_crud() {
 
     let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ---- Automation-managed rows (Story 10.4 AC #8, server side) ----
+//
+// The dashboard disables Edit on a managed row; the API is the guard.
+// Each refused verb is tried on a managed row and on a plain one in
+// the same test, so a guard that refuses everything cannot pass.
+
+fn automation_mark(environment: &str) -> lorica_config::models::ManagedBy {
+    lorica_config::models::ManagedBy::Automation {
+        environment: environment.to_string(),
+    }
+}
+
+async fn create_plain_route(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    hostname: &str,
+) -> String {
+    let response = send(
+        state,
+        session_store,
+        rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        cookie,
+        Some(serde_json::json!({ "hostname": hostname })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    parse_data(response).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string()
+}
+
+async fn create_plain_backend(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    address: &str,
+) -> String {
+    let response = send(
+        state,
+        session_store,
+        rate_limiter,
+        "POST",
+        "/api/v1/backends",
+        cookie,
+        Some(serde_json::json!({ "address": address })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    parse_data(response).await["id"]
+        .as_str()
+        .expect("backend id")
+        .to_string()
+}
+
+/// A route the automation API owns, as its `PUT` leaves it: the mark
+/// on the row and the `automation_environments` row the route delete
+/// must cascade away.
+async fn seed_managed_route(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    environment: &str,
+) -> String {
+    let route_id = create_plain_route(
+        state,
+        session_store,
+        rate_limiter,
+        cookie,
+        &format!("{environment}.review.example.com"),
+    )
+    .await;
+    let now = chrono::Utc::now();
+    let store = state.store.lock().await;
+    let mut route = store
+        .get_route(&route_id)
+        .expect("route read")
+        .expect("the route exists");
+    route.managed_by = Some(automation_mark(environment));
+    store.update_route(&route).expect("mark written");
+    store
+        .upsert_automation_environment(&lorica_config::models::AutomationEnvironment {
+            name: environment.to_string(),
+            route_id: route_id.clone(),
+            owner: lorica_config::models::EnvironmentOwner {
+                kind: lorica_config::models::OwnerKind::StaticToken,
+                principal: "acme-ci".to_string(),
+            },
+            certificate_mode: lorica_config::models::CertificateMode::Auto,
+            labels: std::collections::BTreeMap::new(),
+            expires_at: now + chrono::Duration::hours(1),
+            created_at: now,
+            updated_at: now,
+            last_pipeline: None,
+            pipeline: None,
+        })
+        .expect("environment row written");
+    route_id
+}
+
+/// A backend the automation API owns.
+async fn seed_managed_backend(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    environment: &str,
+) -> String {
+    let backend_id = create_plain_backend(
+        state,
+        session_store,
+        rate_limiter,
+        cookie,
+        "10.0.12.34:8080",
+    )
+    .await;
+    let store = state.store.lock().await;
+    let mut backend = store
+        .get_backend(&backend_id)
+        .expect("backend read")
+        .expect("the backend exists");
+    backend.managed_by = Some(automation_mark(environment));
+    store.update_backend(&backend).expect("mark written");
+    backend_id
+}
+
+async fn error_envelope(response: axum::response::Response) -> (String, String) {
+    let json = body_json(response).await;
+    (
+        json["error"]["code"]
+            .as_str()
+            .expect("an error code")
+            .to_string(),
+        json["error"]["message"]
+            .as_str()
+            .expect("an error message")
+            .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn test_put_on_a_managed_route_is_409_naming_the_environment() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let managed = seed_managed_route(&state, &session_store, &rate_limiter, &cookie, "pr-42").await;
+    let plain = create_plain_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "shop.example.com",
+    )
+    .await;
+
+    // The maintenance toggle is a PUT like any other field.
+    let patch = serde_json::json!({ "maintenance_mode": true });
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{managed}"),
+        &cookie,
+        Some(patch.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let (code, message) = error_envelope(response).await;
+    assert_eq!(code, "conflict");
+    assert!(
+        message.contains("`pr-42`"),
+        "names the environment: {message}"
+    );
+    assert!(
+        message.contains("pipeline"),
+        "points at the pipeline: {message}"
+    );
+    {
+        let store = state.store.lock().await;
+        let route = store
+            .get_route(&managed)
+            .expect("route read")
+            .expect("the route is still there");
+        assert!(!route.maintenance_mode, "the refused patch wrote nothing");
+    }
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{plain}"),
+        &cookie,
+        Some(patch),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(parse_data(response).await["maintenance_mode"], true);
+
+    // The listing carries the mark the dashboard reads, and only there.
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/routes/{managed}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(
+        parse_data(response).await["managed_by"],
+        serde_json::json!({ "kind": "automation", "environment": "pr-42" })
+    );
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/routes/{plain}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert!(parse_data(response).await.get("managed_by").is_none());
+}
+
+#[tokio::test]
+async fn test_put_on_a_managed_backend_is_409_naming_the_environment() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let managed =
+        seed_managed_backend(&state, &session_store, &rate_limiter, &cookie, "pr-42").await;
+    let plain = create_plain_backend(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "10.0.0.7:8080",
+    )
+    .await;
+
+    let patch = serde_json::json!({ "weight": 7 });
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/backends/{managed}"),
+        &cookie,
+        Some(patch.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let (code, message) = error_envelope(response).await;
+    assert_eq!(code, "conflict");
+    assert!(
+        message.contains("`pr-42`"),
+        "names the environment: {message}"
+    );
+    assert!(
+        message.contains("pipeline"),
+        "points at the pipeline: {message}"
+    );
+    {
+        let store = state.store.lock().await;
+        let backend = store
+            .get_backend(&managed)
+            .expect("backend read")
+            .expect("the backend is still there");
+        assert_eq!(backend.weight, 100, "the refused patch wrote nothing");
+    }
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/backends/{plain}"),
+        &cookie,
+        Some(patch),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(parse_data(response).await["weight"], 7);
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/backends/{managed}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(
+        parse_data(response).await["managed_by"],
+        serde_json::json!({ "kind": "automation", "environment": "pr-42" })
+    );
+}
+
+#[tokio::test]
+async fn test_delete_on_a_managed_backend_is_409_naming_the_environment() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let managed =
+        seed_managed_backend(&state, &session_store, &rate_limiter, &cookie, "pr-42").await;
+    let plain = create_plain_backend(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "10.0.0.7:8080",
+    )
+    .await;
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/backends/{managed}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let (code, message) = error_envelope(response).await;
+    assert_eq!(code, "conflict");
+    assert!(
+        message.contains("`pr-42`"),
+        "names the environment: {message}"
+    );
+    assert!(
+        message.contains("Delete the environment"),
+        "points at the environment: {message}"
+    );
+    {
+        let store = state.store.lock().await;
+        let backend = store
+            .get_backend(&managed)
+            .expect("backend read")
+            .expect("the backend is still there");
+        assert_eq!(
+            backend.lifecycle_state,
+            lorica_config::models::LifecycleState::Normal,
+            "no drain was started"
+        );
+    }
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/backends/{plain}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_delete_on_a_managed_route_removes_the_environment_row() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let managed = seed_managed_route(&state, &session_store, &rate_limiter, &cookie, "pr-42").await;
+    {
+        let store = state.store.lock().await;
+        assert!(store
+            .get_automation_environment("pr-42")
+            .expect("environment read")
+            .is_some());
+    }
+
+    let response = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/routes/{managed}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let store = state.store.lock().await;
+    assert!(store.get_route(&managed).expect("route read").is_none());
+    assert!(
+        store
+            .get_automation_environment("pr-42")
+            .expect("environment read")
+            .is_none(),
+        "the environment row cascades away with its route"
+    );
+}
+
+#[tokio::test]
+async fn test_managed_by_on_input_is_refused() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route = create_plain_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "shop.example.com",
+    )
+    .await;
+    let backend = create_plain_backend(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        "10.0.0.7:8080",
+    )
+    .await;
+    let mark = serde_json::json!({ "kind": "automation", "environment": "pr-42" });
+
+    let attempts = [
+        (
+            "POST",
+            "/api/v1/routes".to_string(),
+            serde_json::json!({ "hostname": "forged.example.com", "managed_by": mark }),
+        ),
+        (
+            "PUT",
+            format!("/api/v1/routes/{route}"),
+            serde_json::json!({ "managed_by": mark }),
+        ),
+        (
+            "POST",
+            "/api/v1/backends".to_string(),
+            serde_json::json!({ "address": "10.0.0.8:8080", "managed_by": mark }),
+        ),
+        (
+            "PUT",
+            format!("/api/v1/backends/{backend}"),
+            serde_json::json!({ "managed_by": mark }),
+        ),
+    ];
+    for (method, uri, body) in attempts {
+        let response = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            &uri,
+            &cookie,
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{method} {uri}"
+        );
+        let (code, message) = error_envelope(response).await;
+        assert_eq!(code, "unprocessable_entity", "{method} {uri}");
+        assert!(message.contains("managed_by"), "{method} {uri}: {message}");
+    }
+
+    let store = state.store.lock().await;
+    assert_eq!(store.list_routes().expect("routes read").len(), 1);
+    assert_eq!(store.list_backends().expect("backends read").len(), 1);
+    assert!(store
+        .get_route(&route)
+        .expect("route read")
+        .expect("the route exists")
+        .managed_by
+        .is_none());
+    assert!(store
+        .get_backend(&backend)
+        .expect("backend read")
+        .expect("the backend exists")
+        .managed_by
+        .is_none());
 }
 
 // ---- Certificates Tests ----
@@ -2860,6 +3349,98 @@ async fn test_update_settings_sla_purge_retention_cap() {
 }
 
 #[tokio::test]
+async fn test_update_settings_automation_allowed_cidrs_rejects_a_typo() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    // The automation listener refuses to open on an allowlist it
+    // cannot parse, and it is read at boot. A typo caught here costs
+    // the operator one retry; the same typo stored costs them a
+    // listener that does not come back after the next restart.
+    let body = serde_json::json!({
+        "automation_allowed_cidrs": ["10.0.0.0/8", "10.0.0.0/33"]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&payload).expect("test setup");
+    let message = json["error"]["message"].as_str().unwrap_or("");
+    // The message names the field and the offending entry: an
+    // allowlist is a list, and "one of them is wrong" is not enough
+    // to act on.
+    assert!(message.contains("automation_allowed_cidrs"), "{message}");
+    assert!(message.contains("10.0.0.0/33"), "{message}");
+
+    // Nothing was stored: the write is all-or-nothing, so the good
+    // entry did not land either.
+    let stored = state
+        .store
+        .lock()
+        .await
+        .get_global_settings()
+        .expect("test setup");
+    assert!(stored.automation_allowed_cidrs.is_empty());
+}
+
+#[tokio::test]
+async fn test_update_settings_automation_allowed_cidrs_roundtrip() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    // A bare address beside a CIDR: the listener promotes it to a
+    // single-host network, so the API must accept both spellings.
+    let body = serde_json::json!({
+        "automation_allowed_cidrs": ["10.0.0.0/8", "192.0.2.10"]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&payload).expect("test setup");
+    assert_eq!(
+        json["data"]["automation_allowed_cidrs"],
+        serde_json::json!(["10.0.0.0/8", "192.0.2.10"])
+    );
+}
+
+#[tokio::test]
 async fn test_update_settings_cert_export_roundtrip() {
     let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
@@ -3083,8 +3664,8 @@ async fn test_update_settings_cert_export_clears_dir_on_empty_string() {
 
 #[tokio::test]
 async fn test_rate_limit_settings_bucket_returns_429_after_limit() {
-    // PUT /api/v1/settings is capped at 30/60s per IP (v1.5.0 A.3
-    // — relaxed from the initial 10/60s after the e2e smoke flagged
+    // PUT /api/v1/settings is capped at 30/60s per IP (v1.5.0 A.3,
+    // relaxed from the initial 10/60s after the e2e smoke flagged
     // realistic operator activity on the /settings endpoint under
     // test-isolation). Drive 31 PUTs from the same (simulated)
     // client and assert the 31st returns 429 with a Retry-After
@@ -3704,6 +4285,35 @@ async fn test_create_backend_empty_address_returns_400() {
 
     let router = app(state, session_store, rate_limiter);
     let body = serde_json::json!({ "address": "" });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/backends")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_a_backend_cannot_claim_an_automation_group_name_by_hand() {
+    // The route path has refused a colon in a group name since v1.2;
+    // the backend path never called the same validator, so a backend
+    // could carry `automation:<name>` without ever being managed. The
+    // guard on `managed_by` is the stronger one; this closes the name.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "address": "10.0.0.10:8080",
+        "group_name": "automation:review-42"
+    });
 
     let req = Request::builder()
         .method("POST")
@@ -4771,6 +5381,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
+        oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -4811,6 +5422,7 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         log_writer: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
+        oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -5351,7 +5963,7 @@ async fn test_otel_connection_reachable_when_mock_server_responds() {
 
     // Persist the mock server as the OTLP endpoint. The probe path
     // appends /v1/traces for http-proto, which our dummy server
-    // ignores — it answers any path.
+    // ignores - it answers any path.
     {
         let s = state.store.lock().await;
         let mut cur = s.get_global_settings().expect("test setup");
@@ -5437,7 +6049,7 @@ async fn test_otel_connection_unreachable_when_port_is_dead() {
 #[tokio::test]
 async fn test_rotate_bot_hmac_is_non_deterministic_across_calls() {
     // Two back-to-back rotations on the same state must produce two
-    // different secrets — the rotation path pulls fresh bytes from
+    // different secrets - the rotation path pulls fresh bytes from
     // `rand::rngs::OsRng`, so a collision here means the CSPRNG call
     // was accidentally swapped for a deterministic generator.
     let (state, _session_store, _rate_limiter) = test_state().await;
@@ -5967,11 +6579,24 @@ async fn test_settings_schema_bounds_match_validator() {
     // max and reject just past the max for every field carrying both
     // bounds. If `update_settings` ever diverges from `settings_schema`
     // the status flips and this fails.
-    for field in [
-        "health_max_concurrent_probes",
-        "header_timeout_s",
-        "flood_strict_rps",
-        "sla_purge_retention_days",
+    //
+    // The rejection status is part of the table rather than one constant
+    // for the whole list. The project's rule, written on `ApiError`, is
+    // that a value the caller could have got right is 422; the older
+    // handlers still answer 400 and are corrected when they are touched
+    // for another reason. With a single expected status, the first field
+    // to follow the rule could only be left OUT of the list, and an
+    // anti-drift test that grows an exception per new field stops
+    // covering the thing it exists for.
+    for (field, rejected) in [
+        ("health_max_concurrent_probes", StatusCode::BAD_REQUEST),
+        ("header_timeout_s", StatusCode::BAD_REQUEST),
+        ("flood_strict_rps", StatusCode::BAD_REQUEST),
+        ("sla_purge_retention_days", StatusCode::BAD_REQUEST),
+        (
+            "waf_body_scan_max_inflight_bytes",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
     ] {
         let min = schema[field]["min"].as_i64().expect("schema min");
         let max = schema[field]["max"].as_i64().expect("schema max");
@@ -5979,7 +6604,7 @@ async fn test_settings_schema_bounds_match_validator() {
         for (value, expected) in [
             (min, StatusCode::OK),
             (max, StatusCode::OK),
-            (max + 1, StatusCode::BAD_REQUEST),
+            (max + 1, rejected),
         ] {
             let mut map = serde_json::Map::new();
             map.insert(field.to_string(), serde_json::json!(value));
@@ -6008,7 +6633,7 @@ async fn test_settings_schema_bounds_match_validator() {
 /// the fleet handles wired the way the binary wires them. Returns the
 /// handle and the token-liveness receiver the enrollment listener
 /// would watch.
-fn test_control_plane() -> (
+pub(crate) fn test_control_plane() -> (
     std::sync::Arc<crate::cluster::ControlPlaneRuntime>,
     tokio::sync::watch::Receiver<u32>,
 ) {
@@ -7477,6 +8102,182 @@ async fn probe_crud_history_and_validation() {
 }
 
 // ---------------------------------------------------------------------------
+// Story 10.0 AC #2: a node_selector is resolved at write time
+// ---------------------------------------------------------------------------
+
+/// One roster row in the shape the enrollment handler writes.
+fn enrolled_node(node_id: &str, name: &str, seed: &str) -> lorica_config::models::ClusterNode {
+    let now = chrono::Utc::now();
+    lorica_config::models::ClusterNode {
+        node_id: node_id.to_string(),
+        name: name.to_string(),
+        cert_fingerprint: seed.repeat(32),
+        cert_serial: seed.to_uppercase().repeat(16),
+        prev_cert_fingerprint: None,
+        prev_cert_serial: None,
+        address: "192.0.2.10:5000".to_string(),
+        version: "1.8.0".to_string(),
+        schema_version: 50,
+        status: lorica_config::models::NodeStatus::Active,
+        enrolled_at: now,
+        last_seen_at: None,
+        applied_config_generation: 0,
+        applied_config_hash: String::new(),
+        cert_not_after: now + chrono::Duration::days(90),
+        revoked_at: None,
+    }
+}
+
+/// A control plane whose roster holds `nodes`.
+async fn control_plane_with_roster(
+    nodes: &[lorica_config::models::ClusterNode],
+) -> (AppState, SessionStore, RateLimiter, String) {
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    let (control, _liveness) = test_control_plane();
+    state.cluster = crate::cluster::ClusterRuntime::ControlPlane(control);
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    {
+        let store = state.store.lock().await;
+        for node in nodes {
+            store.create_cluster_node(node).expect("test setup");
+        }
+    }
+    (state, session_store, rate_limiter, admin)
+}
+
+/// The `error.message` of a response the caller expects to be a 400.
+async fn bad_request_message(resp: axum::response::Response) -> String {
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    body_json(resp).await["error"]["message"]
+        .as_str()
+        .expect("test setup")
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_selector_naming_an_enrolled_node_is_accepted_on_a_control_plane() {
+    let (state, session_store, rate_limiter, admin) =
+        control_plane_with_roster(&[enrolled_node("node-a", "edge-1", "ab")]).await;
+
+    let mut body = a_valid_route("pinned.example.com");
+    body["node_selector"] = serde_json::json!(["edge-1"]);
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    assert_eq!(
+        created["data"]["node_selector"],
+        serde_json::json!(["edge-1"])
+    );
+    let route_id = created["data"]["id"]
+        .as_str()
+        .expect("test setup")
+        .to_string();
+
+    // The update handler resolves against the same roster.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{route_id}"),
+        &admin,
+        Some(serde_json::json!({ "node_selector": ["edge-1"] })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_selector_naming_no_enrolled_node_is_refused_on_a_control_plane() {
+    let (state, session_store, rate_limiter, admin) =
+        control_plane_with_roster(&[enrolled_node("node-a", "edge-1", "ab")]).await;
+
+    let mut body = a_valid_route("typo.example.com");
+    body["node_selector"] = serde_json::json!(["edge-9"]);
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        bad_request_message(resp).await,
+        "bad request: node_selector entry `edge-9` matches no enrolled cluster node"
+    );
+
+    // Same refusal on the patch path, so a fleet-wide route cannot be
+    // narrowed into oblivion after the fact.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(a_valid_route("wide.example.com")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let route_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .expect("test setup")
+        .to_string();
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{route_id}"),
+        &admin,
+        Some(serde_json::json!({ "node_selector": ["edge-9"] })),
+    )
+    .await;
+    assert_eq!(
+        bad_request_message(resp).await,
+        "bad request: node_selector entry `edge-9` matches no enrolled cluster node"
+    );
+}
+
+#[tokio::test]
+async fn a_selector_is_not_resolved_off_a_control_plane() {
+    // A standalone node has no authoritative roster, and an operator
+    // legitimately pins a route before the node it names enrolls.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let mut body = a_valid_route("unenrolled.example.com");
+    body["node_selector"] = serde_json::json!(["edge-9"]);
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        body_json(resp).await["data"]["node_selector"],
+        serde_json::json!(["edge-9"])
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Argon2 upgrade compatibility (v1.7.3 dependency pass)
 // ---------------------------------------------------------------------------
 
@@ -7521,4 +8322,1409 @@ fn hashing_the_same_password_twice_gives_different_salts() {
     let a = hash_password("same").expect("hashing");
     let b = hash_password("same").expect("hashing");
     assert_ne!(a, b);
+}
+
+// ---- Traffic-capture rules (Story 10.1) ----
+
+/// Create a route through the API and return its id, so a capture rule
+/// has something real to hang on.
+async fn seed_capture_route(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    admin: &str,
+    hostname: &str,
+) -> String {
+    let resp = send(
+        state,
+        session_store,
+        rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        admin,
+        Some(serde_json::json!({
+            "hostname": hostname,
+            "path_prefix": "/",
+            "load_balancing": "round_robin"
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "test setup: route");
+    body_json(resp).await["data"]["id"]
+        .as_str()
+        .expect("test setup: route id")
+        .to_string()
+}
+
+/// A capture rule body that validates, so each test below changes
+/// exactly one thing and the failure it asserts is the thing it changed.
+fn capture_body(route_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "checkout 5xx",
+        "route_id": route_id,
+        "emit": { "status": ["server_error"] },
+        "limits": { "ttl_seconds": 900 },
+    })
+}
+
+#[tokio::test]
+async fn capture_listing_is_operator_and_refused_below() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-op-list",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-viewer-list",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    for (cookie, expected, who) in [
+        (&operator, StatusCode::OK, "operator"),
+        (&viewer, StatusCode::FORBIDDEN, "viewer"),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            "/api/v1/capture/rules",
+            cookie,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), expected, "{who}");
+    }
+}
+
+#[tokio::test]
+async fn capture_create_read_update_delete_are_super_admin_only() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-op-cud",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap1.example",
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &operator,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "an operator may not arm a recorder"
+    );
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let rule_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .expect("rule id")
+        .to_string();
+
+    for (method, body) in [
+        ("GET", None),
+        ("PUT", Some(capture_body(&route_id))),
+        ("DELETE", None),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            &format!("/api/v1/capture/rules/{rule_id}"),
+            &operator,
+            body,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} for operator"
+        );
+    }
+
+    for (method, body, expected) in [
+        ("GET", None, StatusCode::OK),
+        ("PUT", Some(capture_body(&route_id)), StatusCode::OK),
+        ("DELETE", None, StatusCode::OK),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            &format!("/api/v1/capture/rules/{rule_id}"),
+            &admin,
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), expected, "{method} for admin");
+    }
+}
+
+#[tokio::test]
+async fn an_operator_can_stop_a_capture_it_could_never_have_started() {
+    // The asymmetry is the point: arming a recorder writes production
+    // bodies to disk, stopping one only stops that.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-op-disable",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-viewer-disable",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap2.example",
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    let created = body_json(resp).await;
+    assert_eq!(created["data"]["enabled"], true);
+    let rule_id = created["data"]["id"].as_str().expect("rule id").to_string();
+    let disable = format!("/api/v1/capture/rules/{rule_id}/disable");
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        &disable,
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "viewer");
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        &disable,
+        &operator,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "operator");
+    assert_eq!(body_json(resp).await["data"]["enabled"], false);
+
+    // The same operator still cannot arm one.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &operator,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_created_rule_expires_at_now_plus_its_ttl() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap3.example",
+    )
+    .await;
+
+    let before = chrono::Utc::now();
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = body_json(resp).await;
+
+    let expires = chrono::DateTime::parse_from_rfc3339(
+        body["data"]["expires_at"].as_str().expect("expires_at"),
+    )
+    .expect("expires_at parses")
+    .with_timezone(&chrono::Utc);
+    let drift = (expires - before).num_seconds() - 900;
+    assert!(
+        (0..5).contains(&drift),
+        "expires_at must be creation plus ttl_seconds, drifted {drift}s"
+    );
+}
+
+#[tokio::test]
+async fn the_recent_captures_ring_is_operator_and_refused_below() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-op-recent",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "cap-viewer-recent",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/capture/recent",
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "viewer");
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/capture/recent",
+        &operator,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "operator");
+    let body = body_json(resp).await;
+    assert!(body["data"]["captures"].is_array());
+    assert_eq!(
+        body["data"]["capacity"],
+        crate::capture_ring::CAPTURE_RING_CAPACITY as u64
+    );
+}
+
+#[tokio::test]
+async fn the_ring_is_refused_on_a_workers_supervisor_and_the_refusal_names_the_sink() {
+    // The one outcome not allowed is an empty ring on a node that is
+    // capturing normally: the supervisor never emits, so it answers
+    // 503 and says where the records are.
+    let (state, session_store, rate_limiter) = test_state_with_workers().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    for uri in ["/api/v1/capture/recent", "/api/v1/capture/recent/abc"] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            uri,
+            &admin,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "service_unavailable");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(message.contains("--workers"), "{message}");
+        assert!(message.contains("output.dir"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn a_record_in_the_ring_downloads_whole_and_an_evicted_one_is_a_404() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // The ring is process-global, so the id is unique to this test.
+    let request_id = format!("ring-test-{}", uuid::Uuid::new_v4().simple());
+    let document = serde_json::json!({
+        "kind": "capture",
+        "rule_id": "cap-ring",
+        "request_id": request_id,
+        "request": { "method": "POST", "body": "x".repeat(8192), "body_encoding": "utf8" },
+        "response": { "status": 503, "body": "", "body_encoding": "base64" },
+    });
+    let text = serde_json::to_string(&document).expect("test setup: serialises");
+    let file_name = format!("20260101T000000.000000000Z-{request_id}.json");
+    crate::capture_ring::node_capture_ring().remember(
+        "cap-ring",
+        &request_id,
+        &file_name,
+        std::sync::Arc::from(text.clone()),
+    );
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/capture/recent/{request_id}?rule_id=cap-ring"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(http::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("attachment; filename=\"{file_name}\"").as_str())
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(
+        bytes.as_ref(),
+        text.as_bytes(),
+        "the download is the record, whole"
+    );
+
+    // The listing carries the same record with its body cut.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/capture/recent",
+        &admin,
+        None,
+    )
+    .await;
+    let listed = body_json(resp).await;
+    let row = listed["data"]["captures"]
+        .as_array()
+        .expect("captures")
+        .iter()
+        .find(|row| row["request_id"] == request_id)
+        .expect("this test's record is listed");
+    assert_eq!(row["request"]["body_elided"], true);
+    assert_eq!(row["request"]["body_elided_total"], 8192);
+    assert_eq!(
+        row["request"]["body"].as_str().expect("body").len(),
+        crate::capture_ring::CAPTURE_RING_LIST_BODY_MAX
+    );
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/capture/recent/never-in-the-ring",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_client_supplied_expires_at_is_refused() {
+    // The instant is server-owned: a client that picks it can outlive
+    // the seven-day retention ceiling by writing its own date.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap4.example",
+    )
+    .await;
+
+    let mut body = capture_body(&route_id);
+    body["expires_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn capture_counters_are_refused_on_input() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap5.example",
+    )
+    .await;
+
+    for counter in ["captures_emitted", "captures_dropped"] {
+        let mut body = capture_body(&route_id);
+        body[counter] = serde_json::json!(0);
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/capture/rules",
+            &admin,
+            Some(body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{counter}");
+    }
+}
+
+#[tokio::test]
+async fn a_route_id_naming_no_route_names_the_field_instead_of_faulting() {
+    // Without the pre-check the foreign key raises a driver error and
+    // the client gets a 500 that names nothing.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body("no-such-route")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let message = body_json(resp).await["error"]["message"]
+        .as_str()
+        .expect("message")
+        .to_string();
+    assert!(message.contains("route_id"), "{message}");
+}
+
+#[tokio::test]
+async fn each_refused_capture_rule_names_the_field_that_refused_it() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap6.example",
+    )
+    .await;
+
+    let no_route = {
+        let mut body = capture_body(&route_id);
+        body["route_id"] = serde_json::json!("");
+        (body, "route_id")
+    };
+    let unconstrained_emit = {
+        let mut body = capture_body(&route_id);
+        body["emit"] = serde_json::json!({});
+        (body, "emit.always")
+    };
+    let always_plus_predicate = {
+        let mut body = capture_body(&route_id);
+        body["emit"] = serde_json::json!({ "always": true, "upstream_error": true });
+        (body, "emit.always")
+    };
+    let over_the_cap = {
+        let mut body = capture_body(&route_id);
+        body["limits"] = serde_json::json!({
+            "ttl_seconds": lorica_config::models::CAPTURE_TTL_SECONDS_CAP + 1
+        });
+        (body, "limits.ttl_seconds")
+    };
+
+    for (body, field) in [
+        no_route,
+        unconstrained_emit,
+        always_plus_predicate,
+        over_the_cap,
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/capture/rules",
+            &admin,
+            Some(body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        let message = body_json(resp).await["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_string();
+        assert!(message.contains(field), "expected {field} in: {message}");
+    }
+}
+
+#[tokio::test]
+async fn a_put_preserves_created_at_created_by_and_both_counters() {
+    // Resetting the counters on an edit would make a rule that has
+    // already spent its budget look untouched.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap7.example",
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    let created = body_json(resp).await;
+    let rule_id = created["data"]["id"].as_str().expect("rule id").to_string();
+
+    {
+        let store = state.store.lock().await;
+        store
+            .bump_capture_counters(&rule_id, 7, 3)
+            .expect("test setup: counter bump");
+    }
+
+    let mut edited = capture_body(&route_id);
+    edited["name"] = serde_json::json!("renamed");
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/capture/rules/{rule_id}"),
+        &admin,
+        Some(edited),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let updated = body_json(resp).await;
+
+    assert_eq!(updated["data"]["name"], "renamed");
+    assert_eq!(updated["data"]["created_at"], created["data"]["created_at"]);
+    assert_eq!(updated["data"]["created_by"], created["data"]["created_by"]);
+    assert_eq!(updated["data"]["captures_emitted"], 7);
+    assert_eq!(updated["data"]["captures_dropped"], 3);
+}
+
+#[tokio::test]
+async fn deleting_an_unknown_capture_rule_is_404() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        "/api/v1/capture/rules/no-such-rule",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn every_capture_mutation_lands_in_the_audit_log() {
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(data_dir.path()).expect("test setup: log store"),
+    ));
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let route_id = seed_capture_route(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &admin,
+        "cap8.example",
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/capture/rules",
+        &admin,
+        Some(capture_body(&route_id)),
+    )
+    .await;
+    let rule_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .expect("rule id")
+        .to_string();
+
+    for (method, uri, body) in [
+        (
+            "PUT",
+            format!("/api/v1/capture/rules/{rule_id}"),
+            Some(capture_body(&route_id)),
+        ),
+        (
+            "POST",
+            format!("/api/v1/capture/rules/{rule_id}/disable"),
+            None,
+        ),
+        ("DELETE", format!("/api/v1/capture/rules/{rule_id}"), None),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            method,
+            &uri,
+            &admin,
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{method} {uri}");
+    }
+
+    let log_store = state.log_store.clone().expect("log store");
+    // `record` only enqueues: the chain is durable within the audit
+    // writer's next drain, not before the response returned above.
+    log_store
+        .flush_audit()
+        .await
+        .expect("the audit writer drains");
+    let (rows, _total) = log_store
+        .query_audit(&crate::audit::AuditQuery {
+            operator: None,
+            action_prefix: Some("capture.".to_string()),
+            from: None,
+            to: None,
+            limit: 50,
+            before_id: None,
+            node_id: None,
+        })
+        .expect("audit query");
+
+    let mut actions: Vec<&str> = rows.iter().map(|r| r.action.as_str()).collect();
+    actions.sort_unstable();
+    assert_eq!(
+        actions,
+        vec![
+            "capture.create",
+            "capture.delete",
+            "capture.disable",
+            "capture.update"
+        ]
+    );
+    for row in &rows {
+        assert_eq!(row.operator_username, "admin");
+        assert_eq!(row.target_type, "capture_rule");
+        assert_eq!(row.target_id, rule_id);
+    }
+}
+
+// ---- Automation plane (Story 10.3) ----
+//
+// The chain under test is source filter -> TLS -> bearer -> scope ->
+// audit. Everything above TLS is exercised here through the router
+// directly, the way every other test in this file drives the
+// management router: starting a real TLS listener would test
+// `tokio-rustls` and `hyper-util`, not this crate's gates, and would
+// put a bind and a handshake in the path of every assertion. The
+// source filter and the allowlist parser are pure and are tested
+// beside them in `automation::listener`.
+
+/// Mint one automation token into the store and return the string a
+/// caller would present. `expires_at` and `revoked_at` are parameters
+/// so a test can place a token on either side of its liveness without
+/// waiting for a clock, and `allowed_hostnames` because the resource
+/// tests need names their seeded certificates cover and names they
+/// deliberately do not.
+pub(crate) async fn mint_automation(
+    state: &AppState,
+    name: &str,
+    scopes: Vec<lorica_config::models::AutomationScope>,
+    allowed_hostnames: &[&str],
+    expires_at: chrono::DateTime<chrono::Utc>,
+    revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    let store = state.store.lock().await;
+    let key = store
+        .automation_token_hmac_key()
+        .expect("test setup: hmac key");
+    let minted = lorica_config::models::mint_automation_token(&key).expect("test setup: mint");
+    let row = lorica_config::models::AutomationToken {
+        public_id: minted.public_id.clone(),
+        name: name.to_string(),
+        secret_hmac: minted.secret_hmac.clone(),
+        scopes,
+        allowed_hostnames: allowed_hostnames.iter().map(|h| (*h).to_string()).collect(),
+        // `AutomationToken::validate` refuses an empty grant: the
+        // connection filter reads one as allow-every-address.
+        allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
+        max_ttl_seconds: lorica_config::models::AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS,
+        created_by: "admin".to_string(),
+        created_at: chrono::Utc::now() - chrono::Duration::hours(1),
+        expires_at,
+        last_used_at: None,
+        revoked_at,
+    };
+    store
+        .create_automation_token(&row)
+        .expect("test setup: create automation token");
+    minted.token
+}
+
+/// A live token carrying `environments:read`, the scope `whoami`
+/// needs.
+async fn mint_live_reader(state: &AppState, name: &str) -> String {
+    mint_automation(
+        state,
+        name,
+        vec![lorica_config::models::AutomationScope::EnvironmentsRead],
+        &["*.preview.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await
+}
+
+/// Drive the automation router. `auth` and `cookie` are independent so
+/// a test can present one, both, or neither.
+async fn automation_send(
+    state: &AppState,
+    uri: &str,
+    auth: Option<&str>,
+    cookie: Option<&str>,
+) -> axum::response::Response {
+    let router = crate::automation::build_automation_router(state.clone());
+    let mut builder = Request::builder().method("GET").uri(uri);
+    if let Some(auth) = auth {
+        builder = builder.header(http::header::AUTHORIZATION, auth);
+    }
+    if let Some(cookie) = cookie {
+        builder = builder.header(http::header::COOKIE, cookie);
+    }
+    router
+        .oneshot(builder.body(Body::empty()).expect("test setup"))
+        .await
+        .expect("test setup")
+}
+
+/// Every `automation.` audit action recorded so far, sorted.
+///
+/// Async because `record` only enqueues: the rows are durable within
+/// the audit writer's next drain, so the flush is what makes "recorded
+/// so far" a true statement.
+async fn automation_audit_actions(state: &AppState) -> Vec<String> {
+    let log_store = state.log_store.clone().expect("test setup: log store");
+    log_store
+        .flush_audit()
+        .await
+        .expect("the audit writer drains");
+    let (rows, _total) = log_store
+        .query_audit(&crate::audit::AuditQuery {
+            operator: None,
+            action_prefix: Some("automation.".to_string()),
+            from: None,
+            to: None,
+            limit: 50,
+            before_id: None,
+            node_id: None,
+        })
+        .expect("audit query");
+    let mut actions: Vec<String> = rows.into_iter().map(|row| row.action).collect();
+    actions.sort();
+    actions
+}
+
+#[tokio::test]
+async fn automation_whoami_reports_the_token_behind_the_request() {
+    let (state, _session_store, _rate_limiter) = test_state().await;
+    let token = mint_live_reader(&state, "ci-preview").await;
+
+    let response = automation_send(
+        &state,
+        "/automation/v1/whoami",
+        Some(&format!("Bearer {token}")),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let public_id = token.split('.').next().expect("token has two halves");
+    let body = body_json(response).await;
+    assert_eq!(body["data"]["name"], "ci-preview");
+    assert_eq!(body["data"]["public_id"], public_id);
+    assert_eq!(
+        body["data"]["scopes"],
+        serde_json::json!(["environments:read"])
+    );
+
+    // A token that was accepted is a token in use.
+    let store = state.store.lock().await;
+    let stored = store
+        .get_automation_token(public_id)
+        .expect("stored token")
+        .expect("stored token");
+    assert!(
+        stored.last_used_at.is_some(),
+        "accepting a token must stamp last_used_at"
+    );
+}
+
+#[tokio::test]
+async fn automation_without_a_bearer_token_is_challenged() {
+    let (state, _session_store, _rate_limiter) = test_state().await;
+
+    let response = automation_send(&state, "/automation/v1/whoami", None, None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer realm=\"lorica-automation\"")
+    );
+}
+
+#[tokio::test]
+async fn a_dashboard_session_cookie_is_not_an_automation_credential() {
+    // The two planes share no credential. A cookie that opens every
+    // management endpoint opens nothing here, and the automation
+    // router has no cookie layer to read it with in the first place.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let response = automation_send(&state, "/automation/v1/whoami", None, Some(&admin)).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer realm=\"lorica-automation\"")
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_automation_token_is_refused_on_the_next_request() {
+    let (state, _session_store, _rate_limiter) = test_state().await;
+    let token = mint_live_reader(&state, "revoked-soon").await;
+    let public_id = token
+        .split('.')
+        .next()
+        .expect("token has two halves")
+        .to_string();
+
+    let response = automation_send(
+        &state,
+        "/automation/v1/whoami",
+        Some(&format!("Bearer {token}")),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    {
+        let store = state.store.lock().await;
+        assert!(store
+            .revoke_automation_token(&public_id, chrono::Utc::now())
+            .expect("revoke"));
+    }
+
+    // Nothing is cached, so the revoke takes effect immediately.
+    let response = automation_send(
+        &state,
+        "/automation/v1/whoami",
+        Some(&format!("Bearer {token}")),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_expired_automation_token_is_refused() {
+    let (state, _session_store, _rate_limiter) = test_state().await;
+    let token = mint_automation(
+        &state,
+        "expired",
+        vec![lorica_config::models::AutomationScope::EnvironmentsRead],
+        &["*.preview.example.com"],
+        chrono::Utc::now() - chrono::Duration::minutes(1),
+        None,
+    )
+    .await;
+
+    let response = automation_send(
+        &state,
+        "/automation/v1/whoami",
+        Some(&format!("Bearer {token}")),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_token_without_the_scope_is_forbidden_and_not_unauthorized() {
+    // 403, not 401. The caller authenticated: their credential is
+    // real and the grant is missing. Answering 401 would tell them to
+    // present a credential they just presented successfully, and would
+    // send an operator to re-mint a token that was never the problem.
+    let (state, _session_store, _rate_limiter) = test_state().await;
+    let token = mint_automation(
+        &state,
+        "write-only",
+        vec![lorica_config::models::AutomationScope::EnvironmentsWrite],
+        &["*.preview.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+
+    let response = automation_send(
+        &state,
+        "/automation/v1/whoami",
+        Some(&format!("Bearer {token}")),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = body_json(response).await;
+    assert_eq!(body["error"]["code"], "forbidden");
+}
+
+#[tokio::test]
+async fn a_malformed_automation_token_is_refused_without_a_store_lookup() {
+    let (state, _session_store, _rate_limiter) = test_state().await;
+
+    // Holding the store mutex for the whole test is what makes the
+    // absence of a lookup observable: anything reaching the store
+    // queues behind this guard and never answers.
+    let _guard = state.store.lock().await;
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        automation_send(
+            &state,
+            "/automation/v1/whoami",
+            Some("Bearer not-a-token"),
+            None,
+        ),
+    )
+    .await
+    .expect("the shape guard must answer before any store access");
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+    // Control for the assertion above: a well-shaped token DOES reach
+    // the store, so the same timeout would have caught a lookup on the
+    // malformed path. 24 hex characters and 43 base64url characters
+    // are exactly a minted token's two halves.
+    let well_shaped = format!("Bearer {}.{}", "0".repeat(24), "A".repeat(43));
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        automation_send(&state, "/automation/v1/whoami", Some(&well_shaped), None),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "a well-shaped token must reach the store, otherwise the timeout above proves nothing"
+    );
+}
+
+#[tokio::test]
+async fn every_automation_request_lands_in_the_audit_log() {
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(data_dir.path()).expect("test setup: log store"),
+    ));
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let live = mint_live_reader(&state, "ci-preview").await;
+    let write_only = mint_automation(
+        &state,
+        "write-only",
+        vec![lorica_config::models::AutomationScope::EnvironmentsWrite],
+        &["*.preview.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+
+    for (auth, cookie, expected) in [
+        (Some(format!("Bearer {live}")), None, StatusCode::OK),
+        (None, None, StatusCode::UNAUTHORIZED),
+        (None, Some(admin.clone()), StatusCode::UNAUTHORIZED),
+        (
+            Some("Bearer not-a-token".to_string()),
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            Some(format!("Bearer {write_only}")),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let response = automation_send(
+            &state,
+            "/automation/v1/whoami",
+            auth.as_deref(),
+            cookie.as_deref(),
+        )
+        .await;
+        assert_eq!(response.status(), expected, "{auth:?}");
+    }
+
+    assert_eq!(
+        automation_audit_actions(&state).await,
+        vec![
+            // The verb carries the precise cause after a colon, which
+            // is how `GET /api/v1/audit` shows an operator why a
+            // request was turned away (the wire said only 401 or 403).
+            "automation.request.forbidden:environments:read",
+            "automation.request.ok",
+            "automation.request.unauthenticated:no_bearer",
+            "automation.request.unauthenticated:no_bearer",
+            "automation.request.unauthenticated:not_a_credential",
+        ]
+    );
+
+    let log_store = state.log_store.clone().expect("log store");
+    let (rows, _total) = log_store
+        .query_audit(&crate::audit::AuditQuery {
+            operator: None,
+            action_prefix: Some("automation.".to_string()),
+            from: None,
+            to: None,
+            limit: 50,
+            before_id: None,
+            node_id: None,
+        })
+        .expect("audit query");
+    for row in &rows {
+        assert_eq!(row.operator_role, "automation");
+        assert_eq!(row.target_type, "automation_request");
+        assert_eq!(row.target_id, "GET /automation/v1/whoami");
+    }
+
+    // The row names the credential: its label and the id an operator
+    // revokes. A request that never authenticated names neither.
+    let ok_row = rows
+        .iter()
+        .find(|row| row.action == "automation.request.ok")
+        .expect("the successful request is audited");
+    let public_id = live.split('.').next().expect("token has two halves");
+    assert_eq!(
+        ok_row.operator_username,
+        format!("ci-preview ({public_id})")
+    );
+    assert!(rows
+        .iter()
+        .filter(|row| row.action == "automation.request.unauthenticated")
+        .all(|row| row.operator_username == "-"));
+}
+
+// ---- Story 10.6 AC #9: the WAF body-scan budget on the settings surface ----
+
+/// The global in-flight budget is operator-tunable, round-trips through
+/// `GET /settings`, and refuses an out-of-range value with 422 (the
+/// rule on `ApiError::Unprocessable`: the server understood the request
+/// and refuses it on its merits). It is a capacity figure, not a
+/// credential, so it is never masked.
+#[tokio::test]
+async fn test_update_settings_waf_body_scan_budget_bounds() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let schema = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            "/api/v1/settings/schema",
+            &admin,
+            None,
+        )
+        .await,
+    )
+    .await;
+    let field = "waf_body_scan_max_inflight_bytes";
+    let min = schema[field]["min"].as_u64().expect("schema min");
+    let max = schema[field]["max"].as_u64().expect("schema max");
+    assert_eq!(
+        schema[field]["default"].as_u64(),
+        Some(268_435_456),
+        "the advertised default must stay 256 MiB"
+    );
+
+    for (value, expected) in [
+        (min, StatusCode::OK),
+        (max, StatusCode::OK),
+        (min - 1, StatusCode::UNPROCESSABLE_ENTITY),
+        (max + 1, StatusCode::UNPROCESSABLE_ENTITY),
+        (0, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "PUT",
+            "/api/v1/settings",
+            &admin,
+            Some(serde_json::json!({ field: value })),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            expected,
+            "{field}={value} should map to {expected}"
+        );
+    }
+
+    // An absent field leaves the stored value alone, and the value the
+    // last accepted PUT wrote (`max`) reads back unmasked.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        "/api/v1/settings",
+        &admin,
+        Some(serde_json::json!({ "waf_ban_threshold": 3 })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let settings = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            "/api/v1/settings",
+            &admin,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(settings[field].as_u64(), Some(max));
+}
+
+/// The per-route cap on the create and update payloads: every arm of
+/// the validator over the wire, plus the read-path round trip.
+#[tokio::test]
+async fn test_route_waf_body_scan_max_bytes_over_the_api() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Absent on create: the route stores `null` and runs the crate
+    // default.
+    let created = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/routes",
+            &admin,
+            Some(serde_json::json!({ "hostname": "scan-default.example.com" })),
+        )
+        .await,
+    )
+    .await;
+    assert!(created["waf_body_scan_max_bytes"].is_null());
+    let route_id = created["id"]
+        .as_str()
+        .expect("created route id")
+        .to_string();
+
+    for (value, expected) in [
+        (4_096_u64, StatusCode::OK),
+        (67_108_864, StatusCode::OK),
+        (8_388_608, StatusCode::OK),
+        (0, StatusCode::OK),
+        (4_095, StatusCode::UNPROCESSABLE_ENTITY),
+        (67_108_865, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let resp = send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "PUT",
+            &format!("/api/v1/routes/{route_id}"),
+            &admin,
+            Some(serde_json::json!({ "waf_body_scan_max_bytes": value })),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            expected,
+            "waf_body_scan_max_bytes={value} should map to {expected}"
+        );
+    }
+
+    // `0` normalised to `None`, exactly as `max_request_body_bytes` is:
+    // the last accepted PUT above sent `0`, so the read path answers
+    // `null` rather than `0`.
+    let read = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "GET",
+            &format!("/api/v1/routes/{route_id}"),
+            &admin,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        read["waf_body_scan_max_bytes"].is_null(),
+        "0 must clear the override back to the crate default"
+    );
+
+    // Same normalisation on create, and a real value round-trips.
+    let created = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/routes",
+            &admin,
+            Some(serde_json::json!({
+                "hostname": "scan-zero.example.com",
+                "waf_body_scan_max_bytes": 0,
+            })),
+        )
+        .await,
+    )
+    .await;
+    assert!(created["waf_body_scan_max_bytes"].is_null());
+
+    let created = parse_data(
+        send(
+            &state,
+            &session_store,
+            &rate_limiter,
+            "POST",
+            "/api/v1/routes",
+            &admin,
+            Some(serde_json::json!({
+                "hostname": "scan-8m.example.com",
+                "waf_body_scan_max_bytes": 8_388_608,
+            })),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(created["waf_body_scan_max_bytes"].as_u64(), Some(8_388_608));
+
+    // Out of range on create is refused before the row exists.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(serde_json::json!({
+            "hostname": "scan-too-big.example.com",
+            "waf_body_scan_max_bytes": 134_217_728_u64,
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

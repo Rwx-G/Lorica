@@ -58,7 +58,7 @@ pub struct LocalBucket {
     /// `AtomicI64` (rather than `AtomicU64`) is a future-proofing choice
     /// so the supervisor can signal a "debt" state (e.g. the worker
     /// overdrew between syncs) by passing a negative starting value to
-    /// `refresh` — not exercised today but preserves the headroom.
+    /// `refresh` - not exercised today but preserves the headroom.
     tokens: AtomicI64,
     /// Accumulated successful consumption since the last `take_delta`.
     delta: AtomicU64,
@@ -110,7 +110,7 @@ impl LocalBucket {
     /// consumption is ever dropped; the only effect of a race is a
     /// one-tick delay in the supervisor observing it. That makes the
     /// authoritative bucket slightly more permissive than strict
-    /// semantics for ~100 ms — the direction the design § 6 already
+    /// semantics for ~100 ms, the direction the design § 6 already
     /// documents as acceptable for rate-limiting.
     ///
     /// The `min(u32::MAX)` clamp is defensive: a pathological workload
@@ -142,7 +142,7 @@ impl LocalBucket {
 
 /// Supervisor-side authoritative bucket. Applies time-based refill
 /// lazily (on each `snapshot` or `apply_delta` call) and serialises
-/// updates via a per-bucket `Mutex` — contention is bounded by the
+/// updates via a per-bucket `Mutex` - contention is bounded by the
 /// number of workers × one RPC per sync tick, well below the
 /// frequency where lock-free would matter.
 #[derive(Debug)]

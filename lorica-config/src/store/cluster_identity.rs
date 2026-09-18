@@ -116,6 +116,41 @@ impl ConfigStore {
         }))
     }
 
+    /// Whether this node is a follower, with the fail-closed
+    /// disposition every caller needs baked in.
+    ///
+    /// A read failure answers `true`. Every caller uses the answer to
+    /// decide whether to WRITE - reap an expired environment, disable
+    /// an expired capture rule, rewrite a route's certificate, open
+    /// the automation listener - and on a node whose role cannot be
+    /// read, not writing is the recoverable side: a follower's
+    /// configuration is replaced by the control plane on the next
+    /// replication round, so a local write there is lost anyway, while
+    /// a skipped sweep is retried on the next tick.
+    ///
+    /// The error is not swallowed silently: it is logged at WARN with
+    /// the underlying reason, because a store this node cannot read is
+    /// an operator's problem whatever the role turns out to be.
+    ///
+    /// ```rust
+    /// use lorica_config::ConfigStore;
+    ///
+    /// let store = ConfigStore::open_in_memory().expect("in-memory store");
+    /// assert!(!store.is_follower());
+    /// ```
+    pub fn is_follower(&self) -> bool {
+        match self.get_cluster_identity() {
+            Ok(identity) => identity.is_some(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "fleet identity unreadable; treating this node as a follower so nothing is written"
+                );
+                true
+            }
+        }
+    }
+
     /// Wipe this node's fleet identity (`lorica cluster leave`).
     /// `true` iff a row existed.
     ///
@@ -173,7 +208,7 @@ impl ConfigStore {
         };
         let key: [u8; TOKEN_HMAC_KEY_LEN] = raw
             .try_into()
-            .map_err(|_| ConfigError::Validation("stored token key has the wrong length".into()))?;
+            .map_err(|_| ConfigError::Corrupt("stored token key has the wrong length".into()))?;
         Ok(key)
     }
 }

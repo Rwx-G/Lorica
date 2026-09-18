@@ -257,6 +257,11 @@ pub struct AppState {
     /// This process's fleet role and its live handles (Story 9.3):
     /// `Standalone` on every install without a cluster role.
     pub cluster: crate::cluster::ClusterRuntime,
+    /// The GitLab ID-token verifier of the automation listener
+    /// (Story 10.5): the JWKS cache and the replay set, one per
+    /// process. Issuer entries are read from the store per request,
+    /// so this holds no trust configuration of its own.
+    pub oidc: Arc<crate::automation::OidcVerifier>,
 }
 
 impl AppState {
@@ -381,7 +386,7 @@ impl AppState {
 
     /// Rotate the bot-protection HMAC secret (v1.4.0 Epic 3,
     /// follow-up to story 3.5a). Called from every certificate
-    /// install / renew success path — the design doc calls for
+    /// install / renew success path - the design doc calls for
     /// "rotate the secret on every cert renewal so cookie
     /// lifetime is capped at the cert TTL".
     ///
@@ -392,7 +397,7 @@ impl AppState {
     /// every subsequent `reload_proxy_config*`, triggered by the
     /// cert-save site's own `notify_config_changed` call). Two
     /// consecutive writes would double-rotate in a tight renewal
-    /// loop, which is fine — the user just solves the challenge
+    /// loop, which is fine - the user just solves the challenge
     /// once more.
     ///
     /// Tolerates failures: a DB write error is `warn!`-logged
@@ -637,6 +642,93 @@ pub fn build_router(
         .route(
             "/api/v1/routes/{id}",
             delete(crate::routes::delete_route).layer(rl("routes_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
+        )
+        // Traffic-capture rules (Story 10.1). Role floors live in the
+        // authorize middleware: the listing and `disable` are
+        // Operator+, everything that arms or edits a recorder is
+        // SuperAdmin.
+        .route(
+            "/api/v1/capture/rules",
+            get(crate::capture::list_capture_rules)
+                .post(crate::capture::create_capture_rule)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("capture_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/capture/rules/{id}",
+            get(crate::capture::get_capture_rule)
+                .put(crate::capture::update_capture_rule)
+                .delete(crate::capture::delete_capture_rule)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("capture_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/capture/rules/{id}/disable",
+            post(crate::capture::disable_capture_rule).layer(rl(
+                "capture_cud",
+                RL_ROUTES_CUD,
+                RL_WINDOW_S,
+            )),
+        )
+        // The recent-captures ring (Story 10.2 AC #5), Operator+. Its
+        // own read bucket: the dashboard polls the listing while the
+        // page is open, and sharing the mutation bucket would answer
+        // 429 to a Disable pressed during an incident.
+        .route(
+            "/api/v1/capture/recent",
+            get(crate::capture::list_recent_captures).layer(rl(
+                "capture_read",
+                RL_CLUSTER_READ,
+                RL_WINDOW_S,
+            )),
+        )
+        .route(
+            "/api/v1/capture/recent/{request_id}",
+            get(crate::capture::download_recent_capture).layer(rl(
+                "capture_read",
+                RL_CLUSTER_READ,
+                RL_WINDOW_S,
+            )),
+        )
+        // Automation-token administration (Story 10.3 AC #6). These
+        // are MANAGEMENT-plane routes on purpose: they mint the
+        // credential the automation listener accepts, and a token able
+        // to mint tokens would outlive its own revocation.
+        // `build_automation_router` has no route for these paths.
+        .route(
+            "/api/v1/automation/tokens",
+            get(crate::automation_tokens::list_automation_tokens)
+                .post(crate::automation_tokens::create_automation_token)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("automation_tokens", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/automation/tokens/{public_id}",
+            delete(crate::automation_tokens::revoke_automation_token).layer(rl(
+                "automation_tokens",
+                RL_CLUSTER,
+                RL_WINDOW_S,
+            )),
+        )
+        // OIDC issuer entries (Story 10.5 AC #1): the trust
+        // configuration behind a GitLab ID token, on the management
+        // plane for the same reason token administration is. An
+        // entry decides who needs no secret at all to act on this
+        // node, which is a larger power than minting one token.
+        .route(
+            "/api/v1/automation/oidc-issuers",
+            get(crate::oidc_issuers::list_oidc_issuers)
+                .post(crate::oidc_issuers::create_oidc_issuer)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("automation_tokens", RL_CLUSTER, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/automation/oidc-issuers/{id}",
+            delete(crate::oidc_issuers::delete_oidc_issuer).layer(rl(
+                "automation_tokens",
+                RL_CLUSTER,
+                RL_WINDOW_S,
+            )),
         )
         .route(
             "/api/v1/validate/mtls-pem",

@@ -4,7 +4,7 @@
 //! backing the pending-challenge state with SQLite (table
 //! `bot_pending_challenges`, schema V36). Every stash / take / prune
 //! operation goes through the shared DB so a client that solves on
-//! worker A can submit on worker B — the DELETE RETURNING on take
+//! worker A can submit on worker B - the DELETE RETURNING on take
 //! gives atomic "first solver wins" semantics across the whole
 //! pool, no RPC needed.
 //!
@@ -21,8 +21,8 @@ use rusqlite::params;
 use super::ConfigStore;
 use crate::error::Result;
 
-/// One row in the pending-challenge stash. Fields are plain-old-data
-/// — semantics live in `lorica::bot`, we just move bytes.
+/// One row in the pending-challenge stash. Fields are plain-old-data;
+/// semantics live in `lorica::bot`, we just move bytes.
 #[derive(Debug, Clone)]
 pub struct BotStashEntry {
     /// Random hex nonce identifying the challenge.
@@ -140,7 +140,7 @@ impl ConfigStore {
     /// Atomically remove + return a pending challenge. The
     /// DELETE...RETURNING wraps the SELECT + DELETE in one SQLite
     /// statement so two workers both racing to verify a solution
-    /// will NOT both succeed — only one wins, the other gets
+    /// will NOT both succeed - only one wins, the other gets
     /// `None` and rejects with 403 "challenge expired or unknown".
     /// This is the cross-worker replay defence.
     pub fn bot_stash_take(&self, nonce: &str, now: i64) -> Result<Option<BotStashEntry>> {
@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(taken.nonce, "abc");
         assert_eq!(taken.kind, "pow");
         assert_eq!(taken.mode, 2);
-        // second take returns None — first solver wins.
+        // second take returns None - first solver wins.
         assert!(store
             .bot_stash_take("abc", 1_900_000_000)
             .unwrap()
@@ -280,7 +280,7 @@ mod tests {
             store.bot_stash_captcha_image("cap1").unwrap(),
             Some(vec![1, 2, 3, 4])
         );
-        // Image fetch must NOT remove the row — user can reload.
+        // Image fetch must NOT remove the row - user can reload.
         assert_eq!(store.bot_stash_len().unwrap(), 1);
         // Still present + takeable.
         assert!(store

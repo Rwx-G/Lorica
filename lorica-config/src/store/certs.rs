@@ -142,7 +142,7 @@ impl ConfigStore {
     pub(super) fn row_to_certificate(&self, row: &rusqlite::Row<'_>) -> Result<Certificate> {
         let san_json: String = row.get(2)?;
         let san_domains: Vec<String> = serde_json::from_str(&san_json)
-            .map_err(|e| ConfigError::Validation(format!("invalid san_domains JSON: {e}")))?;
+            .map_err(|e| ConfigError::Corrupt(format!("invalid san_domains JSON: {e}")))?;
         let key_pem_raw: Vec<u8> = row.get(5)?;
         let key_pem = self.decrypt_key_pem(&key_pem_raw)?;
         let acme_method: Option<String> = row.get(12)?;

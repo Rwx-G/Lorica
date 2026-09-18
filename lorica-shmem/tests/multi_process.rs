@@ -42,7 +42,7 @@ use nix::unistd::{fork, ForkResult, Pid};
 /// child PID to the parent.
 ///
 /// # Safety
-/// The parent must not rely on any async runtime before calling this —
+/// The parent must not rely on any async runtime before calling this:
 /// forking a process with tokio threads active is undefined behaviour.
 /// These tests deliberately avoid tokio.
 fn fork_child<F: FnOnce(&'static SharedRegion)>(fd: RawFd, body: F) -> Pid {
@@ -146,7 +146,7 @@ fn siphash_key_is_shared_across_children() {
 
     // Child: write a marker value into waf_flood under a known raw key
     // using its own tagged(), then exit. Parent verifies it sees the
-    // same tag — which means both hashed the same raw to the same h.
+    // same tag - which means both hashed the same raw to the same h.
     let pid = fork_child(fd_raw, move |r| {
         assert_eq!(r.hash_key, parent_key, "child must see same key");
         let h = r.tagged(0xabcd_1234);
@@ -207,7 +207,7 @@ fn probe_chain_saturation_returns_sentinel_across_processes() {
     //
     // NB: this test *bypasses* siphash and constructs tagged hashes
     // directly so we can control the probe-chain start bits. That is
-    // deliberate — the guarantee under test is that the `AtomicHashTable`
+    // deliberate - the guarantee under test is that the `AtomicHashTable`
     // probe loop saturates at `MAX_PROBE` regardless of how the hash
     // was derived. If the table implementation ever changes to double
     // hashing or Robin Hood, this test must be updated to reflect the

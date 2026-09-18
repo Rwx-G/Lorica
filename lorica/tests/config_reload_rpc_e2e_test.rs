@@ -240,7 +240,7 @@ async fn reload_commit_rejects_mismatched_generation() {
         .await
         .unwrap();
     assert_eq!(resp.typed_status(), ResponseStatus::Error);
-    // Pending slot must still hold generation 7 — a mismatched commit
+    // Pending slot must still hold generation 7 - a mismatched commit
     // must not clobber a prepared entry.
     assert_eq!(*state.pending_gen.lock(), Some(7));
 }

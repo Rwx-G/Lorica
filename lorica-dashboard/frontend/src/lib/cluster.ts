@@ -102,6 +102,28 @@ export interface ClusterNodeResponse {
   session_peer: string | null;
   session_last_seen_unix: number | null;
   /**
+   * The control plane's own drift verdict, formed the same way
+   * `/cluster/drift` forms it: generation and hash, from the live
+   * session when there is one and from the registry row otherwise.
+   *
+   * Read it; do not recompute it. This page used to compare the
+   * registry generation against the fleet's, which answered a
+   * different question: a node that converged by pull kept a pill for
+   * up to the 30 s flush interval, and a divergence that kept the
+   * generation and changed the hash never showed one (backlog #71).
+   */
+  drifted: boolean;
+  /** The generation the verdict above was formed against. */
+  applied_generation: number;
+  /** The hash the verdict above was formed against. */
+  applied_hash: string;
+  /**
+   * Whether that generation and hash came from the node's live session
+   * or from the registry row, which a timer writes and which can
+   * therefore lag a converged node.
+   */
+  from_live_session: boolean;
+  /**
    * Hostnames whose route selectors already name this node
    * (Story 9.5 D15). Shown when approving a pending node, because
    * activating is the moment those selectors start handing it keys.

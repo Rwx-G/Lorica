@@ -10,7 +10,7 @@
 //!
 //! `lorica-geoip::GeoIpResolver` hot-swaps its in-memory `.mmdb`
 //! reader atomically via `ArcSwapOption`, but the `reload_proxy_config`
-//! path in `lorica::reload` only sees `ConfigStore` and `ProxyConfig` —
+//! path in `lorica::reload` only sees `ConfigStore` and `ProxyConfig`;
 //! it has no handle on the resolver. This module exposes a process-wide
 //! `OnceLock<Arc<GeoIpResolver>>` that the single-process / worker
 //! startup code registers once with [`set_handle`]; `reload.rs` then
@@ -19,7 +19,7 @@
 //!
 //! A single OnceLock is safe because a given Lorica process only
 //! owns one `GeoIpResolver` (worker processes are forked from the
-//! supervisor but each one has its own process-wide static — fork
+//! supervisor but each one has its own process-wide static - fork
 //! COWs the memory space and the worker's `ProxyApp::geoip_resolver`
 //! field points at the same `Arc<GeoIpResolver>` we stash here).
 //!
@@ -38,7 +38,7 @@ static ASN_RESOLVER_HANDLE: OnceLock<Arc<AsnResolver>> = OnceLock::new();
 /// Register the process-wide GeoIP resolver handle. Called once from
 /// each runtime's startup path (`run_single_process`, `run_worker`)
 /// with the same `Arc` that backs `ProxyApp::geoip_resolver`. Second
-/// and subsequent calls are silently ignored — the OnceLock is
+/// and subsequent calls are silently ignored - the OnceLock is
 /// set-once, so a test harness that calls this twice (rare, but
 /// possible with nested `#[tokio::test]` runtimes) does not panic.
 pub fn set_handle(resolver: Arc<GeoIpResolver>) {
@@ -62,7 +62,7 @@ pub fn set_asn_handle(resolver: Arc<AsnResolver>) {
 /// Read the process-wide ASN resolver handle. `None` before
 /// [`set_asn_handle`] has been called OR when no ASN DB has been
 /// loaded. The bot-protection evaluator treats `None` as
-/// "ASN-based bypass disabled for this request" — so the operator's
+/// "ASN-based bypass disabled for this request" - so the operator's
 /// bypass list is simply never consulted.
 pub fn asn_handle() -> Option<Arc<AsnResolver>> {
     ASN_RESOLVER_HANDLE.get().cloned()

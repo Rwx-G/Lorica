@@ -11,21 +11,21 @@
 //! A single 32-byte random secret is published via [`ArcSwap`] at
 //! startup and hot-swapped on each call to [`rotate`]. Every verify
 //! / sign operation on the hot path reads through [`handle`],
-//! which returns a lock-free `Arc<[u8; 32]>` snapshot — a rotation
+//! which returns a lock-free `Arc<[u8; 32]>` snapshot - a rotation
 //! does not block in-flight requests.
 //!
 //! Storage of the secret in SQLite (`global_settings.bot_hmac_secret`)
 //! is handled by the caller (`lorica-config` + `lorica::reload`);
 //! this crate only owns the in-memory view. Persisting the bytes
 //! in the config DB (rather than, say, a systemd credential) keeps
-//! the first-boot path simple — the same migration that creates
+//! the first-boot path simple - the same migration that creates
 //! the `global_settings` table carries the default empty value.
 //!
 //! ## Threading
 //!
 //! `handle()` is safe to call from any thread / task. The returned
 //! `Arc<[u8; 32]>` is cheap to clone (Arc refcount bump) and does
-//! not pin the resolver — dropping the snapshot on the calling
+//! not pin the resolver - dropping the snapshot on the calling
 //! task is idiomatic.
 //!
 //! ## Rotation contract
@@ -35,7 +35,7 @@
 //!   new secret, never a partial replacement.
 //! - **Forward-only.** Rotation overwrites the slot; previous
 //!   secrets are dropped once all live references elapse. No
-//!   historical secret is retained to "retry" an old cookie — by
+//!   historical secret is retained to "retry" an old cookie - by
 //!   design, rotation invalidates outstanding verdicts.
 //! - **Idempotent.** Rotating with the same bytes is a legal no-op.
 
@@ -51,7 +51,7 @@ use rand::TryRngCore;
 pub const SECRET_LEN: usize = 32;
 
 /// Process-wide secret slot. `None` until [`install`] has been
-/// called at least once — callers that read the secret before
+/// called at least once - callers that read the secret before
 /// startup has finished get a typed error rather than a random
 /// panic from `unwrap`.
 static SECRET: Lazy<ArcSwap<Option<Arc<[u8; SECRET_LEN]>>>> =
@@ -158,7 +158,7 @@ mod tests {
         assert_eq!(*second, new_key);
 
         // The original Arc is still alive (we are holding it) and
-        // carries the old bytes — ArcSwap dropped its slot pointer
+        // carries the old bytes - ArcSwap dropped its slot pointer
         // but did not mutate the payload.
         assert_eq!(*first, [0xA1u8; SECRET_LEN]);
     }

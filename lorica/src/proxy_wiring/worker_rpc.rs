@@ -187,10 +187,11 @@ impl WorkerMetricsCtx {
 
     /// Build an instant `MetricsReport` snapshot for `worker_id`:
     /// cache hits/misses, active connections, bans, EWMA scores,
-    /// backend connections, request counts, WAF counts, AND the
-    /// per-worker `generic_counters` (bot_challenge, geoip_block,
-    /// ai_bot, cert_resolver_reload, ocsp_refresh, ...). Shared by
-    /// both `MetricsRequest` responders so neither can drop a field.
+    /// backend connections, request counts, WAF counts, the
+    /// traffic-capture gauges, AND the per-worker `generic_counters`
+    /// (bot_challenge, geoip_block, ai_bot, cert_resolver_reload,
+    /// ocsp_refresh, ...). Shared by both `MetricsRequest` responders
+    /// so neither can drop a field.
     pub fn build_report(&self, worker_id: u32) -> lorica_command::MetricsReport {
         use lorica_command::{
             BackendConnEntry, BanReportEntry, EwmaReportEntry, MetricsReport, RequestCountEntry,
@@ -272,6 +273,23 @@ impl WorkerMetricsCtx {
         report.backend_conn_entries = backend_conn_entries;
         report.request_entries = request_entries;
         report.waf_entries = waf_entries;
+        // Traffic-capture gauges (Story 10.1 AC #9 follow-up). Both are
+        // published from worker-side code - the config compile for the
+        // rule count, the request path's budget for the in-flight bytes
+        // - so the supervisor's own registry holds zeros. They are read
+        // straight from this process's registry rather than carried in
+        // the ctx because neither has a counter Arc the proxy hands
+        // out; the gauge static IS the state.
+        report.capture_rules_active =
+            lorica_api::metrics::capture_rules_active_value().max(0) as u64;
+        report.capture_inflight_bytes =
+            lorica_api::metrics::capture_inflight_bytes_value().max(0) as u64;
+        // Same story for the WAF body-scan budget (Story 10.6): the
+        // reservation is a worker-side process-global, so the
+        // supervisor's own gauge is 0 and only this field lets
+        // `/metrics` report what the node actually holds.
+        report.waf_body_scan_inflight_bytes =
+            lorica_api::metrics::waf_body_scan_inflight_bytes_value().max(0) as u64;
         // Cross-worker counter aggregation (v1.4.0 follow-up). Ships
         // every non-typed per-worker counter (bot_challenge,
         // geoip_block, forward_auth_cache, ...) to the supervisor so
@@ -539,5 +557,65 @@ pub(crate) async fn handle_config_reload_commit(
                 ))
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two capture gauges are process-global statics shared with
+    /// every other test in this binary, so the report assertions below
+    /// are serialized against each other.
+    static CAPTURE_GAUGE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A context whose only meaningful content is the process-global
+    /// state `build_report` reads: every per-worker Arc is empty.
+    fn empty_ctx() -> WorkerMetricsCtx {
+        WorkerMetricsCtx::new(
+            Arc::new(lorica_api::ban::BanMap::new()),
+            Arc::new(DashMap::new()),
+            Arc::new(BackendConnections::new()),
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    #[test]
+    fn build_report_carries_the_worker_capture_gauges() {
+        let _guard = CAPTURE_GAUGE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Both gauges are published from worker-side code the
+        // supervisor never runs, so the report is the only way the
+        // fleet figure reaches the scrape.
+        lorica_api::metrics::set_capture_rules_active(6);
+        lorica_api::metrics::set_capture_inflight_bytes(65_536);
+        lorica_api::metrics::set_waf_body_scan_inflight_bytes(16_384);
+
+        let report = empty_ctx().build_report(3);
+
+        assert_eq!(report.capture_rules_active, 6);
+        assert_eq!(report.capture_inflight_bytes, 65_536);
+        assert_eq!(report.waf_body_scan_inflight_bytes, 16_384);
+    }
+
+    #[test]
+    fn build_report_capture_gauges_are_zero_on_an_idle_worker() {
+        let _guard = CAPTURE_GAUGE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lorica_api::metrics::set_capture_rules_active(0);
+        lorica_api::metrics::set_capture_inflight_bytes(0);
+        lorica_api::metrics::set_waf_body_scan_inflight_bytes(0);
+
+        let report = empty_ctx().build_report(3);
+
+        assert_eq!(report.capture_rules_active, 0);
+        assert_eq!(report.capture_inflight_bytes, 0);
+        assert_eq!(report.waf_body_scan_inflight_bytes, 0);
     }
 }

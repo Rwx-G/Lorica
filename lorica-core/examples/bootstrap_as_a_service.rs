@@ -22,7 +22,7 @@
 //!
 //! [`Server::bootstrap_as_a_service`] instead schedules bootstrap as a dependency-aware init
 //! service. This allows other services to declare a dependency on the bootstrap handle and
-//! ensures they only start after bootstrap completes — while keeping setup fully asynchronous
+//! ensures they only start after bootstrap completes - while keeping setup fully asynchronous
 //! and composable with the rest of the service graph.
 //!
 //! Use `bootstrap_as_a_service` when:
@@ -96,7 +96,7 @@ fn main() {
     // MyService will not start until the bootstrap service has signaled that it is ready.
     service_handle.add_dependency(&bootstrap_handle);
 
-    info!("Starting server — bootstrap will run as a service before MyService starts");
+    info!("Starting server - bootstrap will run as a service before MyService starts");
 
     server.run_forever();
 }

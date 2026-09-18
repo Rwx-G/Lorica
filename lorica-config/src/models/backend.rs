@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::automation_environment::ManagedBy;
 use super::enums::{HealthStatus, LifecycleState};
 
 /// Single upstream target reachable at `address` (validated as
@@ -54,6 +55,12 @@ pub struct Backend {
     /// ALPN h2 for TLS). Default false (HTTP/1.1).
     #[serde(default)]
     pub h2_upstream: bool,
+    /// Who manages this backend when it is not the operator (Story
+    /// 10.4 AC #8). Same contract as `Route::managed_by`: `None` is
+    /// operator-managed, a `Some` is badged and refused in-place
+    /// edits, and the mark replicates with the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<ManagedBy>,
     /// First-insert timestamp (DB-assigned).
     pub created_at: DateTime<Utc>,
     /// Last-write timestamp (refreshed on every UPDATE).

@@ -29,7 +29,7 @@
 //!   background task (spawned inside request_filter via
 //!   `tokio::spawn`) populates the cache asynchronously so the
 //!   NEXT request from the same IP gets a hit.
-//! - Zero cost when no route uses `bypass.rdns` — the populate
+//! - Zero cost when no route uses `bypass.rdns` - the populate
 //!   call site only runs when the config has at least one suffix.
 
 use std::net::IpAddr;
@@ -74,7 +74,7 @@ const CACHE_CAPACITY: usize = 16_384;
 const MAX_INFLIGHT_RESOLVES: usize = 256;
 
 /// What the cache stores per client IP. `None` confirmed name =
-/// "we looked up, no PTR or forward-confirm failed" — still a
+/// "we looked up, no PTR or forward-confirm failed" - still a
 /// cache entry so we do NOT re-resolve on every request from a
 /// non-matching IP. `Some(name)` = forward-confirmed PTR.
 #[derive(Debug, Clone)]
@@ -120,7 +120,7 @@ impl RdnsResolver {
         // stable for callers (audit L-15 dep bump).
         let (config, mut opts) =
             hickory_resolver::system_conf::read_system_conf().map_err(std::io::Error::other)?;
-        // Short timeouts — a stuck DNS server must not wedge the
+        // Short timeouts - a stuck DNS server must not wedge the
         // background populate task. Two retries + 2 s each = ≤ 6 s
         // end-to-end per lookup, well inside the tokio spawn's
         // natural lifetime.
@@ -321,7 +321,7 @@ pub fn set_handle(resolver: Arc<RdnsResolver>) {
 
 /// Read the process-wide rDNS resolver handle. `None` before
 /// [`set_handle`] or when the startup path failed to build one
-/// (e.g. missing `/etc/resolv.conf`) — the bot evaluator treats
+/// (e.g. missing `/etc/resolv.conf`) - the bot evaluator treats
 /// that as "rDNS bypass category is a silent no-op".
 pub fn handle() -> Option<Arc<RdnsResolver>> {
     RDNS_HANDLE.get().cloned()
@@ -390,7 +390,7 @@ mod tests {
     fn suffix_matches_multiple_patterns() {
         let suffixes = vec!["googlebot.com".to_string(), "search.msn.com".to_string()];
         assert!(suffix_matches("msnbot.search.msn.com", &suffixes));
-        // `google.com` is not in the suffix list — must not match
+        // `google.com` is not in the suffix list - must not match
         // even though it looks like it could belong to Google.
         assert!(!suffix_matches(
             "rate-limited-proxy-66-249-64-1.google.com.",
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn cache_expires_past_ttl() {
         // Resolver requires a tokio runtime to actually dispatch
-        // queries. We only exercise the cache surface here — the
+        // queries. We only exercise the cache surface here - the
         // hickory inner is unused.
         let config = ResolverConfig::default();
         let opts = ResolverOpts::default();
@@ -416,7 +416,7 @@ mod tests {
             },
         );
         assert!(resolver.cache_check(ip, 2_000).is_none());
-        // Fresh entry — same IP, new timestamp.
+        // Fresh entry - same IP, new timestamp.
         resolver.cache.lock().put(
             ip,
             RdnsCacheEntry {
@@ -532,7 +532,7 @@ mod tests {
     /// entry prevents a hot-path from re-resolving the same IP every
     /// request). Pointing the resolver at a black-hole nameserver
     /// exercises the failure path without needing a real DNS server
-    /// in the test — the PTR lookup times out and `resolve_and_cache`
+    /// in the test - the PTR lookup times out and `resolve_and_cache`
     /// returns None, but the cache entry still lands.
     ///
     /// This covers the implicit "fail-closed with cached negative"
@@ -543,7 +543,7 @@ mod tests {
         use hickory_resolver::config::{ConnectionConfig, NameServerConfig};
         use std::net::SocketAddr;
 
-        // 127.0.0.1:1 is deliberately a port nothing listens on —
+        // 127.0.0.1:1 is deliberately a port nothing listens on;
         // UDP sends will drop / time out. The short opts below cap
         // the test at ≤ 1 s wall-clock.
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -578,7 +578,7 @@ mod tests {
         assert!(got.is_none(), "black-hole nameserver must not resolve");
 
         // Post-condition: the cache now has a negative entry, so
-        // cache_check returns `Some(None)` — the request filter uses
+        // cache_check returns `Some(None)` - the request filter uses
         // this to skip re-resolving the same IP on the hot path.
         match resolver.cache_check(ip, now) {
             Some(None) => {}

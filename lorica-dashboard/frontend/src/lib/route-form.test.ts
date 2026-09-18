@@ -7,9 +7,15 @@ import {
   validateRedirectHostname,
   routeToFormState,
   formStateToCreateRequest,
+  formStateToUpdateRequest,
   getModifiedFields,
   inferTabFromBackendError,
+  wafBodyScanMbToBytes,
+  validateWafBodyScanMb,
   ROUTE_DEFAULTS,
+  WAF_BODY_SCAN_MAX_BYTES,
+  WAF_BODY_SCAN_MIN_BYTES,
+  WAF_BODY_SCAN_MIN_MB,
   type RouteFormState,
 } from './route-form';
 import {
@@ -587,6 +593,7 @@ describe('routeToFormState', () => {
     retry_attempts: 3,
     security_headers: 'strict',
     max_request_body_bytes: 10485760, // 10 MB
+    waf_body_scan_max_bytes: 8388608, // 8 MB
     rate_limit_rps: 100,
     rate_limit_burst: 200,
     ip_allowlist: ['10.0.0.0/8'],
@@ -650,6 +657,26 @@ describe('routeToFormState', () => {
   it('converts max_request_body_bytes to MB', () => {
     const form = routeToFormState(mockRoute);
     expect(form.max_body_mb).toBe('10');
+  });
+
+  it('converts waf_body_scan_max_bytes to MB', () => {
+    const form = routeToFormState(mockRoute);
+    expect(form.waf_body_scan_max_mb).toBe('8');
+  });
+
+  it('maps a null waf_body_scan_max_bytes to an empty field', () => {
+    const form = routeToFormState({ ...mockRoute, waf_body_scan_max_bytes: null });
+    expect(form.waf_body_scan_max_mb).toBe('');
+  });
+
+  it('round-trips waf_body_scan_max_bytes back to the same byte count', () => {
+    const form = routeToFormState(mockRoute);
+    expect(formStateToUpdateRequest(form).waf_body_scan_max_bytes).toBe(8 * 1024 * 1024);
+  });
+
+  it('round-trips an unset scan cap as the 0 the API reads as unset', () => {
+    const form = routeToFormState({ ...mockRoute, waf_body_scan_max_bytes: null });
+    expect(formStateToUpdateRequest(form).waf_body_scan_max_bytes).toBe(0);
   });
 
   it('converts rate limits to strings', () => {
@@ -868,6 +895,7 @@ describe('header_rules', () => {
       proxy_headers_remove: [],
       response_headers_remove: [],
       max_request_body_bytes: null,
+      waf_body_scan_max_bytes: null,
       websocket_enabled: true,
       rate_limit_rps: null,
       rate_limit_burst: null,
@@ -953,6 +981,7 @@ describe('header_rules', () => {
       proxy_headers_remove: [],
       response_headers_remove: [],
       max_request_body_bytes: null,
+      waf_body_scan_max_bytes: null,
       websocket_enabled: true,
       rate_limit_rps: null,
       rate_limit_burst: null,
@@ -1096,6 +1125,7 @@ describe('traffic_splits', () => {
       proxy_headers_remove: [],
       response_headers_remove: [],
       max_request_body_bytes: null,
+      waf_body_scan_max_bytes: null,
       websocket_enabled: true,
       rate_limit_rps: null,
       rate_limit_burst: null,
@@ -1231,6 +1261,7 @@ describe('forward_auth', () => {
       proxy_headers_remove: [],
       response_headers_remove: [],
       max_request_body_bytes: null,
+      waf_body_scan_max_bytes: null,
       websocket_enabled: true,
       rate_limit_rps: null,
       rate_limit_burst: null,
@@ -1397,6 +1428,7 @@ describe('mirror', () => {
       proxy_headers_remove: [],
       response_headers_remove: [],
       max_request_body_bytes: null,
+      waf_body_scan_max_bytes: null,
       websocket_enabled: true,
       rate_limit_rps: null,
       rate_limit_burst: null,
@@ -1690,6 +1722,7 @@ describe('cache_vary_headers round-trip', () => {
       proxy_headers_remove: [],
       response_headers_remove: [],
       max_request_body_bytes: null,
+      waf_body_scan_max_bytes: null,
       websocket_enabled: true,
       rate_limit_rps: null,
       rate_limit_burst: null,
@@ -1953,5 +1986,101 @@ describe('inferTabFromBackendError', () => {
 
   it('trims leading whitespace before parsing', () => {
     expect(inferTabFromBackendError('   return_status must be in 100..=599')).toBe('general');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// waf_body_scan_max_bytes (Story 10.6 AC #5 / #9)
+// ---------------------------------------------------------------------------
+
+describe('waf_body_scan_max_mb', () => {
+  function form(mb: string): RouteFormState {
+    return { ...ROUTE_DEFAULTS, hostname: 'test.com', waf_body_scan_max_mb: mb };
+  }
+
+  describe('wafBodyScanMbToBytes', () => {
+    it('converts MB to bytes', () => {
+      expect(wafBodyScanMbToBytes('8')).toBe(8 * 1024 * 1024);
+    });
+
+    it('converts the 4 KiB floor without losing precision', () => {
+      expect(wafBodyScanMbToBytes(String(WAF_BODY_SCAN_MIN_MB))).toBe(WAF_BODY_SCAN_MIN_BYTES);
+    });
+
+    it('treats an empty field as unset', () => {
+      expect(wafBodyScanMbToBytes('')).toBeNull();
+      expect(wafBodyScanMbToBytes('   ')).toBeNull();
+    });
+
+    it('treats the server 0 sentinel as unset rather than as a value', () => {
+      expect(wafBodyScanMbToBytes('0')).toBeNull();
+    });
+
+    it('treats junk as unset instead of producing a NaN payload', () => {
+      expect(wafBodyScanMbToBytes('abc')).toBeNull();
+    });
+  });
+
+  describe('validateWafBodyScanMb', () => {
+    it('accepts an empty field and the 0 sentinel', () => {
+      expect(validateWafBodyScanMb('')).toBeNull();
+      expect(validateWafBodyScanMb('0')).toBeNull();
+    });
+
+    it('accepts both ends of the server range', () => {
+      expect(validateWafBodyScanMb(String(WAF_BODY_SCAN_MIN_MB))).toBeNull();
+      expect(validateWafBodyScanMb('64')).toBeNull();
+    });
+
+    it('rejects below 4 KiB', () => {
+      expect(validateWafBodyScanMb('0.001')).toContain('WAF body scan limit');
+    });
+
+    it('rejects past 64 MiB', () => {
+      expect(validateWafBodyScanMb('65')).toContain('WAF body scan limit');
+    });
+
+    it('rejects text that is not a number', () => {
+      expect(validateWafBodyScanMb('abc')).toContain('must be a number');
+    });
+  });
+
+  describe('form conversion', () => {
+    it('sends the byte value on create', () => {
+      expect(formStateToCreateRequest(form('8')).waf_body_scan_max_bytes).toBe(8 * 1024 * 1024);
+    });
+
+    it('omits the field on create when unset', () => {
+      expect(formStateToCreateRequest(form('')).waf_body_scan_max_bytes).toBeUndefined();
+    });
+
+    it('sends the 0 the server normalises back to unset on update', () => {
+      expect(formStateToUpdateRequest(form('')).waf_body_scan_max_bytes).toBe(0);
+    });
+
+  });
+
+  describe('form validation', () => {
+    it('blocks a save the API would answer 422 to', () => {
+      expect(validateRouteForm(form(String(WAF_BODY_SCAN_MAX_BYTES)))).toContain('WAF body scan limit');
+    });
+
+    it('points the drawer at the Protection tab', () => {
+      const r = validateRouteFormWithTab(form('65'));
+      expect(r.message).toContain('WAF body scan limit');
+      expect(r.tab).toBe('protection');
+    });
+
+    it('leaves a valid value alone', () => {
+      expect(validateRouteForm(form('8'))).toBe('');
+    });
+  });
+
+  it('is tracked as a modified field', () => {
+    expect(getModifiedFields(form('8')).has('waf_body_scan_max_mb')).toBe(true);
+  });
+
+  it('maps a backend rejection to the Protection tab', () => {
+    expect(inferTabFromBackendError('waf_body_scan_max_bytes must be in 4096..=67108864')).toBe('protection');
   });
 });

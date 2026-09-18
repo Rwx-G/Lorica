@@ -429,6 +429,7 @@ fn test_route_with_path_rule_overrides_applies_some_fields() {
         proxy_headers_remove: vec![],
         response_headers_remove: vec![],
         max_request_body_bytes: None,
+        waf_body_scan_max_bytes: None,
         websocket_enabled: true,
         rate_limit_rps: None,
         rate_limit_burst: None,
@@ -471,6 +472,7 @@ fn test_route_with_path_rule_overrides_applies_some_fields() {
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        managed_by: None,
         created_at: now,
         updated_at: now,
     };
@@ -690,6 +692,7 @@ fn example_route_for_serde() -> Route {
         proxy_headers_remove: vec![],
         response_headers_remove: vec![],
         max_request_body_bytes: None,
+        waf_body_scan_max_bytes: None,
         websocket_enabled: true,
         rate_limit_rps: None,
         rate_limit_burst: None,
@@ -732,6 +735,7 @@ fn example_route_for_serde() -> Route {
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        managed_by: None,
         created_at: now,
         updated_at: now,
     }
@@ -740,7 +744,7 @@ fn example_route_for_serde() -> Route {
 #[test]
 fn route_rate_limit_is_skipped_when_none() {
     // The `skip_serializing_if = "Option::is_none"` keeps older tooling
-    // and dashboards happy — a route without rate_limit does not leak
+    // and dashboards happy - a route without rate_limit does not leak
     // a `"rate_limit": null` field.
     let route = example_route_for_serde();
     assert!(route.rate_limit.is_none());

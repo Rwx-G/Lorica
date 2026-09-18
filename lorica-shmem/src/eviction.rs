@@ -18,7 +18,7 @@
 //! every table once per minute. A slot is evicted when its
 //! `last_update_ns` is older than 5 minutes; eviction CAS's the `key`
 //! from `h` to `0` to release the slot. `value` and `last_update_ns`
-//! are *not* reset at eviction time — they are reset by the next
+//! are *not* reset at eviction time - they are reset by the next
 //! `increment` that claims the slot, which is safe because the claim
 //! CAS serialises reuse (§ 5.3).
 //!

@@ -53,7 +53,7 @@ const MAX_SOLVE_BODY_BYTES: usize = 2048;
 const PENDING_TTL_S: u64 = 300;
 
 /// Handle `POST /lorica/bot/solve`. Returns `Ok(true)` when the
-/// handler has written a full response (regardless of verdict —
+/// handler has written a full response (regardless of verdict:
 /// successful verify writes 302, failed verify writes 403). The
 /// caller stops the filter pipeline.
 pub async fn handle_solve(
@@ -147,7 +147,7 @@ pub async fn handle_solve(
 
     // Success: mint verdict cookie bound to the stashed route_id
     // and IP prefix. Use the stashed cookie_ttl_s so a per-route
-    // override propagates end-to-end. Secret MUST be present — if
+    // override propagates end-to-end. Secret MUST be present - if
     // it isn't, the process is in a weird state and we fail
     // closed rather than issue an unverifiable cookie.
     let Some(secret) = secret else {
@@ -206,7 +206,7 @@ pub async fn handle_captcha_image(
     let mut header = ResponseHeader::build(200, None)?;
     header.insert_header("Content-Type", "image/png")?;
     header.insert_header("Content-Length", png.len().to_string())?;
-    // Disable any proxy / browser cache — the image is one-shot
+    // Disable any proxy / browser cache - the image is one-shot
     // and must not be served from a stale cache after the nonce
     // expires or is consumed.
     header.insert_header("Cache-Control", "no-store, private")?;
@@ -226,7 +226,7 @@ pub async fn handle_captcha_image(
 ///
 /// `content_type_prefers_html` is true when the client advertised
 /// `text/html` in `Accept`. When false, the response becomes a
-/// plain-text 403 instead of the HTML page — useful for curl /
+/// plain-text 403 instead of the HTML page - useful for curl /
 /// wget / scripts that would otherwise see a blob of HTML.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_challenge(
@@ -251,7 +251,7 @@ pub async fn serve_challenge(
     if !content_type_prefers_html {
         // Non-HTML client → plain-text fallback. Still counts as
         // "shown" for metrics because the filter served a
-        // challenge response — it just rendered as text.
+        // challenge response - it just rendered as text.
         lorica_api::metrics::inc_bot_challenge(route_id, mode_str, "shown");
         let body = chrender::render_plaintext_fallback(mode, None);
         let mut header = ResponseHeader::build(403, None)?;
@@ -287,7 +287,7 @@ pub async fn serve_challenge(
             // We still need a verdict cookie so the NEXT request
             // to the same route skips straight through. Mint it
             // here inline.
-            // HMAC secret must be installed at this point — if it
+            // HMAC secret must be installed at this point - if it
             // is not, bail with 503 rather than issue a
             // non-verifiable cookie.
             let Some(secret) = lorica_challenge::secret::handle() else {
@@ -308,7 +308,7 @@ pub async fn serve_challenge(
             };
             let set_cookie = build_set_cookie_header(&cookie_value, cfg.cookie_ttl_s);
 
-            // Cookie mode's page IS the verdict issuance — the
+            // Cookie mode's page IS the verdict issuance - the
             // browser that follows the meta-refresh AND carries
             // the cookie back is what we let through. Count it as
             // "passed" here rather than "shown" because the user
@@ -569,7 +569,7 @@ fn hex_digit(b: u8) -> Option<u8> {
 }
 
 /// Return true iff the `Accept` header on the request advertises
-/// HTML. Case-insensitive substring match — covers `text/html`,
+/// HTML. Case-insensitive substring match - covers `text/html`,
 /// `application/xhtml+xml`, and the various `*/*` weighted forms
 /// every browser sends. Missing header = treat as "not HTML"
 /// (conservative: scripts get the plain-text fallback).
@@ -637,7 +637,7 @@ async fn write_plain_retry_after(
 impl PendingEntry {
     /// Compute the 16-byte route-id hash stored in the verdict
     /// cookie. Kept here (rather than on `BotEngine`) because the
-    /// cookie wire format is a `bot_handlers` concern —
+    /// cookie wire format is a `bot_handlers` concern;
     /// `PendingEntry.route_id` is a plain String and does not
     /// otherwise need a derived-form lookup.
     pub(super) fn route_id_bytes_cached(&self) -> [u8; 16] {

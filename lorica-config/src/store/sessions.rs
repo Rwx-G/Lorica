@@ -67,8 +67,9 @@ impl ConfigStore {
 
         match result {
             Some((user_id, username, role_str, created_str, expires_str)) => {
-                let role = Role::from_str(&role_str)
-                    .map_err(|e| ConfigError::Validation(format!("invalid session role: {e}")))?;
+                let role = Role::from_str(&role_str).map_err(|e| {
+                    ConfigError::Corrupt(format!("stored session role is invalid: {e}"))
+                })?;
                 let created_at = parse_datetime(&created_str)?;
                 let expires_at = parse_datetime(&expires_str)?;
                 Ok(Some((user_id, username, role, created_at, expires_at)))

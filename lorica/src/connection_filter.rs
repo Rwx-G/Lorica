@@ -18,6 +18,13 @@
 //! operator to drop connections from known-hostile networks without spending
 //! CPU on TLS negotiation, WAF evaluation, or routing.
 //!
+//! The RULE is not here: `ConnectionFilterPolicy` lives in
+//! `lorica-config`, next to the settings it reads and the validators
+//! that refuse a malformed entry at the boundary (backlog #88). What
+//! stays here is the RUNTIME around it: the hot-swappable snapshot,
+//! the per-source-IP connection counters, and the pingora trait
+//! implementation the accept loop calls.
+//!
 //! The filter holds its CIDR lists inside an [`ArcSwap`], so hot-reloads
 //! triggered by a `GlobalSettings` update take effect on the next accepted
 //! connection without rebuilding listeners. This keeps the feature coherent
@@ -33,73 +40,11 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use ipnet::IpNet;
 use lorica_core::listeners::{AcceptPermit, AcceptVerdict, ConnectionFilter};
-use tracing::warn;
 
-/// Parsed CIDR policy used by [`GlobalConnectionFilter`].
-#[derive(Debug, Default, Clone)]
-pub struct ConnectionFilterPolicy {
-    /// CIDR ranges always rejected. Evaluated last so a deny entry always wins.
-    pub deny: Vec<IpNet>,
-    /// CIDR ranges allowed when non-empty. When empty, the filter operates in
-    /// default-allow mode: only the `deny` list can reject connections.
-    /// When non-empty, the filter operates in default-deny mode: a connection
-    /// is accepted only if its IP matches at least one entry here (and does
-    /// not match `deny`).
-    pub allow: Vec<IpNet>,
-}
-
-impl ConnectionFilterPolicy {
-    /// Parse two CIDR string lists, skipping malformed entries with a warning.
-    /// Bare IPs are promoted to single-host nets (same contract as
-    /// `trusted_proxies`/`waf_whitelist_ips`).
-    pub fn from_cidrs(allow: &[String], deny: &[String]) -> Self {
-        Self {
-            allow: parse_cidrs(allow, "connection_allow_cidrs"),
-            deny: parse_cidrs(deny, "connection_deny_cidrs"),
-        }
-    }
-
-    /// Return `true` if the given IP should be accepted under this policy.
-    #[inline]
-    pub fn accepts(&self, ip: IpAddr) -> bool {
-        if self.deny.iter().any(|net| net.contains(&ip)) {
-            return false;
-        }
-        if self.allow.is_empty() {
-            return true;
-        }
-        self.allow.iter().any(|net| net.contains(&ip))
-    }
-
-    /// `true` when the policy is a pure no-op (both lists empty), so the
-    /// runtime can skip even calling the filter when the feature is unused.
-    #[inline]
-    pub fn is_noop(&self) -> bool {
-        self.allow.is_empty() && self.deny.is_empty()
-    }
-}
-
-fn parse_cidrs(entries: &[String], field_name: &str) -> Vec<IpNet> {
-    entries
-        .iter()
-        .filter_map(|s| {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            if let Ok(net) = trimmed.parse::<IpNet>() {
-                Some(net)
-            } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
-                Some(IpNet::from(ip))
-            } else {
-                warn!(field = field_name, entry = %trimmed, "ignoring invalid CIDR entry");
-                None
-            }
-        })
-        .collect()
-}
+/// The policy this filter evaluates. Re-exported so the accept-loop
+/// wiring names one path for the rule and the runtime it runs in.
+pub use lorica_config::connection_filter::ConnectionFilterPolicy;
 
 /// RAII token decrementing one IP's live-connection count when the
 /// accepted stream drops (Story 8.9 AC #5). The listener attaches it
@@ -258,62 +203,12 @@ mod tests {
         SocketAddr::new(IpAddr::V6(ip), 0)
     }
 
-    #[test]
-    fn empty_policy_is_noop() {
-        let p = ConnectionFilterPolicy::from_cidrs(&[], &[]);
-        assert!(p.is_noop());
-        assert!(p.accepts(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
-    }
-
-    #[test]
-    fn deny_only_default_allow() {
-        let p = ConnectionFilterPolicy::from_cidrs(
-            &[],
-            &["10.0.0.0/8".to_string(), "203.0.113.7".to_string()],
-        );
-        assert!(p.accepts(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(!p.accepts(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
-        assert!(!p.accepts(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))));
-        assert!(p.accepts(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8))));
-    }
-
-    #[test]
-    fn allow_nonempty_is_default_deny() {
-        let p = ConnectionFilterPolicy::from_cidrs(&["192.168.0.0/16".to_string()], &[]);
-        assert!(p.accepts(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-        assert!(!p.accepts(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-    }
-
-    #[test]
-    fn deny_wins_over_allow() {
-        let p = ConnectionFilterPolicy::from_cidrs(
-            &["10.0.0.0/8".to_string()],
-            &["10.0.0.5".to_string()],
-        );
-        assert!(p.accepts(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(!p.accepts(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
-        assert!(!p.accepts(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-    }
-
-    #[test]
-    fn ipv6_cidrs() {
-        let p = ConnectionFilterPolicy::from_cidrs(&[], &["2001:db8::/32".to_string()]);
-        assert!(!p.accepts("2001:db8::1".parse().unwrap()));
-        assert!(p.accepts("2001:db9::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn invalid_entries_are_skipped() {
-        let p = ConnectionFilterPolicy::from_cidrs(
-            &[
-                "bogus".to_string(),
-                "   ".to_string(),
-                "10.0.0.0/8".to_string(),
-            ],
-            &[],
-        );
-        assert_eq!(p.allow.len(), 1);
-    }
+    // The policy's own behaviour (deny wins, empty allow = default
+    // allow, a bare IP is promoted, a malformed entry is skipped) is
+    // tested where the policy lives, in
+    // `lorica_config::connection_filter`. What follows exercises the
+    // runtime this module owns: the hot swap, the per-IP cap, and the
+    // pingora accept verdicts.
 
     #[tokio::test]
     async fn filter_accepts_missing_addr() {

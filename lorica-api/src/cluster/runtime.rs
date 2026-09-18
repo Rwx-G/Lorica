@@ -82,8 +82,11 @@ pub enum ClusterRuntime {
 pub struct ControlPlaneRuntime {
     /// The fleet runtime shared with the listeners.
     pub control: Arc<ControlPlane>,
-    /// Drift bookkeeping.
+    /// Drift bookkeeping. The alert budget inside it is spendable
+    /// only through [`DriftAlerter`], claimed once by the watch task.
     pub drift: DriftTracker,
+    /// Whether the single [`DriftAlerter`] has been handed out.
+    alerter_claimed: std::sync::atomic::AtomicBool,
     /// The fan-in database (Story 9.6 AC #2), shared with the
     /// listener's ingest handler so the rows an operator reads are
     /// the rows the fleet delivered. `None` when it could not be
@@ -92,6 +95,22 @@ pub struct ControlPlaneRuntime {
 }
 
 impl ControlPlaneRuntime {
+    /// Claim the one [`DriftAlerter`] for this runtime.
+    ///
+    /// `Some` the first time, `None` afterwards: there is exactly one
+    /// task entitled to advance the alert backoff, and a second caller
+    /// asking for it is a bug worth failing on rather than a second
+    /// consumer of the same budget (backlog #59).
+    pub fn claim_drift_alerter(self: &Arc<Self>) -> Option<DriftAlerter> {
+        use std::sync::atomic::Ordering;
+        if self.alerter_claimed.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        Some(DriftAlerter {
+            runtime: Arc::clone(self),
+        })
+    }
+
     /// Bundle a control plane with fresh drift bookkeeping and no
     /// telemetry store (the transport tests, and any caller that does
     /// not fan telemetry in).
@@ -99,6 +118,7 @@ impl ControlPlaneRuntime {
         Self {
             control,
             drift: DriftTracker::default(),
+            alerter_claimed: std::sync::atomic::AtomicBool::new(false),
             telemetry: None,
         }
     }
@@ -111,6 +131,7 @@ impl ControlPlaneRuntime {
         Self {
             control,
             drift: DriftTracker::default(),
+            alerter_claimed: std::sync::atomic::AtomicBool::new(false),
             telemetry,
         }
     }
@@ -182,7 +203,15 @@ impl DriftTracker {
     /// ids whose alert is due (first observation, or the backoff
     /// expired); nodes back in sync are forgotten so their next drift
     /// starts from the shortest interval again.
-    pub fn observe(&self, drifted: &[String], now: DateTime<Utc>) -> Vec<String> {
+    ///
+    /// Crate-private on purpose: this call SPENDS the alert budget,
+    /// and the only thing entitled to spend it is the periodic watch
+    /// task, which reaches it through [`DriftAlerter`]. A read path
+    /// that called this would consume a node's suppression window on
+    /// behalf of whoever refreshed a dashboard, so the read path takes
+    /// [`Self::record_first_seen`] and the compiler now says which is
+    /// which (backlog #59).
+    pub(crate) fn observe(&self, drifted: &[String], now: DateTime<Utc>) -> Vec<String> {
         let mut first_seen = self.first_seen.lock().unwrap_or_else(|p| p.into_inner());
         let mut backoff = self.backoff.lock().unwrap_or_else(|p| p.into_inner());
         first_seen.retain(|id, _| drifted.contains(id));
@@ -230,6 +259,25 @@ impl DriftTracker {
             .unwrap_or_else(|p| p.into_inner())
             .get(node_id)
             .copied()
+    }
+}
+
+/// The right to spend the drift alert budget.
+///
+/// Claimed once per runtime by the task that owns the alerting loop.
+/// A second claim returns `None`, so "who advances the backoff" has an
+/// answer the type system can state rather than a comment asking
+/// nicely. Everything else that wants drift reads
+/// [`drift_report`], which records first-seen times and spends
+/// nothing.
+pub struct DriftAlerter {
+    runtime: Arc<ControlPlaneRuntime>,
+}
+
+impl DriftAlerter {
+    /// The ids whose alert is due now, advancing each one's backoff.
+    pub fn due(&self, drifted: &[String], now: DateTime<Utc>) -> Vec<String> {
+        self.runtime.drift.observe(drifted, now)
     }
 }
 
@@ -370,11 +418,79 @@ pub async fn distribute_certificate(
 /// the current version, the live session's report when the node is
 /// connected, the registry row's persisted `applied_config_*` columns
 /// otherwise. Records first-seen times in the tracker.
+/// What the fleet knows about one node's applied configuration, and
+/// the verdict that follows.
+///
+/// The single definition of drift. Two things used to answer this
+/// question: this module, comparing generation AND hash against the
+/// live session when the node is connected, and the dashboard,
+/// comparing generation alone against the registry column that a 30 s
+/// timer persists. Two divergences followed. A node that converged by
+/// pull kept a drift pill for up to half a minute after the endpoint
+/// called it in sync, and a same-generation hash divergence never
+/// showed a pill at all (backlog #71).
+#[derive(Debug, Clone, Serialize)]
+pub struct DriftVerdict {
+    /// Whether this node diverges from the control plane's current
+    /// configuration.
+    pub drifted: bool,
+    /// The generation this verdict was formed against.
+    pub applied_generation: u64,
+    /// The hash this verdict was formed against.
+    pub applied_hash: String,
+    /// Whether those two came from the node's live session or from the
+    /// registry row. The registry row is written on a timer, so it can
+    /// lag a converged node; saying which clock produced the answer is
+    /// what lets a reader tell a stale verdict from a real one.
+    pub from_live_session: bool,
+}
+
+/// Form the verdict for one node.
+///
+/// `expected` is what THIS node should be holding: the fleet's
+/// generation with the hash of the payload the control plane cut for
+/// it (Story 10.0). Comparing against the fleet's own hash instead
+/// would mark every node in a fleet that uses `node_selector` as
+/// permanently drifted, since no follower ever receives the control
+/// plane's full view.
+///
+/// `live` is the node's own report from its open session, when it has
+/// one; otherwise the registry row is all there is. Both call sites,
+/// the drift endpoint and the fleet node list, go through here.
+pub fn evaluate_drift(
+    expected: &ConfigVersion,
+    registry_generation: i64,
+    registry_hash: &str,
+    live: Option<&AppliedConfig>,
+) -> DriftVerdict {
+    let (generation, hash, from_live_session) = match live {
+        Some(applied) => (applied.generation, applied.hash.clone(), true),
+        None => (
+            u64::try_from(registry_generation).unwrap_or(0),
+            registry_hash.to_string(),
+            false,
+        ),
+    };
+    DriftVerdict {
+        drifted: !(generation == expected.generation && hash == expected.hash),
+        applied_generation: generation,
+        applied_hash: hash,
+        from_live_session,
+    }
+}
+
+/// Which Active nodes diverge from the control plane's current
+/// configuration, with how long each has been diverging. Records
+/// first-seen times; spends no alert budget (see [`DriftAlerter`]).
 pub async fn drift_report(
     runtime: &ControlPlaneRuntime,
     store: &Arc<Mutex<ConfigStore>>,
 ) -> Result<DriftReport, ClusterRuntimeError> {
     let nodes = store_op(store, |store| store.list_cluster_nodes()).await?;
+    // The report's header is the FLEET's identity, which is what an
+    // operator reads as "where the fleet is". Each node is judged
+    // against its own expected version below, because since Story 10.0
+    // no follower holds the bytes this hash covers.
     let current: ConfigVersion = runtime.control.config_version();
     let live: HashMap<String, (AppliedConfig, bool)> = runtime
         .control
@@ -387,17 +503,23 @@ pub async fn drift_report(
     let mut drifted = Vec::new();
     let mut in_sync = 0usize;
     for node in nodes.into_iter().filter(|n| n.status == NodeStatus::Active) {
-        let (applied, connected) = live.get(&node.node_id).cloned().unwrap_or_else(|| {
-            (
-                AppliedConfig {
-                    generation: u64::try_from(node.applied_config_generation).unwrap_or(0),
-                    hash: node.applied_config_hash.clone(),
-                    break_glass: false,
-                },
-                false,
-            )
-        });
-        if applied.generation == current.generation && applied.hash == current.hash {
+        let session = live.get(&node.node_id);
+        let expected = runtime.control.expected_config_version(&node.node_id);
+        let verdict = evaluate_drift(
+            &expected,
+            node.applied_config_generation,
+            &node.applied_config_hash,
+            session.map(|(applied, _)| applied),
+        );
+        let connected = session.is_some_and(|(_, connected)| *connected);
+        let applied = session
+            .map(|(applied, _)| applied.clone())
+            .unwrap_or_else(|| AppliedConfig {
+                generation: verdict.applied_generation,
+                hash: verdict.applied_hash.clone(),
+                break_glass: false,
+            });
+        if !verdict.drifted {
             in_sync += 1;
             continue;
         }
@@ -640,6 +762,87 @@ mod tests {
         assert!(roster["fp-b-old"].via_previous_certificate);
         assert_eq!(roster["fp-b-old"].node_id, "b");
         assert_eq!(roster["fp-c"].state, NodeState::Revoked);
+    }
+
+    // -----------------------------------------------------------------
+    // Story 10.0 AC #4: the verdict is formed against what THIS node
+    // was offered, not against the control plane's own view.
+    // -----------------------------------------------------------------
+
+    fn expected(generation: u64, hash: &str) -> ConfigVersion {
+        ConfigVersion {
+            generation,
+            hash: hash.to_string(),
+        }
+    }
+
+    fn reported(generation: u64, hash: &str) -> AppliedConfig {
+        AppliedConfig {
+            generation,
+            hash: hash.to_string(),
+            break_glass: false,
+        }
+    }
+
+    #[test]
+    fn a_node_reporting_its_own_payload_at_the_current_generation_is_in_sync() {
+        let verdict = evaluate_drift(&expected(7, "cut-a"), 0, "", Some(&reported(7, "cut-a")));
+        assert!(!verdict.drifted);
+        assert!(verdict.from_live_session);
+    }
+
+    #[test]
+    fn a_node_a_generation_behind_is_drifted() {
+        let verdict = evaluate_drift(&expected(7, "cut-a"), 0, "", Some(&reported(6, "cut-a")));
+        assert!(verdict.drifted);
+        assert_eq!(verdict.applied_generation, 6);
+    }
+
+    #[test]
+    fn a_node_at_the_current_generation_with_the_wrong_bytes_is_drifted() {
+        // The case a generation-only comparison misses (backlog #71),
+        // and the one per-recipient payloads make easy to get wrong in
+        // the other direction.
+        let verdict = evaluate_drift(&expected(7, "cut-a"), 0, "", Some(&reported(7, "cut-b")));
+        assert!(verdict.drifted);
+    }
+
+    #[test]
+    fn a_node_that_never_connected_is_drifted_from_its_registry_row() {
+        let verdict = evaluate_drift(&expected(7, "cut-a"), 0, "", None);
+        assert!(verdict.drifted);
+        assert!(!verdict.from_live_session);
+        assert_eq!(verdict.applied_generation, 0);
+    }
+
+    #[test]
+    fn two_nodes_at_one_generation_with_different_bytes_are_both_in_sync() {
+        // The regression this story is most likely to introduce: judge
+        // either node against the fleet's own hash and a fleet that
+        // uses `node_selector` reads as entirely drifted, forever.
+        let a = evaluate_drift(&expected(9, "cut-a"), 0, "", Some(&reported(9, "cut-a")));
+        let b = evaluate_drift(&expected(9, "cut-b"), 0, "", Some(&reported(9, "cut-b")));
+        assert!(!a.drifted && !b.drifted);
+
+        let fleet = expected(9, "fleet-wide");
+        assert!(
+            evaluate_drift(&fleet, 0, "", Some(&reported(9, "cut-a"))).drifted,
+            "this is what the old fleet-wide comparison would have said about a converged node"
+        );
+    }
+
+    #[test]
+    fn the_alert_budget_has_exactly_one_claimant() {
+        // The contract #59 asked for: the backoff is spendable only
+        // through a handle, and the handle exists once. A read path
+        // that wants drift calls `drift_report`, which records
+        // first-seen times and spends nothing.
+        let (runtime, _liveness) = crate::tests::test_control_plane();
+        assert!(runtime.claim_drift_alerter().is_some(), "first claim");
+        assert!(
+            runtime.claim_drift_alerter().is_none(),
+            "a second claimant would alert on a budget it does not own"
+        );
     }
 
     #[test]

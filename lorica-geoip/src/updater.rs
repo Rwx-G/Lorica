@@ -289,7 +289,7 @@ pub async fn run_once(resolver: &dyn MmdbResolver, cfg: &UpdaterConfig) -> Resul
     //    the temp file and keep serving the old DB.
     //    `load_from_path` also does the atomic ArcSwap, so after this
     //    returns Ok the resolver is already serving the new DB from
-    //    the in-memory copy — the rename below is purely for restart
+    //    the in-memory copy - the rename below is purely for restart
     //    persistence.
     if let Err(e) = resolver.load_from_path(&tmp_path) {
         let _ = tokio::fs::remove_file(&tmp_path).await;
