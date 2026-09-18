@@ -52,6 +52,25 @@ done
 
 EXIT_CODE=0
 
+# Dump a node's log when a smoke fails.
+#
+# A failing assertion names the request and the status; the reason lives
+# in the node's own log, and on CI the run ends before anyone can ask
+# the container for it. The ACME phase lost a full CI cycle to exactly
+# that: a 500 whose body is the deliberate generic "internal error",
+# with the real cause in a `warn!` nobody kept.
+#
+# Usage: dump_node_log <compose-service> [lines]
+dump_node_log() {
+    node="$1"
+    lines="${2:-80}"
+    echo ""
+    echo "--- last ${lines} log lines from ${node} ---"
+    docker compose logs --no-color "$node" 2>&1 | tail -n "$lines"
+    echo "--- end ${node} ---"
+    echo ""
+}
+
 # Profile-gated services need explicit --profile flags: on teardown
 # `down -v` otherwise skips their containers and named volumes (the next
 # run boots against stale data - e.g. the cert-export smoke rotates the
@@ -359,7 +378,11 @@ if [ "$SKIP_ACME" = false ] && [ "$EXIT_CODE" = "0" ]; then
         sleep 2
     done
 
-    docker compose --profile acme run --rm acme-smoke || EXIT_CODE=$?
+    if ! docker compose --profile acme run --rm acme-smoke; then
+        EXIT_CODE=1
+        dump_node_log lorica-acme
+        dump_node_log pebble 40
+    fi
 fi
 
 # ---- Phase 10: Capture profile (Stories 10.1 IV1-IV3, 10.2 IV1-IV4) --
