@@ -261,6 +261,7 @@ mod tests {
             proxy_headers_remove: Vec::new(),
             response_headers_remove: Vec::new(),
             max_request_body_bytes: None,
+            waf_body_scan_max_bytes: None,
             websocket_enabled: true,
             rate_limit_rps: None,
             rate_limit_burst: None,

@@ -619,6 +619,21 @@ pub struct Route {
     /// Hard cap on request body size in bytes. `None` = no limit.
     #[serde(default)]
     pub max_request_body_bytes: Option<u64>,
+    /// How many bytes of an inspectable request body the WAF may
+    /// buffer on this route before the oversize path takes over.
+    /// `None` = the crate default in `lorica-waf`.
+    ///
+    /// Per route rather than global because the memory cost is
+    /// `value x concurrent inspectable requests on this route`: an
+    /// API that legitimately posts 5 MB of JSON needs a wider window
+    /// than the default, and granting it fleet-wide would multiply
+    /// the worst case across every route that never needed it. It is
+    /// not a body size limit; `max_request_body_bytes` is, and the
+    /// two are independent. Content-Type gating decides whether a
+    /// body is buffered at all, so this only widens the window for
+    /// bodies the engine can actually parse.
+    #[serde(default)]
+    pub waf_body_scan_max_bytes: Option<u64>,
     /// Whether `Upgrade: websocket` requests are proxied.
     #[serde(default = "default_websocket_enabled")]
     pub websocket_enabled: bool,

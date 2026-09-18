@@ -538,6 +538,18 @@ pub struct GlobalSettings {
     /// `true`.
     #[serde(default = "default_true")]
     pub otlp_logs_capture_enabled: bool,
+    /// Ceiling on the bytes every in-flight WAF body buffer may hold
+    /// at once, summed across all routes. Default 268_435_456
+    /// (256 MiB).
+    ///
+    /// The per-route `waf_body_scan_max_bytes` shapes one request; it
+    /// guarantees nothing about the total, which is that value times
+    /// the concurrency an attacker chooses. This is the number that
+    /// actually bounds proxy memory. Like `connection_limits_per_ip`
+    /// the accounting is per process, so multi-worker mode multiplies
+    /// the effective ceiling by the worker count.
+    #[serde(default = "default_waf_body_scan_max_inflight_bytes")]
+    pub waf_body_scan_max_inflight_bytes: u64,
 }
 
 /// `true` since v1.7.0. See the field doc on
@@ -588,6 +600,14 @@ fn default_loadtest_max_rps() -> i32 {
 
 fn default_access_log_retention() -> i64 {
     100_000
+}
+
+/// 256 MiB: 256 concurrent bodies at the 1 MiB crate default, or 4 at
+/// the 64 MiB per-route ceiling. Large enough that a normally loaded
+/// proxy never reaches it, small enough to stay a rounding error next
+/// to the machine's RAM when it does.
+fn default_waf_body_scan_max_inflight_bytes() -> u64 {
+    268_435_456
 }
 
 fn default_waf_event_retention() -> i64 {
@@ -805,6 +825,7 @@ impl Default for GlobalSettings {
             otlp_logs_waf_enabled: true,
             otlp_logs_audit_enabled: true,
             otlp_logs_capture_enabled: true,
+            waf_body_scan_max_inflight_bytes: default_waf_body_scan_max_inflight_bytes(),
         }
     }
 }

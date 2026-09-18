@@ -282,6 +282,8 @@ pub struct CanonicalGlobalSettings {
     pub connection_allow_cidrs: Vec<String>,
     /// Per-source-IP TCP connection cap.
     pub connection_limits_per_ip: Option<u32>,
+    /// Process-wide ceiling on concurrent WAF body-scan buffers.
+    pub waf_body_scan_max_inflight_bytes: u64,
     /// Global spoofed-AI-bot fallback policy.
     pub ai_bot_treat_spoofed_as: SpoofedFallback,
     /// Whether verified-bot headers are injected upstream.
@@ -330,6 +332,7 @@ impl From<&GlobalSettings> for CanonicalGlobalSettings {
             connection_deny_cidrs: s.connection_deny_cidrs.clone(),
             connection_allow_cidrs: s.connection_allow_cidrs.clone(),
             connection_limits_per_ip: s.connection_limits_per_ip,
+            waf_body_scan_max_inflight_bytes: s.waf_body_scan_max_inflight_bytes,
             ai_bot_treat_spoofed_as: s.ai_bot_treat_spoofed_as,
             ai_bot_inject_headers: s.ai_bot_inject_headers,
             password_min_length: s.password_min_length,
@@ -380,6 +383,7 @@ impl CanonicalGlobalSettings {
         settings.connection_deny_cidrs = self.connection_deny_cidrs.clone();
         settings.connection_allow_cidrs = self.connection_allow_cidrs.clone();
         settings.connection_limits_per_ip = self.connection_limits_per_ip;
+        settings.waf_body_scan_max_inflight_bytes = self.waf_body_scan_max_inflight_bytes;
         settings.ai_bot_treat_spoofed_as = self.ai_bot_treat_spoofed_as;
         settings.ai_bot_inject_headers = self.ai_bot_inject_headers;
         settings.password_min_length = self.password_min_length;
@@ -1008,6 +1012,7 @@ mod tests {
             proxy_headers_remove: Vec::new(),
             response_headers_remove: Vec::new(),
             max_request_body_bytes: None,
+            waf_body_scan_max_bytes: None,
             websocket_enabled: true,
             rate_limit_rps: None,
             rate_limit_burst: None,
@@ -1280,6 +1285,27 @@ mod tests {
     }
 
     #[test]
+    fn the_waf_body_scan_caps_survive_an_encode_decode_round_trip() {
+        // Story 10.6: a follower that decodes either cap as its own
+        // default computes a different config hash from the control
+        // plane's and the pair loops on replication.
+        let mut cfg = fleet_config();
+        cfg.global.waf_body_scan_max_inflight_bytes = 33_554_432;
+        cfg.routes[1].waf_body_scan_max_bytes = Some(8_388_608);
+
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("test setup: decode");
+
+        assert_eq!(decoded.global.waf_body_scan_max_inflight_bytes, 33_554_432);
+        assert_eq!(decoded.routes[1].waf_body_scan_max_bytes, Some(8_388_608));
+        assert!(decoded.routes[0].waf_body_scan_max_bytes.is_none());
+
+        let mut settings = GlobalSettings::default();
+        assert!(decoded.global.apply_to(&mut settings));
+        assert_eq!(settings.waf_body_scan_max_inflight_bytes, 33_554_432);
+    }
+
+    #[test]
     fn the_per_node_capture_counters_are_absent_from_the_encoded_blob() {
         // Replicating them would have the control plane's own traffic
         // overwrite every follower's counts on each round.
@@ -1301,8 +1327,18 @@ mod tests {
     /// The field-name set of every type the canonical blob carries,
     /// digested. Update it ONLY together with a deliberate answer to
     /// the question the failure message asks.
+    ///
+    /// Story 10.6 moved it: `Route.waf_body_scan_max_bytes` and
+    /// `CanonicalGlobalSettings.waf_body_scan_max_inflight_bytes`
+    /// joined the blob. The digest is updated and
+    /// `CANONICAL_FORMAT_VERSION` stays at 2, because version 2 has
+    /// never been released. v1.7.4 ships version 1; the 1 to 2 move
+    /// happened earlier in this same unreleased v1.8.0 cycle. The
+    /// project bumps the format version once per release, not once per
+    /// field, and no peer anywhere holds a version 2 blob of the older
+    /// shape, so a second bump would protect nothing.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "3825ea544c4250cf5f7b0bb84417f17ccc70d461edeb574218e8bd5f87e39387";
+        "6e20386dd9a665ad7f29274780f99a39c10f6441eda917dbf902884222149482";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -1973,6 +2009,7 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             connection_deny_cidrs: _,
             connection_allow_cidrs: _,
             connection_limits_per_ip: _,
+            waf_body_scan_max_inflight_bytes: _,
             ai_bot_treat_spoofed_as: _,
             ai_bot_inject_headers: _,
             password_min_length: _,

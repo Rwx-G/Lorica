@@ -326,6 +326,13 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             row.get::<_, Option<String>>(70).unwrap_or(None),
             "managed_by",
         )?,
+        // Column index 71 (Story 10.6 migration V61). `None` means
+        // "use the crate default", which is also what a pre-V61 row on
+        // a bisect build reads as, so `unwrap_or(None)` loses nothing.
+        waf_body_scan_max_bytes: row
+            .get::<_, Option<i64>>(71)
+            .unwrap_or(None)
+            .map(|v| v as u64),
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

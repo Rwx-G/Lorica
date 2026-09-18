@@ -41,6 +41,7 @@ mod tests {
             proxy_headers_remove: Vec::new(),
             response_headers_remove: Vec::new(),
             max_request_body_bytes: None,
+            waf_body_scan_max_bytes: None,
             websocket_enabled: true,
             rate_limit_rps: None,
             rate_limit_burst: None,
@@ -1307,14 +1308,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 60 is the current head of the tracked MIGRATIONS table (every
+        // 61 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            60
+            61
         );
     }
 
@@ -1332,7 +1333,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                60
+                61
             );
         }
     }
@@ -3085,9 +3086,103 @@ cert_critical_days = 3
         assert!(fetched.max_connections.is_none());
         assert!(fetched.retry_attempts.is_none());
         assert!(fetched.max_request_body_bytes.is_none());
+        assert!(fetched.waf_body_scan_max_bytes.is_none());
         assert!(fetched.cors_max_age_s.is_none());
         assert!(fetched.ip_allowlist.is_empty());
         assert!(fetched.ip_denylist.is_empty());
+    }
+
+    #[test]
+    fn test_route_waf_body_scan_max_bytes_round_trip() {
+        // Story 10.6 AC #5. The column is the last one on `routes` and
+        // `row_to_route` reads positionally, so a SELECT list that
+        // forgot it would decode as `None` rather than fail loudly.
+        // Insert, update and clear all have to be exercised.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut route = make_route();
+        route.waf_body_scan_max_bytes = Some(8_388_608);
+
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+        assert_eq!(fetched.waf_body_scan_max_bytes, Some(8_388_608));
+
+        // The list path uses its own SELECT and must agree.
+        let listed = store.list_routes().expect("test setup: route list");
+        assert_eq!(listed[0].waf_body_scan_max_bytes, Some(8_388_608));
+
+        route.waf_body_scan_max_bytes = Some(4_096);
+        store
+            .update_route(&route)
+            .expect("test setup: route updates");
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+        assert_eq!(fetched.waf_body_scan_max_bytes, Some(4_096));
+
+        // Back to the crate default: the store persists `None` rather
+        // than leaving the previous value in place.
+        route.waf_body_scan_max_bytes = None;
+        store
+            .update_route(&route)
+            .expect("test setup: route updates");
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+        assert!(fetched.waf_body_scan_max_bytes.is_none());
+    }
+
+    #[test]
+    fn test_route_waf_body_scan_max_bytes_is_independent_of_max_request_body_bytes() {
+        // The dashboard puts the two in different sections on purpose:
+        // one caps what the WAF buffers, the other caps what the route
+        // accepts at all. A store that confused them would be invisible
+        // until a route set one and got the other.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut route = make_route();
+        route.max_request_body_bytes = Some(2_147_483_648);
+        route.waf_body_scan_max_bytes = Some(1_048_576);
+
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+
+        assert_eq!(fetched.max_request_body_bytes, Some(2_147_483_648));
+        assert_eq!(fetched.waf_body_scan_max_bytes, Some(1_048_576));
+    }
+
+    #[test]
+    fn test_global_settings_waf_body_scan_budget_round_trip() {
+        // Story 10.6 AC #7. The default is load-bearing: the budget is
+        // consulted before every body scan, so a settings read that
+        // produced 0 would read as "exhausted" and silently stop the
+        // WAF from inspecting anything.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let settings = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert_eq!(settings.waf_body_scan_max_inflight_bytes, 268_435_456);
+
+        let mut updated = settings;
+        updated.waf_body_scan_max_inflight_bytes = 33_554_432;
+        store
+            .update_global_settings(&updated)
+            .expect("test setup: global settings update");
+
+        let fetched = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert_eq!(fetched.waf_body_scan_max_inflight_bytes, 33_554_432);
     }
 
     #[test]

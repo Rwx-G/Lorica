@@ -350,6 +350,15 @@ impl ConfigStore {
                 "otlp_logs_capture_enabled" => {
                     settings.otlp_logs_capture_enabled = value == "true" || value == "1";
                 }
+                "waf_body_scan_max_inflight_bytes" => {
+                    // A stored value that no longer parses (hand-edited
+                    // database, downgrade) falls back to the shipped
+                    // default rather than to 0, which would read as
+                    // "budget exhausted" and skip every body scan.
+                    settings.waf_body_scan_max_inflight_bytes = value
+                        .parse()
+                        .unwrap_or(settings.waf_body_scan_max_inflight_bytes);
+                }
                 _ => {}
             }
         }
@@ -721,6 +730,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_capture_enabled', ?1)",
             params![settings.otlp_logs_capture_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_body_scan_max_inflight_bytes', ?1)",
+            params![settings.waf_body_scan_max_inflight_bytes.to_string()],
         )?;
         Ok(())
     }

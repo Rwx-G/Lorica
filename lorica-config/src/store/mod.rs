@@ -184,6 +184,7 @@ const MIGRATIONS: &[Migration] = &[
     (58, migrate_automation_environments),
     (59, migrate_oidc_issuers),
     (60, migrate_oidc_issuer_ca_pem),
+    (61, migrate_route_waf_body_scan_cap),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1123,6 +1124,33 @@ fn migrate_oidc_issuers(conn: &Connection) -> rusqlite::Result<()> {
 /// and `CREATE TABLE IF NOT EXISTS` would leave it without the column.
 fn migrate_oidc_issuer_ca_pem(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_absent(conn, "oidc_issuers", "ca_pem", "TEXT DEFAULT NULL")
+}
+
+/// Story 10.6 AC #5: the per-route ceiling on how much of an
+/// inspectable request body the WAF buffers.
+///
+/// Nullable with no backfill, and `NULL` is a value rather than a gap:
+/// it says "use the crate default", which is exactly what every route
+/// written before this migration did under the compiled-in constant.
+/// Writing the current default into every row instead would freeze
+/// today's number into the database and silently ignore a later change
+/// to it.
+///
+/// Appended at the end of the table on purpose. `row_to_route` reads
+/// the `routes` columns positionally, so inserting anywhere else would
+/// shift every index after it.
+///
+/// AC #7's `waf_body_scan_max_inflight_bytes` needs no DDL here: global
+/// settings live in the `global_settings` key-value table, and
+/// `get_global_settings` fills a missing key from
+/// `GlobalSettings::default`.
+fn migrate_route_waf_body_scan_cap(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "routes",
+        "waf_body_scan_max_bytes",
+        "INTEGER DEFAULT NULL",
+    )
 }
 
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {
