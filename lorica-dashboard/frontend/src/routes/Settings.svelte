@@ -46,6 +46,7 @@
     flood_threshold_rps: 0,
     waf_ban_threshold: 5,
     waf_ban_duration_s: 3600,
+    waf_body_scan_max_inflight_bytes: 268435456,
     access_log_retention: 100000,
     waf_event_retention: 100000,
     sla_purge_enabled: false,

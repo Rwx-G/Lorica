@@ -13,6 +13,7 @@
     flood_threshold_rps: number;
     waf_ban_threshold: number;
     waf_ban_duration_s: number;
+    waf_body_scan_max_inflight_bytes: number;
     access_log_retention: number;
     waf_event_retention: number;
     sla_purge_enabled: boolean;
@@ -73,6 +74,7 @@
     flood: bound('flood_threshold_rps', 0, 1_000_000),
     wafBanThreshold: bound('waf_ban_threshold', 0, 1000),
     wafBanDur: bound('waf_ban_duration_s', 0, 604_800),
+    wafScanBudget: bound('waf_body_scan_max_inflight_bytes', 1_048_576, 17_179_869_184),
     logRet: bound('access_log_retention', 0, 100_000_000),
     wafRet: bound('waf_event_retention', 0, 100_000_000),
     slaPurge: bound('sla_purge_retention_days', 1, 3650),
@@ -95,6 +97,7 @@
   let floodErr = $state<string | null>(null);
   let wafBanThresholdErr = $state<string | null>(null);
   let wafBanDurErr = $state<string | null>(null);
+  let wafScanBudgetErr = $state<string | null>(null);
   let logRetErr = $state<string | null>(null);
   let wafRetErr = $state<string | null>(null);
   let slaPurgeErr = $state<string | null>(null);
@@ -106,6 +109,7 @@
   function checkFlood() { floodErr = numErr(settingsForm.flood_threshold_rps, c.flood.min, c.flood.max); }
   function checkWafBanThreshold() { wafBanThresholdErr = numErr(settingsForm.waf_ban_threshold, c.wafBanThreshold.min, c.wafBanThreshold.max); }
   function checkWafBanDur() { wafBanDurErr = numErr(settingsForm.waf_ban_duration_s, c.wafBanDur.min, c.wafBanDur.max); }
+  function checkWafScanBudget() { wafScanBudgetErr = numErr(settingsForm.waf_body_scan_max_inflight_bytes, c.wafScanBudget.min, c.wafScanBudget.max); }
   function checkLogRet() { logRetErr = numErr(settingsForm.access_log_retention, c.logRet.min, c.logRet.max); }
   function checkWafRet() { wafRetErr = numErr(settingsForm.waf_event_retention, c.wafRet.min, c.wafRet.max); }
   function checkSlaPurge() { slaPurgeErr = numErr(settingsForm.sla_purge_retention_days, c.slaPurge.min, c.slaPurge.max); }
@@ -176,6 +180,12 @@
         <input id="waf-ban-duration" type="number" bind:value={settingsForm.waf_ban_duration_s} min={c.wafBanDur.min} max={c.wafBanDur.max} onblur={checkWafBanDur} oninput={checkWafBanDur} />
         {#if wafBanDurErr}<span class="field-error" role="alert">{wafBanDurErr}</span>{/if}
         <span class="hint">How long to ban (default 3600 = 1 hour, max 7 days).</span>
+      </div>
+      <div class="settings-form-row">
+        <label for="waf-scan-budget">WAF Body Scan Budget (bytes)</label>
+        <input id="waf-scan-budget" type="number" bind:value={settingsForm.waf_body_scan_max_inflight_bytes} min={c.wafScanBudget.min} max={c.wafScanBudget.max} onblur={checkWafScanBudget} oninput={checkWafScanBudget} />
+        {#if wafScanBudgetErr}<span class="field-error" role="alert">{wafScanBudgetErr}</span>{/if}
+        <span class="hint">Ceiling on the bytes held in WAF body-scan buffers at once (default 268435456 = 256 MiB). The budget is per process, so worker mode multiplies it by the worker count. A request that would exceed it is let through UNSCANNED rather than rejected, and raises a skipped-budget WAF event.</span>
       </div>
       <div class="settings-form-row">
         <label for="waf-whitelist">WAF Whitelist IPs</label>

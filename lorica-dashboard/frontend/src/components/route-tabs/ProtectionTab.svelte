@@ -1,6 +1,11 @@
 <script lang="ts">
   import type { RouteFormState } from '../../lib/route-form';
-  import { ROUTE_DEFAULTS } from '../../lib/route-form';
+  import {
+    ROUTE_DEFAULTS,
+    WAF_BODY_SCAN_MAX_MB,
+    WAF_BODY_SCAN_MIN_MB,
+    validateWafBodyScanMb,
+  } from '../../lib/route-form';
   import { api, type AiCrawlerTestResponse, type AiCrawlerStatEntry, type AiCrawlerVerificationKind } from '../../lib/api';
   import { verificationKindLabel } from '../../lib/ai-crawlers';
   import CountryPicker from '../CountryPicker.svelte';
@@ -106,6 +111,7 @@
     | 'section:connection_limits'
     | 'section:body_limit'
     | 'section:auto_ban'
+    | 'section:waf_body_scan'
     | 'section:geoip'
     | 'section:bot'
     | 'section:ai_crawler'
@@ -162,6 +168,8 @@
       maxBodyError = null;
     }
   }
+  let wafBodyScanError = $state<string | null>(null);
+  function checkWafBodyScan() { wafBodyScanError = validateWafBodyScanMb(String(form.waf_body_scan_max_mb)); }
   function checkAutoBanThreshold() { autoBanThresholdError = rangeErr(form.auto_ban_threshold, 1, 10_000, 'value'); }
   function checkAutoBanDuration() { autoBanDurationError = rangeErr(form.auto_ban_duration_s, 1, 31_536_000, 'value'); }
   function checkBotCookieTtl() { botCookieTtlError = rangeErr(form.bot_cookie_ttl_s, 1, 604_800, 'value'); }
@@ -285,6 +293,29 @@
           {#if autoBanDurationError}<span class="field-error" role="alert">{autoBanDurationError}</span>{/if}
           <span class="hint">Ban duration after the threshold is hit.</span>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ WAF body inspection ============ -->
+  <section id="prot-waf-body-scan" class="subsection">
+    <SubsectionHeader
+      title="WAF body inspection"
+      description="How much of an accepted request body the WAF reads. Separate from the body size limit above, which decides what the proxy accepts at all."
+      accent="pink"
+      onhelp={() => { activeHelp = 'section:waf_body_scan'; }}
+    />
+    <div class="subsection-body">
+      <div class="form-group" class:modified={isModified('waf_body_scan_max_mb')}>
+        <label for="waf-body-scan-max">Scan limit (MB)</label>
+        {#if isImported('waf_body_scan_max_mb')}<span class="imported-badge">imported</span>{/if}
+        <input id="waf-body-scan-max" type="number" min={WAF_BODY_SCAN_MIN_MB} max={WAF_BODY_SCAN_MAX_MB} step="any" bind:value={form.waf_body_scan_max_mb} placeholder="1 (default)" onblur={checkWafBodyScan} oninput={checkWafBodyScan} />
+        {#if wafBodyScanError}<span class="field-error" role="alert">{wafBodyScanError}</span>{/if}
+        <span class="hint">
+          Empty = the 1 MB engine default. Accepted range 4 KiB to 64 MiB.
+          Only bodies the WAF can parse are buffered, so the memory cost is
+          this value times the concurrent requests on this route.
+        </span>
       </div>
     </div>
   </section>
@@ -686,6 +717,31 @@
       Bans are per-route, cached in memory, and cleared on a restart.
       For durable bans across restarts, export / import via the
       management API or rely on an external fail2ban setup.
+    </p>
+  </HelpModal>
+{:else if activeHelp === 'section:waf_body_scan'}
+  <HelpModal title="WAF body inspection" onclose={() => { activeHelp = null; }}>
+    <p>
+      The WAF only inspects request bodies it can parse: JSON, XML,
+      form-encoded and <code>text/*</code>. A body declaring any other
+      content type (an upload, an octet stream) is forwarded without
+      being buffered at all, so a large-file route keeps the WAF on.
+    </p>
+    <p>
+      This setting caps how many bytes of an inspectable body are
+      buffered and scanned. Past the cap, a Blocking route answers 413
+      and a Detection route scans the prefix and records a truncation
+      event.
+    </p>
+    <p>
+      Do not confuse it with <strong>Body size limit</strong>: that one
+      decides which requests the proxy accepts at all, this one decides
+      how much of an accepted body the WAF reads. The memory cost is
+      this value times the concurrent inspectable requests on the
+      route, which is why the accepted range stops at 64 MiB and why a
+      process-wide budget
+      (<code>waf_body_scan_max_inflight_bytes</code>) backs it in
+      Settings.
     </p>
   </HelpModal>
 {:else if activeHelp === 'section:geoip'}

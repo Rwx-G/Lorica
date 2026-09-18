@@ -35,6 +35,7 @@ function route(overrides: Partial<RouteResponse> = {}): RouteResponse {
     proxy_headers_remove: [],
     response_headers_remove: [],
     max_request_body_bytes: null,
+    waf_body_scan_max_bytes: null,
     websocket_enabled: false,
     rate_limit_rps: null,
     rate_limit_burst: null,

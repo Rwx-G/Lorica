@@ -323,6 +323,10 @@ export interface RouteResponse {
   proxy_headers_remove: string[];
   response_headers_remove: string[];
   max_request_body_bytes: number | null;
+  // How much of an inspectable body the WAF reads (Story 10.6 AC #5).
+  // `null` = the engine default (1 MiB). Unrelated to
+  // `max_request_body_bytes`, which caps what the proxy accepts at all.
+  waf_body_scan_max_bytes: number | null;
   websocket_enabled: boolean;
   rate_limit_rps: number | null;
   rate_limit_burst: number | null;
@@ -537,6 +541,8 @@ export interface CreateRouteRequest {
   proxy_headers_remove?: string[];
   response_headers_remove?: string[];
   max_request_body_bytes?: number;
+  // 4 KiB to 64 MiB, or 0 to fall back to the engine default.
+  waf_body_scan_max_bytes?: number;
   websocket_enabled?: boolean;
   rate_limit_rps?: number;
   rate_limit_burst?: number;
@@ -608,6 +614,8 @@ export interface UpdateRouteRequest {
   proxy_headers_remove?: string[];
   response_headers_remove?: string[];
   max_request_body_bytes?: number;
+  // 4 KiB to 64 MiB, or 0 to fall back to the engine default.
+  waf_body_scan_max_bytes?: number;
   websocket_enabled?: boolean;
   rate_limit_rps?: number;
   rate_limit_burst?: number;
@@ -916,6 +924,9 @@ export interface GlobalSettingsResponse {
   flood_threshold_rps: number;
   waf_ban_threshold: number;
   waf_ban_duration_s: number;
+  // Process-wide ceiling on the bytes the WAF holds in body-scan
+  // buffers at once (Story 10.6 AC #7). Default 268435456 (256 MiB).
+  waf_body_scan_max_inflight_bytes: number;
   access_log_retention: number;
   waf_event_retention: number;
   sla_purge_enabled: boolean;
@@ -991,6 +1002,7 @@ export interface UpdateSettingsRequest {
   flood_threshold_rps?: number;
   waf_ban_threshold?: number;
   waf_ban_duration_s?: number;
+  waf_body_scan_max_inflight_bytes?: number;
   access_log_retention?: number;
   waf_event_retention?: number;
   sla_purge_enabled?: boolean;
