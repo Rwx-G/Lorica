@@ -9,7 +9,7 @@
 > banner ; it was refreshed during the v1.8.0 cycle.
 >
 > **What is true today.** The configuration database holds 34 tables
-> and its schema version is 60. Captured traffic is not one of them: a
+> and its schema version is 61. Captured traffic is not one of them: a
 > capture rule is a row, the captured bodies are files on disk.
 >
 > ## Where the migrations actually live

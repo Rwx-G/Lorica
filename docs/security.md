@@ -150,7 +150,7 @@ An absolute-form request target (`GET http://host/path HTTP/1.1`) is
 refused earlier still, when the request header is parsed, so it never
 reaches routing. Legitimate clients do not send one to a reverse proxy.
 
-### WAF body inspection (v1.7.2)
+### WAF body inspection (v1.7.2, v1.8.0)
 
 The WAF buffers a request body only when it can parse it, and the
 decision is taken on the declared `Content-Type` before the first
@@ -179,6 +179,70 @@ the raw envelope, base64 and binary part payloads included: high
 false-positive, low value. A parser with a separate limit for the
 non-file parts (the ModSecurity `SecRequestBodyNoFilesLimit` model)
 is tracked in `docs/backlog.md`.
+
+**How much of an inspected body is read (v1.8.0).** Two caps, and they
+answer different questions.
+
+| Setting | Scope | Default | Range | Answers |
+|---|---|---|---|---|
+| `max_request_body_bytes` | per route | unset | | what the proxy accepts at all |
+| `waf_body_scan_max_bytes` | per route | 1 MiB | 4 KiB to 64 MiB | how much of an accepted, inspectable body the WAF reads |
+| `waf_body_scan_max_inflight_bytes` | global | 256 MiB | 1 MiB to 16 GiB | how much the node holds in scan buffers at once |
+
+A body the `Content-Type` rules above exclude is never buffered, so
+none of the three applies to it: the only ceiling a binary upload meets
+is the route's `max_request_body_bytes`. Raising
+`waf_body_scan_max_bytes` widens the window for the bodies that are
+actually inspected, which is what a JSON API legitimately posting 5 MB
+documents needs, and it costs that value times the concurrent inspected
+requests on that route. The oversize behaviour past the window does not
+change: Blocking answers `413`, Detection emits one truncation event and
+scans what it has. The padding bypass closed by the v1.5.1 audit stays
+closed, because a megabyte of inert text in front of a payload still
+reaches the window.
+
+**The global budget fails OPEN, deliberately.** When a request would
+push the node past `waf_body_scan_max_inflight_bytes`, its body is not
+buffered, not scanned, and the request is **allowed through** in both
+Blocking and Detection mode, with one WAF event
+(`protocol_violation` / `skipped`) and
+`lorica_waf_body_scans_total{outcome="skipped_budget"}`.
+
+Failing closed was the other option and it is worse. The budget is
+shared by every route on the node, so any client able to fill it would
+be able to turn it into a `413` for everyone else: a denial of service
+handed out by the control that exists to prevent one. A scan gap that
+increments a counter is a gap you can alarm on; a fleet-wide `413`
+storm is an outage. Alarm on that series, and on
+`lorica_waf_body_scan_inflight_bytes` sitting near the ceiling.
+
+Under `--workers N` the budget is per worker, like every other
+process-wide byte ceiling in Lorica, so the node's real worst case is
+`N` times the setting. Size the host accordingly.
+
+**A worked example, the case this exists for.** A Nextcloud route:
+uploads flow untouched while the WAF stays armed on everything the
+engine can actually read.
+
+```jsonc
+{
+  "waf_enabled": true,
+  "waf_mode": "blocking",
+  // Multi-gigabyte uploads are accepted...
+  "max_request_body_bytes": 2147483648,
+  // ...and never buffered: application/octet-stream is not inspectable,
+  // so this window applies only to the JSON and form traffic on the
+  // same route, where 1 MiB is plenty.
+  "waf_body_scan_max_bytes": 1048576
+}
+```
+
+A `PUT` of a 100 MB file with `Content-Type: application/octet-stream`
+reaches the upstream byte for byte,
+`lorica_waf_body_scan_inflight_bytes` never leaves zero, and
+`lorica_waf_body_scans_total{outcome="skipped_content_type"}`
+increments. A `POST` of a JSON body carrying a SQL injection payload on
+the same route is still answered `403`.
 
 **The residual risk, stated plainly.** A client that declares
 `application/octet-stream` skips inspection, whatever the bytes

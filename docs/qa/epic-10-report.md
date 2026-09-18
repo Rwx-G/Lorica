@@ -21,17 +21,11 @@ that a GitLab pipeline creates, re-runs and tears down, authenticated by
 a scoped static token or by the job's own OIDC ID token.
 
 Overall gate: **PASS** for the epic as its PRD defines it. Stories
-10.0 to 10.5 are Done, every acceptance criterion is met, each story
+10.0 to 10.6 are Done, every acceptance criterion is met, each story
 was audited as part of one epic-wide pass, and every Critical, High
 and Medium finding plus every Low with operational impact was fixed on
-the branch rather than filed. Two qualifications, both stated in the
-story records rather than discovered here:
+the branch rather than filed. One qualification:
 
-- **Story 10.6 (content-type-aware WAF body inspection) is not part of
-  this delivery.** It carries an Epic 10 header but has no section in
-  `docs/prd/epic-10-v1.8.0.md`. Its AC #1 to #4 shipped in the v1.7.2
-  patch; AC #5, #7, #8, #9 and the rest of #10 are unshipped and the
-  story is still `InProgress`. Nothing on this branch depends on it.
 - **The version bump to 1.8.0 is deliberately not in this epic's
   work.** `CHANGELOG.md` sits under `[Unreleased]` and the README
   roadmap row reads `In progress`, as in previous cycles. The bump is
@@ -47,7 +41,7 @@ Story status:
 | 10.3 | Automation listener and scoped API tokens | Done |
 | 10.4 | The environment resource | Done (ownership deviates from the PRD, section 3) |
 | 10.5 | GitLab OIDC ID tokens | Done |
-| 10.6 | Content-type-aware WAF body inspection | InProgress, out of this delivery |
+| 10.6 | Content-type-aware WAF body inspection | Done (AC #1 to #4 in the v1.7.2 patch, the rest here; section 11) |
 
 Top findings across the epic, ranked by what they would have cost:
 
@@ -414,15 +408,20 @@ requests the proxy refuses itself produced no record.
   10.0 met by derivation rather than persistence. Every one of these is
   in a story's Debug Log with the reasoning, not in a commit message
   alone.
-- **One acceptance criterion is met by documentation rather than by the
-  behaviour it describes.** Story 10.1 AC #5 says reaching `expires_at`
-  flips `enabled = false` and audits it. The shipped code stops an
-  expired rule (it is never a candidate on any node, whatever the flag
-  says) and the self-disable task reacts to a spent `max_captures`
-  only. `docs/capture.md` states what the code does. Closing the gap is
-  a ticker that walks the store for `enabled AND expires_at <= now`;
-  it is not in this release, and it is named here rather than left for
-  an operator to find.
+- **Story 10.1 AC #5 is met by behaviour, on both halves.** An expired
+  rule stops recording immediately, because the compiled rule set drops
+  it from the candidates whatever the stored flag says; and the same
+  five-second tick that flushes the counters also sweeps for
+  `enabled AND expires_at <= now`, clears the flag and writes the audit
+  line with `budget: "expired"`, so the listing tells an operator the
+  rule stopped and why (`disable_expired` in
+  `lorica/src/capture/self_disable.rs`, wired from both `startup/single.rs`
+  and `startup/worker.rs`). The sweep reads the node's role on every
+  tick rather than once at spawn and treats an unreadable role as
+  follower, so a node that joins a fleet after boot stops sweeping
+  without a restart. An earlier draft of this report recorded this
+  criterion as met by documentation only; that was wrong, and the
+  correction is noted here rather than silently applied.
 - **Worker-mode parity was answered per story, not assumed.** The
   capture ring is a 503 under `--workers` with the alternatives in the
   message; `lorica_captures_total` joined `PER_WORKER_COUNTERS`; the
@@ -432,7 +431,8 @@ requests the proxy refuses itself produced no record.
   the PRD asked for on the grounds that body buffering is precisely the
   kind of thing that passes single-process and breaks in a worker. The
   in-process tests and the documented semantics cover it; a profile
-  would cover it better.
+  covers it better, and one was built before this branch merged
+  (section 11).
 - **Honest guarantees, stated where an operator reads them.** The
   captured response body is the upstream's, before any rewrite this
   proxy applies, so a capture can disagree with what the client
@@ -507,7 +507,7 @@ audit findings were fixed rather than recorded. The two items a reader
 might expect to find there are at section 7 instead, the expiry ticker
 and the `capture-workers` profile.
 
-## 10. Recommendations
+## 10. Recommendations (superseded by section 12)
 
 - **Immediate:** none blocking. Bump to 1.8.0 as its own commit when
   requested.
@@ -522,13 +522,64 @@ and the `capture-workers` profile.
   against Lorica gains nothing and should leave it off.
   `docs/security/hardening-guide.md` carries the firewall stanza and
   the capture-rule hygiene paragraph.
+## 11. What closed after this report was first written
+
+This report was written when the branch carried Stories 10.0 to 10.5.
+Reviewing it surfaced two things that were about to be carried into the
+next cycle, and the release rule here is that a cycle does not create
+debt, so they were closed instead. Reviewing it also corrected one
+finding that was simply wrong: see the expiry sweep in section 7.
+
+**Story 10.6, the v1.8.0 remainder.** The story carries an Epic 10
+header and its own Delivery split says AC #5, #7, #8 and #9 were held
+for this branch while AC #1 to #4 shipped in the v1.7.2 patch. They are
+implemented now: a per-route `waf_body_scan_max_bytes` (migration 61, 4
+KiB to 64 MiB) so a JSON API posting large documents can widen the scan
+window that used to be a compiled-in 1 MiB, and a global
+`waf_body_scan_max_inflight_bytes` (256 MiB) bounding what the node
+holds in scan buffers at once, because the per-route value multiplies
+by concurrency. The budget fails OPEN, with the reasoning in the code
+and in `docs/security.md`: the budget is shared by every route, so
+failing closed would let any client turn it into a `413` for everyone
+else, a denial of service handed out by the control meant to prevent
+one. Two new metric families, both aggregated across workers.
+
+The one design decision worth recording: the byte ceiling was
+generalised rather than written a second time. `capture/node_ceiling.rs`
+already had this exact mechanism, so it became an instance of
+`lorica/src/byte_budget.rs` with the two differences carried as data (a
+ceiling the WAF one updates on reload, and the gauge each publishes).
+Given that the duplication pattern in section 6 is the defect this epic
+kept rediscovering, adding a second copy of it in the epic's last story
+would have been a poor joke.
+
+**The `capture-workers` e2e profile.** Built, sharing the single-process
+profile's 163 assertions behind a flag rather than forking them. What it
+adds is what actually differs under `--workers`: the budget spent per
+worker, the recent-captures ring answering 503 rather than an empty 200,
+the sinks fed from inside a worker, and the counters aggregating. It
+does not prove the 64 MiB ceiling is per worker, which would need more
+than 64 MiB of concurrent bodies; the script header says so.
+
+Two further defects were found while doing the above and fixed rather
+than filed: the gauge `lorica_waf_body_scan_inflight_bytes` was per
+process and unsummed, which on a `--workers` node means the supervisor
+serving `/metrics` reports its own permanent zero; and `reserve_port`
+was copy-pasted into twelve end-to-end test binaries, one of which had
+just been fixed for a real `SO_REUSEPORT` race where two harnesses draw
+the same port and the kernel splits connections between them. Eleven
+copies still had the racy version. That is section 6's pattern again,
+found twice more in the closing days of the epic.
+
+## 12. Recommendations
+
 - **Operator spot-checks:** the Capture page against a real node in a
   browser (the e2e drives the API, not the DOM), the automation badge
   and edit refusal on a route an environment owns, and one full
   create-and-tear-down from a real GitLab pipeline under both
   authentication modes.
-- **Next cycle, in order:** the expiry ticker that clears `enabled`
-  (section 7), the `capture-workers` e2e profile, and a decision on
-  Story 10.6's remainder, which is currently an `InProgress` story
-  attached to a closed epic and should either be finished in the 1.9.0
-  cycle or re-homed.
+- **Next cycle:** nothing carried over from this one. The three items
+  this report first listed for later were closed before the branch
+  merged: the `capture-workers` profile was built, and Story 10.6 was
+  finished rather than re-homed (section 11). The third, the expiry
+  ticker, turned out to be already shipped and the finding withdrawn.

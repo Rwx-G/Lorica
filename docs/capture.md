@@ -486,7 +486,13 @@ the flag arrived by replication: the audit row is on the control plane.
 Under `--workers`, each worker spends its own copy of `max_captures`, so
 the stored `captures_emitted` at the moment of the disable can be as high
 as workers times `max_captures`; that is the documented semantics, not a
-miscount.
+miscount. For the same reason you may see MORE THAN ONE
+`capture.rule.auto_disabled` row for one rule: the self-disable task runs
+in every worker, and two workers that spend their last capture close
+together both write a row before either sees the other's `enabled = 0`.
+The store's filter makes that unlikely rather than impossible, and the
+rows are identical but for the worker that wrote them. One row, or three,
+means the same thing.
 
 **Why is the "Recent captures" panel unavailable under `--workers`?**
 The ring is per process. Under `--workers` every capture is emitted in a

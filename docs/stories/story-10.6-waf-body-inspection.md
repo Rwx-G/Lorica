@@ -1,7 +1,7 @@
 # Story 10.6: Content-Type-Aware WAF Body Inspection
 
 **Epic:** [Epic 10 - Conditional Request Capture & CI Automation API (v1.8.0)](../prd/epic-10-v1.8.0.md)
-**Status:** InProgress - AC #1 to #4 shipped in v1.7.2, the rest is v1.8.0 (see Delivery split)
+**Status:** Done - AC #1 to #4 shipped in v1.7.2, AC #5 to #10 on the v1.8.0 branch (see Delivery split)
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:** nothing on the v1.8.0 branch. Touches the v1.5.1 audit H-2 remediation (`WAF_BODY_SCAN_MAX`, `lorica/src/proxy_wiring.rs:73`) and must not regress it.
@@ -44,14 +44,14 @@ Raising `WAF_BODY_SCAN_MAX` alone does not fix this: it multiplies the per-reque
 ## Tasks
 
 - [x] AC #1/#2 (v1.7.2): `body_is_inspectable` + `INSPECTABLE_BODY_CONTENT_TYPES` in `lorica-waf` (new `body_types.rs` or alongside `eval.rs`), re-export, unit tests per arm including suffix matching, absent header, parameter stripping, case folding, and the multipart exclusion.
-- [ ] AC #5: `waf_body_scan_max_bytes` on `Route` (`lorica-config/src/models/route.rs`), migration 56 `migrate_route_waf_body_scan_cap` appending the column, the three SELECT/INSERT column lists in `store/routes.rs:125,247,294` plus the UPDATE at `:393`, the positional index in `store/row_helpers.rs`, and `canonical.rs:634` so the config hash and the cluster replication digest stay stable.
+- [x] AC #5: `waf_body_scan_max_bytes` on `Route` (`lorica-config/src/models/route.rs`), migration 61 `migrate_route_waf_body_scan_cap` appending the column, the three SELECT/INSERT column lists in `store/routes.rs:125,247,294` plus the UPDATE at `:393`, the positional index in `store/row_helpers.rs`, and `canonical.rs:634` so the config hash and the cluster replication digest stay stable.
 - [x] AC #3/#4/#6 (v1.7.2, `waf_body_inspect` only, the cap stays the constant until AC #5): `RequestCtx` fields, decision computed in `check_body_limits` (`filters.rs:2074`), both enforcement sites collapsed onto the cached values (`filters.rs:2083` and `proxy_wiring.rs:1024-1084`), `evaluate_body` call site skipped when not inspecting.
-- [ ] AC #7: `waf_body_scan_max_inflight_bytes` global setting (model + store + `UpdateSettingsRequest` + frontend types), process-global `AtomicU64` with an RAII guard so the decrement cannot be skipped on an early return or a dropped connection, fail-open path + `ScanSkippedBudget`.
-- [ ] AC #8: `WafEventKind::ScanSkippedBudget`, `lorica_waf_body_scans_total` + `lorica_waf_body_scan_inflight_bytes` through `lorica-metrics`, `PER_WORKER_COUNTERS` + `resolve_per_worker_counter` arms.
-- [ ] AC #9: `crud.rs` validation and the three route payload structs, `openapi.yaml` + contract test, `api.ts`, `route-form.ts` (to/from form, modified-field tracking, validation), ProtectionTab WAF subsection field.
-- [ ] AC #10: `docs/security.md` section, `docs/backlog.md` multipart follow-up entry, `CHANGELOG.md`. v1.7.2 landed all three for what shipped: the inspectable set, the spoofed-`Content-Type` and gzip gaps, the two caps and their interaction, the Nextcloud route, backlog #86. The fail-open budget rationale follows AC #7.
-- [ ] IV coverage: `lorica/tests/waf_body_inspection_e2e_test.rs` exists and covers IV1, IV3 and IV4; IV2 needs AC #5 and IV5 needs AC #7. Remaining: IV2 and IV5 against the existing in-process test harness used by `lorica/tests/rate_limit_e2e_test.rs`; unit tests for the budget guard and the cap resolution (`None` -> default, `0` -> `None`, out-of-range -> 422).
-- [ ] Gates: `cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica`, `cargo clippy --all-targets --all-features -- -D warnings` with `RUSTFLAGS=-D warnings`, `cargo audit`, `npm run check` + `npm run lint` + `npx vitest run` in `lorica-dashboard/frontend`.
+- [x] AC #7: `waf_body_scan_max_inflight_bytes` global setting (model + store + `UpdateSettingsRequest` + frontend types), process-global `AtomicU64` with an RAII guard so the decrement cannot be skipped on an early return or a dropped connection, fail-open path + `ScanSkippedBudget`.
+- [x] AC #8: `WafEventKind::ScanSkippedBudget`, `lorica_waf_body_scans_total` + `lorica_waf_body_scan_inflight_bytes` through `lorica-metrics`, `PER_WORKER_COUNTERS` + `resolve_per_worker_counter` arms.
+- [x] AC #9: `crud.rs` validation and the three route payload structs, `openapi.yaml` + contract test, `api.ts`, `route-form.ts` (to/from form, modified-field tracking, validation), ProtectionTab WAF subsection field.
+- [x] AC #10: `docs/security.md` section, `docs/backlog.md` multipart follow-up entry, `CHANGELOG.md`. v1.7.2 landed all three for what shipped: the inspectable set, the spoofed-`Content-Type` and gzip gaps, the two caps and their interaction, the Nextcloud route, backlog #86. The fail-open budget rationale follows AC #7.
+- [x] IV coverage: `lorica/tests/waf_body_inspection_e2e_test.rs` exists and covers IV1, IV3 and IV4; IV2 needs AC #5 and IV5 needs AC #7. Remaining: IV2 and IV5 against the existing in-process test harness used by `lorica/tests/rate_limit_e2e_test.rs`; unit tests for the budget guard and the cap resolution (`None` -> default, `0` -> `None`, out-of-range -> 422).
+- [x] Gates: `cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica`, `cargo clippy --all-targets --all-features -- -D warnings` with `RUSTFLAGS=-D warnings`, `cargo audit`, `npm run check` + `npm run lint` + `npx vitest run` in `lorica-dashboard/frontend`.
 
 ## Dev Notes
 
@@ -66,7 +66,7 @@ replicated configuration model moves and a mixed-version fleet is
 unaffected.
 
 What stayed for v1.8.0, and why none of it is patch-shaped: AC #5
-(per-route `waf_body_scan_max_bytes`) needs migration 56, the three
+(per-route `waf_body_scan_max_bytes`) needs migration 61, the three
 SELECT lists, `canonical.rs` and the API contract; AC #7 (global
 in-flight budget) is a new global setting plus a process-wide
 accounting guard; AC #8 (the counters) needs `PER_WORKER_COUNTERS`
@@ -114,6 +114,71 @@ Worst case per route is `waf_body_scan_max_bytes x concurrent inspectable reques
 
 ### Debug Log
 
+**2026-09-17, the v1.8.0 remainder. Seven deviations from this story's
+own text, each one a case of the story being older than the tree.**
+
+1. **Migration 61, not 56.** The story was written before Stories 10.1
+   to 10.5 landed; 56 is `migrate_capture_rules` today. The task list
+   and the Delivery split both said 56 and are corrected in place.
+2. **`canonical.rs:634` needed no edit.** The story assumed a separate
+   canonical route struct. The blob carries `crate::models::Route`
+   directly, so the field propagated on its own. What DID need a
+   deliberate answer is the shape digest: adding a field moves it, and
+   the guard demands either a format-version bump or an updated digest.
+   The digest was updated and `CANONICAL_FORMAT_VERSION` stays 2,
+   because version 2 has never been released (v1.7.4 ships 1, the 1 to
+   2 move happened earlier in this same cycle) so no peer anywhere
+   holds a version 2 blob of the older shape.
+3. **The global setting needed no DDL.** Global settings live in a
+   key-value table whose reader fills missing keys from
+   `GlobalSettings::default`, so migration 61 carries one column, not
+   two.
+4. **There is no `WafEventKind` enum.** AC #8 asks for a variant on a
+   type that does not exist: the truncation event is emitted by
+   `record_waf_body_truncated`, which publishes a `WafEvent` with a
+   textual category and action. The budget skip mirrors that path
+   exactly, as `record_waf_body_scan_skipped_budget`, idempotent per
+   request like its neighbour, with the action word `skipped` next to
+   `blocked` and `detected`: nothing fired and nothing was refused.
+5. **The Protection tab had no WAF subsection to put the field in.**
+   `waf_enabled` and `waf_mode` live in the Security tab. Rather than
+   move WAF configuration around to satisfy the wording, a "WAF body
+   inspection" subsection was created in Protection, still deliberately
+   away from "Body size limit": the two caps answer different questions
+   and sitting them side by side is how an operator conflates them.
+6. **The byte ceiling was generalised rather than written twice.**
+   `lorica/src/capture/node_ceiling.rs` already had this mechanism for
+   capture, down to the comment explaining why the counter is a static
+   rather than a field on the snapshot. It is now the capture instance
+   of `lorica/src/byte_budget.rs`, with the two differences carried as
+   data: an updatable ceiling (capture never calls it, the WAF one is
+   re-pointed on configuration reload) and the gauge passed in at
+   construction. The alternative was a twelfth copy of a rule this
+   epic kept finding duplicated.
+7. **IV2 uses a 2 MiB window and a 1.5 MiB body**, not the story's 8
+   MiB and 6 MiB: every byte under the window is really scanned, and 6
+   MiB pushed the request past the test client's timeout. The chunked
+   half asserts the 413 only, because a chunked body is forwarded as it
+   arrives, so "403 at end of stream" and "0 bytes upstream" are both
+   races on that path.
+
+**Two findings outside the story, fixed in the same pass rather than
+filed.** The gauge `lorica_waf_body_scan_inflight_bytes` was per
+process and unsummed, which on a `--workers` node means the supervisor
+serving `/metrics` reports its own, always zero; it now goes through
+the same `MetricsReport` path as the capture gauge. And `reserve_port`
+was copy-pasted into twelve end-to-end test files, one of which had
+just been fixed for a real `SO_REUSEPORT` race where two harnesses
+draw the same port and the kernel splits connections between them; the
+helper is now one implementation.
+
+**One thing deliberately not fixed, needing a decision.** Under
+`--all-features`, `lorica/src/lib.rs` fails on an unused glob
+re-export of `lorica_timeout` behind the empty `time` feature. It
+predates this story and CI never builds that combination (it uses
+`--features otel` on this crate), so the branch is not red. Removing a
+public re-export is an API decision, not a warning fix.
+
 (empty)
 
 ### Completion Notes
@@ -152,14 +217,18 @@ Shipped in v1.7.2 (AC #1 to #4):
 - `lorica/tests/waf_body_inspection_e2e_test.rs` (new)
 - `docs/security.md`, `docs/backlog.md` (#86), `CHANGELOG.md`
 
-Anticipated for the v1.8.0 remainder (AC #5, #7, #8, #9):
+Shipped on the v1.8.0 branch (AC #5, #7, #8, #9, #10):
 
-- `lorica-waf/src/` (`WafEventKind::ScanSkippedBudget`)
-- `lorica-config/src/models/route.rs`, `models/settings.rs`, `store/routes.rs`, `store/row_helpers.rs`, `store/mod.rs` (migration 56), `store/settings.rs`, `canonical.rs`
-- `lorica-api/src/routes/crud.rs`, `lorica-api/src/metrics.rs`, `lorica-api/openapi.yaml`
-- `lorica-dashboard/frontend/src/lib/api.ts`, `lib/route-form.ts`, `components/route-tabs/ProtectionTab.svelte`, global settings tab
+- `lorica-config/src/models/route.rs`, `models/settings.rs`, `store/routes.rs`, `store/row_helpers.rs`, `store/mod.rs` (migration 61), `store/settings.rs`, `canonical.rs` (field plus the new shape digest)
+- `lorica/src/byte_budget.rs` (new, the shared ceiling), `lorica/src/capture/node_ceiling.rs` (now an instance of it), `lorica/src/proxy_wiring/waf_body_budget.rs` (new), `lorica/src/proxy_wiring.rs` (`WAF_BODY_SCAN_DEFAULT`), `proxy_wiring/{context,filters,config}.rs`, `lorica/src/reload.rs`, `lorica/src/lib.rs`
+- `lorica-api/src/routes/crud.rs` (validation, the three payloads), `lorica-api/src/settings.rs` (the budget, its schema entry), `lorica-api/src/metrics.rs` (both families, `PER_WORKER_COUNTERS`), `lorica-api/src/workers.rs` (the cross-worker sum), `lorica-command/src/messages.rs` (the report field), `lorica-api/openapi.yaml`, `lorica-api/src/tests.rs`
+- `lorica-dashboard/frontend/src/lib/api.ts`, `lib/route-form.ts`, `components/route-tabs/ProtectionTab.svelte`, `components/settings-tabs/GlobalConfigTab.svelte`, `routes/Settings.svelte`, and their tests
+- `lorica/tests/waf_body_scan_budget_e2e_test.rs` (new), `lorica/tests/waf_body_inspection_e2e_test.rs`, and the shared port helper across the twelve end-to-end binaries
+- `tests-e2e-docker/` (the `capture-workers` profile, from the Epic 10 PRD)
+- `docs/security.md`, `docs/capture.md`, `CHANGELOG.md`
 
 ## Change Log
 
+- 2026-09-17: AC #5, #7, #8, #9 and #10 implemented on the v1.8.0 branch. Per-route `waf_body_scan_max_bytes` (4 KiB to 64 MiB, migration 61) and the global `waf_body_scan_max_inflight_bytes` budget (256 MiB, fail-open) with one shared byte ceiling rather than a second copy of the capture one, `lorica_waf_body_scans_total` and `lorica_waf_body_scan_inflight_bytes` both aggregated across workers, the API validation answering 422 under the project's current rule, the dashboard field and the global setting, and the `docs/security.md` section with the worked Nextcloud configuration. Seven deviations from the story text recorded in the Debug Log, all of them the story being older than the tree. Status Done.
 - 2026-09-15: AC #1 to #4 implemented and shipped in the v1.7.2 patch: `body_is_inspectable` in `lorica-waf`, the cached `waf_body_inspect` decision on `RequestCtx`, both enforcement sites reading it, nine end-to-end assertions over a real proxy, and the `docs/security.md` section. AC #5, #7, #8 and #9 stay on the v1.8.0 branch; see Delivery split for why the order is this one. Status InProgress.
 - 2026-09-13: Story drafted from the Nextcloud upload case. Root cause identified as the byte-count-only buffering decision in front of an engine that already skips non-UTF-8 bodies, not the value of `WAF_BODY_SCAN_MAX` itself.
