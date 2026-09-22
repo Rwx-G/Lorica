@@ -1,7 +1,7 @@
 # Story 11.1: The `lorica-mcp` Crate and the Read Tier
 
 **Epic:** [Epic 11 - Management MCP Server with Tiered Access (v1.9.0)](../prd/epic-11-v1.9.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Epic 10 Story 10.3, merged in v1.8.0. It supplies the
@@ -145,22 +145,71 @@ These are the PRD's, unchanged. They are the contract.
 
 ## Tasks
 
-- [ ] AC #2 first, because everything else reads from it: five new
-      `AutomationScope` variants. All three spellings move together
+The story ships in four lots, agreed 2026-09-22. Each one ends on a tree
+that builds and passes its gates, so none of them is a skeleton waiting
+for the next. The order is a dependency order, not a preference: every
+lot reads from the one before it.
+
+### Lot 1: the scope surface and a crate that compiles
+
+- [ ] AC #2, first because everything else reads from it: five new
+      `AutomationScope` variants. All four spellings move together
       (see Dev Notes), and the doc comment on the enum stops saying
-      four variants are the whole surface.
-- [ ] `whoami` reachable by any live token, per the decision above, with
-      the test in `scope.rs` rewritten to assert the new rule rather
-      than deleted.
-- [ ] AC #1: the `lorica-mcp` crate skeleton. Workspace `members`, the
-      three Dockerfiles, `docs/BUMP-CHECKLIST.md`, product version line,
-      `#![deny(unsafe_code)]` and `#![warn(missing_docs)]`.
-- [ ] Configuration intake: endpoint and token from environment or
-      config file, and a refusal with a clear message if either arrives
-      on argv.
+      four variants are the whole surface and stops saying the
+      vocabulary lives in three places.
+- [ ] Close the unguarded Rust-to-TypeScript edge, following the
+      `openapi_contract.rs` idiom exactly: an integration test under
+      `lorica-api/tests/` that reads the committed file with
+      `include_str!`, asserts the extraction found something before
+      comparing (or a broken parser passes by comparing two empty
+      sets), diffs both directions and `panic!`s with a message naming
+      what to do. Diff-style, never auto-write.
+- [ ] Rename the fixture to `automation-scopes.generated.ts`. Prettier
+      does not exist here and is banned by `lorica-frontend.md`, so
+      there is nothing to exempt; `eslint.config.js:83` already ignores
+      `**/*.generated.ts` and nothing matches it yet. It stays
+      committed, since the Vitest gate imports it, and it must be
+      `--strict` clean on its own because `tsconfig.app.json:20` sweeps
+      in every `src/**/*.ts` regardless of the eslint ignore.
+- [ ] `whoami` reachable by any live token, per the decision above.
+      This is not a one-line change (see Dev Notes): `required_scope`
+      returns `Option<AutomationScope>`, where `None` already means
+      "refused for everyone", so the third state needs a type.
+      `whoami`'s match is path-only today, so the new arm takes a
+      method guard or a future `POST /whoami` inherits it.
+- [ ] Retarget, never delete, the two tests that prove the scope gate
+      end to end and that break by construction here
+      (`lorica-api/src/tests.rs:9356` and `:9423`). They are the only
+      two that drive a real 403 through the whole stack; deleting them
+      leaves the gate unproven while every suite stays green.
+- [ ] A sentinel for "no scope required" in `openapi-automation.yaml`
+      and the arm that reads it in
+      `lorica-api/tests/openapi_contract.rs:184`. The contract test
+      currently fails any documented operation without an
+      `x-required-scope`, so the state is unrepresentable and the gate
+      would go red on a correct implementation.
+- [ ] AC #1, the crate skeleton only. It builds and does nothing. The
+      enumerations it has to land in are listed in the Code Map, and
+      there are far more than the three Dockerfiles the AC names.
+
+### Lot 2: the automation read surface, then the core and the tools
+
+Absorbing the read surface into this lot was decided 2026-09-22. The
+lot carries two natures of work and that is accepted: the endpoints
+have to exist before a client of them means anything.
+
+- [ ] The automation plane gains its read surface, because it has none
+      (see Dev Notes): logs, WAF events and stats, SLA, cluster and
+      node status, backends, routes, certificate metadata. Each one
+      declared in `required_scope`, paginated with a hard cap,
+      stripped of secrets, audited, and documented in
+      `openapi-automation.yaml` against the contract test.
+
+- [ ] AC #1, the rest: configuration intake, endpoint and token from
+      environment or config file, and a refusal with a clear message if
+      either arrives on argv.
 - [ ] The protocol core: JSON-RPC framing, `initialize`, `tools/list`,
       `tools/call`, error mapping. Transport-agnostic, no I/O in it.
-- [ ] AC #10: the stdio adapter over the core.
 - [ ] AC #3: startup introspection against `whoami`, tool registration
       from the returned scopes, and the no-scope case that produces a
       server with no tools and says why.
@@ -168,37 +217,108 @@ These are the PRD's, unchanged. They are the contract.
 - [ ] AC #5: the secret-name sweep over every tool's output, as a test
       that walks the field names rather than a review promise.
 - [ ] AC #7: the untrusted-text field, its delimiters, and the tool
-      descriptions that say what it is.
+      descriptions that say what it is. It lives in the shared core, so
+      a tool added later gets it by construction.
+
+### Lot 3: stdio, and the first calls that actually flow
+
+- [ ] AC #10: the stdio adapter over the core.
+- [ ] AC #6: the MCP transport marker in the audit row, and the
+      argument redaction that precedes it. It lands here rather than in
+      lot 2 because nothing reaches the listener until a transport
+      exists to carry it.
+- [ ] IV1, IV2, IV3 as tests.
+- [ ] AC #8: `docs/mcp.md` for the read tier over stdio.
+
+### Lot 4: the Streamable HTTP binding
+
 - [ ] AC #9: the Streamable HTTP adapter as a path on the automation
       listener. `Origin` validation, protocol-version pinning, and the
       header-versus-body mirror check. The path is declared in
       `required_scope` or it is reachable by nobody.
-- [ ] AC #6: the MCP transport marker in the audit row, and the
-      argument redaction that precedes it.
-- [ ] IV1, IV2, IV3 as tests.
-- [ ] AC #8 and #11: `docs/mcp.md`, including the implemented revision
-      and the maintenance note.
+- [ ] AC #11: the implemented revision and the maintenance note in
+      `docs/mcp.md`, and the client configuration for the second
+      transport.
 - [ ] `lorica-api/openapi.yaml` for the new scopes and the endpoint,
       green against the contract test. `CHANGELOG.md` under Added and
       Security.
 
 ## Dev Notes
 
-### A scope spelling lives in three files
+### A scope spelling lives in six places, and one edge is guarded by nothing
 
 The doc comment on `AutomationScope`
-(`lorica-config/src/models/automation_token.rs:110`) names them and the
-warning is load-bearing: the serde renames on the enum, `scope_str` in
-`lorica-api/src/automation/scope.rs` which is the string an operator
-reads in a 403, and
-`lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.fixture.ts`
-which is what the mint form offers. Two of the three agreeing produces a
-token minted with a scope the gate never matches. Five new variants
-means five additions in each.
+(`lorica-config/src/models/automation_token.rs:110`) says three. It is
+wrong, and so was the first draft of this note. The copies are:
+
+1. the serde renames on the enum itself;
+2. `scope_str`, `lorica-api/src/automation/scope.rs:153`, the string an
+   operator reads in a 403;
+3. `scope_wire_name`, `lorica-api/src/automation/audit.rs:254`;
+4. `AUTOMATION_AUDIT_REASONS`, `lorica-api/src/automation/audit.rs:127`,
+   which embeds scope names inside refusal reasons and is hand-typed;
+5. `automation-scopes.fixture.ts` under
+   `lorica-dashboard/frontend/src/components/settings-tabs/`;
+6. `ALL_SCOPES` in `AutomationTokensTab.svelte`, what the mint form
+   actually renders.
+
+Tests pin 2, 3 and 4 against 1, and `AutomationTokensTab.test.ts` pins
+6 against 5. **Nothing pins 5 against anything in Rust.** That is the
+language boundary, and it is the one edge with no guard: add a variant
+on the Rust side and forget the fixture, and the Rust suite passes, the
+frontend suite passes, and the mint form simply cannot offer the scope.
+Silent in both directions.
+
+Going from four scopes to nine multiplies the occasions. Lot 1
+therefore closes that edge rather than adding five more unguarded
+entries, per `.claude/rules/derived-not-transcribed.md`, which names
+this exact pair as the trigger to build a vector set rather than write
+another lock-step comment. The fixture becomes derived from the enum
+and exempt from prettier, because a formatter rewriting a shared
+artefact turns a byte comparison into noise on every line.
+
+### The automation plane has no read surface to be a client of
+
+AC #4 reads as though the tools wrap endpoints that exist. They do not.
+`build_automation_router` (`lorica-api/src/automation/router.rs:123`)
+mounts exactly four entries: `whoami`, the environments collection, and
+one environment by name for GET, PUT and DELETE. There is no logs path,
+no WAF path, no SLA path, no cluster path, no backends path, no routes
+path and no certificates path on that listener.
+
+The management API has all of them (`/api/v1/logs`, `/api/v1/waf/events`,
+`/api/v1/waf/stats`, `/api/v1/sla/overview`, `/api/v1/sla/routes/{id}`,
+`/api/v1/backends`, `/api/v1/routes`, and the certificate paths), but
+PRD decision D3 puts the MCP server on the automation listener
+precisely so it never holds a management credential. So the surface has
+to be built, not borrowed. That work is the first half of lot 2.
+
+This is the largest thing the story's own acceptance criteria do not
+say out loud, and it is why lot 2 carries two natures of work.
+
+### A scopeless token cannot exist
+
+AC #3 says a token with no read scope produces a server with no tools.
+Minting refuses an empty `scopes` array
+(`lorica-api/src/automation/automation_tokens/tests.rs:609`), so the
+case is never "a token carrying nothing": it is "a token carrying some
+scope, none of which this tier uses". `docs/mcp.md` must not promise
+the scopeless token, because an operator cannot mint one.
 
 An unknown scope string fails to deserialise rather than being dropped,
 so a 1.9.0 token presented to a 1.8.0 node is refused outright. That is
 the intended behaviour and the upgrade note belongs in the changelog.
+
+### AC #1 and AC #9 are not in conflict
+
+AC #1 says "stdio transport, no listener" and AC #9 mounts Streamable
+HTTP on the automation listener. Read top-down that looks like a
+contradiction, and a developer building the crate before reaching AC #9
+will resolve it the wrong way. It is not one: `lorica-mcp` opens no
+socket of its own in either binding. The HTTP adapter runs inside
+`lorica-api`, on the listener Story 10.3 already built, which is
+precisely what "no third management plane" means. The crate stays a
+subprocess and a library; the listener stays the only thing that binds.
 
 ### An undeclared path is reachable by nobody
 
@@ -227,6 +347,104 @@ this story silently. Whatever shape the delimiting takes, it belongs in
 the shared core where a new tool gets it by construction, not in each
 tool's own formatting.
 
+## Code Map
+
+Investigated 2026-09-22. Line numbers are from that day's tree.
+
+### The scope gate, what lot 1 changes
+
+- `lorica-api/src/automation/scope.rs:67` `required_scope`, the whole
+  matrix. `:71` the whoami arm, path-only with no method match. `:94`
+  the fail-closed fallback. `:108` `authorize_scope`, which runs inside
+  the bearer gate and requires the principal extension.
+- `lorica-api/src/automation/scope.rs:153` `scope_str`.
+- `lorica-api/src/automation/audit.rs:254` `scope_wire_name`, `:127`
+  `AUTOMATION_AUDIT_REASONS`, `:282` `refusal_reason`. The last one
+  maps "no scope in the matrix" to `no_declared_scope`; the new state
+  must map to no reason at all, or a handler-raised 403 gets
+  mislabelled.
+- `lorica-api/src/automation/auth.rs:200` `AutomationPrincipal`, `:314`
+  its extractor, `:376` where it enters the extensions. It already
+  carries everything `whoami` returns. Nothing to change here.
+- `lorica-api/src/automation/router.rs:123` the router and its layer
+  order, documented at `:109`. Audit outermost and unconditional, then
+  the panic net, then the bearer gate, then the scope gate.
+- `lorica-api/src/automation/mod.rs:92` re-exports `required_scope`.
+  The contract test reaches it as `lorica_api::automation::...`, so a
+  new type must be public and re-exported beside it.
+
+Tests that pin the current rule and must be updated rather than
+removed: the doctest at `scope.rs:52`, `whoami_needs_only_the_read_scope`
+`scope.rs:168`, `an_undeclared_path_is_reachable_by_nobody...`
+`scope.rs:176`, `the_layer_refuses_an_undeclared_path...` `scope.rs:233`
+(which transcribes all four scopes in a principal literal and has to
+grow to nine), and in `audit.rs` the pair at `:508` and `:544`. In
+`lorica-api/src/tests.rs`, `:9356` and `:9423` break by construction:
+they use whoami as the negative scope case and are the only two that
+drive a real 403 through the full stack.
+
+- `lorica-api/openapi-automation.yaml:91` and the prose at `:87`.
+- `lorica-api/tests/openapi_contract.rs:184`, which fails any documented
+  operation lacking `x-required-scope` and otherwise compares it to a
+  serialised `AutomationScope`. "No scope" is unrepresentable there
+  today.
+
+### The artefact guard, the idiom to copy
+
+`lorica-api/tests/openapi_contract.rs` is the house pattern and the one
+to follow: `include_str!` on the committed file, an extraction sanity
+assertion before any comparison, two `BTreeSet`s diffed both ways, and
+a `panic!` carrying a message that tells the developer what to do. It
+is explicit that nothing is auto-written. Put the new reader in
+`tests/` rather than `src/`, so a renamed fixture is a test failure
+with a readable message rather than a compile error.
+
+There is no `insta`, no golden-file crate and no snapshot directory in
+the workspace.
+
+### Adding a workspace member, the full list
+
+`.claude/rules/lorica-rust.md:78` names four items and is incomplete.
+The last crates added were `lorica-challenge` and `lorica-geoip` in
+`7e2831e2`; copy that. Build breaks without:
+
+- `Cargo.toml:34` members.
+- `Dockerfile:57`, `Dockerfile.dev:50`, `tests-e2e-docker/Dockerfile:47`,
+  each appending a `COPY` line before the `tinyufo` line.
+- `ci-check.Dockerfile:32` and `:39`. A fourth Dockerfile the rule does
+  not mention.
+
+Then the enumerations that fail quietly: `.github/workflows/ci.yml:45`,
+`:204` and `:253`; `docs/BUMP-CHECKLIST.md:8` and its hand-duplicated
+twin `.claude/skills/bump-version/bump-checklist.md:20`; the crate
+tables in `README.md:365`, `FORK.md:64` and `CONTRIBUTING.md:32`; the
+crate lists in the `run-tests` and `build-deb` skills; the inventories
+under `docs/architecture/`.
+
+Nothing to change in `deny.toml`, `.cargo/audit.toml`, the `dist/`
+packaging scripts or the RPM spec: they package one binary and the only
+crate list there is the Debian copyright stanza for the forked crates.
+
+Manifest shape: copy `lorica-geoip/Cargo.toml:1`. Version hard-coded,
+no `[workspace.package]`, dependencies declared directly except the
+Pingora-inherited ones, siblings by path. There is no `[lints]` table
+anywhere; lints are inner attributes at the top of the root source
+file.
+
+### Frontend gates
+
+`eslint.config.js:83` already ignores `**/*.generated.ts` and nothing
+matches it. `tsconfig.app.json:20` sweeps every `src/**/*.ts`
+regardless, so the generated file must be strict-clean. Three local
+gates, all required: `npm run check`, `npm run lint`, `npx vitest run`.
+The existing consumer is
+`AutomationTokensTab.test.ts:8` and `:52`.
+
+### Do not touch
+
+The data plane. No story in this epic adds a code path inside
+`request_filter`.
+
 ## Dev Agent Record
 
 ### Debug Log
@@ -240,3 +458,19 @@ tool's own formatting.
 - 2026-09-22: Story drafted from the Epic 11 PRD. D5 resolved as a
   hand-rolled JSON-RPC loop; the `whoami` scope change recorded as the
   one modification this story makes to the Story 10.3 gate.
+- 2026-09-22: Tasks split into four lots and the status moved to
+  InProgress. The lots are increments of this story inside the v1.9.0
+  cycle, not deferred work: `docs/backlog.md` stays the only backlog.
+- 2026-09-22: Code Map added from a codebase investigation, and four
+  things the acceptance criteria assume but the tree contradicts are
+  recorded in Dev Notes: the automation plane has no read surface, the
+  scope vocabulary has six copies rather than three, "no scope
+  required" is representable neither in `required_scope` nor in the
+  OpenAPI contract test, and the frontend has no prettier to exempt a
+  generated file from. Lot 2 absorbs the read surface by decision of
+  the same day.
+- 2026-09-22: AC #4 confirmed at its full width after the question was
+  put explicitly. All five read families stay in scope: logs, WAF, SLA,
+  cluster and node status, and the read-only configuration listings.
+  The narrower "logs and WAF first" increment was offered and refused,
+  so lot 2 builds the whole read surface.
