@@ -8,10 +8,18 @@
 The automation plane is the door a CI pipeline uses to make
 `https://<slug>.review.example.com` reach the container it just
 started, in one call that is safe to repeat and safe to abandon. It
-serves one resource, the environment: a route, its backends, a
+serves one writable resource, the environment: a route, its backends, a
 certificate binding and a lifetime, created or replaced by a single
 idempotent `PUT`, readable, and removed by `DELETE` or by a reaper once
 its lifetime has run out.
+
+Since v1.9.0 it also serves a read surface: what this node is seeing
+(access log, WAF events and counters, passive SLA) and what it is
+currently configured with (cluster and node status, backends, routes,
+certificate metadata). Each family sits behind its own scope. It exists
+because the management MCP server runs against this listener and never
+holds a management credential, and it is useful to any automation that
+wants to check what it just deployed is actually serving.
 
 One sentence decides everything else in this document. **The
 management API stays on loopback with a session cookie; the automation
@@ -36,11 +44,11 @@ audited: `GET|POST /api/v1/automation/tokens`,
 tokens sub-page under Settings in the dashboard. The automation listener
 serves none of it, so a token can never mint a token, widen its own
 scopes or extend its own expiry. What the listener serves is
-`GET /automation/v1/whoami`, `GET /automation/v1/environments` and
-`GET|PUT|DELETE /automation/v1/environments/{name}`, described in
-`lorica-api/openapi-automation.yaml`, a separate document from the
-management API's because it is a different socket with a different
-security scheme.
+`GET /automation/v1/whoami`, `GET /automation/v1/environments`,
+`GET|PUT|DELETE /automation/v1/environments/{name}` and the read
+surface below, described in `lorica-api/openapi-automation.yaml`, a
+separate document from the management API's because it is a different
+socket with a different security scheme.
 
 ## The listener
 
@@ -649,6 +657,76 @@ paths, whose alphabet is lowercase ASCII letters, digits, `-` and `_`
 and does not include the colon. That looked like an inconsistency during
 implementation and is a guard: the mark and the group name agree by
 construction.
+
+## The read surface
+
+Since v1.9.0 the listener answers eleven read paths, all `GET` and
+nothing else:
+
+| Path | Scope | What it answers |
+|---|---|---|
+| `/automation/v1/logs` | `logs:read` | Access-log rows, with the filters the dashboard offers. |
+| `/automation/v1/waf/events` | `waf:read` | Recent WAF matches, optionally one category. |
+| `/automation/v1/waf/stats` | `waf:read` | Totals, the 24 h count, the loaded rule count, the count per category. |
+| `/automation/v1/sla/overview` | `sla:read` | The 1 h and 24 h passive windows for every route. |
+| `/automation/v1/sla/routes/{id}` | `sla:read` | One route's passive windows (1 h, 24 h, 7 d, 30 d). |
+| `/automation/v1/cluster/status` | `cluster:read` | This node's role, build, applied generation and hash. |
+| `/automation/v1/cluster/nodes` | `cluster:read` | The fleet roster (control plane only; 409 elsewhere). |
+| `/automation/v1/cluster/nodes/{id}` | `cluster:read` | One node of the roster. |
+| `/automation/v1/backends` | `backends:read` | Every backend with its health, connections and EWMA score. |
+| `/automation/v1/routes` | `routes:read` | Every route with its linked backend ids, optionally one group. |
+| `/automation/v1/certificates` | `certificates:read` | Certificate metadata: domain, SANs, fingerprint, issuer, validity, ACME settings. |
+
+**Each one is the management API's own answer, not a second
+implementation of it.** The handler on this listener calls the
+management handler, or the function that handler was split out of, and
+re-wraps the rows it returns; nothing on this plane computes a figure,
+filters a row set or serialises a record of its own. That is not
+tidiness. Two surfaces that compute one answer independently drift, and
+on a read surface the drift takes the shape of a field one of them
+stopped stripping, which no test on either side notices.
+
+**The row cap is the server's.** Every collection answers
+`{"data": {"items": [...], "page": {...}}}` where `page` carries
+`limit`, `offset`, `returned` and `has_more`. `?limit=` is clamped to
+200 rows and there is no parameter that raises it; absent, it is 50.
+The intended caller is a language model reading on an operator's
+behalf, and a model that asks for everything must not be able to pull
+the access log into a context window. There is no `total`: the sources
+behind this surface count differently, and one field meaning three
+things is worse than no field, so `has_more` answers the only question
+a pager actually has.
+
+**No secret crosses this boundary**, and the reason is the first point
+above rather than a filter written here: the views are the management
+plane's, so a route's Basic-auth hash never leaves the store, and the
+certificate listing carries metadata with no PEM body of any kind. The
+single-certificate endpoint, which does return the public certificate
+PEM, is deliberately not mounted on this listener. A test in
+`lorica-api/src/tests.rs` walks every field name and every string value
+of every answer for credential spellings and for PEM private-key
+blocks, so the inherited property is one a change can break loudly.
+
+**What the rows contain is attacker-controlled text.** Access-log paths
+and hostnames, WAF matched values, User-Agent strings: that is the
+point of reading them and it is also the hazard. They cross unchanged,
+in the field the node recorded them in. Lorica does not summarise them,
+quote them or interpret them, and whatever consumes this surface must
+treat them as data.
+
+**Two narrowings against the management plane.** The SLA reads do not
+accept `?node=`: proxying a read to a follower carries an operator
+floor, and an automation credential has scopes and no role to weigh
+against it. And the fleet roster omits each node's host telemetry (CPU,
+memory, disk), which the management API shows from `Operator` upwards;
+the scope vocabulary cannot say "this token is an operator", so this
+surface reads the floor rather than granting every `cluster:read` token
+a view an operator kept for operators.
+
+Every one of these requests is audited like any other on the plane, by
+the same outermost layer: `automation.request.ok` with the calling
+token named, or `automation.request.forbidden:<scope>` when the grant
+is missing.
 
 ## GitLab OIDC
 

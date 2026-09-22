@@ -198,7 +198,7 @@ Absorbing the read surface into this lot was decided 2026-09-22. The
 lot carries two natures of work and that is accepted: the endpoints
 have to exist before a client of them means anything.
 
-- [ ] The automation plane gains its read surface, because it has none
+- [x] The automation plane gains its read surface, because it has none
       (see Dev Notes): logs, WAF events and stats, SLA, cluster and
       node status, backends, routes, certificate metadata. Each one
       declared in `required_scope`, paginated with a hard cap,
@@ -471,6 +471,25 @@ Lot 1, 2026-09-22. Gates run, all on the branch as it stands:
 `cargo audit` was NOT run: no dependency changed in this lot and
 `lorica-mcp` declares none.
 
+Lot 2, first half (the automation read surface), 2026-09-23. Gates run
+in `rust:1-bookworm` with `RUSTFLAGS=-D warnings` unless noted:
+
+- `cargo fmt --all -- --check` on the Windows host: clean (it needed
+  one pass of `cargo fmt --all` first, on three files).
+- `cargo test -p lorica-config -p lorica-api`: 843 + 495 unit, 2 in
+  `tests/automation_scope_fixture.rs`, 3 in `tests/openapi_contract.rs`,
+  8 + 18 doctests. 0 failed. The lib count went 826 -> 843.
+- `cargo test -p lorica-api --test openapi_contract --test automation_scope_fixture`:
+  3 + 2 passed, 0 failed.
+- `cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings`: clean.
+- `cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings`: clean.
+- `cargo clippy -p lorica --all-targets --features otel -- -D warnings`:
+  clean. Run because `get_status`'s return type changed and the binary
+  links the crate.
+
+`cargo audit` was NOT run: no dependency changed. Nothing in this half
+touches the frontend, so its three gates were not re-run.
+
 ### Completion Notes
 
 **The third state is a type, not a sentinel scope.** `required_scope`
@@ -527,6 +546,82 @@ protocol revision it implements, then exits. No configuration intake,
 no JSON-RPC, no transport: those are lots 2 and 3, and nothing here
 stands in for them.
 
+---
+
+Lot 2, first half. `lorica-mcp/` was not touched: the JSON-RPC core and
+the tools are the second half and nothing here stands in for them.
+
+**Eleven paths, all `GET`.** `/automation/v1/logs` (`logs:read`),
+`/waf/events` and `/waf/stats` (`waf:read`), `/sla/overview` and
+`/sla/routes/{id}` (`sla:read`), `/cluster/status`, `/cluster/nodes`
+and `/cluster/nodes/{id}` (`cluster:read`), `/backends`
+(`backends:read`), `/routes` (`routes:read`), `/certificates`
+(`certificates:read`). `required_scope` consults the read matrix for
+`GET` alone, so no verb the router does not mount inherits a grant, and
+a test asserts `POST`, `PUT`, `DELETE` and `PATCH` stay undeclared on
+every one of them.
+
+**Every handler is a wrapper and computes nothing.** `logs`,
+`waf/events`, `waf/stats`, `backends`, `routes` and `certificates` call
+the management handler directly, which was possible because none of
+those six takes a `Session`. The other three needed a split rather than
+a rewrite: `sla::get_sla_overview` and `sla::get_route_sla` took a
+`Session` only for the `?node=` cluster proxy, and `cluster::list_nodes`
+and `cluster::get_node` only for the role that gates per-node host
+telemetry. Those four now call `sla::local_sla_overview`,
+`sla::local_route_sla`, `cluster::roster` and `cluster::one_node`, and
+the automation handlers call the same four. `cluster::get_status`
+changed from `impl IntoResponse` to `Json<Value>` so its answer can be
+passed through; an opaque return type cannot be.
+
+**Two deliberate narrowings against the management plane**, both
+recorded in `docs/automation.md` and in the OpenAPI descriptions. The
+SLA reads do not accept `?node=`: the proxy carries an Operator floor
+and an automation credential has no role to weigh against it. The fleet
+roster is read at `Role::Viewer`, so the Operator-only per-node CPU,
+memory and disk figures are absent; the scope vocabulary cannot express
+"this token is an operator", so reading anything above the floor would
+hand every `cluster:read` token a view an operator kept for operators.
+
+**The page envelope carries no `total`.** Collections answer
+`{"data": {"items": [...], "page": {limit, offset, returned, has_more}}}`.
+`limit` is clamped to 200 server-side with no parameter that raises it,
+50 by default. `total` was dropped on purpose: the log store counts
+every match, the WAF buffer counts what it returned and a store listing
+counts rows, so one field would have meant three things. Every source
+is asked for one row past the window instead, which makes `has_more`
+exact everywhere and costs one row.
+
+**A management answer that changed shape is a 500, not an empty page.**
+`rows()` pulls the array out of the management envelope by name and
+refuses when it is not there. The failure it declines to hide: someone
+renames `backends` in the management view, this surface keeps answering
+200 with nothing in it, and an operator reads "no backends".
+
+**AC #5 is a test, not a review promise.**
+`no_automation_read_answer_carries_a_secret_field_name` seeds a node
+with a certificate, a backend, a route carrying Basic auth, five log
+rows and five WAF events, then drives every read path with a token
+carrying `AutomationScope::ALL` and walks every key name and every
+string value of every answer. Keys are matched as substrings against a
+credential vocabulary; values are checked for PEM private-key blocks.
+The sweep asserts it walked more than a hundred field names, because an
+empty answer on every path would pass it trivially. `session` is
+deliberately absent from the marker list: the roster legitimately
+reports `session_peer` and `session_last_seen_unix`, which are
+connection facts, so `session_id` and `cookie` are named instead.
+
+**Audit needed nothing.** The audit layer is outermost and
+unconditional, so every new path lands a row by construction, and
+`AUTOMATION_AUDIT_REASONS` already carried all nine scope spellings
+from lot 1.
+
+**Not done here, and by scope.** `openapi.yaml` gains nothing: these
+are automation-plane paths and that document describes the management
+socket. `CHANGELOG.md` was updated under Added and Security although
+lot 4 lists the changelog, because a read surface that ships without a
+security note in the same edit is a note nobody writes later.
+
 ## File List
 
 Added:
@@ -535,6 +630,7 @@ Added:
 - `lorica-mcp/src/main.rs`
 - `lorica-api/tests/automation_scope_fixture.rs`
 - `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.generated.ts`
+- `lorica-api/src/automation/read.rs` (lot 2)
 
 Removed:
 
@@ -561,6 +657,17 @@ Modified:
 - `docs/automation.md`, `docs/BUMP-CHECKLIST.md`,
   `docs/architecture/source-tree.md`,
   `docs/architecture/component-architecture.md`,
+  `docs/architecture/api-design-and-integration.md`
+- `docs/stories/story-11.1-mcp-crate-read-tier.md`
+
+Modified in lot 2 (first half):
+
+- `lorica-api/src/automation/mod.rs`, `.../router.rs`, `.../scope.rs`
+- `lorica-api/src/cluster/mod.rs`, `lorica-api/src/sla.rs`,
+  `lorica-api/src/routes/mod.rs`
+- `lorica-api/src/tests.rs`
+- `lorica-api/openapi-automation.yaml`
+- `CHANGELOG.md`, `docs/automation.md`,
   `docs/architecture/api-design-and-integration.md`
 - `docs/stories/story-11.1-mcp-crate-read-tier.md`
 
@@ -597,3 +704,17 @@ Modified:
   cluster and node status, and the read-only configuration listings.
   The narrower "logs and WAF first" increment was offered and refused,
   so lot 2 builds the whole read surface.
+- 2026-09-23: the first half of lot 2 landed, the automation plane's
+  read surface. Eleven `GET` paths in `lorica-api/src/automation/read.rs`,
+  every one a wrapper over the management handler that already answers
+  it, each declared in `required_scope` in the same edit and documented
+  in `openapi-automation.yaml` with its `x-required-scope`. Four
+  management handlers were split rather than rewritten so the
+  automation plane could reach their computation without a `Session`
+  (`sla::local_sla_overview`, `sla::local_route_sla`, `cluster::roster`,
+  `cluster::one_node`), and `cluster::get_status` returns a concrete
+  `Json` so its answer can be passed through. Collections answer a
+  `{items, page}` envelope whose 200-row ceiling the caller cannot
+  raise, and AC #5's secret sweep walks every field name and string
+  value of every answer. `lorica-mcp/` untouched: the JSON-RPC core and
+  the tools are the second half of the lot.

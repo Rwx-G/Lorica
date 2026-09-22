@@ -42,6 +42,9 @@
 //! - [`router`] - the router and the `whoami` endpoint.
 //! - [`environments`] - the environment resource (Story 10.4): the
 //!   handlers, the one-transaction write, and the reaper's sweep.
+//! - [`read`] - the read surface (Story 11.1): logs, WAF, SLA, cluster,
+//!   backends, routes and certificate metadata, each a wrapper over the
+//!   management handler that already answers it.
 //! - [`oidc`] - the GitLab ID-token verifier (Story 10.5): the pinned
 //!   algorithm, the JWKS cache and the bounded replay set.
 //!
@@ -74,6 +77,7 @@ pub mod auth;
 pub mod environments;
 pub mod listener;
 pub mod oidc;
+pub mod read;
 pub mod router;
 pub mod scope;
 
@@ -88,5 +92,6 @@ pub use environments::{
 };
 pub use listener::{start_automation_server, AutomationListenerConfig, AutomationListenerError};
 pub use oidc::{OidcVerifier, RefusalReason, OIDC_REPLAY_SET_CAP};
+pub use read::{AUTOMATION_READ_DEFAULT_ROWS, AUTOMATION_READ_MAX_ROWS};
 pub use router::build_automation_router;
 pub use scope::{required_scope, ScopeRequirement};

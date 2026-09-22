@@ -221,6 +221,34 @@ pub fn bucket_from_wire(r: SlaBucketRow) -> Result<SlaBucket, String> {
     })
 }
 
+/// This node's own passive SLA summaries for one route, every standard
+/// window (1h, 24h, 7d, 30d).
+///
+/// Split out of [`get_route_sla`] so the automation plane's read
+/// surface (Story 11.1) computes the figures the same way rather than a
+/// second way. `?node=` stays in the handler: proxying a read to a
+/// follower needs a management session to carry the operator floor, and
+/// an automation credential has no role to check.
+///
+/// # Errors
+///
+/// `NotFound` when this node holds no such route, or the store's error.
+pub(crate) async fn local_route_sla(
+    state: &AppState,
+    route_id: String,
+) -> Result<Vec<SlaSummary>, ApiError> {
+    db_blocking(&state.store, move |store| {
+        // Verify route exists
+        store
+            .get_route(&route_id)?
+            .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
+
+        lorica_bench::results::compute_all_windows(store, &route_id, "passive")
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await
+}
+
 /// GET /api/v1/sla/routes/:id - return passive SLA summaries for all standard windows (1h, 24h, 7d, 30d).
 /// With `?node=`, the same for one follower (Story 9.7 AC #5).
 pub async fn get_route_sla(
@@ -239,18 +267,7 @@ pub async fn get_route_sla(
         let summaries: Vec<SlaSummary> = ack.summaries.into_iter().map(summary_from_wire).collect();
         return Ok(json_data(summaries));
     }
-    let summaries = db_blocking(&state.store, move |store| {
-        // Verify route exists
-        store
-            .get_route(&route_id)?
-            .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
-
-        lorica_bench::results::compute_all_windows(store, &route_id, "passive")
-            .map_err(|e| ApiError::Internal(e.to_string()))
-    })
-    .await?;
-
-    Ok(json_data(summaries))
+    Ok(json_data(local_route_sla(&state, route_id).await?))
 }
 
 /// Query parameters for bucket queries: `?from=&to=&source=passive|active&node=`.
@@ -578,26 +595,21 @@ pub async fn clear_route_sla(
     })))
 }
 
-/// GET /api/v1/sla/overview - return 1h and 24h passive SLA summaries for every route.
-/// With `?node=`, one follower's overview (Story 9.7 AC #5).
-pub async fn get_sla_overview(
-    Extension(state): Extension<AppState>,
-    Extension(session): Extension<Session>,
-    Query(node): Query<NodeQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(node) = foreign_node(&node.node) {
-        let pull = SlaPull {
-            source: "passive".to_string(),
-            ..SlaPull::default()
-        };
-        let ack = pull_from_node(&state, &session, node, pull).await?;
-        let summaries: Vec<SlaSummary> = ack.summaries.into_iter().map(summary_from_wire).collect();
-        return Ok(json_data(summaries));
-    }
+/// This node's own 1h and 24h passive summaries for every route it
+/// holds.
+///
+/// Split out of [`get_sla_overview`] for the reason given on
+/// [`local_route_sla`]: the automation plane reads the same figures
+/// through the same computation, and `?node=` stays in the handler.
+///
+/// # Errors
+///
+/// The store's error text.
+pub(crate) async fn local_sla_overview(state: &AppState) -> Result<Vec<SlaSummary>, ApiError> {
     // One store acquisition for the whole overview, as before the
     // blocking-pool migration: every per-route summary runs inside a
     // single closure.
-    let overview = db_blocking(&state.store, move |store| {
+    db_blocking(&state.store, move |store| {
         let routes = store
             .list_routes()
             .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -619,7 +631,24 @@ pub async fn get_sla_overview(
 
         Ok::<_, ApiError>(overview)
     })
-    .await?;
+    .await
+}
 
-    Ok(json_data(overview))
+/// GET /api/v1/sla/overview - return 1h and 24h passive SLA summaries for every route.
+/// With `?node=`, one follower's overview (Story 9.7 AC #5).
+pub async fn get_sla_overview(
+    Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+    Query(node): Query<NodeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(node) = foreign_node(&node.node) {
+        let pull = SlaPull {
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        };
+        let ack = pull_from_node(&state, &session, node, pull).await?;
+        let summaries: Vec<SlaSummary> = ack.summaries.into_iter().map(summary_from_wire).collect();
+        return Ok(json_data(summaries));
+    }
+    Ok(json_data(local_sla_overview(&state).await?))
 }

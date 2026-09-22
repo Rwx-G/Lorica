@@ -105,11 +105,8 @@ pub fn required_scope(method: &http::Method, path: &str) -> Option<ScopeRequirem
     // environment by name. Exactly one path segment after the
     // collection, so a deeper path stays undeclared and refused.
     if let Some(rest) = path.strip_prefix(ENVIRONMENTS_PATH) {
-        let is_collection = rest.is_empty();
-        let is_one = rest
-            .strip_prefix('/')
-            .is_some_and(|name| !name.is_empty() && !name.contains('/'));
-        if is_collection || is_one {
+        let is_one = one_segment_under(path, ENVIRONMENTS_PATH);
+        if rest.is_empty() || is_one {
             return match *method {
                 http::Method::GET => {
                     Some(ScopeRequirement::Scope(AutomationScope::EnvironmentsRead))
@@ -122,7 +119,49 @@ pub fn required_scope(method: &http::Method, path: &str) -> Option<ScopeRequirem
         }
     }
 
+    // The read surface (Story 11.1). Every one of these is a GET and
+    // nothing else: the tier exists to be unable to change anything, so
+    // a verb the router does not mount inherits no grant here either.
+    if *method == http::Method::GET {
+        if let Some(scope) = read_scope(path) {
+            return Some(ScopeRequirement::Scope(scope));
+        }
+    }
+
     None
+}
+
+/// The scope behind each path of the read surface, or `None` for a path
+/// that is not one of them.
+///
+/// Read-only by construction: [`required_scope`] consults it for `GET`
+/// alone, so no write scope can be reached from here.
+fn read_scope(path: &str) -> Option<AutomationScope> {
+    match path {
+        LOGS_PATH => Some(AutomationScope::LogsRead),
+        WAF_EVENTS_PATH | WAF_STATS_PATH => Some(AutomationScope::WafRead),
+        SLA_OVERVIEW_PATH => Some(AutomationScope::SlaRead),
+        CLUSTER_STATUS_PATH | CLUSTER_NODES_PATH => Some(AutomationScope::ClusterRead),
+        BACKENDS_PATH => Some(AutomationScope::BackendsRead),
+        ROUTES_PATH => Some(AutomationScope::RoutesRead),
+        CERTIFICATES_PATH => Some(AutomationScope::CertificatesRead),
+        // One resource under a collection, and exactly one: a deeper
+        // path stays undeclared and is refused for every token.
+        _ if one_segment_under(path, SLA_ROUTES_PATH) => Some(AutomationScope::SlaRead),
+        _ if one_segment_under(path, CLUSTER_NODES_PATH) => Some(AutomationScope::ClusterRead),
+        _ => None,
+    }
+}
+
+/// Whether `path` is exactly one non-empty segment under `collection`.
+///
+/// The OpenAPI gate asks with the parameter normalised to `{}`, which
+/// is a segment like any other, so the same rule answers both the live
+/// path and the documented one.
+fn one_segment_under(path: &str, collection: &str) -> bool {
+    path.strip_prefix(collection)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|last| !last.is_empty() && !last.contains('/'))
 }
 
 /// The identity path, the only one any live token reaches.
@@ -130,6 +169,36 @@ const WHOAMI_PATH: &str = "/automation/v1/whoami";
 
 /// The environment collection path; single environments hang under it.
 const ENVIRONMENTS_PATH: &str = "/automation/v1/environments";
+
+/// The access log.
+const LOGS_PATH: &str = "/automation/v1/logs";
+
+/// Recent WAF events.
+const WAF_EVENTS_PATH: &str = "/automation/v1/waf/events";
+
+/// The WAF summary counters.
+const WAF_STATS_PATH: &str = "/automation/v1/waf/stats";
+
+/// Passive SLA for every route.
+const SLA_OVERVIEW_PATH: &str = "/automation/v1/sla/overview";
+
+/// Passive SLA per route; one route id hangs under it.
+const SLA_ROUTES_PATH: &str = "/automation/v1/sla/routes";
+
+/// This node's cluster role and applied configuration.
+const CLUSTER_STATUS_PATH: &str = "/automation/v1/cluster/status";
+
+/// The fleet roster; one node id hangs under it.
+const CLUSTER_NODES_PATH: &str = "/automation/v1/cluster/nodes";
+
+/// The backend listing.
+const BACKENDS_PATH: &str = "/automation/v1/backends";
+
+/// The route listing.
+const ROUTES_PATH: &str = "/automation/v1/routes";
+
+/// Certificate metadata; never a PEM body and never key material.
+const CERTIFICATES_PATH: &str = "/automation/v1/certificates";
 
 /// Axum middleware enforcing [`required_scope`] against the
 /// authenticated principal.
@@ -360,6 +429,117 @@ mod tests {
         let reader = principal_carrying(vec![AutomationScope::LogsRead]);
         assert_eq!(
             through_the_layer(reader, "/automation/v1/environments").await,
+            http::StatusCode::FORBIDDEN
+        );
+    }
+
+    /// Every path of the read surface beside the scope it sits behind.
+    ///
+    /// The one list this file's read tests walk. It is the test's own
+    /// statement of the contract, deliberately spelled out here so a
+    /// path silently moved to another scope fails rather than agreeing
+    /// with itself.
+    const READ_SURFACE: &[(&str, AutomationScope)] = &[
+        ("/automation/v1/logs", AutomationScope::LogsRead),
+        ("/automation/v1/waf/events", AutomationScope::WafRead),
+        ("/automation/v1/waf/stats", AutomationScope::WafRead),
+        ("/automation/v1/sla/overview", AutomationScope::SlaRead),
+        ("/automation/v1/sla/routes/r-1", AutomationScope::SlaRead),
+        (
+            "/automation/v1/cluster/status",
+            AutomationScope::ClusterRead,
+        ),
+        ("/automation/v1/cluster/nodes", AutomationScope::ClusterRead),
+        (
+            "/automation/v1/cluster/nodes/n-1",
+            AutomationScope::ClusterRead,
+        ),
+        ("/automation/v1/backends", AutomationScope::BackendsRead),
+        ("/automation/v1/routes", AutomationScope::RoutesRead),
+        (
+            "/automation/v1/certificates",
+            AutomationScope::CertificatesRead,
+        ),
+    ];
+
+    #[test]
+    fn every_read_path_declares_its_scope_and_only_on_get() {
+        for (path, scope) in READ_SURFACE {
+            assert_eq!(
+                required_scope(&Method::GET, path),
+                Some(ScopeRequirement::Scope(*scope)),
+                "{path}"
+            );
+            // The read tier exists to be unable to change anything. A
+            // verb the router does not mount must inherit nothing from
+            // a rule written about a read.
+            for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+                assert_eq!(required_scope(&method, path), None, "{method} {path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_read_path_is_reachable_by_a_token_holding_every_other_scope() {
+        // Each path refused by the widest token that lacks exactly its
+        // own grant. Asserted through the layer, because the matrix
+        // agreeing with itself proves nothing about what a caller meets.
+        for (path, scope) in READ_SURFACE {
+            let everything_else: Vec<AutomationScope> = AutomationScope::ALL
+                .iter()
+                .copied()
+                .filter(|held| held != scope)
+                .collect();
+            assert_eq!(
+                through_the_layer(principal_carrying(everything_else), path).await,
+                http::StatusCode::FORBIDDEN,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deeper_read_path_stays_undeclared() {
+        // The collections that take one id take exactly one. Anything
+        // beyond it has no entry, and no entry is a 403 for every
+        // token, including one carrying every scope.
+        for path in [
+            "/automation/v1/sla/routes",
+            "/automation/v1/sla/routes/",
+            "/automation/v1/sla/routes/r-1/buckets",
+            "/automation/v1/cluster/nodes/n-1/activate",
+            "/automation/v1/waf/rules",
+            "/automation/v1/logs/export",
+            "/automation/v1/certificates/c-1",
+            "/automation/v1/routes/r-1",
+            "/automation/v1/backends/b-1",
+        ] {
+            assert_eq!(required_scope(&Method::GET, path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn the_openapi_gate_sees_the_same_scope_with_the_parameter_normalised() {
+        // `tests/openapi_contract.rs` asks with `{}` where the id is.
+        assert_eq!(
+            required_scope(&Method::GET, "/automation/v1/sla/routes/{}"),
+            Some(ScopeRequirement::Scope(AutomationScope::SlaRead))
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/automation/v1/cluster/nodes/{}"),
+            Some(ScopeRequirement::Scope(AutomationScope::ClusterRead))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_layer_lets_a_read_token_reach_its_own_path_and_nothing_else() {
+        let logs_only = principal_carrying(vec![AutomationScope::LogsRead]);
+        assert_eq!(
+            through_the_layer(logs_only.clone(), "/automation/v1/logs").await,
+            http::StatusCode::OK
+        );
+        assert_eq!(
+            through_the_layer(logs_only, "/automation/v1/waf/events").await,
             http::StatusCode::FORBIDDEN
         );
     }

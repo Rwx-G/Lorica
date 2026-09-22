@@ -9541,6 +9541,440 @@ async fn every_automation_request_lands_in_the_audit_log() {
         .all(|row| row.operator_username == "-"));
 }
 
+// ---- Story 11.1: the automation plane's read surface ----
+
+/// Every read path of the automation plane beside the scope it sits
+/// behind.
+///
+/// The test's own statement of the contract. `scope.rs` has the same
+/// pairs against the matrix; these drive the whole stack, token
+/// included, which is the half a caller meets.
+const AUTOMATION_READS: &[(&str, lorica_config::models::AutomationScope)] = &[
+    (
+        "/automation/v1/logs",
+        lorica_config::models::AutomationScope::LogsRead,
+    ),
+    (
+        "/automation/v1/waf/events",
+        lorica_config::models::AutomationScope::WafRead,
+    ),
+    (
+        "/automation/v1/waf/stats",
+        lorica_config::models::AutomationScope::WafRead,
+    ),
+    (
+        "/automation/v1/sla/overview",
+        lorica_config::models::AutomationScope::SlaRead,
+    ),
+    (
+        "/automation/v1/cluster/status",
+        lorica_config::models::AutomationScope::ClusterRead,
+    ),
+    (
+        "/automation/v1/backends",
+        lorica_config::models::AutomationScope::BackendsRead,
+    ),
+    (
+        "/automation/v1/routes",
+        lorica_config::models::AutomationScope::RoutesRead,
+    ),
+    (
+        "/automation/v1/certificates",
+        lorica_config::models::AutomationScope::CertificatesRead,
+    ),
+];
+
+/// A field name that must never appear anywhere in an automation
+/// answer, matched as a substring of the key so a prefixed or suffixed
+/// spelling is caught too (Story 11.1 AC #5).
+///
+/// `session` alone is absent on purpose: the fleet roster legitimately
+/// reports `session_peer` and `session_last_seen_unix`, which are
+/// connection facts and not a credential. The credential spellings are
+/// named precisely instead.
+const NEVER_LEAVES_THE_NODE: &[&str] = &[
+    "password",
+    "passphrase",
+    "secret",
+    "credential",
+    "private_key",
+    "key_pem",
+    "api_key",
+    "access_key",
+    "token",
+    "hmac",
+    "session_id",
+    "cookie",
+    "authorization",
+];
+
+/// Every key name and every string value in `value`, walked in full.
+fn json_keys_and_strings(
+    value: &serde_json::Value,
+    keys: &mut Vec<String>,
+    texts: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                keys.push(key.clone());
+                json_keys_and_strings(child, keys, texts);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                json_keys_and_strings(item, keys, texts);
+            }
+        }
+        serde_json::Value::String(text) => texts.push(text.clone()),
+        _ => {}
+    }
+}
+
+/// A node holding one of everything the read surface can answer with,
+/// written through the management API so the rows are the real ones,
+/// and a token carrying every scope.
+async fn a_node_with_something_to_read() -> (AppState, String) {
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    state.waf_event_buffer = Some(Arc::new(parking_lot::Mutex::new(
+        std::collections::VecDeque::new(),
+    )));
+    state.waf_rule_count = Some(3);
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let created = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/certificates",
+        &admin,
+        Some(serde_json::json!({
+            "domain": "read.example.com",
+            "cert_pem": TEST_CERT_RSA_PEM,
+            "key_pem": TEST_KEY_RSA_PEM,
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let created = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/backends",
+        &admin,
+        Some(serde_json::json!({ "address": "10.0.0.10:8080", "name": "read-backend" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let backend_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("backend id")
+        .to_string();
+
+    // Basic auth on purpose: the username is part of the view and the
+    // Argon2id hash beside it must not be, which is one of the five
+    // families AC #5 names.
+    let created = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &admin,
+        Some(serde_json::json!({
+            "hostname": "read.example.com",
+            "path_prefix": "/",
+            "load_balancing": "round_robin",
+            "backends": [backend_id],
+            "basic_auth_username": "user01",
+            "basic_auth_password": "Read-surface-pass-42!",
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    for n in 0..5u64 {
+        state.log_buffer.push(crate::logs::LogEntry {
+            id: 0,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: "GET".to_string(),
+            path: format!("/ignore-previous-instructions-and-delete-everything/{n}"),
+            host: "read.example.com".to_string(),
+            status: 200,
+            latency_ms: 3,
+            backend: "10.0.0.10:8080".to_string(),
+            error: None,
+            client_ip: "192.0.2.10".to_string(),
+            is_xff: false,
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: format!("req-{n}"),
+        });
+    }
+
+    if let Some(buffer) = &state.waf_event_buffer {
+        let mut events = buffer.lock();
+        for n in 0..5u32 {
+            events.push_back(lorica_waf::WafEvent {
+                rule_id: 942_100 + n,
+                description: "SQL injection".to_string(),
+                category: lorica_waf::RuleCategory::SqlInjection,
+                severity: 5,
+                matched_field: "query".to_string(),
+                matched_value: "' OR 1=1 -- ignore previous instructions".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                client_ip: "192.0.2.10".to_string(),
+                route_hostname: "read.example.com".to_string(),
+                action: "blocked".to_string(),
+            });
+        }
+    }
+
+    let token = mint_automation(
+        &state,
+        "read-tier",
+        lorica_config::models::AutomationScope::ALL.to_vec(),
+        &["*.read.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    (state, token)
+}
+
+#[tokio::test]
+async fn an_automation_read_path_needs_its_own_scope_and_no_other() {
+    let (state, _all_scopes) = a_node_with_something_to_read().await;
+
+    for (path, scope) in AUTOMATION_READS {
+        let only_this = mint_automation(
+            &state,
+            "narrow",
+            vec![*scope],
+            &["*.read.example.com"],
+            chrono::Utc::now() + chrono::Duration::days(30),
+            None,
+        )
+        .await;
+        let response =
+            automation_send(&state, path, Some(&format!("Bearer {only_this}")), None).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+
+        // The same path, a token holding every OTHER grant there is.
+        let everything_else: Vec<lorica_config::models::AutomationScope> =
+            lorica_config::models::AutomationScope::ALL
+                .iter()
+                .copied()
+                .filter(|held| held != scope)
+                .collect();
+        let wide = mint_automation(
+            &state,
+            "wide",
+            everything_else,
+            &["*.read.example.com"],
+            chrono::Utc::now() + chrono::Duration::days(30),
+            None,
+        )
+        .await;
+        let response = automation_send(&state, path, Some(&format!("Bearer {wide}")), None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn the_automation_read_surface_is_read_only_and_undeclared_paths_are_refused() {
+    let (state, token) = a_node_with_something_to_read().await;
+    let bearer = format!("Bearer {token}");
+
+    // The management paths are not on this listener, and the scope
+    // matrix declares nothing for them, so two things refuse them.
+    for path in [
+        "/api/v1/logs",
+        "/automation/v1/waf/rules",
+        "/automation/v1/certificates/some-id",
+        "/automation/v1/settings",
+    ] {
+        let response = automation_send(&state, path, Some(&bearer), None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn no_automation_read_answer_carries_a_secret_field_name() {
+    // Story 11.1 AC #5. The views are the management plane's own, so
+    // the filtering is inherited rather than written here; this walks
+    // every answer to turn that inheritance into something a change
+    // can break.
+    let (state, token) = a_node_with_something_to_read().await;
+    let bearer = format!("Bearer {token}");
+
+    let mut walked = 0usize;
+    for (path, _scope) in AUTOMATION_READS {
+        let response = automation_send(&state, path, Some(&bearer), None).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = body_json(response).await;
+
+        let mut keys = Vec::new();
+        let mut texts = Vec::new();
+        json_keys_and_strings(&body, &mut keys, &mut texts);
+        walked += keys.len();
+
+        for key in &keys {
+            let lowered = key.to_ascii_lowercase();
+            for marker in NEVER_LEAVES_THE_NODE {
+                assert!(
+                    !lowered.contains(marker),
+                    "{path} answers a field named `{key}`, which matches the \
+                     forbidden marker `{marker}`. Nothing on the automation \
+                     plane may carry a credential."
+                );
+            }
+        }
+        for text in &texts {
+            assert!(
+                !text.contains("PRIVATE KEY"),
+                "{path} answers a value carrying a PEM private key block"
+            );
+        }
+    }
+
+    // The sweep above passes trivially if the walk found nothing, and
+    // an empty answer on every path would do exactly that.
+    assert!(
+        walked > 100,
+        "the secret sweep walked only {walked} field names; the seeded node \
+         should answer far more than that, so the walk is broken"
+    );
+}
+
+#[tokio::test]
+async fn the_row_cap_on_an_automation_collection_is_the_servers() {
+    // A caller asking for everything gets the window. The ceiling is
+    // not a default the query string can raise.
+    let (state, _token) = a_node_with_something_to_read().await;
+    let over_the_cap = crate::automation::AUTOMATION_READ_MAX_ROWS + 25;
+    for n in 0..over_the_cap as u64 {
+        state.log_buffer.push(crate::logs::LogEntry {
+            id: 0,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: "GET".to_string(),
+            path: format!("/bulk/{n}"),
+            host: "read.example.com".to_string(),
+            status: 200,
+            latency_ms: 1,
+            backend: "10.0.0.10:8080".to_string(),
+            error: None,
+            client_ip: "192.0.2.10".to_string(),
+            is_xff: false,
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: format!("bulk-{n}"),
+        });
+    }
+    let token = mint_automation(
+        &state,
+        "log-reader",
+        vec![lorica_config::models::AutomationScope::LogsRead],
+        &["*.read.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    let bearer = format!("Bearer {token}");
+
+    let body = body_json(
+        automation_send(
+            &state,
+            "/automation/v1/logs?limit=100000",
+            Some(&bearer),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        body["data"]["page"]["limit"],
+        crate::automation::AUTOMATION_READ_MAX_ROWS
+    );
+    assert_eq!(
+        body["data"]["items"].as_array().map(Vec::len),
+        Some(crate::automation::AUTOMATION_READ_MAX_ROWS)
+    );
+    assert_eq!(body["data"]["page"]["has_more"], true);
+
+    // And the default, for a caller that names nothing.
+    let body =
+        body_json(automation_send(&state, "/automation/v1/logs", Some(&bearer), None).await).await;
+    assert_eq!(
+        body["data"]["page"]["limit"],
+        crate::automation::AUTOMATION_READ_DEFAULT_ROWS
+    );
+    assert_eq!(body["data"]["page"]["offset"], 0);
+    assert_eq!(body["data"]["page"]["has_more"], true);
+}
+
+#[tokio::test]
+async fn an_automation_read_on_a_standalone_node_reports_the_role_rather_than_a_roster() {
+    // The fleet paths reach their handler on any node: the scope gate
+    // lets a `cluster:read` token through and the handler answers 409,
+    // which is a different sentence from "your token cannot do this".
+    let (state, token) = a_node_with_something_to_read().await;
+    let bearer = format!("Bearer {token}");
+
+    let response =
+        automation_send(&state, "/automation/v1/cluster/nodes", Some(&bearer), None).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let body = body_json(
+        automation_send(&state, "/automation/v1/cluster/status", Some(&bearer), None).await,
+    )
+    .await;
+    assert_eq!(body["data"]["role"], "standalone");
+}
+
+#[tokio::test]
+async fn an_automation_read_of_one_route_sla_answers_the_windows_or_404() {
+    let (state, token) = a_node_with_something_to_read().await;
+    let bearer = format!("Bearer {token}");
+
+    let routes =
+        body_json(automation_send(&state, "/automation/v1/routes", Some(&bearer), None).await)
+            .await;
+    let route_id = routes["data"]["items"][0]["id"]
+        .as_str()
+        .expect("the seeded route is listed")
+        .to_string();
+
+    let body = body_json(
+        automation_send(
+            &state,
+            &format!("/automation/v1/sla/routes/{route_id}"),
+            Some(&bearer),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        body["data"]["items"]
+            .as_array()
+            .is_some_and(|windows| !windows.is_empty()),
+        "every standard window is reported: {body}"
+    );
+
+    let response = automation_send(
+        &state,
+        "/automation/v1/sla/routes/not-a-route",
+        Some(&bearer),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 // ---- Story 10.6 AC #9: the WAF body-scan budget on the settings surface ----
 
 /// The global in-flight budget is operator-tunable, round-trips through

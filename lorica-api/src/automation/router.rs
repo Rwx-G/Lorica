@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The automation router: `whoami` and the environment resource.
+//! The automation router: `whoami`, the environment resource and the
+//! read surface.
 //!
 //! `GET /automation/v1/whoami` exists so the whole chain - source
 //! filter, TLS, bearer verification, scope gate, audit - is testable
@@ -20,7 +21,8 @@
 //! nothing else, so it stays useful as the call an automation makes to
 //! check that its credential is still live and still carries what it
 //! expects. The environment paths (Story 10.4) live in
-//! [`super::environments`]; they are mounted here, and only here, so
+//! [`super::environments`] and the read paths (Story 11.1) in
+//! [`super::read`]; they are mounted here, and only here, so
 //! the OpenAPI drift gate in `tests/openapi_contract.rs` sees every
 //! automation route in one file.
 
@@ -129,6 +131,43 @@ pub fn build_automation_router(state: AppState) -> Router {
             get(get_environment)
                 .put(put_environment)
                 .delete(delete_environment),
+        )
+        // The read surface (Story 11.1). Every one of these is a
+        // wrapper over the management handler that already answers it;
+        // the scope each sits behind is declared in
+        // [`super::scope::required_scope`], without which it would be
+        // reachable by no token at all.
+        .route("/automation/v1/logs", get(super::read::list_logs))
+        .route(
+            "/automation/v1/waf/events",
+            get(super::read::list_waf_events),
+        )
+        .route("/automation/v1/waf/stats", get(super::read::waf_stats))
+        .route(
+            "/automation/v1/sla/overview",
+            get(super::read::sla_overview),
+        )
+        .route(
+            "/automation/v1/sla/routes/{id}",
+            get(super::read::route_sla),
+        )
+        .route(
+            "/automation/v1/cluster/status",
+            get(super::read::cluster_status),
+        )
+        .route(
+            "/automation/v1/cluster/nodes",
+            get(super::read::list_cluster_nodes),
+        )
+        .route(
+            "/automation/v1/cluster/nodes/{id}",
+            get(super::read::get_cluster_node),
+        )
+        .route("/automation/v1/backends", get(super::read::list_backends))
+        .route("/automation/v1/routes", get(super::read::list_routes))
+        .route(
+            "/automation/v1/certificates",
+            get(super::read::list_certificates),
         )
         .layer(axum::middleware::from_fn(super::scope::authorize_scope))
         .layer(axum::middleware::from_fn_with_state(
