@@ -618,11 +618,15 @@ local_total() {
 start_load_on() {
     # $1 = node name, $2 = API. Opens a window, creates the config,
     # starts it, closes the window. The session is the follower's.
+    # Publishes LOAD_CFG_ID for the caller, the way `login` publishes
+    # SESSION: the assertions below need it to ask the engine how many
+    # requests it really completed.
     API="$2"
     login "$(cat "$SHARED/$1_admin_password")"
     api_post /api/v1/cluster/break-glass '{"duration_s":120}' > /dev/null
     CFG=$(api_post /api/v1/loadtest/configs "{\"name\":\"fan-in-$1\",\"target_url\":\"http://127.0.0.1:8080/\",\"headers\":{\"Host\":\"${FLEET_HOST}\"},\"concurrency\":20,\"requests_per_second\":${LOAD_RPS},\"duration_s\":${LOAD_DURATION_S},\"error_threshold_pct\":100}")
     CFG_ID=$(echo "$CFG" | jq -r '.data.id // empty')
+    LOAD_CFG_ID="$CFG_ID"
     if [ -z "$CFG_ID" ]; then
         fail "$1: load-test config not created: $(echo "$CFG" | head -c 300)"
         return
@@ -644,6 +648,32 @@ wait_load_done() {
     return 1
 }
 
+requests_sent() {
+    # $1 = API, $2 = session, $3 = config id. The newest stored result
+    # for that config, and the request count the engine finished with.
+    #
+    # This is the denominator every assertion below needs. The load
+    # generator is Lorica's own engine running ON the node under test,
+    # so what it manages to send is a property of the machine the suite
+    # happens to run on, not of the fleet. Asserting against the
+    # REQUESTED rate measured the runner instead: on a contended CI
+    # runner the same commit produced 624 rows where a quiet one
+    # produced 17807, against a fixed threshold of 9000.
+    # The engine flips `active` to false and then stores its result, so
+    # a read that lands between the two sees an empty list. Poll for a
+    # short while rather than turning that window into the next flake.
+    for _ in $(seq 1 15); do
+        n=$(curl -sk -b "$2" "$1/api/v1/loadtest/results/$3" 2>/dev/null \
+            | jq -r '[(.data // [])[] | .total_requests] | max // 0')
+        case "$n" in
+            ''|*[!0-9]*) n=0 ;;
+        esac
+        [ "$n" -gt 0 ] && { echo "$n"; return 0; }
+        sleep 1
+    done
+    echo 0
+}
+
 # Baselines: this node's local rows and what the control plane holds.
 API="$EDGE_A_API"; login "$(cat "$SHARED/edge-a_admin_password")"; SESSION_A="$SESSION"
 API="$EDGE_B_API"; login "$(cat "$SHARED/edge-b_admin_password")"; SESSION_B="$SESSION"
@@ -652,8 +682,8 @@ B0_LOCAL=$(local_total "$EDGE_B_API" "$SESSION_B")
 A0_IN=$(ingested_for "$EDGE_A_ID"); A0_IN=${A0_IN:-0}
 B0_IN=$(ingested_for "$EDGE_B_ID"); B0_IN=${B0_IN:-0}
 
-start_load_on edge-a "$EDGE_A_API"
-start_load_on edge-b "$EDGE_B_API"
+start_load_on edge-a "$EDGE_A_API"; CFG_ID_A="$LOAD_CFG_ID"
+start_load_on edge-b "$EDGE_B_API"; CFG_ID_B="$LOAD_CFG_ID"
 LOAD_T0=$(date +%s)
 wait_load_done "$EDGE_A_API" "$SESSION_A" || fail "edge-a's load test did not finish"
 wait_load_done "$EDGE_B_API" "$SESSION_B" || fail "edge-b's load test did not finish"
@@ -663,12 +693,28 @@ A1_LOCAL=$(local_total "$EDGE_A_API" "$SESSION_A")
 B1_LOCAL=$(local_total "$EDGE_B_API" "$SESSION_B")
 A_ROWS=$((A1_LOCAL - A0_LOCAL)); B_ROWS=$((B1_LOCAL - B0_LOCAL))
 ELAPSED=$((LOAD_T1 - LOAD_T0)); [ "$ELAPSED" -gt 0 ] || ELAPSED=1
+A_SENT=$(requests_sent "$EDGE_A_API" "$SESSION_A" "$CFG_ID_A")
+B_SENT=$(requests_sent "$EDGE_B_API" "$SESSION_B" "$CFG_ID_B")
 log "edge-a wrote $A_ROWS rows, edge-b wrote $B_ROWS rows in ${ELAPSED}s ($(( (A_ROWS + B_ROWS) / ELAPSED )) rows/s across the fleet)"
-assert_json_gt "{\"n\":$A_ROWS}" '.n' $((LOAD_RPS * LOAD_DURATION_S / 2)) "edge-a served at least half the requested load locally"
+log "the engines sent $A_SENT and $B_SENT requests against ${LOAD_RPS}x${LOAD_DURATION_S} requested (the shortfall, if any, is the runner's)"
+
+# Two separate questions, because they have two different answers when
+# the machine is busy.
+#
+# First: did the load engine run at all? A zero here is a broken engine
+# or a refused start, and no ratio below would be meaningful.
+assert_json_gt "{\"n\":$A_SENT}" '.n' 0 "edge-a's load engine sent requests"
+assert_json_gt "{\"n\":$B_SENT}" '.n' 0 "edge-b's load engine sent requests"
+
+# Second, and this is what the phase exists for: did the node write a
+# row for what it actually served? Against what was SENT, never against
+# what was requested. A slow runner then shows up in the log line above
+# and fails nothing, while a node that drops rows still fails here.
+assert_json_gt "{\"n\":$A_ROWS}" '.n' $((A_SENT / 2)) "edge-a logged at least half of what its engine sent"
 # edge-b holds no route for this hostname (the selector names edge-a),
 # so its rows are 404s: still access rows, still fanned in, which is
 # what this phase measures.
-assert_json_gt "{\"n\":$B_ROWS}" '.n' $((LOAD_RPS * LOAD_DURATION_S / 2)) "edge-b (workers) logged at least half the requested load locally (404s by selector)"
+assert_json_gt "{\"n\":$B_ROWS}" '.n' $((B_SENT / 2)) "edge-b (workers) logged at least half of what its engine sent (404s by selector)"
 
 # The drain must close the gap: ingested delta within 5% of the local
 # delta, given time to catch up.
