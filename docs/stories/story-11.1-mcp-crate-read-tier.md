@@ -208,8 +208,12 @@ have to exist before a client of them means anything.
 - [ ] AC #1, the rest: configuration intake, endpoint and token from
       environment or config file, and a refusal with a clear message if
       either arrives on argv.
-- [ ] The protocol core: JSON-RPC framing, `initialize`, `tools/list`,
-      `tools/call`, error mapping. Transport-agnostic, no I/O in it.
+- [ ] The protocol core: JSON-RPC framing, `server/discover`,
+      `tools/list`, `tools/call`, error mapping. Transport-agnostic, no
+      I/O in it. **Not `initialize`**: that method belongs to the eras
+      this revision replaced, and the Dev Note "What revision
+      2026-07-28 actually requires" has the normative detail read from
+      the specification rather than from the PRD.
 - [ ] AC #3: startup introspection against `whoami`, tool registration
       from the returned scopes, and the no-scope case that produces a
       server with no tools and says why.
@@ -308,6 +312,69 @@ the scopeless token, because an operator cannot mint one.
 An unknown scope string fails to deserialise rather than being dropped,
 so a 1.9.0 token presented to a 1.8.0 node is refused outright. That is
 the intended behaviour and the upgrade note belongs in the changelog.
+
+### What revision 2026-07-28 actually requires
+
+Read from the specification pages on 2026-09-23, not from the PRD's
+summary of them. The PRD was written against a reading of 2026-09-16
+and is right in outline and wrong in one structural detail.
+
+**There is no `initialize` in this revision.** The lot 2 task below
+said the core implements "`initialize`, `tools/list`, `tools/call`".
+That is the shape of protocol versions up to and including 2025-11-25.
+In 2026-07-28 the handshake is gone and every request carries its own
+metadata in `_meta.io.modelcontextprotocol/*`: the protocol version,
+the client info, the client capabilities. The discovery call that
+replaces the handshake is **`server/discover`**, which answers a
+`DiscoverResult` carrying `supportedVersions`. The core methods this
+crate implements are therefore `server/discover`, `tools/list` and
+`tools/call`, plus `notifications/cancelled` on stdio.
+
+**The message directions are constrained.** Servers do not initiate
+JSON-RPC requests and clients do not send JSON-RPC responses. Anything
+the server needs from the client travels as an `InputRequiredResult`
+that the client answers by retrying the original call. The read tier
+needs none of that, but a core written as a general JSON-RPC peer would
+be building a direction the protocol forbids.
+
+**stdio framing.** One JSON-RPC message per line, newline-delimited,
+UTF-8, no embedded newlines. `stdout` carries nothing that is not a
+valid MCP message; `stderr` is free for logging and the client is told
+not to read anything into it. The server exits promptly when `stdin`
+closes or reads EOF: that is the portable graceful-shutdown signal.
+
+**Streamable HTTP, the parts that are MUST.** A single endpoint
+accepting POST. `Origin` validated on every connection, and a present
+but invalid one answered `403`. Every POST carries `MCP-Protocol-Version`,
+`Mcp-Method` (from `method`) and, for `tools/call`, `Mcp-Name` (from
+`params.name`). Each MUST equal its body counterpart; a mismatch, a
+missing required header or an invalid character is `400` with JSON-RPC
+error code **-32020** `HeaderMismatch`. A version the server does not
+implement is `400` with `UnsupportedProtocolVersionError` listing what
+it does support. An unknown method is **`404`** with `-32601`, which is
+not what a JSON-RPC server usually does and is deliberate: it lets a
+client tell a modern server from a legacy one. A notification POST is
+`202` with no body, though this revision defines no client-to-server
+notification over HTTP.
+
+**Header values may be Base64-sentinel encoded** as `=?base64?...?=`
+when they cannot be plain ASCII, and a server MUST decode before
+comparing to the body. Comparing the raw header to the body instead
+would make the mismatch check bypassable, which is the whole reason the
+check exists.
+
+**What this revision removed, and what to answer if it arrives.** No
+protocol-level sessions, no standalone GET stream, no `Last-Event-ID`
+resumability. `GET` or `DELETE` on the endpoint answers `405`. An
+`Mcp-Session-Id` header is ignored and never echoed. A `Last-Event-ID`
+is ignored.
+
+**Decision taken here:** this crate implements 2026-07-28 and nothing
+else. No `initialize` fallback for older clients, no legacy era. AC #11
+already requires the crate to state its revision, and a second era
+would double the surface that has to stay correct against attacker-fed
+text. Whether to also speak the `initialize` era for clients that have
+not moved is a product decision, and it is open.
 
 ### AC #1 and AC #9 are not in conflict
 
