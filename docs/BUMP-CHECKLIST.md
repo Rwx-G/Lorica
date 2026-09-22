@@ -148,6 +148,20 @@ cargo test <the README product-crate list> 2>&1 \
 grep -c 'description: "' lorica-waf/src/rules.rs
 grep -rn 'OWASP-inspired\|OWASP CRS' README.md COMPARISON.md docs/
 
+# Crate counts quoted in README.md and CONTRIBUTING.md ("a Rust
+# workspace with N crates: F forked from Cloudflare Pingora and P
+# product crates"). They drift the day a workspace member is added and
+# nothing recomputes them. Derive all three rather than editing one:
+# a forked crate is pinned below the product line, a product crate
+# follows it. `tinyufo` is forked and carries its own upstream version,
+# so counting "not 0.1.0" as product is wrong by one.
+for d in $(sed -n '/^members = \[/,/^]/p' Cargo.toml \
+    | grep -o '"[^"]*"' | tr -d '"'); do
+  printf "%-22s %s\n" "$d" \
+    "$(grep -m1 '^version' "$d/Cargo.toml" | cut -d'"' -f2)"
+done | sort -k2
+grep -n 'workspace with .* crates' README.md CONTRIBUTING.md
+
 # IP blocklist size (~80k today, sourced from Data-Shield IPv4
 # Blocklist). The ~80k figure tracks the upstream feed ; if a
 # major refresh moves the count by an order of magnitude, the

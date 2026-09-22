@@ -351,7 +351,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 ## Architecture
 
-Lorica is a Rust workspace with 31 crates: 16 forked from Cloudflare Pingora and 15 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
+Lorica is a Rust workspace with 32 crates: 16 forked from Cloudflare Pingora and 16 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
 
 | Crate | Purpose |
 |-------|---------|
