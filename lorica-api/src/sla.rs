@@ -595,17 +595,30 @@ pub async fn clear_route_sla(
     })))
 }
 
-/// This node's own 1h and 24h passive summaries for every route it
-/// holds.
+/// This node's own 1h and 24h passive summaries, two rows per route,
+/// stopping once `wanted` of them exist.
 ///
 /// Split out of [`get_sla_overview`] for the reason given on
 /// [`local_route_sla`]: the automation plane reads the same figures
 /// through the same computation, and `?node=` stays in the handler.
 ///
+/// `wanted` is what makes that split affordable. Every summary is two
+/// synchronous SQL passes, and the whole loop runs inside ONE
+/// acquisition of the process-wide config-store mutex, so computing
+/// every route's figures to answer `?limit=1` held that lock against
+/// configuration writes and the replication round for `2R` queries.
+/// `None` asks for all of them and is what the management overview
+/// wants; a paginating caller passes its window and the loop stops one
+/// route past it. The overshoot is deliberate: the caller's `has_more`
+/// is answered by a row existing past the window.
+///
 /// # Errors
 ///
 /// The store's error text.
-pub(crate) async fn local_sla_overview(state: &AppState) -> Result<Vec<SlaSummary>, ApiError> {
+pub(crate) async fn local_sla_overview(
+    state: &AppState,
+    wanted: Option<usize>,
+) -> Result<Vec<SlaSummary>, ApiError> {
     // One store acquisition for the whole overview, as before the
     // blocking-pool migration: every per-route summary runs inside a
     // single closure.
@@ -619,6 +632,9 @@ pub(crate) async fn local_sla_overview(state: &AppState) -> Result<Vec<SlaSummar
         let mut overview = Vec::new();
         let from_1h = now - Duration::hours(1);
         for route in &routes {
+            if wanted.is_some_and(|wanted| overview.len() >= wanted) {
+                break;
+            }
             let summary_1h = store
                 .compute_sla_summary(&route.id, &from_1h, &now, "1h", "passive")
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -650,5 +666,5 @@ pub async fn get_sla_overview(
         let summaries: Vec<SlaSummary> = ack.summaries.into_iter().map(summary_from_wire).collect();
         return Ok(json_data(summaries));
     }
-    Ok(json_data(local_sla_overview(&state).await?))
+    Ok(json_data(local_sla_overview(&state, None).await?))
 }

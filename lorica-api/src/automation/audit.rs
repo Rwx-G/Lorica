@@ -320,6 +320,42 @@ fn action_for(outcome_word: &str, reason: Option<&str>) -> String {
     }
 }
 
+/// The names of the query parameters one request carried, sorted, with
+/// no value.
+///
+/// Story 9.9 forbids storing payloads and that decision stands, so the
+/// values never reach a row. The names still answer the question a
+/// reader of the trail has on a READ surface: `GET
+/// /automation/v1/logs` alone says a token read the log, and nothing
+/// about whether it read one route, one status band or every row in a
+/// search. The names are a vocabulary the caller chooses, so they are
+/// bounded on both counts: a long name cannot bloat the row and a flood
+/// of them cannot lengthen it without limit.
+fn query_parameter_names(query: Option<&str>) -> String {
+    const MAX_NAMES: usize = 16;
+    const MAX_NAME_BYTES: usize = 32;
+
+    let Some(query) = query.filter(|q| !q.is_empty()) else {
+        return String::new();
+    };
+    let mut names: Vec<&str> = query
+        .split('&')
+        .filter_map(|pair| pair.split('=').next())
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            let cut = (0..=name.len().min(MAX_NAME_BYTES))
+                .rev()
+                .find(|end| name.is_char_boundary(*end))
+                .unwrap_or(0);
+            &name[..cut]
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.truncate(MAX_NAMES);
+    format!("?{}", names.join(","))
+}
+
 /// Axum middleware recording one audit row per automation request.
 pub async fn audit_automation_request(
     State(state): State<AppState>,
@@ -328,6 +364,7 @@ pub async fn audit_automation_request(
 ) -> Response {
     let method: Method = req.method().clone();
     let path: String = req.uri().path().to_string();
+    let filters: String = query_parameter_names(req.uri().query());
     let ip: String = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -349,6 +386,14 @@ pub async fn audit_automation_request(
     // the log never disagree on what a request was.
     let outcome_word: &'static str = outcome(response.status());
     crate::metrics::inc_automation_request(outcome_word);
+    // Labelled by the TEMPLATE the matrix declares, never the raw path:
+    // a route id is the caller's own text and would be a new time
+    // series per value. An undeclared path is one bucket, which is also
+    // the shape a scan of the plane produces.
+    crate::metrics::inc_automation_request_by_path(
+        super::scope::path_template(&method, &path).unwrap_or("undeclared"),
+        outcome_word,
+    );
 
     // The principal's two halves share one column because the audit
     // row has one principal field and an automation principal has two
@@ -378,7 +423,7 @@ pub async fn audit_automation_request(
         &state,
         &ctx,
         &action_for(outcome_word, reason.as_deref()),
-        (AUTOMATION_TARGET_TYPE, &format!("{method} {path}")),
+        (AUTOMATION_TARGET_TYPE, &format!("{method} {path}{filters}")),
         None,
         None,
     )
@@ -551,6 +596,31 @@ mod tests {
             "automation.request.unauthenticated:bound_claim_mismatch:environment_protected"
         );
         assert_eq!(longest.len(), 77);
+    }
+
+    #[test]
+    fn the_audit_target_names_the_filters_used_and_never_their_values() {
+        // What separates two reads of the same path in the trail. The
+        // values stay out (Story 9.9), so a search string an operator
+        // typed and an attacker's payload are equally absent.
+        assert_eq!(
+            query_parameter_names(Some("limit=50&search=ignore%20previous&offset=0")),
+            "?limit,offset,search"
+        );
+        assert_eq!(query_parameter_names(Some("category=xss")), "?category");
+        // Repeats collapse; a bare flag still names itself.
+        assert_eq!(query_parameter_names(Some("a=1&a=2&b")), "?a,b");
+        assert_eq!(query_parameter_names(None), "");
+        assert_eq!(query_parameter_names(Some("")), "");
+
+        // The names are the caller's own text, so neither their length
+        // nor their number can stretch the row.
+        let flood: String = (0..64)
+            .map(|n| format!("{}{n}=1&", "x".repeat(100)))
+            .collect();
+        let recorded = query_parameter_names(Some(&flood));
+        assert!(recorded.len() < 600, "{} bytes", recorded.len());
+        assert!(!recorded.contains(&"x".repeat(40)), "{recorded}");
     }
 
     #[test]

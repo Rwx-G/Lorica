@@ -219,6 +219,295 @@ fn automation_openapi_declares_the_scope_the_gate_enforces() {
     }
 }
 
+/// The automation reads whose query vocabulary is the management
+/// plane's, and the struct each one takes it from.
+///
+/// `(path, source file, struct name)`. The read surface reuses these
+/// filter structs verbatim so it never owns a filter vocabulary of its
+/// own, which means the published document is a TRANSCRIPTION of Rust
+/// field names: a filter added to the dashboard's log query becomes an
+/// undocumented parameter of a network-facing API, and a renamed one
+/// makes the document false, with nothing red in between. The test
+/// below is what turns red.
+const AUTOMATION_REUSED_QUERIES: &[(&str, &str, &str)] = &[
+    ("/automation/v1/logs", "/src/logs.rs", "LogsQuery"),
+    ("/automation/v1/waf/events", "/src/waf.rs", "WafEventsQuery"),
+    (
+        "/automation/v1/routes",
+        "/src/routes/crud.rs",
+        "ListRoutesQuery",
+    ),
+];
+
+/// The page parameters every automation collection adds to whatever
+/// filters it reuses.
+///
+/// `limit` is named by both sides: the filter structs carry one and
+/// this surface overrides it with its own window, so the documented
+/// parameter is the page's whatever the struct says.
+const PAGE_PARAMETERS: &[&str] = &["limit", "offset"];
+
+#[test]
+fn automation_openapi_documents_the_query_vocabulary_the_handlers_reuse() {
+    let spec_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/openapi-automation.yaml"
+    ));
+    let sources: BTreeMap<&str, &str> = BTreeMap::from([
+        (
+            "/src/logs.rs",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/logs.rs")),
+        ),
+        (
+            "/src/waf.rs",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/waf.rs")),
+        ),
+        (
+            "/src/routes/crud.rs",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/crud.rs")),
+        ),
+    ]);
+
+    let components = extract_parameter_components(spec_src);
+    assert!(
+        !components.is_empty(),
+        "parameter-component extraction looks broken: no entry found under \
+         components.parameters in openapi-automation.yaml"
+    );
+    let documented = extract_operation_query_parameters(spec_src, &components);
+    assert!(
+        !documented.is_empty(),
+        "query-parameter extraction looks broken: no documented query parameter \
+         found in openapi-automation.yaml"
+    );
+
+    for (path, file, struct_name) in AUTOMATION_REUSED_QUERIES {
+        let src = sources.get(file).expect("the source is included above");
+        let mut expected: BTreeSet<String> = serde_field_names(src, struct_name);
+        assert!(
+            !expected.is_empty(),
+            "field extraction looks broken: no field found in `pub struct {struct_name}` \
+             in {file}. The scan expects `pub struct {struct_name} {{` and `pub <name>:` \
+             lines until the closing brace."
+        );
+        expected.extend(PAGE_PARAMETERS.iter().map(|p| (*p).to_string()));
+
+        let key = ("GET".to_string(), (*path).to_string());
+        let actual: &BTreeSet<String> = documented
+            .get(&key)
+            .unwrap_or_else(|| panic!("{path} documents no query parameters at all"));
+
+        let missing: Vec<&String> = expected.difference(actual).collect();
+        let extra: Vec<&String> = actual.difference(&expected).collect();
+        if !missing.is_empty() || !extra.is_empty() {
+            let mut msg = format!("\nAutomation query-parameter drift on GET {path}.\n");
+            msg.push_str(&format!(
+                "\nAccepted by {struct_name} ({file}) and undocumented ({}):\n",
+                missing.len()
+            ));
+            for name in &missing {
+                msg.push_str(&format!("  {name}\n"));
+            }
+            msg.push_str(&format!(
+                "\nDocumented and not a field of {struct_name} ({}):\n",
+                extra.len()
+            ));
+            for name in &extra {
+                msg.push_str(&format!("  {name}\n"));
+            }
+            msg.push_str(
+                "\nThe automation read takes this filter struct verbatim, so the struct \
+                 is the contract and the document restates it. Add the parameter to \
+                 openapi-automation.yaml, or remove the stale entry. A filter the \
+                 handler accepts and the document omits is an undocumented parameter of \
+                 a network-facing API; one the document names and the handler ignores \
+                 is a promise nothing keeps.\n",
+            );
+            panic!("{msg}");
+        }
+    }
+}
+
+/// Each `components.parameters` entry as `component name -> (name, in)`.
+fn extract_parameter_components(yaml: &str) -> BTreeMap<String, (String, String)> {
+    let mut out: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut in_components = false;
+    let mut in_parameters = false;
+    let mut current: Option<String> = None;
+
+    for line in yaml.lines() {
+        let first = line.as_bytes().first().copied();
+        if let Some(c) = first {
+            if c != b' ' && c != b'#' {
+                in_components = line.starts_with("components:");
+                in_parameters = false;
+                current = None;
+                continue;
+            }
+        } else {
+            continue;
+        }
+        if !in_components {
+            continue;
+        }
+
+        if let Some(rest) = strip_exact_indent(line, 2) {
+            in_parameters = rest.trim_end() == "parameters:";
+            current = None;
+            continue;
+        }
+        if !in_parameters {
+            continue;
+        }
+
+        if let Some(rest) = strip_exact_indent(line, 4) {
+            current = rest.trim_end().strip_suffix(':').map(str::to_string);
+            continue;
+        }
+        if let (Some(rest), Some(component)) = (strip_exact_indent(line, 6), current.as_ref()) {
+            let entry = out
+                .entry(component.clone())
+                .or_insert_with(|| (String::new(), String::new()));
+            if let Some(value) = rest.trim_end().strip_prefix("name:") {
+                entry.0 = value.trim().to_string();
+            } else if let Some(value) = rest.trim_end().strip_prefix("in:") {
+                entry.1 = value.trim().to_string();
+            }
+        }
+    }
+    out
+}
+
+/// The `in: query` parameter names each operation documents, `$ref`s to
+/// `components.parameters` resolved.
+fn extract_operation_query_parameters(
+    yaml: &str,
+    components: &BTreeMap<String, (String, String)>,
+) -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut out: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    let mut in_paths = false;
+    let mut current_path: Option<String> = None;
+    let mut current_method: Option<String> = None;
+    let mut in_parameters = false;
+    let mut pending: Option<String> = None;
+
+    for line in yaml.lines() {
+        let first = line.as_bytes().first().copied();
+        if let Some(c) = first {
+            if c != b' ' && c != b'#' {
+                in_paths = line.starts_with("paths:");
+                current_path = None;
+                current_method = None;
+                in_parameters = false;
+                pending = None;
+                continue;
+            }
+        } else {
+            continue;
+        }
+        if !in_paths {
+            continue;
+        }
+
+        if let Some(rest) = strip_exact_indent(line, 2) {
+            if let Some(key) = rest.trim_end().strip_suffix(':') {
+                if key.starts_with('/') {
+                    current_path = Some(normalize_path(key));
+                    current_method = None;
+                }
+            }
+            in_parameters = false;
+            pending = None;
+            continue;
+        }
+
+        if let Some(rest) = strip_exact_indent(line, 4) {
+            let key = rest.trim_end().strip_suffix(':').unwrap_or("");
+            current_method = HTTP_METHODS.contains(&key).then(|| key.to_uppercase());
+            in_parameters = false;
+            pending = None;
+            continue;
+        }
+
+        if let Some(rest) = strip_exact_indent(line, 6) {
+            in_parameters = rest.trim_end() == "parameters:";
+            pending = None;
+            continue;
+        }
+        if !in_parameters {
+            continue;
+        }
+
+        let (Some(path), Some(method)) = (&current_path, &current_method) else {
+            continue;
+        };
+        let key = (method.clone(), path.clone());
+
+        if let Some(rest) = strip_exact_indent(line, 8) {
+            pending = None;
+            let item = rest.trim_end();
+            if let Some(reference) = item.strip_prefix("- $ref:") {
+                let component = reference
+                    .trim()
+                    .trim_matches('"')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default();
+                if let Some((name, location)) = components.get(component) {
+                    if location == "query" {
+                        out.entry(key).or_default().insert(name.clone());
+                    }
+                }
+            } else if let Some(name) = item.strip_prefix("- name:") {
+                pending = Some(name.trim().to_string());
+            }
+            continue;
+        }
+
+        if let (Some(rest), Some(name)) = (strip_exact_indent(line, 10), pending.as_ref()) {
+            if let Some(location) = rest.trim_end().strip_prefix("in:") {
+                if location.trim() == "query" {
+                    out.entry(key).or_default().insert(name.clone());
+                }
+                pending = None;
+            }
+        }
+    }
+    out
+}
+
+/// The wire names of every field of `pub struct <name>` in `src`.
+///
+/// A `#[serde(rename = "...")]` on a field wins, the way it does on the
+/// wire; everything else is the identifier.
+fn serde_field_names(src: &str, struct_name: &str) -> BTreeSet<String> {
+    let opening = format!("pub struct {struct_name} {{");
+    let Some((_, body)) = src.split_once(&opening) else {
+        return BTreeSet::new();
+    };
+    let Some((body, _)) = body.split_once("\n}") else {
+        return BTreeSet::new();
+    };
+
+    let mut out = BTreeSet::new();
+    let mut renamed: Option<String> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("#[serde(rename = \"") {
+            renamed = rest.split('"').next().map(str::to_string);
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("pub ") else {
+            continue;
+        };
+        let Some((name, _)) = rest.split_once(':') else {
+            continue;
+        };
+        out.insert(renamed.take().unwrap_or_else(|| name.trim().to_string()));
+    }
+    out
+}
+
 /// The `x-required-scope` value that documents a path any authenticated
 /// caller reaches.
 ///

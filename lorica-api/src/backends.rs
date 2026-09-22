@@ -191,17 +191,60 @@ async fn get_ewma_score_async(state: &crate::server::AppState, addr: &str) -> f6
     0.0
 }
 
+/// Every worker's EWMA scores and connection counts, merged once.
+///
+/// The per-backend lookups above each rebuild one of these maps from
+/// every worker's own map, so a listing of `B` backends used to run the
+/// merge `2B` times over the same data, behind `2B` sequential
+/// acquisitions of the worker-metrics lock. Built once and read `B`
+/// times instead. Empty in single-process mode, where the direct
+/// counters answer and no merge is needed.
+struct MergedWorkerMetrics {
+    ewma: std::collections::HashMap<String, f64>,
+    connections: std::collections::HashMap<String, u64>,
+}
+
+impl MergedWorkerMetrics {
+    async fn collect(state: &AppState) -> Self {
+        match state.aggregated_metrics() {
+            Some(agg) => Self {
+                ewma: agg.merged_ewma_scores().await,
+                connections: agg.merged_backend_connections().await,
+            },
+            None => Self {
+                ewma: std::collections::HashMap::new(),
+                connections: std::collections::HashMap::new(),
+            },
+        }
+    }
+}
+
 /// GET /api/v1/backends - list every backend with its live EWMA score and active connection count.
 pub async fn list_backends(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let backends = db_blocking(&state.store, move |store| store.list_backends()).await?;
-    let mut responses = Vec::with_capacity(backends.len());
-    for b in &backends {
-        let score = get_ewma_score_async(&state, &b.address).await;
-        let conns = get_backend_connections_async(&state, &b.address).await;
-        responses.push(backend_to_response(b, score, conns));
-    }
+    let merged = MergedWorkerMetrics::collect(&state).await;
+    let responses: Vec<BackendResponse> = backends
+        .iter()
+        .map(|b| {
+            // Same precedence as the single-backend lookups: the direct
+            // counters when this process owns them, the supervisor's
+            // merged view otherwise, zero when neither knows the
+            // address.
+            let score = state
+                .ewma_scores()
+                .and_then(|scores| scores.get(&b.address).map(|s| *s))
+                .or_else(|| merged.ewma.get(&b.address).copied())
+                .unwrap_or(0.0);
+            let conns = state
+                .backend_connections()
+                .map(|bc| bc.get(&b.address) as i32)
+                .or_else(|| merged.connections.get(&b.address).map(|c| *c as i32))
+                .unwrap_or(0);
+            backend_to_response(b, score, conns)
+        })
+        .collect();
     Ok(json_data(serde_json::json!({ "backends": responses })))
 }
 

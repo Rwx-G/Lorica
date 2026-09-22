@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! The automation plane's read surface (Story 11.1): logs, WAF events
-//! and stats, SLA, cluster and node status, backends, routes and
-//! certificate metadata, each behind its own scope.
+//! and stats, SLA, cluster status, backends, routes and certificate
+//! metadata, each behind its own scope.
 //!
 //! # Why this exists at all
 //!
@@ -32,16 +32,33 @@
 //! Two surfaces that compute the same answer independently drift, and
 //! the drift shows up as a field one of them stopped stripping, which
 //! is a leak nobody's test notices. The rows cross unchanged; what this
-//! module adds is the window around them.
+//! module adds is the window around them, and the ordering the window
+//! walks.
 //!
 //! # The window is the server's, not the caller's
 //!
 //! Every collection answers `{"items": [...], "page": {...}}`, and the
-//! page is bounded by [`AUTOMATION_READ_MAX_ROWS`] whatever `?limit=`
-//! says. The caller of this surface is a language model asking on an
-//! operator's behalf, and a model that asks for everything must not be
-//! able to pull the access log into a context window. A ceiling the
-//! caller can raise is not a ceiling.
+//! page is bounded twice: by [`AUTOMATION_READ_MAX_ROWS`] whatever
+//! `?limit=` says, and by [`AUTOMATION_READ_MAX_ANSWER_BYTES`] whatever
+//! the rows weigh. The caller of this surface is a language model
+//! asking on an operator's behalf, and a model that asks for everything
+//! must not be able to pull the access log into a context window. A
+//! ceiling the caller can raise is not a ceiling, and a ceiling that
+//! counts rows does not bound an answer whose fields are
+//! attacker-authored and unbounded.
+//!
+//! # A window this surface cannot reach is a refusal, never an empty
+//! page
+//!
+//! Two of the sources clamp their own row budget
+//! ([`crate::logs::LOGS_QUERY_MAX_ROWS`],
+//! [`crate::waf::WAF_EVENTS_MAX_ROWS`]). Past that clamp an
+//! offset-based read gets fewer rows than the window starts at, so the
+//! honest-looking answer is `{"items": [], "has_more": false}` while
+//! the table still holds thousands of rows. That is the one failure an
+//! operator, or a model paginating on `has_more`, reads as "there was
+//! nothing". Such an offset is a 400 naming the depth instead: see
+//! [`PageQuery::page_within`].
 //!
 //! # No secret crosses this boundary
 //!
@@ -49,13 +66,16 @@
 //! too: certificate key material never leaves [`crate::certificates`]'s
 //! list view, and a route's Basic-auth hash never leaves
 //! [`crate::routes`]'s. That is an inherited property and not a
-//! promise, so `lorica-api/src/tests.rs` walks every response this
-//! module can produce for the field names that must never appear
-//! (Story 11.1 AC #5).
+//! promise, so `lorica-api/src/tests.rs` walks every path
+//! [`super::scope`] declares - the list it walks is derived from that
+//! matrix, not retyped beside it - for the field names that must never
+//! appear (Story 11.1 AC #5), and pins the whole set of key names each
+//! answer carries against a committed list, so a field added to a
+//! management view reaches this plane only by someone deciding it
+//! should.
 
 use axum::extract::{Extension, Path, Query};
 use axum::Json;
-use lorica_config::models::Role;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -71,16 +91,27 @@ pub const AUTOMATION_READ_MAX_ROWS: usize = 200;
 /// The window size when the caller names none.
 pub const AUTOMATION_READ_DEFAULT_ROWS: usize = 50;
 
-/// The RBAC role an automation credential stands in for when a
-/// management view gates a field on one.
+/// The most bytes of row data one automation answer carries.
 ///
-/// The fleet roster hides each node's host telemetry (CPU, memory,
-/// disk) below `Operator`. An automation credential carries scopes and
-/// no role, and the scope vocabulary has no way to say "this one is an
-/// operator", so reading a higher role into `cluster:read` would hand
-/// every such token a view an operator deliberately kept for operators.
-/// The floor is the only answer that cannot be wrong.
-const AUTOMATION_VIEW_ROLE: Role = Role::Viewer;
+/// [`AUTOMATION_READ_MAX_ROWS`] counts rows, and the fields those rows
+/// carry are attacker-authored and unbounded: a WAF event's matched
+/// value is the raw regex match, truncated neither when it is recorded
+/// nor when it is read. A row ceiling alone therefore does not bound
+/// what AC #4 exists to bound. Rows are dropped whole rather than
+/// truncated, so no field ever arrives mangled: the answer comes back
+/// with `returned` short of `limit` and `has_more` true, which is the
+/// signal a pager already reads.
+pub const AUTOMATION_READ_MAX_ANSWER_BYTES: usize = 256 * 1024;
+
+/// The most bytes a caller may put in one free-text filter.
+///
+/// `?search=` becomes five unanchored `LIKE` predicates and a
+/// `COUNT(*)` over the whole retained access log, so its length is a
+/// per-request cost the caller chooses. The management plane takes it
+/// from a dashboard field behind a session; this one takes it off-box
+/// behind a token the router gives no per-request budget. Long enough
+/// for a request id, a hostname or a user-agent fragment.
+const AUTOMATION_READ_MAX_FILTER_BYTES: usize = 256;
 
 /// `?limit=` and `?offset=` on any automation collection.
 ///
@@ -108,8 +139,12 @@ struct Page {
 /// No total: the sources behind this surface count differently (the
 /// log store counts every match, the WAF buffer counts what it
 /// returned, a store listing counts rows), and one field meaning three
-/// things is worse than no field. `has_more` is exact everywhere,
-/// because every source is asked for one row past the window.
+/// things is worse than no field.
+///
+/// `returned` and not `limit` is what a pager advances `offset` by. The
+/// two are usually equal, and are not when the byte ceiling
+/// ([`AUTOMATION_READ_MAX_ANSWER_BYTES`]) ended the answer early;
+/// advancing by `limit` would then step over the rows that did not fit.
 #[derive(Debug, Serialize)]
 struct PageInfo {
     limit: usize,
@@ -119,7 +154,11 @@ struct PageInfo {
 }
 
 impl PageQuery {
-    /// This query's window, clamped.
+    /// This query's window over a source that answers its own full
+    /// listing: routes, backends, certificates, SLA.
+    ///
+    /// An offset past the end of one of those is an empty window and an
+    /// honest one, because the source really held nothing there.
     fn page(&self) -> Page {
         Page {
             limit: self
@@ -128,6 +167,35 @@ impl PageQuery {
                 .clamp(1, AUTOMATION_READ_MAX_ROWS),
             offset: self.offset.unwrap_or(0),
         }
+    }
+
+    /// This query's window over a source that clamps its own row budget
+    /// at `depth`, refusing an offset that clamp cannot honour.
+    ///
+    /// Two things ride on the refusal. It is what makes `has_more`
+    /// mean something on a clamped source: every window this returns is
+    /// one the source can fill, so a `false` is the end of the data and
+    /// not the end of the reach. And it is what bounds `offset`, which
+    /// is otherwise the caller's lever on how much work the node does
+    /// per request: `scan()` feeds the source's own limit, so an
+    /// unbounded offset turns a 50-row answer into a 10 000-row fetch
+    /// under the mutex the audit drain shares.
+    ///
+    /// # Errors
+    ///
+    /// `BadRequest` naming the deepest offset this limit can reach.
+    fn page_within(&self, depth: usize) -> Result<Page, ApiError> {
+        let page = self.page();
+        if page.scan() > depth {
+            let deepest = depth.saturating_sub(page.limit).saturating_sub(1);
+            return Err(ApiError::BadRequest(format!(
+                "this read reaches at most {depth} rows, so with limit={} the deepest \
+                 window starts at offset={deepest}. Narrow the read with its filters \
+                 rather than paging past that.",
+                page.limit
+            )));
+        }
+        Ok(page)
     }
 }
 
@@ -141,17 +209,28 @@ impl Page {
 
     /// Wrap `rows` in the paginated envelope this surface answers with.
     fn of(self, rows: Vec<Value>) -> Json<Value> {
-        let has_more = rows.len() > self.offset.saturating_add(self.limit);
-        let items: Vec<Value> = rows
-            .into_iter()
-            .skip(self.offset)
-            .take(self.limit)
-            .collect();
+        let beyond_the_window = rows.len() > self.offset.saturating_add(self.limit);
+        let mut budget = AUTOMATION_READ_MAX_ANSWER_BYTES;
+        let mut short_of_the_window = false;
+        let mut items: Vec<Value> = Vec::new();
+        for row in rows.into_iter().skip(self.offset).take(self.limit) {
+            let cost = serde_json::to_string(&row).map_or(0, |text| text.len());
+            // The first row crosses whatever it weighs. An answer with
+            // nothing in it is the one shape a reader takes for "there
+            // was nothing", and a single oversized row is exactly the
+            // row an operator is looking for.
+            if cost > budget && !items.is_empty() {
+                short_of_the_window = true;
+                break;
+            }
+            budget = budget.saturating_sub(cost);
+            items.push(row);
+        }
         let page = PageInfo {
             limit: self.limit,
             offset: self.offset,
             returned: items.len(),
-            has_more,
+            has_more: beyond_the_window || short_of_the_window,
         };
         json_data(serde_json::json!({ "items": items, "page": page }))
     }
@@ -181,6 +260,37 @@ fn rows(answer: Json<Value>, field: Option<&str>) -> Result<Vec<Value>, ApiError
     }
 }
 
+/// Refuse a free-text filter longer than this surface accepts.
+///
+/// `name` is this module's own vocabulary, never the caller's text, so
+/// the refusal reflects nothing back at the model that reads it.
+///
+/// # Errors
+///
+/// `BadRequest` when `value` is over the ceiling.
+fn within_the_filter_ceiling(name: &str, value: Option<&str>) -> Result<(), ApiError> {
+    match value {
+        Some(text) if text.len() > AUTOMATION_READ_MAX_FILTER_BYTES => Err(ApiError::BadRequest(
+            format!("?{name}= accepts at most {AUTOMATION_READ_MAX_FILTER_BYTES} bytes here"),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The same refusal, with any identifier the caller supplied removed.
+///
+/// The management plane echoes the id back ("route `<id>`"), which is
+/// the right answer for a dashboard toast. Here the reader is a
+/// language model and the echoed span is whatever the caller put in the
+/// path, so the refusal names the class of thing and nothing the caller
+/// chose.
+fn without_the_callers_echo(error: ApiError) -> ApiError {
+    match error {
+        ApiError::NotFound(_) => ApiError::NotFound("this node holds no route with that id".into()),
+        other => other,
+    }
+}
+
 /// `GET /automation/v1/logs` (scope `logs:read`).
 ///
 /// The access log with the filters the dashboard already offers, taken
@@ -189,41 +299,62 @@ fn rows(answer: Json<Value>, field: Option<&str>) -> Result<Vec<Value>, ApiError
 /// the query's: whatever the caller asks for, the store is read one row
 /// past the window and no further.
 ///
-/// `after_id` is the stable cursor for a log that is still growing;
-/// `offset` walks within the answer the filters produced.
+/// Rows come back newest first, so `offset` walks backwards in time and
+/// page one is what just happened. `after_id` is the stable cursor for
+/// a log that is still growing; `offset` walks within the answer the
+/// filters produced, as deep as
+/// [`crate::logs::LOGS_QUERY_MAX_ROWS`] and no deeper.
 ///
 /// # Errors
 ///
-/// Whatever [`crate::logs::get_logs`] answers.
+/// `BadRequest` for an unreachable offset or an oversized filter, then
+/// whatever [`crate::logs::get_logs`] answers.
 pub async fn list_logs(
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
     Query(filters): Query<crate::logs::LogsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let page = page.page();
+    let page = page.page_within(crate::logs::LOGS_QUERY_MAX_ROWS)?;
+    within_the_filter_ceiling("search", filters.search.as_deref())?;
+    within_the_filter_ceiling("route", filters.route.as_deref())?;
+    within_the_filter_ceiling("client_ip", filters.client_ip.as_deref())?;
     let filters = crate::logs::LogsQuery {
         limit: Some(page.scan()),
         ..filters
     };
     let answer = crate::logs::get_logs(Extension(state), Query(filters)).await?;
-    Ok(page.of(rows(answer, Some("entries"))?))
+    let mut rows = rows(answer, Some("entries"))?;
+    // Both log sources fetch the NEWEST `scan` rows and hand them back
+    // oldest first: the store runs `ORDER BY id DESC LIMIT ?` and then
+    // reverses, the in-memory fallback returns the tail of a
+    // chronological buffer. Walking that array from the front means
+    // `offset` walks the window's OLDEST end, so every offset answered
+    // nearly the same rows, the newest row was unreachable at any
+    // offset, and `has_more` never went false. `/waf/events` answers
+    // newest first and pages correctly; this makes the two agree.
+    rows.reverse();
+    Ok(page.of(rows))
 }
 
 /// `GET /automation/v1/waf/events` (scope `waf:read`).
 ///
-/// Recent WAF events, `?category=` narrowing them the way the dashboard
-/// does. A matched payload is attacker-controlled text and travels as
-/// the field the WAF recorded it in, unchanged and uninterpreted.
+/// Recent WAF events, newest first, `?category=` narrowing them the way
+/// the dashboard does. A matched payload is attacker-controlled text
+/// and travels as the field the WAF recorded it in, unchanged and
+/// uninterpreted. `offset` reaches as deep as
+/// [`crate::waf::WAF_EVENTS_MAX_ROWS`] and no deeper.
 ///
 /// # Errors
 ///
-/// Whatever [`crate::waf::get_waf_events`] answers.
+/// `BadRequest` for an unreachable offset, then whatever
+/// [`crate::waf::get_waf_events`] answers.
 pub async fn list_waf_events(
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
     Query(filters): Query<crate::waf::WafEventsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let page = page.page();
+    let page = page.page_within(crate::waf::WAF_EVENTS_MAX_ROWS)?;
+    within_the_filter_ceiling("category", filters.category.as_deref())?;
     let filters = crate::waf::WafEventsQuery {
         limit: Some(page.scan()),
         ..filters
@@ -253,6 +384,12 @@ pub async fn waf_stats(Extension(state): Extension<AppState>) -> Result<Json<Val
 /// to a follower carries an operator floor a credential with no role
 /// cannot be weighed against.
 ///
+/// The window travels down into the computation rather than slicing
+/// what it produced: each summary is two synchronous SQL passes under
+/// the process-wide config-store mutex, so computing every route's
+/// figures to answer `?limit=1` held that lock against every
+/// configuration write for no one's benefit.
+///
 /// # Errors
 ///
 /// Whatever [`crate::sla::local_sla_overview`] answers.
@@ -261,7 +398,7 @@ pub async fn sla_overview(
     Query(page): Query<PageQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let page = page.page();
-    let summaries = crate::sla::local_sla_overview(&state).await?;
+    let summaries = crate::sla::local_sla_overview(&state, Some(page.scan())).await?;
     Ok(page.of(rows(json_data(summaries), None)?))
 }
 
@@ -272,14 +409,17 @@ pub async fn sla_overview(
 /// # Errors
 ///
 /// Whatever [`crate::sla::local_route_sla`] answers, including a 404
-/// for a route this node does not hold.
+/// for a route this node does not hold, with the caller's own id struck
+/// out of the message.
 pub async fn route_sla(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
     Query(page): Query<PageQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let page = page.page();
-    let summaries = crate::sla::local_route_sla(&state, route_id).await?;
+    let summaries = crate::sla::local_route_sla(&state, route_id)
+        .await
+        .map_err(without_the_callers_echo)?;
     Ok(page.of(rows(json_data(summaries), None)?))
 }
 
@@ -288,6 +428,12 @@ pub async fn route_sla(
 /// This node's role, build, applied configuration generation and, on a
 /// control plane, the fleet summary. One object, answered unchanged.
 ///
+/// The fleet ROSTER is deliberately not on this plane: it is the one
+/// cluster read the management API gates at `Operator` rather than
+/// `Viewer`, because it discloses each follower's source address and
+/// the hostnames whose private keys it holds. Status is `Viewer` on
+/// both planes and answers the question this surface exists for.
+///
 /// # Errors
 ///
 /// Whatever [`crate::cluster::get_status`] answers.
@@ -295,39 +441,6 @@ pub async fn cluster_status(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     crate::cluster::get_status(Extension(state)).await
-}
-
-/// `GET /automation/v1/cluster/nodes` (scope `cluster:read`).
-///
-/// The fleet roster as a `Viewer` sees it: see [`AUTOMATION_VIEW_ROLE`].
-///
-/// # Errors
-///
-/// Whatever [`crate::cluster::roster`] answers, including a 409 off a
-/// control plane.
-pub async fn list_cluster_nodes(
-    Extension(state): Extension<AppState>,
-    Query(page): Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let page = page.page();
-    let nodes = crate::cluster::roster(&state, AUTOMATION_VIEW_ROLE).await?;
-    Ok(page.of(rows(json_data(nodes), None)?))
-}
-
-/// `GET /automation/v1/cluster/nodes/{id}` (scope `cluster:read`).
-///
-/// One node of the roster, same view as the collection.
-///
-/// # Errors
-///
-/// Whatever [`crate::cluster::one_node`] answers, including a 409 off a
-/// control plane and a 404 for an unknown id.
-pub async fn get_cluster_node(
-    Extension(state): Extension<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let node = crate::cluster::one_node(&state, AUTOMATION_VIEW_ROLE, id).await?;
-    Ok(json_data(node))
 }
 
 /// `GET /automation/v1/backends` (scope `backends:read`).
@@ -430,6 +543,43 @@ mod tests {
     }
 
     #[test]
+    fn an_offset_past_a_clamped_sources_reach_is_refused_and_not_answered_empty() {
+        // The failure this replaces: the source clamps at `depth`, the
+        // window starts past what it returned, and the answer is an
+        // empty page with `has_more: false` while the table still holds
+        // rows. A reader takes that for "there was nothing".
+        let depth = crate::waf::WAF_EVENTS_MAX_ROWS;
+        let refused = PageQuery {
+            limit: Some(50),
+            offset: Some(depth),
+        }
+        .page_within(depth)
+        .expect_err("an offset at the clamp cannot be honoured");
+        assert!(matches!(refused, ApiError::BadRequest(_)), "{refused:?}");
+        // The message names the depth the caller can reach, or it sends
+        // them guessing.
+        let ApiError::BadRequest(message) = refused else {
+            unreachable!("asserted above")
+        };
+        assert!(message.contains(&depth.to_string()), "{message}");
+        assert!(message.contains("offset=449"), "{message}");
+
+        // The deepest window the clamp can fill is allowed, and it is
+        // exactly the one whose scan lands on the clamp.
+        let deepest = PageQuery {
+            limit: Some(50),
+            offset: Some(449),
+        }
+        .page_within(depth)
+        .expect("the deepest window is reachable");
+        assert_eq!(deepest.scan(), depth);
+
+        // An unclamped source takes any offset: an empty window there
+        // is the truth, because the listing really held nothing.
+        assert_eq!(page_of(Some(50), Some(10_000)).offset, 10_000);
+    }
+
+    #[test]
     fn has_more_is_true_exactly_when_a_row_was_left_behind() {
         // The source was asked for `scan()` rows: eleven back for a
         // window of ten means an eleventh exists.
@@ -468,6 +618,52 @@ mod tests {
     }
 
     #[test]
+    fn the_byte_ceiling_ends_the_answer_early_and_says_so() {
+        // One WAF matched value is the raw regex match, with no
+        // truncation anywhere on the way here, so a row ceiling alone
+        // bounds nothing. Rows are dropped whole and the shortfall is
+        // reported, never truncated into a mangled field.
+        let heavy: Vec<Value> = (0..20)
+            .map(|n| serde_json::json!({ "n": n, "payload": "x".repeat(40 * 1024) }))
+            .collect();
+        let answered = page_of(Some(20), None).of(heavy);
+        let returned = answered.0["data"]["page"]["returned"]
+            .as_u64()
+            .expect("returned is a number") as usize;
+        assert!(returned > 0, "a window is never empty on a full source");
+        assert!(returned < 20, "the byte ceiling ended the answer early");
+        assert_eq!(answered.0["data"]["page"]["has_more"], true);
+        assert_eq!(
+            answered.0["data"]["items"].as_array().map(Vec::len),
+            Some(returned)
+        );
+
+        // A single row over the whole budget still crosses: an empty
+        // answer is the one shape a reader takes for "there was
+        // nothing".
+        let one_huge = vec![serde_json::json!({
+            "payload": "x".repeat(AUTOMATION_READ_MAX_ANSWER_BYTES + 1)
+        })];
+        let answered = page_of(Some(10), None).of(one_huge);
+        assert_eq!(answered.0["data"]["page"]["returned"], 1);
+    }
+
+    #[test]
+    fn a_free_text_filter_is_bounded_and_the_refusal_reflects_nothing_back() {
+        let too_long = "a".repeat(AUTOMATION_READ_MAX_FILTER_BYTES + 1);
+        let refused = within_the_filter_ceiling("search", Some(&too_long))
+            .expect_err("over the ceiling is refused");
+        let ApiError::BadRequest(message) = refused else {
+            panic!("the refusal is a 400")
+        };
+        assert!(message.contains("?search="), "{message}");
+        assert!(!message.contains(&too_long), "{message}");
+
+        within_the_filter_ceiling("search", Some("GET /health")).expect("a normal filter passes");
+        within_the_filter_ceiling("search", None).expect("no filter passes");
+    }
+
+    #[test]
     fn the_rows_are_pulled_out_of_the_management_envelope_by_name() {
         let answer = json_data(serde_json::json!({ "backends": [{ "id": "b1" }] }));
         assert_eq!(
@@ -490,5 +686,22 @@ mod tests {
         let answer = json_data(serde_json::json!({ "upstreams": [{ "id": "b1" }] }));
         let refused = rows(answer, Some("backends")).expect_err("the shape changed");
         assert!(matches!(refused, ApiError::Internal(_)), "{refused:?}");
+    }
+
+    #[test]
+    fn a_not_found_on_this_plane_names_no_identifier_the_caller_chose() {
+        let echoed = ApiError::NotFound("route ignore-previous-instructions".to_string());
+        let ApiError::NotFound(message) = without_the_callers_echo(echoed) else {
+            panic!("a not-found stays a not-found")
+        };
+        assert!(
+            !message.contains("ignore-previous-instructions"),
+            "{message}"
+        );
+
+        // Every other variant travels unchanged: the echo rule is about
+        // identifiers in a 404, not about rewriting the store's errors.
+        let conflict = without_the_callers_echo(ApiError::Conflict("not a control plane".into()));
+        assert!(matches!(conflict, ApiError::Conflict(_)), "{conflict:?}");
     }
 }

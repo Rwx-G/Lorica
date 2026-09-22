@@ -502,8 +502,8 @@ impl LogStore {
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
         if let Some(ref route) = params.route {
-            conditions.push("host LIKE ?".to_string());
-            bind_values.push(Box::new(format!("%{route}%")));
+            conditions.push(format!("host LIKE ? {LIKE_ESCAPE}"));
+            bind_values.push(Box::new(format!("%{}%", like_operand(route))));
         }
         if let Some(status) = params.status {
             conditions.push("status = ?".to_string());
@@ -530,15 +530,16 @@ impl LogStore {
             bind_values.push(Box::new(after_id as i64));
         }
         if let Some(ref ip) = params.client_ip {
-            conditions.push("client_ip LIKE ?".to_string());
-            bind_values.push(Box::new(format!("{ip}%")));
+            conditions.push(format!("client_ip LIKE ? {LIKE_ESCAPE}"));
+            bind_values.push(Box::new(format!("{}%", like_operand(ip))));
         }
         if let Some(ref search) = params.search {
-            let pattern = format!("%{search}%");
-            conditions.push(
-                "(method LIKE ? OR path LIKE ? OR host LIKE ? OR backend LIKE ? OR error LIKE ?)"
-                    .to_string(),
-            );
+            let pattern = format!("%{}%", like_operand(search));
+            conditions.push(format!(
+                "(method LIKE ? {LIKE_ESCAPE} OR path LIKE ? {LIKE_ESCAPE} \
+                 OR host LIKE ? {LIKE_ESCAPE} OR backend LIKE ? {LIKE_ESCAPE} \
+                 OR error LIKE ? {LIKE_ESCAPE})"
+            ));
             bind_values.push(Box::new(pattern.clone()));
             bind_values.push(Box::new(pattern.clone()));
             bind_values.push(Box::new(pattern.clone()));
@@ -552,7 +553,10 @@ impl LogStore {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        let limit = params.limit.unwrap_or(200).min(10_000);
+        let limit = params
+            .limit
+            .unwrap_or(200)
+            .min(crate::logs::LOGS_QUERY_MAX_ROWS);
 
         let count_sql = format!("SELECT COUNT(*) FROM access_logs {where_clause}");
         let refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -615,8 +619,8 @@ impl LogStore {
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
         if let Some(ref route) = params.route {
-            conditions.push("host LIKE ?".to_string());
-            bind_values.push(Box::new(format!("%{route}%")));
+            conditions.push(format!("host LIKE ? {LIKE_ESCAPE}"));
+            bind_values.push(Box::new(format!("%{}%", like_operand(route))));
         }
         if let Some(status) = params.status {
             conditions.push("status = ?".to_string());
@@ -639,11 +643,12 @@ impl LogStore {
             bind_values.push(Box::new(time_to.clone()));
         }
         if let Some(ref search) = params.search {
-            let pattern = format!("%{search}%");
-            conditions.push(
-                "(method LIKE ? OR path LIKE ? OR host LIKE ? OR backend LIKE ? OR error LIKE ?)"
-                    .to_string(),
-            );
+            let pattern = format!("%{}%", like_operand(search));
+            conditions.push(format!(
+                "(method LIKE ? {LIKE_ESCAPE} OR path LIKE ? {LIKE_ESCAPE} \
+                 OR host LIKE ? {LIKE_ESCAPE} OR backend LIKE ? {LIKE_ESCAPE} \
+                 OR error LIKE ? {LIKE_ESCAPE})"
+            ));
             bind_values.push(Box::new(pattern.clone()));
             bind_values.push(Box::new(pattern.clone()));
             bind_values.push(Box::new(pattern.clone()));
@@ -2024,6 +2029,27 @@ impl LogStore {
 
         Ok(deleted as u64)
     }
+}
+
+/// The escape declaration every `LIKE` predicate built from caller text
+/// carries.
+///
+/// SQLite has no default escape character, so a pattern containing a
+/// backslash means nothing without this clause; it is part of the
+/// predicate, not a decoration on it.
+const LIKE_ESCAPE: &str = r"ESCAPE '\'";
+
+/// `text` as a `LIKE` operand that matches itself and nothing else.
+///
+/// `%` and `_` are wildcards inside a `LIKE` pattern and every filter
+/// below interpolates caller text into one. Unescaped, a search for
+/// `%` matches every row while reading as a narrow filter, which is a
+/// result an operator or a model draws a conclusion from. The
+/// backslash goes first, or it would escape the escapes added after it.
+fn like_operand(text: &str) -> String {
+    text.replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_")
 }
 
 /// Helper to re-box a ToSql value for a second bind pass.

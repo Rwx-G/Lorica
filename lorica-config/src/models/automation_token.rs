@@ -105,9 +105,9 @@ fn default_max_ttl_seconds() -> u32 {
 /// assert_eq!(scope, AutomationScope::EnvironmentsWrite);
 /// assert!(serde_json::from_str::<AutomationScope>("\"settings:write\"").is_err());
 /// ```
-// The serde renames below are this vocabulary's source of truth. Four
-// other surfaces carry the same strings and none of them is maintained
-// from memory: `scope_str` (`lorica-api/src/automation/scope.rs`, the
+// The serde renames below are this vocabulary's source of truth. The
+// surfaces named here carry the same strings and none of them is
+// maintained from memory: `scope_str` (`lorica-api/src/automation/scope.rs`, the
 // string an operator reads in a 403) and `scope_wire_name`
 // (`lorica-api/src/automation/audit.rs`) are each asserted against
 // these renames by a test that walks `ALL`; `AUTOMATION_AUDIT_REASONS`

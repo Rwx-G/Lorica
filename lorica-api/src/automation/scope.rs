@@ -93,12 +93,35 @@ pub enum ScopeRequirement {
 /// );
 /// ```
 pub fn required_scope(method: &http::Method, path: &str) -> Option<ScopeRequirement> {
+    declaration(method, path).map(|(_, requirement)| requirement)
+}
+
+/// The path template this request matched, or `None` for a path the
+/// plane declares nothing for.
+///
+/// Templates and not raw paths, because the consumer is a metric label:
+/// an environment name and a route id are the caller's own text, and a
+/// counter labelled by them grows one series per value anyone ever
+/// sends, which is how a scrape target runs out of memory. Derived from
+/// the same arms [`required_scope`] reads, so a path cannot be declared
+/// and unlabelled, or labelled under a spelling the document does not
+/// use.
+pub fn path_template(method: &http::Method, path: &str) -> Option<&'static str> {
+    declaration(method, path).map(|(template, _)| template)
+}
+
+/// What the matrix says about one `(method, path)` pair: the template
+/// it is documented under, and what it demands of a credential.
+///
+/// One match with two readers, rather than a second matrix that would
+/// have to be kept in step with this one by memory.
+fn declaration(method: &http::Method, path: &str) -> Option<(&'static str, ScopeRequirement)> {
     // The method guard is not decoration: the arm below is path-shaped,
     // so without it a `POST /automation/v1/whoami` added later would
     // inherit "any live token reaches this" from a rule written about a
     // read.
     if *method == http::Method::GET && path == WHOAMI_PATH {
-        return Some(ScopeRequirement::AnyLiveToken);
+        return Some((WHOAMI_PATH, ScopeRequirement::AnyLiveToken));
     }
 
     // The environment resource (Story 10.4): the collection, and one
@@ -107,13 +130,20 @@ pub fn required_scope(method: &http::Method, path: &str) -> Option<ScopeRequirem
     if let Some(rest) = path.strip_prefix(ENVIRONMENTS_PATH) {
         let is_one = one_segment_under(path, ENVIRONMENTS_PATH);
         if rest.is_empty() || is_one {
+            let template = if is_one {
+                ENVIRONMENT_TEMPLATE
+            } else {
+                ENVIRONMENTS_PATH
+            };
             return match *method {
-                http::Method::GET => {
-                    Some(ScopeRequirement::Scope(AutomationScope::EnvironmentsRead))
-                }
-                http::Method::PUT | http::Method::DELETE if is_one => {
-                    Some(ScopeRequirement::Scope(AutomationScope::EnvironmentsWrite))
-                }
+                http::Method::GET => Some((
+                    template,
+                    ScopeRequirement::Scope(AutomationScope::EnvironmentsRead),
+                )),
+                http::Method::PUT | http::Method::DELETE if is_one => Some((
+                    template,
+                    ScopeRequirement::Scope(AutomationScope::EnvironmentsWrite),
+                )),
                 _ => None,
             };
         }
@@ -123,32 +153,34 @@ pub fn required_scope(method: &http::Method, path: &str) -> Option<ScopeRequirem
     // nothing else: the tier exists to be unable to change anything, so
     // a verb the router does not mount inherits no grant here either.
     if *method == http::Method::GET {
-        if let Some(scope) = read_scope(path) {
-            return Some(ScopeRequirement::Scope(scope));
+        if let Some((template, scope)) = read_declaration(path) {
+            return Some((template, ScopeRequirement::Scope(scope)));
         }
     }
 
     None
 }
 
-/// The scope behind each path of the read surface, or `None` for a path
-/// that is not one of them.
+/// The template and the scope behind each path of the read surface, or
+/// `None` for a path that is not one of them.
 ///
-/// Read-only by construction: [`required_scope`] consults it for `GET`
+/// Read-only by construction: [`declaration`] consults it for `GET`
 /// alone, so no write scope can be reached from here.
-fn read_scope(path: &str) -> Option<AutomationScope> {
+fn read_declaration(path: &str) -> Option<(&'static str, AutomationScope)> {
     match path {
-        LOGS_PATH => Some(AutomationScope::LogsRead),
-        WAF_EVENTS_PATH | WAF_STATS_PATH => Some(AutomationScope::WafRead),
-        SLA_OVERVIEW_PATH => Some(AutomationScope::SlaRead),
-        CLUSTER_STATUS_PATH | CLUSTER_NODES_PATH => Some(AutomationScope::ClusterRead),
-        BACKENDS_PATH => Some(AutomationScope::BackendsRead),
-        ROUTES_PATH => Some(AutomationScope::RoutesRead),
-        CERTIFICATES_PATH => Some(AutomationScope::CertificatesRead),
+        LOGS_PATH => Some((LOGS_PATH, AutomationScope::LogsRead)),
+        WAF_EVENTS_PATH => Some((WAF_EVENTS_PATH, AutomationScope::WafRead)),
+        WAF_STATS_PATH => Some((WAF_STATS_PATH, AutomationScope::WafRead)),
+        SLA_OVERVIEW_PATH => Some((SLA_OVERVIEW_PATH, AutomationScope::SlaRead)),
+        CLUSTER_STATUS_PATH => Some((CLUSTER_STATUS_PATH, AutomationScope::ClusterRead)),
+        BACKENDS_PATH => Some((BACKENDS_PATH, AutomationScope::BackendsRead)),
+        ROUTES_PATH => Some((ROUTES_PATH, AutomationScope::RoutesRead)),
+        CERTIFICATES_PATH => Some((CERTIFICATES_PATH, AutomationScope::CertificatesRead)),
         // One resource under a collection, and exactly one: a deeper
         // path stays undeclared and is refused for every token.
-        _ if one_segment_under(path, SLA_ROUTES_PATH) => Some(AutomationScope::SlaRead),
-        _ if one_segment_under(path, CLUSTER_NODES_PATH) => Some(AutomationScope::ClusterRead),
+        _ if one_segment_under(path, SLA_ROUTES_PATH) => {
+            Some((SLA_ROUTE_TEMPLATE, AutomationScope::SlaRead))
+        }
         _ => None,
     }
 }
@@ -170,6 +202,10 @@ const WHOAMI_PATH: &str = "/automation/v1/whoami";
 /// The environment collection path; single environments hang under it.
 const ENVIRONMENTS_PATH: &str = "/automation/v1/environments";
 
+/// How `openapi-automation.yaml` spells one environment, and how the
+/// metric labels it.
+const ENVIRONMENT_TEMPLATE: &str = "/automation/v1/environments/{name}";
+
 /// The access log.
 const LOGS_PATH: &str = "/automation/v1/logs";
 
@@ -185,11 +221,21 @@ const SLA_OVERVIEW_PATH: &str = "/automation/v1/sla/overview";
 /// Passive SLA per route; one route id hangs under it.
 const SLA_ROUTES_PATH: &str = "/automation/v1/sla/routes";
 
-/// This node's cluster role and applied configuration.
-const CLUSTER_STATUS_PATH: &str = "/automation/v1/cluster/status";
+/// How `openapi-automation.yaml` spells one route's SLA, and how the
+/// metric labels it.
+const SLA_ROUTE_TEMPLATE: &str = "/automation/v1/sla/routes/{id}";
 
-/// The fleet roster; one node id hangs under it.
-const CLUSTER_NODES_PATH: &str = "/automation/v1/cluster/nodes";
+/// This node's cluster role and applied configuration.
+///
+/// The fleet ROSTER (`/automation/v1/cluster/nodes`) is deliberately
+/// not declared here and not mounted. The management plane gates it at
+/// `Operator` rather than `Viewer`, because it discloses each
+/// follower's source address and the hostnames whose certificate
+/// private keys it holds; an automation credential carries scopes and
+/// no role, so a `cluster:read` token reading it would stand a role
+/// above where the management matrix put that answer. Status is
+/// `Viewer` on both planes.
+const CLUSTER_STATUS_PATH: &str = "/automation/v1/cluster/status";
 
 /// The backend listing.
 const BACKENDS_PATH: &str = "/automation/v1/backends";
@@ -268,6 +314,35 @@ fn scope_str(scope: AutomationScope) -> &'static str {
         AutomationScope::BackendsRead => "backends:read",
     }
 }
+
+/// Every path of the read surface beside the scope it sits behind, as a
+/// request a test can actually send.
+///
+/// Test-only, and deliberately spelled out rather than read back from
+/// [`read_declaration`]: a list derived from the code under test agrees
+/// with that code whatever it says. It is the ONE statement of the
+/// surface, walked by this module's matrix tests and by the AC #5
+/// secret sweep in `crate::tests` alike, so a path added to the matrix
+/// and forgotten in either place fails in the other rather than
+/// shrinking a sweep in silence.
+#[cfg(test)]
+pub(crate) const READ_SURFACE: &[(&str, AutomationScope)] = &[
+    ("/automation/v1/logs", AutomationScope::LogsRead),
+    ("/automation/v1/waf/events", AutomationScope::WafRead),
+    ("/automation/v1/waf/stats", AutomationScope::WafRead),
+    ("/automation/v1/sla/overview", AutomationScope::SlaRead),
+    ("/automation/v1/sla/routes/r-1", AutomationScope::SlaRead),
+    (
+        "/automation/v1/cluster/status",
+        AutomationScope::ClusterRead,
+    ),
+    ("/automation/v1/backends", AutomationScope::BackendsRead),
+    ("/automation/v1/routes", AutomationScope::RoutesRead),
+    (
+        "/automation/v1/certificates",
+        AutomationScope::CertificatesRead,
+    ),
+];
 
 #[cfg(test)]
 mod tests {
@@ -433,35 +508,6 @@ mod tests {
         );
     }
 
-    /// Every path of the read surface beside the scope it sits behind.
-    ///
-    /// The one list this file's read tests walk. It is the test's own
-    /// statement of the contract, deliberately spelled out here so a
-    /// path silently moved to another scope fails rather than agreeing
-    /// with itself.
-    const READ_SURFACE: &[(&str, AutomationScope)] = &[
-        ("/automation/v1/logs", AutomationScope::LogsRead),
-        ("/automation/v1/waf/events", AutomationScope::WafRead),
-        ("/automation/v1/waf/stats", AutomationScope::WafRead),
-        ("/automation/v1/sla/overview", AutomationScope::SlaRead),
-        ("/automation/v1/sla/routes/r-1", AutomationScope::SlaRead),
-        (
-            "/automation/v1/cluster/status",
-            AutomationScope::ClusterRead,
-        ),
-        ("/automation/v1/cluster/nodes", AutomationScope::ClusterRead),
-        (
-            "/automation/v1/cluster/nodes/n-1",
-            AutomationScope::ClusterRead,
-        ),
-        ("/automation/v1/backends", AutomationScope::BackendsRead),
-        ("/automation/v1/routes", AutomationScope::RoutesRead),
-        (
-            "/automation/v1/certificates",
-            AutomationScope::CertificatesRead,
-        ),
-    ];
-
     #[test]
     fn every_read_path_declares_its_scope_and_only_on_get() {
         for (path, scope) in READ_SURFACE {
@@ -507,7 +553,6 @@ mod tests {
             "/automation/v1/sla/routes",
             "/automation/v1/sla/routes/",
             "/automation/v1/sla/routes/r-1/buckets",
-            "/automation/v1/cluster/nodes/n-1/activate",
             "/automation/v1/waf/rules",
             "/automation/v1/logs/export",
             "/automation/v1/certificates/c-1",
@@ -519,16 +564,61 @@ mod tests {
     }
 
     #[test]
+    fn the_fleet_roster_is_reachable_by_no_token_on_this_plane() {
+        // The management plane gates the roster at `Operator`, one role
+        // above where this surface stands, because it discloses each
+        // follower's source address and the hostnames whose private
+        // keys it holds. `cluster:read` reaches status and nothing
+        // else, and an undeclared path is refused for every token
+        // including one carrying every scope.
+        for path in [
+            "/automation/v1/cluster/nodes",
+            "/automation/v1/cluster/nodes/n-1",
+            "/automation/v1/cluster/nodes/{}",
+            "/automation/v1/cluster/nodes/n-1/activate",
+        ] {
+            assert_eq!(required_scope(&Method::GET, path), None, "{path}");
+        }
+        assert_eq!(
+            required_scope(&Method::GET, "/automation/v1/cluster/status"),
+            Some(ScopeRequirement::Scope(AutomationScope::ClusterRead))
+        );
+    }
+
+    #[test]
     fn the_openapi_gate_sees_the_same_scope_with_the_parameter_normalised() {
         // `tests/openapi_contract.rs` asks with `{}` where the id is.
         assert_eq!(
             required_scope(&Method::GET, "/automation/v1/sla/routes/{}"),
             Some(ScopeRequirement::Scope(AutomationScope::SlaRead))
         );
+    }
+
+    #[test]
+    fn every_declared_path_carries_the_template_the_document_spells_it_with() {
+        // The metric's label vocabulary. A caller-chosen id must
+        // collapse into the template, or one time series per route id
+        // anyone ever asks about ends up in the scrape.
         assert_eq!(
-            required_scope(&Method::GET, "/automation/v1/cluster/nodes/{}"),
-            Some(ScopeRequirement::Scope(AutomationScope::ClusterRead))
+            path_template(&Method::GET, "/automation/v1/sla/routes/r-1"),
+            Some("/automation/v1/sla/routes/{id}")
         );
+        assert_eq!(
+            path_template(&Method::PUT, "/automation/v1/environments/pr-42"),
+            Some("/automation/v1/environments/{name}")
+        );
+        assert_eq!(
+            path_template(&Method::GET, "/automation/v1/environments"),
+            Some("/automation/v1/environments")
+        );
+        for (path, _scope) in READ_SURFACE {
+            assert!(
+                path_template(&Method::GET, path).is_some(),
+                "{path} is declared and has no template"
+            );
+        }
+        // Undeclared is unlabelled, the same way it is unreachable.
+        assert_eq!(path_template(&Method::GET, "/automation/v1/tokens"), None);
     }
 
     #[tokio::test]

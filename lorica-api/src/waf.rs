@@ -24,6 +24,14 @@ use crate::middleware::auth::Session;
 use crate::server::AppState;
 use lorica_waf::WafEvent;
 
+/// The deepest one WAF-event read reaches, whatever `?limit=` asks for.
+///
+/// Public for the same reason as [`crate::logs::LOGS_QUERY_MAX_ROWS`]:
+/// a surface paging over this source cannot reach a row past it, and
+/// [`crate::automation::read`] refuses such an offset with a 400 naming
+/// the depth rather than answering an empty page.
+pub const WAF_EVENTS_MAX_ROWS: usize = 500;
+
 /// Query parameters for the WAF events endpoint.
 #[derive(Debug, Deserialize)]
 pub struct WafEventsQuery {
@@ -60,7 +68,7 @@ pub async fn get_waf_events(
     Extension(state): Extension<AppState>,
     Query(params): Query<WafEventsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let limit = params.limit.unwrap_or(50).min(500);
+    let limit = params.limit.unwrap_or(50).min(WAF_EVENTS_MAX_ROWS);
     let rule_count = state.waf_rule_count.unwrap_or(0);
 
     // Read from persistent store if available, fall back to in-memory buffer.

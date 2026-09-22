@@ -17,6 +17,18 @@ use crate::error::{json_data, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
 
+/// The deepest one access-log read reaches, whatever `?limit=` asks
+/// for.
+///
+/// Both log paths clamp to it: the SQLite `LIMIT` in
+/// [`crate::log_store::LogStore::query`] and the in-memory tail below.
+/// A surface that pages over this source cannot reach a row past it, so
+/// the constant is public: [`crate::automation::read`] refuses an offset
+/// beyond it with a 400 naming the depth rather than answering an empty
+/// page, which is the one failure an operator reads as "there was
+/// nothing".
+pub const LOGS_QUERY_MAX_ROWS: usize = 10_000;
+
 /// A single access log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -205,7 +217,7 @@ pub async fn get_logs(
     }
 
     let all_entries = state.log_buffer.snapshot();
-    let limit = params.limit.unwrap_or(200).min(10_000);
+    let limit = params.limit.unwrap_or(200).min(LOGS_QUERY_MAX_ROWS);
 
     let filtered: Vec<LogEntry> = all_entries
         .into_iter()

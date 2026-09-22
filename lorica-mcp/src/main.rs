@@ -20,6 +20,15 @@
 //! surface an operator's MCP client talks to, over the automation
 //! plane and never over the management API.
 //!
+//! This is the stdio binding, and the only thing in the crate that will
+//! ever read a file descriptor. Everything it will drive - the
+//! configuration intake, the JSON-RPC core, the read tools and the
+//! fetch seam they reach a read view through - lives in the library
+//! beside it, because the Streamable HTTP binding runs inside
+//! `lorica-api` and has to be able to reach the same core. See
+//! `lorica-mcp/src/lib.rs` for why that seam exists before there is
+//! anything to put through it.
+//!
 //! # It binds nothing
 //!
 //! Both transports the epic ships leave the socket to someone else.
@@ -37,8 +46,8 @@
 //! offers: one mounts on an axum listener that already exists, the
 //! other is a subprocess reading stdin. What is left after removing
 //! them is the message types of a protocol that
-//! [`MCP_PROTOCOL_REVISION`] made stateless, which is little code. The
-//! cost is that spec drift is tracked by hand, and
+//! [`lorica_mcp::MCP_PROTOCOL_REVISION`] made stateless, which is
+//! little code. The cost is that spec drift is tracked by hand, and
 //! `docs/mcp.md` is where that obligation is written down.
 //!
 //! # What this binary does today
@@ -47,13 +56,7 @@
 //! JSON-RPC core, the startup introspection and the read tools are the
 //! remaining lots of Story 11.1; nothing here pretends to be them.
 
-/// The MCP specification revision this crate implements.
-///
-/// The specification has moved three times in eighteen months, most
-/// recently dropping sessions and the GET stream, so the revision is a
-/// fact the crate states rather than one a reader infers. Changing it
-/// is a release note.
-const MCP_PROTOCOL_REVISION: &str = "2026-07-28";
+use lorica_mcp::MCP_PROTOCOL_REVISION;
 
 fn main() {
     println!(

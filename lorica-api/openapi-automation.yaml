@@ -372,9 +372,11 @@ paths:
       summary: Recent access-log rows
       description: >-
         The access log this node holds, with the filters the dashboard
-        already offers. `after_id` is the stable cursor for a log that
-        is still growing; `offset` walks within the answer the filters
-        produced.
+        already offers. Rows come back newest first, so page one is what
+        just happened and `offset` walks backwards in time. `after_id`
+        is the stable cursor for a log that is still growing; `offset`
+        walks within the answer the filters produced, as deep as 10000
+        rows and no deeper.
 
 
         The rows carry text Lorica collected from whoever sent the
@@ -454,6 +456,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PagedAnswer"
+        "400":
+          $ref: "#/components/responses/BeyondTheWindow"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -494,6 +498,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PagedAnswer"
+        "400":
+          $ref: "#/components/responses/BeyondTheWindow"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -618,6 +624,16 @@ paths:
         member.
 
 
+        The fleet ROSTER (`GET /api/v1/cluster/nodes` on the management
+        API) is deliberately not on this plane. It is the one cluster
+        read the management API gates at `Operator` rather than
+        `Viewer`, because it discloses each follower's source address
+        and the hostnames whose certificate private keys it holds; an
+        automation credential carries scopes and no role, so serving it
+        here would stand a role above where the management matrix put
+        that answer. This path is `Viewer` on both planes.
+
+
         Required scope: `cluster:read`.
       operationId: automationClusterStatus
       x-required-scope: cluster:read
@@ -641,92 +657,6 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
-
-  /automation/v1/cluster/nodes:
-    get:
-      tags: [Reads]
-      summary: The fleet roster
-      description: >-
-        Every registered node with its registry row and its live session
-        facts: whether it is connected, whether its applied
-        configuration has drifted, what hostnames it is selected for.
-
-
-        Each node's host telemetry (CPU, memory, disk) is absent. The
-        management API shows it from `Operator` upwards, and an
-        automation credential carries scopes and no role, so this
-        surface reads the floor rather than granting every
-        `cluster:read` token a view an operator kept for operators.
-
-
-        A node that is not a cluster control plane answers 409: it does
-        not hold a roster to report.
-
-
-        Required scope: `cluster:read`.
-      operationId: automationListClusterNodes
-      x-required-scope: cluster:read
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/PageLimit"
-        - $ref: "#/components/parameters/PageOffset"
-      responses:
-        "200":
-          description: One page of the roster
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/PagedAnswer"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "409":
-          $ref: "#/components/responses/NotAControlPlane"
-
-  /automation/v1/cluster/nodes/{id}:
-    get:
-      tags: [Reads]
-      summary: One node of the roster
-      description: >-
-        The same view the roster gives, for one node id.
-
-
-        Required scope: `cluster:read`.
-      operationId: automationGetClusterNode
-      x-required-scope: cluster:read
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/ResourceId"
-      responses:
-        "200":
-          description: The node
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data:
-                    type: object
-                    description: >-
-                      The object `GET /api/v1/cluster/nodes/{id}` returns
-                      on the management API, minus the Operator-only host
-                      telemetry.
-                    additionalProperties: true
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          description: No node with that id.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "409":
-          $ref: "#/components/responses/NotAControlPlane"
 
   /automation/v1/backends:
     get:
@@ -878,8 +808,23 @@ components:
       in: query
       required: false
       description: >-
-        Rows to skip before the window starts. An offset past the end
-        is an empty window, not an error.
+        Rows to skip before the window starts. Advance it by the
+        answer's `returned`, never by `limit`: the two differ when the
+        byte ceiling ended an answer early, and advancing by `limit`
+        would step over the rows that did not fit.
+
+
+        On a listing the node holds in full (routes, backends,
+        certificates, SLA) an offset past the end is an empty window and
+        not an error, because the listing really held nothing there. On
+        the two reads whose source clamps its own row budget (`/logs` at
+        10000 rows, `/waf/events` at 500) an offset that clamp cannot
+        honour is a `400` naming the deepest window this limit can
+        reach. It is not an empty page: past the clamp the answer would
+        read `{"items": [], "has_more": false}` while the table still
+        held thousands of rows, and that is the one failure a pager
+        reports as "there was nothing". Narrow such a read with its
+        filters rather than paging past the clamp.
       schema:
         type: integer
         minimum: 0
@@ -957,6 +902,7 @@ components:
           description: Everything this credential may do.
           items:
             $ref: "#/components/schemas/AutomationScope"
+          example: ["environments:read", "routes:read"]
         pipeline:
           $ref: "#/components/schemas/PipelineIdentity"
 
@@ -982,7 +928,7 @@ components:
         user_login:
           type: string
           nullable: true
-          example: ["environments:read", "routes:read"]
+          example: user01
 
     AutomationScope:
       type: string
@@ -1199,8 +1145,10 @@ components:
         this surface count differently (the log store counts every
         match, the WAF buffer counts what it returned, a store listing
         counts rows), and one field meaning three things is worse than
-        no field. `has_more` is exact everywhere, because every source
-        is asked for one row past the window.
+        no field. Every source is asked for one row past the window, and
+        a window the source cannot fill is refused rather than answered
+        short, so `has_more` is exact on every window this surface
+        answers at all.
       required: [limit, offset, returned, has_more]
       properties:
         limit:
@@ -1212,7 +1160,12 @@ components:
           example: 0
         returned:
           type: integer
-          description: How many items this answer carries.
+          description: >-
+            How many items this answer carries, and what a pager
+            advances `offset` by. Short of `limit` with `has_more` true
+            means the answer stopped on the byte ceiling: rows are
+            dropped whole rather than truncated, because a field that
+            arrives mangled is worse than a page that arrives short.
           example: 50
         has_more:
           type: boolean
@@ -1230,6 +1183,19 @@ components:
               type: string
 
   responses:
+    BeyondTheWindow:
+      description: >-
+        Either the `offset` is past the depth this read can reach (see
+        the `offset` parameter), or a free-text filter is longer than
+        this surface accepts: `?search=` becomes five unanchored `LIKE`
+        predicates plus a `COUNT(*)` over the whole retained log, so its
+        length is a per-request cost the caller would otherwise choose.
+        The message names the limit and never reflects the caller's own
+        text back.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
     NotFound:
       description: >-
         No environment of this caller's has this name. An environment
@@ -1242,20 +1208,6 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
-    NotAControlPlane:
-      description: >-
-        The node holds no fleet roster: it is standalone or a follower,
-        and only a control plane knows who the other nodes are. A
-        conflict and not a 404, because the path exists and the node's
-        role is what makes it unanswerable.
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: conflict
-              message: "conflict: this node is not a cluster control plane"
     Conflict:
       description: >-
         The hostname is held by another route. The message names the

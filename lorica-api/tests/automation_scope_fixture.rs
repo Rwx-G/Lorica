@@ -121,14 +121,69 @@ fn ordered_scopes_in_fixture(source: &str) -> Vec<String> {
         },
         None => return Vec::new(),
     };
-    body.split('\'')
+    without_comments(body)
+        .split('\'')
         .skip(1)
         .step_by(2)
         .map(str::to_string)
         .collect()
 }
 
+/// `body` with every comment removed.
+///
+/// The one way this guard could pass while the vocabularies disagree:
+/// a commented-out entry (`// 'waf:read',`) still carries its quotes,
+/// so the quote split counted it as present while the mint form had
+/// lost the scope. That is exactly the silent failure the test exists
+/// to prevent. A scope string never spans a line, so dropping whole
+/// comment spans cannot swallow a live entry.
+fn without_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    loop {
+        let line_comment = rest.find("//");
+        let block_comment = rest.find("/*");
+        let (at, close) = match (line_comment, block_comment) {
+            (Some(line), Some(block)) if line < block => (line, "\n"),
+            (Some(_), Some(block)) => (block, "*/"),
+            (Some(line), None) => (line, "\n"),
+            (None, Some(block)) => (block, "*/"),
+            (None, None) => {
+                out.push_str(rest);
+                return out;
+            }
+        };
+        out.push_str(&rest[..at]);
+        rest = match rest[at..].find(close) {
+            Some(end) => &rest[at + end + close.len()..],
+            // An unterminated comment swallows the remainder, which
+            // leaves the extraction empty and trips the sanity
+            // assertion rather than reading as agreement.
+            None => return out,
+        };
+    }
+}
+
 /// The same strings as a set, which is what the diff compares.
 fn scopes_in_fixture(source: &str) -> BTreeSet<String> {
     ordered_scopes_in_fixture(source).into_iter().collect()
+}
+
+#[test]
+fn a_commented_out_entry_is_not_counted_as_present() {
+    // The one way this guard could pass while the vocabularies
+    // disagree. Asserted on a synthetic fixture rather than by editing
+    // the committed one, so the check is about the parser and not
+    // about today's list.
+    let commented = format!(
+        "export const {EXPORT}: readonly AutomationScope[] = [\n\
+         \x20 'cluster:read',\n\
+         \x20 // 'waf:read',\n\
+         \x20 /* 'logs:read', */\n\
+         ];\n"
+    );
+    assert_eq!(
+        ordered_scopes_in_fixture(&commented),
+        vec!["cluster:read".to_string()]
+    );
 }

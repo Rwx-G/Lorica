@@ -26,6 +26,7 @@
 //! the OpenAPI drift gate in `tests/openapi_contract.rs` sees every
 //! automation route in one file.
 
+use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 use lorica_config::models::{AutomationScope, OwnerKind, PipelineIdentity};
@@ -108,6 +109,30 @@ pub(super) fn with_audit_and_panic_net(router: Router, state: AppState) -> Route
         ))
 }
 
+/// Add the two response headers every answer on this plane carries.
+///
+/// `no-store` because the answers are operational data: client
+/// addresses, matched attack payloads, which node holds which
+/// certificate. The plane is machine-facing with no browser in the
+/// path, so neither header defends against a vector that exists today;
+/// they are there for the client library or the future gateway that
+/// caches or sniffs without being asked to. Written as a middleware
+/// rather than `SetResponseHeaderLayer` so the crate gains no
+/// `tower-http` feature for two constants.
+async fn hardened_response(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        http::HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 /// Build the automation-plane router.
 ///
 /// Layer order, outermost first:
@@ -115,8 +140,10 @@ pub(super) fn with_audit_and_panic_net(router: Router, state: AppState) -> Route
 /// 1. [`super::audit::audit_automation_request`] - outermost, so a
 ///    request refused by the bearer gate still lands a row.
 /// 2. `CatchPanicLayer` - see [`with_audit_and_panic_net`].
-/// 3. [`super::auth::require_automation_auth`] - the bearer check.
-/// 4. [`super::scope::authorize_scope`] - the scope floor.
+/// 3. [`hardened_response`] - outside the gates, so a 401 and a 403
+///    carry the headers too.
+/// 4. [`super::auth::require_automation_auth`] - the bearer check.
+/// 5. [`super::scope::authorize_scope`] - the scope floor.
 ///
 /// There is deliberately NO cookie layer, NO CSRF layer and NO session
 /// store here. The two management planes share no credential, and the
@@ -155,14 +182,6 @@ pub fn build_automation_router(state: AppState) -> Router {
             "/automation/v1/cluster/status",
             get(super::read::cluster_status),
         )
-        .route(
-            "/automation/v1/cluster/nodes",
-            get(super::read::list_cluster_nodes),
-        )
-        .route(
-            "/automation/v1/cluster/nodes/{id}",
-            get(super::read::get_cluster_node),
-        )
         .route("/automation/v1/backends", get(super::read::list_backends))
         .route("/automation/v1/routes", get(super::read::list_routes))
         .route(
@@ -174,6 +193,7 @@ pub fn build_automation_router(state: AppState) -> Router {
             state.clone(),
             super::auth::require_automation_auth,
         ))
+        .layer(axum::middleware::from_fn(hardened_response))
         .layer(axum::extract::DefaultBodyLimit::max(AUTOMATION_BODY_CAP))
         .layer(axum::Extension(state.clone()));
     with_audit_and_panic_net(routed, state)

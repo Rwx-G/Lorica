@@ -660,19 +660,17 @@ construction.
 
 ## The read surface
 
-Since v1.9.0 the listener answers eleven read paths, all `GET` and
+Since v1.9.0 the listener answers these read paths, all `GET` and
 nothing else:
 
 | Path | Scope | What it answers |
 |---|---|---|
-| `/automation/v1/logs` | `logs:read` | Access-log rows, with the filters the dashboard offers. |
-| `/automation/v1/waf/events` | `waf:read` | Recent WAF matches, optionally one category. |
+| `/automation/v1/logs` | `logs:read` | Access-log rows, newest first, with the filters the dashboard offers. |
+| `/automation/v1/waf/events` | `waf:read` | Recent WAF matches, newest first, optionally one category. |
 | `/automation/v1/waf/stats` | `waf:read` | Totals, the 24 h count, the loaded rule count, the count per category. |
 | `/automation/v1/sla/overview` | `sla:read` | The 1 h and 24 h passive windows for every route. |
 | `/automation/v1/sla/routes/{id}` | `sla:read` | One route's passive windows (1 h, 24 h, 7 d, 30 d). |
 | `/automation/v1/cluster/status` | `cluster:read` | This node's role, build, applied generation and hash. |
-| `/automation/v1/cluster/nodes` | `cluster:read` | The fleet roster (control plane only; 409 elsewhere). |
-| `/automation/v1/cluster/nodes/{id}` | `cluster:read` | One node of the roster. |
 | `/automation/v1/backends` | `backends:read` | Every backend with its health, connections and EWMA score. |
 | `/automation/v1/routes` | `routes:read` | Every route with its linked backend ids, optionally one group. |
 | `/automation/v1/certificates` | `certificates:read` | Certificate metadata: domain, SANs, fingerprint, issuer, validity, ACME settings. |
@@ -686,26 +684,49 @@ tidiness. Two surfaces that compute one answer independently drift, and
 on a read surface the drift takes the shape of a field one of them
 stopped stripping, which no test on either side notices.
 
-**The row cap is the server's.** Every collection answers
-`{"data": {"items": [...], "page": {...}}}` where `page` carries
-`limit`, `offset`, `returned` and `has_more`. `?limit=` is clamped to
-200 rows and there is no parameter that raises it; absent, it is 50.
-The intended caller is a language model reading on an operator's
-behalf, and a model that asks for everything must not be able to pull
-the access log into a context window. There is no `total`: the sources
-behind this surface count differently, and one field meaning three
-things is worse than no field, so `has_more` answers the only question
-a pager actually has.
+**The cap is the server's, and it counts bytes as well as rows.** Every
+collection answers `{"data": {"items": [...], "page": {...}}}` where
+`page` carries `limit`, `offset`, `returned` and `has_more`. `?limit=`
+is clamped to 200 rows and there is no parameter that raises it;
+absent, it is 50. The answer is additionally capped at 256 KiB of row
+data, because a row ceiling bounds nothing on its own: a WAF event's
+matched value is the raw regex match, truncated neither when it is
+recorded nor when it is read. Rows are dropped whole rather than
+truncated, so no field arrives mangled; the answer comes back with
+`returned` short of `limit` and `has_more` true. **Advance `offset` by
+`returned`, never by `limit`.** There is no `total`: the sources behind
+this surface count differently, and one field meaning three things is
+worse than no field, so `has_more` answers the only question a pager
+actually has.
+
+**A window this surface cannot reach is a refusal, never an empty
+page.** Two of the sources clamp their own row budget: the access log
+at 10 000 rows, the WAF events at 500. Past that clamp an offset-based
+read gets fewer rows than its window starts at, and the honest-looking
+answer would be `{"items": [], "has_more": false}` while the table
+still holds thousands of rows, which an operator and a model alike read
+as "there was nothing". Such an offset is a `400` naming the deepest
+window the requested `limit` can reach; narrow the read with its
+filters instead. The same `400` bounds a free-text filter: `?search=`
+becomes five unanchored `LIKE` predicates plus a `COUNT(*)` over the
+whole retained log, so its length is a per-request cost the caller
+would otherwise choose, and it is capped at 256 bytes here.
 
 **No secret crosses this boundary**, and the reason is the first point
 above rather than a filter written here: the views are the management
 plane's, so a route's Basic-auth hash never leaves the store, and the
 certificate listing carries metadata with no PEM body of any kind. The
 single-certificate endpoint, which does return the public certificate
-PEM, is deliberately not mounted on this listener. A test in
-`lorica-api/src/tests.rs` walks every field name and every string value
-of every answer for credential spellings and for PEM private-key
-blocks, so the inherited property is one a change can break loudly.
+PEM, is deliberately not mounted on this listener. Two tests in
+`lorica-api/src/tests.rs` hold that, and they walk the paths the scope
+matrix declares rather than a list typed beside it. The first walks
+every field name and every string value of every answer for credential
+spellings and for PEM private-key blocks. The second pins the whole SET
+of field names each answer carries against a committed list, which is
+the question the first cannot reach: the answers are the management
+plane's own views, so a field added to one of them would otherwise land
+on a network-reachable token surface with every gate green, sensitive
+or not.
 
 **What the rows contain is attacker-controlled text.** Access-log paths
 and hostnames, WAF matched values, User-Agent strings: that is the
@@ -717,16 +738,37 @@ treat them as data.
 **Two narrowings against the management plane.** The SLA reads do not
 accept `?node=`: proxying a read to a follower carries an operator
 floor, and an automation credential has scopes and no role to weigh
-against it. And the fleet roster omits each node's host telemetry (CPU,
-memory, disk), which the management API shows from `Operator` upwards;
-the scope vocabulary cannot say "this token is an operator", so this
-surface reads the floor rather than granting every `cluster:read` token
-a view an operator kept for operators.
+against it. And **the fleet roster is not on this plane at all**.
+`GET /api/v1/cluster/nodes` is the one cluster read the management API
+gates at `Operator` rather than `Viewer`, because the roster discloses
+each follower's source address and the hostnames whose certificate
+private keys it holds. A `cluster:read` token carries scopes and no
+role, so serving it there would stand a role above where the management
+matrix deliberately put that answer. `cluster:read` reaches
+`/cluster/status`, which is `Viewer` on both planes and answers the
+question this surface exists for: what this node's role, build and
+applied configuration are, and on a control plane a one-line entry per
+fleet member. Whether the roster returns behind a projection that
+strips `session_peer`, `selected_for_hostnames` and `certificate_ids`
+is an open question, not a shipped one.
 
 Every one of these requests is audited like any other on the plane, by
 the same outermost layer: `automation.request.ok` with the calling
 token named, or `automation.request.forbidden:<scope>` when the grant
-is missing.
+is missing. On a read surface the substance is in the query string, so
+the audit target carries the NAMES of the parameters the request used
+and never their values (`GET /automation/v1/logs?limit,offset,search`):
+which filters a token reached for is what separates two reads of one
+path, and Story 9.9's rule that no payload is stored still holds. The
+same requests are counted per declared path template by
+`automation_requests_by_path_total`, beside the plane-wide
+`automation_requests_total`.
+
+Every answer carries `Cache-Control: no-store` and
+`X-Content-Type-Options: nosniff`. Neither defends against a vector
+that exists on a machine-facing, TLS-only, bearer-only plane with no
+browser in the path; they are there for the client library or the
+future gateway that caches or sniffs without being asked to.
 
 ## GitLab OIDC
 

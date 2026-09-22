@@ -205,6 +205,15 @@ have to exist before a client of them means anything.
       stripped of secrets, audited, and documented in
       `openapi-automation.yaml` against the contract test.
 
+- [x] The fix pass over that half, from five parallel audits of
+      `031d9e0e` and `4610b594`: the log read's ordering defect, the
+      unbounded `offset`, the fleet roster's removal from this plane,
+      the AC #5 sweep derived from the scope matrix rather than
+      transcribed beside it, and the field-name SET pinned rather than
+      only its forbidden subset. The `lorica-mcp` library seam lands
+      here too, ahead of the lot it serves, because it is free while
+      the crate is empty. See the Completion Notes.
+
 - [ ] AC #1, the rest: configuration intake, endpoint and token from
       environment or config file, and a refusal with a clear message if
       either arrives on argv.
@@ -369,6 +378,42 @@ resumability. `GET` or `DELETE` on the endpoint answers `405`. An
 `Mcp-Session-Id` header is ignored and never echoed. A `Last-Event-ID`
 is ignored.
 
+**The tool surface, read from the same source.** A `tools/list` result
+carries `resultType: "complete"`, a `tools` array, and optionally
+`nextCursor`, `ttlMs` and `cacheScope`. A tool definition is `name`,
+optional `title`, `description`, optional `icons`, `inputSchema` and
+optional `outputSchema` and `annotations`. `inputSchema` MUST be a
+valid JSON Schema object and never `null`; a tool taking no arguments
+declares `{"type": "object", "additionalProperties": false}`. Tool
+names are 1 to 128 characters from `[A-Za-z0-9_.-]`, case-sensitive.
+
+A `tools/call` result carries `content` (an array of typed blocks:
+`text`, `image`, `audio`, `resource_link`, `resource`), an `isError`
+flag, and optionally `structuredContent` conforming to the declared
+`outputSchema`. A tool that returns structured content SHOULD also put
+the serialised JSON in a text block.
+
+**Two error channels, and they are not interchangeable.** A protocol
+error is a JSON-RPC error and covers an unknown tool or a malformed
+request. A tool execution error is a normal result with
+`isError: true`, and it is what a model can read and correct. An
+authorization refusal from the API behind us is an execution error, not
+a protocol error: the model should see it and stop, not retry blindly.
+
+**The specification explicitly blesses the tier design.** The tool set
+"MUST NOT vary per-connection or as a side effect of other requests on
+the connection", but it "MAY vary by the authorization presented on the
+request, for example returning only the tools the caller's granted
+scopes permit, since credentials are per-request input, not connection
+state". AC #3 is therefore the sanctioned pattern rather than a
+deviation.
+
+**Four server MUSTs on tools** land on us: validate every tool input,
+implement access controls, **rate limit tool invocations**, and
+sanitise tool outputs. The HTTP binding inherits the automation
+listener's per-IP limiter for the third; stdio has no limiter at all
+and the crate owns that one itself.
+
 **Decision taken here:** this crate implements 2026-07-28 and nothing
 else. No `initialize` fallback for older clients, no legacy era. AC #11
 already requires the crate to state its revision, and a second era
@@ -395,6 +440,38 @@ endpoint added in AC #9 is a new path on that listener: if it is not
 declared in the matrix it answers 403 to everyone, which is the
 fail-closed outcome but looks like a broken build. Declare it with the
 rest of AC #9, not afterwards.
+
+### AC #4's "cluster and node status" is served in part
+
+Decided 2026-09-23, during the fix pass. AC #4 asks for "cluster and
+node status". This surface answers the first and not the second:
+`/automation/v1/cluster/status` is mounted, the fleet roster is not.
+
+The reason is that the roster is the one cluster read the management
+API gates at `Operator` rather than `Viewer`
+(`middleware/authorize.rs`), and the comment there gives the grounds in
+terms that apply verbatim to a token: it discloses each follower's
+source address and the hostnames whose certificate private keys it
+holds. Epic 9 raised that floor on purpose (backlog #69). The first
+implementation read the roster at `Role::Viewer` and recorded that as a
+narrowing; it is not one. `Role::Viewer` gates exactly one field of
+that answer, `resources`, so `session_peer`, `selected_for_hostnames`
+and `certificate_ids` crossed at every role and therefore to every
+`cluster:read` token, off-box, behind a credential with no role at all.
+On a delegated fleet that hands a model the map of which node holds
+which private key and where each follower dials from.
+
+`/cluster/status` is `Viewer` on both planes, carries the node's role,
+build, applied generation and hash, and on a control plane a one-line
+entry per fleet member. That is the answer the story's own motivating
+question needs ("why is this route 502-ing"); the roster is not.
+
+**Open, not closed.** Whether the roster returns behind a projection
+that strips those three fields is a product decision nobody has taken.
+Such a projection would cost this module its "nothing here filters"
+property, which is the property the whole wrapper design rests on, so
+it needs a test of its own if it lands. Until then `docs/mcp.md` must
+not promise a node listing.
 
 ### The tier check is a startup property, not a tool
 
@@ -557,6 +634,56 @@ in `rust:1-bookworm` with `RUSTFLAGS=-D warnings` unless noted:
 `cargo audit` was NOT run: no dependency changed. Nothing in this half
 touches the frontend, so its three gates were not re-run.
 
+Lot 2, the fix pass over the first half, 2026-09-23. Gates run in
+`rust:1-bookworm` with `RUSTFLAGS=-D warnings` unless noted:
+
+- `cargo fmt --all -- --check` on the Windows host: clean (it needed
+  one pass of `cargo fmt --all` first, on three files).
+- `cargo test -p lorica-config -p lorica-api`: 853 + 495 unit, 3 in
+  `tests/automation_scope_fixture.rs`, 4 in `tests/openapi_contract.rs`,
+  8 + 18 doctests. 0 failed. The `lorica-api` lib count went 843 -> 853.
+- `cargo test -p lorica-api --test openapi_contract --test automation_scope_fixture`:
+  4 + 3 passed, 0 failed.
+- `cargo test -p lorica-mcp`: 2 passed (the library's seam tests; the
+  crate had no test target at all before it had a `lib.rs`).
+- `cargo build -p lorica-mcp`: clean.
+- `cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings`: clean.
+- `cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings`: clean.
+- `cargo clippy -p lorica --all-targets --features otel -- -D warnings`:
+  clean.
+
+- `README.md`'s product-crate test count, recomputed with the
+  `docs/BUMP-CHECKLIST.md` recipe rather than incremented by hand:
+  2663 -> 2694. It had already drifted by the first half of this lot
+  and nothing recomputes it.
+
+`cargo audit` was NOT run: no dependency was added or bumped.
+`lorica-mcp` still declares none, and the response-hardening headers
+are a `from_fn` middleware rather than a new `tower-http` feature for
+two constants. Nothing here touches the frontend.
+
+**Every fix was watched failing before it was watched passing.** Each
+defect was reintroduced in the tree, the named test run, and the file
+restored byte-exact (md5 checked before and after):
+
+- the log reversal removed: `the_first_page_of_the_log_is_the_newest_rows_and_the_offset_walks_backwards`
+  answered `["ordered-34" ..= "ordered-38"]` where it wanted
+  `["ordered-39" ..= "ordered-35"]`, which is the defect exactly: the
+  window's oldest end, with the newest row unreachable.
+- `page_within` swapped back to `page` on the WAF read:
+  `an_offset_past_what_a_source_can_answer_is_refused_and_not_an_empty_page`
+  got 200 where it wanted 400.
+- the roster path declared again in the matrix:
+  `automation::scope::tests::the_fleet_roster_is_reachable_by_no_token_on_this_plane`
+  and `tests::the_fleet_roster_is_not_reachable_on_the_automation_plane`
+  both failed.
+- a path added to `scope::READ_SURFACE` and to nothing else:
+  `no_automation_read_answer_carries_a_secret_field_name` immediately
+  drove it and failed on its 200 assertion, which is the property the
+  hand-written `AUTOMATION_READS` could not have.
+- the field-name pin failed on its first run by construction, listing
+  all 139 names the surface answers; the committed list is that output.
+
 ### Completion Notes
 
 **The third state is a type, not a sentinel scope.** `required_scope`
@@ -628,6 +755,11 @@ and `/cluster/nodes/{id}` (`cluster:read`), `/backends`
 a test asserts `POST`, `PUT`, `DELETE` and `PATCH` stay undeclared on
 every one of them.
 
+> Amended 2026-09-23 by the fix pass below: nine, not eleven.
+> `/cluster/nodes` and `/cluster/nodes/{id}` were removed from this
+> plane. See "AC #4's cluster and node status is served in part" in the
+> Dev Notes for why, and the fix-pass notes for what moved.
+
 **Every handler is a wrapper and computes nothing.** `logs`,
 `waf/events`, `waf/stats`, `backends`, `routes` and `certificates` call
 the management handler directly, which was possible because none of
@@ -649,6 +781,12 @@ roster is read at `Role::Viewer`, so the Operator-only per-node CPU,
 memory and disk figures are absent; the scope vocabulary cannot express
 "this token is an operator", so reading anything above the floor would
 hand every `cluster:read` token a view an operator kept for operators.
+
+> Amended 2026-09-23: the second of those was not a narrowing.
+> `Role::Viewer` gates one field of that answer and the endpoint as a
+> whole sits at `Operator` on the management plane, so the roster was
+> being served a role below where its own matrix put it. The paths are
+> gone rather than narrowed.
 
 **The page envelope carries no `total`.** Collections answer
 `{"data": {"items": [...], "page": {limit, offset, returned, has_more}}}`.
@@ -688,6 +826,131 @@ are automation-plane paths and that document describes the management
 socket. `CHANGELOG.md` was updated under Added and Security although
 lot 4 lists the changelog, because a read surface that ships without a
 security note in the same edit is a note nobody writes later.
+
+---
+
+Lot 2, the fix pass over the first half, 2026-09-23. Five parallel
+audits of `031d9e0e` and `4610b594` (security, architecture, quality,
+performance, debt). Everything below is fixed in the same cycle; the
+only thing carried forward is named as open, not deferred.
+
+**The log read answered nearly the same window at every offset.** Both
+log sources fetch the newest `scan` rows and hand them back OLDEST
+first: the store runs `ORDER BY id DESC LIMIT ?` and then reverses
+(`log_store.rs`), the in-memory fallback returns the tail of a
+chronological buffer. `Page::of` walked that array from the FRONT, so
+`skip(offset)` walked the window's oldest end. The arithmetic: with
+more rows in the table than the scan, the array is exactly
+`offset + limit + 1` long, index `offset+limit` is the newest row, and
+`rows[offset .. offset+limit]` is the 2nd- through (limit+1)-th-newest
+**whatever `offset` is**. The newest row was unreachable at every
+offset, consecutive pages overlapped almost entirely, and
+`has_more = rows.len() > offset + limit` was permanently true, so a
+consumer honouring it paged forever over duplicates. `/waf/events` was
+never affected: it returns descending and is not reversed. Fixed by
+reversing to newest-first in `list_logs` before the window is cut, so
+the two reads now agree and `offset` walks backwards in time. This is
+the read tier's primary use case and NO test in the suite used `offset`
+at all; the new one asserts which rows come back, not how many.
+
+**`offset` was the caller's lever on how much work the node did.**
+`limit` was clamped and `offset` was not, and `scan()` feeds the
+source's own row budget, so `?offset=9999&limit=200` made the node run
+a `COUNT(*)`, fetch 10 000 rows, build 10 000 `LogEntry` values and
+serialise them, under the one `LogStore` mutex the audit drain shares,
+to answer with one row. The same gap made the envelope answer
+`{"items": [], "has_more": false}` on any window past a source's own
+clamp. `PageQuery::page_within(depth)` now refuses such an offset with
+a 400 naming the deepest window the requested `limit` can reach; the
+two depths are `logs::LOGS_QUERY_MAX_ROWS` and
+`waf::WAF_EVENTS_MAX_ROWS`, both newly named where the clamp is applied
+rather than transcribed here. The unclamped sources keep `page()`: an
+empty window on a listing the node holds in full is the truth.
+
+**The fleet roster left this plane.** See the Dev Note. `read.rs` loses
+`list_cluster_nodes`, `get_cluster_node` and `AUTOMATION_VIEW_ROLE`
+(which had nothing left to gate and would not have compiled under
+`-D warnings`); `scope.rs` loses `CLUSTER_NODES_PATH`; the router, the
+OpenAPI document and `docs/automation.md` lose the two paths, and the
+`NotAControlPlane` response component with them. `cluster::roster` and
+`cluster::one_node` stay: the management handlers they were split out
+of still call them, so the split is not reverted, only its second
+consumer. Two tests assert the paths are refused, one on the matrix and
+one through the whole stack.
+
+**The AC #5 sweep is derived from the matrix, not typed beside it.**
+`AUTOMATION_READS` hand-listed 8 paths while `scope::READ_SURFACE` and
+the router declared 11, and three places said the sweep walked every
+answer. The const is gone; `READ_SURFACE` moved to `scope.rs`'s module
+level under `#[cfg(test)]` and both sweeps iterate it, substituting the
+seeded route id for the one entry that names a resource. A path added
+to the matrix now enters both sweeps by construction, which the probe
+in the Debug Log demonstrates. The fixture is a control plane, so
+`/cluster/status` answers its widest shape rather than a standalone
+node's. The false claim is corrected in `read.rs`'s module doc, in the
+test's own doc, in `docs/automation.md` and in this file.
+
+**The field-name SET is pinned, not just its forbidden subset.** The
+marker sweep asks whether a credential got out. It cannot ask what is
+on this plane at all, and the answers are the management plane's own
+views, so a field that is sensitive but not credential-shaped would
+arrive with every gate green: `NodeResponse` used `#[serde(flatten)]`
+over a store model, which is how a new column ships itself.
+`every_automation_read_answers_only_the_field_names_this_surface_committed_to`
+walks every read on the seeded node, collects the key names and diffs
+them both ways against `AUTOMATION_READ_FIELD_NAMES`, 139 entries,
+following the `openapi_contract.rs` idiom: extraction sanity first,
+both directions, a `panic!` naming the decision, nothing auto-written.
+
+**The rest, all from the same audits.** `local_sla_overview` takes the
+window and stops one route past it, so the config-store mutex is no
+longer held for `2R` queries to answer `?limit=1`. `list_backends`
+builds the two merged worker maps once instead of `2B` times. `?search=`
+is capped at 256 bytes on this plane, and `%` and `_` are escaped with
+an `ESCAPE` clause in the store, so a search for `%` matches a per cent
+sign on both planes rather than every row. The answer carries a 256 KiB
+byte ceiling beside the row ceiling, dropping rows whole and reporting
+the shortfall through `returned` and `has_more`. The audit row carries
+the NAMES of the query parameters used, bounded in count and length,
+and `automation_requests_by_path_total` counts per declared path
+template (`scope::path_template`, derived from the same match
+`required_scope` reads, so a caller-chosen id cannot become a label).
+`openapi_contract.rs` gains a gate comparing the documented query
+parameters of the three reused-filter reads against the serde field
+names of the structs they reuse. The misplaced scope-array example
+moved from `PipelineIdentity.user_login` to `WhoAmI.scopes`. The
+cross-language scope guard strips comments before counting quoted
+strings, so a commented-out entry no longer reads as present. The route
+SLA 404 no longer echoes the caller's id back into a body a model
+reads. The router adds `Cache-Control: no-store` and
+`X-Content-Type-Options: nosniff` as a `from_fn` middleware, which
+needs no new `tower-http` feature. `automation_token.rs` drops its
+hand-written "four".
+
+**`lorica-mcp` gains a library target.** It was binary-only with no
+`lib.rs`, and lot 4 mounts the Streamable HTTP adapter INSIDE
+`lorica-api`, which needs to depend on this crate. `lib.rs` carries
+`MCP_PROTOCOL_REVISION`, a `ReadError` that keeps the status the
+automation plane chose (an authorization refusal is a tool EXECUTION
+error, not a protocol one, and that only survives if the status crosses
+the seam), and `ReadSource`, one method taking a built path and
+answering the JSON body verbatim. `main.rs` is now the stdio binary
+over the library. **Nothing else was built**: no JSON-RPC core, no
+tools, neither adapter. `lorica-api` does NOT yet depend on the crate;
+that belongs to the lot that mounts the adapter. The seam is here now
+because what decides whether AC #10's "one shared core" holds is how
+the FIRST tool body reaches a read view, and that is cheaper to settle
+while there are no tool bodies.
+
+**Not done, and named rather than hidden.** No per-token request-rate
+budget on the automation router: the listener's budgets are
+connection-level and a keep-alive caller can issue requests without
+one. The architecture audit proposes a per-principal in-flight cap;
+that is a design decision, not a fix, and it belongs with the MCP
+adapter that will be its heaviest caller. No OTel span on this plane
+either (inherited from Story 10.3). Neither is deferred debt from this
+story's own work; both are raised here so the next lot starts from a
+true picture.
 
 ## File List
 
@@ -738,6 +1001,26 @@ Modified in lot 2 (first half):
   `docs/architecture/api-design-and-integration.md`
 - `docs/stories/story-11.1-mcp-crate-read-tier.md`
 
+Added in lot 2 (the fix pass):
+
+- `lorica-mcp/src/lib.rs`
+
+Modified in lot 2 (the fix pass):
+
+- `lorica-api/src/automation/read.rs`, `.../scope.rs`, `.../router.rs`,
+  `.../audit.rs`, `.../mod.rs`
+- `lorica-api/src/logs.rs`, `lorica-api/src/log_store.rs`,
+  `lorica-api/src/waf.rs`, `lorica-api/src/sla.rs`,
+  `lorica-api/src/backends.rs`, `lorica-api/src/metrics.rs`
+- `lorica-api/src/tests.rs`
+- `lorica-api/tests/openapi_contract.rs`,
+  `lorica-api/tests/automation_scope_fixture.rs`
+- `lorica-api/openapi-automation.yaml`
+- `lorica-config/src/models/automation_token.rs`
+- `lorica-mcp/Cargo.toml`, `lorica-mcp/src/main.rs`
+- `CHANGELOG.md`, `README.md`, `docs/automation.md`
+- `docs/stories/story-11.1-mcp-crate-read-tier.md`
+
 ## Change Log
 
 - 2026-09-22: Story drafted from the Epic 11 PRD. D5 resolved as a
@@ -784,4 +1067,36 @@ Modified in lot 2 (first half):
   `{items, page}` envelope whose 200-row ceiling the caller cannot
   raise, and AC #5's secret sweep walks every field name and string
   value of every answer. `lorica-mcp/` untouched: the JSON-RPC core and
-  the tools are the second half of the lot.
+  the tools are the second half of the lot. Corrected the same day by
+  the entry below: eleven became nine, and the sweep walked eight of
+  the eleven rather than every answer.
+- 2026-09-23: the fix pass over that half, from five parallel audits
+  (security, architecture, quality, performance, debt) of `031d9e0e`
+  and `4610b594`. One High each from three of them proved out and is
+  fixed here. **The log read answered nearly the same window at every
+  `offset` and never the newest row**, because both sources hand back
+  their newest window oldest-first and the pager walked it from the
+  front; rows are newest-first now and a test asserts which rows come
+  back, which no test did before. **`offset` was unclamped**, which
+  bought a 200x work amplification under the mutex the audit drain
+  shares and made the envelope answer an empty page with
+  `has_more: false` past a source's own clamp; an offset a source
+  cannot reach is now a 400 naming the depth. **The fleet roster left
+  this plane**: `/cluster/nodes` and `/cluster/nodes/{id}` were serving
+  a `Viewer` view of an answer the management API gates at `Operator`
+  because it names each follower's address and the hostnames whose
+  private keys it holds, so AC #4's "cluster and node status" is now
+  served in part, status yes and roster no, pending a decision recorded
+  in the Dev Notes. **The AC #5 sweep is derived from
+  `scope::READ_SURFACE`** rather than transcribed beside it, and a
+  second test pins the whole set of field names each answer carries.
+  Also: the SLA overview and the backend listing stop computing what
+  they are about to discard, `?search=` is length-bounded and its
+  wildcards escaped in the store, the answer carries a byte ceiling
+  beside the row ceiling, the audit row names the query parameters used
+  (never their values) and a per-path counter joins the plane-wide one,
+  the OpenAPI document's reused query vocabulary is pinned against the
+  structs it restates, and the cross-language scope guard stops
+  counting commented-out entries. `lorica-mcp` gains a `lib.rs` with
+  the fetch seam lot 4 needs and nothing else: no JSON-RPC core, no
+  tools, no adapter.

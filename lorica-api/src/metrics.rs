@@ -2334,6 +2334,32 @@ pub fn inc_automation_request(outcome: &str) {
         .inc();
 }
 
+/// Requests on the automation listener by path and outcome. Labels:
+/// path, outcome.
+///
+/// Separate from the counter above rather than a label added to it: the
+/// plane-wide rate is what an operator alerts on and what a dashboard
+/// shows without a sum, and a whole read surface made "which one" a
+/// second question rather than a refinement of the first.
+static AUTOMATION_REQUESTS_BY_PATH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "automation_requests_by_path_total",
+        "Automation API requests by declared path template and outcome",
+        &["path", "outcome"],
+    )
+});
+
+/// Record one automation request against its path template.
+///
+/// `path` MUST be a template the scope matrix declares, or the fixed
+/// word for an undeclared one. Anything carrying a caller-chosen
+/// segment is a new time series per value a caller sends.
+pub fn inc_automation_request_by_path(path: &str, outcome: &str) {
+    AUTOMATION_REQUESTS_BY_PATH_TOTAL
+        .with_label_values(&[path, outcome])
+        .inc();
+}
+
 /// Connections dropped before the handshake because the source was
 /// outside `automation_allowed_cidrs`.
 static AUTOMATION_SOURCE_REFUSED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {

@@ -7,6 +7,19 @@ edition = "2021"
 repository = "https://github.com/Rwx-G/Lorica"
 description = "Management MCP server for Lorica: a tiered, scope-gated tool surface over the automation plane"
 
+# A library and a binary. The library is the shared core AC #10 asks
+# for: `lorica-api` mounts the Streamable HTTP binding in process and
+# depends on this crate for it, so a binary-only crate would leave that
+# adapter nothing to mount. The binary is the stdio binding and the only
+# thing here that ever touches a file descriptor.
+[lib]
+name = "lorica_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lorica-mcp"
+path = "src/main.rs"
+
 # No dependencies yet. The protocol core is hand-rolled (Story 11.1
 # decision D5) and the transports reuse what the workspace already has,
 # so the intake, the JSON-RPC loop and the stdio adapter declare theirs

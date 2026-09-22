@@ -9543,52 +9543,11 @@ async fn every_automation_request_lands_in_the_audit_log() {
 
 // ---- Story 11.1: the automation plane's read surface ----
 
-/// Every read path of the automation plane beside the scope it sits
-/// behind.
-///
-/// The test's own statement of the contract. `scope.rs` has the same
-/// pairs against the matrix; these drive the whole stack, token
-/// included, which is the half a caller meets.
-const AUTOMATION_READS: &[(&str, lorica_config::models::AutomationScope)] = &[
-    (
-        "/automation/v1/logs",
-        lorica_config::models::AutomationScope::LogsRead,
-    ),
-    (
-        "/automation/v1/waf/events",
-        lorica_config::models::AutomationScope::WafRead,
-    ),
-    (
-        "/automation/v1/waf/stats",
-        lorica_config::models::AutomationScope::WafRead,
-    ),
-    (
-        "/automation/v1/sla/overview",
-        lorica_config::models::AutomationScope::SlaRead,
-    ),
-    (
-        "/automation/v1/cluster/status",
-        lorica_config::models::AutomationScope::ClusterRead,
-    ),
-    (
-        "/automation/v1/backends",
-        lorica_config::models::AutomationScope::BackendsRead,
-    ),
-    (
-        "/automation/v1/routes",
-        lorica_config::models::AutomationScope::RoutesRead,
-    ),
-    (
-        "/automation/v1/certificates",
-        lorica_config::models::AutomationScope::CertificatesRead,
-    ),
-];
-
 /// A field name that must never appear anywhere in an automation
 /// answer, matched as a substring of the key so a prefixed or suffixed
 /// spelling is caught too (Story 11.1 AC #5).
 ///
-/// `session` alone is absent on purpose: the fleet roster legitimately
+/// `session` alone is absent on purpose: a fleet view legitimately
 /// reports `session_peer` and `session_last_seen_unix`, which are
 /// connection facts and not a credential. The credential spellings are
 /// named precisely instead.
@@ -9606,6 +9565,162 @@ const NEVER_LEAVES_THE_NODE: &[&str] = &[
     "session_id",
     "cookie",
     "authorization",
+];
+
+/// Every key name the read surface answers with on a seeded node.
+///
+/// The forbidden-marker sweep below asks "did a credential get out".
+/// This list asks the question that one cannot: what is on this plane
+/// AT ALL. The answers are the management plane's own views, so the
+/// exposure of this surface is whatever those views happen to contain
+/// at every future commit, and a field that is sensitive but not
+/// credential-shaped (a source address, a file path, an internal node
+/// name) would arrive with every gate green. `NodeResponse` used
+/// `#[serde(flatten)]` over a store model, which is how a new column
+/// ships itself.
+///
+/// Sorted, one canonical thing, and nothing writes it: a new field is a
+/// red test and a decision, which is the point.
+const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
+    "access_log_enabled",
+    "acme_auto_renew",
+    "action",
+    "active_connections",
+    "add_path_prefix",
+    "address",
+    "applied_config_generation",
+    "applied_config_hash",
+    "auto_ban_duration_s",
+    "auto_ban_threshold",
+    "avg_latency_ms",
+    "backend",
+    "backends",
+    "basic_auth_username",
+    "break_glass_until",
+    "build_version",
+    "by_category",
+    "cache_enabled",
+    "cache_max_bytes",
+    "cache_ttl_s",
+    "cache_vary_headers",
+    "category",
+    "certificate_id",
+    "client_ip",
+    "compression_enabled",
+    "connect_timeout_s",
+    "connected",
+    "connection_state",
+    "control_plane",
+    "cors_allowed_methods",
+    "cors_allowed_origins",
+    "cors_max_age_s",
+    "count",
+    "created_at",
+    "data",
+    "description",
+    "domain",
+    "enabled",
+    "error",
+    "ewma_score_us",
+    "fingerprint",
+    "fleet",
+    "force_https",
+    "group_name",
+    "h2_upstream",
+    "has_more",
+    "header_rules",
+    "health_check_enabled",
+    "health_check_interval_s",
+    "health_check_path",
+    "health_status",
+    "host",
+    "hostname",
+    "hostname_aliases",
+    "id",
+    "ip_allowlist",
+    "ip_denylist",
+    "is_acme",
+    "is_xff",
+    "issuer",
+    "items",
+    "last_seen_at",
+    "latency_ms",
+    "lifecycle_state",
+    "limit",
+    "load_balancing",
+    "maintenance_mode",
+    "matched_field",
+    "matched_value",
+    "max_connections",
+    "max_request_body_bytes",
+    "meets_target",
+    "method",
+    "name",
+    "node_id",
+    "node_name",
+    "not_after",
+    "not_before",
+    "offset",
+    "p50_latency_ms",
+    "p95_latency_ms",
+    "p99_latency_ms",
+    "page",
+    "path",
+    "path_prefix",
+    "path_rewrite_pattern",
+    "path_rewrite_replacement",
+    "path_rules",
+    "proxy_headers",
+    "proxy_headers_remove",
+    "rate_limit_burst",
+    "rate_limit_rps",
+    "read_timeout_s",
+    "redirect_hostname",
+    "redirect_to",
+    "request_id",
+    "response_headers",
+    "response_headers_remove",
+    "retry_attempts",
+    "retry_on_methods",
+    "returned",
+    "role",
+    "route_hostname",
+    "route_id",
+    "rule_count",
+    "rule_id",
+    "san_domains",
+    "security_headers",
+    "send_timeout_s",
+    "serve_robots_txt",
+    "session_generation",
+    "severity",
+    "sla_pct",
+    "slowloris_threshold_ms",
+    "source",
+    "stale_if_error_s",
+    "stale_while_revalidate_s",
+    "status",
+    "sticky_session",
+    "strip_path_prefix",
+    "successful_requests",
+    "target_pct",
+    "timestamp",
+    "tls_skip_verify",
+    "tls_sni",
+    "tls_upstream",
+    "total_24h",
+    "total_events",
+    "total_requests",
+    "traffic_splits",
+    "updated_at",
+    "version",
+    "waf_body_scan_max_bytes",
+    "waf_enabled",
+    "waf_mode",
+    "websocket_enabled",
+    "weight",
+    "window",
+    "xff_proxy_ip",
 ];
 
 /// Every key name and every string value in `value`, walked in full.
@@ -9631,16 +9746,47 @@ fn json_keys_and_strings(
     }
 }
 
+/// One entry of `automation::scope::READ_SURFACE` as a request this
+/// suite can actually send.
+///
+/// The surface is walked as the scope matrix declares it and never as a
+/// second list typed beside it, so a path added there enters every
+/// sweep below by construction. The one entry naming a resource id gets
+/// the id the fixture seeded: a path added later that takes an id and
+/// is not handled here answers 404, and the sweep's own 200 assertion
+/// is where that surfaces.
+fn as_seeded_request(path: &str, route_id: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((collection, _)) if collection == "/automation/v1/sla/routes" => {
+            format!("{collection}/{route_id}")
+        }
+        _ => path.to_string(),
+    }
+}
+
 /// A node holding one of everything the read surface can answer with,
 /// written through the management API so the rows are the real ones,
-/// and a token carrying every scope.
-async fn a_node_with_something_to_read() -> (AppState, String) {
+/// a token carrying every scope, and the seeded route's id.
+///
+/// A control plane and not a standalone node: `/cluster/status` answers
+/// its widest shape there, the per-member fleet summary included, and
+/// the sweeps below are worth exactly as much as the widest answer they
+/// reach.
+async fn a_node_with_something_to_read() -> (AppState, String, String) {
     let (mut state, session_store, rate_limiter) = test_state().await;
     state.waf_event_buffer = Some(Arc::new(parking_lot::Mutex::new(
         std::collections::VecDeque::new(),
     )));
     state.waf_rule_count = Some(3);
+    let (control, _liveness) = test_control_plane();
+    state.cluster = crate::cluster::ClusterRuntime::ControlPlane(control);
     let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    {
+        let store = state.store.lock().await;
+        store
+            .create_cluster_node(&enrolled_node("node-a", "edge-1", "ab"))
+            .expect("test setup");
+    }
 
     let created = send(
         &state,
@@ -9695,6 +9841,10 @@ async fn a_node_with_something_to_read() -> (AppState, String) {
     )
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
 
     for n in 0..5u64 {
         state.log_buffer.push(crate::logs::LogEntry {
@@ -9742,14 +9892,15 @@ async fn a_node_with_something_to_read() -> (AppState, String) {
         None,
     )
     .await;
-    (state, token)
+    (state, token, route_id)
 }
 
 #[tokio::test]
 async fn an_automation_read_path_needs_its_own_scope_and_no_other() {
-    let (state, _all_scopes) = a_node_with_something_to_read().await;
+    let (state, _all_scopes, route_id) = a_node_with_something_to_read().await;
 
-    for (path, scope) in AUTOMATION_READS {
+    for (path, scope) in crate::automation::scope::READ_SURFACE {
+        let request = as_seeded_request(path, &route_id);
         let only_this = mint_automation(
             &state,
             "narrow",
@@ -9760,8 +9911,8 @@ async fn an_automation_read_path_needs_its_own_scope_and_no_other() {
         )
         .await;
         let response =
-            automation_send(&state, path, Some(&format!("Bearer {only_this}")), None).await;
-        assert_eq!(response.status(), StatusCode::OK, "{path}");
+            automation_send(&state, &request, Some(&format!("Bearer {only_this}")), None).await;
+        assert_eq!(response.status(), StatusCode::OK, "{request}");
 
         // The same path, a token holding every OTHER grant there is.
         let everything_else: Vec<lorica_config::models::AutomationScope> =
@@ -9779,14 +9930,15 @@ async fn an_automation_read_path_needs_its_own_scope_and_no_other() {
             None,
         )
         .await;
-        let response = automation_send(&state, path, Some(&format!("Bearer {wide}")), None).await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        let response =
+            automation_send(&state, &request, Some(&format!("Bearer {wide}")), None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{request}");
     }
 }
 
 #[tokio::test]
 async fn the_automation_read_surface_is_read_only_and_undeclared_paths_are_refused() {
-    let (state, token) = a_node_with_something_to_read().await;
+    let (state, token, _route_id) = a_node_with_something_to_read().await;
     let bearer = format!("Bearer {token}");
 
     // The management paths are not on this listener, and the scope
@@ -9800,6 +9952,50 @@ async fn the_automation_read_surface_is_read_only_and_undeclared_paths_are_refus
         let response = automation_send(&state, path, Some(&bearer), None).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
     }
+
+    // Every answer carries the two response headers, whatever it is.
+    let response =
+        automation_send(&state, "/automation/v1/cluster/status", Some(&bearer), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+}
+
+#[tokio::test]
+async fn the_fleet_roster_is_not_reachable_on_the_automation_plane() {
+    // The management plane gates `GET /api/v1/cluster/nodes` at
+    // `Operator`, one role above where this surface stands, because the
+    // roster discloses each follower's source address and the hostnames
+    // whose certificate private keys it holds. `cluster:read` reaches
+    // status and nothing else, and status is `Viewer` on both planes.
+    let (state, token, _route_id) = a_node_with_something_to_read().await;
+    let bearer = format!("Bearer {token}");
+
+    for path in [
+        "/automation/v1/cluster/nodes",
+        "/automation/v1/cluster/nodes/node-a",
+    ] {
+        let response = automation_send(&state, path, Some(&bearer), None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+
+    let body = body_json(
+        automation_send(&state, "/automation/v1/cluster/status", Some(&bearer), None).await,
+    )
+    .await;
+    assert_eq!(body["data"]["role"], "control_plane");
 }
 
 #[tokio::test]
@@ -9808,13 +10004,14 @@ async fn no_automation_read_answer_carries_a_secret_field_name() {
     // the filtering is inherited rather than written here; this walks
     // every answer to turn that inheritance into something a change
     // can break.
-    let (state, token) = a_node_with_something_to_read().await;
+    let (state, token, route_id) = a_node_with_something_to_read().await;
     let bearer = format!("Bearer {token}");
 
     let mut walked = 0usize;
-    for (path, _scope) in AUTOMATION_READS {
-        let response = automation_send(&state, path, Some(&bearer), None).await;
-        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    for (path, _scope) in crate::automation::scope::READ_SURFACE {
+        let request = as_seeded_request(path, &route_id);
+        let response = automation_send(&state, &request, Some(&bearer), None).await;
+        assert_eq!(response.status(), StatusCode::OK, "{request}");
         let body = body_json(response).await;
 
         let mut keys = Vec::new();
@@ -9827,7 +10024,7 @@ async fn no_automation_read_answer_carries_a_secret_field_name() {
             for marker in NEVER_LEAVES_THE_NODE {
                 assert!(
                     !lowered.contains(marker),
-                    "{path} answers a field named `{key}`, which matches the \
+                    "{request} answers a field named `{key}`, which matches the \
                      forbidden marker `{marker}`. Nothing on the automation \
                      plane may carry a credential."
                 );
@@ -9836,7 +10033,7 @@ async fn no_automation_read_answer_carries_a_secret_field_name() {
         for text in &texts {
             assert!(
                 !text.contains("PRIVATE KEY"),
-                "{path} answers a value carrying a PEM private key block"
+                "{request} answers a value carrying a PEM private key block"
             );
         }
     }
@@ -9851,10 +10048,79 @@ async fn no_automation_read_answer_carries_a_secret_field_name() {
 }
 
 #[tokio::test]
+async fn every_automation_read_answers_only_the_field_names_this_surface_committed_to() {
+    // The marker sweep asks whether a credential got out. This asks
+    // what is on this plane at all, which is the question the marker
+    // list cannot reach: the answers are the management plane's own
+    // views, so a field added to one of them lands here with every
+    // other gate green. Same idiom as `tests/openapi_contract.rs`:
+    // extraction sanity first, both directions diffed, a panic naming
+    // what to do, nothing auto-written.
+    let (state, token, route_id) = a_node_with_something_to_read().await;
+    let bearer = format!("Bearer {token}");
+
+    let mut answered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (path, _scope) in crate::automation::scope::READ_SURFACE {
+        let request = as_seeded_request(path, &route_id);
+        let response = automation_send(&state, &request, Some(&bearer), None).await;
+        assert_eq!(response.status(), StatusCode::OK, "{request}");
+        let body = body_json(response).await;
+        let mut keys = Vec::new();
+        let mut texts = Vec::new();
+        json_keys_and_strings(&body, &mut keys, &mut texts);
+        answered.extend(keys);
+    }
+
+    // Two empty sets compare equal, so a walk that collected nothing
+    // must fail loudly rather than read as a clean contract.
+    assert!(
+        answered.len() > 40,
+        "the field walk collected only {} names across the whole read surface; \
+         the seeded node answers far more than that, so the walk is broken",
+        answered.len()
+    );
+
+    let committed: std::collections::BTreeSet<String> = AUTOMATION_READ_FIELD_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let new_on_the_plane: Vec<&String> = answered.difference(&committed).collect();
+    let gone_from_the_plane: Vec<&String> = committed.difference(&answered).collect();
+
+    if !new_on_the_plane.is_empty() || !gone_from_the_plane.is_empty() {
+        let mut msg = String::from("\nAutomation read surface: the answered field names moved.\n");
+        msg.push_str(&format!(
+            "\nAnswered and not in AUTOMATION_READ_FIELD_NAMES ({}):\n",
+            new_on_the_plane.len()
+        ));
+        for name in &new_on_the_plane {
+            msg.push_str(&format!("  {name}\n"));
+        }
+        msg.push_str(&format!(
+            "\nIn AUTOMATION_READ_FIELD_NAMES and no longer answered ({}):\n",
+            gone_from_the_plane.len()
+        ));
+        for name in &gone_from_the_plane {
+            msg.push_str(&format!("  {name}\n"));
+        }
+        msg.push_str(
+            "\nA name on the first list arrived here because a management view grew a \
+             field, not because anyone decided this plane should publish it. Decide: \
+             either the field belongs on a network-reachable token surface a language \
+             model reads, and you add it to AUTOMATION_READ_FIELD_NAMES in \
+             lorica-api/src/tests.rs, sorted; or it does not, and the automation read \
+             projects it away. The second list is the mirror: a field this surface \
+             stopped answering, which is a contract change for whoever reads it.\n",
+        );
+        panic!("{msg}");
+    }
+}
+
+#[tokio::test]
 async fn the_row_cap_on_an_automation_collection_is_the_servers() {
     // A caller asking for everything gets the window. The ceiling is
     // not a default the query string can raise.
-    let (state, _token) = a_node_with_something_to_read().await;
+    let (state, _token, _route_id) = a_node_with_something_to_read().await;
     let over_the_cap = crate::automation::AUTOMATION_READ_MAX_ROWS + 25;
     for n in 0..over_the_cap as u64 {
         state.log_buffer.push(crate::logs::LogEntry {
@@ -9916,37 +10182,178 @@ async fn the_row_cap_on_an_automation_collection_is_the_servers() {
     assert_eq!(body["data"]["page"]["has_more"], true);
 }
 
-#[tokio::test]
-async fn an_automation_read_on_a_standalone_node_reports_the_role_rather_than_a_roster() {
-    // The fleet paths reach their handler on any node: the scope gate
-    // lets a `cluster:read` token through and the handler answers 409,
-    // which is a different sentence from "your token cannot do this".
-    let (state, token) = a_node_with_something_to_read().await;
-    let bearer = format!("Bearer {token}");
-
-    let response =
-        automation_send(&state, "/automation/v1/cluster/nodes", Some(&bearer), None).await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-
+/// The `request_id` of every row one paginated log read answered.
+async fn log_request_ids(state: &AppState, bearer: &str, query: &str) -> Vec<String> {
     let body = body_json(
-        automation_send(&state, "/automation/v1/cluster/status", Some(&bearer), None).await,
+        automation_send(
+            state,
+            &format!("/automation/v1/logs{query}"),
+            Some(bearer),
+            None,
+        )
+        .await,
     )
     .await;
-    assert_eq!(body["data"]["role"], "standalone");
+    body["data"]["items"]
+        .as_array()
+        .expect("a page of rows")
+        .iter()
+        .map(|row| {
+            row["request_id"]
+                .as_str()
+                .expect("every row carries its request id")
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_first_page_of_the_log_is_the_newest_rows_and_the_offset_walks_backwards() {
+    // The defect this pins: the source fetches the newest `scan` rows
+    // and hands them back OLDEST first, so paging from the front of
+    // that array walked the window's oldest end. Every offset answered
+    // nearly the same rows, the newest row was unreachable at any
+    // offset, and `has_more` never went false.
+    let (state, _token, _route_id) = a_node_with_something_to_read().await;
+    for n in 0..40u64 {
+        state.log_buffer.push(crate::logs::LogEntry {
+            id: 0,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: "GET".to_string(),
+            path: format!("/ordered/{n}"),
+            host: "read.example.com".to_string(),
+            status: 200,
+            latency_ms: 1,
+            backend: "10.0.0.10:8080".to_string(),
+            error: None,
+            client_ip: "192.0.2.10".to_string(),
+            is_xff: false,
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: format!("ordered-{n}"),
+        });
+    }
+    let token = mint_automation(
+        &state,
+        "log-reader",
+        vec![lorica_config::models::AutomationScope::LogsRead],
+        &["*.read.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    let bearer = format!("Bearer {token}");
+
+    // Page one is what just happened, newest first.
+    let first = log_request_ids(&state, &bearer, "?limit=5").await;
+    assert_eq!(
+        first,
+        vec![
+            "ordered-39",
+            "ordered-38",
+            "ordered-37",
+            "ordered-36",
+            "ordered-35"
+        ],
+        "the first page is the newest rows, newest first"
+    );
+
+    // The next window is the next five going back, and it shares no
+    // row with the first.
+    let second = log_request_ids(&state, &bearer, "?limit=5&offset=5").await;
+    assert_eq!(
+        second,
+        vec![
+            "ordered-34",
+            "ordered-33",
+            "ordered-32",
+            "ordered-31",
+            "ordered-30"
+        ],
+        "offset walks backwards in time"
+    );
+
+    // And the walk terminates: the buffer holds 45 rows, so the window
+    // starting at 40 is the last one.
+    let body = body_json(
+        automation_send(
+            &state,
+            "/automation/v1/logs?limit=5&offset=40",
+            Some(&bearer),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(body["data"]["page"]["returned"], 5);
+    assert_eq!(
+        body["data"]["page"]["has_more"], false,
+        "the oldest window ends the walk: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_offset_past_what_a_source_can_answer_is_refused_and_not_an_empty_page() {
+    // The WAF buffer answers at most `WAF_EVENTS_MAX_ROWS`. Past that,
+    // an offset-based read used to get fewer rows than its window
+    // started at and answer `{"items": [], "has_more": false}` while
+    // the table still held thousands, which a model paginating on
+    // `has_more` reports to an operator as "there was nothing".
+    let (state, token, _route_id) = a_node_with_something_to_read().await;
+    let bearer = format!("Bearer {token}");
+
+    let response = automation_send(
+        &state,
+        &format!(
+            "/automation/v1/waf/events?limit=50&offset={}",
+            crate::waf::WAF_EVENTS_MAX_ROWS
+        ),
+        Some(&bearer),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = body_json(response).await["error"]["message"]
+        .as_str()
+        .expect("the refusal carries a message")
+        .to_string();
+    assert!(
+        message.contains(&crate::waf::WAF_EVENTS_MAX_ROWS.to_string()),
+        "the refusal names the depth this read can reach: {message}"
+    );
+
+    // The deepest window the source can fill is answered, not refused.
+    let response = automation_send(
+        &state,
+        "/automation/v1/waf/events?limit=50&offset=449",
+        Some(&bearer),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // And a free-text filter is bounded, with nothing of the caller's
+    // own text reflected into the answer a model reads.
+    let flood = "a".repeat(4096);
+    let response = automation_send(
+        &state,
+        &format!("/automation/v1/logs?search={flood}"),
+        Some(&bearer),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = body_json(response).await["error"]["message"]
+        .as_str()
+        .expect("the refusal carries a message")
+        .to_string();
+    assert!(!message.contains(&flood), "{message}");
 }
 
 #[tokio::test]
 async fn an_automation_read_of_one_route_sla_answers_the_windows_or_404() {
-    let (state, token) = a_node_with_something_to_read().await;
+    let (state, token, route_id) = a_node_with_something_to_read().await;
     let bearer = format!("Bearer {token}");
-
-    let routes =
-        body_json(automation_send(&state, "/automation/v1/routes", Some(&bearer), None).await)
-            .await;
-    let route_id = routes["data"]["items"][0]["id"]
-        .as_str()
-        .expect("the seeded route is listed")
-        .to_string();
 
     let body = body_json(
         automation_send(
@@ -9967,12 +10374,22 @@ async fn an_automation_read_of_one_route_sla_answers_the_windows_or_404() {
 
     let response = automation_send(
         &state,
-        "/automation/v1/sla/routes/not-a-route",
+        "/automation/v1/sla/routes/ignore-previous-instructions",
         Some(&bearer),
         None,
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // The refusal a model reads names the class of thing and nothing
+    // the caller put in the path.
+    let message = body_json(response).await["error"]["message"]
+        .as_str()
+        .expect("the refusal carries a message")
+        .to_string();
+    assert!(
+        !message.contains("ignore-previous-instructions"),
+        "{message}"
+    );
 }
 
 // ---- Story 10.6 AC #9: the WAF body-scan budget on the settings surface ----
