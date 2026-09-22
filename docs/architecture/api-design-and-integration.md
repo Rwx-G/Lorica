@@ -45,7 +45,7 @@ Everything below is the v1.0 planning subset of the **management plane**.
 The automation plane is a separate surface under `/automation/v1/`, and
 its live shape is `lorica-api/openapi-automation.yaml`:
 
-- `GET /automation/v1/whoami` (`environments:read`) - what the presented credential is. Reaches nothing else, so it is the call an automation makes to check that its credential is still live and still carries the scopes it expects.
+- `GET /automation/v1/whoami` (no scope; any live token) - what the presented credential is. Reaches nothing else, so it is the call an automation makes to check that its credential is still live and still carries the scopes it expects, and the call the MCP server makes at startup to discover its own tier.
 - `GET /automation/v1/environments` (`environments:read`) - list the environments this token owns.
 - `GET /automation/v1/environments/{name}` (`environments:read`)
 - `PUT /automation/v1/environments/{name}` (`environments:write`) - one idempotent create-or-replace covering a route, its backends, a certificate binding and a lifetime, applied in a single transaction.

@@ -72,6 +72,7 @@ These crates do not exist in upstream Pingora:
 | `lorica-geoip` | GeoIP / ASN country and network lookups |
 | `lorica-shmem` | Anonymous `memfd` shared region for per-IP WAF flood / auto-ban counters |
 | `lorica-cluster` | Multi-node fleet: enrollment, the mutually authenticated cluster plane, configuration and certificate replication, telemetry fan-in |
+| `lorica-mcp` | Management MCP server: a scope-gated tool surface over the automation plane, spoken over stdio or over a path on the automation listener |
 | `lorica-tls` | SNI resolver, hot-swap, encrypted key storage (extends upstream TLS) |
 
 ## Comparing with Upstream

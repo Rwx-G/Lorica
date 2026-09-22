@@ -236,14 +236,19 @@ typo must not read as a revocation. The row stays, so after an incident
 the audit trail still says the credential existed, who minted it and
 when it was last presented.
 
-**The scope set is a closed list**: `environments:write`,
-`environments:read`, `routes:read`, `certificates:read`. An unknown
-scope string fails to deserialise rather than being dropped, so a token
-minted against a newer Lorica is refused instead of silently losing a
-grant an operator wrote down. `routes:write`, `certificates:write` and
-`settings:*` are absent on purpose in 1.8.0. The automation surface is
-the environment resource, not the management API behind a different
-door; an automation that needs to reshape routing or issue a
+**The scope set is a closed list**, published as the `AutomationScope`
+enum in `lorica-api/openapi.yaml` and offered by the mint form: the two
+environment grants, `routes:read` and `certificates:read`, plus the
+read grants the management MCP server's read tier is built on
+(`logs:read`, `waf:read`, `sla:read`, `cluster:read`,
+`backends:read`). An unknown scope string fails to deserialise rather
+than being dropped, so a token minted against a newer Lorica is refused
+instead of silently losing a grant an operator wrote down; a 1.9.0
+token presented to a 1.8.0 node is refused outright for that reason.
+`routes:write`, `certificates:write` and `settings:*` are absent on
+purpose. The automation surface is the environment resource plus read
+views over what the node is doing, not the management API behind a
+different door; an automation that needs to reshape routing or issue a
 certificate is asking for an operator's credential, and it should have
 to say so rather than find the capability already attached to the token
 it uses for ephemeral environments.
@@ -320,10 +325,13 @@ The OpenAPI contract test cross-checks every `x-required-scope` in
 
 `GET /automation/v1/whoami` reports the credential back to its holder
 (`name`, `public_id`, `kind`, `scopes`, and `pipeline` for an ID token)
-and reaches nothing else. It needs `environments:read`, the narrowest
-scope any token that talks to this plane carries, and it exists so the
-whole chain, source filter, TLS, bearer check, scope gate and audit,
-can be exercised on its own.
+and reaches nothing else. It needs no scope: any live token reaches it,
+whatever it carries. Everything in the response is something the caller
+already presented, and a scope in front of it would mean a token minted
+for one job cannot ask what it is - which is exactly what the MCP
+server does at startup with a token carrying only read grants. It
+exists so the whole chain, source filter, TLS, bearer check, scope gate
+and audit, can be exercised on its own.
 
 **Every request is audited, not only the mutations.** On the
 management plane a read is a human looking at a page they are already
@@ -950,6 +958,7 @@ translating:
 | `environments:write` | The path writes environments and the credential does not carry the scope. |
 | `routes:read` | Same, for the routes an environment resolves to. |
 | `certificates:read` | Same, for certificate metadata. |
+| `logs:read`, `waf:read`, `sla:read`, `cluster:read`, `backends:read` | Same, for the read views the MCP server's read tier is built on. |
 | `no_declared_scope` | The path has no entry in the scope matrix, so no token can reach it. A bug in Lorica, not in the caller: the scope gate also logs it at ERROR. |
 
 A 403 a handler raised rather than the scope gate (an ownership rule, a
@@ -1238,6 +1247,6 @@ the pipeline holds answers `kind` (`static_token` or `oidc_project`),
 `name` (the token's label or the project path), `public_id` (the
 token's lookup half or the issuer entry's id, the thing an operator
 revokes), `scopes`, and for an ID token the `pipeline` identity GitLab
-signed. It needs `environments:read`; a token minted with
-`environments:write` alone cannot call it, which is the first thing to
-check when `whoami` itself answers 403.
+signed. It needs no scope, so a 403 here is never a missing grant: on
+this path it can only come from a handler, and the message on the wire
+is what explains it.

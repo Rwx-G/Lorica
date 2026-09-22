@@ -46,6 +46,7 @@ COPY lorica-worker/ lorica-worker/
 COPY lorica-bench/ lorica-bench/
 COPY lorica-geoip/ lorica-geoip/
 COPY lorica-challenge/ lorica-challenge/
+COPY lorica-mcp/ lorica-mcp/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend into the dashboard crate

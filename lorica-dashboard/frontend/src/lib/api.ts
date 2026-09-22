@@ -1997,12 +1997,27 @@ export const api = {
     request<AutomationTokenResponse>('DELETE', `/automation/tokens/${encodeURIComponent(publicId)}`),
 };
 
-/** The closed scope enum an automation token carries (Story 10.3). */
+/**
+ * The closed scope enum an automation token carries (Story 10.3, widened
+ * by the read tier of the management MCP server).
+ *
+ * Owned by `AutomationScope` in Rust. This union is not the guard: the
+ * guard is that `automation-scopes.generated.ts` is typed as an array of
+ * this union AND diffed against the Rust enum by
+ * `lorica-api/tests/automation_scope_fixture.rs`, so a scope missing
+ * here makes that file fail `npm run check` and a scope missing there
+ * fails `cargo test`.
+ */
 export type AutomationScope =
   | 'environments:write'
   | 'environments:read'
   | 'routes:read'
-  | 'certificates:read';
+  | 'certificates:read'
+  | 'logs:read'
+  | 'waf:read'
+  | 'sla:read'
+  | 'cluster:read'
+  | 'backends:read';
 
 /**
  * One automation token as the API renders it. There is no field for

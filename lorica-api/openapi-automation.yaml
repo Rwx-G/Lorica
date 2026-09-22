@@ -19,10 +19,12 @@ info:
 
 
     Authorization is by scope, never by role. Every path below declares
-    the scope it requires. A path that declares no scope is reachable by
-    no token, including a token carrying every scope in the enum:
-    refusing outright is what keeps a path added without a declaration
-    from silently inheriting the widest grant.
+    what it requires in `x-required-scope`: either a scope, or the
+    sentinel `any-live-token` for a path that discloses nothing the
+    caller did not already present. A path that declares nothing is
+    reachable by no token, including a token carrying every scope in the
+    enum: refusing outright is what keeps a path added without a
+    declaration from silently inheriting the widest grant.
   version: "1.8.0"
   license:
     name: Apache-2.0
@@ -85,10 +87,12 @@ paths:
         not return it anyway: the store keeps only its HMAC.
 
 
-        Required scope: `environments:read`, the narrowest scope any
-        token that talks to this plane at all will carry.
+        Required scope: none. Any live token reaches this path, whatever
+        it carries. Everything the response holds is something the
+        caller already presented, and a scope in front of it would mean
+        a token minted for one job cannot ask what it is.
       operationId: automationWhoAmI
-      x-required-scope: environments:read
+      x-required-scope: any-live-token
       security:
         - bearerAuth: []
       responses:
@@ -457,6 +461,11 @@ components:
         - environments:read
         - routes:read
         - certificates:read
+        - logs:read
+        - waf:read
+        - sla:read
+        - cluster:read
+        - backends:read
 
     EnvironmentRequest:
       type: object

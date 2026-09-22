@@ -1,25 +1,26 @@
 <script lang="ts" module>
   import type { AutomationScope } from '../../lib/api';
+  import { AUTOMATION_SCOPE_WIRE_STRINGS } from './automation-scopes.generated';
 
   /**
-   * The closed scope enum, in the order the create form offers it:
-   * the reads first, because a token that only reads is the one an
-   * operator should reach for by default.
+   * What the create form offers, derived from the wire vocabulary
+   * rather than restated: a scope added to the Rust enum reaches this
+   * form through `automation-scopes.generated.ts` with nothing to
+   * remember here.
    *
-   * These strings are the wire spelling, owned by Rust: the
-   * `#[serde(rename = "...")]` attributes on `AutomationScope` in
-   * `lorica-config/src/models/automation_token.rs` and `scope_str` in
-   * `lorica-api/src/automation/scope.rs`. Nothing generates this
-   * client, so `automation-scopes.fixture.ts` beside this file pins
-   * the set and the test fails if a rename lands on one side only.
-   * Exported for that test and for no other reason.
+   * The label is the wire string itself, because a second vocabulary
+   * in the UI is a second thing an operator has to map back to what a
+   * 403 says. The order puts the writes last, so the reads an operator
+   * should reach for by default come first; `sort` is stable, so the
+   * reads keep the generated file's order.
+   *
+   * Exported for the test beside this file and for no other reason.
    */
   export const ALL_SCOPES: { value: AutomationScope; label: string }[] = [
-    { value: 'environments:read', label: 'environments:read' },
-    { value: 'routes:read', label: 'routes:read' },
-    { value: 'certificates:read', label: 'certificates:read' },
-    { value: 'environments:write', label: 'environments:write' },
-  ];
+    ...AUTOMATION_SCOPE_WIRE_STRINGS,
+  ]
+    .sort((a, b) => Number(a.endsWith(':write')) - Number(b.endsWith(':write')))
+    .map((value) => ({ value, label: value }));
 </script>
 
 <script lang="ts">

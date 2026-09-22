@@ -5843,15 +5843,22 @@ components:
     AutomationScope:
       type: string
       description: >-
-        What an automation token may do. The enum is closed and these four are
-        the whole surface for 1.8.0; an unknown string is refused rather than
-        dropped, so a token written against a newer Lorica fails loudly instead
-        of silently losing a grant.
+        What an automation token may do. The enum is closed and the list below
+        is the whole surface; an unknown string is refused rather than dropped,
+        so a token written against a newer Lorica fails loudly instead of
+        silently losing a grant. The five read grants after `certificates:read`
+        arrived with the management MCP server and are what its read tier is
+        built on.
       enum:
         - environments:write
         - environments:read
         - routes:read
         - certificates:read
+        - logs:read
+        - waf:read
+        - sla:read
+        - cluster:read
+        - backends:read
 
     AutomationTokenRequest:
       type: object

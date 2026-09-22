@@ -79,14 +79,20 @@ fn default_max_ttl_seconds() -> u32 {
 
 /// What an automation token is allowed to do.
 ///
-/// The enum is closed and these four variants are the whole surface for
-/// 1.8.0. The absence of `routes:write`, `certificates:write` and
-/// `settings:*` is deliberate: the automation surface is the
-/// environment resource, not the management API behind a different
-/// door. An automation that needs to reshape routing or issue a
-/// certificate is asking for an operator's credential, and it should
+/// The enum is closed and [`AutomationScope::ALL`] is the whole surface.
+/// What is absent from it is absent deliberately: there is no
+/// `routes:write`, no `certificates:write` and no `settings:*`, because
+/// the automation surface is the environment resource plus read views
+/// over what the node is doing, not the management API behind a
+/// different door. An automation that needs to reshape routing or issue
+/// a certificate is asking for an operator's credential, and it should
 /// have to say so rather than find the capability already attached to
 /// the token it uses for ephemeral environments.
+///
+/// The read grants beyond `routes:read` and `certificates:read` arrived
+/// with the management MCP server (Epic 11). Its read tier is what
+/// consumes them: a session that can only read has nothing an injected
+/// instruction can usefully reach.
 ///
 /// An unknown scope string fails to deserialise rather than being
 /// dropped, so a token minted against a newer Lorica is refused here
@@ -99,13 +105,17 @@ fn default_max_ttl_seconds() -> u32 {
 /// assert_eq!(scope, AutomationScope::EnvironmentsWrite);
 /// assert!(serde_json::from_str::<AutomationScope>("\"settings:write\"").is_err());
 /// ```
-// The wire spelling below lives in three places and a rename has to
-// touch all three: these renames, `scope_str` in
-// `lorica-api/src/automation/scope.rs` (the string an operator reads in
-// a 403), and
-// `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.fixture.ts`
-// (what the mint form offers). Two of the three agreeing is a token
-// minted with a scope the gate never matches.
+// The serde renames below are this vocabulary's source of truth. Four
+// other surfaces carry the same strings and none of them is maintained
+// from memory: `scope_str` (`lorica-api/src/automation/scope.rs`, the
+// string an operator reads in a 403) and `scope_wire_name`
+// (`lorica-api/src/automation/audit.rs`) are each asserted against
+// these renames by a test that walks `ALL`; `AUTOMATION_AUDIT_REASONS`
+// publishes them as refusal reasons under the same walk; and
+// `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.generated.ts`,
+// what the mint form offers, is diffed against `ALL` by
+// `lorica-api/tests/automation_scope_fixture.rs`. Add a variant here
+// alone and each of those turns red.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AutomationScope {
     /// Create, update and tear down environments.
@@ -120,6 +130,44 @@ pub enum AutomationScope {
     /// Read certificate metadata (never private key material).
     #[serde(rename = "certificates:read")]
     CertificatesRead,
+    /// Read access-log rows.
+    #[serde(rename = "logs:read")]
+    LogsRead,
+    /// Read WAF events and their aggregate counts.
+    #[serde(rename = "waf:read")]
+    WafRead,
+    /// Read SLA windows per route.
+    #[serde(rename = "sla:read")]
+    SlaRead,
+    /// Read cluster and node status.
+    #[serde(rename = "cluster:read")]
+    ClusterRead,
+    /// Read the backends a route resolves to.
+    #[serde(rename = "backends:read")]
+    BackendsRead,
+}
+
+impl AutomationScope {
+    /// Every variant, in declaration order.
+    ///
+    /// The one place anything that has to walk the vocabulary reads it
+    /// from, so that the surfaces restating the spellings (the two
+    /// `scope_str` / `scope_wire_name` matches, the published audit
+    /// reasons, the dashboard's generated fixture) are each checked
+    /// against the enum instead of against somebody's memory of it. A
+    /// variant added above and not here fails
+    /// `all_carries_every_variant_the_enum_declares`.
+    pub const ALL: &'static [AutomationScope] = &[
+        AutomationScope::EnvironmentsWrite,
+        AutomationScope::EnvironmentsRead,
+        AutomationScope::RoutesRead,
+        AutomationScope::CertificatesRead,
+        AutomationScope::LogsRead,
+        AutomationScope::WafRead,
+        AutomationScope::SlaRead,
+        AutomationScope::ClusterRead,
+        AutomationScope::BackendsRead,
+    ];
 }
 
 /// One scoped automation credential.
@@ -514,27 +562,74 @@ mod tests {
 
     // ---- The scope enum ----
 
+    /// The wire spellings this file's enum declares, read back out of
+    /// its own source.
+    ///
+    /// Nothing else in the process can see a serde rename, so the only
+    /// way to assert that [`AutomationScope::ALL`] is complete is to
+    /// look at what the enum wrote. A hand-written expectation would
+    /// need remembering on exactly the day it matters.
+    fn renames_declared_by_the_enum() -> Vec<&'static str> {
+        const MARKER: &str = "#[serde(rename = \"";
+        let body: &'static str = include_str!("automation_token.rs")
+            .split_once("pub enum AutomationScope {")
+            .expect("the enum is declared in this file")
+            .1
+            .split_once("\n}")
+            .expect("the enum body ends at a closing brace in column zero")
+            .0;
+        body.match_indices(MARKER)
+            .filter_map(|(at, marker)| body[at + marker.len()..].split_once('"'))
+            .map(|(spelling, _)| spelling)
+            .collect()
+    }
+
+    /// The wire spelling of every entry in [`AutomationScope::ALL`].
+    fn spellings_of_all() -> Vec<String> {
+        AutomationScope::ALL
+            .iter()
+            .map(|scope| {
+                serde_json::to_value(scope)
+                    .expect("test setup: a scope serialises")
+                    .as_str()
+                    .expect("test setup: a scope serialises to a string")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn all_carries_every_variant_the_enum_declares() {
+        let declared: Vec<&str> = renames_declared_by_the_enum();
+        assert!(
+            !declared.is_empty(),
+            "the rename scan found nothing: the enum was reshaped and this guard went blind"
+        );
+        assert_eq!(
+            spellings_of_all(),
+            declared,
+            "AutomationScope::ALL and the enum's serde renames disagree. \
+             ALL is what every other surface walks, so a variant missing \
+             from it is a grant the 403 cannot name and the mint form \
+             cannot offer."
+        );
+    }
+
     #[test]
     fn every_scope_round_trips_through_its_exact_wire_string() {
-        for (scope, wire) in [
-            (AutomationScope::EnvironmentsWrite, "environments:write"),
-            (AutomationScope::EnvironmentsRead, "environments:read"),
-            (AutomationScope::RoutesRead, "routes:read"),
-            (AutomationScope::CertificatesRead, "certificates:read"),
-        ] {
-            let json = serde_json::to_string(&scope).expect("test setup: scope serialises");
-            assert_eq!(json, format!("\"{wire}\""));
+        for scope in AutomationScope::ALL {
+            let json = serde_json::to_string(scope).expect("test setup: scope serialises");
             let back: AutomationScope =
                 serde_json::from_str(&json).expect("test setup: scope deserialises");
-            assert_eq!(back, scope);
+            assert_eq!(back, *scope);
         }
     }
 
     #[test]
     fn an_unknown_scope_string_fails_to_deserialise_rather_than_being_ignored() {
-        // The enum is the whole grant surface for 1.8.0. Dropping an
-        // unknown entry would mint a token narrower than the operator
-        // wrote, and they would find out at the first call.
+        // [`AutomationScope::ALL`] is the whole grant surface. Dropping
+        // an unknown entry would mint a token narrower than the
+        // operator wrote, and they would find out at the first call.
         for unknown in [
             "\"settings:write\"",
             "\"routes:write\"",

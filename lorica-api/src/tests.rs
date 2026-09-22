@@ -9160,8 +9160,8 @@ pub(crate) async fn mint_automation(
     minted.token
 }
 
-/// A live token carrying `environments:read`, the scope `whoami`
-/// needs.
+/// A live token carrying `environments:read`, the narrowest grant that
+/// reaches the environment resource.
 async fn mint_live_reader(state: &AppState, name: &str) -> String {
     mint_automation(
         state,
@@ -9358,6 +9358,10 @@ async fn a_token_without_the_scope_is_forbidden_and_not_unauthorized() {
     // real and the grant is missing. Answering 401 would tell them to
     // present a credential they just presented successfully, and would
     // send an operator to re-mint a token that was never the problem.
+    //
+    // The environment collection and not `whoami`: since Story 11.1
+    // `whoami` is reachable by any live token, so it is no longer a
+    // path that can demonstrate a missing grant.
     let (state, _session_store, _rate_limiter) = test_state().await;
     let token = mint_automation(
         &state,
@@ -9371,7 +9375,7 @@ async fn a_token_without_the_scope_is_forbidden_and_not_unauthorized() {
 
     let response = automation_send(
         &state,
-        "/automation/v1/whoami",
+        "/automation/v1/environments",
         Some(&format!("Bearer {token}")),
         None,
     )
@@ -9379,6 +9383,21 @@ async fn a_token_without_the_scope_is_forbidden_and_not_unauthorized() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let body = body_json(response).await;
     assert_eq!(body["error"]["code"], "forbidden");
+
+    // And the grant it does carry still reaches what it is for, so the
+    // 403 above is the scope gate and not a broken route.
+    let response = automation_send(
+        &state,
+        "/automation/v1/whoami",
+        Some(&format!("Bearer {token}")),
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a token carrying no environment read grant still asks what it is"
+    );
 }
 
 #[tokio::test]
@@ -9439,29 +9458,31 @@ async fn every_automation_request_lands_in_the_audit_log() {
     )
     .await;
 
-    for (auth, cookie, expected) in [
-        (Some(format!("Bearer {live}")), None, StatusCode::OK),
-        (None, None, StatusCode::UNAUTHORIZED),
-        (None, Some(admin.clone()), StatusCode::UNAUTHORIZED),
+    // The 403 asks for the environment collection rather than
+    // `whoami`: since Story 11.1 `whoami` is reachable by any live
+    // token, so a scope refusal has to be driven at a path that still
+    // demands one.
+    const WHOAMI: &str = "/automation/v1/whoami";
+    const ENVIRONMENTS: &str = "/automation/v1/environments";
+    for (path, auth, cookie, expected) in [
+        (WHOAMI, Some(format!("Bearer {live}")), None, StatusCode::OK),
+        (WHOAMI, None, None, StatusCode::UNAUTHORIZED),
+        (WHOAMI, None, Some(admin.clone()), StatusCode::UNAUTHORIZED),
         (
+            WHOAMI,
             Some("Bearer not-a-token".to_string()),
             None,
             StatusCode::UNAUTHORIZED,
         ),
         (
+            ENVIRONMENTS,
             Some(format!("Bearer {write_only}")),
             None,
             StatusCode::FORBIDDEN,
         ),
     ] {
-        let response = automation_send(
-            &state,
-            "/automation/v1/whoami",
-            auth.as_deref(),
-            cookie.as_deref(),
-        )
-        .await;
-        assert_eq!(response.status(), expected, "{auth:?}");
+        let response = automation_send(&state, path, auth.as_deref(), cookie.as_deref()).await;
+        assert_eq!(response.status(), expected, "{path} {auth:?}");
     }
 
     assert_eq!(
@@ -9493,7 +9514,14 @@ async fn every_automation_request_lands_in_the_audit_log() {
     for row in &rows {
         assert_eq!(row.operator_role, "automation");
         assert_eq!(row.target_type, "automation_request");
-        assert_eq!(row.target_id, "GET /automation/v1/whoami");
+        // The target names the request, so the one row driven at
+        // another path says so rather than being smoothed over.
+        let expected_target = if row.action.starts_with("automation.request.forbidden") {
+            format!("GET {ENVIRONMENTS}")
+        } else {
+            format!("GET {WHOAMI}")
+        };
+        assert_eq!(row.target_id, expected_target);
     }
 
     // The row names the credential: its label and the id an operator

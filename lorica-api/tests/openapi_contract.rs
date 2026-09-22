@@ -209,19 +209,40 @@ fn automation_openapi_declares_the_scope_the_gate_enforces() {
     for ((method, path), spelled) in &declared {
         let method: http::Method = method.parse().expect("documented method parses");
         let enforced: Option<String> =
-            lorica_api::automation::required_scope(&method, path).map(|scope| {
-                serde_json::to_value(scope)
-                    .expect("scope serialises")
-                    .as_str()
-                    .expect("scope serialises to a string")
-                    .to_string()
-            });
+            documented_spelling(lorica_api::automation::required_scope(&method, path));
         assert_eq!(
             enforced.as_deref(),
             Some(spelled.as_str()),
             "openapi-automation.yaml says {method} {path} needs {spelled:?}, \
              but the scope gate enforces {enforced:?}"
         );
+    }
+}
+
+/// The `x-required-scope` value that documents a path any authenticated
+/// caller reaches.
+///
+/// A sentinel and not a scope: the gate's third state has no scope to
+/// name, and leaving the extension off instead would be indistinguishable
+/// from forgetting it, which the assertion above refuses. The spelling
+/// carries no colon, so it cannot collide with a scope, every one of
+/// which has one.
+const ANY_LIVE_TOKEN: &str = "any-live-token";
+
+/// How the document spells what the gate enforces, or `None` for a path
+/// the gate declares nothing for and therefore refuses to everyone.
+fn documented_spelling(
+    enforced: Option<lorica_api::automation::ScopeRequirement>,
+) -> Option<String> {
+    match enforced? {
+        lorica_api::automation::ScopeRequirement::AnyLiveToken => Some(ANY_LIVE_TOKEN.to_string()),
+        lorica_api::automation::ScopeRequirement::Scope(scope) => Some(
+            serde_json::to_value(scope)
+                .expect("scope serialises")
+                .as_str()
+                .expect("scope serialises to a string")
+                .to_string(),
+        ),
     }
 }
 

@@ -1,0 +1,14 @@
+[package]
+name = "lorica-mcp"
+version = "1.8.0"
+authors = ["Rwx-G"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "Management MCP server for Lorica: a tiered, scope-gated tool surface over the automation plane"
+
+# No dependencies yet. The protocol core is hand-rolled (Story 11.1
+# decision D5) and the transports reuse what the workspace already has,
+# so the intake, the JSON-RPC loop and the stdio adapter declare theirs
+# as they land rather than up front.
+[dependencies]

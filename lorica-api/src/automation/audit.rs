@@ -86,6 +86,7 @@ use axum::response::Response;
 use lorica_config::models::AutomationScope;
 
 use super::auth::AutomationPrincipal;
+use super::scope::ScopeRequirement;
 use crate::audit::AuditContext;
 use crate::server::AppState;
 
@@ -120,10 +121,13 @@ const NO_DECLARED_SCOPE: &str = "no_declared_scope";
 /// the gates emit nothing that is not here.
 ///
 /// Two of these carry a parameter after a second colon:
-/// `missing_claim:jti`, `bound_claim_mismatch:project_path`. The four
-/// scope spellings are the reasons a 403 names, and they contain a
-/// colon of their own, which is why membership is
-/// [`is_published_reason`] and not a bare `contains`.
+/// `missing_claim:jti`, `bound_claim_mismatch:project_path`. The scope
+/// spellings are the reasons a 403 names, and they contain a colon of
+/// their own, which is why membership is [`is_published_reason`] and
+/// not a bare `contains`. The test below walks
+/// [`AutomationScope::ALL`], so a scope missing from the block at the
+/// end of this list fails rather than reaching an operator as a word
+/// no table explains.
 pub const AUTOMATION_AUDIT_REASONS: &[&str] = &[
     // The bearer gate, before either credential path.
     "no_bearer",
@@ -157,6 +161,11 @@ pub const AUTOMATION_AUDIT_REASONS: &[&str] = &[
     "environments:read",
     "routes:read",
     "certificates:read",
+    "logs:read",
+    "waf:read",
+    "sla:read",
+    "cluster:read",
+    "backends:read",
     NO_DECLARED_SCOPE,
 ];
 
@@ -247,16 +256,21 @@ fn outcome(status: StatusCode) -> &'static str {
 /// operator reads the same string in the audit row, in the 403 body
 /// and in the token.
 ///
-/// [`super::scope`] has the same four arms for the error body. One
-/// copy here beats exporting a private helper to build one const: the
-/// test below asserts both spell what serde does, which is the thing
-/// that must not drift.
+/// [`super::scope`] has the same arms for the error body. One copy
+/// here beats exporting a private helper to build one const: the test
+/// below walks [`AutomationScope::ALL`] and asserts both spell what
+/// serde does, which is the thing that must not drift.
 fn scope_wire_name(scope: AutomationScope) -> &'static str {
     match scope {
         AutomationScope::EnvironmentsWrite => "environments:write",
         AutomationScope::EnvironmentsRead => "environments:read",
         AutomationScope::RoutesRead => "routes:read",
         AutomationScope::CertificatesRead => "certificates:read",
+        AutomationScope::LogsRead => "logs:read",
+        AutomationScope::WafRead => "waf:read",
+        AutomationScope::SlaRead => "sla:read",
+        AutomationScope::ClusterRead => "cluster:read",
+        AutomationScope::BackendsRead => "backends:read",
     }
 }
 
@@ -269,7 +283,8 @@ fn scope_wire_name(scope: AutomationScope) -> &'static str {
 /// path wanted. A 403 a HANDLER raised (an ownership rule, a hostname
 /// outside the grant) names no scope on purpose: naming the path's
 /// scope there would send an operator off to re-mint a token that was
-/// never the problem.
+/// never the problem. A path any live token reaches has no scope to
+/// name at all, so a 403 on one is always a handler's.
 fn refusal_reason(
     status: StatusCode,
     decision: Option<&AuthOutcome>,
@@ -281,7 +296,7 @@ fn refusal_reason(
         (StatusCode::FORBIDDEN, Some(AuthOutcome::Accepted { scopes, .. })) => {
             match super::scope::required_scope(method, path) {
                 None => Some(NO_DECLARED_SCOPE.to_string()),
-                Some(needed) if !scopes.contains(&needed) => {
+                Some(ScopeRequirement::Scope(needed)) if !scopes.contains(&needed) => {
                     Some(scope_wire_name(needed).to_string())
                 }
                 Some(_) => None,
@@ -506,18 +521,16 @@ mod tests {
 
     #[test]
     fn every_scope_spells_itself_the_way_the_wire_does_and_is_published() {
-        for scope in [
-            AutomationScope::EnvironmentsWrite,
-            AutomationScope::EnvironmentsRead,
-            AutomationScope::RoutesRead,
-            AutomationScope::CertificatesRead,
-        ] {
-            let wire = scope_wire_name(scope);
+        for scope in AutomationScope::ALL {
+            let wire = scope_wire_name(*scope);
             assert_eq!(
-                serde_json::to_string(&scope).expect("a scope serialises"),
+                serde_json::to_string(scope).expect("a scope serialises"),
                 format!("\"{wire}\"")
             );
-            assert!(is_published_reason(wire));
+            assert!(
+                is_published_reason(wire),
+                "`{wire}` is a scope a 403 can name and is not in AUTOMATION_AUDIT_REASONS"
+            );
         }
     }
 
@@ -584,6 +597,18 @@ mod tests {
         assert_eq!(
             refusal_reason(
                 StatusCode::OK,
+                Some(&holds_read),
+                &Method::GET,
+                "/automation/v1/whoami"
+            ),
+            None
+        );
+        // A path any live token reaches has no scope to name, so a 403
+        // on it can only be a handler's and must stay unexplained
+        // rather than borrow a grant the caller already holds.
+        assert_eq!(
+            refusal_reason(
+                StatusCode::FORBIDDEN,
                 Some(&holds_read),
                 &Method::GET,
                 "/automation/v1/whoami"

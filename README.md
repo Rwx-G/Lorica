@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/version-1.8.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-2632-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-2663-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-748-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -372,6 +372,7 @@ Lorica is a Rust workspace with 31 crates: 16 forked from Cloudflare Pingora and
 | `lorica-cluster` | Cluster plane (v1.7.0): mutual-TLS transport on the same `RpcEndpoint` as the worker channel, fleet CA, join tokens, enrollment and operational listeners, roster and session registry, two-phase replication, telemetry ingest quota; configuration-blind by design (the blob is opaque bytes to it) |
 | `lorica-geoip` | GeoIP / ASN lookups (MaxMind-format databases) for country and network policy |
 | `lorica-challenge` | Bot challenges: proof-of-work, image captcha (vendored renderer), cookie issuance |
+| `lorica-mcp` | Management MCP server (v1.9.0): a scope-gated tool surface over the automation plane, spoken over stdio or over a path on the automation listener |
 | `lorica-lb` | Load balancing (Round Robin, Peak EWMA, Hash, Random, Least Conn) |
 | `lorica-cache` | HTTP response cache, LRU eviction |
 | `lorica-limits` | Rate estimator + per-route `LocalBucket` / `AuthoritativeBucket` token-bucket primitives (lock-free CAS, 100 ms cross-worker sync) |
@@ -650,7 +651,7 @@ The automation routes answer on `--automation-listen`, authenticate with `Author
 
 | Method | Path | Scope | Description |
 |--------|------|-------|-------------|
-| `GET` | `/automation/v1/whoami` | `environments:read` | The token behind this request: name, `public_id`, scopes |
+| `GET` | `/automation/v1/whoami` | any live token | The token behind this request: name, `public_id`, scopes. No scope required: the response holds nothing the caller did not already present |
 | `GET` | `/automation/v1/environments` | `environments:read` | List environments (`?label=`, `?hostname=`, `?expiring_before=`) |
 | `GET` | `/automation/v1/environments/{name}` | `environments:read` | One environment, with its `ETag` |
 | `PUT` | `/automation/v1/environments/{name}` | `environments:write` | Create (201) or replace (200) the route, backends and certificate binding in one transaction; `If-Match` for a 412 instead of last-writer-wins |
@@ -710,12 +711,13 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (2632 tests, Lorica-native)
+# Product crates only (2663 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-limits -p lorica-shmem \
            -p lorica-challenge -p lorica-geoip -p lorica-acme \
            -p lorica-metrics -p lorica-cluster -p lorica-dashboard \
+           -p lorica-mcp \
            --features otel
 
 # Pingora-forked crates (748 tests)

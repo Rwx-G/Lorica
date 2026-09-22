@@ -29,14 +29,14 @@ RUN echo "===== LINT: Build frontend =====" \
     && npm run build
 
 RUN echo "===== LINT: Clippy (product crates) =====" \
-    && cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings
+    && cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings
 
 RUN echo "===== LINT: cargo fmt check =====" \
     && cargo fmt -- --check || echo "fmt check: some files not formatted (non-blocking)"
 
 # ===== JOB 2: TEST =====
 RUN echo "===== TEST: Rust unit tests (product crates) =====" \
-    && cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench
+    && cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp
 
 RUN echo "===== TEST: Rust unit tests (forked + binary crates) =====" \
     && cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \

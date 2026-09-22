@@ -18,6 +18,7 @@ When bumping the version, update ALL of these files:
 - [ ] `lorica-notify/Cargo.toml` - `version` (first-party; follows product since v1.6.0)
 - [ ] `lorica-acme/Cargo.toml` - `version` (first-party; follows product since v1.6.0)
 - [ ] `lorica-cluster/Cargo.toml` - `version` (first-party; follows product since v1.7.0)
+- [ ] `lorica-mcp/Cargo.toml` - `version` (first-party; follows product since v1.9.0)
 
 ## Internal dependency references (cross-crate deps)
 - [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-bench, lorica-worker, lorica-command, lorica-cluster, lorica-shmem, lorica-geoip, lorica-challenge, lorica-waf, lorica-notify versions

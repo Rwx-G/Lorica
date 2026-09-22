@@ -89,4 +89,4 @@ pub use environments::{
 pub use listener::{start_automation_server, AutomationListenerConfig, AutomationListenerError};
 pub use oidc::{OidcVerifier, RefusalReason, OIDC_REPLAY_SET_CAP};
 pub use router::build_automation_router;
-pub use scope::required_scope;
+pub use scope::{required_scope, ScopeRequirement};

@@ -57,6 +57,7 @@ COPY lorica-waf/ lorica-waf/
 COPY lorica-challenge/ lorica-challenge/
 COPY lorica-geoip/ lorica-geoip/
 COPY lorica-shmem/ lorica-shmem/
+COPY lorica-mcp/ lorica-mcp/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend

@@ -5,7 +5,7 @@ import { auth } from '../../lib/auth';
 import { clusterStatus } from '../../lib/cluster';
 import { api, type AutomationTokenResponse } from '../../lib/api';
 import AutomationTokensTab, { ALL_SCOPES } from './AutomationTokensTab.svelte';
-import { AUTOMATION_SCOPE_WIRE_STRINGS } from './automation-scopes.fixture';
+import { AUTOMATION_SCOPE_WIRE_STRINGS } from './automation-scopes.generated';
 
 const FULL_TOKEN = '0123456789abcdef01234567.SGVsbG9Xb3JsZFNlY3JldFZhbHVlSGVyZTEyMzQ1Ng';
 
@@ -42,20 +42,34 @@ afterEach(() => {
 });
 
 describe('AutomationTokensTab scope spelling', () => {
-  // The four strings are Rust's: the serde renames on
-  // `AutomationScope` and `scope_str`. Nothing generates this client,
-  // so this is the only thing standing between a rename on the server
-  // and a create form that mints tokens the node refuses. The fixture
-  // carries the wire spelling; the component restates it.
-  it('offers exactly the scopes the wire fixture names', () => {
-    const offered = ALL_SCOPES.map((scope) => scope.value).sort();
-    expect(offered).toEqual([...AUTOMATION_SCOPE_WIRE_STRINGS]);
+  // The wire strings are Rust's, and `automation-scopes.generated.ts`
+  // is what `lorica-api/tests/automation_scope_fixture.rs` pins them
+  // against. What is left to check on this side is that the form
+  // actually renders one control per scope: `ALL_SCOPES` is derived
+  // from the generated list, so the way this breaks is a template that
+  // drops entries, not a list that disagrees.
+  it('renders one checkbox per wire scope, labelled with the wire string', async () => {
+    vi.spyOn(api, 'listAutomationTokens').mockResolvedValue({ data: { tokens: [] } });
+    render(AutomationTokensTab, { props: props() });
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Create Token' })).toBeInTheDocument(),
+    );
+    await fireEvent.click(screen.getByRole('button', { name: 'Create Token' }));
+
+    for (const wire of AUTOMATION_SCOPE_WIRE_STRINGS) {
+      expect(screen.getByRole('checkbox', { name: wire })).toBeInTheDocument();
+    }
+    expect(screen.getAllByRole('checkbox')).toHaveLength(AUTOMATION_SCOPE_WIRE_STRINGS.length);
   });
 
-  it('labels every scope with its own wire string, so the UI is not a second vocabulary', () => {
-    for (const scope of ALL_SCOPES) {
-      expect(scope.label).toBe(scope.value);
-    }
+  it('offers the reads before the writes, so the narrower token is the default reach', () => {
+    const firstWrite = ALL_SCOPES.findIndex((scope) => scope.value.endsWith(':write'));
+    const lastRead = ALL_SCOPES.map((scope) => scope.value).reduce(
+      (last, value, index) => (value.endsWith(':write') ? last : index),
+      -1,
+    );
+    expect(firstWrite).toBeGreaterThan(lastRead);
   });
 });
 

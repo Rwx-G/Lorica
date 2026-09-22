@@ -2,13 +2,14 @@
 
 > **Baseline note.** This is the v1.0 planning decomposition (the
 > "Phase 2 / Phase 3" markers are the original roadmap phasing). The
-> workspace has since grown to 31 members; components added after this
+> workspace has since grown to 32 members; components added after this
 > blueprint and not described below include `lorica-acme` (pure ACME
 > core: DNS challengers + instant-acme driver), `lorica-metrics` (shared
 > Prometheus registry + cross-worker counter aggregation),
 > `lorica-cluster` (the v1.7.0 cluster plane: fleet CA, join tokens,
 > enrollment and operational listeners, roster, two-phase replication),
-> `lorica-geoip`, `lorica-challenge`, `lorica-shmem`, and `lorica-cache`.
+> `lorica-geoip`, `lorica-challenge`, `lorica-shmem`, `lorica-cache`, and
+> `lorica-mcp` (the v1.9.0 management MCP server).
 > See [FORK.md](../../FORK.md) and the README architecture table for the
 > current crate roster, which is authoritative over the count above.
 

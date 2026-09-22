@@ -23,13 +23,13 @@ The Svelte frontend is compiled automatically during `cargo build` via `build.rs
 ### Running Tests
 
 ```bash
-# All Rust tests (3380 across 31 crates: 2632 in the product
-# crates, 748 in the Pingora-forked ones; see the
-# test-coverage table in README.md for the per-layer breakdown)
+# All Rust tests, the product crates and the Pingora-forked ones
+# alike (see the test-coverage table in README.md for the per-layer
+# breakdown; a count written here would be stale by the next merge)
 cargo test
 
 # Product crate tests only
-cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench
+cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp
 
 # Frontend tests (Vitest)
 cd lorica-dashboard/frontend && npx vitest run
@@ -69,10 +69,10 @@ export it locally too.
 ```bash
 export RUSTFLAGS="-D warnings"
 cargo fmt --all -- --check
-cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings
+cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings
 cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings
 cargo clippy -p lorica --all-targets --features otel -- -D warnings
-cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command
+cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-command
 cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
 cargo audit
 ```

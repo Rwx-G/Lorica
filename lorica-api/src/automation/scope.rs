@@ -38,8 +38,32 @@ use lorica_config::models::AutomationScope;
 use super::auth::AutomationPrincipal;
 use crate::error::ApiError;
 
-/// The scope a request needs, or `None` when no scope has been
-/// declared for it.
+/// What a path on the automation plane demands of the credential that
+/// reaches it.
+///
+/// `Option<AutomationScope>` had two states and used `None` for
+/// "reachable by nobody", which leaves nowhere to put a path that any
+/// authenticated caller may have. That is a third state and not a
+/// wider grant: see [`ScopeRequirement::AnyLiveToken`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeRequirement {
+    /// Every token that got past the bearer gate reaches this path,
+    /// whatever it carries.
+    ///
+    /// Reserved for a path that discloses nothing the caller did not
+    /// already present. `whoami` is the one: it reports the presented
+    /// token's own label, its lookup half and its own grants. Putting a
+    /// scope in front of it would mean a token minted for one job
+    /// cannot ask what it is, which is precisely what the MCP server's
+    /// startup introspection has to do with a token carrying only read
+    /// grants.
+    AnyLiveToken,
+    /// The named scope, and a 403 for a token that does not carry it.
+    Scope(AutomationScope),
+}
+
+/// What a request needs, or `None` when nothing has been declared for
+/// it.
 ///
 /// `None` refuses every token, including one carrying every scope in
 /// the enum. Naming the widest grant as the default would look
@@ -50,12 +74,16 @@ use crate::error::ApiError;
 /// on the first call rather than a grant nobody notices.
 ///
 /// ```
-/// use lorica_api::automation::required_scope;
+/// use lorica_api::automation::{required_scope, ScopeRequirement};
 /// use lorica_config::models::AutomationScope;
 ///
 /// assert_eq!(
 ///     required_scope(&http::Method::GET, "/automation/v1/whoami"),
-///     Some(AutomationScope::EnvironmentsRead)
+///     Some(ScopeRequirement::AnyLiveToken)
+/// );
+/// assert_eq!(
+///     required_scope(&http::Method::GET, "/automation/v1/environments"),
+///     Some(ScopeRequirement::Scope(AutomationScope::EnvironmentsRead))
 /// );
 /// // An undeclared path is reachable by nobody, not by the most
 /// // privileged token.
@@ -64,12 +92,13 @@ use crate::error::ApiError;
 ///     None
 /// );
 /// ```
-pub fn required_scope(method: &http::Method, path: &str) -> Option<AutomationScope> {
-    // `whoami` reports the token back to its own holder and reaches
-    // nothing else, so it sits on the narrowest scope any automation
-    // token that talks to this plane at all will carry.
-    if path == "/automation/v1/whoami" {
-        return Some(AutomationScope::EnvironmentsRead);
+pub fn required_scope(method: &http::Method, path: &str) -> Option<ScopeRequirement> {
+    // The method guard is not decoration: the arm below is path-shaped,
+    // so without it a `POST /automation/v1/whoami` added later would
+    // inherit "any live token reaches this" from a rule written about a
+    // read.
+    if *method == http::Method::GET && path == WHOAMI_PATH {
+        return Some(ScopeRequirement::AnyLiveToken);
     }
 
     // The environment resource (Story 10.4): the collection, and one
@@ -82,9 +111,11 @@ pub fn required_scope(method: &http::Method, path: &str) -> Option<AutomationSco
             .is_some_and(|name| !name.is_empty() && !name.contains('/'));
         if is_collection || is_one {
             return match *method {
-                http::Method::GET => Some(AutomationScope::EnvironmentsRead),
+                http::Method::GET => {
+                    Some(ScopeRequirement::Scope(AutomationScope::EnvironmentsRead))
+                }
                 http::Method::PUT | http::Method::DELETE if is_one => {
-                    Some(AutomationScope::EnvironmentsWrite)
+                    Some(ScopeRequirement::Scope(AutomationScope::EnvironmentsWrite))
                 }
                 _ => None,
             };
@@ -93,6 +124,9 @@ pub fn required_scope(method: &http::Method, path: &str) -> Option<AutomationSco
 
     None
 }
+
+/// The identity path, the only one any live token reaches.
+const WHOAMI_PATH: &str = "/automation/v1/whoami";
 
 /// The environment collection path; single environments hang under it.
 const ENVIRONMENTS_PATH: &str = "/automation/v1/environments";
@@ -114,7 +148,7 @@ pub async fn authorize_scope(req: Request, next: Next) -> Result<Response, ApiEr
         })?;
 
     let path = req.uri().path().to_string();
-    let Some(needed) = required_scope(req.method(), &path) else {
+    let Some(requirement) = required_scope(req.method(), &path) else {
         // A route reachable through this listener with no entry in the
         // matrix above. Loud, because the alternative is a grant that
         // nobody chose and nobody sees.
@@ -127,15 +161,17 @@ pub async fn authorize_scope(req: Request, next: Next) -> Result<Response, ApiEr
             "this path declares no automation scope and is reachable by no token".into(),
         ));
     };
-    if !principal.has_scope(needed) {
-        // The message names the missing scope. That is not a
-        // disclosure: the caller already holds the token and can read
-        // its own scopes from `whoami`; what they cannot do is guess
-        // which one this path wanted.
-        return Err(ApiError::Forbidden(format!(
-            "this token does not carry the {} scope",
-            scope_str(needed)
-        )));
+    if let ScopeRequirement::Scope(needed) = requirement {
+        if !principal.has_scope(needed) {
+            // The message names the missing scope. That is not a
+            // disclosure: the caller already holds the token and can
+            // read its own scopes from `whoami`; what they cannot do is
+            // guess which one this path wanted.
+            return Err(ApiError::Forbidden(format!(
+                "this token does not carry the {} scope",
+                scope_str(needed)
+            )));
+        }
     }
 
     Ok(next.run(req).await)
@@ -144,18 +180,23 @@ pub async fn authorize_scope(req: Request, next: Next) -> Result<Response, ApiEr
 /// The wire spelling of a scope, matching its serde rename so an
 /// operator reads the same string in the error and in the token.
 ///
-/// The third copy of this vocabulary is
-/// `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.fixture.ts`,
-/// which is what the mint form offers. A rename touches all three: the
-/// serde renames on `AutomationScope`, this match, and that fixture.
-/// The test below pins this half against serde; nothing pins the
-/// fixture, so it is the one to check by hand.
+/// The vocabulary is owned by the serde renames on `AutomationScope`.
+/// This match restates it for a message an operator reads, and the test
+/// below walks [`AutomationScope::ALL`] to assert the two agree, so a
+/// variant added to the enum stops this file compiling and a variant
+/// spelled differently here fails that test. The other restatements are
+/// named in the comment above the enum.
 fn scope_str(scope: AutomationScope) -> &'static str {
     match scope {
         AutomationScope::EnvironmentsWrite => "environments:write",
         AutomationScope::EnvironmentsRead => "environments:read",
         AutomationScope::RoutesRead => "routes:read",
         AutomationScope::CertificatesRead => "certificates:read",
+        AutomationScope::LogsRead => "logs:read",
+        AutomationScope::WafRead => "waf:read",
+        AutomationScope::SlaRead => "sla:read",
+        AutomationScope::ClusterRead => "cluster:read",
+        AutomationScope::BackendsRead => "backends:read",
     }
 }
 
@@ -165,11 +206,16 @@ mod tests {
     use http::Method;
 
     #[test]
-    fn whoami_needs_only_the_read_scope() {
+    fn whoami_is_reachable_by_any_live_token_and_only_on_get() {
         assert_eq!(
-            required_scope(&Method::GET, "/automation/v1/whoami"),
-            Some(AutomationScope::EnvironmentsRead)
+            required_scope(&Method::GET, WHOAMI_PATH),
+            Some(ScopeRequirement::AnyLiveToken)
         );
+        // The arm is method-guarded, so a verb the router does not
+        // mount inherits nothing from it.
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            assert_eq!(required_scope(&method, WHOAMI_PATH), None, "{method}");
+        }
     }
 
     #[test]
@@ -192,26 +238,28 @@ mod tests {
 
     #[test]
     fn the_environment_paths_read_with_read_and_write_with_write() {
+        let read = Some(ScopeRequirement::Scope(AutomationScope::EnvironmentsRead));
+        let write = Some(ScopeRequirement::Scope(AutomationScope::EnvironmentsWrite));
         assert_eq!(
             required_scope(&Method::GET, "/automation/v1/environments"),
-            Some(AutomationScope::EnvironmentsRead)
+            read
         );
         assert_eq!(
             required_scope(&Method::GET, "/automation/v1/environments/pr-42"),
-            Some(AutomationScope::EnvironmentsRead)
+            read
         );
         assert_eq!(
             required_scope(&Method::PUT, "/automation/v1/environments/pr-42"),
-            Some(AutomationScope::EnvironmentsWrite)
+            write
         );
         assert_eq!(
             required_scope(&Method::DELETE, "/automation/v1/environments/pr-42"),
-            Some(AutomationScope::EnvironmentsWrite)
+            write
         );
         // The OpenAPI gate asks with the parameter normalised away.
         assert_eq!(
             required_scope(&Method::PUT, "/automation/v1/environments/{}"),
-            Some(AutomationScope::EnvironmentsWrite)
+            write
         );
         // No verb the router does not mount inherits a scope: a POST on
         // the collection or a PUT on it is refused for every token.
@@ -229,64 +277,100 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_layer_refuses_an_undeclared_path_for_a_token_holding_every_scope() {
+    /// A principal carrying exactly `scopes`, and otherwise the
+    /// narrowest grant a minted token can have.
+    fn principal_carrying(scopes: Vec<AutomationScope>) -> AutomationPrincipal {
+        AutomationPrincipal {
+            kind: lorica_config::models::OwnerKind::StaticToken,
+            principal: "acme-ci".to_string(),
+            grant_id: "0123456789abcdef01234567".to_string(),
+            scopes,
+            allowed_hostnames: vec!["*.review.example.com".to_string()],
+            allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
+            max_ttl_seconds: 3_600,
+            pipeline: None,
+            required_environment_slug: None,
+        }
+    }
+
+    /// `GET path` through the scope layer alone, with `principal`
+    /// already installed, against a handler that answers on every path
+    /// the caller reaches.
+    async fn through_the_layer(principal: AutomationPrincipal, path: &str) -> http::StatusCode {
         use axum::body::Body;
         use axum::routing::get;
         use axum::{Extension, Router};
         use http::Request;
         use tower::ServiceExt;
 
+        let app = Router::new()
+            .route(path, get(|| async { "reached" }))
+            .layer(axum::middleware::from_fn(authorize_scope))
+            .layer(Extension(principal));
+
+        app.oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .expect("test setup: request builds"),
+        )
+        .await
+        .expect("test setup: request runs")
+        .status()
+    }
+
+    #[tokio::test]
+    async fn the_layer_refuses_an_undeclared_path_for_a_token_holding_every_scope() {
         // The matrix test above asserts the function. This one asserts
         // the layer consults it, which is the half a caller meets: a
         // handler mounted on a path with no declaration must be
         // unreachable, and unreachable by the widest token there is.
-        let principal = AutomationPrincipal {
-            kind: lorica_config::models::OwnerKind::StaticToken,
-            principal: "acme-ci".to_string(),
-            grant_id: "0123456789abcdef01234567".to_string(),
-            scopes: vec![
-                AutomationScope::EnvironmentsWrite,
-                AutomationScope::EnvironmentsRead,
-                AutomationScope::RoutesRead,
-                AutomationScope::CertificatesRead,
-            ],
-            allowed_hostnames: vec!["*.review.example.com".to_string()],
-            allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
-            max_ttl_seconds: 3_600,
-            pipeline: None,
-            required_environment_slug: None,
-        };
-        let app = Router::new()
-            .route("/automation/v1/tokens", get(|| async { "reached" }))
-            .layer(axum::middleware::from_fn(authorize_scope))
-            .layer(Extension(principal));
+        let widest = principal_carrying(AutomationScope::ALL.to_vec());
+        assert_eq!(
+            through_the_layer(widest, "/automation/v1/tokens").await,
+            http::StatusCode::FORBIDDEN
+        );
+    }
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/automation/v1/tokens")
-                    .body(Body::empty())
-                    .expect("test setup: request builds"),
-            )
-            .await
-            .expect("test setup: request runs");
-        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    #[tokio::test]
+    async fn the_layer_lets_any_live_token_reach_whoami_whatever_it_carries() {
+        // The case the MCP server's startup introspection is: a token
+        // whose grants say nothing about environments still has to be
+        // able to ask what it is. Asserted through the layer and not
+        // only on the matrix, because the layer is where the old rule
+        // turned this into a 403.
+        for scopes in [
+            vec![AutomationScope::LogsRead],
+            vec![AutomationScope::EnvironmentsWrite],
+            AutomationScope::ALL.to_vec(),
+        ] {
+            assert_eq!(
+                through_the_layer(principal_carrying(scopes.clone()), WHOAMI_PATH).await,
+                http::StatusCode::OK,
+                "{scopes:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_layer_still_refuses_a_scoped_path_the_token_does_not_carry() {
+        // The mirror of the test above: widening `whoami` must not have
+        // widened anything else on the plane.
+        let reader = principal_carrying(vec![AutomationScope::LogsRead]);
+        assert_eq!(
+            through_the_layer(reader, "/automation/v1/environments").await,
+            http::StatusCode::FORBIDDEN
+        );
     }
 
     #[test]
     fn every_scope_spells_itself_the_way_the_wire_does() {
-        for (scope, expected) in [
-            (AutomationScope::EnvironmentsWrite, "environments:write"),
-            (AutomationScope::EnvironmentsRead, "environments:read"),
-            (AutomationScope::RoutesRead, "routes:read"),
-            (AutomationScope::CertificatesRead, "certificates:read"),
-        ] {
-            assert_eq!(scope_str(scope), expected);
+        for scope in AutomationScope::ALL {
             assert_eq!(
-                serde_json::to_string(&scope).expect("scope serialises"),
-                format!("\"{expected}\"")
+                serde_json::to_string(scope).expect("scope serialises"),
+                format!("\"{}\"", scope_str(*scope)),
+                "{scope:?}"
             );
         }
     }

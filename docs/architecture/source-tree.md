@@ -25,6 +25,7 @@ architectural moves per release.
 | `lorica-challenge` | Bot challenges: PoW + image captcha generation, verdict cookie HMAC. |
 | `lorica-geoip` | GeoIP / ASN MMDB resolvers with hot-swappable process-wide handles. |
 | `lorica-shmem` | Cross-worker shared-memory region (WAF auto-ban counters, rate-limit buckets). |
+| `lorica-mcp` | Management MCP server (Epic 11): the hand-rolled JSON-RPC core, the tool registry a token's scopes populate at startup, and the stdio adapter. It binds no socket of its own; the remote transport is a path on the `lorica-api` automation listener. |
 
 ## `lorica/src/proxy_wiring/` (data plane, backlog #7 layout)
 

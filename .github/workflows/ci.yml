@@ -42,7 +42,7 @@ jobs:
 
       # Same four gates as the local Docker recipe (see CONTRIBUTING.md).
       - name: Clippy (product crates)
-        run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings
+        run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings
 
       - name: Clippy (tests and benches of the API and cluster crates)
         run: cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings
@@ -201,7 +201,7 @@ jobs:
           npm run build
 
       - name: Run Rust unit tests (product crates)
-        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-tls -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem
+        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-tls -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-mcp
         env:
           SKIP_FRONTEND_BUILD: ""
 
@@ -253,6 +253,7 @@ jobs:
             -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify \
             -p lorica-bench -p lorica-command -p lorica-metrics -p lorica-acme \
             -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker \
+            -p lorica-mcp \
             -p lorica-cluster -p lorica-tls \
             -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \
             -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde

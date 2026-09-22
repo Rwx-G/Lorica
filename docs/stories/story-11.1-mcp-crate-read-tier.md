@@ -152,43 +152,43 @@ lot reads from the one before it.
 
 ### Lot 1: the scope surface and a crate that compiles
 
-- [ ] AC #2, first because everything else reads from it: five new
+- [x] AC #2, first because everything else reads from it: five new
       `AutomationScope` variants. All four spellings move together
       (see Dev Notes), and the doc comment on the enum stops saying
       four variants are the whole surface and stops saying the
       vocabulary lives in three places.
-- [ ] Close the unguarded Rust-to-TypeScript edge, following the
+- [x] Close the unguarded Rust-to-TypeScript edge, following the
       `openapi_contract.rs` idiom exactly: an integration test under
       `lorica-api/tests/` that reads the committed file with
       `include_str!`, asserts the extraction found something before
       comparing (or a broken parser passes by comparing two empty
       sets), diffs both directions and `panic!`s with a message naming
       what to do. Diff-style, never auto-write.
-- [ ] Rename the fixture to `automation-scopes.generated.ts`. Prettier
+- [x] Rename the fixture to `automation-scopes.generated.ts`. Prettier
       does not exist here and is banned by `lorica-frontend.md`, so
       there is nothing to exempt; `eslint.config.js:83` already ignores
       `**/*.generated.ts` and nothing matches it yet. It stays
       committed, since the Vitest gate imports it, and it must be
       `--strict` clean on its own because `tsconfig.app.json:20` sweeps
       in every `src/**/*.ts` regardless of the eslint ignore.
-- [ ] `whoami` reachable by any live token, per the decision above.
+- [x] `whoami` reachable by any live token, per the decision above.
       This is not a one-line change (see Dev Notes): `required_scope`
       returns `Option<AutomationScope>`, where `None` already means
       "refused for everyone", so the third state needs a type.
       `whoami`'s match is path-only today, so the new arm takes a
       method guard or a future `POST /whoami` inherits it.
-- [ ] Retarget, never delete, the two tests that prove the scope gate
+- [x] Retarget, never delete, the two tests that prove the scope gate
       end to end and that break by construction here
       (`lorica-api/src/tests.rs:9356` and `:9423`). They are the only
       two that drive a real 403 through the whole stack; deleting them
       leaves the gate unproven while every suite stays green.
-- [ ] A sentinel for "no scope required" in `openapi-automation.yaml`
+- [x] A sentinel for "no scope required" in `openapi-automation.yaml`
       and the arm that reads it in
       `lorica-api/tests/openapi_contract.rs:184`. The contract test
       currently fails any documented operation without an
       `x-required-scope`, so the state is unrepresentable and the gate
       would go red on a correct implementation.
-- [ ] AC #1, the crate skeleton only. It builds and does nothing. The
+- [x] AC #1, the crate skeleton only. It builds and does nothing. The
       enumerations it has to land in are listed in the Code Map, and
       there are far more than the three Dockerfiles the AC names.
 
@@ -449,9 +449,120 @@ The data plane. No story in this epic adds a code path inside
 
 ### Debug Log
 
+Lot 1, 2026-09-22. Gates run, all on the branch as it stands:
+
+- `cargo fmt --all -- --check` on the Windows host: clean (it needed one
+  pass of `cargo fmt --all` first, on two files).
+- `cargo build -p lorica-mcp` in `rust:1-bookworm` with
+  `RUSTFLAGS=-D warnings`: clean.
+- `cargo test -p lorica-config -p lorica-api`: 826 + 495 unit, 2 in the
+  new `tests/automation_scope_fixture.rs`, 3 in `tests/openapi_contract.rs`,
+  8 + 18 doctests. 0 failed.
+- `cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings`: clean.
+- `cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings`: clean.
+- `cargo clippy -p lorica --all-targets --features otel -- -D warnings`:
+  clean. Run because the binary links both changed crates.
+- Frontend: `svelte-check --tsconfig ./tsconfig.app.json` 0 errors 0
+  warnings, `tsc -p tsconfig.node.json` clean, `eslint .` clean,
+  `vitest run` 502 passed across 25 files. Vitest ran in `node:22-slim`
+  over a fresh `pnpm install --frozen-lockfile`: the host's
+  `node_modules` has no rolldown native binding for its Node 25.
+
+`cargo audit` was NOT run: no dependency changed in this lot and
+`lorica-mcp` declares none.
+
 ### Completion Notes
 
+**The third state is a type, not a sentinel scope.** `required_scope`
+now returns `Option<ScopeRequirement>`: `None` keeps its meaning
+(nothing declared, reachable by nobody), `Some(AnyLiveToken)` is the
+new state and `Some(Scope(..))` the old one. `audit::refusal_reason`
+maps `AnyLiveToken` to no reason, so a handler-raised 403 on `whoami`
+is not mislabelled as a missing grant. The `whoami` arm is guarded on
+`GET`, and a test asserts `POST`, `PUT` and `DELETE` on that path stay
+undeclared.
+
+**`AutomationScope::ALL` was added and is load-bearing.** The Dev Notes
+call for closing the Rust-to-TypeScript edge rather than adding five
+more unguarded entries, and the guard needs something in Rust that can
+walk the vocabulary. `ALL` is that, pinned by
+`all_carries_every_variant_the_enum_declares`, which reads this file's
+own source with `include_str!` and compares the serde renames it finds
+against `ALL`. Every list that used to retype the variants now walks
+`ALL`: the `scope_str` spelling test, the `scope_wire_name` /
+`AUTOMATION_AUDIT_REASONS` test, the widest-token principal in the
+scope-layer test, and the new fixture gate.
+
+**A seventh copy of the vocabulary existed and the Dev Notes do not
+name it.** `AutomationScope` in
+`lorica-dashboard/frontend/src/lib/api.ts` is a TypeScript union of the
+same strings, and `ALL_SCOPES` is typed against it, so the union had to
+grow or the branch would not typecheck. It is now pinned in one
+direction by construction: `automation-scopes.generated.ts` is declared
+`readonly AutomationScope[]`, so a scope in the generated file and
+missing from the union fails `npm run check`, and the generated file is
+itself diffed against `ALL` by the Rust gate.
+
+**`ALL_SCOPES` is derived rather than restated.** It maps the generated
+list, sorting the writes last so the reads stay first in the form. That
+made the two old spelling tests vacuous, so they were replaced by one
+that renders the create dialog and asserts a checkbox per wire scope,
+and one that asserts the read-before-write order.
+
+**Scope of the doc edits.** The whoami change and the five new scopes
+touch prose in `docs/automation.md`, `README.md`,
+`docs/architecture/api-design-and-integration.md` and both OpenAPI
+documents. `openapi.yaml`'s `AutomationScope` enum was updated here
+although lot 4 lists it: leaving the published mint schema short of the
+scopes the mint form offers would be false for three lots. Fold it into
+lot 4's bullet if that is not wanted.
+
+**Not done, and deliberately.** `.claude/skills/bump-version/bump-checklist.md`
+and the crate lists in the `run-tests` and `build-deb` skills are named
+in the Code Map but live under `.claude/`, which this pass was told to
+read only. They still need `lorica-mcp`.
+
+**What the binary does.** It prints its name, version and the MCP
+protocol revision it implements, then exits. No configuration intake,
+no JSON-RPC, no transport: those are lots 2 and 3, and nothing here
+stands in for them.
+
 ## File List
+
+Added:
+
+- `lorica-mcp/Cargo.toml`
+- `lorica-mcp/src/main.rs`
+- `lorica-api/tests/automation_scope_fixture.rs`
+- `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.generated.ts`
+
+Removed:
+
+- `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.fixture.ts`
+  (renamed to `.generated.ts`)
+
+Modified:
+
+- `Cargo.toml`, `Cargo.lock`
+- `Dockerfile`, `Dockerfile.dev`, `tests-e2e-docker/Dockerfile`,
+  `ci-check.Dockerfile`
+- `.github/workflows/ci.yml`
+- `lorica-config/src/models/automation_token.rs`
+- `lorica-api/src/automation/scope.rs`
+- `lorica-api/src/automation/audit.rs`
+- `lorica-api/src/automation/mod.rs`
+- `lorica-api/src/tests.rs`
+- `lorica-api/tests/openapi_contract.rs`
+- `lorica-api/openapi-automation.yaml`, `lorica-api/openapi.yaml`
+- `lorica-dashboard/frontend/src/lib/api.ts`
+- `lorica-dashboard/frontend/src/components/settings-tabs/AutomationTokensTab.svelte`
+- `lorica-dashboard/frontend/src/components/settings-tabs/AutomationTokensTab.test.ts`
+- `CHANGELOG.md`, `README.md`, `FORK.md`, `CONTRIBUTING.md`
+- `docs/automation.md`, `docs/BUMP-CHECKLIST.md`,
+  `docs/architecture/source-tree.md`,
+  `docs/architecture/component-architecture.md`,
+  `docs/architecture/api-design-and-integration.md`
+- `docs/stories/story-11.1-mcp-crate-read-tier.md`
 
 ## Change Log
 
@@ -469,6 +580,18 @@ The data plane. No story in this epic adds a code path inside
   OpenAPI contract test, and the frontend has no prettier to exempt a
   generated file from. Lot 2 absorbs the read surface by decision of
   the same day.
+- 2026-09-22: Lot 1 landed. Five read scopes on `AutomationScope`, with
+  `AutomationScope::ALL` added as the one list every restatement now
+  walks; the Rust-to-TypeScript edge closed by
+  `lorica-api/tests/automation_scope_fixture.rs` over the renamed
+  `automation-scopes.generated.ts`; `whoami` moved to the new
+  `ScopeRequirement::AnyLiveToken` state, documented in
+  `openapi-automation.yaml` as `x-required-scope: any-live-token` and
+  read by the contract test; the two end-to-end scope tests retargeted
+  at the environment collection; and `lorica-mcp` added as a workspace
+  member at 1.8.0. A seventh copy of the scope vocabulary was found in
+  `lorica-dashboard/frontend/src/lib/api.ts`, which the Dev Notes' list
+  of six does not mention.
 - 2026-09-22: AC #4 confirmed at its full width after the question was
   put explicitly. All five read families stay in scope: logs, WAF, SLA,
   cluster and node status, and the read-only configuration listings.
