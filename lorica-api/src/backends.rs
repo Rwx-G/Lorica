@@ -267,6 +267,9 @@ pub async fn create_backend(
 /// exactly this with a token as the actor rather than a session; see
 /// `crate::routes::crud::create_route_as` for the rule, and for what
 /// [`crate::preview::WriteMode::Preview`] answers instead of the row.
+/// No target guard: a create names no existing row, and the one thing
+/// it points at, the address, is held to the grant by the automation
+/// handler before this body runs.
 pub(crate) async fn create_backend_as(
     state: &AppState,
     actor: &crate::audit::AuditContext,
@@ -373,26 +376,32 @@ pub async fn update_backend(
         id,
         body,
         crate::preview::WriteMode::Apply,
+        crate::target::BackendGuard::unbounded(),
     )
     .await
 }
 
 /// The whole of [`update_backend`] as `actor`; see
-/// [`create_backend_as`] for why the split exists. The managed-row
-/// refusal (409) runs here, so it holds on every plane that reaches
-/// this function.
+/// [`create_backend_as`] for why the split exists and what `guard` is.
+/// The managed-row refusal (409) runs here, so it holds on every plane
+/// that reaches this function. The guard runs under the lock on the
+/// row as read, before that refusal so a caller outside the grant
+/// learns nothing from it, and again on the row as it would be
+/// written.
 pub(crate) async fn update_backend_as(
     state: &AppState,
     actor: &crate::audit::AuditContext,
     id: String,
     body: UpdateBackendRequest,
     mode: crate::preview::WriteMode,
+    guard: crate::target::BackendGuard,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     let (before_backend, backend) = db_blocking(&state.store, move |store| {
         let mut backend = store
             .get_backend(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        guard.check(store, &backend)?;
         if let Some(managed_by) = &backend.managed_by {
             return Err(managed_row_conflict(
                 "update",
@@ -444,6 +453,7 @@ pub(crate) async fn update_backend_as(
             backend.h2_upstream = h2;
         }
         backend.updated_at = Utc::now();
+        guard.check(store, &backend)?;
 
         if mode.previews() {
             return Ok::<_, ApiError>((before_backend, backend));
@@ -492,25 +502,38 @@ pub async fn delete_backend(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    delete_backend_as(&state, &audit_ctx, id, crate::preview::WriteMode::Apply).await
+    delete_backend_as(
+        &state,
+        &audit_ctx,
+        id,
+        crate::preview::WriteMode::Apply,
+        crate::target::BackendGuard::unbounded(),
+    )
+    .await
 }
 
 /// The whole of [`delete_backend`] as `actor`, the drain included; see
-/// [`create_backend_as`] for why the split exists.
+/// [`create_backend_as`] for why the split exists and what `guard` is.
+/// The guard runs under the lock on the row as read.
 ///
-/// In [`crate::preview::WriteMode::Preview`] it answers the row that
-/// would drain and neither marks it closing nor starts the drain.
+/// In [`crate::preview::WriteMode::Preview`] it answers what the apply
+/// would do to the row, and does neither: for a backend in normal
+/// service, the row marked closing, since the apply drains it and the
+/// row stays until the drain ends; for one already closing or closed,
+/// no `after`, since the apply removes it at once.
 pub(crate) async fn delete_backend_as(
     state: &AppState,
     actor: &crate::audit::AuditContext,
     id: String,
     mode: crate::preview::WriteMode,
+    guard: crate::target::BackendGuard,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id_db = id.clone();
     let (backend, force_deleted) = db_blocking(&state.store, move |store| {
         let mut backend = store
             .get_backend(&id_db)?
             .ok_or_else(|| ApiError::NotFound(format!("backend {id_db}")))?;
+        guard.check(store, &backend)?;
         // Removing one backend from an environment's set is an edit of
         // that set, which only the pipeline owns. Whole-environment
         // removal goes through the route (its delete cascades) or the
@@ -523,12 +546,14 @@ pub(crate) async fn delete_backend_as(
                 "Delete the environment, or update it through the pipeline, instead.",
             ));
         }
+        // A backend already closing or closed goes at once; one in
+        // normal service is marked closing and drained first.
+        let force_deleted =
+            backend.lifecycle_state != lorica_config::models::LifecycleState::Normal;
         if mode.previews() {
-            return Ok((backend, false));
+            return Ok((backend, force_deleted));
         }
-
-        // If already closing/closed, force delete immediately
-        if backend.lifecycle_state != lorica_config::models::LifecycleState::Normal {
+        if force_deleted {
             store.delete_backend(&id_db)?;
             return Ok((backend, true));
         }
@@ -541,10 +566,15 @@ pub(crate) async fn delete_backend_as(
     })
     .await?;
     if mode.previews() {
+        let after = (!force_deleted).then(|| {
+            let mut closing = backend.clone();
+            closing.lifecycle_state = lorica_config::models::LifecycleState::Closing;
+            serde_json::to_value(backend_to_response(&closing, 0.0, 0)).ok()
+        });
         return Ok(crate::preview::previewed(
             "delete",
             serde_json::to_value(backend_to_response(&backend, 0.0, 0)).ok(),
-            None,
+            after.flatten(),
         ));
     }
     state.notify_config_changed();

@@ -136,11 +136,31 @@ it weighs under the listener's cap. A field the handler does not know
 is refused before the call leaves, rather than dropped silently by the
 node.
 
-**The token's grants apply.** A hostname and every alias a route write
-claims must be inside the token's `allowed_hostnames`, and a backend's
-address must be an `ip:port` inside its `allowed_backend_cidrs`, both
-refused with a 403 before the handler runs. A config-tier token is
-bounded by the same two fields an operator reads on it.
+**The token's grants bound what a write claims and what it targets.**
+A hostname and every alias a route write claims must be inside the
+token's `allowed_hostnames`, and a backend's address must be an
+`ip:port` inside its `allowed_backend_cidrs`, both refused with a 403
+before the handler runs. The row a write names by id is held to the
+same grant, inside the store closure that writes it, so the check and
+the write see one row: a route update, delete or certificate binding
+needs the route's current hostname and every current alias inside the
+hostname grant; a backend update or delete needs the backend's stored
+address inside the CIDR grant; a renewal needs every name the
+certificate carries, `domain` and each SAN, inside the hostname grant;
+and a route or a backend an environment owns is refused unless the
+environment's own ownership rule would let this token reach it. Every
+backend a route write links anew, at the top level or inside
+`path_rules`, `header_rules` or `traffic_splits`, must point inside the
+CIDR grant and belong to no other pipeline's environment. `forward_auth`
+and `mirror` are refused from an automation token outright, in either
+direction: the first is a URL the CIDR grant cannot weigh, to which the
+proxy forwards every downstream `Cookie` and `Authorization` header;
+the second ships a copy of every request to a second set of backends.
+Neither is offered by the tools. A config-tier token is bounded by the
+same two fields an operator reads on it, on what it may claim and on
+what it may reach, and a preview is refused exactly where the apply
+would be, so a token learns nothing about a row outside its grant by
+previewing a change to it.
 
 **One named resource per call.** Every tool that acts on an existing
 resource takes exactly one `id`, a string, and the body of the one
@@ -180,10 +200,16 @@ written in words:
 
 A create's `after` is the row it would insert, less the id and the
 clock the apply would mint; a delete's and a renewal's `before` is the
-row that would go or be renewed. What only the store refuses, a
-duplicate hostname or a backend id that names nothing, is refused by
-the apply and not by the preview, since the preview holds no lock and
-inserts nothing.
+row that would go or be renewed. A backend delete's preview says what
+its apply does: for a backend in normal service, `after` is the row
+marked `closing`, since the apply drains it for up to a minute before
+the row leaves; for one already closing, `after` is null, since the
+apply removes it at once. A renewal's preview resolves the method and
+the DNS provider the apply would use, so a certificate the apply cannot
+renew is refused by the preview with the same words. What only the
+store refuses, a duplicate hostname or a backend id that names
+nothing, is refused by the apply and not by the preview, since the
+preview inserts nothing.
 
 **The preview is an affordance, not a control.** MCP revision
 2026-07-28 has no server-initiated confirmation: a server cannot make a
@@ -227,13 +253,15 @@ to execute:
 - **`hostname`, `hostname_aliases`, `backend_ids` and `node_selector`
   on a route that carries production traffic**: the change is one
   field, the consequence is every request on it. The grant bounds
-  which hostnames a token may claim, which is what to narrow rather
-  than the model.
+  which hostnames a token may claim and which routes and backends it
+  may reach, which is what to narrow rather than the model.
 - **Deleting a backend** shared by several routes, or a route whose
-  environment a pipeline owns: the drain and the cascade are the
-  dashboard's own behaviour and are correct, and they are also more
-  than the one sentence the model was asked for.
-- **A Basic-auth credential**, which the tier refuses to take at all.
+  environment the token's own pipeline owns: the drain and the cascade
+  are the dashboard's own behaviour and are correct, and they are also
+  more than the one sentence the model was asked for. A route or a
+  backend another pipeline's environment owns is refused outright.
+- **A Basic-auth credential, `forward_auth` and `mirror`**, which the
+  tier refuses to take at all.
 
 The rule underneath: give the tier a token whose grants name the
 hostnames and address ranges the model is meant to touch and no

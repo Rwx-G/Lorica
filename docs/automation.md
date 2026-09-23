@@ -882,19 +882,44 @@ on this plane reimplements a field check, which is what keeps the two
 surfaces from drifting: on a write surface, drift is one plane
 accepting what the other refuses.
 
-**What this plane adds is the token's grant**, applied before the
-handler runs and before anything is written, and it is authorization
-rather than validation. Every hostname a route write claims, the
-route's own and each alias, must be inside the token's
-`allowed_hostnames` (403), and a wildcard is refused outright because
-the grant is checked one exact host at a time. Every address a backend
-write points at must be an `ip:port` (422, since a name cannot be
-checked against a CIDR) inside the token's `allowed_backend_cidrs`
-(403). These are the two grants the environment resource already
-applies, through the same two functions, so a token minted for one
-shape of write is bounded the same way on the other. A route update
-that names no hostname and a backend update that names no address
-claim nothing and are checked against nothing.
+**What this plane adds is the token's grant**, applied before anything
+is written, and it is authorization rather than validation. Every
+hostname a route write claims, the route's own and each alias, must be
+inside the token's `allowed_hostnames` (403), and a wildcard is refused
+outright because the grant is checked one exact host at a time. Every
+address a backend write points at must be an `ip:port` (422, since a
+name cannot be checked against a CIDR) inside the token's
+`allowed_backend_cidrs` (403). These are the two grants the environment
+resource already applies, through the same two functions, so a token
+minted for one shape of write is bounded the same way on the other.
+
+**The grant bounds the row a write names, not only what it claims.**
+A route update that names no hostname still names a route, and that
+route is held to the grant: its current hostname and every current
+alias must be inside `allowed_hostnames`, or the update, the delete and
+the certificate binding are refused (403) whatever the body says. A
+backend update that names no address is held to the backend's stored
+address against `allowed_backend_cidrs`, as is the delete. A renewal
+is held to every name the certificate carries, `domain` and each SAN.
+A route or a backend an environment owns is refused unless the
+environment resource's own ownership rule would let the token reach
+that environment; a route whose environment another principal owns is
+therefore not deletable through this door, although the same route is
+deletable by an operator on the management plane. The check runs
+inside the store closure that performs the write, on the row the write
+reads, so nothing can move between the two, and a refused row is named
+by its id alone: the refusal does not echo a hostname or an address the
+token was not granted. Every backend a route write links anew, at the
+top level or inside `path_rules`, `header_rules` or `traffic_splits`,
+must point inside the CIDR grant and belong to no other principal's
+environment; a backend the route already carries is not re-weighed by
+a patch that leaves the links alone. `forward_auth` and `mirror` are
+refused (403) when an automation token sends them, whatever the value,
+because the first is a URL the CIDR grant cannot weigh and the proxy
+forwards every downstream `Cookie` and `Authorization` header to it,
+and the second ships a copy of every request to a second set of
+backends. All of this holds for `?dry_run=true` as for the apply, so a
+preview is refused exactly where the write would be.
 
 **One named resource per call.** Every write names one route, one
 backend or one certificate by id, or creates one. There is no pattern,

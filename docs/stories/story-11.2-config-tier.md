@@ -134,6 +134,36 @@ These are the PRD's, unchanged. They are the contract.
 - [x] AC #7: the `docs/mcp.md` section (the Epic 10 PRD pointer landed
       with lot 1), and audit as in 11.1 on both bindings, verified.
 
+### Lot 3: the audit findings on the tier
+
+- [x] Security Critical: the grants bound what a write targets, not
+      only what it claims. A target guard per `_as` body, built from
+      the token and run inside the store closure that writes, on the
+      row it writes; one whole-stack test per mutation, each watched
+      failing before the fix.
+- [x] Security High: `forward_auth` and `mirror` refused from an
+      automation token and withdrawn from the tools; every
+      `backend_ids` list, in every position, resolved under the lock
+      and held to the CIDR grant and to environment ownership. Watched
+      failing before the fix.
+- [x] The two documents corrected: `docs/mcp.md` now says what the
+      code does and `docs/automation.md` no longer states the gap as
+      intended.
+- [x] Performance High: the route update validates outside the store
+      lock, as the create does.
+- [x] Quality Medium: `ROUTE_UPDATE_FIELDS` pinned to
+      `ROUTE_CREATE_FIELDS` plus a named patch-only delta.
+- [x] Quality Low: the backend delete preview reports the drain the
+      apply starts.
+- [x] Architecture Medium 1 (the fix half): the renewal's method and
+      provider resolved before the preview branch, so the preview
+      refuses what the apply refuses, as a 400.
+- [x] Architecture Medium 2: one `authorized()` for every
+      authorization-class layer, on both routers, and a test walking
+      every declared path through the in-process router.
+- [x] Debt Low: the lot 2 probe count corrected to the fourteen bullets
+      it counts.
+
 ## Dev Notes
 
 ### What "diff before apply" can and cannot promise
@@ -229,6 +259,69 @@ called through.
 > under the Completion Notes: `ToolSpec` gained a `Kind`, a `Mutation`
 > is declared once and both its tools are built from it, and the plane
 > owns the preview as `?dry_run=true`.
+
+### The grant bounds the target, and a body cannot carry that
+
+Recorded 2026-09-23 from the security audit of lots 1 and 2 (Critical
+and High). Lot 1 decided that the token's grants apply to every write,
+and applied them to what a body CLAIMS: the hostname and the aliases a
+route write names, the address a backend write points at. A write that
+names a row by id claims nothing in its body and reached the row all
+the same: `PUT /automation/v1/routes/{id}` with `{"waf_enabled":
+false}` passed the grant check on an empty claim and disabled the WAF
+on any route; the delete, the certificate binding and the renewal
+checked no target; the backend update checked only a new address. A
+token minted for `*.review.example.com` and `10.0.0.0/8` reached every
+production route and backend on the node, and a managed route of
+another pipeline's environment, whose delete cascaded that environment
+past the environment resource's own ownership rule. `docs/automation.md`
+stated the gap as intended ("a route update that names no hostname
+claims nothing and is checked against nothing") and `docs/mcp.md`
+promised the opposite. Both were wrong in the direction that matters:
+the second was false, and the first described a hole as a rule.
+
+The fix is where the report put it and no cheaper: the target is
+authorized INSIDE the store closure that performs the write, on the
+row that closure read and is about to write, so the check and the
+write see one row and nothing can move between them. Each `_as` body
+takes a guard from the new `lorica-api/src/target.rs`, unbounded from
+the management wrapper (the session's role was checked at the door)
+and built from the token in `automation/write.rs`, which stays the one
+place the grant rules are spelled. The rules: a route's current
+hostname and every current alias, and after a patch its new ones,
+inside `allowed_hostnames`; a backend's stored address, and a new one,
+inside `allowed_backend_cidrs` through the same
+`ensure_backend_address_granted`; a certificate's `domain` and every
+SAN inside `allowed_hostnames`, weighed as the grant spells them so a
+wildcard certificate covering exactly the grant's namespace is
+renewable; a route or a backend an environment owns reachable only when
+`caller_may_access`, the environment resource's rule, would let the
+token reach that environment, a mark whose environment row is gone
+treated as unowned. A refusal names the row by id and echoes none of
+its values, so a token probing ids outside its grant reads no
+production hostname off the answer, and the guard runs on the row as
+read BEFORE the managed-row 409, so the environment's name is not
+disclosed either. The preview runs the guard as the apply does.
+
+The High is the same finding one field over: `allowed_backend_cidrs`
+bounded a backend's `address` and none of the five other ways a route
+body points somewhere. `forward_auth` and `mirror` are refused from a
+token outright, whatever the value, and withdrawn from the tools; every
+`backend_ids` list, top level and inside `path_rules`, `header_rules`
+and `traffic_splits`, is resolved under the lock, and each backend the
+write links ANEW must sit inside the CIDR grant and belong to no other
+principal's environment. A backend the route already carries is not
+re-weighed by a patch that leaves the links alone, which is what keeps
+`{"waf_enabled": true}` on a route an operator pointed outside the grant
+the write it was.
+
+Two things this leaves as decisions rather than fixes. The security
+report's Mediums and Lows (the renewal's per-certificate budget, `mtls`
+and `proxy_headers` offered to a model, `certificate_id` under
+`routes:write`, `deny_unknown_fields` on `DryRunQuery`, the IPv6
+mapped-address grant) were not in this pass's brief and are recorded
+here for the maintainer. And the guard is a callback, not a tier table:
+the architecture report's two Highs are Stories 11.3 and 11.4's.
 
 ### The cluster case is the interesting one
 
@@ -447,12 +540,14 @@ Lot 2, 2026-09-23. Gates run in `rust:1-bookworm` with
 The frontend was not touched and its gates were not re-run.
 
 **Every new test was watched failing before it was watched passing.**
-Fifteen probes, each a one-substitution defect applied by a script on
+Fourteen probes, each a one-substitution defect applied by a script on
 the host, the named tests run in the container, the file restored from
 a copy and its md5 compared before and after (identical on every
 restore). One was void on its first attempt: `cargo fmt` had rewrapped
 the line it targeted, and it was rerun against the formatted source.
-What failed, and how:
+(This paragraph said fifteen until the 2026-09-23 debt audit counted
+the bullets below and found fourteen; the list was always the record,
+the number was the miscount.) What failed, and how:
 
 - the scope filter in `McpServer::sharing` replaced by `true`:
   `a_token_carrying_only_read_scopes_registers_no_write_tool_and_cannot_call_one`
@@ -551,6 +646,123 @@ Which test guards what:
 - The seam's shape: `a_verb_spells_itself_the_way_the_request_line_does`
   and `the_write_tools_body_cap_is_the_planes` (not probed; they pin
   constants).
+
+Lot 3, 2026-09-23. Gates run in `rust:1-bookworm` with
+`RUSTFLAGS=-D warnings`, one container at a time, after the e2e suite
+that was running from the previous lot had torn down:
+
+- `cargo fmt --all -- --check` on the Windows host: clean, after one
+  `cargo fmt --all` pass over the moved patch block.
+- `cargo test --no-fail-fast -p lorica-config -p lorica-api`: the
+  first run compiled nothing, `lorica-mcp` refusing an unused constant
+  under `-D warnings` (`ROUTE_UPDATE_ONLY_FIELDS` is a test vector and
+  is `#[cfg(test)]` now). The second run: 925 passed, 4 failed, all
+  four on the fixtures and not on the fix. Three were the seeded
+  certificate: the management upload reads the SANs off the test PEM,
+  whose names are not under the grant, so the renewal guard refused the
+  fixture's own certificate in `a_certificate_is_bound_and_renewed_through_the_plane_and_never_uploaded`,
+  `every_write_path_previews_under_dry_run_and_writes_nothing` and the
+  new `a_renewal_preview_refuses_what_the_apply_refuses`; the fixture
+  clears the SANs after the upload and each test that needs one sets
+  its own. The fourth was `every_registered_tool_answers_through_the_endpoint_without_leaving_the_process`,
+  whose token was granted `*.read.example.com` and whose seeded route
+  answers on `read.example.com` itself, which the one-label wildcard
+  does not cover: the route update preview was refused on its target,
+  exactly as the fix intends, and the token now carries the exact name
+  beside the wildcard. Both are the guard doing its job on fixtures
+  that predate it.
+- The README product-crate list with `--no-fail-fast` and
+  `--features otel`, which is the `docs/BUMP-CHECKLIST.md` recipe and
+  a superset of the previous gate: 66 binaries, none failed, the
+  `ok.`-only sum equal to the sum of every `passed`, 2868.
+  `lorica-api` lib 918 -> 929 (the seven whole-stack tests, two
+  `write.rs` unit tests, one `target.rs` unit test, the in-process
+  walk in `mcp.rs`), `lorica-mcp` 85 -> 86 (the vocabulary pin),
+  `automation_scope_fixture` 3, `mcp_asserted_headers` 3,
+  `mcp_catalogue_scopes` 6, `openapi_contract` 9. `README.md` moved
+  2856 -> 2868 in BOTH places; `grep -n 2856 README.md CONTRIBUTING.md`
+  answers nothing.
+- The three Lint clippy invocations and
+  `cargo clippy -p lorica-mcp --all-targets -- -D warnings`: the first
+  three failed on one line, `needless_option_as_deref` in
+  `apply_route_patch` (the roster parameter is already `Option<&[_]>`;
+  the `.as_deref()` came with the block from the closure, where the
+  variable was owned). Fixed to `node_roster`, a no-op on behaviour;
+  all four clean on the rerun. The test run above was not repeated for
+  a one-token change the compiler proves equivalent.
+- `cargo audit`: NOT run. No dependency added or bumped; `Cargo.lock`
+  is untouched.
+- `git ls-files --eol`: index `lf` on every changed file, the working
+  tree `crlf` on the ones the checkout already held that way and `lf`
+  on the rest; the new `target.rs` at `w/lf`. Checked this way and not
+  with `awk`.
+- No em dash (U+2014) in any changed file, checked with a byte grep.
+
+**The seven new tests were watched failing before the fix, on the
+unfixed sources.** They were written first, into `tests.rs` alone, and
+run in the container before any source file was touched; then the fix
+landed and they were run again. Not a probe reintroducing a defect: the
+defect was the code as committed. What failed, and how:
+
+- `a_route_write_is_refused_when_the_route_it_names_is_outside_the_grant`:
+  `PUT {"waf_enabled": false}` on the production route answered 200
+  where a 403 was owed (the Critical's first input).
+- `a_managed_route_goes_through_the_plane_only_for_its_environments_owner`:
+  the `DELETE` of another pipeline's route answered 200.
+- `a_backend_write_is_refused_when_the_backend_it_names_is_outside_the_grant`:
+  `PUT {"address": "10.9.9.9:80"}` on the production backend answered
+  200, the redirect of production traffic the report describes.
+- `a_renewal_is_refused_when_the_certificate_covers_a_name_outside_the_grant`:
+  the renewal of `www.example.com` answered 500, the ACME order having
+  been attempted for a certificate the token had no business with.
+- `a_route_body_cannot_aim_traffic_or_credentials_outside_the_grant`:
+  a create carrying `forward_auth` at `https://collector.attacker.example.net/v`
+  answered 201 (the High's first input).
+- `a_backend_delete_preview_reports_the_drain_the_apply_starts`:
+  `after` was null where the closing row was owed.
+- `a_renewal_preview_refuses_what_the_apply_refuses`: the preview of a
+  `dns01-manual` certificate answered 200 where the apply answers a
+  refusal.
+
+The `write.rs` unit tests (`a_certificate_is_renewable_when_every_name_it_carries_is_inside_the_grant`,
+`forward_auth_and_mirror_are_refused_from_a_token_whatever_the_value`),
+the `target.rs` unit test, the `mcp.rs` walk
+(`every_declared_path_reaches_its_handler_in_process`) and the
+`lorica-mcp` vocabulary pin
+(`the_update_vocabulary_is_the_create_vocabulary_plus_what_only_a_patch_has`)
+were not watched failing: they pin functions and constants that did
+not exist before this lot, or a structural property that held already
+(the walk), and the whole-stack tests above are the ones that guard the
+findings.
+
+Which test guards what:
+
+- The Critical, per mutation: route update, delete and certificate
+  binding in `a_route_write_is_refused_when_the_route_it_names_is_outside_the_grant`;
+  the managed-row ownership rule in `a_managed_route_goes_through_the_plane_only_for_its_environments_owner`;
+  backend update and delete in `a_backend_write_is_refused_when_the_backend_it_names_is_outside_the_grant`;
+  the renewal in `a_renewal_is_refused_when_the_certificate_covers_a_name_outside_the_grant`.
+  Each asserts the 403, the grant named in the message, the preview
+  refused alike, the store's canonical bytes unchanged, the row's
+  fields unchanged, and the `automation.request.forbidden` rows.
+- The High: `a_route_body_cannot_aim_traffic_or_credentials_outside_the_grant`,
+  on the report's inputs (both `forward_auth` addresses, `mirror`,
+  `backend_ids` in all four positions, an environment-owned backend),
+  create and update, apply and preview, with the positive controls
+  that a link inside the grant and a patch leaving the links alone
+  still write; and the vocabulary withdrawal through
+  `every_mcp_write_tool_declares_exactly_the_fields_its_handler_accepts_less_the_ones_not_offered`
+  (the two `NOT_OFFERED_TO_A_MODEL` entries) and
+  `the_update_vocabulary_is_the_create_vocabulary_plus_what_only_a_patch_has`.
+- The performance High: no new test; `iv1_*`, `every_write_path_previews_under_dry_run_and_writes_nothing`
+  and every route-update test pass through `apply_route_patch` and the
+  re-read closure, which is what shows the reorder changed no answer.
+- Quality Medium: `the_update_vocabulary_is_the_create_vocabulary_plus_what_only_a_patch_has`.
+- Quality Low: `a_backend_delete_preview_reports_the_drain_the_apply_starts`.
+- Architecture Medium 1: `a_renewal_preview_refuses_what_the_apply_refuses`.
+- Architecture Medium 2: `every_declared_path_reaches_its_handler_in_process`,
+  and `the_in_process_plane_runs_the_scope_gate_and_refuses_what_the_matrix_refuses`
+  still passing over `authorized()`.
 
 ### Completion Notes
 
@@ -817,7 +1029,102 @@ socket test in this lot. No tier table and no refusal of a token
 spanning two tiers: Story 11.4's, and `docs/mcp.md` says the operator
 keeps the two tokens apart until then.
 
+---
+
+Lot 3, 2026-09-23. The audit findings on lots 1 and 2, the security
+Critical first. The finding and the fix are in the Dev Note "The grant
+bounds the target, and a body cannot carry that"; what follows is how
+it was built and what it changed beyond the finding.
+
+**The guard is a callback the body runs, not a check the handler
+makes.** `lorica-api/src/target.rs` holds `RouteGuard`, `BackendGuard`
+and `CertificateGuard`: each an optional `Arc<dyn Fn>` with
+`unbounded()` for the management wrappers and `bounded(check)` for the
+automation handlers, cloneable so one guard serves the two closures
+the update now runs. The `_as` bodies call `guard.check(...)` inside
+their `db_blocking` closure, on the row they just read: the route
+bodies hand it `RouteTarget { before, after, backend_ids }`, the
+backend bodies the row before and the row after the patch, the renewal
+the certificate. `target.rs` knows the shape of a guard and none of the
+rules; `automation/write.rs` builds the three from the token and stays
+the one place the grant is spelled, so `routes::crud`, `backends` and
+`acme::renewal` depend on no automation type. The create's preview now
+takes the store lock for the guard's reads, which is the one cost the
+route create pays that it did not.
+
+**The route update validates outside the lock, and that is the
+performance High.** `apply_route_patch(route, body, roster)` is the
+former closure body, pure: every validator, the regex compiles
+included, runs on a snapshot read under the lock and released. The
+writing closure re-reads the row, runs the guard and the managed-row
+refusal on it, writes the patched row when the row is the snapshot
+(compared as `serde_json::Value`, since `Route` derives no
+`PartialEq`), and applies the patch again to the row as it stands when
+another writer moved it in between, so the last writer wins on the row
+it saw and nothing is written over a change nobody read.
+`UpdateRouteRequest` and the three nested request structs it holds
+derive `Clone` for that second application. The first closure also
+runs the guard and the 409, so a caller outside the grant is refused
+before any validator runs and learns nothing from a validator's
+message.
+
+**The two documents said two different wrong things.** `docs/mcp.md`
+promised that a config-tier token is bounded by `allowed_hostnames`
+and `allowed_backend_cidrs`, which five of eight mutations did not
+honour; `docs/automation.md` said an update naming no host is checked
+against nothing, which described the hole as the rule. Both now say
+what the code does, the second at the length the rule deserves.
+
+**Withdrawn from the tools, refused by the plane.** `forward_auth` and
+`mirror` left `ROUTE_CREATE_FIELDS` and `ROUTE_UPDATE_FIELDS` and
+joined `NOT_OFFERED_TO_A_MODEL` with their reasons, so the pin test
+holds the withdrawal both ways; `write.rs` refuses either field from a
+token with a 403 naming it, a clearing value included. The tool
+summaries name the target rule beside the claim rule.
+
+**The preview promises what the apply does, twice over.** The backend
+delete's preview answers the row marked `closing` for a backend in
+normal service and `null` for one already closing, which is the two
+things the apply does. The renewal's method and provider resolution
+left `renew_with_method` for `plan_renewal`, run before the preview
+branch and executed by `execute_renewal` on apply; the background loop
+runs the same three steps through `renew_with_method`. A row the plan
+refuses is a 400 naming it on both planes where it was a 500 from
+inside the order, which the CHANGELOG records under Fixed.
+
+**One `authorized()` on both routers.** `router.rs` gained the one
+function holding every authorization-class layer, called by
+`in_process_router()` and `build_automation_router()` alike, and
+`mcp.rs` gained a test walking every `READ_SURFACE` and `WRITE_SURFACE`
+path through the in-process plane with a full-scope principal,
+asserting no 500 and no 403: a handler that came to extract something
+only a listener layer provides fails there rather than in production.
+
+**Recorded, not built.** The security report's Mediums and Lows and the
+architecture report's Highs are decisions for the maintainer and for
+Stories 11.3 and 11.4, listed at the end of the Dev Note above. The
+architecture Medium on observability (the resource id and a
+correlation id on the MCP request row, a per-tool metric) is a design
+choice about the audit row's columns and was left as one.
+
 ## File List
+
+Added in lot 3:
+
+- `lorica-api/src/target.rs`
+
+Modified in lot 3:
+
+- `lorica-api/src/automation/write.rs`, `.../router.rs`, `.../mcp.rs`,
+  `.../environments.rs`
+- `lorica-api/src/routes/crud.rs`, `.../path_rules.rs`,
+  `.../header_rules.rs`, `.../traffic_splits.rs`
+- `lorica-api/src/backends.rs`, `lorica-api/src/acme/renewal.rs`,
+  `lorica-api/src/preview.rs`, `lorica-api/src/lib.rs`
+- `lorica-api/src/tests.rs`, `lorica-api/tests/openapi_contract.rs`
+- `lorica-mcp/src/tools.rs`
+- `CHANGELOG.md`, `README.md`, `docs/mcp.md`, `docs/automation.md`
+- `docs/stories/story-11.2-config-tier.md`
 
 Added in lot 2:
 
@@ -866,6 +1173,29 @@ Modified in lot 1:
 - `docs/stories/story-11.2-config-tier.md`
 
 ## Change Log
+
+- 2026-09-23: Lot 3, the audit findings on the tier. The security
+  Critical: the grants bounded what a write claimed and never what it
+  targeted, so a `routes:write` token reached any route, backend or
+  certificate on the node by id. Every `_as` body now takes a target
+  guard (`lorica-api/src/target.rs`), unbounded from the management
+  wrapper and built from the token in `automation/write.rs`, run inside
+  the store closure that writes on the row it writes: hostname and
+  aliases against `allowed_hostnames`, stored address against
+  `allowed_backend_cidrs`, every certificate name against
+  `allowed_hostnames`, environment ownership through
+  `caller_may_access`. The High: `forward_auth` and `mirror` refused
+  from a token and withdrawn from the tools, every `backend_ids` list
+  in every position resolved under the lock and held to the CIDR grant
+  and to ownership. Both documents corrected. Also: the route update
+  validates outside the store lock; `ROUTE_UPDATE_FIELDS` pinned to the
+  create's plus a named delta; the backend delete preview reports the
+  drain; the renewal resolves its method and provider before the
+  preview branch and refuses as a 400 what it refused as a 500; one
+  `authorized()` on both routers with a test walking every declared
+  path in process; the lot 2 probe count corrected. Seven whole-stack
+  tests in `lorica-api/src/tests.rs`, each watched failing before the
+  fix on the finding's own input.
 
 - 2026-09-23: Lot 2 landed, the tier itself. The in-process seam
   decision was taken first and as recommended: `lorica-mcp`'s seam is

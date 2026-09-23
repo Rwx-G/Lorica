@@ -32,11 +32,13 @@
 //!
 //! # What a preview can and cannot promise
 //!
-//! It runs every check the handler runs before it reaches the store.
-//! What only the store refuses, a duplicate hostname or a backend id
-//! that names nothing, is refused by the apply and not by the preview,
-//! since the preview holds no lock and makes no insert. The protocol
-//! offers no way to make a client call the preview first either:
+//! It runs every check the handler runs before it writes, the target
+//! guard of [`crate::target`] included, so a change the grant refuses
+//! is refused by the preview too. What only the store refuses on the
+//! write itself, a duplicate hostname or a backend id that names
+//! nothing, is refused by the apply and not by the preview, since the
+//! preview makes no insert. The protocol offers no way to make a client
+//! call the preview first either:
 //! `docs/mcp.md` says in those terms that it is an affordance and not a
 //! control.
 //!

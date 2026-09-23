@@ -3249,7 +3249,10 @@ pub struct CreateRouteRequest {
 /// `Default` is every field absent, which is the patch that changes
 /// nothing; the automation plane's certificate binding builds its
 /// one-field patch from it rather than restating seventy `None`s.
-#[derive(Deserialize, Default)]
+/// `Clone` because the update applies the patch to a snapshot with the
+/// store lock released and, when the row moved in between, once more
+/// to the row as it stands under the lock.
+#[derive(Deserialize, Default, Clone)]
 pub struct UpdateRouteRequest {
     /// New hostname (must stay unique across the route table).
     pub hostname: Option<String>,
@@ -3657,7 +3660,14 @@ pub async fn create_route(
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    create_route_as(&state, &audit_ctx, body, crate::preview::WriteMode::Apply).await
+    create_route_as(
+        &state,
+        &audit_ctx,
+        body,
+        crate::preview::WriteMode::Apply,
+        crate::target::RouteGuard::unbounded(),
+    )
+    .await
 }
 
 /// The whole of [`create_route`] as `actor`: the validation, the row,
@@ -3669,16 +3679,23 @@ pub async fn create_route(
 /// a route created through either plane is this function's row, so
 /// the two cannot drift on a validator or a default.
 ///
+/// `guard` is who may act on the rows the write touches: unbounded
+/// from the management plane, the token's grant from the automation
+/// plane. It runs inside the store closure, on the row about to be
+/// inserted and the backends its ids resolve to, so the check and the
+/// insert see the same rows.
+///
 /// In [`crate::preview::WriteMode::Preview`] it runs every check up to
-/// the store and answers the row it would have inserted, without the
-/// insert, the reload signal or the audit row. What only the store
-/// refuses (a duplicate hostname, a backend id that names nothing) is
-/// the apply's to refuse.
+/// the store, the guard included, and answers the row it would have
+/// inserted, without the insert, the reload signal or the audit row.
+/// What only the store refuses (a duplicate hostname, a backend id
+/// that names nothing) is the apply's to refuse.
 pub(crate) async fn create_route_as(
     state: &AppState,
     actor: &crate::audit::AuditContext,
     body: CreateRouteRequest,
     mode: crate::preview::WriteMode,
+    guard: crate::target::RouteGuard,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     if body.hostname.is_empty() {
@@ -4003,6 +4020,31 @@ pub(crate) async fn create_route_as(
     };
 
     let backend_ids = body.backend_ids.unwrap_or_default();
+    let (route, backend_ids) = db_blocking(&state.store, move |store| {
+        // The guard resolves the backend ids against the rows they
+        // name under the same lock the links are written under, so the
+        // backend it weighed is the backend the link reaches.
+        guard.check(
+            store,
+            crate::target::RouteTarget {
+                before: None,
+                after: Some(&route),
+                backend_ids: Some(&backend_ids),
+            },
+        )?;
+        if mode.previews() {
+            return Ok::<_, ApiError>((route, backend_ids));
+        }
+        store.create_route(&route)?;
+
+        // Backend links land under the same single lock acquisition
+        // as the route insert, exactly as before.
+        for bid in &backend_ids {
+            store.link_route_backend(&route.id, bid)?;
+        }
+        Ok((route, backend_ids))
+    })
+    .await?;
     if mode.previews() {
         return Ok((
             StatusCode::OK,
@@ -4013,17 +4055,6 @@ pub(crate) async fn create_route_as(
             ),
         ));
     }
-    let (route, backend_ids) = db_blocking(&state.store, move |store| {
-        store.create_route(&route)?;
-
-        // Backend links land under the same single lock acquisition
-        // as the route insert, exactly as before.
-        for bid in &backend_ids {
-            store.link_route_backend(&route.id, bid)?;
-        }
-        Ok::<_, lorica_config::ConfigError>((route, backend_ids))
-    })
-    .await?;
 
     let response = route_to_response(&route, backend_ids);
     state.notify_config_changed();
@@ -4076,24 +4107,44 @@ pub async fn update_route(
         id,
         body,
         crate::preview::WriteMode::Apply,
+        crate::target::RouteGuard::unbounded(),
     )
     .await
 }
 
 /// The whole of [`update_route`] as `actor`; see [`create_route_as`]
-/// for why the split exists. The managed-row refusal (409) runs here,
-/// so it holds on every plane that reaches this function.
+/// for why the split exists and what `guard` is. The managed-row
+/// refusal (409) runs here, so it holds on every plane that reaches
+/// this function.
+///
+/// The validators run with the store lock released. The patch is
+/// applied to a snapshot of the row read under the lock, which is
+/// where a `bot_protection` body compiles up to five hundred regexes,
+/// and the closure that writes re-reads the row: when the row is the
+/// snapshot, the patched row is written; when another writer moved it
+/// in between, the patch is applied again to the row as it stands,
+/// under the lock, so the last writer still wins on the row it saw
+/// rather than on one it never read. The create validates before its
+/// lock for the same reason; before this the update held the lock
+/// for the whole patch, and every other caller of the store waited.
+///
+/// The guard runs twice under the lock: on the row as read, before
+/// the managed-row refusal, so a caller outside the grant learns
+/// nothing from a 409 or a validator; and on the row as it would be
+/// written, with the backends the patch links anew, so the check and
+/// the write see the same rows.
 ///
 /// In [`crate::preview::WriteMode::Preview`] it applies the patch to
-/// the row in memory, under the same validators, and answers the view
-/// before and the view after without the update, the reload signal or
-/// the audit row.
+/// the row in memory, under the same validators and the same guard,
+/// and answers the view before and the view after without the update,
+/// the reload signal or the audit row.
 pub(crate) async fn update_route_as(
     state: &AppState,
     actor: &crate::audit::AuditContext,
     id: String,
     body: UpdateRouteRequest,
     mode: crate::preview::WriteMode,
+    guard: crate::target::RouteGuard,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     // Read before the update closure takes the store lock, and only
@@ -4104,14 +4155,24 @@ pub(crate) async fn update_route_as(
         None
     };
 
-    // The backend links before the patch are read only for a preview,
-    // whose `before` view is the one place they are shown: the audit
-    // row's `before` leaves them out rather than pay the read.
-    let (before_route, before_backend_ids, route, backend_ids) =
+    // The row the patch is applied to, read under the lock and held
+    // to the guard there: a caller outside the grant is refused before
+    // any validator runs, and pays for none.
+    let snapshot = {
+        let id = id.clone();
+        let guard = guard.clone();
         db_blocking(&state.store, move |store| {
-            let mut route = store
+            let route = store
                 .get_route(&id)?
                 .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
+            guard.check(
+                store,
+                crate::target::RouteTarget {
+                    before: Some(&route),
+                    after: None,
+                    backend_ids: None,
+                },
+            )?;
             // Story 10.4 AC #8. Every in-place mutation of a route, the
             // maintenance toggle included, goes through this handler, so
             // this one check is the whole guard: the next automation PUT
@@ -4124,421 +4185,63 @@ pub(crate) async fn update_route_as(
                     "Update the environment through the pipeline instead.",
                 ));
             }
-            let before_route = route.clone();
+            Ok::<_, ApiError>(route)
+        })
+        .await?
+    };
 
-            validate_route_numeric_bounds(
-                body.connect_timeout_s,
-                body.read_timeout_s,
-                body.send_timeout_s,
-                body.cache_ttl_s,
-                body.cache_max_bytes,
-                body.max_connections,
-                body.slowloris_threshold_ms,
-                body.auto_ban_threshold,
-                body.auto_ban_duration_s,
-                body.return_status,
-                body.retry_attempts,
-                body.stale_while_revalidate_s,
-                body.stale_if_error_s,
-                body.cors_max_age_s,
-                body.max_request_body_bytes,
+    let linked = body.backend_ids.clone();
+    let patched = apply_route_patch(snapshot.clone(), body.clone(), node_roster.as_deref())?;
+    let snapshot_view = serde_json::to_value(&snapshot).ok();
+
+    // The backend links before the patch are read only for a preview,
+    // whose `before` view is the one place they are shown: the audit
+    // row's `before` leaves them out rather than pay the read.
+    let (before_route, before_backend_ids, route, backend_ids) =
+        db_blocking(&state.store, move |store| {
+            let before_route = store
+                .get_route(&id)?
+                .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
+            guard.check(
+                store,
+                crate::target::RouteTarget {
+                    before: Some(&before_route),
+                    after: None,
+                    backend_ids: None,
+                },
             )?;
-            validate_rate_limit_bounds(body.rate_limit_rps, body.rate_limit_burst)?;
-            validate_waf_body_scan_max_bytes(body.waf_body_scan_max_bytes)?;
-
-            if let Some(hostname) = body.hostname {
-                route.hostname = hostname;
-            }
-            if let Some(path_prefix) = body.path_prefix {
-                let v = validate_route_path(&path_prefix, "path_prefix")?;
-                route.path_prefix = if v.is_empty() { "/".to_string() } else { v };
-            }
-            if let Some(certificate_id) = body.certificate_id {
-                if certificate_id.is_empty() {
-                    route.certificate_id = None;
-                    route.force_https = false;
-                } else {
-                    route.certificate_id = Some(certificate_id);
-                }
-            }
-            if let Some(lb) = body.load_balancing {
-                route.load_balancing = lb
-                    .parse::<lorica_config::models::LoadBalancing>()
-                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-            }
-            if let Some(waf_enabled) = body.waf_enabled {
-                route.waf_enabled = waf_enabled;
-            }
-            if let Some(waf_mode) = body.waf_mode {
-                route.waf_mode = waf_mode
-                    .parse::<lorica_config::models::WafMode>()
-                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-            }
-            if let Some(enabled) = body.enabled {
-                route.enabled = enabled;
-            }
-            if let Some(force_https) = body.force_https {
-                route.force_https = force_https;
-            }
-            if let Some(redirect_hostname) = body.redirect_hostname {
-                let v = validate_redirect_hostname(&redirect_hostname)?;
-                route.redirect_hostname = if v.is_empty() { None } else { Some(v) };
-            }
-            if let Some(redirect_to) = body.redirect_to {
-                let v = validate_redirect_to(&redirect_to, "redirect_to")?;
-                route.redirect_to = if v.is_empty() { None } else { Some(v) };
-            }
-            if let Some(hostname_aliases) = body.hostname_aliases {
-                let mut out = Vec::with_capacity(hostname_aliases.len());
-                for (i, a) in hostname_aliases.iter().enumerate() {
-                    out.push(validate_hostname_alias(
-                        a,
-                        &format!("hostname_aliases[{i}]"),
-                    )?);
-                }
-                route.hostname_aliases = out;
-            }
-            if let Some(proxy_headers) = body.proxy_headers {
-                validate_http_headers_map(&proxy_headers, "proxy_headers")?;
-                route.proxy_headers = proxy_headers;
-            }
-            if let Some(response_headers) = body.response_headers {
-                validate_http_headers_map(&response_headers, "response_headers")?;
-                route.response_headers = response_headers;
-            }
-            if let Some(security_headers) = body.security_headers {
-                route.security_headers = security_headers;
-            }
-            if let Some(connect_timeout_s) = body.connect_timeout_s {
-                route.connect_timeout_s = connect_timeout_s;
-            }
-            if let Some(read_timeout_s) = body.read_timeout_s {
-                route.read_timeout_s = read_timeout_s;
-            }
-            if let Some(send_timeout_s) = body.send_timeout_s {
-                route.send_timeout_s = send_timeout_s;
-            }
-            if let Some(strip_path_prefix) = body.strip_path_prefix {
-                let v = validate_route_path(&strip_path_prefix, "strip_path_prefix")?;
-                route.strip_path_prefix = if v.is_empty() { None } else { Some(v) };
-            }
-            if let Some(add_path_prefix) = body.add_path_prefix {
-                let v = validate_route_path(&add_path_prefix, "add_path_prefix")?;
-                route.add_path_prefix = if v.is_empty() { None } else { Some(v) };
-            }
-            if let Some(ref pattern) = body.path_rewrite_pattern {
-                let v = validate_path_rewrite_pattern(pattern)?;
-                if v.is_empty() {
-                    route.path_rewrite_pattern = None;
-                    route.path_rewrite_replacement = None;
-                } else {
-                    route.path_rewrite_pattern = Some(v);
-                }
-            }
-            if let Some(replacement) = body.path_rewrite_replacement {
-                let v = validate_path_rewrite_replacement(
-                    &replacement,
-                    route.path_rewrite_pattern.as_deref(),
-                )?;
-                route.path_rewrite_replacement =
-                    if v.is_empty() && route.path_rewrite_pattern.is_none() {
-                        None
-                    } else {
-                        Some(v)
-                    };
-            }
-            if let Some(access_log_enabled) = body.access_log_enabled {
-                route.access_log_enabled = access_log_enabled;
-            }
-            if let Some(proxy_headers_remove) = body.proxy_headers_remove {
-                validate_http_header_name_list(&proxy_headers_remove, "proxy_headers_remove")?;
-                route.proxy_headers_remove = proxy_headers_remove;
-            }
-            if let Some(response_headers_remove) = body.response_headers_remove {
-                validate_http_header_name_list(
-                    &response_headers_remove,
-                    "response_headers_remove",
-                )?;
-                route.response_headers_remove = response_headers_remove;
-            }
-            if let Some(max_request_body_bytes) = body.max_request_body_bytes {
-                route.max_request_body_bytes = if max_request_body_bytes == 0 {
-                    None
-                } else {
-                    Some(max_request_body_bytes)
-                };
-            }
-            if let Some(waf_body_scan_max_bytes) = body.waf_body_scan_max_bytes {
-                route.waf_body_scan_max_bytes = if waf_body_scan_max_bytes == 0 {
-                    None
-                } else {
-                    Some(waf_body_scan_max_bytes)
-                };
-            }
-            if let Some(websocket_enabled) = body.websocket_enabled {
-                route.websocket_enabled = websocket_enabled;
-            }
-            if let Some(rate_limit_rps) = body.rate_limit_rps {
-                route.rate_limit_rps = if rate_limit_rps == 0 {
-                    None
-                } else {
-                    Some(rate_limit_rps)
-                };
-            }
-            if let Some(rate_limit_burst) = body.rate_limit_burst {
-                route.rate_limit_burst = if rate_limit_burst == 0 {
-                    None
-                } else {
-                    Some(rate_limit_burst)
-                };
-            }
-            if let Some(ip_allowlist) = body.ip_allowlist {
-                route.ip_allowlist = ip_allowlist;
-            }
-            if let Some(ip_denylist) = body.ip_denylist {
-                route.ip_denylist = ip_denylist;
-            }
-            if let Some(cors_allowed_origins) = body.cors_allowed_origins {
-                for o in &cors_allowed_origins {
-                    validate_cors_origin(o.trim(), "cors_allowed_origins")?;
-                }
-                route.cors_allowed_origins = cors_allowed_origins;
-            }
-            if let Some(cors_allowed_methods) = body.cors_allowed_methods {
-                for m in &cors_allowed_methods {
-                    validate_http_method(m.trim(), "cors_allowed_methods")?;
-                }
-                route.cors_allowed_methods = cors_allowed_methods;
-            }
-            if let Some(cors_max_age_s) = body.cors_max_age_s {
-                route.cors_max_age_s = if cors_max_age_s == 0 {
-                    None
-                } else {
-                    Some(cors_max_age_s)
-                };
-            }
-            if let Some(compression_enabled) = body.compression_enabled {
-                route.compression_enabled = compression_enabled;
-            }
-            if let Some(retry_attempts) = body.retry_attempts {
-                route.retry_attempts = if retry_attempts == 0 {
-                    None
-                } else {
-                    Some(retry_attempts)
-                };
-            }
-            if let Some(cache_enabled) = body.cache_enabled {
-                route.cache_enabled = cache_enabled;
-            }
-            if let Some(cache_ttl_s) = body.cache_ttl_s {
-                route.cache_ttl_s = cache_ttl_s;
-            }
-            if let Some(cache_max_bytes) = body.cache_max_bytes {
-                route.cache_max_bytes = cache_max_bytes;
-            }
-            if let Some(max_connections) = body.max_connections {
-                route.max_connections = if max_connections == 0 {
-                    None
-                } else {
-                    Some(max_connections)
-                };
-            }
-            if let Some(slowloris_threshold_ms) = body.slowloris_threshold_ms {
-                route.slowloris_threshold_ms = slowloris_threshold_ms;
-            }
-            if let Some(auto_ban_threshold) = body.auto_ban_threshold {
-                route.auto_ban_threshold = if auto_ban_threshold == 0 {
-                    None
-                } else {
-                    Some(auto_ban_threshold)
-                };
-            }
-            if let Some(auto_ban_duration_s) = body.auto_ban_duration_s {
-                route.auto_ban_duration_s = auto_ban_duration_s;
-            }
-            if let Some(ref prs) = body.path_rules {
-                route.path_rules = build_path_rules(prs)?;
-            }
-            if let Some(return_status) = body.return_status {
-                route.return_status = if return_status == 0 {
-                    None
-                } else {
-                    Some(return_status)
-                };
-            }
-            if let Some(sticky) = body.sticky_session {
-                route.sticky_session = sticky;
-            }
-            if let Some(ref username) = body.basic_auth_username {
-                route.basic_auth_username = if username.is_empty() {
-                    None
-                } else {
-                    Some(username.clone())
-                };
-            }
-            if let Some(ref password) = body.basic_auth_password {
-                route.basic_auth_password_hash = if password.is_empty() {
-                    None
-                } else {
-                    Some(crate::auth::hash_password(password)?)
-                };
-            }
-            if let Some(swr) = body.stale_while_revalidate_s {
-                route.stale_while_revalidate_s = swr;
-            }
-            if let Some(sie) = body.stale_if_error_s {
-                route.stale_if_error_s = sie;
-            }
-            if let Some(ref methods) = body.retry_on_methods {
-                for m in methods {
-                    validate_http_method(m.trim(), "retry_on_methods")?;
-                }
-                route.retry_on_methods = methods.clone();
-            }
-            if let Some(maintenance) = body.maintenance_mode {
-                route.maintenance_mode = maintenance;
-            }
-            if let Some(ref html) = body.error_page_html {
-                validate_error_page_html(html)?;
-                route.error_page_html = if html.is_empty() {
-                    None
-                } else {
-                    Some(html.clone())
-                };
-            }
-            if let Some(ref headers) = body.cache_vary_headers {
-                // Normalise on write: trim whitespace, drop empties. Downstream
-                // variance logic lowercases on the hot path so no need to do it
-                // here - keeps the dashboard showing exactly what the operator typed.
-                let normalised: Vec<String> = headers
-                    .iter()
-                    .map(|h| h.trim().to_string())
-                    .filter(|h| !h.is_empty())
-                    .collect();
-                validate_http_header_name_list(&normalised, "cache_vary_headers")?;
-                route.cache_vary_headers = normalised;
-            }
-            if let Some(ref rules) = body.header_rules {
-                route.header_rules = rules
-                    .iter()
-                    .map(build_header_rule)
-                    .collect::<Result<Vec<_>, _>>()?;
-            }
-            if let Some(ref splits) = body.traffic_splits {
-                let built = splits
-                    .iter()
-                    .map(build_traffic_split)
-                    .collect::<Result<Vec<_>, _>>()?;
-                validate_traffic_splits(&built)?;
-                route.traffic_splits = built;
-            }
-            if let Some(ref fa) = body.forward_auth {
-                // Empty address = explicit "disable" signal from the dashboard.
-                // Non-empty address = validate + install/replace.
-                if fa.address.trim().is_empty() {
-                    route.forward_auth = None;
-                } else {
-                    route.forward_auth = Some(build_forward_auth(fa)?);
-                }
-            }
-            if let Some(ref m) = body.mirror {
-                if m.backend_ids.is_empty() {
-                    route.mirror = None;
-                } else {
-                    route.mirror = Some(build_mirror_config(m)?);
-                }
-            }
-            if let Some(ref rr) = body.response_rewrite {
-                if rr.rules.is_empty() {
-                    route.response_rewrite = None;
-                } else {
-                    route.response_rewrite = Some(build_response_rewrite(rr)?);
-                }
-            }
-            if let Some(ref m) = body.mtls {
-                // Empty ca_cert_pem = explicit "disable" signal from dashboard.
-                // Non-empty = validate + install/replace. Changes to the PEM
-                // take effect on next restart (rustls ServerConfig is immutable
-                // after build); required/allowed_organizations hot-reload.
-                if m.ca_cert_pem.trim().is_empty() {
-                    route.mtls = None;
-                } else {
-                    route.mtls = Some(build_mtls_config(m)?);
-                }
-            }
-            if let Some(ref rl) = body.rate_limit {
-                // capacity == 0 = explicit "disable" signal; any positive value
-                // goes through validate_rate_limit and replaces the existing
-                // config.
-                if rl.capacity == 0 {
-                    route.rate_limit = None;
-                } else {
-                    route.rate_limit = Some(validate_rate_limit(rl)?);
-                }
-            }
-            if let Some(ref g) = body.geoip {
-                // Empty country list in allowlist mode is rejected by
-                // `validate_geoip`; empty list in denylist mode is legal and
-                // means "filter disabled for this route". Empty list in
-                // denylist mode also clears the `geoip` column on disk.
-                use lorica_config::models::GeoIpMode;
-                if g.mode == GeoIpMode::Denylist && g.countries.is_empty() {
-                    route.geoip = None;
-                } else {
-                    route.geoip = Some(validate_geoip(g)?);
-                }
-            }
-            if body.bot_protection_disable == Some(true) {
-                // Explicit clear signal from the dashboard when the
-                // operator toggles bot-protection OFF on a route that
-                // previously had a config. Mutually exclusive with
-                // sending a new `bot_protection` body (would be a
-                // contradiction - `disable` wins so the API contract
-                // stays predictable).
-                route.bot_protection = None;
-            } else if let Some(ref b) = body.bot_protection {
-                route.bot_protection = Some(validate_bot_protection(b)?);
-            }
-            if let Some(ref raw) = body.group_name {
-                route.group_name = validate_group_name(raw)?;
-            }
-            // Story 9.4 AC #13. An explicit empty list widens the route
-            // back to fleet-wide; absent leaves the pinning alone.
-            if let Some(ref names) = body.node_selector {
-                route.node_selector = validate_node_selector(names, node_roster.as_deref())?;
-            }
-            // Story 8.2 AC #2 / #3 / #10. None on the patch leaves alone ;
-            // explicit Some(_) installs. The serde-derived enum guards the
-            // string set, so server-side validation is just passthrough.
-            if let Some(p) = body.ai_bot_policy {
-                // Some(Off) is functionally equivalent to None at the request
-                // filter ; we still store it explicitly so the round-trip
-                // matches the API contract (set Off -> read Off).
-                route.ai_bot_policy = Some(p);
-            }
-            if matches!(body.ai_bot_spoofed_fallback_inherit, Some(true)) {
-                route.ai_bot_spoofed_fallback = None;
-            } else if let Some(f) = body.ai_bot_spoofed_fallback {
-                route.ai_bot_spoofed_fallback = Some(f);
-            }
-            if let Some(b) = body.serve_robots_txt {
-                route.serve_robots_txt = b;
-            }
-            route.updated_at = Utc::now();
+            if let Some(managed_by) = &before_route.managed_by {
+                return Err(managed_row_conflict(
+                    "update",
+                    "route",
+                    managed_by,
+                    "Update the environment through the pipeline instead.",
+                ));
+            }
+            let route = if serde_json::to_value(&before_route).ok() == snapshot_view {
+                patched
+            } else {
+                apply_route_patch(before_route.clone(), body, node_roster.as_deref())?
+            };
+            guard.check(
+                store,
+                crate::target::RouteTarget {
+                    before: Some(&before_route),
+                    after: Some(&route),
+                    backend_ids: linked.as_deref(),
+                },
+            )?;
 
             if mode.previews() {
                 let before_backend_ids = store.list_backends_for_route(&id)?;
-                let backend_ids = body
-                    .backend_ids
-                    .clone()
-                    .unwrap_or_else(|| before_backend_ids.clone());
+                let backend_ids = linked.unwrap_or_else(|| before_backend_ids.clone());
                 return Ok::<_, ApiError>((before_route, before_backend_ids, route, backend_ids));
             }
 
             store.update_route(&route)?;
 
             // Update backend associations if provided
-            if let Some(backend_ids) = &body.backend_ids {
+            if let Some(backend_ids) = &linked {
                 let current = store.list_backends_for_route(&id)?;
                 for bid in &current {
                     store.unlink_route_backend(&id, bid)?;
@@ -4581,6 +4284,414 @@ pub(crate) async fn update_route_as(
     Ok(json_data(response))
 }
 
+/// `route` with `body` applied: every field the patch names validated
+/// and set, every other one left alone, and `updated_at` moved.
+///
+/// Pure: it reads no store and takes no lock, which is what lets
+/// [`update_route_as`] run the validators, regex compiles included,
+/// with the store lock released. `node_roster` is the registry a
+/// `node_selector` is checked against, read by the caller beforehand.
+fn apply_route_patch(
+    mut route: lorica_config::models::Route,
+    body: UpdateRouteRequest,
+    node_roster: Option<&[lorica_config::models::ClusterNode]>,
+) -> Result<lorica_config::models::Route, ApiError> {
+    validate_route_numeric_bounds(
+        body.connect_timeout_s,
+        body.read_timeout_s,
+        body.send_timeout_s,
+        body.cache_ttl_s,
+        body.cache_max_bytes,
+        body.max_connections,
+        body.slowloris_threshold_ms,
+        body.auto_ban_threshold,
+        body.auto_ban_duration_s,
+        body.return_status,
+        body.retry_attempts,
+        body.stale_while_revalidate_s,
+        body.stale_if_error_s,
+        body.cors_max_age_s,
+        body.max_request_body_bytes,
+    )?;
+    validate_rate_limit_bounds(body.rate_limit_rps, body.rate_limit_burst)?;
+    validate_waf_body_scan_max_bytes(body.waf_body_scan_max_bytes)?;
+
+    if let Some(hostname) = body.hostname {
+        route.hostname = hostname;
+    }
+    if let Some(path_prefix) = body.path_prefix {
+        let v = validate_route_path(&path_prefix, "path_prefix")?;
+        route.path_prefix = if v.is_empty() { "/".to_string() } else { v };
+    }
+    if let Some(certificate_id) = body.certificate_id {
+        if certificate_id.is_empty() {
+            route.certificate_id = None;
+            route.force_https = false;
+        } else {
+            route.certificate_id = Some(certificate_id);
+        }
+    }
+    if let Some(lb) = body.load_balancing {
+        route.load_balancing = lb
+            .parse::<lorica_config::models::LoadBalancing>()
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    }
+    if let Some(waf_enabled) = body.waf_enabled {
+        route.waf_enabled = waf_enabled;
+    }
+    if let Some(waf_mode) = body.waf_mode {
+        route.waf_mode = waf_mode
+            .parse::<lorica_config::models::WafMode>()
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    }
+    if let Some(enabled) = body.enabled {
+        route.enabled = enabled;
+    }
+    if let Some(force_https) = body.force_https {
+        route.force_https = force_https;
+    }
+    if let Some(redirect_hostname) = body.redirect_hostname {
+        let v = validate_redirect_hostname(&redirect_hostname)?;
+        route.redirect_hostname = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(redirect_to) = body.redirect_to {
+        let v = validate_redirect_to(&redirect_to, "redirect_to")?;
+        route.redirect_to = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(hostname_aliases) = body.hostname_aliases {
+        let mut out = Vec::with_capacity(hostname_aliases.len());
+        for (i, a) in hostname_aliases.iter().enumerate() {
+            out.push(validate_hostname_alias(
+                a,
+                &format!("hostname_aliases[{i}]"),
+            )?);
+        }
+        route.hostname_aliases = out;
+    }
+    if let Some(proxy_headers) = body.proxy_headers {
+        validate_http_headers_map(&proxy_headers, "proxy_headers")?;
+        route.proxy_headers = proxy_headers;
+    }
+    if let Some(response_headers) = body.response_headers {
+        validate_http_headers_map(&response_headers, "response_headers")?;
+        route.response_headers = response_headers;
+    }
+    if let Some(security_headers) = body.security_headers {
+        route.security_headers = security_headers;
+    }
+    if let Some(connect_timeout_s) = body.connect_timeout_s {
+        route.connect_timeout_s = connect_timeout_s;
+    }
+    if let Some(read_timeout_s) = body.read_timeout_s {
+        route.read_timeout_s = read_timeout_s;
+    }
+    if let Some(send_timeout_s) = body.send_timeout_s {
+        route.send_timeout_s = send_timeout_s;
+    }
+    if let Some(strip_path_prefix) = body.strip_path_prefix {
+        let v = validate_route_path(&strip_path_prefix, "strip_path_prefix")?;
+        route.strip_path_prefix = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(add_path_prefix) = body.add_path_prefix {
+        let v = validate_route_path(&add_path_prefix, "add_path_prefix")?;
+        route.add_path_prefix = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(ref pattern) = body.path_rewrite_pattern {
+        let v = validate_path_rewrite_pattern(pattern)?;
+        if v.is_empty() {
+            route.path_rewrite_pattern = None;
+            route.path_rewrite_replacement = None;
+        } else {
+            route.path_rewrite_pattern = Some(v);
+        }
+    }
+    if let Some(replacement) = body.path_rewrite_replacement {
+        let v =
+            validate_path_rewrite_replacement(&replacement, route.path_rewrite_pattern.as_deref())?;
+        route.path_rewrite_replacement = if v.is_empty() && route.path_rewrite_pattern.is_none() {
+            None
+        } else {
+            Some(v)
+        };
+    }
+    if let Some(access_log_enabled) = body.access_log_enabled {
+        route.access_log_enabled = access_log_enabled;
+    }
+    if let Some(proxy_headers_remove) = body.proxy_headers_remove {
+        validate_http_header_name_list(&proxy_headers_remove, "proxy_headers_remove")?;
+        route.proxy_headers_remove = proxy_headers_remove;
+    }
+    if let Some(response_headers_remove) = body.response_headers_remove {
+        validate_http_header_name_list(&response_headers_remove, "response_headers_remove")?;
+        route.response_headers_remove = response_headers_remove;
+    }
+    if let Some(max_request_body_bytes) = body.max_request_body_bytes {
+        route.max_request_body_bytes = if max_request_body_bytes == 0 {
+            None
+        } else {
+            Some(max_request_body_bytes)
+        };
+    }
+    if let Some(waf_body_scan_max_bytes) = body.waf_body_scan_max_bytes {
+        route.waf_body_scan_max_bytes = if waf_body_scan_max_bytes == 0 {
+            None
+        } else {
+            Some(waf_body_scan_max_bytes)
+        };
+    }
+    if let Some(websocket_enabled) = body.websocket_enabled {
+        route.websocket_enabled = websocket_enabled;
+    }
+    if let Some(rate_limit_rps) = body.rate_limit_rps {
+        route.rate_limit_rps = if rate_limit_rps == 0 {
+            None
+        } else {
+            Some(rate_limit_rps)
+        };
+    }
+    if let Some(rate_limit_burst) = body.rate_limit_burst {
+        route.rate_limit_burst = if rate_limit_burst == 0 {
+            None
+        } else {
+            Some(rate_limit_burst)
+        };
+    }
+    if let Some(ip_allowlist) = body.ip_allowlist {
+        route.ip_allowlist = ip_allowlist;
+    }
+    if let Some(ip_denylist) = body.ip_denylist {
+        route.ip_denylist = ip_denylist;
+    }
+    if let Some(cors_allowed_origins) = body.cors_allowed_origins {
+        for o in &cors_allowed_origins {
+            validate_cors_origin(o.trim(), "cors_allowed_origins")?;
+        }
+        route.cors_allowed_origins = cors_allowed_origins;
+    }
+    if let Some(cors_allowed_methods) = body.cors_allowed_methods {
+        for m in &cors_allowed_methods {
+            validate_http_method(m.trim(), "cors_allowed_methods")?;
+        }
+        route.cors_allowed_methods = cors_allowed_methods;
+    }
+    if let Some(cors_max_age_s) = body.cors_max_age_s {
+        route.cors_max_age_s = if cors_max_age_s == 0 {
+            None
+        } else {
+            Some(cors_max_age_s)
+        };
+    }
+    if let Some(compression_enabled) = body.compression_enabled {
+        route.compression_enabled = compression_enabled;
+    }
+    if let Some(retry_attempts) = body.retry_attempts {
+        route.retry_attempts = if retry_attempts == 0 {
+            None
+        } else {
+            Some(retry_attempts)
+        };
+    }
+    if let Some(cache_enabled) = body.cache_enabled {
+        route.cache_enabled = cache_enabled;
+    }
+    if let Some(cache_ttl_s) = body.cache_ttl_s {
+        route.cache_ttl_s = cache_ttl_s;
+    }
+    if let Some(cache_max_bytes) = body.cache_max_bytes {
+        route.cache_max_bytes = cache_max_bytes;
+    }
+    if let Some(max_connections) = body.max_connections {
+        route.max_connections = if max_connections == 0 {
+            None
+        } else {
+            Some(max_connections)
+        };
+    }
+    if let Some(slowloris_threshold_ms) = body.slowloris_threshold_ms {
+        route.slowloris_threshold_ms = slowloris_threshold_ms;
+    }
+    if let Some(auto_ban_threshold) = body.auto_ban_threshold {
+        route.auto_ban_threshold = if auto_ban_threshold == 0 {
+            None
+        } else {
+            Some(auto_ban_threshold)
+        };
+    }
+    if let Some(auto_ban_duration_s) = body.auto_ban_duration_s {
+        route.auto_ban_duration_s = auto_ban_duration_s;
+    }
+    if let Some(ref prs) = body.path_rules {
+        route.path_rules = build_path_rules(prs)?;
+    }
+    if let Some(return_status) = body.return_status {
+        route.return_status = if return_status == 0 {
+            None
+        } else {
+            Some(return_status)
+        };
+    }
+    if let Some(sticky) = body.sticky_session {
+        route.sticky_session = sticky;
+    }
+    if let Some(ref username) = body.basic_auth_username {
+        route.basic_auth_username = if username.is_empty() {
+            None
+        } else {
+            Some(username.clone())
+        };
+    }
+    if let Some(ref password) = body.basic_auth_password {
+        route.basic_auth_password_hash = if password.is_empty() {
+            None
+        } else {
+            Some(crate::auth::hash_password(password)?)
+        };
+    }
+    if let Some(swr) = body.stale_while_revalidate_s {
+        route.stale_while_revalidate_s = swr;
+    }
+    if let Some(sie) = body.stale_if_error_s {
+        route.stale_if_error_s = sie;
+    }
+    if let Some(ref methods) = body.retry_on_methods {
+        for m in methods {
+            validate_http_method(m.trim(), "retry_on_methods")?;
+        }
+        route.retry_on_methods = methods.clone();
+    }
+    if let Some(maintenance) = body.maintenance_mode {
+        route.maintenance_mode = maintenance;
+    }
+    if let Some(ref html) = body.error_page_html {
+        validate_error_page_html(html)?;
+        route.error_page_html = if html.is_empty() {
+            None
+        } else {
+            Some(html.clone())
+        };
+    }
+    if let Some(ref headers) = body.cache_vary_headers {
+        // Normalise on write: trim whitespace, drop empties. Downstream
+        // variance logic lowercases on the hot path so no need to do it
+        // here - keeps the dashboard showing exactly what the operator typed.
+        let normalised: Vec<String> = headers
+            .iter()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        validate_http_header_name_list(&normalised, "cache_vary_headers")?;
+        route.cache_vary_headers = normalised;
+    }
+    if let Some(ref rules) = body.header_rules {
+        route.header_rules = rules
+            .iter()
+            .map(build_header_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    if let Some(ref splits) = body.traffic_splits {
+        let built = splits
+            .iter()
+            .map(build_traffic_split)
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_traffic_splits(&built)?;
+        route.traffic_splits = built;
+    }
+    if let Some(ref fa) = body.forward_auth {
+        // Empty address = explicit "disable" signal from the dashboard.
+        // Non-empty address = validate + install/replace.
+        if fa.address.trim().is_empty() {
+            route.forward_auth = None;
+        } else {
+            route.forward_auth = Some(build_forward_auth(fa)?);
+        }
+    }
+    if let Some(ref m) = body.mirror {
+        if m.backend_ids.is_empty() {
+            route.mirror = None;
+        } else {
+            route.mirror = Some(build_mirror_config(m)?);
+        }
+    }
+    if let Some(ref rr) = body.response_rewrite {
+        if rr.rules.is_empty() {
+            route.response_rewrite = None;
+        } else {
+            route.response_rewrite = Some(build_response_rewrite(rr)?);
+        }
+    }
+    if let Some(ref m) = body.mtls {
+        // Empty ca_cert_pem = explicit "disable" signal from dashboard.
+        // Non-empty = validate + install/replace. Changes to the PEM
+        // take effect on next restart (rustls ServerConfig is immutable
+        // after build); required/allowed_organizations hot-reload.
+        if m.ca_cert_pem.trim().is_empty() {
+            route.mtls = None;
+        } else {
+            route.mtls = Some(build_mtls_config(m)?);
+        }
+    }
+    if let Some(ref rl) = body.rate_limit {
+        // capacity == 0 = explicit "disable" signal; any positive value
+        // goes through validate_rate_limit and replaces the existing
+        // config.
+        if rl.capacity == 0 {
+            route.rate_limit = None;
+        } else {
+            route.rate_limit = Some(validate_rate_limit(rl)?);
+        }
+    }
+    if let Some(ref g) = body.geoip {
+        // Empty country list in allowlist mode is rejected by
+        // `validate_geoip`; empty list in denylist mode is legal and
+        // means "filter disabled for this route". Empty list in
+        // denylist mode also clears the `geoip` column on disk.
+        use lorica_config::models::GeoIpMode;
+        if g.mode == GeoIpMode::Denylist && g.countries.is_empty() {
+            route.geoip = None;
+        } else {
+            route.geoip = Some(validate_geoip(g)?);
+        }
+    }
+    if body.bot_protection_disable == Some(true) {
+        // Explicit clear signal from the dashboard when the
+        // operator toggles bot-protection OFF on a route that
+        // previously had a config. Mutually exclusive with
+        // sending a new `bot_protection` body (would be a
+        // contradiction - `disable` wins so the API contract
+        // stays predictable).
+        route.bot_protection = None;
+    } else if let Some(ref b) = body.bot_protection {
+        route.bot_protection = Some(validate_bot_protection(b)?);
+    }
+    if let Some(ref raw) = body.group_name {
+        route.group_name = validate_group_name(raw)?;
+    }
+    // Story 9.4 AC #13. An explicit empty list widens the route
+    // back to fleet-wide; absent leaves the pinning alone.
+    if let Some(ref names) = body.node_selector {
+        route.node_selector = validate_node_selector(names, node_roster)?;
+    }
+    // Story 8.2 AC #2 / #3 / #10. None on the patch leaves alone ;
+    // explicit Some(_) installs. The serde-derived enum guards the
+    // string set, so server-side validation is just passthrough.
+    if let Some(p) = body.ai_bot_policy {
+        // Some(Off) is functionally equivalent to None at the request
+        // filter ; we still store it explicitly so the round-trip
+        // matches the API contract (set Off -> read Off).
+        route.ai_bot_policy = Some(p);
+    }
+    if matches!(body.ai_bot_spoofed_fallback_inherit, Some(true)) {
+        route.ai_bot_spoofed_fallback = None;
+    } else if let Some(f) = body.ai_bot_spoofed_fallback {
+        route.ai_bot_spoofed_fallback = Some(f);
+    }
+    if let Some(b) = body.serve_robots_txt {
+        route.serve_robots_txt = b;
+    }
+    route.updated_at = Utc::now();
+    Ok(route)
+}
+
 /// DELETE /api/v1/routes/:id - delete a route and notify the proxy.
 ///
 /// A managed route is deletable (Story 10.4 AC #8): the
@@ -4597,11 +4708,19 @@ pub async fn delete_route(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    delete_route_as(&state, &audit_ctx, id, crate::preview::WriteMode::Apply).await
+    delete_route_as(
+        &state,
+        &audit_ctx,
+        id,
+        crate::preview::WriteMode::Apply,
+        crate::target::RouteGuard::unbounded(),
+    )
+    .await
 }
 
 /// The whole of [`delete_route`] as `actor`; see [`create_route_as`]
-/// for why the split exists.
+/// for why the split exists and what `guard` is. The guard runs on the
+/// row as read, under the lock that deletes it.
 ///
 /// In [`crate::preview::WriteMode::Preview`] it answers the row that
 /// would go, environment included when one owns it, and deletes
@@ -4611,11 +4730,20 @@ pub(crate) async fn delete_route_as(
     actor: &crate::audit::AuditContext,
     id: String,
     mode: crate::preview::WriteMode,
+    guard: crate::target::RouteGuard,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let route = db_blocking(&state.store, move |store| {
         let route = store
             .get_route(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
+        guard.check(
+            store,
+            crate::target::RouteTarget {
+                before: Some(&route),
+                after: None,
+                backend_ids: None,
+            },
+        )?;
         if mode.previews() {
             return Ok::<_, ApiError>(route);
         }

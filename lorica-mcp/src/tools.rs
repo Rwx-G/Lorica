@@ -957,14 +957,19 @@ const CERTIFICATE_ID: Param = Param {
 
 /// The fields of `CreateRouteRequest` this tier offers.
 ///
-/// Two of the struct's fields are absent on purpose, and `lorica-api`'s
-/// pin names both as decisions rather than drift. `managed_by` is
+/// Four of the struct's fields are absent on purpose, and `lorica-api`'s
+/// pin names each as a decision rather than drift. `managed_by` is
 /// refused by the plane on input (422): offering it would be a field
 /// that always fails. `basic_auth_password` is a credential a model
 /// would be choosing or relaying, and it would cross the model's host
 /// in the clear on its way here; the route's Basic auth is set in the
 /// dashboard, by a human, and this tier reads the username alone as the
-/// read tier does.
+/// read tier does. `forward_auth` and `mirror` are refused by the plane
+/// from an automation token (403): the first is a URL the CIDR grant
+/// cannot weigh, to which the proxy forwards every downstream Cookie
+/// and Authorization header, and the second ships a copy of every
+/// request to a second set of backends; both are set in the dashboard,
+/// by a human.
 const ROUTE_CREATE_FIELDS: &[&str] = &[
     "access_log_enabled",
     "add_path_prefix",
@@ -987,7 +992,6 @@ const ROUTE_CREATE_FIELDS: &[&str] = &[
     "cors_max_age_s",
     "error_page_html",
     "force_https",
-    "forward_auth",
     "geoip",
     "group_name",
     "header_rules",
@@ -999,7 +1003,6 @@ const ROUTE_CREATE_FIELDS: &[&str] = &[
     "maintenance_mode",
     "max_connections",
     "max_request_body_bytes",
-    "mirror",
     "mtls",
     "node_selector",
     "path_prefix",
@@ -1035,9 +1038,20 @@ const ROUTE_CREATE_FIELDS: &[&str] = &[
     "websocket_enabled",
 ];
 
-/// The fields of `UpdateRouteRequest` this tier offers: the create's,
-/// plus the three that exist only on a patch. The same two are absent,
-/// for the same reasons.
+/// The fields that exist on a patch and not on a create: the enabled
+/// toggle and the two explicit clear flags. The delta the pin test
+/// rebuilds [`ROUTE_UPDATE_FIELDS`] from, and nothing the tools read.
+#[cfg(test)]
+const ROUTE_UPDATE_ONLY_FIELDS: &[&str] = &[
+    "ai_bot_spoofed_fallback_inherit",
+    "bot_protection_disable",
+    "enabled",
+];
+
+/// The fields of `UpdateRouteRequest` this tier offers:
+/// [`ROUTE_CREATE_FIELDS`] plus [`ROUTE_UPDATE_ONLY_FIELDS`], sorted,
+/// which a test asserts entry for entry since a `const` slice cannot be
+/// built from the two. The same four are absent, for the same reasons.
 const ROUTE_UPDATE_FIELDS: &[&str] = &[
     "access_log_enabled",
     "add_path_prefix",
@@ -1063,7 +1077,6 @@ const ROUTE_UPDATE_FIELDS: &[&str] = &[
     "enabled",
     "error_page_html",
     "force_https",
-    "forward_auth",
     "geoip",
     "group_name",
     "header_rules",
@@ -1075,7 +1088,6 @@ const ROUTE_UPDATE_FIELDS: &[&str] = &[
     "maintenance_mode",
     "max_connections",
     "max_request_body_bytes",
-    "mirror",
     "mtls",
     "node_selector",
     "path_prefix",
@@ -1144,8 +1156,10 @@ pub const MUTATIONS: &[Mutation] = &[
         summary: "Create a route on this node, as the dashboard's route form would, through \
                   the management API's own validators and defaults. The hostname and every \
                   alias must be inside the token's allowed_hostnames. `backend_ids` names \
-                  backends by id as `lorica_backends` reports them. A duplicate hostname and \
-                  an unknown backend id are refused by the store when the change is applied.",
+                  backends by id as `lorica_backends` reports them; every backend linked, here \
+                  or inside path_rules, header_rules and traffic_splits, must sit inside the \
+                  token's allowed_backend_cidrs. A duplicate hostname and an unknown backend \
+                  id are refused by the store when the change is applied.",
         scope: "routes:write",
         verb: Verb::Post,
         path: "/automation/v1/routes",
@@ -1164,9 +1178,11 @@ pub const MUTATIONS: &[Mutation] = &[
         preview: "lorica_route_update_preview",
         title: "Update one route",
         summary: "Patch one route by id: only the fields sent change, exactly as the \
-                  dashboard's edit form changes them. A hostname or an alias in the patch \
-                  must be inside the token's allowed_hostnames. A route an environment owns \
-                  is refused.",
+                  dashboard's edit form changes them. The route named, on its current \
+                  hostname and aliases, and any hostname or alias the patch gives it must be \
+                  inside the token's allowed_hostnames; every backend the patch links anew \
+                  must sit inside allowed_backend_cidrs. A route an environment owns is \
+                  refused.",
         scope: "routes:write",
         verb: Verb::Put,
         path: "/automation/v1/routes",
@@ -1183,8 +1199,10 @@ pub const MUTATIONS: &[Mutation] = &[
         apply: "lorica_route_delete",
         preview: "lorica_route_delete_preview",
         title: "Delete one route",
-        summary: "Delete one route by id. A route an environment owns takes the environment \
-                  with it, as the dashboard's delete does.",
+        summary: "Delete one route by id. The route named must be inside the token's \
+                  allowed_hostnames on its current hostname and aliases. A route an \
+                  environment owns takes the environment with it, as the dashboard's delete \
+                  does, and is refused unless the environment is this token's own.",
         scope: "routes:write",
         verb: Verb::Delete,
         path: "/automation/v1/routes",
@@ -1197,9 +1215,11 @@ pub const MUTATIONS: &[Mutation] = &[
         preview: "lorica_route_bind_certificate_preview",
         title: "Bind a certificate to one route",
         summary: "Bind a stored certificate to one route by id, or unbind it with the empty \
-                  string. The certificate must already be on the node, as `lorica_certificates` \
-                  reports it: nothing here uploads, replaces or generates one, and no argument \
-                  takes key material. A route an environment owns is refused.",
+                  string. The route named must be inside the token's allowed_hostnames on its \
+                  current hostname and aliases. The certificate must already be on the node, \
+                  as `lorica_certificates` reports it: nothing here uploads, replaces or \
+                  generates one, and no argument takes key material. A route an environment \
+                  owns is refused.",
         scope: "certificates:write",
         verb: Verb::Put,
         path: "/automation/v1/routes",
@@ -1236,9 +1256,9 @@ pub const MUTATIONS: &[Mutation] = &[
         apply: "lorica_backend_update",
         preview: "lorica_backend_update_preview",
         title: "Update one backend",
-        summary: "Patch one backend by id: only the fields sent change. An address in the \
-                  patch is checked against the token's allowed_backend_cidrs as on create. A \
-                  backend an environment owns is refused.",
+        summary: "Patch one backend by id: only the fields sent change. The backend named, on \
+                  its stored address, and any address the patch gives it must be inside the \
+                  token's allowed_backend_cidrs. A backend an environment owns is refused.",
         scope: "backends:write",
         verb: Verb::Put,
         path: "/automation/v1/backends",
@@ -1257,8 +1277,9 @@ pub const MUTATIONS: &[Mutation] = &[
         title: "Delete one backend",
         summary: "Delete one backend by id, with the graceful drain the dashboard's delete \
                   runs: no new request is routed to it, and the row leaves once its \
-                  connections are gone or after a minute. A backend an environment owns is \
-                  refused.",
+                  connections are gone or after a minute. The backend named must be inside \
+                  the token's allowed_backend_cidrs on its stored address. A backend an \
+                  environment owns is refused.",
         scope: "backends:write",
         verb: Verb::Delete,
         path: "/automation/v1/backends",
@@ -1271,9 +1292,10 @@ pub const MUTATIONS: &[Mutation] = &[
         preview: "lorica_certificate_renew_preview",
         title: "Renew one certificate",
         summary: "Renew one ACME certificate by id, in place: an ACME order the node makes \
-                  for a row it already holds, keeping the id and every route bound to it. A \
-                  certificate that was uploaded rather than issued is refused, and nothing \
-                  here takes its replacement.",
+                  for a row it already holds, keeping the id and every route bound to it. \
+                  Every name the certificate carries must be inside the token's \
+                  allowed_hostnames. A certificate that was uploaded rather than issued is \
+                  refused, and nothing here takes its replacement.",
         scope: "certificates:write",
         verb: Verb::Post,
         path: "/automation/v1/certificates",
@@ -1387,6 +1409,48 @@ mod tests {
             "a scope moved: either give it a tool or add it to the complement here, \
              deliberately"
         );
+    }
+
+    #[test]
+    fn the_update_vocabulary_is_the_create_vocabulary_plus_what_only_a_patch_has() {
+        // Two typed lists of one struct's fields each, pinned to their
+        // structs by `lorica-api` but, until this, never to each other:
+        // a shared field spelled two ways would have surfaced as one
+        // drift per list rather than as the disagreement it is. The
+        // update's list is the create's plus the patch-only fields,
+        // sorted, and every list is sorted and free of duplicates, which
+        // is what `checked_body`'s refusal message promises.
+        let mut expected: Vec<&str> = ROUTE_CREATE_FIELDS
+            .iter()
+            .chain(ROUTE_UPDATE_ONLY_FIELDS)
+            .copied()
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(ROUTE_UPDATE_FIELDS, expected.as_slice());
+        for (name, list) in [
+            ("ROUTE_CREATE_FIELDS", ROUTE_CREATE_FIELDS),
+            ("ROUTE_UPDATE_ONLY_FIELDS", ROUTE_UPDATE_ONLY_FIELDS),
+            ("ROUTE_UPDATE_FIELDS", ROUTE_UPDATE_FIELDS),
+            ("BACKEND_FIELDS", BACKEND_FIELDS),
+        ] {
+            let sorted: BTreeSet<&str> = list.iter().copied().collect();
+            assert_eq!(
+                sorted.into_iter().collect::<Vec<_>>(),
+                list.to_vec(),
+                "{name} is not sorted and unique"
+            );
+        }
+        for absent in [
+            "forward_auth",
+            "mirror",
+            "basic_auth_password",
+            "managed_by",
+        ] {
+            assert!(
+                !ROUTE_CREATE_FIELDS.contains(&absent) && !ROUTE_UPDATE_FIELDS.contains(&absent),
+                "{absent} is offered"
+            );
+        }
     }
 
     #[test]

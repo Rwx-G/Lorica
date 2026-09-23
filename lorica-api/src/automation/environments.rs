@@ -589,7 +589,15 @@ fn parse_certificate_mode(
 /// kind, so the two never match each other. An environment is reached
 /// by its exact owner, or by anybody when its owner labelled it
 /// `shared = "true"`.
-fn caller_may_access(environment: &AutomationEnvironment, caller: &EnvironmentOwner) -> bool {
+///
+/// Shared with the write surface (Story 11.2), which holds a route or
+/// a backend an environment owns to this same rule before a token may
+/// act on it: the route's delete cascades the environment, so the
+/// route is reachable exactly when the environment would be.
+pub(super) fn caller_may_access(
+    environment: &AutomationEnvironment,
+    caller: &EnvironmentOwner,
+) -> bool {
     may_access(
         &environment.owner,
         &caller.principal,

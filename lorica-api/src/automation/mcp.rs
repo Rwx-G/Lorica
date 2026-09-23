@@ -1283,6 +1283,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn every_declared_path_reaches_its_handler_in_process() {
+        // In process equals the listener minus authentication and
+        // audit, and that must hold by structure and not by memory:
+        // `InProcessPlane::call` inserts the state, the principal and
+        // the connection info by hand, so a handler that came to
+        // extract something only a listener layer provides would work
+        // over the socket and fail here with an extractor rejection,
+        // a 500. Every path the matrix declares, walked with a
+        // principal carrying every scope: no 500, and no 403, since
+        // the scope gate has nothing to refuse it.
+        use crate::automation::scope::{READ_SURFACE, WRITE_SURFACE};
+        use lorica_config::models::AutomationScope;
+
+        let (state, _session_store, _rate_limiter) = crate::tests::test_state().await;
+        let plane = InProcessPlane::new(state, principal_carrying(AutomationScope::ALL.to_vec()));
+        let mut walked = 0usize;
+        let mut assert_reached = |what: String, answered: Result<String, PlaneError>| {
+            walked += 1;
+            match answered {
+                Ok(_) => {}
+                Err(PlaneError::Refused { status, body }) => {
+                    assert!(
+                        status < 500 && status != 403,
+                        "{what} answered {status} in process: {body}"
+                    );
+                }
+                Err(PlaneError::Transport(reason)) => panic!("{what}: {reason}"),
+            }
+        };
+        for (path, _) in READ_SURFACE {
+            let answered = plane
+                .call(Verb::Get, path, None, Reason::Tool("walk"))
+                .await;
+            assert_reached(format!("GET {path}"), answered);
+        }
+        for (method, path, _) in WRITE_SURFACE {
+            let verb = match *method {
+                "POST" => Verb::Post,
+                "PUT" => Verb::Put,
+                "DELETE" => Verb::Delete,
+                other => panic!("{other} is not a verb the seam carries"),
+            };
+            let body = (verb != Verb::Delete).then(|| json!({}));
+            let answered = plane
+                .call(verb, path, body.as_ref(), Reason::Tool("walk"))
+                .await;
+            assert_reached(format!("{method} {path}"), answered);
+        }
+        assert_eq!(walked, READ_SURFACE.len() + WRITE_SURFACE.len());
+    }
+
     #[test]
     fn the_router_mounts_the_path_this_module_declares() {
         // The OpenAPI gate reads `router.rs` for string literals, so the

@@ -1048,6 +1048,17 @@ const NOT_OFFERED_TO_A_MODEL: &[(&str, &str)] = &[
         "a credential a model would be choosing or relaying, crossing the model's host in \
          the clear; the route's Basic auth is set in the dashboard by a human",
     ),
+    (
+        "forward_auth",
+        "refused by the plane from an automation token (403): its address is a URL the CIDR \
+         grant cannot weigh, and the proxy forwards every downstream Cookie and Authorization \
+         header to it; set in the dashboard by a human",
+    ),
+    (
+        "mirror",
+        "refused by the plane from an automation token (403): it ships a copy of every request \
+         to a second set of backends the preview does not show; set in the dashboard by a human",
+    ),
 ];
 
 /// The handler each MCP write tool's call reaches, as `(METHOD, path)`

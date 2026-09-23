@@ -228,8 +228,24 @@ fn plane_routes() -> Router {
         )
 }
 
+/// Every authorization-class layer this plane runs on an authenticated
+/// request, on both routers.
+///
+/// [`in_process_router`] and [`build_automation_router`] are built
+/// through this one function so that what authorizes a call over the
+/// socket is what authorizes a call in process by construction, and a
+/// per-token check added for the listener cannot be silently absent
+/// in process. Authentication, audit, the body cap and the response
+/// hardening are the listener's own and stay in
+/// [`build_automation_router`]: the in-process binding has an
+/// established principal, an outer request being audited, a body the
+/// tool layer bounded, and no wire.
+fn authorized(router: Router) -> Router {
+    router.layer(axum::middleware::from_fn(super::scope::authorize_scope))
+}
+
 /// The router the in-process MCP binding runs a tool's call through:
-/// the plane's routes under the scope gate, and nothing else.
+/// the plane's routes under [`authorized`], and nothing else.
 ///
 /// Built once for the process and shared, since it captures no state:
 /// the [`AppState`], the [`AutomationPrincipal`] and the connection
@@ -240,9 +256,7 @@ fn plane_routes() -> Router {
 pub(super) fn in_process_router() -> Router {
     static IN_PROCESS: OnceLock<Router> = OnceLock::new();
     IN_PROCESS
-        .get_or_init(|| {
-            plane_routes().layer(axum::middleware::from_fn(super::scope::authorize_scope))
-        })
+        .get_or_init(|| authorized(plane_routes()))
         .clone()
 }
 
@@ -256,26 +270,29 @@ pub(super) fn in_process_router() -> Router {
 /// 3. [`hardened_response`] - outside the gates, so a 401 and a 403
 ///    carry the headers too.
 /// 4. [`super::auth::require_automation_auth`] - the bearer check.
-/// 5. [`super::scope::authorize_scope`] - the scope floor.
+/// 5. [`authorized`] - every authorization-class layer, the scope
+///    floor today, shared with [`in_process_router`].
 ///
 /// There is deliberately NO cookie layer, NO CSRF layer and NO session
 /// store here. The two management planes share no credential, and the
 /// cheapest way to keep that true is for this router to have no way to
 /// read one.
 pub fn build_automation_router(state: AppState) -> Router {
-    let routed = plane_routes()
-        // The MCP endpoint (Story 11.1 AC #9). `post` and nothing else:
-        // revision 2026-07-28 removed the standalone GET stream and the
-        // session DELETE, so both answer the 405 this mounting produces
-        // rather than a handler that explains they are gone.
-        .route("/automation/v1/mcp", post(super::mcp::mcp_endpoint))
-        .layer(axum::middleware::from_fn(super::scope::authorize_scope))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            super::auth::require_automation_auth,
-        ))
-        .layer(axum::middleware::from_fn(hardened_response))
-        .layer(axum::extract::DefaultBodyLimit::max(AUTOMATION_BODY_CAP))
-        .layer(axum::Extension(state.clone()));
+    let routed = authorized(
+        plane_routes()
+            // The MCP endpoint (Story 11.1 AC #9). `post` and nothing
+            // else: revision 2026-07-28 removed the standalone GET
+            // stream and the session DELETE, so both answer the 405
+            // this mounting produces rather than a handler that
+            // explains they are gone.
+            .route("/automation/v1/mcp", post(super::mcp::mcp_endpoint)),
+    )
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        super::auth::require_automation_auth,
+    ))
+    .layer(axum::middleware::from_fn(hardened_response))
+    .layer(axum::extract::DefaultBodyLimit::max(AUTOMATION_BODY_CAP))
+    .layer(axum::Extension(state.clone()));
     with_audit_and_panic_net(routed, state)
 }

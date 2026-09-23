@@ -10210,7 +10210,9 @@ async fn a_node_with_something_to_write() -> WriteFixture {
         "/api/v1/certificates",
         &admin,
         Some(serde_json::json!({
-            "domain": "write.example.com",
+            // One label under the grant's parent, so the token that
+            // is about to be minted may act on this certificate.
+            "domain": "tls.write.example.com",
             "cert_pem": TEST_CERT_RSA_PEM,
             "key_pem": TEST_KEY_RSA_PEM,
         })),
@@ -10221,6 +10223,21 @@ async fn a_node_with_something_to_write() -> WriteFixture {
         .as_str()
         .expect("certificate id")
         .to_string();
+    // The upload reads the SANs off the test PEM, whose names are not
+    // under the grant and are not what these tests are about; the
+    // renewal grant weighs every name a row carries, so the row starts
+    // with none and each test that needs a SAN sets its own.
+    {
+        let store = state.store.lock().await;
+        let mut certificate = store
+            .get_certificate(&certificate_id)
+            .expect("store")
+            .expect("the seeded certificate");
+        certificate.san_domains = Vec::new();
+        store
+            .update_certificate(&certificate)
+            .expect("the SANs are cleared");
+    }
 
     let created = send(
         &state,
@@ -11669,11 +11686,15 @@ async fn mcp_call(
 /// A token carrying every scope, on the node the read surface seeds.
 async fn a_node_and_a_token_for_every_tool() -> (AppState, String, String) {
     let (state, _read_token, route_id) = a_node_with_something_to_read().await;
+    // The seeded route answers on `read.example.com` itself, which the
+    // one-label wildcard does not cover, and since the grant bounds
+    // what a write targets the previews this token drives need the
+    // exact name granted beside the wildcard.
     let token = mint_automation(
         &state,
         "mcp-every-read",
         lorica_config::models::AutomationScope::ALL.to_vec(),
-        &["*.read.example.com"],
+        &["read.example.com", "*.read.example.com"],
         chrono::Utc::now() + chrono::Duration::days(30),
         None,
     )
@@ -11877,7 +11898,9 @@ async fn every_registered_tool_answers_through_the_endpoint_without_leaving_the_
     };
     // The renewal preview refuses a certificate that was uploaded, as
     // the apply would; the seeded one is marked as issued so the
-    // preview reaches its answer rather than its refusal.
+    // preview reaches its answer rather than its refusal. Its SANs are
+    // the test PEM's own names, which the grant does not cover and
+    // which this sweep is not about, so the row carries none.
     {
         let store = state.store.lock().await;
         let mut certificate = store
@@ -11885,6 +11908,7 @@ async fn every_registered_tool_answers_through_the_endpoint_without_leaving_the_
             .expect("store")
             .expect("the seeded certificate");
         certificate.is_acme = true;
+        certificate.san_domains = Vec::new();
         store
             .update_certificate(&certificate)
             .expect("the mark lands");
@@ -13036,6 +13060,892 @@ async fn every_write_path_previews_under_dry_run_and_writes_nothing() {
         ),
         "{request_rows:?}"
     );
+}
+
+// ---- Story 11.2, security audit: the grant bounds what a write TARGETS ----
+
+/// A route and a backend an operator wrote outside the write token's
+/// grant: `www.example.com`, served by `192.0.2.10:8080`, with the
+/// fixture's certificate bound and `force_https` on. What a config-tier
+/// token scoped to `*.write.example.com` and `10.0.0.0/8` must not
+/// reach by naming an id.
+async fn a_production_route_and_backend(f: &WriteFixture) -> (String, String) {
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/backends",
+        &f.admin,
+        Some(serde_json::json!({ "address": "192.0.2.10:8080", "name": "prod-backend" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let backend_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("backend id")
+        .to_string();
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &f.admin,
+        Some(serde_json::json!({
+            "hostname": "www.example.com",
+            "backend_ids": [backend_id],
+            "certificate_id": f.certificate_id,
+            "force_https": true,
+            "waf_enabled": true,
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    (route_id, backend_id)
+}
+
+/// Mark `route_id` as the route of the environment `name`, whose row
+/// names the static token `owner` as its principal.
+async fn an_environment_owning(state: &AppState, name: &str, route_id: &str, owner: &str) {
+    use lorica_config::models::{
+        AutomationEnvironment, CertificateMode, EnvironmentOwner, ManagedBy, OwnerKind,
+    };
+    let store = state.store.lock().await;
+    let mut route = store
+        .get_route(route_id)
+        .expect("store")
+        .expect("the route exists");
+    route.managed_by = Some(ManagedBy::Automation {
+        environment: name.to_string(),
+    });
+    store.update_route(&route).expect("the mark lands");
+    let now = chrono::Utc::now();
+    store
+        .upsert_automation_environment(&AutomationEnvironment {
+            name: name.to_string(),
+            route_id: route_id.to_string(),
+            owner: EnvironmentOwner {
+                kind: OwnerKind::StaticToken,
+                principal: owner.to_string(),
+            },
+            certificate_mode: CertificateMode::Auto,
+            labels: std::collections::BTreeMap::new(),
+            expires_at: now + chrono::Duration::hours(1),
+            created_at: now,
+            updated_at: now,
+            last_pipeline: None,
+            pipeline: None,
+        })
+        .expect("the environment row lands");
+}
+
+/// A 403 whose message names `marker`, the reason the plane gives for
+/// a grant refusal.
+async fn assert_forbidden_naming(response: axum::response::Response, marker: &str, what: &str) {
+    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{what}");
+    let refusal = body_json(response).await;
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(marker)),
+        "{what}: {refusal}"
+    );
+}
+
+/// The `automation.request.forbidden` rows whose target names `path`.
+async fn forbidden_rows_naming(state: &AppState, path: &str) -> usize {
+    automation_audit_rows(state)
+        .await
+        .iter()
+        .filter(|row| {
+            row.action.starts_with("automation.request.forbidden") && row.target_id.contains(path)
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn a_route_write_is_refused_when_the_route_it_names_is_outside_the_grant() {
+    // The grant bounds what a write TARGETS and not only what it
+    // claims. A token scoped to `*.write.example.com` naming a route on
+    // `www.example.com` by id must not disable its WAF, redirect it,
+    // disable it, move it under the grant, rewrite its error page,
+    // unbind its certificate or delete it; and a preview of any of
+    // those must not show it the row either. Every refusal is the
+    // plane's grant refusal, audited as forbidden.
+    let f = a_node_with_something_to_write().await;
+    let (prod_route, _) = a_production_route_and_backend(&f).await;
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+
+    let patches = [
+        serde_json::json!({ "waf_enabled": false }),
+        serde_json::json!({ "redirect_to": "https://attacker.example.net" }),
+        serde_json::json!({ "enabled": false }),
+        serde_json::json!({ "hostname": "pr-1.write.example.com" }),
+        serde_json::json!({ "error_page_html": "<h1>moved</h1>" }),
+        serde_json::json!({}),
+    ];
+    for patch in &patches {
+        for suffix in ["", "?dry_run=true"] {
+            let response = automation_call(
+                &f.state,
+                "PUT",
+                &format!("/automation/v1/routes/{prod_route}{suffix}"),
+                &f.bearer,
+                Some(patch.clone()),
+            )
+            .await;
+            assert_forbidden_naming(
+                response,
+                "allowed_hostnames",
+                &format!("PUT {patch}{suffix}"),
+            )
+            .await;
+        }
+    }
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "DELETE",
+            &format!("/automation/v1/routes/{prod_route}{suffix}"),
+            &f.bearer,
+            None,
+        )
+        .await;
+        assert_forbidden_naming(response, "allowed_hostnames", &format!("DELETE {suffix}")).await;
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("/automation/v1/routes/{prod_route}/certificate{suffix}"),
+            &f.bearer,
+            Some(serde_json::json!({ "certificate_id": "" })),
+        )
+        .await;
+        assert_forbidden_naming(response, "allowed_hostnames", &format!("unbind {suffix}")).await;
+    }
+
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes"),
+        "a refused write changed the store"
+    );
+    {
+        let store = f.state.store.lock().await;
+        let route = store
+            .get_route(&prod_route)
+            .expect("store")
+            .expect("the production route is still there");
+        assert_eq!(route.hostname, "www.example.com");
+        assert!(route.enabled && route.waf_enabled && route.force_https);
+        assert_eq!(
+            route.certificate_id.as_deref(),
+            Some(f.certificate_id.as_str())
+        );
+        assert_eq!(route.redirect_to, None);
+    }
+    assert_eq!(
+        forbidden_rows_naming(&f.state, &format!("/automation/v1/routes/{prod_route}")).await,
+        patches.len() * 2 + 4
+    );
+
+    // The same patch on a route inside the grant is the write it was.
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "app.write.example.com",
+            "backend_ids": [f.backend_id],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let own_route = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{own_route}"),
+        &f.bearer,
+        Some(serde_json::json!({ "waf_enabled": true })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = automation_call(
+        &f.state,
+        "DELETE",
+        &format!("/automation/v1/routes/{own_route}"),
+        &f.bearer,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_managed_route_goes_through_the_plane_only_for_its_environments_owner() {
+    // A route inside the hostname grant that another pipeline's
+    // environment owns: deleting it would cascade that environment,
+    // which the environment resource's own ownership rule refuses, so
+    // the route delete refuses it too. The owner's own token is let
+    // through, and the delete then cascades as the dashboard's does.
+    let f = a_node_with_something_to_write().await;
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "pr-7.write.example.com",
+            "backend_ids": [f.backend_id],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    an_environment_owning(&f.state, "pr-7", &route_id, "other-pipeline").await;
+
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "DELETE",
+            &format!("/automation/v1/routes/{route_id}{suffix}"),
+            &f.bearer,
+            None,
+        )
+        .await;
+        assert_forbidden_naming(response, "environment", &format!("DELETE {suffix}")).await;
+    }
+    // Another owner's row is not even the 409 the owner would get.
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{route_id}"),
+        &f.bearer,
+        Some(serde_json::json!({ "waf_enabled": true })),
+    )
+    .await;
+    assert_forbidden_naming(response, "environment", "PUT on another owner's row").await;
+    {
+        let store = f.state.store.lock().await;
+        assert!(store.get_route(&route_id).expect("store").is_some());
+        assert!(store
+            .get_automation_environment("pr-7")
+            .expect("store")
+            .is_some());
+    }
+
+    // The token's own environment: the managed-row 409 on an update,
+    // as on the management plane, and the cascading delete.
+    an_environment_owning(&f.state, "pr-7", &route_id, WRITE_TOKEN_NAME).await;
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{route_id}"),
+        &f.bearer,
+        Some(serde_json::json!({ "waf_enabled": true })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = automation_call(
+        &f.state,
+        "DELETE",
+        &format!("/automation/v1/routes/{route_id}"),
+        &f.bearer,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    {
+        let store = f.state.store.lock().await;
+        assert!(store.get_route(&route_id).expect("store").is_none());
+        assert!(store
+            .get_automation_environment("pr-7")
+            .expect("store")
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn a_backend_write_is_refused_when_the_backend_it_names_is_outside_the_grant() {
+    // The CIDR grant bounds the backend a write TARGETS: a token scoped
+    // to `10.0.0.0/8` naming a backend at `192.0.2.10` by id must not
+    // move it inside the grant, reweight it, loosen its TLS, silence its
+    // health check or drain it, previews included. A backend inside the
+    // CIDR that another pipeline's environment holds is that
+    // environment's, and refused as such.
+    let f = a_node_with_something_to_write().await;
+    let (_, prod_backend) = a_production_route_and_backend(&f).await;
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+
+    let patches = [
+        serde_json::json!({ "address": "10.9.9.9:80" }),
+        serde_json::json!({ "weight": 1 }),
+        serde_json::json!({ "tls_skip_verify": true }),
+        serde_json::json!({ "health_check_enabled": false }),
+        serde_json::json!({}),
+    ];
+    for patch in &patches {
+        for suffix in ["", "?dry_run=true"] {
+            let response = automation_call(
+                &f.state,
+                "PUT",
+                &format!("/automation/v1/backends/{prod_backend}{suffix}"),
+                &f.bearer,
+                Some(patch.clone()),
+            )
+            .await;
+            assert_forbidden_naming(
+                response,
+                "allowed_backend_cidrs",
+                &format!("PUT {patch}{suffix}"),
+            )
+            .await;
+        }
+    }
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "DELETE",
+            &format!("/automation/v1/backends/{prod_backend}{suffix}"),
+            &f.bearer,
+            None,
+        )
+        .await;
+        assert_forbidden_naming(
+            response,
+            "allowed_backend_cidrs",
+            &format!("DELETE {suffix}"),
+        )
+        .await;
+    }
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes"),
+        "a refused write changed the store"
+    );
+    {
+        let store = f.state.store.lock().await;
+        let backend = store
+            .get_backend(&prod_backend)
+            .expect("store")
+            .expect("the production backend is still there");
+        assert_eq!(backend.address, "192.0.2.10:8080");
+        assert_eq!(
+            backend.lifecycle_state,
+            lorica_config::models::LifecycleState::Normal
+        );
+        assert!(!backend.tls_skip_verify && backend.health_check_enabled);
+    }
+    assert_eq!(
+        forbidden_rows_naming(&f.state, &format!("/automation/v1/backends/{prod_backend}")).await,
+        patches.len() * 2 + 2
+    );
+
+    // Inside the CIDR, held by another pipeline's environment.
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "pr-9.write.example.com",
+            "backend_ids": [f.backend_id],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    an_environment_owning(&f.state, "pr-9", &route_id, "other-pipeline").await;
+    {
+        let store = f.state.store.lock().await;
+        let mut backend = store
+            .get_backend(&f.backend_id)
+            .expect("store")
+            .expect("the backend exists");
+        backend.managed_by = Some(lorica_config::models::ManagedBy::Automation {
+            environment: "pr-9".to_string(),
+        });
+        store.update_backend(&backend).expect("the mark lands");
+    }
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/backends/{}", f.backend_id),
+        &f.bearer,
+        Some(serde_json::json!({ "name": "renamed" })),
+    )
+    .await;
+    assert_forbidden_naming(
+        response,
+        "environment",
+        "PUT on another environment's backend",
+    )
+    .await;
+    let response = automation_call(
+        &f.state,
+        "DELETE",
+        &format!("/automation/v1/backends/{}", f.backend_id),
+        &f.bearer,
+        None,
+    )
+    .await;
+    assert_forbidden_naming(
+        response,
+        "environment",
+        "DELETE on another environment's backend",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_renewal_is_refused_when_the_certificate_covers_a_name_outside_the_grant() {
+    // A renewal spends an ACME budget and rotates the node's bot HMAC,
+    // for a certificate the token may have no business with. Every name
+    // the certificate carries, `domain` and each SAN, must be inside the
+    // hostname grant, or the renewal and its preview are refused before
+    // the ACME-only check can say anything about the row.
+    let f = a_node_with_something_to_write().await;
+    let outside_id = {
+        let store = f.state.store.lock().await;
+        let mut outside = store
+            .get_certificate(&f.certificate_id)
+            .expect("store")
+            .expect("the seeded certificate");
+        outside.id = uuid::Uuid::new_v4().to_string();
+        outside.domain = "www.example.com".to_string();
+        outside.fingerprint = format!("{}-www", outside.fingerprint);
+        outside.is_acme = true;
+        store
+            .create_certificate(&outside)
+            .expect("the production certificate lands");
+        outside.id
+    };
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "POST",
+            &format!("/automation/v1/certificates/{outside_id}/renew{suffix}"),
+            &f.bearer,
+            None,
+        )
+        .await;
+        assert_forbidden_naming(response, "allowed_hostnames", &format!("renew {suffix}")).await;
+    }
+
+    // A SAN outside the grant refuses the renewal as the domain does.
+    {
+        let store = f.state.store.lock().await;
+        let mut certificate = store
+            .get_certificate(&f.certificate_id)
+            .expect("store")
+            .expect("the seeded certificate");
+        certificate.is_acme = true;
+        certificate.san_domains = vec!["www.example.com".to_string()];
+        store
+            .update_certificate(&certificate)
+            .expect("the SAN lands");
+    }
+    let response = automation_call(
+        &f.state,
+        "POST",
+        &format!(
+            "/automation/v1/certificates/{}/renew?dry_run=true",
+            f.certificate_id
+        ),
+        &f.bearer,
+        None,
+    )
+    .await;
+    assert_forbidden_naming(response, "allowed_hostnames", "renew with a SAN outside").await;
+    assert_eq!(
+        forbidden_rows_naming(&f.state, "/renew").await,
+        3,
+        "every refused renewal is audited as forbidden"
+    );
+
+    // Every name inside the grant: the preview answers the row, the
+    // apply would place the order.
+    {
+        let store = f.state.store.lock().await;
+        let mut certificate = store
+            .get_certificate(&f.certificate_id)
+            .expect("store")
+            .expect("the seeded certificate");
+        certificate.san_domains = vec!["api.write.example.com".to_string()];
+        store
+            .update_certificate(&certificate)
+            .expect("the SAN lands");
+    }
+    let response = automation_call(
+        &f.state,
+        "POST",
+        &format!(
+            "/automation/v1/certificates/{}/renew?dry_run=true",
+            f.certificate_id
+        ),
+        &f.bearer,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        parse_data(response).await["operation"],
+        serde_json::json!("renew")
+    );
+}
+
+#[tokio::test]
+async fn a_route_body_cannot_aim_traffic_or_credentials_outside_the_grant() {
+    // The CIDR grant bounded one field of the eight that point
+    // somewhere. `forward_auth` is a URL the grant cannot weigh, and the
+    // proxy forwards every downstream Cookie and Authorization header to
+    // it; `mirror` ships a copy of every request to a second set of
+    // backends. Both are refused outright from an automation token. And
+    // every `backend_ids` list, at the top level and inside path rules,
+    // header rules and traffic splits, links a backend by id: each one
+    // the write links anew must sit inside the CIDR grant and belong to
+    // no other pipeline's environment.
+    let f = a_node_with_something_to_write().await;
+    let (_, prod_backend) = a_production_route_and_backend(&f).await;
+
+    // A backend inside the CIDR that another pipeline's environment
+    // holds.
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "pr-8.write.example.com",
+            "backend_ids": [f.backend_id],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let environment_route = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    an_environment_owning(&f.state, "pr-8", &environment_route, "other-pipeline").await;
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/backends",
+        &f.admin,
+        Some(serde_json::json!({ "address": "10.0.0.20:8080", "name": "pr-8-0" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let owned_backend = parse_data(created).await["id"]
+        .as_str()
+        .expect("backend id")
+        .to_string();
+    {
+        let store = f.state.store.lock().await;
+        let mut backend = store
+            .get_backend(&owned_backend)
+            .expect("store")
+            .expect("the backend exists");
+        backend.managed_by = Some(lorica_config::models::ManagedBy::Automation {
+            environment: "pr-8".to_string(),
+        });
+        store.update_backend(&backend).expect("the mark lands");
+    }
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+
+    let refused_bodies: Vec<(serde_json::Value, &str)> = vec![
+        (
+            serde_json::json!({ "forward_auth": { "address": "https://collector.attacker.example.net/v", "timeout_ms": 1000 } }),
+            "forward_auth",
+        ),
+        (
+            serde_json::json!({ "forward_auth": { "address": "http://169.254.169.254/latest/meta-data/" } }),
+            "forward_auth",
+        ),
+        (
+            serde_json::json!({ "mirror": { "backend_ids": [f.backend_id] } }),
+            "mirror",
+        ),
+        (
+            serde_json::json!({ "backend_ids": [prod_backend] }),
+            "allowed_backend_cidrs",
+        ),
+        (
+            serde_json::json!({ "traffic_splits": [{ "name": "canary", "weight_percent": 10, "backend_ids": [prod_backend] }] }),
+            "allowed_backend_cidrs",
+        ),
+        (
+            serde_json::json!({ "header_rules": [{ "header_name": "X-Canary", "value": "1", "backend_ids": [prod_backend] }] }),
+            "allowed_backend_cidrs",
+        ),
+        (
+            serde_json::json!({ "path_rules": [{ "path": "/admin", "backend_ids": [prod_backend] }] }),
+            "allowed_backend_cidrs",
+        ),
+        (
+            serde_json::json!({ "backend_ids": [owned_backend] }),
+            "environment",
+        ),
+    ];
+    for (fields, marker) in &refused_bodies {
+        let mut body = fields.clone();
+        body["hostname"] = serde_json::json!("app.write.example.com");
+        for suffix in ["", "?dry_run=true"] {
+            let response = automation_call(
+                &f.state,
+                "POST",
+                &format!("/automation/v1/routes{suffix}"),
+                &f.bearer,
+                Some(body.clone()),
+            )
+            .await;
+            assert_forbidden_naming(response, marker, &format!("POST {fields}{suffix}")).await;
+        }
+    }
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes"),
+        "a refused create changed the store"
+    );
+
+    // A route inside the grant, linked inside the grant: created, and
+    // then patched with each body the create refused.
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "app.write.example.com",
+            "backend_ids": [f.backend_id],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+    for (fields, marker) in &refused_bodies {
+        for suffix in ["", "?dry_run=true"] {
+            let response = automation_call(
+                &f.state,
+                "PUT",
+                &format!("/automation/v1/routes/{route_id}{suffix}"),
+                &f.bearer,
+                Some(fields.clone()),
+            )
+            .await;
+            assert_forbidden_naming(response, marker, &format!("PUT {fields}{suffix}")).await;
+        }
+    }
+    // Clearing `forward_auth` is refused with the rest: the field is
+    // not the tier's, in either direction.
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{route_id}"),
+        &f.bearer,
+        Some(serde_json::json!({ "forward_auth": { "address": "" } })),
+    )
+    .await;
+    assert_forbidden_naming(response, "forward_auth", "PUT clearing forward_auth").await;
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes"),
+        "a refused patch changed the store"
+    );
+
+    // Inside the grant, every position links: the same backend at the
+    // top level again, and in a path rule.
+    for body in [
+        serde_json::json!({ "backend_ids": [f.backend_id] }),
+        serde_json::json!({ "path_rules": [{ "path": "/api", "backend_ids": [f.backend_id] }] }),
+        serde_json::json!({ "waf_enabled": true }),
+    ] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("/automation/v1/routes/{route_id}"),
+            &f.bearer,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{body}");
+    }
+    // A patch that leaves the links alone does not re-weigh them: the
+    // route now carries a path rule, and toggling a flag beside it is
+    // still the write it was.
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{route_id}"),
+        &f.bearer,
+        Some(serde_json::json!({ "waf_enabled": false })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    {
+        let store = f.state.store.lock().await;
+        let linked = store.list_backends_for_route(&route_id).expect("store");
+        assert_eq!(linked, vec![f.backend_id.clone()]);
+        let route = store
+            .get_route(&route_id)
+            .expect("store")
+            .expect("the route");
+        assert!(route.forward_auth.is_none() && route.mirror.is_none());
+        assert_eq!(
+            route.path_rules[0].backend_ids.as_deref(),
+            Some(&[f.backend_id.clone()][..])
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_backend_delete_preview_reports_the_drain_the_apply_starts() {
+    // The apply of a backend delete marks the row closing and drains it
+    // for up to a minute before the row leaves; only a backend already
+    // closing goes at once. The preview says which of the two the apply
+    // would do, rather than promising a row gone that the apply keeps.
+    let f = a_node_with_something_to_write().await;
+    let response = automation_call(
+        &f.state,
+        "DELETE",
+        &format!("/automation/v1/backends/{}?dry_run=true", f.backend_id),
+        &f.bearer,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let change = parse_data(response).await;
+    assert_eq!(change["operation"], serde_json::json!("delete"));
+    assert_eq!(
+        change["before"]["lifecycle_state"],
+        serde_json::json!("normal")
+    );
+    assert_eq!(
+        change["after"]["lifecycle_state"],
+        serde_json::json!("closing")
+    );
+    assert_eq!(
+        change["changes"],
+        serde_json::json!({ "lifecycle_state": { "from": "normal", "to": "closing" } })
+    );
+
+    {
+        let store = f.state.store.lock().await;
+        let mut backend = store
+            .get_backend(&f.backend_id)
+            .expect("store")
+            .expect("the backend exists");
+        backend.lifecycle_state = lorica_config::models::LifecycleState::Closing;
+        store.update_backend(&backend).expect("the state lands");
+    }
+    let response = automation_call(
+        &f.state,
+        "DELETE",
+        &format!("/automation/v1/backends/{}?dry_run=true", f.backend_id),
+        &f.bearer,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let change = parse_data(response).await;
+    assert_eq!(
+        change["before"]["lifecycle_state"],
+        serde_json::json!("closing")
+    );
+    assert_eq!(change["after"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn a_renewal_preview_refuses_what_the_apply_refuses() {
+    // A preview that answers "would renew" for a certificate the apply
+    // then refuses is a preview promising more than the apply does. The
+    // method and the DNS provider are resolved before the preview
+    // branch, so the two answer alike, and a refusal the row provokes is
+    // a 400 naming it rather than a 500 from inside the order.
+    let f = a_node_with_something_to_write().await;
+    for (method, provider, marker) in [
+        ("dns01-manual", None, "manual"),
+        ("dns01-cloudflare", None, "no DNS provider"),
+        (
+            "dns01-cloudflare",
+            Some("no-such-provider"),
+            "no longer exists",
+        ),
+        ("carrier-pigeon", None, "unknown ACME method"),
+    ] {
+        {
+            let store = f.state.store.lock().await;
+            let mut certificate = store
+                .get_certificate(&f.certificate_id)
+                .expect("store")
+                .expect("the seeded certificate");
+            certificate.is_acme = true;
+            certificate.acme_method = Some(method.to_string());
+            certificate.acme_dns_provider_id = provider.map(str::to_string);
+            store
+                .update_certificate(&certificate)
+                .expect("the method lands");
+        }
+        let mut answers = Vec::new();
+        for suffix in ["?dry_run=true", ""] {
+            let response = automation_call(
+                &f.state,
+                "POST",
+                &format!(
+                    "/automation/v1/certificates/{}/renew{suffix}",
+                    f.certificate_id
+                ),
+                &f.bearer,
+                None,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{method} {provider:?} {suffix}"
+            );
+            let refusal = body_json(response).await;
+            assert!(
+                refusal["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(marker)),
+                "{method} {provider:?} {suffix}: {refusal}"
+            );
+            answers.push(refusal);
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "{method}: the preview and the apply disagree"
+        );
+    }
 }
 
 #[tokio::test]

@@ -366,7 +366,14 @@ pub async fn renew_certificate(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    renew_certificate_as(&state, &audit_ctx, id, crate::preview::WriteMode::Apply).await
+    renew_certificate_as(
+        &state,
+        &audit_ctx,
+        id,
+        crate::preview::WriteMode::Apply,
+        crate::target::CertificateGuard::unbounded(),
+    )
+    .await
 }
 
 /// The whole of [`renew_certificate`] as `actor`: the ACME-only
@@ -375,23 +382,37 @@ pub async fn renew_certificate(
 ///
 /// Split from the handler so the automation plane (Story 11.2) can run
 /// exactly this with a token as the actor rather than a session; see
-/// `crate::routes::crud::create_route_as` for the rule. No key
-/// material crosses this function's arguments: the renewal is an ACME
-/// order the node makes for a row it already holds.
+/// `crate::routes::crud::create_route_as` for the rule and for what
+/// `guard` is. The guard runs on the row as read, before the ACME-only
+/// refusal, so a caller outside the grant learns nothing about the
+/// row. No key material crosses this function's arguments: the renewal
+/// is an ACME order the node makes for a row it already holds.
+///
+/// The method and the DNS provider are resolved before the preview
+/// branch, by the same [`plan_renewal`] the apply then executes, so
+/// what the apply would refuse the preview refuses with the same
+/// words, as a 400 the row provoked rather than a 500 from inside the
+/// order.
 ///
 /// In [`crate::preview::WriteMode::Preview`] it answers the metadata of
-/// the certificate that would be renewed, after the ACME-only refusal,
-/// and makes no order.
+/// the certificate that would be renewed and makes no order.
 pub(crate) async fn renew_certificate_as(
     state: &AppState,
     actor: &crate::audit::AuditContext,
     id: String,
     mode: crate::preview::WriteMode,
+    guard: crate::target::CertificateGuard,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let cert = db_blocking(&state.store, move |store| {
-        store
+    let (cert, provider) = db_blocking(&state.store, move |store| {
+        let cert = store
             .get_certificate(&id)?
-            .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))
+            .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
+        guard.check(&cert)?;
+        let provider = match cert.acme_dns_provider_id.as_deref() {
+            Some(provider_id) => store.get_dns_provider(provider_id)?,
+            None => None,
+        };
+        Ok::<_, ApiError>((cert, provider))
     })
     .await?;
 
@@ -400,6 +421,7 @@ pub(crate) async fn renew_certificate_as(
             "only ACME certificates can be renewed (use upload for manual certs)".into(),
         ));
     }
+    let plan = plan_renewal(&cert, provider.as_ref()).map_err(ApiError::BadRequest)?;
     if mode.previews() {
         return Ok(crate::preview::previewed(
             "renew",
@@ -413,18 +435,16 @@ pub(crate) async fn renew_certificate_as(
         contact_email: None,
     };
 
-    // Renew with all domains (primary + SANs), deduplicated
-    let mut all_domains = vec![cert.domain.clone()];
-    for d in &cert.san_domains {
-        if !all_domains.contains(d) {
-            all_domains.push(d.clone());
-        }
-    }
-
     // In-place renewal : same id, route bindings untouched (AC1).
-    renew_with_method(state, &cert, &config, &all_domains, Some(&cert.id))
-        .await
-        .map_err(|e| ApiError::Internal(format!("ACME renewal failed: {e}")))?;
+    execute_renewal(
+        state,
+        &config,
+        &renewal_domains(&cert),
+        plan,
+        Some(&cert.id),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("ACME renewal failed: {e}")))?;
 
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
@@ -457,70 +477,117 @@ pub(crate) async fn renew_certificate_as(
     Ok(crate::error::json_data(payload))
 }
 
-/// Renew a certificate using the appropriate method based on `acme_method`.
+/// Every name a renewal orders: the primary and the SANs, deduplicated.
+fn renewal_domains(cert: &lorica_config::models::Certificate) -> Vec<String> {
+    let mut all_domains = vec![cert.domain.clone()];
+    for d in &cert.san_domains {
+        if !all_domains.contains(d) {
+            all_domains.push(d.clone());
+        }
+    }
+    all_domains
+}
+
+/// How a certificate is renewed, resolved from the row and its DNS
+/// provider before any order is placed.
+///
+/// Resolved once and executed once, so the manual renewal's preview
+/// refuses exactly what its apply would: before this the method and
+/// the provider were resolved inside the call that also placed the
+/// order, and a `dns01-manual` certificate previewed as "would renew"
+/// and then failed on apply.
+#[derive(Debug)]
+enum RenewalPlan {
+    /// HTTP-01, the method a row without `acme_method` gets.
+    Http01,
+    /// DNS-01 through a global DNS provider whose configuration parsed
+    /// and matches the method's provider name.
+    Dns01 {
+        method: String,
+        provider_id: Option<String>,
+        config: DnsChallengeConfig,
+    },
+}
+
+/// Resolve [`RenewalPlan`] for `cert`, given the DNS provider row its
+/// `acme_dns_provider_id` names (`None` when it names none, or the row
+/// is gone).
 ///
 /// - `"http01"` or `None` -> HTTP-01 (original behavior)
-/// - `"dns01-cloudflare"` / `"dns01-route53"` / `"dns01-ovh"` -> decrypt config, build challenger
+/// - `"dns01-cloudflare"` / `"dns01-route53"` / `"dns01-ovh"` -> the
+///   provider's configuration, checked against the method
 /// - `"dns01-manual"` -> error (requires manual renewal)
+///
+/// # Errors
+///
+/// The reason the certificate cannot be renewed this way, in the words
+/// the operator reads.
+fn plan_renewal(
+    cert: &lorica_config::models::Certificate,
+    provider: Option<&lorica_config::models::DnsProvider>,
+) -> Result<RenewalPlan, String> {
+    let method = cert.acme_method.as_deref().unwrap_or("http01");
+
+    match method {
+        "http01" => Ok(RenewalPlan::Http01),
+        "dns01-manual" => Err("manual DNS-01 certificates require manual renewal - \
+             use the provision-dns-manual endpoint"
+            .to_string()),
+        m if m.starts_with("dns01-") => {
+            // Extract provider name from "dns01-provider"
+            let provider_name = &m[6..];
+
+            let Some(pid) = cert.acme_dns_provider_id.as_deref() else {
+                return Err(format!(
+                    "certificate has method '{m}' but no DNS provider configured - \
+                     cannot auto-renew"
+                ));
+            };
+            let dp = provider.ok_or_else(|| {
+                format!(
+                    "certificate references DNS provider '{pid}' which no longer exists - \
+                     cannot auto-renew"
+                )
+            })?;
+            let config: DnsChallengeConfig = serde_json::from_str(&dp.config)
+                .map_err(|e| format!("failed to parse DNS provider config: {e}"))?;
+
+            // Verify provider matches
+            if config.provider != provider_name {
+                return Err(format!(
+                    "DNS config provider '{}' does not match method '{m}'",
+                    config.provider
+                ));
+            }
+            Ok(RenewalPlan::Dns01 {
+                method: m.to_string(),
+                provider_id: Some(pid.to_string()),
+                config,
+            })
+        }
+        other => Err(format!("unknown ACME method: {other}")),
+    }
+}
+
+/// Place the order `plan` describes.
 ///
 /// `existing_cert_id` is threaded to the provisioning helpers so the
 /// renewed leaf updates that row in place (same id) rather than
 /// inserting a new certificate.
-async fn renew_with_method(
+async fn execute_renewal(
     state: &AppState,
-    cert: &lorica_config::models::Certificate,
     config: &AcmeConfig,
     domains: &[String],
+    plan: RenewalPlan,
     existing_cert_id: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let method = cert.acme_method.as_deref().unwrap_or("http01");
-
-    match method {
-        "http01" => provision_with_acme(state, config, domains, existing_cert_id).await,
-        "dns01-manual" => Err("manual DNS-01 certificates require manual renewal - \
-             use the provision-dns-manual endpoint"
-            .into()),
-        m if m.starts_with("dns01-") => {
-            // Extract provider name from "dns01-provider"
-            let provider = &m[6..];
-
-            // Try new approach first: global DNS provider reference
-            let (dns_config, dns_provider_id) = if let Some(ref pid) = cert.acme_dns_provider_id {
-                let pid_owned = pid.clone();
-                let dp = db_blocking(&state.store, move |store| {
-                    store.get_dns_provider(&pid_owned).map_err(|e| {
-                        ApiError::Internal(format!(
-                            "failed to fetch DNS provider '{pid_owned}': {e}"
-                        ))
-                    })
-                })
-                .await?;
-                let dp = dp.ok_or_else(|| {
-                    format!(
-                        "certificate references DNS provider '{pid}' which no longer exists - \
-                         cannot auto-renew"
-                    )
-                })?;
-                let cfg: DnsChallengeConfig = serde_json::from_str(&dp.config)
-                    .map_err(|e| format!("failed to parse DNS provider config: {e}"))?;
-                (cfg, Some(pid.clone()))
-            } else {
-                return Err(format!(
-                    "certificate has method '{m}' but no DNS provider configured - \
-                     cannot auto-renew"
-                )
-                .into());
-            };
-
-            // Verify provider matches
-            if dns_config.provider != provider {
-                return Err(format!(
-                    "DNS config provider '{}' does not match method '{m}'",
-                    dns_config.provider
-                )
-                .into());
-            }
-
+    match plan {
+        RenewalPlan::Http01 => provision_with_acme(state, config, domains, existing_cert_id).await,
+        RenewalPlan::Dns01 {
+            method,
+            provider_id,
+            config: dns_config,
+        } => {
             let challenger = build_dns_challenger(&dns_config)
                 .await
                 .map_err(|e| format!("failed to build DNS challenger for renewal: {e}"))?;
@@ -530,12 +597,38 @@ async fn renew_with_method(
                 config,
                 domains,
                 challenger.as_ref(),
-                m,
-                dns_provider_id,
+                &method,
+                provider_id,
                 existing_cert_id,
             )
             .await
         }
-        other => Err(format!("unknown ACME method: {other}").into()),
     }
+}
+
+/// Renew a certificate using the appropriate method based on
+/// `acme_method`: the DNS provider read, the plan resolved, the order
+/// placed. The background loop's one call; the manual renewal runs the
+/// same three steps with the preview branch between the second and
+/// the third.
+async fn renew_with_method(
+    state: &AppState,
+    cert: &lorica_config::models::Certificate,
+    config: &AcmeConfig,
+    domains: &[String],
+    existing_cert_id: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let provider = match cert.acme_dns_provider_id.clone() {
+        Some(pid) => {
+            db_blocking(&state.store, move |store| {
+                store.get_dns_provider(&pid).map_err(|e| {
+                    ApiError::Internal(format!("failed to fetch DNS provider '{pid}': {e}"))
+                })
+            })
+            .await?
+        }
+        None => None,
+    };
+    let plan = plan_renewal(cert, provider.as_ref())?;
+    execute_renewal(state, config, domains, plan, existing_cert_id).await
 }
