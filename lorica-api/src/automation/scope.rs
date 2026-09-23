@@ -50,13 +50,29 @@ pub enum ScopeRequirement {
     /// Every token that got past the bearer gate reaches this path,
     /// whatever it carries.
     ///
-    /// Reserved for a path that discloses nothing the caller did not
-    /// already present. `whoami` is the one: it reports the presented
-    /// token's own label, its lookup half and its own grants. Putting a
-    /// scope in front of it would mean a token minted for one job
-    /// cannot ask what it is, which is precisely what the MCP server's
-    /// startup introspection has to do with a token carrying only read
-    /// grants.
+    /// Reserved for two kinds of path, and nothing else.
+    ///
+    /// One discloses nothing the caller did not already present.
+    /// `whoami` is that: it reports the presented token's own label, its
+    /// lookup half and its own grants. Putting a scope in front of it
+    /// would mean a token minted for one job cannot ask what it is,
+    /// which is precisely what the MCP server's startup introspection
+    /// has to do with a token carrying only read grants.
+    ///
+    /// The other carries its own authorization inside the request,
+    /// because one requirement per path cannot express what it needs.
+    /// [`super::mcp::MCP_PATH`] is that: an MCP request names its own
+    /// tool and each tool has its own scope, so the endpoint is reached
+    /// by any live token and every `tools/call` is authorized against
+    /// the presented token's scopes, in the same matrix, by the tool
+    /// registry [`lorica_mcp::server::McpServer::over`] builds for that
+    /// one request. `tests/mcp_catalogue_scopes.rs` pins the scope each
+    /// tool names against the scope this matrix puts on the path it
+    /// reads.
+    ///
+    /// It is not a wider grant in either case. It is the statement that
+    /// the path's own gate is somewhere else, and the somewhere else is
+    /// named here.
     AnyLiveToken,
     /// The named scope, and a 403 for a token that does not carry it.
     Scope(AutomationScope),
@@ -122,6 +138,19 @@ fn declaration(method: &http::Method, path: &str) -> Option<(&'static str, Scope
     // read.
     if *method == http::Method::GET && path == WHOAMI_PATH {
         return Some((WHOAMI_PATH, ScopeRequirement::AnyLiveToken));
+    }
+
+    // The MCP endpoint (Story 11.1 AC #9), declared for EVERY method on
+    // purpose, which is the opposite of the rule one line above and has
+    // its own reason. The router mounts it for `POST` alone, so a `GET`
+    // or a `DELETE` on it is a verb that does not exist here and the
+    // revision says to answer `405`. Leaving those verbs undeclared
+    // would make the scope gate answer `403` first, which tells a client
+    // its token lacks a grant when the truth is that the path answers
+    // one verb. What the endpoint requires of a credential is decided
+    // per tool call inside it: see [`ScopeRequirement::AnyLiveToken`].
+    if path == super::mcp::MCP_PATH {
+        return Some((super::mcp::MCP_PATH, ScopeRequirement::AnyLiveToken));
     }
 
     // The environment resource (Story 10.4): the collection, and one
@@ -207,19 +236,19 @@ const ENVIRONMENTS_PATH: &str = "/automation/v1/environments";
 const ENVIRONMENT_TEMPLATE: &str = "/automation/v1/environments/{name}";
 
 /// The access log.
-const LOGS_PATH: &str = "/automation/v1/logs";
+pub(super) const LOGS_PATH: &str = "/automation/v1/logs";
 
 /// Recent WAF events.
-const WAF_EVENTS_PATH: &str = "/automation/v1/waf/events";
+pub(super) const WAF_EVENTS_PATH: &str = "/automation/v1/waf/events";
 
 /// The WAF summary counters.
-const WAF_STATS_PATH: &str = "/automation/v1/waf/stats";
+pub(super) const WAF_STATS_PATH: &str = "/automation/v1/waf/stats";
 
 /// Passive SLA for every route.
-const SLA_OVERVIEW_PATH: &str = "/automation/v1/sla/overview";
+pub(super) const SLA_OVERVIEW_PATH: &str = "/automation/v1/sla/overview";
 
 /// Passive SLA per route; one route id hangs under it.
-const SLA_ROUTES_PATH: &str = "/automation/v1/sla/routes";
+pub(super) const SLA_ROUTES_PATH: &str = "/automation/v1/sla/routes";
 
 /// How `openapi-automation.yaml` spells one route's SLA, and how the
 /// metric labels it.
@@ -235,16 +264,16 @@ const SLA_ROUTE_TEMPLATE: &str = "/automation/v1/sla/routes/{id}";
 /// no role, so a `cluster:read` token reading it would stand a role
 /// above where the management matrix put that answer. Status is
 /// `Viewer` on both planes.
-const CLUSTER_STATUS_PATH: &str = "/automation/v1/cluster/status";
+pub(super) const CLUSTER_STATUS_PATH: &str = "/automation/v1/cluster/status";
 
 /// The backend listing.
-const BACKENDS_PATH: &str = "/automation/v1/backends";
+pub(super) const BACKENDS_PATH: &str = "/automation/v1/backends";
 
 /// The route listing.
-const ROUTES_PATH: &str = "/automation/v1/routes";
+pub(super) const ROUTES_PATH: &str = "/automation/v1/routes";
 
 /// Certificate metadata; never a PEM body and never key material.
-const CERTIFICATES_PATH: &str = "/automation/v1/certificates";
+pub(super) const CERTIFICATES_PATH: &str = "/automation/v1/certificates";
 
 /// Axum middleware enforcing [`required_scope`] against the
 /// authenticated principal.

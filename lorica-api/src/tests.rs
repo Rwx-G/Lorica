@@ -10772,3 +10772,528 @@ async fn test_route_waf_body_scan_max_bytes_over_the_api() {
     .await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+// ---- The MCP Streamable HTTP binding (Story 11.1 AC #9) ----
+//
+// One path on this same listener, so everything below runs the chain
+// the read surface runs: source filter above, TLS above, bearer gate,
+// scope gate, audit. What is new is that the scope gate lets any live
+// token through and the authorization that matters happens per tool
+// call inside the handler, so these tests are mostly about that and
+// about the transport rules revision 2026-07-28 puts on a POST.
+
+/// The mirrored headers a conforming client sends, derived from
+/// `message` rather than spelled beside it.
+///
+/// A test that typed them by hand would be asserting its own typing,
+/// and the mirror check would pass for the wrong reason on the day the
+/// body shape moved.
+fn mcp_headers_for(message: &serde_json::Value) -> Vec<(String, String)> {
+    let mut headers = vec![(
+        crate::automation::mcp::PROTOCOL_VERSION_HEADER.to_string(),
+        lorica_mcp::MCP_PROTOCOL_REVISION.to_string(),
+    )];
+    if let Some(method) = message["method"].as_str() {
+        headers.push((
+            crate::automation::mcp::METHOD_HEADER.to_string(),
+            method.to_string(),
+        ));
+    }
+    if let Some(name) = message["params"]["name"].as_str() {
+        headers.push((
+            crate::automation::mcp::NAME_HEADER.to_string(),
+            name.to_string(),
+        ));
+    }
+    headers
+}
+
+/// `POST /automation/v1/mcp` with `headers` exactly as given.
+async fn mcp_post_with(
+    state: &AppState,
+    bearer: &str,
+    message: &serde_json::Value,
+    headers: &[(String, String)],
+) -> axum::response::Response {
+    let router = crate::automation::build_automation_router(state.clone());
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(crate::automation::MCP_PATH)
+        .header(http::header::AUTHORIZATION, bearer)
+        .header(http::header::CONTENT_TYPE, "application/json");
+    for (name, value) in headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    router
+        .oneshot(
+            builder
+                .body(Body::from(
+                    serde_json::to_vec(message).expect("test setup: a message serialises"),
+                ))
+                .expect("test setup"),
+        )
+        .await
+        .expect("test setup")
+}
+
+/// The same POST, with the headers a conforming client would send.
+async fn mcp_post(
+    state: &AppState,
+    bearer: &str,
+    message: &serde_json::Value,
+) -> axum::response::Response {
+    mcp_post_with(state, bearer, message, &mcp_headers_for(message)).await
+}
+
+/// One `tools/call`, answered.
+async fn mcp_call(
+    state: &AppState,
+    bearer: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let response = mcp_post(
+        state,
+        bearer,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "{tool}");
+    body_json(response).await
+}
+
+/// A token carrying every scope, on the node the read surface seeds.
+async fn a_node_and_a_token_for_every_tool() -> (AppState, String, String) {
+    let (state, _read_token, route_id) = a_node_with_something_to_read().await;
+    let token = mint_automation(
+        &state,
+        "mcp-every-read",
+        lorica_config::models::AutomationScope::ALL.to_vec(),
+        &["*.read.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    (state, format!("Bearer {token}"), route_id)
+}
+
+/// A token carrying `logs:read` alone, on the same node.
+async fn a_node_and_a_token_for_the_log_alone() -> (AppState, String) {
+    let (state, _read_token, _route_id) = a_node_with_something_to_read().await;
+    let token = mint_automation(
+        &state,
+        "mcp-logs-only",
+        vec![lorica_config::models::AutomationScope::LogsRead],
+        &["*.read.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    (state, format!("Bearer {token}"))
+}
+
+#[tokio::test]
+async fn the_mcp_endpoint_is_reached_by_any_live_token_and_answers_one_object() {
+    // The endpoint cannot be declared behind one scope, so it is
+    // declared reachable by any live token. This is that half: a token
+    // carrying a read grant and nothing about environments gets an
+    // answer rather than the 403 an undeclared path gives everyone.
+    let (state, bearer) = a_node_and_a_token_for_the_log_alone().await;
+
+    let response = mcp_post(
+        &state,
+        &bearer,
+        &serde_json::json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/list" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("application/json")),
+        Some(true)
+    );
+
+    let body = body_json(response).await;
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["id"], 7);
+    assert_eq!(body["result"]["resultType"], "complete");
+}
+
+#[tokio::test]
+async fn the_tool_set_is_the_one_the_presented_token_can_reach_and_nothing_else() {
+    // The per-tool authorization the scope matrix cannot express. The
+    // specification permits a tool set to vary by the authorization
+    // presented on the request, since credentials are per-request input
+    // rather than connection state, and forbids it varying per
+    // connection, which nothing here does: the registry is built from
+    // this request's principal and dropped with it.
+    let (state, bearer) = a_node_and_a_token_for_the_log_alone().await;
+
+    let body = body_json(
+        mcp_post(
+            &state,
+            &bearer,
+            &serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await,
+    )
+    .await;
+    let offered: Vec<String> = body["result"]["tools"]
+        .as_array()
+        .expect("a tool list")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("a name").to_string())
+        .collect();
+    assert_eq!(offered, vec!["lorica_logs".to_string()]);
+
+    // And a tool outside the grant does not exist to be called: a
+    // protocol error raised before any read is reached, rather than the
+    // 403 the read itself would have answered.
+    let refused = mcp_call(
+        &state,
+        &bearer,
+        "lorica_certificates",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"],
+        lorica_mcp::jsonrpc::code::METHOD_NOT_FOUND
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("certificates:read")),
+        "{refused}"
+    );
+    assert!(refused.get("result").is_none(), "{refused}");
+}
+
+#[tokio::test]
+async fn every_registered_tool_answers_through_the_endpoint_without_leaving_the_process() {
+    // Two things at once, deliberately. That the in-process read source
+    // dispatches every path the catalogue can build, which is what
+    // stops a tool added later reaching a handler nobody wired. And
+    // that what comes back is the plane's own filtered view, which is
+    // what stops the in-process route becoming a second way out for a
+    // field the HTTP route strips.
+    let (state, bearer, route_id) = a_node_and_a_token_for_every_tool().await;
+
+    let listed = body_json(
+        mcp_post(
+            &state,
+            &bearer,
+            &serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await,
+    )
+    .await;
+    let offered: Vec<String> = listed["result"]["tools"]
+        .as_array()
+        .expect("a tool list")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("a name").to_string())
+        .collect();
+    assert_eq!(
+        offered.len(),
+        lorica_mcp::tools::CATALOGUE.len(),
+        "a token carrying every scope registers every tool: {offered:?}"
+    );
+
+    let mut walked = 0usize;
+    for name in &offered {
+        let spec = lorica_mcp::tools::find(name).expect("the catalogue knows what it offered");
+        let arguments = match spec.resource {
+            Some(param) => {
+                let mut map = serde_json::Map::new();
+                map.insert(param.name.to_string(), serde_json::json!(route_id));
+                serde_json::Value::Object(map)
+            }
+            None => serde_json::json!({}),
+        };
+        let answered = mcp_call(&state, &bearer, name, arguments).await;
+        assert_eq!(
+            answered["result"]["isError"],
+            serde_json::json!(false),
+            "{name} answered an execution error: {answered}"
+        );
+
+        let mut keys = Vec::new();
+        let mut texts = Vec::new();
+        json_keys_and_strings(&answered, &mut keys, &mut texts);
+        walked += keys.len();
+        for key in &keys {
+            let lowered = key.to_ascii_lowercase();
+            for marker in NEVER_LEAVES_THE_NODE {
+                assert!(
+                    !lowered.contains(marker),
+                    "{name} answers a field named `{key}`, which matches `{marker}`"
+                );
+            }
+        }
+        for text in &texts {
+            assert!(
+                !text.contains("PRIVATE KEY"),
+                "{name} answers a value carrying a PEM private key block"
+            );
+        }
+    }
+    assert!(
+        walked > 100,
+        "the sweep walked only {walked} field names across every tool, so it is broken"
+    );
+}
+
+#[tokio::test]
+async fn the_verbs_this_revision_removed_answer_405_and_not_403() {
+    // Revision 2026-07-28 dropped protocol-level sessions and the
+    // standalone GET stream, so neither verb exists here. A 403 would
+    // tell a client its token lacks a grant, which is not what is
+    // wrong: the path answers one verb.
+    let (state, bearer, _route_id) = a_node_and_a_token_for_every_tool().await;
+    for method in ["GET", "DELETE", "PUT", "PATCH"] {
+        let router = crate::automation::build_automation_router(state.clone());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(crate::automation::MCP_PATH)
+                    .header(http::header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .expect("test setup"),
+            )
+            .await
+            .expect("test setup");
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_session_id_and_a_last_event_id_are_ignored_and_never_echoed() {
+    // Both belong to eras this revision replaced. They are accepted and
+    // do nothing, and nothing comes back that would let a client think
+    // a session was established.
+    let (state, bearer, _route_id) = a_node_and_a_token_for_every_tool().await;
+    let message = serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" });
+    let mut headers = mcp_headers_for(&message);
+    headers.push((
+        crate::automation::mcp::SESSION_ID_HEADER.to_string(),
+        "a-session-from-an-older-era".to_string(),
+    ));
+    headers.push((
+        crate::automation::mcp::LAST_EVENT_ID_HEADER.to_string(),
+        "42".to_string(),
+    ));
+
+    let response = mcp_post_with(&state, &bearer, &message, &headers).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(crate::automation::mcp::SESSION_ID_HEADER)
+            .is_none(),
+        "a session id was echoed"
+    );
+    assert_eq!(body_json(response).await["id"], 3);
+}
+
+#[tokio::test]
+async fn a_notification_is_accepted_with_no_body_at_all() {
+    let (state, bearer, _route_id) = a_node_and_a_token_for_every_tool().await;
+    let response = mcp_post(
+        &state,
+        &bearer,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": { "requestId": 1 },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    assert!(body.is_empty(), "a 202 carries no body");
+}
+
+#[tokio::test]
+async fn an_origin_header_is_refused_through_the_whole_stack() {
+    // The specification's one MUST on this transport, against DNS
+    // rebinding. Asserted through the router and not only on the pure
+    // function, because the gates in front of it are where a refusal
+    // could be turned into something else.
+    let (state, bearer, _route_id) = a_node_and_a_token_for_every_tool().await;
+    let message = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+    let mut headers = mcp_headers_for(&message);
+    headers.push((
+        http::header::ORIGIN.to_string(),
+        "https://evil.example.com".to_string(),
+    ));
+
+    let response = mcp_post_with(&state, &bearer, &message, &headers).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = body_json(response).await;
+    assert_eq!(body["id"], serde_json::Value::Null);
+    assert!(body["error"]["message"].is_string(), "{body}");
+}
+
+#[tokio::test]
+async fn a_header_that_does_not_mirror_its_body_is_refused_through_the_whole_stack() {
+    let (state, bearer, _route_id) = a_node_and_a_token_for_every_tool().await;
+    let message = serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": { "name": "lorica_logs", "arguments": {} },
+    });
+
+    // The header naming another tool than the body does. This is what
+    // an intermediary is asked to validate rather than trust, and
+    // Lorica is exactly that kind of intermediary.
+    let forged = with_header(
+        &message,
+        crate::automation::mcp::NAME_HEADER,
+        "lorica_certificates",
+    );
+    let response = mcp_post_with(&state, &bearer, &message, &forged).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["error"]["code"],
+        crate::automation::mcp::HEADER_MISMATCH
+    );
+    assert_eq!(body["id"], 4);
+
+    // And the same forgery behind a Base64 sentinel, which is the shape
+    // that makes the check bypassable on a server comparing the raw
+    // header instead of decoding it first.
+    use base64::Engine as _;
+    let sentinel = format!(
+        "=?base64?{}?=",
+        base64::engine::general_purpose::STANDARD.encode("lorica_certificates")
+    );
+    let smuggled = with_header(&message, crate::automation::mcp::NAME_HEADER, &sentinel);
+    let response = mcp_post_with(&state, &bearer, &message, &smuggled).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(response).await["error"]["code"],
+        crate::automation::mcp::HEADER_MISMATCH
+    );
+}
+
+/// The conforming headers for `message`, with one of them replaced.
+fn with_header(message: &serde_json::Value, header: &str, value: &str) -> Vec<(String, String)> {
+    mcp_headers_for(message)
+        .into_iter()
+        .map(|(name, carried)| {
+            if name == header {
+                (name, value.to_string())
+            } else {
+                (name, carried)
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_method_this_revision_does_not_define_is_a_404_through_the_whole_stack() {
+    // Deliberately unusual: a JSON-RPC server would answer -32601 in a
+    // 200. The 404 is how a client tells a server implementing this
+    // revision from one implementing the era where `initialize` existed.
+    let (state, bearer, _route_id) = a_node_and_a_token_for_every_tool().await;
+    let response = mcp_post(
+        &state,
+        &bearer,
+        &serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(response).await["error"]["code"],
+        lorica_mcp::jsonrpc::code::METHOD_NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_protocol_version_this_server_does_not_implement_names_what_it_does() {
+    let (state, bearer, _route_id) = a_node_and_a_token_for_every_tool().await;
+    let message = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+    let older = with_header(
+        &message,
+        crate::automation::mcp::PROTOCOL_VERSION_HEADER,
+        "2025-11-25",
+    );
+
+    let response = mcp_post_with(&state, &bearer, &message, &older).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["error"]["data"]["supportedVersions"],
+        serde_json::json!([lorica_mcp::MCP_PROTOCOL_REVISION])
+    );
+    assert_eq!(
+        body["error"]["data"]["name"],
+        "UnsupportedProtocolVersionError"
+    );
+}
+
+#[tokio::test]
+async fn a_tool_call_on_this_binding_is_audited_on_the_path_that_is_its_transport() {
+    // AC #6 for the second binding. What differs from stdio: the node
+    // routed this request to the MCP endpoint itself, so the path in
+    // the row IS the transport and needs no claim. The tool name is
+    // still the caller's, carried in the revision's own `Mcp-Name`, and
+    // it lands inside the `asserted[...]` clause with everything else
+    // that was said rather than established.
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let (mut state, _session_store, _rate_limiter) = test_state().await;
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(data_dir.path()).expect("test setup: log store"),
+    ));
+    let token = mint_automation(
+        &state,
+        "mcp-http",
+        vec![lorica_config::models::AutomationScope::LogsRead],
+        &["*.read.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    let bearer = format!("Bearer {token}");
+    let public_id = token.split('.').next().expect("a token has two halves");
+
+    let answered = mcp_call(
+        &state,
+        &bearer,
+        "lorica_logs",
+        serde_json::json!({ "limit": 5 }),
+    )
+    .await;
+    assert_eq!(answered["result"]["isError"], serde_json::json!(false));
+
+    let rows = automation_audit_rows(&state).await;
+    let row = rows
+        .iter()
+        .find(|row| row.target_id.contains(crate::automation::MCP_PATH))
+        .unwrap_or_else(|| panic!("no row names the MCP endpoint: {rows:?}"));
+
+    // Established: the principal, from verifying the credential, and
+    // the method and the path, from the request line this node parsed.
+    assert!(row.operator_username.contains(public_id), "{row:?}");
+    assert!(row.target_id.starts_with("POST "), "{row:?}");
+    assert_eq!(row.action, "automation.request.ok", "{row:?}");
+    // Asserted: the tool the caller said the request was for, inside
+    // the clause that says so and nowhere else.
+    assert!(
+        row.target_id.contains("asserted[tool=lorica_logs]"),
+        "{row:?}"
+    );
+}

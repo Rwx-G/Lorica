@@ -45,6 +45,9 @@
 //! - [`read`] - the read surface (Story 11.1): logs, WAF, SLA, cluster
 //!   status, backends, routes and certificate metadata, each a wrapper
 //!   over the management handler that already answers it.
+//! - [`mcp`] - the MCP Streamable HTTP binding (Story 11.1 AC #9): one
+//!   `POST` path over the shared `lorica-mcp` core, reaching [`read`]'s
+//!   handlers in process rather than over a socket of its own.
 //! - [`oidc`] - the GitLab ID-token verifier (Story 10.5): the pinned
 //!   algorithm, the JWKS cache and the bounded replay set.
 //!
@@ -76,6 +79,7 @@ pub mod audit;
 pub mod auth;
 pub mod environments;
 pub mod listener;
+pub mod mcp;
 pub mod oidc;
 pub mod read;
 pub mod router;
@@ -91,6 +95,7 @@ pub use environments::{
     ENVIRONMENT_EXPIRED_ACTION,
 };
 pub use listener::{start_automation_server, AutomationListenerConfig, AutomationListenerError};
+pub use mcp::{InProcessReads, MCP_PATH};
 pub use oidc::{OidcVerifier, RefusalReason, OIDC_REPLAY_SET_CAP};
 pub use read::{
     AUTOMATION_READ_DEFAULT_ROWS, AUTOMATION_READ_MAX_ANSWER_BYTES, AUTOMATION_READ_MAX_ROWS,

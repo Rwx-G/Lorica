@@ -99,6 +99,20 @@ tags:
       principal, and its owner and its labels are still its owner's: a
       `PUT` by anybody else rewrites the route, the backends and the
       lifetime and leaves both untouched.
+  - name: MCP
+    description: >-
+      The Model Context Protocol read tier (Story 11.1), Streamable HTTP
+      binding. One `POST` path over the same core the `lorica-mcp` stdio
+      server runs, reaching the read family above in process rather than
+      over a socket of its own.
+
+
+      It is the one path on this plane whose `x-required-scope` is
+      `any-live-token` for a reason other than disclosing nothing: an
+      MCP request names its own tool and each tool sits behind its own
+      scope, so the gate the matrix cannot express happens per tool
+      call, against the scopes the presented token carries and against
+      the same matrix the read paths use.
 
 security:
   - bearerAuth: []
@@ -765,6 +779,98 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /automation/v1/mcp:
+    post:
+      tags: [MCP]
+      summary: One Model Context Protocol message
+      description: >-
+        The Streamable HTTP binding of the Lorica MCP read tier, as one
+        path on this listener rather than a port of its own: an operator
+        who has not enabled the automation listener gains no MCP
+        surface.
+
+
+        This implements MCP revision **2026-07-28** and no other era.
+        There is no `initialize` handshake in that revision: every
+        request carries its own metadata under `params._meta`, and the
+        discovery call that replaced the handshake is `server/discover`.
+        The methods answered are `server/discover`, `tools/list` and
+        `tools/call`, plus the notification `notifications/cancelled`.
+        Anything else is a `404`, which is unusual for a JSON-RPC server
+        and deliberate: it is how a client tells a server on this
+        revision from one on the era its method belonged to.
+
+
+        Required scope: none at the path. That is not a wider grant, it
+        is the statement that this path's gate is elsewhere: an MCP
+        request names its own tool and each tool has its own scope, so
+        the endpoint is reached by any live token and every `tools/call`
+        is authorized against the presented token's scopes. A tool the
+        token cannot reach is absent from that request's `tools/list`
+        and unknown to its `tools/call`, which the specification permits
+        explicitly, since credentials are per-request input and not
+        connection state.
+
+
+        Every POST carries `MCP-Protocol-Version`, `Mcp-Method` mirrored
+        from the body's `method`, and, on a `tools/call`, `Mcp-Name`
+        mirrored from `params.name`. Each is VALIDATED against the body
+        rather than trusted, because Lorica is exactly the kind of
+        intermediary that rule exists to protect. A header value may
+        arrive Base64-sentinel encoded as `=?base64?...?=` and is
+        decoded before it is compared.
+
+
+        The `Origin` header is refused whatever it names. The
+        specification's one MUST on this transport is against DNS
+        rebinding, and the usual same-host check is what rebinding
+        defeats; this plane serves no browser, so a present `Origin`
+        means a page is driving the endpoint.
+
+
+        Revision 2026-07-28 removed protocol-level sessions, the
+        standalone `GET` stream and `Last-Event-ID` resumability. `GET`
+        and `DELETE` on this path answer `405`. An `Mcp-Session-Id` is
+        ignored and never echoed, and a `Last-Event-ID` is ignored.
+      operationId: automationMcp
+      x-required-scope: any-live-token
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/McpProtocolVersion"
+        - $ref: "#/components/parameters/McpMethod"
+        - $ref: "#/components/parameters/McpName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonRpcMessage"
+      responses:
+        "200":
+          description: >-
+            One JSON-RPC response object. The revision also permits an
+            SSE stream here; this binding answers in one object, because
+            every method it implements answers in one message.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonRpcAnswer"
+        "202":
+          description: >-
+            The message was a notification and there is nothing to
+            answer. No body. This revision defines no client-to-server
+            notification over HTTP, so this is transport mechanics
+            rather than a path with a purpose.
+        "400":
+          $ref: "#/components/responses/McpBadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/McpOriginRefused"
+        "404":
+          $ref: "#/components/responses/McpMethodNotFound"
+
 components:
   parameters:
     EnvironmentName:
@@ -829,6 +935,57 @@ components:
         type: integer
         minimum: 0
         default: 0
+
+    McpProtocolVersion:
+      name: MCP-Protocol-Version
+      in: header
+      required: true
+      description: >-
+        The MCP revision this request is written against. Required on
+        every POST to the MCP endpoint. It must equal the
+        `io.modelcontextprotocol/protocolVersion` field under the body's
+        `_meta` when the body names one, and it must be a revision this
+        server implements: a mismatch is `-32020`, an unimplemented
+        revision is a `400` naming the versions that are supported.
+      schema:
+        type: string
+        example: "2026-07-28"
+
+    McpMethod:
+      name: Mcp-Method
+      in: header
+      required: true
+      description: >-
+        The body's `method`, mirrored. Validated rather than trusted:
+        an intermediary routing on the header while the body asks for
+        something else is the failure this rule exists for.
+
+
+        The value may be Base64-sentinel encoded as `=?base64?...?=`,
+        and is decoded before it is compared. A server that compared
+        the raw header instead would accept any mismatch wearing a
+        sentinel, which makes the check optional for anyone who read
+        the specification.
+      schema:
+        type: string
+        example: tools/call
+
+    McpName:
+      name: Mcp-Name
+      in: header
+      required: false
+      description: >-
+        The body's `params.name`, mirrored. Required on a `tools/call`
+        and refused on anything else, since nothing else has a
+        counterpart for it to equal. Same Base64 sentinel and same
+        decode-before-compare rule as `Mcp-Method`.
+
+
+        It is also what the audit row records as the tool the caller
+        said this request was for, inside the `asserted[...]` clause.
+      schema:
+        type: string
+        example: lorica_logs
 
   securitySchemes:
     bearerAuth:
@@ -1182,6 +1339,79 @@ components:
             message:
               type: string
 
+    JsonRpcMessage:
+      type: object
+      description: >-
+        One JSON-RPC 2.0 request or notification. A message with no `id`
+        is a notification and is answered by a `202` with no body.
+      required: [jsonrpc, method]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          description: >-
+            The correlation id. A string or a number; absent makes this
+            a notification.
+          oneOf:
+            - type: string
+            - type: integer
+        method:
+          type: string
+          enum:
+            - server/discover
+            - tools/list
+            - tools/call
+            - notifications/cancelled
+        params:
+          type: object
+          description: >-
+            Per-method parameters. `tools/call` takes `name` and
+            `arguments`. Every method may carry `_meta`, which is where
+            this revision puts the protocol version, the client info and
+            the client capabilities.
+
+    JsonRpcAnswer:
+      type: object
+      description: >-
+        One JSON-RPC 2.0 response. Carries `result` or `error` and never
+        both.
+
+
+        A tool that ran and failed is NOT an `error` here: it is a
+        `result` carrying `isError: true`, which is the channel a model
+        reads and corrects. An authorization refusal from a read behind
+        this endpoint is on that channel deliberately, so the model sees
+        the refusal and stops rather than rewording the call. The
+        `error` channel is for a call that never ran: an unknown tool, a
+        malformed request, arguments outside the declared schema.
+
+
+        A tool result's rows arrive inside a delimited block whose tool
+        description states, in terms, that the delimited content is data
+        and not instructions.
+      required: [jsonrpc, id]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          oneOf:
+            - type: string
+            - type: integer
+            - type: "null"
+        result:
+          type: object
+        error:
+          type: object
+          properties:
+            code:
+              type: integer
+            message:
+              type: string
+            data:
+              type: object
+
   responses:
     BeyondTheWindow:
       description: >-
@@ -1303,3 +1533,64 @@ components:
             error:
               code: forbidden
               message: this token does not carry the environments:read scope
+
+    McpBadRequest:
+      description: >-
+        The transport refused the POST before the protocol core saw it.
+
+
+        Code `-32020` `HeaderMismatch` for a mirrored header that does
+        not equal its body counterpart, a required one missing, or a
+        value carrying characters that cannot be read as text and
+        therefore cannot be compared. A different code, with
+        `error.data.name` set to `UnsupportedProtocolVersionError` and
+        `error.data.supportedVersions` listing what this server speaks,
+        for a revision it does not implement. `-32700` for a body that
+        is not JSON and `-32600` for JSON that is not a JSON-RPC
+        message.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/JsonRpcAnswer"
+          example:
+            jsonrpc: "2.0"
+            id: 4
+            error:
+              code: -32020
+              message: "`mcp-name` does not equal the body's `params.name`"
+
+    McpOriginRefused:
+      description: >-
+        An `Origin` header was present. This endpoint serves no browser
+        origin, so every one is refused: the specification's one MUST on
+        this transport is against DNS rebinding, and a present `Origin`
+        on a machine-facing API behind a bearer token means a page is
+        driving it.
+
+
+        The body carries no `id`: the request was not read far enough to
+        have one, and inventing one would answer a correlation nobody
+        made.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/JsonRpcAnswer"
+
+    McpMethodNotFound:
+      description: >-
+        The method is not one this server implements. A `404` and not a
+        `-32601` inside a `200`, which is unusual for a JSON-RPC server
+        and is how a client tells a server on revision 2026-07-28 from
+        one on the era the method belonged to: `initialize` answers this.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/JsonRpcAnswer"
+          example:
+            jsonrpc: "2.0"
+            id: 1
+            error:
+              code: -32601
+              message: >-
+                this server implements server/discover, tools/list and
+                tools/call, and accepts notifications/cancelled

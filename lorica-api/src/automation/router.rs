@@ -22,12 +22,13 @@
 //! check that its credential is still live and still carries what it
 //! expects. The environment paths (Story 10.4) live in
 //! [`super::environments`] and the read paths (Story 11.1) in
-//! [`super::read`]; they are mounted here, and only here, so
+//! [`super::read`]; the MCP endpoint (Story 11.1 AC #9) is in
+//! [`super::mcp`]. They are mounted here, and only here, so
 //! the OpenAPI drift gate in `tests/openapi_contract.rs` sees every
 //! automation route in one file.
 
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use lorica_config::models::{AutomationScope, OwnerKind, PipelineIdentity};
 use serde::Serialize;
@@ -188,6 +189,11 @@ pub fn build_automation_router(state: AppState) -> Router {
             "/automation/v1/certificates",
             get(super::read::list_certificates),
         )
+        // The MCP endpoint (Story 11.1 AC #9). `post` and nothing else:
+        // revision 2026-07-28 removed the standalone GET stream and the
+        // session DELETE, so both answer the 405 this mounting produces
+        // rather than a handler that explains they are gone.
+        .route("/automation/v1/mcp", post(super::mcp::mcp_endpoint))
         .layer(axum::middleware::from_fn(super::scope::authorize_scope))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

@@ -17,6 +17,13 @@ lorica-waf = { version = "1.8.0", path = "../lorica-waf" }
 lorica-notify = { version = "1.8.0", path = "../lorica-notify" }
 lorica-bench = { version = "1.8.0", path = "../lorica-bench" }
 lorica-cluster = { version = "1.8.0", path = "../lorica-cluster" }
+# The shared MCP core (Story 11.1 AC #9 and AC #10). The Streamable
+# HTTP binding is a path on the automation listener rather than a
+# second process, so the adapter runs here and reaches the protocol
+# core through this edge. The inversion is deliberate: `lorica-mcp`
+# must not depend on `lorica-api`, or the stdio subprocess would carry
+# the whole management crate.
+lorica-mcp = { version = "1.8.0", path = "../lorica-mcp" }
 # Used in `certificates.rs::validate_certificate_bundle` to gate
 # every cert upload (POST /certificates, PUT /certificates/{id},
 # POST /config/import) with the exact loader the worker uses :
@@ -105,6 +112,11 @@ thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots", "json"] }
 async-trait = { workspace = true }
 base64 = "0.23"
+# The MCP tool layer percent-encodes a resource id into one path
+# segment, and the in-process read source decodes it the way the
+# listener's own path extractor would have. Already a workspace
+# dependency: `lorica-mcp` pins the same version.
+percent-encoding = "2.1"
 dashmap = "6"
 tracing = "0.1"
 once_cell = { workspace = true }

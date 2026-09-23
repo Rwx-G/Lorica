@@ -50,10 +50,13 @@
 //! ([`server`]), the HTTPS implementation of the seam ([`http`]) and
 //! the stdio binding ([`stdio`]).
 //!
-//! NOT here, and not stubbed anywhere: the Streamable HTTP adapter,
-//! which is the last lot of Story 11.1 and runs inside `lorica-api`
-//! rather than in this crate, together with the in-process
-//! [`ReadSource`] it will call the read handlers through.
+//! NOT here, and not stubbed anywhere: the Streamable HTTP adapter and
+//! the in-process [`ReadSource`] it calls the read handlers through.
+//! Both live in `lorica-api`, in `automation::mcp`, because that
+//! binding is a path on the Story 10.3 listener rather than a process
+//! of its own. `lorica-api` depends on this crate for [`server`] and
+//! [`tools`]; nothing here depends on `lorica-api`, or a stdio
+//! subprocess would carry the whole management crate.
 //!
 //! # Where each acceptance criterion lives
 //!
@@ -167,10 +170,11 @@ impl Reason<'_> {
 /// second place that reshapes it is a second place that can stop
 /// stripping a field. The tool layer parses; this seam transports.
 ///
-/// One implementation exists, [`HttpsReadSource`], which the stdio
-/// binary drives. The second belongs to lot 4 and lives inside
-/// `lorica-api`, where the Streamable HTTP adapter calls the read
-/// handlers directly rather than dialling its own listener.
+/// Two implementations exist. [`HttpsReadSource`] is the one the stdio
+/// binary drives. The other lives inside `lorica-api`, as
+/// `automation::mcp::InProcessReads`, where the Streamable HTTP adapter
+/// calls the read handlers directly rather than dialling the listener
+/// it is itself mounted on.
 ///
 /// The bound is `Future` in return position rather than a boxed future,
 /// so a tool layer generic over this trait pays nothing for the

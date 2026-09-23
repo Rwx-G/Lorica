@@ -6,9 +6,12 @@ status and the configuration as it stands. It is a read tier. It
 cannot change anything, and that is the point rather than a limitation
 of the first release.
 
-This document covers the read tier over the stdio transport. The
-Streamable HTTP binding is a later increment and gets its own section
-when it lands.
+It speaks two transports over one core: **stdio**, for a client that
+launches it as a subprocess, and **Streamable HTTP**, as one path on
+the automation listener. The tools, the scopes, the paging, the
+untrusted-text marking and the protocol revision are the same on both,
+because both run the same code; what differs is what carries the
+messages and what each one can honestly put in an audit row.
 
 ## Why the tier exists before the tools do
 
@@ -28,9 +31,15 @@ That is a property of the process, not a rule it follows.
 ## What this tier can see
 
 Nine tools, one per read the automation plane serves. Each needs the
-scope beside it on the token the server was started with, and a server
-started with a token that carries none of them starts with no tools and
-says so.
+scope beside it.
+
+Over stdio that is decided once, at startup, from the token the server
+was started with: a server whose token carries none of these scopes
+starts with no tools and says so on stderr rather than failing every
+call. Over Streamable HTTP it is decided per request, from the token
+that request presented, because there is no startup to decide it at.
+Either way a tool the token cannot reach is not in the list and is
+unknown to a call.
 
 | Tool | Reads | Scope |
 |---|---|---|
@@ -62,8 +71,10 @@ address, the hostnames whose routes name it, and the ids of the
 certificates whose private key it receives. The management API gates
 that at the Operator role on purpose, and an automation credential
 carries scopes and no role, so there is no honest way to serve it at
-the same level of trust. Whether it returns behind a projection that
-strips those three fields is an open question.
+the same level of trust. Serving it behind a projection that strips
+those three fields was considered and refused: this tier's answers are
+the management plane's own views, unfiltered, and that property is what
+makes a field arriving here a visible event rather than a silent one.
 
 **No certificate PEM body.** The listing answers metadata. The
 single-certificate endpoint that returns the public certificate is
@@ -86,7 +97,25 @@ None of this makes the text safe. It makes its provenance unambiguous,
 which is what the reader, human or model, needs in order to treat it
 correctly.
 
-## Configuring a client
+## Which transport to use
+
+**stdio** when the client and Lorica are on the same box, or when the
+client can launch a subprocess and hand it a token. The client starts
+`lorica-mcp`, which dials the automation listener over HTTPS and
+reaches the read paths like any other automation client.
+
+**Streamable HTTP** when the client speaks MCP over HTTP and there is
+no subprocess to launch: a hosted client, a client on another machine,
+a client you do not control. Nothing is installed on the Lorica host
+for it. The endpoint is a path on the automation listener, so it exists
+exactly when that listener does and not otherwise: an operator who has
+not enabled `--automation-listen` has no MCP surface, which is the
+point rather than a side effect.
+
+Neither binding opens a socket of its own. `lorica-mcp` is a subprocess
+and a library; the automation listener stays the only thing that binds.
+
+## Configuring a client, stdio
 
 The server reads its endpoint and its token from the environment or
 from a TOML file, and **never from the command line**: an argument
@@ -132,6 +161,87 @@ gets committed:
 }
 ```
 
+## Configuring a client, Streamable HTTP
+
+```
+POST https://<automation host>:<automation port>/automation/v1/mcp
+Authorization: Bearer <the token, as minted>
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: <the body's method>
+Mcp-Name: <params.name, on a tools/call only>
+```
+
+A client entry looks like this, with the token supplied by whatever
+secret mechanism the client offers:
+
+```json
+{
+  "mcpServers": {
+    "lorica": {
+      "type": "http",
+      "url": "https://lorica.internal.example.org:9446/automation/v1/mcp",
+      "headers": {
+        "Authorization": "Bearer <the token>"
+      }
+    }
+  }
+}
+```
+
+The same three things gate it that gate every other path on that
+listener, and they gate it first: the source-CIDR allowlist drops a
+connection from outside it at TCP accept, before the TLS handshake and
+before any header is read; the connection caps and the per-IP limiter
+apply; and the bearer token is verified. So the MCP endpoint is not a
+way around the automation listener's admission rules, it is behind all
+of them.
+
+**What the endpoint requires of the token.** Any live token reaches the
+path, and every `tools/call` is authorized against the scopes that
+token carries, in the same matrix the read paths use. A tool the token
+cannot reach is absent from that request's `tools/list` and unknown to
+its `tools/call`. The specification permits exactly this: a tool set
+may vary by the authorization presented on the request, since
+credentials are per-request input rather than connection state, while
+it must not vary per connection.
+
+That is why the endpoint is not declared behind one scope. It cannot
+be: the request names its own tool and each tool has its own.
+
+**What the transport requires of the client.** Every POST carries
+`MCP-Protocol-Version`, `Mcp-Method` mirrored from the body's `method`,
+and on a `tools/call` `Mcp-Name` mirrored from `params.name`. Lorica
+validates each against the body rather than trusting it, and a
+disagreement is a `400` carrying JSON-RPC code `-32020`. A header value
+may arrive Base64-sentinel encoded as `=?base64?...?=`, and is decoded
+before it is compared: comparing the raw header would make the whole
+check bypassable, which is the reason the check exists.
+
+An unknown protocol version is a `400` naming the versions this server
+speaks. An unimplemented method is a **`404`**, which is unusual for a
+JSON-RPC server and deliberate: it is how a client tells a server on
+this revision from one on the era its method belonged to. A
+notification is a `202` with no body.
+
+**What is not there.** Revision 2026-07-28 removed protocol-level
+sessions, the standalone `GET` stream and `Last-Event-ID`
+resumability. `GET` and `DELETE` on the endpoint answer `405`. An
+`Mcp-Session-Id` is ignored and never echoed; a `Last-Event-ID` is
+ignored. An answer is one JSON object, not an SSE stream: every method
+this tier implements answers in one message.
+
+**Every `Origin` is refused with a `403`.** The specification's one
+MUST on this transport is against DNS rebinding, and the usual
+same-host check is precisely what rebinding defeats, since the
+attacker's page and the attacker's DNS name agree with each other.
+This plane serves no browser: no cookie layer, no CSRF layer, no
+session store, and an MCP client speaking to it directly sends no
+`Origin` at all. A present one means a page is driving the endpoint. If
+a browser front end ever needs it, an operator-configured allowlist is
+the additive change; refusing by default is what keeps that an explicit
+decision.
+
 ## Minting the token
 
 The tier is the token's scope set, so mint a token carrying exactly the
@@ -165,24 +275,34 @@ conclusion for a model to draw and report to an operator.
 
 ## What the audit records, and what it merely repeats
 
-Every call this server makes lands an audit row on the node, in the
-same tamper-evident chain as everything else on the automation plane.
-The row distinguishes two kinds of fact, because they are not the same
-kind:
+Every call lands an audit row on the node, in the same tamper-evident
+chain as everything else on the automation plane. The row distinguishes
+two kinds of fact, because they are not the same kind:
 
 - **Established by the node**: the principal, from verifying the
   credential; the method, the path and the names of the query
   parameters, from the request it parsed; the status it answered.
-- **Asserted by the caller**: the transport and the tool name, sent as
-  headers and recorded inside an `asserted[...]` clause.
+- **Asserted by the caller**: recorded inside an `asserted[...]` clause
+  and nowhere else.
 
-The second pair cannot be established at that layer. The MCP server is
-a separate process and the node sees HTTP requests, not tool calls; a
-tool is a concept of the protocol the server speaks, not of the one it
-speaks over. Anyone holding a live token can send any header they like,
-so both values are bounded in length and character set before they
-reach a row, and neither is ever presented as something the node
-checked.
+Over **stdio**, both the transport and the tool name are assertions.
+The MCP server is a separate process and the node sees HTTP requests,
+not tool calls; a tool is a concept of the protocol the server speaks,
+not of the one it speaks over. It declares them in
+`lorica-asserted-transport` and `lorica-asserted-tool`.
+
+Over **Streamable HTTP**, the transport needs no claim: the node routed
+the request to `/automation/v1/mcp` itself, so the path already in the
+row is the transport. The tool name is still the caller's, carried in
+the revision's own `Mcp-Name`, and it lands in the same clause. Lorica
+does refuse a request whose `Mcp-Name` disagrees with its body, but
+that check runs inside the layer that writes the row, and the row is
+written for the refusals too. Labelling the value as a claim is the
+reading that is never wrong.
+
+Anyone holding a live token can send any header they like, so every
+asserted value is bounded in length and character set before it reaches
+a row, and none is ever presented as something the node checked.
 
 An audit trail that cannot tell a claim from a proof is telling a story
 that is not true.
@@ -195,6 +315,13 @@ binding has no listener budget to inherit. Going over is a tool
 execution error, so the model sees it and can wait, rather than a
 protocol error it would read as a malfunction.
 
+The Streamable HTTP binding is bounded by the automation listener
+instead: its connection caps and its per-IP limiter, the same ones
+every other path on that socket sits behind. It does not carry the
+core's own per-process budget, because there is no process to budget:
+each request builds its tool registry from the credential it presented
+and drops it again.
+
 ## The protocol revision, and keeping up with it
 
 This crate implements MCP revision **2026-07-28** and no other era.
@@ -203,9 +330,10 @@ That revision removed the `initialize` handshake, protocol-level
 sessions and the standalone GET stream. Every request carries its own
 metadata in `_meta.io.modelcontextprotocol/*`, and the discovery call
 that replaced the handshake is `server/discover`. A client that speaks
-only an older era will not interoperate; the server answers
-`initialize` with method-not-found rather than guessing which era its
-caller is in.
+only an older era will not interoperate: `initialize` answers
+method-not-found over stdio and a `404` over Streamable HTTP, rather
+than the server guessing which era its caller is in. The `404` is the
+revision's own answer and is how a client makes that determination.
 
 **This is a maintenance obligation, not a footnote.** The specification
 has moved three times in eighteen months. The revision this crate

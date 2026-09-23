@@ -770,6 +770,43 @@ that exists on a machine-facing, TLS-only, bearer-only plane with no
 browser in the path; they are there for the client library or the
 future gateway that caches or sniffs without being asked to.
 
+### The MCP endpoint over the same reads
+
+`POST /automation/v1/mcp` is the Model Context Protocol read tier,
+Streamable HTTP binding. It answers the nine reads above through the
+protocol an MCP client speaks, so a language model can ask what this
+node is seeing without anything being installed beside it.
+[mcp.md](mcp.md) is the document for it; what matters here is how it
+sits on this plane.
+
+It is a path and not a listener. Everything this socket enforces it
+enforces first: a source outside `automation_allowed_cidrs` is dropped
+at TCP accept before any of this is reached, the connection caps and
+the per-IP limiter apply, and the bearer token is verified by the same
+gate. An operator who has not enabled the automation listener has no
+MCP surface at all.
+
+Its `x-required-scope` is `any-live-token`, and it is the one path on
+this plane where that means something other than "discloses nothing".
+An MCP request names its own tool and each tool sits behind its own
+scope, so one requirement per path cannot express what this endpoint
+needs. The gate is per call instead: the tool set a request is offered
+is built from the scopes the token on THAT request carries, against
+this same matrix, and a tool the token cannot reach is absent from its
+`tools/list` and unknown to its `tools/call`.
+
+The adapter reaches the read handlers in process. It does not dial this
+listener: the source allowlist would refuse it and the per-source
+connection budget would throttle it, and it would be paying a TLS
+handshake to ask the process a question it already holds the answer to.
+
+Its audit rows look like every other row here, with one difference
+worth knowing when reading a trail: the path `/automation/v1/mcp` is
+itself the transport, established by this node's own routing, while the
+tool name comes from the caller's `Mcp-Name` header and sits inside the
+`asserted[...]` clause with everything else that was claimed rather
+than proved.
+
 ## GitLab OIDC
 
 A static token is a long-lived shared secret sitting in a CI variable.

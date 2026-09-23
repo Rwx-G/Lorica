@@ -12,90 +12,53 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The Story 11.1 AC #6 header names, pinned across two crates that do
-//! not depend on each other.
+//! The Story 11.1 AC #6 header names, pinned between the crate that
+//! writes them and the plane that records them.
 //!
-//! `lorica-mcp` writes [`lorica_api::automation::audit`]'s two assertion
-//! headers and `lorica-api` reads them. Neither can see the other's
-//! constants today: `lorica-mcp` must not depend on `lorica-api` from
-//! `src/`, and `lorica-api` depends on `lorica-mcp` only from the lot
-//! that mounts the Streamable HTTP adapter inside it.
+//! `lorica-mcp`'s stdio client declares the transport and the tool in
+//! two headers of Lorica's own, and
+//! [`lorica_api::automation::audit`] reads them into the `asserted[...]`
+//! clause of the audit row. The drift would be silent in the worst way:
+//! a rename on either side makes the plane record no assertion at all,
+//! the request still succeeds, every gate still passes, and the trail
+//! quietly stops saying which tool a model asked for.
 //!
-//! The drift would be silent. A rename on either side makes the plane
-//! record no assertion at all, every gate stays green, and the audit
-//! trail quietly stops saying which tool a model asked for. So the
-//! coupling is this file: `include_str!` on the committed source of the
-//! emitting side, the literals extracted from it, and a both-directions
-//! diff against the constants the reading side declares. It is the
-//! `openapi_contract.rs` idiom - extraction sanity first, both
-//! directions, a `panic!` naming what to do, nothing auto-written - and
-//! it needs no dependency edge at all.
-//!
-//! When lot 4 makes `lorica-api` depend on `lorica-mcp`, this file
-//! should become a direct comparison of the two constants and stop
-//! parsing source.
-
-use std::collections::BTreeSet;
+//! It used to be pinned by `include_str!` on the emitting source, with
+//! the literals hand-extracted, because neither crate could see the
+//! other. Lot 4 makes `lorica-api` depend on `lorica-mcp` in order to
+//! mount the Streamable HTTP binding in process, so the constants can
+//! now be compared as constants. A comparison that cannot misparse is
+//! worth more than one that reads a file and might.
 
 use lorica_api::automation::audit::{ASSERTED_TOOL_HEADER, ASSERTED_TRANSPORT_HEADER};
+use lorica_mcp::http::{
+    ASSERTED_TOOL_HEADER as EMITTED_TOOL_HEADER,
+    ASSERTED_TRANSPORT_HEADER as EMITTED_TRANSPORT_HEADER, TRANSPORT_MARKER,
+};
 
-/// The emitting side, as committed.
-const MCP_HTTP_SOURCE: &str = include_str!("../../lorica-mcp/src/http.rs");
-
-/// Every `pub const NAME: &str = "value";` in `source`, before its
-/// tests.
+/// The bounds `lorica_api::automation::audit::assertable` applies before
+/// a claimed value may become a row.
 ///
-/// The test module is excluded because it quotes both spellings in its
-/// own assertions, and a fixture is not what the crate emits.
-fn published_string_constants(source: &str) -> BTreeSet<(String, String)> {
-    let source = source.split("#[cfg(test)]").next().unwrap_or(source);
-    source
-        .lines()
-        .filter_map(|line| {
-            let rest = line.trim().strip_prefix("pub const ")?;
-            let (name, rest) = rest.split_once(": &str = \"")?;
-            let (value, _) = rest.split_once('"')?;
-            Some((name.to_string(), value.to_string()))
-        })
-        .collect()
-}
+/// Restated here because the function is private and the point is the
+/// VALUE, not the function: a marker outside these bounds is dropped
+/// whole, so the row would say nothing about the transport while every
+/// gate stayed green. The test below is the executable case.
+const ASSERTED_TRANSPORT_MAX_BYTES: usize = 32;
 
 #[test]
 fn the_header_names_the_mcp_server_writes_are_the_ones_this_plane_reads() {
-    let published = published_string_constants(MCP_HTTP_SOURCE);
-    // A broken parser passes by comparing two empty sets, so the
-    // extraction states what it expects to have found before anything
-    // is compared.
-    assert!(
-        published.len() >= 3,
-        "no `pub const NAME: &str` was found in lorica-mcp/src/http.rs: the extractor below is \
-         reading a shape that file no longer has. {published:?}"
+    assert_eq!(
+        EMITTED_TOOL_HEADER, ASSERTED_TOOL_HEADER,
+        "the tool assertion header drifted: lorica-mcp writes `{EMITTED_TOOL_HEADER}` and \
+         lorica-api reads `{ASSERTED_TOOL_HEADER}`. A rename on either side makes the \
+         automation plane record no assertion at all, and the audit row quietly stops \
+         saying which tool a model asked for."
     );
-
-    let emitted: BTreeSet<&str> = published
-        .iter()
-        .filter(|(name, _)| name.starts_with("ASSERTED_") && name.ends_with("_HEADER"))
-        .map(|(_, value)| value.as_str())
-        .collect();
-    let read: BTreeSet<&str> = BTreeSet::from([ASSERTED_TOOL_HEADER, ASSERTED_TRANSPORT_HEADER]);
-
-    let only_emitted: Vec<&&str> = emitted.difference(&read).collect();
-    let only_read: Vec<&&str> = read.difference(&emitted).collect();
-    if !only_emitted.is_empty() || !only_read.is_empty() {
-        panic!(
-            "the Story 11.1 AC #6 assertion headers drifted between the crate that writes them \
-             and the plane that records them.\n\
-             \n\
-             written by lorica-mcp and not read here: {only_emitted:?}\n\
-             read here and not written by lorica-mcp: {only_read:?}\n\
-             \n\
-             Fix whichever side is wrong. A rename on either one makes the automation plane \
-             record no assertion at all: the request still succeeds, every gate still passes, \
-             and the audit row quietly stops saying which tool a model asked for. The \
-             constants are ASSERTED_TOOL_HEADER and ASSERTED_TRANSPORT_HEADER in \
-             lorica-api/src/automation/audit.rs and in lorica-mcp/src/http.rs."
-        );
-    }
+    assert_eq!(
+        EMITTED_TRANSPORT_HEADER, ASSERTED_TRANSPORT_HEADER,
+        "the transport assertion header drifted: lorica-mcp writes \
+         `{EMITTED_TRANSPORT_HEADER}` and lorica-api reads `{ASSERTED_TRANSPORT_HEADER}`."
+    );
 }
 
 #[test]
@@ -103,23 +66,34 @@ fn the_transport_marker_the_mcp_server_asserts_fits_what_this_plane_will_record(
     // The value, not only the header it travels in. The plane drops an
     // assertion it cannot store, so a marker outside the accepted set
     // would be a row that silently says nothing.
-    let published = published_string_constants(MCP_HTTP_SOURCE);
-    let marker = published
-        .iter()
-        .find(|(name, _)| name == "TRANSPORT_MARKER")
-        .map(|(_, value)| value.as_str())
-        .expect("lorica-mcp/src/http.rs declares TRANSPORT_MARKER");
-
     assert!(
-        marker.starts_with("mcp"),
-        "every MCP binding's marker starts with `mcp` so one filter finds them all: {marker}"
+        TRANSPORT_MARKER.starts_with("mcp"),
+        "every MCP binding's marker starts with `mcp` so one filter finds them all: \
+         {TRANSPORT_MARKER}"
     );
     assert!(
-        (1..=32).contains(&marker.len())
-            && marker
+        (1..=ASSERTED_TRANSPORT_MAX_BYTES).contains(&TRANSPORT_MARKER.len())
+            && TRANSPORT_MARKER
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
-        "`{marker}` is outside what lorica-api/src/automation/audit.rs will record, so the \
-         assertion would be dropped and the row would say nothing about the transport"
+        "`{TRANSPORT_MARKER}` is outside what lorica-api/src/automation/audit.rs will \
+         record, so the assertion would be dropped and the row would say nothing about \
+         the transport"
     );
+}
+
+#[test]
+fn the_streamable_http_binding_asserts_nothing_and_needs_no_marker_of_its_own() {
+    // The in-process binding does not claim a transport, and that is the
+    // design rather than an omission: the node routed the request to
+    // `MCP_PATH` itself, so the path already in the audit row IS the
+    // transport, established. The stdio binding has no such path - it
+    // reaches `/automation/v1/logs` like any other client - which is
+    // exactly why it has to assert one.
+    assert_ne!(
+        lorica_api::automation::MCP_PATH,
+        "/automation/v1/logs",
+        "the MCP endpoint and a read path must be distinguishable in a row"
+    );
+    assert!(lorica_api::automation::MCP_PATH.ends_with("/mcp"));
 }

@@ -448,7 +448,26 @@ fn asserted_clause(headers: &http::HeaderMap) -> String {
         read(ASSERTED_TRANSPORT_HEADER),
         ASSERTED_TRANSPORT_MAX_BYTES,
     );
-    let tool = assertable(read(ASSERTED_TOOL_HEADER), ASSERTED_TOOL_MAX_BYTES);
+    // Two headers, one claim. The stdio server is a separate process and
+    // declares its tool in a header of Lorica's own. A client of
+    // [`super::mcp`] does not have to: the revision's own `Mcp-Name` is
+    // already on the request, mirrored from the body's `params.name`, so
+    // asking for a second header saying the same thing would be asking a
+    // conforming client to speak a dialect.
+    //
+    // Both are read as ASSERTIONS, even though [`super::mcp`] refuses a
+    // request whose `Mcp-Name` and body disagree. That check runs inside
+    // this layer, which writes a row for the refusals too: on a row that
+    // answered 200 the mirror did hold, and on one that answered 400 the
+    // value is exactly what somebody claimed and nothing more. One
+    // labelling that is never wrong beats two that each need the status
+    // read first.
+    //
+    // The MCP transport itself is not claimed here and needs no claim:
+    // this node routed the request to `super::mcp::MCP_PATH`, so the path
+    // already in the row IS the transport, established.
+    let tool = assertable(read(ASSERTED_TOOL_HEADER), ASSERTED_TOOL_MAX_BYTES)
+        .or_else(|| assertable(read(super::mcp::NAME_HEADER), ASSERTED_TOOL_MAX_BYTES));
 
     let mut claims: Vec<String> = Vec::with_capacity(2);
     if let Some(transport) = transport {

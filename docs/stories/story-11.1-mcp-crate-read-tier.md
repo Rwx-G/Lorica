@@ -1,7 +1,7 @@
 # Story 11.1: The `lorica-mcp` Crate and the Read Tier
 
 **Epic:** [Epic 11 - Management MCP Server with Tiered Access (v1.9.0)](../prd/epic-11-v1.9.0.md)
-**Status:** InProgress
+**Status:** Review
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Epic 10 Story 10.3, merged in v1.8.0. It supplies the
@@ -250,16 +250,28 @@ have to exist before a client of them means anything.
 
 ### Lot 4: the Streamable HTTP binding
 
-- [ ] AC #9: the Streamable HTTP adapter as a path on the automation
+- [x] AC #9: the Streamable HTTP adapter as a path on the automation
       listener. `Origin` validation, protocol-version pinning, and the
       header-versus-body mirror check. The path is declared in
       `required_scope` or it is reachable by nobody.
-- [ ] AC #11: the implemented revision and the maintenance note in
+- [x] AC #11: the implemented revision and the maintenance note in
       `docs/mcp.md`, and the client configuration for the second
       transport.
-- [ ] `lorica-api/openapi.yaml` for the new scopes and the endpoint,
+- [x] `lorica-api/openapi.yaml` for the new scopes and the endpoint,
       green against the contract test. `CHANGELOG.md` under Added and
-      Security.
+      Security. The endpoint is an automation-plane path, so it is
+      documented in `openapi-automation.yaml`; `openapi.yaml`'s scope
+      enum was already updated in lot 1, as its Completion Notes
+      record, and that document describes the management socket, which
+      the MCP endpoint is not on.
+- [x] The two items lot 2 deferred here because both need the
+      dependency this lot creates: the in-process `ReadSource` over the
+      read handlers, and the guard pinning each tool's declared scope
+      against what `required_scope` requires of the path it reads.
+- [x] Authorization per tool call, which the scope matrix cannot
+      express as it stands. Decided 2026-09-23: the endpoint is
+      declared `AnyLiveToken` and every `tools/call` is authorized
+      against the presented token's scopes. See the Dev Note below.
 
 ## Dev Notes
 
@@ -423,8 +435,14 @@ and the crate owns that one itself.
 else. No `initialize` fallback for older clients, no legacy era. AC #11
 already requires the crate to state its revision, and a second era
 would double the surface that has to stay correct against attacker-fed
-text. Whether to also speak the `initialize` era for clients that have
-not moved is a product decision, and it is open.
+text.
+
+Whether to also speak the `initialize` era for clients that have not
+moved was put to the maintainer on 2026-09-23 and **refused**: one era,
+and the specification already gives a client a deterministic way to
+detect a modern server rather than guessing. Worth revisiting only on
+evidence, meaning a real client that fails to connect, not on the
+suspicion that some might.
 
 ### AC #6 cannot be wholly true over stdio, so the row says which half is
 
@@ -467,6 +485,48 @@ socket of its own in either binding. The HTTP adapter runs inside
 precisely what "no third management plane" means. The crate stays a
 subprocess and a library; the listener stays the only thing that binds.
 
+### The MCP endpoint cannot be declared behind one scope
+
+Decided 2026-09-23, in lot 4, because the matrix has no state that fits
+and guessing one would have been the wrong kind of cheap.
+
+`required_scope` answers one requirement per `(method, path)`. An MCP
+request carries its own tool, and each tool has its own scope, so there
+is no single answer that is true of the endpoint. The three shapes
+available were: declare it behind the widest read scope, which grants
+nine reads to a token that should reach one; declare it behind each
+tool's scope by inspecting the body in the gate, which puts body
+parsing in a middleware that runs before the body is read; or declare
+it `AnyLiveToken` and authorize per call inside.
+
+The third is what landed. `ScopeRequirement::AnyLiveToken` already
+exists for `whoami`, and it is not a wider grant in either case: it is
+the statement that the path's own gate is somewhere else. For `whoami`
+that somewhere else is "nothing is disclosed". For the MCP endpoint it
+is `McpServer::over`, which builds that request's tool registry from
+the scopes the presented principal carries, so a tool the token cannot
+reach is absent from its `tools/list` and unknown to its `tools/call`.
+The specification blesses precisely this: a tool set "MAY vary by the
+authorization presented on the request ... since credentials are
+per-request input, not connection state", while it "MUST NOT vary
+per-connection or as a side effect of other requests".
+
+**That per-tool check reads the matrix and not a third table.** There
+were already two statements of one rule: a scope per tool in
+`lorica-mcp`'s catalogue and a scope per path in `required_scope`.
+`lorica-api/tests/mcp_catalogue_scopes.rs` pins them, one assertion per
+catalogue entry, with the path taken from `ToolSpec::path_for` rather
+than typed again and both spellings resolved through `AutomationScope`
+rather than compared as strings.
+
+The loosening direction is what makes this a security guard rather than
+a tidiness one, and the in-process binding is why. The adapter calls
+the read HANDLER, not the listener, so the scope gate does not run on
+the read it performs: a tool declaring a looser scope than its path
+would read what the gate would have refused. The tightening direction
+is the quiet one, where the tool simply never registers, nothing fails,
+and an operator concludes the feature does not work.
+
 ### An undeclared path is reachable by nobody
 
 `required_scope` is a single matrix and its default is `None`, which
@@ -501,12 +561,17 @@ build, applied generation and hash, and on a control plane a one-line
 entry per fleet member. That is the answer the story's own motivating
 question needs ("why is this route 502-ing"); the roster is not.
 
-**Open, not closed.** Whether the roster returns behind a projection
-that strips those three fields is a product decision nobody has taken.
-Such a projection would cost this module its "nothing here filters"
-property, which is the property the whole wrapper design rests on, so
-it needs a test of its own if it lands. Until then `docs/mcp.md` must
-not promise a node listing.
+**Decided 2026-09-23: it stays out.** The maintainer was offered a
+projection stripping those three fields, and a dedicated
+operator-equivalent scope, and refused both. The roster is not on this
+plane and `cluster:read` reaches status alone.
+
+The reasoning that follows still stands and is kept because it is what
+would have to be answered if the question ever reopens. Such a
+projection would cost this module its "nothing here filters" property,
+which is the property the whole wrapper design rests on, so it needs a
+test of its own if it lands. Meanwhile `docs/mcp.md` must not promise a
+node listing.
 
 ### The tier check is a startup property, not a tool
 
@@ -816,6 +881,114 @@ the same test rather than by a probe). What failed, and how:
   failed on the name-uniqueness assertion, which is what stops a
   filter that shares a name with a window argument from travelling
   twice in one query string.
+
+Lot 4 (the Streamable HTTP binding), 2026-09-23. Gates run in
+`rust:1-bookworm` with `RUSTFLAGS=-D warnings` unless noted:
+
+- `cargo fmt --all -- --check` on the Windows host: clean (it needed
+  one pass of `cargo fmt --all` first, on four files).
+- `cargo build -p lorica-mcp`: clean.
+- `cargo test -p lorica-mcp`: 65 passed, 0 failed. Unchanged: this lot
+  touches the crate's `lib.rs` documentation and nothing else in it.
+- `cargo test -p lorica-config -p lorica-api`: 885 + 495 unit, 3 in
+  `tests/automation_scope_fixture.rs`, 3 in
+  `tests/mcp_asserted_headers.rs`, 4 in the new
+  `tests/mcp_catalogue_scopes.rs`, 4 in `tests/openapi_contract.rs`,
+  8 + 18 doctests. 0 failed. The `lorica-api` lib count went 857 -> 885
+  and `mcp_asserted_headers.rs` 2 -> 3.
+- `cargo test -p lorica-api --test openapi_contract --test mcp_catalogue_scopes --test mcp_asserted_headers --test automation_scope_fixture`:
+  4 + 4 + 3 + 3 passed, 0 failed.
+- `cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings`: clean.
+- `cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings`:
+  one failure first, `called .err().expect() on a Result value` in the
+  new module's test helper, fixed to `expect_err`; clean after. Worth
+  recording because the first clippy invocation does NOT pass
+  `--all-targets`, so it compiled none of this and stayed green.
+- `cargo clippy -p lorica --all-targets --features otel -- -D warnings`:
+  clean. Run because the binary links `lorica-api`, which gained a
+  dependency.
+- `cargo clippy -p lorica-mcp --all-targets -- -D warnings`: clean. Not
+  one of the three the Lint job runs; added here because the first one
+  covers the crate without its tests.
+- `cargo audit`: run, because `Cargo.lock` changed. Exit 0 over 651
+  crate dependencies, and the same two allowed unmaintained warnings
+  the cycle already carries (`RUSTSEC-2024-0388` on `derivative`,
+  `RUSTSEC-2025-0134` on `rustls-pemfile`). The `Cargo.lock` diff is
+  two lines, `lorica-mcp` and `percent-encoding` under `lorica-api`:
+  no `[[package]]` entry was added and no version moved anywhere,
+  which is why the result cannot differ from the previous run and why
+  neither is a new dependency in the sense the project forbids without
+  approval. Run in a container with its own target directory rather
+  than the shared volume, for the reason lot 2 recorded.
+- `git ls-files --eol`: `w/lf` on both new files and consistent on
+  every modified one, with the index `lf` throughout. Checked this way
+  and not with `awk`, which reports 0 on CRLF files on this host.
+- `README.md`'s product-crate test count, recomputed with the
+  `docs/BUMP-CHECKLIST.md` recipe rather than incremented by hand:
+  2763 -> 2796, in BOTH places, the shell comment and the
+  `Lorica%20Tests-N` badge. `grep -n 2763 README.md CONTRIBUTING.md`
+  answers nothing.
+
+Nothing here touches the frontend, so its three gates were not re-run.
+
+**Every new test was watched failing before it was watched passing.**
+Sixteen probes: each property was removed from the tree with a single
+substitution, the named test was run, and the file was restored and
+checked byte for byte with md5 before and after. Fifteen introduced the
+defect they meant to on the first attempt; the sixteenth was void and
+what it exposed is recorded below it.
+
+- the Origin refusal removed: `an_origin_header_is_refused_whatever_it_names`
+  and `an_origin_header_is_refused_through_the_whole_stack` both failed.
+- an absent `MCP-Protocol-Version` read as the supported one:
+  `every_post_carries_the_protocol_version_and_an_absent_one_is_a_mismatch`
+  failed.
+- the unsupported-revision check removed:
+  `a_version_this_server_does_not_implement_names_what_it_does` failed.
+- the header-versus-`_meta` version check removed:
+  `the_version_header_must_equal_the_one_the_body_meta_names` failed.
+- the `Mcp-Method` mirror check removed:
+  `the_method_header_must_equal_the_body_method` failed.
+- the `Mcp-Name` mirror check removed:
+  `the_name_header_is_required_on_a_call_and_must_equal_the_body`
+  failed.
+- the decoded sentinel discarded and the raw header compared instead:
+  `a_header_is_decoded_out_of_its_base64_sentinel_before_it_is_compared`
+  failed.
+- the sentinel wire shape moved away from `=?base64?...?=`: the same
+  test failed.
+- the unknown-method 404 removed:
+  `a_method_this_server_does_not_implement_is_a_404` failed.
+- a notification answered 200 instead of 202:
+  `a_notification_is_accepted_with_no_body_at_all` failed.
+- the per-tool authorization replaced by the whole catalogue:
+  `the_tool_set_is_the_one_the_presented_token_can_reach_and_nothing_else`
+  failed, offering nine tools to a token carrying `logs:read`.
+- the MCP path declared for `POST` alone in the matrix:
+  `the_verbs_this_revision_removed_answer_405_and_not_403` failed with
+  a 403 where the revision asks for a 405.
+- the `Mcp-Name` header dropped from the asserted clause:
+  `a_tool_call_on_this_binding_is_audited_on_the_path_that_is_its_transport`
+  failed with a row naming no tool.
+- one tool declaring a scope its path does not sit behind:
+  `every_mcp_tool_names_the_scope_its_path_sits_behind` failed, which
+  is the guard lot 2 deferred here.
+- one read left out of the in-process dispatch:
+  `every_registered_tool_answers_through_the_endpoint_without_leaving_the_process`
+  failed on that tool's `isError`, which is the property a hand-listed
+  dispatch could not have.
+- the in-process adapter importing an HTTP client:
+  `this_module_opens_no_connection_of_its_own` failed.
+
+**The void probe, and what it found.** Changing `SENTINEL_PREFIX` did
+not fail the sentinel test on its first version, because that test
+built its own sentinel FROM the constant: the mutation moved both sides
+together and the comparison still held. That is a test that would have
+stayed green while every real sentinel arrived undecoded. The test now
+writes the wire shape out literally and asserts the constants equal it,
+which is the direction the derived-not-transcribed rule runs in here:
+the constant is derived from the specification, not the test from the
+constant. Both probes fail against the corrected test.
 
 ### Completion Notes
 
@@ -1218,6 +1391,116 @@ inverts anyway by making `lorica-api` depend on this crate. The guard
 belongs in `lorica-api/tests/` in the lot that adds that dependency,
 and it is one assertion per catalogue entry.
 
+---
+
+Lot 4, 2026-09-23. The Streamable HTTP binding, the in-process read
+source, and the per-tool authorization the scope matrix cannot express.
+
+**One module, and where its boundary is.**
+`lorica-api/src/automation/mcp.rs` holds the whole binding: the
+endpoint, the transport rules revision 2026-07-28 puts on a POST, and
+`InProcessReads`. It decides nothing a method MEANS: every answer comes
+from `lorica_mcp::server::McpServer::handle`, the same core the stdio
+binary runs, which is what makes AC #10's "one shared core, two
+bindings" a property of the code rather than a promise. `examine` is
+pure, which is what lets every normative point of the transport be
+asserted without a listener; the handler is the six lines around it.
+
+**`lorica-api` now depends on `lorica-mcp`.** That is the inversion the
+lot exists to make, and it is one-directional: nothing in `lorica-mcp`
+depends on `lorica-api`, or the stdio subprocess would carry the whole
+management crate and its bundled SQLite. `percent-encoding` joins it as
+a direct dependency of `lorica-api`, because the tool layer encodes a
+resource id into one path segment and the in-process source has to
+decode it the way the listener's own extractor would have. Both crates
+were already in `Cargo.lock` at the version a sibling pins.
+
+**Authorization per tool, against the matrix and not a third table.**
+See the Dev Note. `McpServer::over` builds the registry from the
+presented principal's scopes, per request, and
+`tests/mcp_catalogue_scopes.rs` is the guard lot 2 named: one assertion
+per catalogue entry, path taken from the tool itself, spellings
+resolved through `AutomationScope`.
+
+**The in-process source is a dispatch over `scope.rs`'s own path
+constants**, which were made `pub(super)` rather than retyped in the
+adapter, so there is no third list of the read paths. A tool naming a
+path with no arm is a 500 and not an empty answer, and
+`every_registered_tool_answers_through_the_endpoint_without_leaving_the_process`
+drives every registered tool through the endpoint, asserts `isError:
+false` on each, and sweeps the answers for credential-shaped field
+names. That last part is not redundant with the AC #5 sweep: the
+in-process route bypasses the scope gate by design, so it needs its own
+evidence that it does not also bypass the filtering. It does not, and
+cannot, because it calls the same handler.
+
+**Every `Origin` is refused, and that is the decision rather than the
+default.** The specification's one MUST here is against DNS rebinding.
+The usual implementation, accepting an origin whose host matches the
+request's `Host`, is exactly what rebinding defeats: the attacker's
+page and the attacker's DNS name agree with each other. This plane
+serves no browser at all, and an MCP client speaking to it directly
+sends no `Origin`, so a present one means a page is driving the
+endpoint. An operator-configured allowlist is the additive change if a
+browser front end ever needs one.
+
+**`GET` and `DELETE` answer 405, which needed a matrix arm.** The MCP
+path is declared for every method, unlike `whoami`, whose arm is
+guarded on `GET`. The reason is the opposite of the usual one: leaving
+the removed verbs undeclared would make the scope gate answer 403
+first, which tells a client its token lacks a grant when the truth is
+that the path answers one verb. The router mounts `post` alone and axum
+produces the 405.
+
+**The audit row for this binding, and why it says less than the stdio
+one.** The stdio server asserts both its transport and its tool in two
+headers of Lorica's own. This binding asserts neither, and needs to
+assert only one: the node routed the request to `/automation/v1/mcp`
+itself, so the path already in the row IS the transport, established.
+The tool name comes from the revision's own `Mcp-Name`, which a
+conforming client already sends, and `audit::asserted_clause` now reads
+it into the same `asserted[...]` clause. It is labelled a claim even
+though `mcp.rs` refuses a request whose header and body disagree: that
+check runs INSIDE the audit layer, which writes a row for the refusals
+too, so on a 200 row the mirror did hold and on a 400 row the value is
+exactly what somebody claimed. One labelling that is never wrong beats
+two that each need the status read first. Asking a conforming client
+for a second header saying what `Mcp-Name` already says would have been
+asking it to speak a dialect.
+
+**`tests/mcp_asserted_headers.rs` stopped parsing source**, which its
+own documentation said to do in this lot. It compared `include_str!`
+extractions because neither crate could see the other; now
+`lorica-api` depends on `lorica-mcp` and it compares the constants
+themselves. A comparison that cannot misparse is worth more than one
+that reads a file and might.
+
+**The answer is one JSON object and not an SSE stream.** The revision
+permits either. Every method this tier implements answers in one
+message, so a stream would be an SSE frame per response and a second
+framing to keep correct for nothing. `X-Accel-Buffering` is an SSE
+concern and is correspondingly absent; if a streaming tool ever lands,
+it arrives with both.
+
+**No per-process rate budget on this binding, deliberately.** The
+core's 120-calls-a-minute budget lives on an `McpServer`, and this
+binding builds one per request, so it never fires here. That is
+correct: the revision's "rate limit tool invocations" MUST is met by
+the listener's connection caps and per-IP limiter, which stdio does not
+have and which is why the core carries a budget at all. Moving the
+budget to shared process state would make it a cross-token limiter on a
+multi-tenant socket, which is a different policy nobody has decided.
+
+**Not done, and named rather than hidden.** No per-token request-rate
+budget on the automation router, which lot 2 raised as open: the
+architecture audit's per-principal in-flight cap is still a design
+decision, and this binding is now its heaviest plausible caller rather
+than a hypothetical one. No OTel span on this plane either, inherited
+from Story 10.3. `.claude/skills/bump-version/bump-checklist.md` and
+the crate lists in the `run-tests` and `build-deb` skills still need
+`lorica-mcp`, for the same reason lot 1 recorded: they live under
+`.claude/`, which this pass was told to read only.
+
 ## File List
 
 Added:
@@ -1305,6 +1588,24 @@ Modified in lot 2 (the second half):
 - `lorica-mcp/Cargo.toml`, `lorica-mcp/src/lib.rs`,
   `lorica-mcp/src/main.rs`
 - `Cargo.lock`, `README.md`
+- `docs/stories/story-11.1-mcp-crate-read-tier.md`
+
+Added in lot 4:
+
+- `lorica-api/src/automation/mcp.rs`
+- `lorica-api/tests/mcp_catalogue_scopes.rs`
+
+Modified in lot 4:
+
+- `lorica-api/Cargo.toml`, `Cargo.lock`
+- `lorica-api/src/automation/mod.rs`, `.../router.rs`, `.../scope.rs`,
+  `.../audit.rs`
+- `lorica-api/src/tests.rs`
+- `lorica-api/tests/mcp_asserted_headers.rs`
+- `lorica-api/openapi-automation.yaml`
+- `lorica-mcp/src/lib.rs`
+- `CHANGELOG.md`, `README.md`
+- `docs/mcp.md`, `docs/automation.md`
 - `docs/stories/story-11.1-mcp-crate-read-tier.md`
 
 ## Change Log
@@ -1438,3 +1739,33 @@ Modified in lot 2 (the second half):
   Still open for lot 4: the Streamable HTTP adapter, and the guard
   pinning the tool catalogue's paths against `scope::required_scope`,
   which needs the `lorica-api` dependency that lot inverts.
+
+- 2026-09-23: Lot 4, the last of the story. The Streamable HTTP binding
+  as `POST /automation/v1/mcp`, one path on the Story 10.3 listener
+  rather than a port, so an operator who has not enabled that listener
+  gains no MCP surface. `lorica-api` now depends on `lorica-mcp`, which
+  is the inversion this lot exists to make: the adapter runs in process
+  and reaches the read handlers directly, because dialling the listener
+  it is mounted on would be refused by that listener's own source
+  allowlist. The transport rules are implemented and each has a test:
+  every `Origin` refused with 403, `MCP-Protocol-Version`, `Mcp-Method`
+  and `Mcp-Name` validated against the body rather than trusted and
+  Base64-sentinel decoded BEFORE the comparison, `-32020` for a
+  mismatch, a 400 naming the supported revisions for a version this
+  server does not speak, a **404** for a method it does not implement,
+  202 for a notification, 405 for the `GET` and `DELETE` the revision
+  removed, and an `Mcp-Session-Id` ignored and never echoed.
+  **Authorization is per tool call**, decided the same day and recorded
+  in a new Dev Note: the endpoint cannot be declared behind one scope
+  because an MCP request carries its own tool, so it is declared
+  `AnyLiveToken` and `McpServer::over` builds each request's tool
+  registry from the scopes that request's token carries. The guard lot
+  2 deferred here landed with it: `tests/mcp_catalogue_scopes.rs` pins
+  each tool's declared scope against what the matrix requires of the
+  path it reads, one assertion per entry, which matters because the
+  in-process route bypasses the scope gate by design.
+  `tests/mcp_asserted_headers.rs` stopped parsing source and compares
+  constants, as its own documentation said to do in this lot. Sixteen
+  probes; one was void and exposed a test that built its sentinel from
+  the constant it was meant to guard, now corrected to the literal wire
+  shape.
