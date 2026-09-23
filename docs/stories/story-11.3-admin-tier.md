@@ -25,25 +25,67 @@ tier that grows by accretion, one useful setting at a time, ends up
 being the management API with extra steps, which is the outcome the
 whole epic is arranged to prevent.
 
-## Open question, blocking the acceptance criteria
+## The allowlist, decided 2026-09-23
 
-**AC #1's allowlist is not decided.** The PRD says the surface is "a
-short list decided by exclusion" and names what is out (user creation,
-role changes, password resets) and one category that is in
-(operational global settings: retention, thresholds, timeouts). It
-does not enumerate the settings themselves, and AC #1 of IV1 wants a
-test asserting the list exactly rather than describing it.
+AC #1 asks for "a short list decided by exclusion". Here it is. The
+settings model carries 81 fields; eighteen are in.
 
-Deciding which settings an MCP client may change is a product
-judgement about blast radius, not a technical one, and it is the
-maintainer's. This story cannot pass its own IV1 until that list
-exists. **Do not start implementation before it is written down here.**
+**Retention and purge.** `access_log_retention`, `waf_event_retention`,
+`sla_purge_enabled`, `sla_purge_retention_days`, `sla_purge_schedule`.
 
-The constraint AC #3 gives is the useful filter: everything this tier
-can change must be reversible from the dashboard by a human who has
-lost their MCP client. A setting that could lock the operator out of
-the management plane is out by construction. Applying that filter to
-the settings surface is the first task below.
+**Alert and protection thresholds.** `cert_warning_days`,
+`cert_critical_days`, `flood_threshold_rps`, `flood_strict_rps`,
+`waf_ban_threshold`, `waf_ban_duration_s`.
+
+**Timeouts and probe budgets.** `header_timeout_s`,
+`default_health_check_interval_s`, `max_active_probes`,
+`health_max_concurrent_probes`, `loadtest_max_concurrency`,
+`loadtest_max_duration_s`, `loadtest_max_rps`.
+
+**Diagnostics.** `log_level`.
+
+### Why the exclusions are what they are
+
+AC #3's filter, reversibility from the dashboard by a human who has
+lost their MCP client, does most of the work and misses one case worth
+naming.
+
+*Out because they can lock the operator out.* `management_port`,
+`management_cert_pem_path`, `management_key_pem_path`,
+`connection_allow_cidrs`, `connection_deny_cidrs`,
+`automation_allowed_cidrs`, `trusted_proxies`. A wrong value here ends
+the session that would have fixed it.
+
+*Out because they are credentials or trust anchors.*
+`bot_hmac_secret_hex`, `prometheus_scrape_token`, `metrics_require_auth`,
+`upgrade_signing_pubkey_path`, and the whole `cert_export_*` family,
+which writes key material to disk with ownership and modes attached.
+
+*Out because they are identity policy.* `password_min_length`,
+`password_require_complexity`, alongside the user operations AC #1
+already excludes.
+
+*Out because reversible is not the same as harmless.* This is the case
+the filter misses. `max_global_connections`, `connection_limits_per_ip`
+and the `mirror_max_concurrent_*` pair are all reversible from the
+dashboard in seconds, and a wrong value takes production traffic down
+or silently stops mirroring for as long as it stands. A model reading
+attacker-authored text should not be able to reach the data plane's
+capacity. The OTLP settings are out for the adjacent reason: they
+redirect where telemetry goes, and a redirect is not visibly wrong.
+
+*Out although it looks like retention.* `audit_log_retention_days`.
+Shortening it destroys the trail this epic depends on to tell a model's
+actions from a person's. Retention that protects the audit of the tier
+changing it is not a setting that tier may change.
+
+### What this list must not become
+
+Every later request to add one entry will be reasonable on its own
+terms. The exclusion reasons above are the artefact that makes a
+widening a decision with a name on it. Keep the reason beside the
+entry, because a future reader needs the reason and the entry alone
+will not carry it.
 
 ## Acceptance Criteria
 
@@ -76,11 +118,14 @@ These are the PRD's, unchanged. They are the contract.
 
 ## Tasks
 
-- [ ] **First, and blocking:** enumerate the settings this tier may
-      change, by walking the settings surface and applying AC #3's
-      reversibility filter to each one. Record the list and the
-      exclusion reason per entry in this file. This is a decision, not
-      an implementation step.
+- [x] Enumerate the settings this tier may change, by walking the
+      settings surface and applying AC #3's reversibility filter.
+      Decided 2026-09-23; the list and the exclusion reasons are above.
+      Eighteen of eighty-one fields are in.
+- [ ] The allowlist as one table in code, with IV1 asserting the tool
+      list against it. The eighteen entries live in exactly one place:
+      a second copy beside the tools is the transcription this project
+      treats as a defect rather than a style question.
 - [ ] The scope or scopes the tier stands on, and the automation-plane
       settings endpoints behind them. As in Stories 11.1 and 11.2, the
       plane does not serve this today.
@@ -122,7 +167,16 @@ a later reader needs and the entry alone will not carry it.
 
 ## Change Log
 
-- 2026-09-23: Drafted from the Epic 11 PRD. AC #1's allowlist is
+- 2026-09-23: Drafted from the Epic 11 PRD. AC #1's allowlist was
   deliberately left empty and marked blocking: it is a product decision
   about blast radius and it belongs to the maintainer, not to whoever
   implements the story.
+- 2026-09-23: The allowlist decided, eighteen of eighty-one settings.
+  The scope chosen was retention and thresholds plus timeouts and probe
+  budgets. Capacity limits, mirroring concurrency and OTLP were offered
+  and refused, on the ground that reversible is not the same as
+  harmless: a wrong global connection limit is undone in seconds and
+  takes traffic down for as long as it stands. `audit_log_retention_days`
+  is excluded despite reading as retention, because retention that
+  protects the audit of the tier changing it is not that tier's to
+  change. The story is unblocked.

@@ -76,22 +76,26 @@ These are the PRD's, unchanged. They are the contract.
 
 ## Dev Notes
 
-### The CLI question this story inherits and must settle
+### The CLI question, settled 2026-09-23
 
 AC #3 specifies `lorica mcp token create --tier read|config|admin`,
 while `docs/automation.md` documents `lorica automation token create
---scope ...` for the same Story 10.3 tokens. Nothing says whether the
-first is a wrapper over the second or a second command, and two ways to
-mint one credential is how an operator ends up with a token nobody can
-explain.
+--scope ...` for the same Story 10.3 tokens. Nothing said whether the
+first was a wrapper over the second or a second command, and two ways
+to mint one credential is how an operator ends up holding a token
+nobody can explain.
 
-The reading that costs least: `lorica mcp token create --tier` is a
-thin front end that resolves a tier to its scope set and calls the
-existing path, so there is one minting route, one audit shape and one
-place where a token is born. It should say so in its own help text.
+**Decided: a thin front end.** `lorica mcp token create --tier`
+resolves a tier to its scope set and calls the existing minting path.
+One creation route, one audit shape, one place where a token is born.
+Its help text says so, so an operator reading it knows the two
+commands are not alternatives with different properties.
 
-Recorded here because the epic context compilation flagged it as
-unreconciled and it belongs to this story.
+Two consequences for the implementation. The tier-to-scopes resolution
+is the same table AC #1's startup check reads, not a second copy beside
+it. And the blast radius AC #3 prints is derived from that table at
+print time, so a scope moved between tiers moves the printed sentence
+with it rather than leaving it to be noticed.
 
 ### Packaging a binary the unit does not start
 
@@ -124,3 +128,6 @@ where that guidance actually lands.
 
 - 2026-09-23: Drafted from the Epic 11 PRD, carrying the unreconciled
   CLI question the Epic 11 context compilation surfaced.
+- 2026-09-23: The CLI question settled as a thin front end over the
+  existing minting path, with the tier-to-scopes table shared with AC
+  #1's startup check and the printed blast radius derived from it.
