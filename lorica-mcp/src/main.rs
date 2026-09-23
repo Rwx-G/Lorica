@@ -20,14 +20,13 @@
 //! surface an operator's MCP client talks to, over the automation
 //! plane and never over the management API.
 //!
-//! This is the stdio binding, and the only thing in the crate that will
-//! ever read a file descriptor. Everything it will drive - the
-//! configuration intake, the JSON-RPC core, the read tools and the
-//! fetch seam they reach a read view through - lives in the library
-//! beside it, because the Streamable HTTP binding runs inside
-//! `lorica-api` and has to be able to reach the same core. See
-//! `lorica-mcp/src/lib.rs` for why that seam exists before there is
-//! anything to put through it.
+//! This is the stdio binding, and the only thing in the crate that ever
+//! reads a file descriptor. Everything it drives - the configuration
+//! intake, the JSON-RPC core, the read tools and the fetch seam they
+//! reach a read view through - lives in the library beside it, because
+//! the Streamable HTTP binding runs inside `lorica-api` and has to be
+//! able to reach the same core. See `lorica-mcp/src/lib.rs` for why
+//! that seam exists.
 //!
 //! # It binds nothing
 //!
@@ -50,22 +49,17 @@
 //! little code. The cost is that spec drift is tracked by hand, and
 //! `docs/mcp.md` is where that obligation is written down.
 //!
-//! # What this binary does today
+//! # What goes where
 //!
-//! It reads its configuration and reports what it found, then exits.
-//! That is the whole of AC #1 at the boundary where it matters: a
-//! process started with arguments refuses to start, and the token is
-//! only ever read from the environment or from a file.
-//!
-//! What it does NOT do yet is speak the protocol over stdin and
-//! stdout. The stdio adapter and the HTTPS [`lorica_mcp::ReadSource`]
-//! it drives are lot 3 of Story 11.1; the core they will run
-//! ([`lorica_mcp::McpServer`]) is complete and nothing here stands in
-//! for the transport.
+//! `stdout` carries JSON-RPC messages and nothing else, one per line.
+//! Every word this binary writes for a human - the refusal of a
+//! misconfiguration, what the token turned out to carry, why the
+//! session ended - goes to `stderr`, and a client must not read
+//! anything on `stderr` into the conversation.
 
 use std::process::ExitCode;
 
-use lorica_mcp::{ServerConfig, MCP_PROTOCOL_REVISION};
+use lorica_mcp::{HttpsReadSource, McpServer, ServerConfig, MCP_PROTOCOL_REVISION};
 
 /// Refused configuration.
 ///
@@ -74,23 +68,82 @@ use lorica_mcp::{ServerConfig, MCP_PROTOCOL_REVISION};
 /// which are fixed in different places.
 const EXIT_MISCONFIGURED: u8 = 78;
 
+/// The automation plane could not be reached, or refused the token.
+///
+/// Distinct from [`EXIT_MISCONFIGURED`] because the configuration may
+/// be perfect and the node down, the certificate untrusted or the token
+/// withdrawn, and those are fixed somewhere else again.
+const EXIT_PLANE_UNREACHABLE: u8 = 69;
+
+/// The session ended on a stream fault rather than on the client
+/// closing `stdin`.
+const EXIT_SESSION_FAILED: u8 = 74;
+
 fn main() -> ExitCode {
     let config = match ServerConfig::from_process() {
         Ok(config) => config,
         Err(refused) => {
-            // stderr, never stdout: stdout carries MCP messages and
-            // nothing else once the adapter lands, and a client is told
-            // to read nothing into stderr.
             eprintln!("lorica-mcp: {refused}");
             return ExitCode::from(EXIT_MISCONFIGURED);
         }
     };
 
-    eprintln!(
-        "{} {} (MCP protocol revision {MCP_PROTOCOL_REVISION}) configured against {}",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
-        config.endpoint,
-    );
-    ExitCode::SUCCESS
+    let source = match HttpsReadSource::new(&config) {
+        Ok(source) => source,
+        Err(refused) => {
+            eprintln!("lorica-mcp: {refused}");
+            return ExitCode::from(EXIT_MISCONFIGURED);
+        }
+    };
+
+    // A current-thread runtime: this process answers one message at a
+    // time by design (see `lorica_mcp::stdio`), so a thread pool would
+    // be threads asleep in a subprocess an operator's editor launched.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(reason) => {
+            eprintln!("lorica-mcp: cannot start the async runtime: {reason}");
+            return ExitCode::from(EXIT_SESSION_FAILED);
+        }
+    };
+
+    runtime.block_on(async {
+        eprintln!(
+            "{} {} (MCP protocol revision {MCP_PROTOCOL_REVISION}) against {}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            config.endpoint,
+        );
+
+        // AC #3: ask what this token may do before offering anything.
+        let server = match McpServer::introspect(&source).await {
+            Ok(server) => server,
+            Err(refused) => {
+                eprintln!("lorica-mcp: {refused}");
+                return ExitCode::from(EXIT_PLANE_UNREACHABLE);
+            }
+        };
+        // Written for the operator reading stderr, never for the model:
+        // it names the token and what it did not get, which is what
+        // somebody acts on when a tool is missing from their client.
+        eprintln!("lorica-mcp: {}", server.startup_notice());
+
+        match lorica_mcp::stdio::serve(
+            &server,
+            &source,
+            tokio::io::BufReader::new(tokio::io::stdin()),
+            tokio::io::stdout(),
+        )
+        .await
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(ended) => {
+                eprintln!("lorica-mcp: {ended}");
+                ExitCode::from(EXIT_SESSION_FAILED)
+            }
+        }
+    })
 }

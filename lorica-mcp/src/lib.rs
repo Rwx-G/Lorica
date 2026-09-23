@@ -46,34 +46,38 @@
 //! Here: the protocol revision this crate implements, the fetch seam,
 //! the configuration intake ([`config`]), the JSON-RPC envelope
 //! ([`jsonrpc`]), the untrusted-text delimiting ([`untrusted`]), the
-//! read tools ([`tools`]) and the protocol core that runs them
-//! ([`server`]).
+//! read tools ([`tools`]), the protocol core that runs them
+//! ([`server`]), the HTTPS implementation of the seam ([`http`]) and
+//! the stdio binding ([`stdio`]).
 //!
-//! NOT here, and not stubbed anywhere: either transport adapter. The
-//! stdio binding and the Streamable HTTP binding are the remaining lots
-//! of Story 11.1, and nothing in this crate stands in for them. Neither
-//! is there an implementation of [`ReadSource`] that speaks HTTPS: the
-//! core is generic over the seam, and the two concrete sources belong
-//! to the bindings that hold a client or a request.
+//! NOT here, and not stubbed anywhere: the Streamable HTTP adapter,
+//! which is the last lot of Story 11.1 and runs inside `lorica-api`
+//! rather than in this crate, together with the in-process
+//! [`ReadSource`] it will call the read handlers through.
 //!
 //! # Where each acceptance criterion lives
 //!
 //! AC #1 is [`config`]. AC #3 is [`server::McpServer::introspect`] and
 //! [`server::McpServer::startup_notice`]. AC #4 is
-//! [`tools::CATALOGUE`]. AC #7 is [`untrusted`], and it is in the
-//! shared core rather than in each tool precisely so that a tool added
-//! in a later story gets it without knowing it exists.
+//! [`tools::CATALOGUE`]. AC #6 is [`http`], which is where the two
+//! assertion headers are written. AC #7 is [`untrusted`], and it is in
+//! the shared core rather than in each tool precisely so that a tool
+//! added in a later story gets it without knowing it exists. AC #10 is
+//! [`stdio`].
 
 use core::fmt;
 use core::future::Future;
 
 pub mod config;
+pub mod http;
 pub mod jsonrpc;
 pub mod server;
+pub mod stdio;
 pub mod tools;
 pub mod untrusted;
 
 pub use config::{ConfigError, ServerConfig};
+pub use http::HttpsReadSource;
 pub use server::{Identity, McpServer, StartupError};
 pub use tools::ToolSpec;
 
@@ -122,6 +126,38 @@ impl fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
+/// What one fetch across the seam is on behalf of.
+///
+/// AC #6 is why this exists. The audit row the automation plane writes
+/// is anchored on the token's `public_id`, which the node established
+/// by verifying the credential, and the plane has no way to observe a
+/// tool name because there is no tool at the HTTP layer. So the tool
+/// name has to be something this server DECLARES, and a declaration
+/// only reaches the wire if the seam carries it: an implementation that
+/// saw a path alone could not say what the read was for.
+///
+/// [`Reason::Introspection`] is not a tool and is not dressed up as
+/// one. The startup `whoami` runs before any client has spoken, and a
+/// row claiming a tool ran there would be a false claim in the one
+/// place that exists to tell claims from facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason<'a> {
+    /// The server's own startup `whoami`. No tool has been called.
+    Introspection,
+    /// The single read of the named tool.
+    Tool(&'a str),
+}
+
+impl Reason<'_> {
+    /// The tool name to declare, or `None` when no tool is running.
+    pub fn tool(&self) -> Option<&str> {
+        match self {
+            Reason::Introspection => None,
+            Reason::Tool(name) => Some(name),
+        }
+    }
+}
+
 /// How a tool reaches one read view of the automation plane.
 ///
 /// One method, taking the path a read is mounted at with its query
@@ -131,9 +167,9 @@ impl std::error::Error for ReadError {}
 /// second place that reshapes it is a second place that can stop
 /// stripping a field. The tool layer parses; this seam transports.
 ///
-/// Two implementations are coming and neither exists yet: an HTTPS
-/// client for the stdio binary, and an in-process one inside
-/// `lorica-api` for the Streamable HTTP adapter, which calls the read
+/// One implementation exists, [`HttpsReadSource`], which the stdio
+/// binary drives. The second belongs to lot 4 and lives inside
+/// `lorica-api`, where the Streamable HTTP adapter calls the read
 /// handlers directly rather than dialling its own listener.
 ///
 /// The bound is `Future` in return position rather than a boxed future,
@@ -149,11 +185,19 @@ pub trait ReadSource {
     /// tool builds it from a vocabulary it owns, so nothing a model
     /// says chooses which endpoint is reached.
     ///
+    /// `reason` is what the read is for, which an implementation that
+    /// talks to a remote plane declares on the request so the audit row
+    /// can record it as a caller's assertion. See [`Reason`].
+    ///
     /// # Errors
     ///
     /// [`ReadError::Transport`] when no answer arrived,
     /// [`ReadError::Refused`] for the status the plane chose.
-    fn fetch(&self, path: &str) -> impl Future<Output = Result<String, ReadError>> + Send;
+    fn fetch(
+        &self,
+        path: &str,
+        reason: Reason<'_>,
+    ) -> impl Future<Output = Result<String, ReadError>> + Send;
 }
 
 #[cfg(test)]
@@ -167,7 +211,7 @@ mod tests {
     struct InProcess;
 
     impl ReadSource for InProcess {
-        async fn fetch(&self, path: &str) -> Result<String, ReadError> {
+        async fn fetch(&self, path: &str, _reason: Reason<'_>) -> Result<String, ReadError> {
             Ok(format!("{{\"data\":{{\"path\":\"{path}\"}}}}"))
         }
     }
@@ -176,7 +220,9 @@ mod tests {
     /// one body serves the stdio client and the in-process adapter
     /// alike rather than two bodies agreeing by discipline.
     async fn a_tool_body<S: ReadSource>(source: &S) -> Result<String, ReadError> {
-        source.fetch("/automation/v1/logs?limit=1").await
+        source
+            .fetch("/automation/v1/logs?limit=1", Reason::Tool("lorica_logs"))
+            .await
     }
 
     #[test]
@@ -202,5 +248,14 @@ mod tests {
 
         let broken = ReadError::Transport("connection reset".to_string());
         assert!(broken.to_string().contains("connection reset"), "{broken}");
+    }
+
+    #[test]
+    fn the_startup_introspection_declares_no_tool_because_none_ran() {
+        // AC #6's honesty rule at the seam. A row claiming a tool ran
+        // during the startup whoami would be a false claim in the one
+        // place that exists to tell a claim from a fact.
+        assert_eq!(Reason::Introspection.tool(), None);
+        assert_eq!(Reason::Tool("lorica_logs").tool(), Some("lorica_logs"));
     }
 }

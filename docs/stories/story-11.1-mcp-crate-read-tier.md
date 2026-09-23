@@ -235,13 +235,18 @@ have to exist before a client of them means anything.
 
 ### Lot 3: stdio, and the first calls that actually flow
 
-- [ ] AC #10: the stdio adapter over the core.
-- [ ] AC #6: the MCP transport marker in the audit row, and the
-      argument redaction that precedes it. It lands here rather than in
-      lot 2 because nothing reaches the listener until a transport
-      exists to carry it.
-- [ ] IV1, IV2, IV3 as tests.
-- [ ] AC #8: `docs/mcp.md` for the read tier over stdio.
+- [x] AC #10: the stdio adapter over the core.
+- [x] The concrete HTTPS `ReadSource` the adapter needs, with a named
+      CA bundle and no way to switch verification off.
+- [x] AC #6: the transport marker in the audit row, in the only honest
+      shape available (see Dev Notes). It lands here rather than in lot
+      2 because nothing reaches the listener until a transport exists
+      to carry it.
+- [x] IV1, IV2, IV3 as tests.
+- [x] AC #8: `docs/mcp.md` for the read tier over stdio. AC #11's
+      revision statement and maintenance note landed with it rather
+      than waiting for lot 4, because a document that omits which
+      revision it describes is worse than no document.
 
 ### Lot 4: the Streamable HTTP binding
 
@@ -420,6 +425,36 @@ already requires the crate to state its revision, and a second era
 would double the surface that has to stay correct against attacker-fed
 text. Whether to also speak the `initialize` era for clients that have
 not moved is a product decision, and it is open.
+
+### AC #6 cannot be wholly true over stdio, so the row says which half is
+
+AC #6 asks that a tool call be audited with the token's `public_id`,
+the tool name, the redacted arguments and a marker naming the transport
+as MCP. Two of those four are not observable where the audit is
+written. The MCP server is a separate process that reaches the plane
+over HTTP, and at that layer there is no tool: a tool is a concept of
+the protocol the server speaks, not of the one it speaks over.
+
+The shape taken, decided 2026-09-23 rather than left to the
+implementation: the server declares the transport and the tool name in
+`lorica-asserted-transport` and `lorica-asserted-tool`, and the node
+records them inside an `asserted[...]` clause that appears nowhere else
+in the row. Everything outside that clause is something the node
+established: the principal from verifying the credential, the method,
+path and query parameter names from the request line, the status from
+what it answered.
+
+Anyone holding a live token can send any header, so both asserted
+values are bounded in length and character set before they reach a row.
+The two spellings are pinned between the crates by
+`lorica-api/tests/mcp_asserted_headers.rs`, which reads the emitting
+source rather than depending on the crate, so the API does not gain a
+dependency on the MCP server in order to agree with it.
+
+What this does not give: proof. It gives provenance, clearly labelled.
+An audit trail that cannot tell a claim from a proof is telling a story
+that is not true, which is the reasoning the epic already gives for
+distinguishing a model from a person.
 
 ### AC #1 and AC #9 are not in conflict
 
@@ -1192,6 +1227,11 @@ Added:
 - `lorica-api/tests/automation_scope_fixture.rs`
 - `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.generated.ts`
 - `lorica-api/src/automation/read.rs` (lot 2)
+- `lorica-mcp/src/lib.rs`, `config.rs`, `jsonrpc.rs`, `untrusted.rs`,
+  `tools.rs`, `server.rs` (lot 2)
+- `lorica-mcp/src/stdio.rs`, `lorica-mcp/src/http.rs` (lot 3)
+- `lorica-api/tests/mcp_asserted_headers.rs` (lot 3)
+- `docs/mcp.md` (lot 3)
 
 Removed:
 
@@ -1378,3 +1418,23 @@ Modified in lot 2 (the second half):
   the catalogue's paths against `scope::required_scope`, which belongs
   in `lorica-api/tests/` in the lot that makes `lorica-api` depend on
   this crate.
+
+- 2026-09-23: Lot 3. The stdio adapter, the HTTPS `ReadSource` the
+  adapter needs, the audit marker in its asserted-versus-established
+  shape, IV1 to IV3, and `docs/mcp.md`. The crate went from 48 tests to
+  65 and `lorica-api` from 853 to 857.
+
+  The machine rebooted mid-lot. The code survived in the working tree
+  and the gates were run afterwards rather than trusted: build, both
+  test suites and clippy all clean under `RUSTFLAGS=-D warnings`.
+  `cargo fmt` had not been run before the interruption and was, which
+  is the gate that most often slips because no other gate reveals it.
+
+  AC #11's revision statement and maintenance note landed here with
+  `docs/mcp.md` rather than waiting for lot 4. A document that does not
+  say which revision it describes is worse than no document, and the
+  specification has moved three times in eighteen months.
+
+  Still open for lot 4: the Streamable HTTP adapter, and the guard
+  pinning the tool catalogue's paths against `scope::required_scope`,
+  which needs the `lorica-api` dependency that lot inverts.

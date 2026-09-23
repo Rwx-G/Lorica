@@ -37,11 +37,25 @@ toml = "1"
 # them is what keeps a value inside the parameter it was given for, and
 # a route id inside its own path segment.
 percent-encoding = "2.1"
+# The stdio binding: the standard streams, and the reactor `reqwest`
+# runs on. `rt` and `macros` only, no `rt-multi-thread`: this process
+# answers one message at a time by design, so a thread pool would be
+# threads asleep in a subprocess an operator's editor launched.
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt"] }
+# The client for the automation listener. `rustls-tls-native-roots`
+# sits beside the webpki bundle for the same reason it does in
+# `lorica-api`: with both on, the root store is seeded from the public
+# roots AND from the platform store, which is where a distribution's CA
+# bundle and anything `SSL_CERT_FILE` points at land. The listener's
+# default certificate is self-signed on top of that, so
+# `LORICA_MCP_CA_BUNDLE` adds what an operator names. There is
+# deliberately no feature and no option here that skips verification.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-native-roots",
+    "rustls-tls-webpki-roots",
+] }
 
 [dev-dependencies]
-# The tool bodies are async because the fetch seam is. Polling them in a
-# test needs a runtime and nothing else.
-tokio = { version = "1", features = ["macros", "rt"] }
 # Test-only, and deliberately not a runtime dependency: the scope
 # vocabulary belongs to `AutomationScope` and this crate names seven of
 # its spellings as plain strings. The guard in `src/tools.rs` parses
@@ -50,3 +64,8 @@ tokio = { version = "1", features = ["macros", "rt"] }
 # runtime dependency would put `rusqlite`, bundled SQLite and all, in
 # the dependency graph of a stdio subprocess that reads no database.
 lorica-config = { path = "../lorica-config" }
+# The CA-bundle tests trust a real certificate rather than a committed
+# fixture, which would expire and fail the suite on a date nobody
+# chose.
+rcgen = "0.14"
+tempfile = "3"

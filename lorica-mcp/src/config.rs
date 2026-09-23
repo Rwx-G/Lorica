@@ -35,6 +35,18 @@
 //! because it is the one an operator can change without editing a file
 //! a client may rewrite.
 //!
+//! # The certificate the listener actually presents
+//!
+//! [`CA_BUNDLE_ENV`] names a PEM file of certificate authorities to
+//! trust IN ADDITION to the platform store and the built-in public
+//! roots. It exists because the automation listener's default
+//! certificate is self-signed and an operator's own is as likely as not
+//! signed by an internal CA, and because the alternative an operator
+//! reaches for otherwise is to turn verification off. There is no
+//! option here that does that: a bearer token travelling to whoever
+//! answered the connection is the failure this whole plane is arranged
+//! to prevent, and a switch that exists gets set.
+//!
 //! # Nothing here ever prints the token
 //!
 //! [`Secret`] has a [`fmt::Debug`] that redacts and no [`fmt::Display`]
@@ -56,8 +68,12 @@ pub const ENDPOINT_ENV: &str = "LORICA_MCP_ENDPOINT";
 /// The automation bearer token.
 pub const TOKEN_ENV: &str = "LORICA_MCP_TOKEN";
 
-/// Path to a TOML file carrying `endpoint` and `token`.
+/// Path to a TOML file carrying `endpoint`, `token` and `ca_bundle`.
 pub const CONFIG_ENV: &str = "LORICA_MCP_CONFIG";
+
+/// Path to a PEM file of certificate authorities to trust as well as
+/// the platform's own.
+pub const CA_BUNDLE_ENV: &str = "LORICA_MCP_CA_BUNDLE";
 
 /// The most bytes a bearer token may weigh.
 ///
@@ -97,6 +113,12 @@ pub struct ServerConfig {
     pub endpoint: String,
     /// The bearer token every request to that listener carries.
     pub token: Secret,
+    /// A PEM file of extra certificate authorities to trust, or `None`
+    /// to trust the platform's own and nothing else.
+    ///
+    /// Additive, never a replacement and never a way to skip
+    /// verification: see the module documentation.
+    pub ca_bundle: Option<PathBuf>,
 }
 
 /// Why configuration was refused.
@@ -208,6 +230,7 @@ impl std::error::Error for ConfigError {}
 struct ConfigFile {
     endpoint: Option<String>,
     token: Option<String>,
+    ca_bundle: Option<String>,
 }
 
 impl ServerConfig {
@@ -251,10 +274,14 @@ impl ServerConfig {
         let token = spoken(TOKEN_ENV)
             .or(from_file.token)
             .ok_or(ConfigError::MissingToken)?;
+        let ca_bundle = spoken(CA_BUNDLE_ENV)
+            .or(from_file.ca_bundle)
+            .map(|named| PathBuf::from(named.trim()));
 
         Ok(ServerConfig {
             endpoint: checked_endpoint(endpoint.trim())?,
             token: Secret(checked_token(token.trim())?),
+            ca_bundle,
         })
     }
 
@@ -396,6 +423,52 @@ mod tests {
         .expect("a blank variable falls through to the file");
         assert_eq!(blank.endpoint, ENDPOINT);
         assert_eq!(blank.token.reveal(), TOKEN);
+    }
+
+    #[test]
+    fn a_ca_bundle_is_optional_and_comes_from_either_intake() {
+        // The listener's default certificate is self-signed, so an
+        // operator needs somewhere to name what they trust. There is
+        // deliberately no companion switch that turns verification off.
+        let bare = ServerConfig::assemble(
+            &[],
+            env_of(&[(ENDPOINT_ENV, ENDPOINT), (TOKEN_ENV, TOKEN)]),
+            None,
+        )
+        .expect("a bundle is optional");
+        assert_eq!(bare.ca_bundle, None);
+
+        let from_env = ServerConfig::assemble(
+            &[],
+            env_of(&[
+                (ENDPOINT_ENV, ENDPOINT),
+                (TOKEN_ENV, TOKEN),
+                (CA_BUNDLE_ENV, "/etc/lorica/internal-ca.pem"),
+            ]),
+            None,
+        )
+        .expect("a named bundle");
+        assert_eq!(
+            from_env.ca_bundle,
+            Some(PathBuf::from("/etc/lorica/internal-ca.pem"))
+        );
+
+        let from_file = ServerConfig::assemble(
+            &[],
+            env_of(&[]),
+            Some((
+                Path::new("/etc/lorica/mcp.toml"),
+                &format!(
+                    "endpoint = \"{ENDPOINT}\"\ntoken = \"{TOKEN}\"\n\
+                     ca_bundle = \"/etc/lorica/internal-ca.pem\"\n"
+                ),
+            )),
+        )
+        .expect("the file names the bundle too");
+        assert_eq!(
+            from_file.ca_bundle,
+            Some(PathBuf::from("/etc/lorica/internal-ca.pem"))
+        );
     }
 
     #[test]

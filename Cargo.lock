@@ -3368,8 +3368,11 @@ version = "1.8.0"
 dependencies = [
  "lorica-config",
  "percent-encoding",
+ "rcgen",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
 ]

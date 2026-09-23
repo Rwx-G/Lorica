@@ -75,6 +75,38 @@
 //! an operator is that the row is durable within the consumer's next
 //! drain rather than before the 401, and that a queue full for long
 //! enough sheds rows into `lorica_audit_rows_dropped_total`.
+//!
+//! # What the node established, and what the caller merely said
+//!
+//! Story 11.1 AC #6 asks that every MCP tool call be audited with the
+//! token's `public_id`, the tool name, the arguments after redaction
+//! and a marker identifying the transport as MCP. Two of those four are
+//! not things this layer can observe. The MCP server is a separate
+//! process that reaches this plane over HTTP; at the HTTP layer there
+//! is no tool, because a tool is a concept of the protocol that process
+//! speaks and not of the one it speaks over.
+//!
+//! So the row says which is which, rather than flattening them into one
+//! sentence that reads as if the node had checked both:
+//!
+//! - **Established.** The principal, from verifying the credential.
+//!   The method, the path and the names of the query parameters, from
+//!   the request line this node parsed. The status, from what this node
+//!   answered. These anchor the row.
+//! - **Asserted.** The transport and the tool name, from
+//!   [`ASSERTED_TRANSPORT_HEADER`] and [`ASSERTED_TOOL_HEADER`], which
+//!   are whatever the caller sent. They are recorded inside an
+//!   `asserted[...]` clause and nowhere else, so nothing reads them as
+//!   a fact the node checked.
+//!
+//! An audit trail that cannot tell a claim from a proof is telling a
+//! story that is not true, which is the same reasoning Epic 11 gives
+//! for distinguishing a model from a person in the first place.
+//!
+//! Header values are attacker-influenced in the general case - anyone
+//! holding a live token can send any header they like - so
+//! [`asserted_clause`] bounds both length and character set before
+//! either reaches a row.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -103,6 +135,30 @@ const AUTOMATION_TARGET_TYPE: &str = "automation_request";
 
 /// What `operator_username` says when the request never authenticated.
 const ANONYMOUS_PRINCIPAL: &str = "-";
+
+/// The header a caller declares the transport it is bridging in.
+///
+/// Story 11.1 AC #6's "marker identifying the transport as MCP". The
+/// emitter is `lorica-mcp`, which spells it in
+/// `lorica-mcp/src/http.rs`; the two spellings are pinned against each
+/// other by `lorica-api/tests/mcp_asserted_headers.rs`, which reads
+/// that file rather than depending on the crate.
+pub const ASSERTED_TRANSPORT_HEADER: &str = "lorica-asserted-transport";
+
+/// The header a caller declares the tool name in.
+///
+/// See [`ASSERTED_TRANSPORT_HEADER`] for where the other end of this
+/// spelling lives and what pins the two together.
+pub const ASSERTED_TOOL_HEADER: &str = "lorica-asserted-tool";
+
+/// The most bytes an asserted transport may weigh.
+const ASSERTED_TRANSPORT_MAX_BYTES: usize = 32;
+
+/// The most bytes an asserted tool name may weigh.
+///
+/// The MCP tool-name grammar's own ceiling, so a legitimate name always
+/// fits and nothing longer than one can be stored.
+const ASSERTED_TOOL_MAX_BYTES: usize = 128;
 
 /// The reason a 403 carries when the path itself declares no scope.
 ///
@@ -356,6 +412,58 @@ fn query_parameter_names(query: Option<&str>) -> String {
     format!("?{}", names.join(","))
 }
 
+/// One asserted value, or `None` when the caller sent nothing usable.
+///
+/// Usable means: present, non-empty, within `max_bytes`, and built from
+/// `[A-Za-z0-9_.-]` alone. That set is the MCP tool-name grammar and it
+/// also happens to contain no byte that could end the clause, break the
+/// target string or read as a field separator further down. A value
+/// outside it is dropped whole rather than trimmed: half of what
+/// somebody claimed is not a smaller claim, it is a different one.
+fn assertable(value: Option<&str>, max_bytes: usize) -> Option<String> {
+    let value = value?;
+    let fits = (1..=max_bytes).contains(&value.len())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    fits.then(|| value.to_string())
+}
+
+/// What the caller CLAIMED this request was, as a clause to append to
+/// the audit target, or the empty string when it claimed nothing.
+///
+/// The word `asserted` is in the row itself and not only in this
+/// module's documentation, because the row is what an operator reads
+/// six months later with none of this in front of them. Everything
+/// outside the clause is something the node established; everything
+/// inside it is something the caller said.
+fn asserted_clause(headers: &http::HeaderMap) -> String {
+    let read = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+    };
+    let transport = assertable(
+        read(ASSERTED_TRANSPORT_HEADER),
+        ASSERTED_TRANSPORT_MAX_BYTES,
+    );
+    let tool = assertable(read(ASSERTED_TOOL_HEADER), ASSERTED_TOOL_MAX_BYTES);
+
+    let mut claims: Vec<String> = Vec::with_capacity(2);
+    if let Some(transport) = transport {
+        claims.push(format!("transport={transport}"));
+    }
+    if let Some(tool) = tool {
+        claims.push(format!("tool={tool}"));
+    }
+    if claims.is_empty() {
+        String::new()
+    } else {
+        format!(" asserted[{}]", claims.join(","))
+    }
+}
+
 /// Axum middleware recording one audit row per automation request.
 pub async fn audit_automation_request(
     State(state): State<AppState>,
@@ -365,6 +473,10 @@ pub async fn audit_automation_request(
     let method: Method = req.method().clone();
     let path: String = req.uri().path().to_string();
     let filters: String = query_parameter_names(req.uri().query());
+    // Read on the way DOWN, like everything else here: a layer below
+    // could otherwise strip or rewrite the headers and change what the
+    // row says the caller claimed.
+    let asserted: String = asserted_clause(req.headers());
     let ip: String = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -423,7 +535,10 @@ pub async fn audit_automation_request(
         &state,
         &ctx,
         &action_for(outcome_word, reason.as_deref()),
-        (AUTOMATION_TARGET_TYPE, &format!("{method} {path}{filters}")),
+        (
+            AUTOMATION_TARGET_TYPE,
+            &format!("{method} {path}{filters}{asserted}"),
+        ),
         None,
         None,
     )
@@ -621,6 +736,106 @@ mod tests {
         let recorded = query_parameter_names(Some(&flood));
         assert!(recorded.len() < 600, "{} bytes", recorded.len());
         assert!(!recorded.contains(&"x".repeat(40)), "{recorded}");
+    }
+
+    /// A header map carrying `pairs`.
+    fn headers_of(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
+                http::HeaderValue::from_str(value).expect("a header value"),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn what_the_caller_claimed_is_recorded_as_a_claim_and_labelled_one() {
+        // AC #6. The node cannot observe a tool name, because there is
+        // no tool at this layer, so the only honest shape is to record
+        // what the caller declared AS a declaration. The word
+        // `asserted` is in the row and not only in the documentation,
+        // because the row is what an operator reads with none of this
+        // in front of them.
+        assert_eq!(
+            asserted_clause(&headers_of(&[
+                (ASSERTED_TRANSPORT_HEADER, "mcp-stdio"),
+                (ASSERTED_TOOL_HEADER, "lorica_logs"),
+            ])),
+            " asserted[transport=mcp-stdio,tool=lorica_logs]"
+        );
+
+        // The MCP server's startup `whoami` declares a transport and no
+        // tool, because no tool ran.
+        assert_eq!(
+            asserted_clause(&headers_of(&[(ASSERTED_TRANSPORT_HEADER, "mcp-stdio")])),
+            " asserted[transport=mcp-stdio]"
+        );
+
+        // A CI call claims nothing, which is the common case and must
+        // add nothing to the row.
+        assert_eq!(asserted_clause(&http::HeaderMap::new()), "");
+    }
+
+    #[test]
+    fn an_asserted_value_is_bounded_before_it_can_become_a_row() {
+        // Anyone holding a live token can send any header they like, so
+        // the claim is attacker-influenced in the general case. An
+        // unusable value is dropped WHOLE: half of what somebody
+        // claimed is not a smaller claim, it is a different one.
+        for hostile in [
+            "a b",
+            "tool=x],transport=dashboard",
+            "lorica/logs",
+            "GET /automation/v1/logs",
+            "lorica_logs,tool=other",
+            "",
+            "   ",
+        ] {
+            let clause = asserted_clause(&headers_of(&[(ASSERTED_TOOL_HEADER, hostile)]));
+            assert_eq!(clause, "", "{hostile:?} reached a row");
+        }
+        // A control character never gets this far: `HeaderValue` refuses
+        // to hold one, so the transport is what stops it and this
+        // filter is the belt behind that brace.
+        assert!(http::HeaderValue::from_str("lorica_logs\u{7f}").is_err());
+        assert!(assertable(Some("lorica_logs\u{7f}"), ASSERTED_TOOL_MAX_BYTES).is_none());
+
+        // Length, on both fields, with the tool's ceiling being the MCP
+        // grammar's own so a legitimate name always fits.
+        assert_eq!(
+            asserted_clause(&headers_of(&[(
+                ASSERTED_TOOL_HEADER,
+                &"t".repeat(ASSERTED_TOOL_MAX_BYTES)
+            )])),
+            format!(" asserted[tool={}]", "t".repeat(ASSERTED_TOOL_MAX_BYTES))
+        );
+        assert_eq!(
+            asserted_clause(&headers_of(&[(
+                ASSERTED_TOOL_HEADER,
+                &"t".repeat(ASSERTED_TOOL_MAX_BYTES + 1)
+            )])),
+            ""
+        );
+        assert_eq!(
+            asserted_clause(&headers_of(&[(
+                ASSERTED_TRANSPORT_HEADER,
+                &"m".repeat(ASSERTED_TRANSPORT_MAX_BYTES + 1)
+            )])),
+            ""
+        );
+
+        // And the whole clause stays short enough to read on one line
+        // whatever arrives.
+        let longest = asserted_clause(&headers_of(&[
+            (
+                ASSERTED_TRANSPORT_HEADER,
+                &"m".repeat(ASSERTED_TRANSPORT_MAX_BYTES),
+            ),
+            (ASSERTED_TOOL_HEADER, &"t".repeat(ASSERTED_TOOL_MAX_BYTES)),
+        ]));
+        assert!(longest.len() < 200, "{} bytes", longest.len());
     }
 
     #[test]

@@ -9196,6 +9196,31 @@ async fn automation_send(
         .expect("test setup")
 }
 
+/// Drive the automation router with extra request headers.
+///
+/// Separate from [`automation_send`] rather than a fifth parameter on
+/// it: exactly one family of tests cares, and every other call site
+/// would have grown a `&[]` that says nothing.
+async fn automation_send_with_headers(
+    state: &AppState,
+    uri: &str,
+    auth: &str,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let router = crate::automation::build_automation_router(state.clone());
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(http::header::AUTHORIZATION, auth);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    router
+        .oneshot(builder.body(Body::empty()).expect("test setup"))
+        .await
+        .expect("test setup")
+}
+
 /// Every `automation.` audit action recorded so far, sorted.
 ///
 /// Async because `record` only enqueues: the rows are durable within
@@ -10390,6 +10415,146 @@ async fn an_automation_read_of_one_route_sla_answers_the_windows_or_404() {
         !message.contains("ignore-previous-instructions"),
         "{message}"
     );
+}
+
+// ---- Story 11.1 AC #6: what the node established, and what the caller said ----
+
+/// Every automation row in the store, newest first.
+async fn automation_audit_rows(state: &AppState) -> Vec<crate::audit::AuditRecord> {
+    let log_store = state.log_store.clone().expect("test setup: log store");
+    log_store
+        .flush_audit()
+        .await
+        .expect("the audit writer drains");
+    let (rows, _total) = log_store
+        .query_audit(&crate::audit::AuditQuery {
+            operator: None,
+            action_prefix: Some("automation.request.".to_string()),
+            from: None,
+            to: None,
+            limit: 50,
+            before_id: None,
+            node_id: None,
+        })
+        .expect("audit query");
+    rows
+}
+
+#[tokio::test]
+async fn an_mcp_tool_call_is_audited_with_what_the_node_proved_and_what_the_caller_claimed() {
+    // AC #6. The MCP server is a separate process and reaches this
+    // plane over HTTP, where there is no tool to observe: a tool is a
+    // concept of the protocol that process speaks, not of the one it
+    // speaks over. So the tool name and the transport are the caller's
+    // declaration and the row says so, while the token's `public_id`
+    // is the part this node proved and is what anchors the row.
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let (mut state, _session_store, _rate_limiter) = test_state().await;
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(data_dir.path()).expect("test setup: log store"),
+    ));
+    let token = mint_automation(
+        &state,
+        "mcp-read",
+        vec![lorica_config::models::AutomationScope::LogsRead],
+        &["*.read.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    let bearer = format!("Bearer {token}");
+    let public_id = token.split('.').next().expect("a token has two halves");
+
+    let response = automation_send_with_headers(
+        &state,
+        "/automation/v1/logs?limit=5&search=secret",
+        &bearer,
+        &[
+            (
+                crate::automation::audit::ASSERTED_TRANSPORT_HEADER,
+                "mcp-stdio",
+            ),
+            (
+                crate::automation::audit::ASSERTED_TOOL_HEADER,
+                "lorica_logs",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = automation_audit_rows(&state).await;
+    assert_eq!(rows.len(), 1, "one row per request: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.action, "automation.request.ok");
+    // Established by verifying the credential: the id an operator
+    // withdraws by, which is what the row is anchored on.
+    assert_eq!(row.operator_username, format!("mcp-read ({public_id})"));
+    // Established from the request line, and the filter VALUES stay out
+    // (Story 9.9), which is the argument redaction AC #6 asks for: a
+    // search string an operator typed and an attacker's payload are
+    // equally absent.
+    assert_eq!(
+        row.target_id,
+        "GET /automation/v1/logs?limit,search asserted[transport=mcp-stdio,tool=lorica_logs]"
+    );
+    assert!(!row.target_id.contains("secret"), "{}", row.target_id);
+}
+
+#[tokio::test]
+async fn a_claim_the_node_cannot_store_is_dropped_and_a_call_without_one_claims_nothing() {
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let (mut state, _session_store, _rate_limiter) = test_state().await;
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(data_dir.path()).expect("test setup: log store"),
+    ));
+    let token = mint_automation(
+        &state,
+        "mcp-read",
+        vec![lorica_config::models::AutomationScope::LogsRead],
+        &["*.read.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    let bearer = format!("Bearer {token}");
+
+    // Anyone holding a live token can send any header they like, so the
+    // claim is attacker-influenced. A value outside the accepted set is
+    // dropped whole: the row must not carry a forged clause, and must
+    // not carry half of one either.
+    let forged = automation_send_with_headers(
+        &state,
+        "/automation/v1/logs",
+        &bearer,
+        &[
+            (
+                crate::automation::audit::ASSERTED_TOOL_HEADER,
+                "x],transport=dashboard-session",
+            ),
+            (
+                crate::automation::audit::ASSERTED_TRANSPORT_HEADER,
+                "a b c d",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(forged.status(), StatusCode::OK);
+
+    // And a CI call, which is the common case: it claims nothing and
+    // the row carries no clause at all.
+    let plain = automation_send(&state, "/automation/v1/logs", Some(&bearer), None).await;
+    assert_eq!(plain.status(), StatusCode::OK);
+
+    let targets: Vec<String> = automation_audit_rows(&state)
+        .await
+        .iter()
+        .map(|row| row.target_id.clone())
+        .collect();
+    assert_eq!(targets.len(), 2, "{targets:?}");
+    for target in &targets {
+        assert_eq!(target, "GET /automation/v1/logs", "{target}");
+    }
 }
 
 // ---- Story 10.6 AC #9: the WAF body-scan budget on the settings surface ----

@@ -54,7 +54,7 @@ use serde_json::{json, Value};
 use crate::jsonrpc::{self, code};
 use crate::tools::{self, ToolSpec};
 use crate::untrusted;
-use crate::{ReadError, ReadSource, MCP_PROTOCOL_REVISION};
+use crate::{ReadError, ReadSource, Reason, MCP_PROTOCOL_REVISION};
 
 /// Where the automation plane reports the calling token back to it.
 const WHOAMI_PATH: &str = "/automation/v1/whoami";
@@ -140,8 +140,12 @@ impl McpServer {
     /// [`StartupError::Unreadable`] when what came back is not a whoami
     /// answer.
     pub async fn introspect<S: ReadSource>(source: &S) -> Result<McpServer, StartupError> {
+        // `Reason::Introspection` and not a tool name: no tool has been
+        // called yet and no client has spoken, so a row claiming one
+        // ran would be false in the place that exists to tell a claim
+        // from a fact. See [`crate::http`] for the whole of AC #6.
         let body = source
-            .fetch(WHOAMI_PATH)
+            .fetch(WHOAMI_PATH, Reason::Introspection)
             .await
             .map_err(StartupError::Introspection)?;
         let answer: Value = serde_json::from_str(&body).map_err(|_| StartupError::Unreadable)?;
@@ -346,7 +350,12 @@ impl McpServer {
             );
         }
 
-        let answered = match source.fetch(&path).await {
+        // The tool name travels with the read so the plane can record
+        // what the caller says this request was for. It is the spec's
+        // own name and never the caller's string: `spec` was found by
+        // matching against the catalogue, so an unknown name never
+        // reaches here.
+        let answered = match source.fetch(&path, Reason::Tool(spec.name)).await {
             Ok(body) => untrusted::answer(&body),
             Err(ReadError::Refused { status, body }) => untrusted::execution_error(
                 &format!(
@@ -445,11 +454,13 @@ mod tests {
     }
 
     /// A plane that answers `whoami` from one field and every other
-    /// read from another, recording what it was asked for.
+    /// read from another, recording what it was asked for and what the
+    /// server said the read was for.
     struct Plane {
         whoami: String,
         answer: Answer,
         asked: Mutex<Vec<String>>,
+        declared: Mutex<Vec<Option<String>>>,
     }
 
     impl Plane {
@@ -463,6 +474,7 @@ mod tests {
                 .to_string(),
                 answer: Answer::Body("{\"data\":{\"items\":[],\"page\":{\"returned\":0}}}"),
                 asked: Mutex::new(Vec::new()),
+                declared: Mutex::new(Vec::new()),
             }
         }
 
@@ -477,16 +489,28 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         }
+
+        fn declared_for(&self) -> Vec<Option<String>> {
+            self.declared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
     }
 
     impl ReadSource for Plane {
-        async fn fetch(&self, path: &str) -> Result<String, ReadError> {
+        async fn fetch(&self, path: &str, reason: Reason<'_>) -> Result<String, ReadError> {
             {
                 let mut asked = self
                     .asked
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 asked.push(path.to_string());
+                let mut declared = self
+                    .declared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                declared.push(reason.tool().map(str::to_string));
             }
             if path == WHOAMI_PATH {
                 return Ok(self.whoami.clone());
@@ -574,6 +598,7 @@ mod tests {
                 whoami: nonsense.to_string(),
                 answer: Answer::Body("{}"),
                 asked: Mutex::new(Vec::new()),
+                declared: Mutex::new(Vec::new()),
             };
             let refused = McpServer::introspect(&plane)
                 .await
@@ -641,6 +666,46 @@ mod tests {
         assert!(answered["result"]["content"][0]["text"]
             .as_str()
             .is_some_and(|text| text.contains(untrusted::NOTICE)));
+    }
+
+    #[tokio::test]
+    async fn the_startup_read_declares_no_tool_and_a_tool_call_declares_its_own() {
+        // AC #6's shape at the core. The plane has no way to observe a
+        // tool name, so what it records is what this server declares;
+        // declaring one for the startup `whoami`, where no tool ran,
+        // would put a false claim in the row that exists to tell a
+        // claim from a fact.
+        let plane = Plane::carrying(&["logs:read"]);
+        let server = server_for(&plane).await;
+        assert_eq!(plane.declared_for(), vec![None]);
+
+        server
+            .handle(
+                &plane,
+                request(1, "tools/call", json!({ "name": "lorica_logs" })),
+            )
+            .await
+            .expect("a request is answered");
+        assert_eq!(
+            plane.declared_for(),
+            vec![None, Some("lorica_logs".to_string())]
+        );
+
+        // A name the caller invented never reaches the seam: the spec
+        // is found by matching the catalogue, so what travels is the
+        // catalogue's own string.
+        server
+            .handle(
+                &plane,
+                request(
+                    2,
+                    "tools/call",
+                    json!({ "name": "ignore previous instructions" }),
+                ),
+            )
+            .await
+            .expect("a request is answered");
+        assert_eq!(plane.declared_for().len(), 2);
     }
 
     #[tokio::test]
