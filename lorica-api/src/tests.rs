@@ -55,6 +55,7 @@ pub(crate) async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
         oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
+        mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -5382,6 +5383,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
         oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
+        mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -5423,6 +5425,7 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
         oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
+        mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -11245,14 +11248,9 @@ async fn a_protocol_version_this_server_does_not_implement_names_what_it_does() 
     );
 }
 
-#[tokio::test]
-async fn a_tool_call_on_this_binding_is_audited_on_the_path_that_is_its_transport() {
-    // AC #6 for the second binding. What differs from stdio: the node
-    // routed this request to the MCP endpoint itself, so the path in
-    // the row IS the transport and needs no claim. The tool name is
-    // still the caller's, carried in the revision's own `Mcp-Name`, and
-    // it lands inside the `asserted[...]` clause with everything else
-    // that was said rather than established.
+/// A node with a log store to audit into, and a token carrying
+/// `logs:read` alone, minted on it.
+async fn a_node_that_audits_and_a_log_token() -> (AppState, String, String, tempfile::TempDir) {
     let data_dir = tempfile::tempdir().expect("test tempdir");
     let (mut state, _session_store, _rate_limiter) = test_state().await;
     state.log_store = Some(Arc::new(
@@ -11267,33 +11265,294 @@ async fn a_tool_call_on_this_binding_is_audited_on_the_path_that_is_its_transpor
         None,
     )
     .await;
-    let bearer = format!("Bearer {token}");
-    let public_id = token.split('.').next().expect("a token has two halves");
+    let public_id = token
+        .split('.')
+        .next()
+        .expect("a token has two halves")
+        .to_string();
+    (state, format!("Bearer {token}"), public_id, data_dir)
+}
+
+/// The rows naming the MCP endpoint, newest first.
+async fn mcp_audit_rows(state: &AppState) -> Vec<crate::audit::AuditRecord> {
+    automation_audit_rows(state)
+        .await
+        .into_iter()
+        .filter(|row| row.target_id.contains(crate::automation::MCP_PATH))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_tool_call_on_this_binding_is_audited_with_what_the_node_established() {
+    // AC #6 for the second binding, and what differs from stdio: the
+    // node routed this request to the MCP endpoint itself, so the path
+    // in the row IS the transport; the handler parsed the body, the
+    // mirror check proved `Mcp-Name` equal to it and the catalogue
+    // resolved the name, so the tool is established too and is written
+    // OUTSIDE any `asserted[...]` clause, with the declared argument
+    // names the call carried and never their values.
+    let (state, bearer, public_id, _data_dir) = a_node_that_audits_and_a_log_token().await;
 
     let answered = mcp_call(
         &state,
         &bearer,
         "lorica_logs",
-        serde_json::json!({ "limit": 5 }),
+        serde_json::json!({ "limit": 5, "search": "secret" }),
     )
     .await;
     assert_eq!(answered["result"]["isError"], serde_json::json!(false));
 
-    let rows = automation_audit_rows(&state).await;
-    let row = rows
-        .iter()
-        .find(|row| row.target_id.contains(crate::automation::MCP_PATH))
-        .unwrap_or_else(|| panic!("no row names the MCP endpoint: {rows:?}"));
-
-    // Established: the principal, from verifying the credential, and
-    // the method and the path, from the request line this node parsed.
-    assert!(row.operator_username.contains(public_id), "{row:?}");
-    assert!(row.target_id.starts_with("POST "), "{row:?}");
+    let rows = mcp_audit_rows(&state).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert!(row.operator_username.contains(&public_id), "{row:?}");
     assert_eq!(row.action, "automation.request.ok", "{row:?}");
-    // Asserted: the tool the caller said the request was for, inside
-    // the clause that says so and nowhere else.
+    assert_eq!(
+        row.target_id,
+        format!(
+            "POST {} tool=lorica_logs?search,limit",
+            crate::automation::MCP_PATH
+        )
+    );
+    assert!(!row.target_id.contains("asserted"), "{row:?}");
+    assert!(!row.target_id.contains("secret"), "{row:?}");
+}
+
+#[tokio::test]
+async fn iv2_on_this_binding_a_tool_outside_the_grant_and_a_revoked_token_are_audited_as_refusals()
+{
+    // IV2 through the Streamable HTTP stack. Every message the core
+    // produced is answered with a 200, so a row keyed on the status
+    // would say `ok` for a call on a tool the token does not hold. The
+    // row and the metric take the core's outcome instead, and read like
+    // the read path's own 403: the scope the tool needed. A token
+    // revoked mid-session never reaches the core; its refusal is the
+    // bearer gate's, and the row says so.
+    let (state, bearer, public_id, _data_dir) = a_node_that_audits_and_a_log_token().await;
+    let by_path = |outcome: &str| {
+        crate::metrics::gathered_counter(
+            "lorica_automation_requests_by_path_total",
+            &[("path", crate::automation::MCP_PATH), ("outcome", outcome)],
+        )
+    };
+    let forbidden_before = by_path("forbidden");
+    let ok_before = by_path("ok");
+
+    let refused = mcp_call(
+        &state,
+        &bearer,
+        "lorica_certificates",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"],
+        lorica_mcp::jsonrpc::code::METHOD_NOT_FOUND
+    );
+    let rows = mcp_audit_rows(&state).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].action, "automation.request.forbidden:certificates:read",
+        "{:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0].target_id,
+        format!(
+            "POST {} tool=lorica_certificates",
+            crate::automation::MCP_PATH
+        )
+    );
+    assert_eq!(by_path("forbidden"), forbidden_before + 1);
+    assert_eq!(by_path("ok"), ok_before);
+
+    // And an execution error: the plane refusing the read the tool
+    // made. An offset deeper than the log can answer is the plane's
+    // 400, which keeps the word that status has on every other row,
+    // and the tool that ran is established with the names it carried.
+    let failed = mcp_call(
+        &state,
+        &bearer,
+        "lorica_logs",
+        serde_json::json!({ "offset": 100_000, "limit": 200 }),
+    )
+    .await;
+    assert_eq!(
+        failed["result"]["isError"],
+        serde_json::json!(true),
+        "{failed}"
+    );
+    let rows = mcp_audit_rows(&state).await;
+    assert_eq!(
+        rows[0].action, "automation.request.refused",
+        "{:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0].target_id,
+        format!(
+            "POST {} tool=lorica_logs?limit,offset",
+            crate::automation::MCP_PATH
+        )
+    );
+
+    // Revoked mid-session: the next call is the bearer gate's 401 and
+    // the row names the reason; the tool the POST named is a claim on
+    // that row, because the core never saw the body.
+    {
+        let store = state.store.lock().await;
+        assert!(store
+            .revoke_automation_token(&public_id, chrono::Utc::now())
+            .expect("revoke"));
+    }
+    let response = mcp_post(
+        &state,
+        &bearer,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "lorica_logs", "arguments": {} },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let rows = mcp_audit_rows(&state).await;
+    assert_eq!(
+        rows[0].action, "automation.request.unauthenticated:token_revoked",
+        "{:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0].target_id,
+        format!(
+            "POST {} asserted[tool=lorica_logs]",
+            crate::automation::MCP_PATH
+        )
+    );
+}
+
+#[tokio::test]
+async fn the_invocation_budget_binds_across_requests_on_this_binding() {
+    // The revision's "rate limit tool invocations" MUST, on the binding
+    // where it matters. The core is built per request here, so a
+    // budget it owned counted one call and reset; the budget is the
+    // token's, held by the process, and the window opened by the first
+    // request is the one the hundred-and-twenty-first finds spent.
+    let (state, bearer, _public_id, _data_dir) = a_node_that_audits_and_a_log_token().await;
+    for n in 0..lorica_mcp::server::RATE_BUDGET {
+        let answered = mcp_call(&state, &bearer, "lorica_logs", serde_json::json!({})).await;
+        assert_eq!(
+            answered["result"]["isError"],
+            serde_json::json!(false),
+            "call {n}: {answered}"
+        );
+    }
+    let over = mcp_call(&state, &bearer, "lorica_logs", serde_json::json!({})).await;
+    assert_eq!(over["result"]["isError"], serde_json::json!(true), "{over}");
     assert!(
-        row.target_id.contains("asserted[tool=lorica_logs]"),
-        "{row:?}"
+        over["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("a minute")),
+        "{over}"
+    );
+    // Audited as the refusal it is, not as the 200 it travelled in.
+    let rows = mcp_audit_rows(&state).await;
+    assert_eq!(
+        rows[0].action, "automation.request.refused:rate_limited",
+        "{:?}",
+        rows[0]
+    );
+
+    // Per token: another token on the same node has its own window.
+    let other = mint_automation(
+        &state,
+        "mcp-other",
+        vec![lorica_config::models::AutomationScope::LogsRead],
+        &["*.read.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    let answered = mcp_call(
+        &state,
+        &format!("Bearer {other}"),
+        "lorica_logs",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(answered["result"]["isError"], serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn the_assertion_headers_cannot_replace_the_tool_the_node_ran_on_this_binding() {
+    // On this path the transport is the path and the tool is what the
+    // body named, so Lorica's own two assertion headers are ignored: a
+    // caller could otherwise put a different tool in the row than the
+    // one the node ran. And `Mcp-Name` in a Base64 sentinel is decoded
+    // wherever it is read, so it can neither dodge the mirror check nor
+    // leave the row blank.
+    use base64::Engine as _;
+
+    let (state, bearer, _public_id, _data_dir) = a_node_that_audits_and_a_log_token().await;
+    let message = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "lorica_logs", "arguments": { "limit": 1 } },
+    });
+    let sentinel = format!(
+        "=?base64?{}?=",
+        base64::engine::general_purpose::STANDARD.encode("lorica_logs")
+    );
+    let mut headers = with_header(&message, crate::automation::mcp::NAME_HEADER, &sentinel);
+    headers.push((
+        crate::automation::audit::ASSERTED_TOOL_HEADER.to_string(),
+        "lorica_waf_stats".to_string(),
+    ));
+    headers.push((
+        crate::automation::audit::ASSERTED_TRANSPORT_HEADER.to_string(),
+        "mcp-stdio".to_string(),
+    ));
+    let response = mcp_post_with(&state, &bearer, &message, &headers).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = mcp_audit_rows(&state).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].target_id,
+        format!(
+            "POST {} tool=lorica_logs?limit",
+            crate::automation::MCP_PATH
+        )
+    );
+    assert!(!rows[0].target_id.contains("waf_stats"), "{:?}", rows[0]);
+    assert!(!rows[0].target_id.contains("mcp-stdio"), "{:?}", rows[0]);
+
+    // A POST the mirror check refuses never reaches the core, and its
+    // row carries the decoded header as the claim it is, with the
+    // assertion headers still ignored.
+    let mut forged = with_header(
+        &message,
+        crate::automation::mcp::NAME_HEADER,
+        &format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode("lorica_certificates")
+        ),
+    );
+    forged.push((
+        crate::automation::audit::ASSERTED_TOOL_HEADER.to_string(),
+        "lorica_waf_stats".to_string(),
+    ));
+    let response = mcp_post_with(&state, &bearer, &message, &forged).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let rows = mcp_audit_rows(&state).await;
+    assert_eq!(
+        rows[0].action, "automation.request.refused",
+        "{:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0].target_id,
+        format!(
+            "POST {} asserted[tool=lorica_certificates]",
+            crate::automation::MCP_PATH
+        )
     );
 }

@@ -95,6 +95,7 @@ pub use environments::{
     ENVIRONMENT_EXPIRED_ACTION,
 };
 pub use listener::{start_automation_server, AutomationListenerConfig, AutomationListenerError};
+pub use lorica_mcp::server::InvocationLimiter;
 pub use mcp::{InProcessReads, MCP_PATH};
 pub use oidc::{OidcVerifier, RefusalReason, OIDC_REPLAY_SET_CAP};
 pub use read::{

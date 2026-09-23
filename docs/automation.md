@@ -800,12 +800,26 @@ listener: the source allowlist would refuse it and the per-source
 connection budget would throttle it, and it would be paying a TLS
 handshake to ask the process a question it already holds the answer to.
 
-Its audit rows look like every other row here, with one difference
-worth knowing when reading a trail: the path `/automation/v1/mcp` is
-itself the transport, established by this node's own routing, while the
-tool name comes from the caller's `Mcp-Name` header and sits inside the
-`asserted[...]` clause with everything else that was claimed rather
-than proved.
+Its audit rows differ from the other rows here in two ways worth
+knowing when reading a trail. The target names the tool the node ran,
+outside any `asserted[...]` clause, with the declared argument names
+the call carried: `POST /automation/v1/mcp tool=lorica_logs?limit`.
+Both are facts the node established, since it parsed the body, refused
+it unless `Mcp-Name` agreed, and resolved the name against the
+catalogue; the two `lorica-asserted-*` headers are ignored on this path
+so a caller cannot overwrite them. And the outcome word is the core's
+rather than the status's, because every message the core produced is
+answered `200`: a call on a tool the token does not hold is
+`forbidden:<scope>`, the same as the read path behind that tool would
+have written, and the core's own refusals are `refused:invalid_params`,
+`refused:rate_limited` and `refused:protocol_error`. Only a POST the
+core never saw carries the decoded `Mcp-Name` as `asserted[tool=...]`.
+[mcp.md](mcp.md) has the whole of it.
+
+Tool invocations on this path are budgeted per token, 120 a minute,
+held by the process across requests. The listener's per-IP limiter is
+not that budget: it counts connections, and a keep-alive client issues
+requests without opening one.
 
 ## GitLab OIDC
 
@@ -1067,8 +1081,9 @@ vocabulary below is a closed list of words the node chooses, with no
 caller-supplied material in it, which is exactly why it may travel in
 clear where a payload may not. The one list the code and this table
 both answer to is `AUTOMATION_AUDIT_REASONS` in
-`lorica-api/src/automation/audit.rs`, and a test refuses any reason the
-gates can emit that is not in it.
+`lorica-api/src/automation/audit.rs`, plus the scope spellings, which
+are read from `AutomationScope` itself rather than restated; a test
+refuses any reason the gates can emit that is not published.
 
 #### 401, the credential
 
@@ -1115,14 +1130,33 @@ translating:
 | `environments:write` | The path writes environments and the credential does not carry the scope. |
 | `routes:read` | Same, for the routes an environment resolves to. |
 | `certificates:read` | Same, for certificate metadata. |
-| `logs:read`, `waf:read`, `sla:read`, `cluster:read`, `backends:read` | Same, for the read views the MCP server's read tier is built on. |
+| `logs:read`, `waf:read`, `sla:read`, `cluster:read`, `backends:read` | Same, for the read views the MCP server's read tier is built on. On `POST /automation/v1/mcp`, the scope the tool the call named needed and the credential does not carry. |
 | `no_declared_scope` | The path has no entry in the scope matrix, so no token can reach it. A bug in Lorica, not in the caller: the scope gate also logs it at ERROR. |
+| `unknown_tool` | On `POST /automation/v1/mcp` only: the call named a tool no catalogue entry has. |
 
 A 403 a handler raised rather than the scope gate (an ownership rule, a
 hostname outside the credential's grant) carries no reason at all: the
 verb is a bare `automation.request.forbidden`. Naming the path's scope
 there would send an operator off to re-mint a token that was never the
 problem; the handler's own message on the wire is what explains those.
+
+#### The MCP endpoint's own refusals
+
+`POST /automation/v1/mcp` answers every message its protocol core
+produced with a `200`, so its rows take their outcome word from what
+the core said the call came to rather than from the status. Three
+refusals the core makes by itself carry a reason under
+`automation.request.refused`:
+
+| `reason` | Meaning |
+|---|---|
+| `invalid_params` | The call's arguments did not fit the tool's declared schema, or a `tools/list` carried a cursor. No read was attempted. |
+| `rate_limited` | The token is over its tool-invocation budget for the window, or the node holds no room for a new window. No read was attempted. |
+| `protocol_error` | The message was malformed, or claimed a protocol revision this node does not speak. |
+
+A tool that ran and whose read the plane refused lands under the word
+that HTTP status has on every other row, with no reason: the tool was
+registered, so the credential held its scope.
 
 #### The node's own faults
 

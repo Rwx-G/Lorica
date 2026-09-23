@@ -55,15 +55,30 @@ unknown to a call.
 
 ## What it cannot see, and why
 
-**No secret leaves through it.** Certificate private keys,
-notification-channel credentials, DNS-provider credentials, Basic-auth
-hashes and session cookies are absent from every answer. That is
-inherited rather than re-filtered: these are the management plane's own
-views, so what they withhold there they withhold here. A test walks
-every answer for credential-shaped field names, and a second test pins
-the entire set of field names each read answers, so a field added to a
-management view tomorrow turns a gate red and forces a decision instead
-of arriving here unnoticed.
+**No secret of Lorica's own leaves through it.** Certificate private
+keys, notification-channel credentials, DNS-provider credentials,
+Basic-auth hashes and session cookies are absent from every answer.
+That is inherited rather than re-filtered: these are the management
+plane's own views, so what they withhold there they withhold here. A
+test walks every answer for credential-shaped field names, and a second
+test pins the entire set of field names each read answers, so a field
+added to a management view tomorrow turns a gate red and forces a
+decision instead of arriving here unnoticed.
+
+**What does cross, and is not filtered.** That sentence is about
+Lorica's secrets and only those. The rows themselves are text end users
+and attackers wrote: request paths including their query strings,
+client addresses, User-Agent strings, WAF matched values, SNI names,
+usernames from failed Basic-auth attempts. A query string routinely
+carries somebody's own credential - a password-reset token, an OAuth
+`code`, a signed-URL signature, an API key a client put in the URL -
+and this plane does not redact it, because it cannot recognise it: a
+filter that stripped what it thought was a token would leave the rest
+and read as if it had stripped everything. Those values reach the model
+verbatim, and through it whatever hosts the model. Pointing a hosted
+model at this tier is a decision that this node's access log, with
+everything its users put in a URL, leaves the node; make it knowing
+that.
 
 **No fleet roster.** `/cluster/status` is served;
 `/cluster/nodes` is not. The roster discloses each follower's source
@@ -289,16 +304,38 @@ Over **stdio**, both the transport and the tool name are assertions.
 The MCP server is a separate process and the node sees HTTP requests,
 not tool calls; a tool is a concept of the protocol the server speaks,
 not of the one it speaks over. It declares them in
-`lorica-asserted-transport` and `lorica-asserted-tool`.
+`lorica-asserted-transport` and `lorica-asserted-tool`, and the row
+reads `GET /automation/v1/logs?limit,search asserted[transport=mcp-stdio,tool=lorica_logs]`.
+A call the server refuses by itself - a tool the token does not hold,
+arguments outside the schema, the invocation budget - never reaches
+the node and lands no row there; the server writes one line about it
+on stderr, in its own words, and that is the only trace.
 
-Over **Streamable HTTP**, the transport needs no claim: the node routed
-the request to `/automation/v1/mcp` itself, so the path already in the
-row is the transport. The tool name is still the caller's, carried in
-the revision's own `Mcp-Name`, and it lands in the same clause. Lorica
-does refuse a request whose `Mcp-Name` disagrees with its body, but
-that check runs inside the layer that writes the row, and the row is
-written for the refusals too. Labelling the value as a claim is the
-reading that is never wrong.
+Over **Streamable HTTP**, both are established. The node routed the
+request to `/automation/v1/mcp` itself, so the path in the row is the
+transport. The node parsed the body, refused it unless `Mcp-Name`
+equalled the tool it named, and resolved that name against the
+catalogue, so the tool is a fact the node holds and is written outside
+any clause, with the declared argument names the call carried and never
+their values: `POST /automation/v1/mcp tool=lorica_logs?limit,search`.
+The two `lorica-asserted-*` headers are ignored on this path; a caller
+sending them could otherwise put a different tool in the row than the
+one the node ran. Only a POST the core never saw - refused by the
+bearer gate, by the header rules, or because the `Mcp-Name` and the
+body disagreed - records the decoded `Mcp-Name` as
+`asserted[tool=...]`, because on that row it is a claim.
+
+The row's outcome on this binding is the core's, not the status's.
+Every message the core produced is answered with a `200`, a refused
+call included, so the outcome word comes from what the call came to:
+`ok`; `forbidden:<scope>` for a tool the token does not hold, the same
+word and the same scope the read path behind that tool would have
+written; `forbidden:unknown_tool` for a name no tool has;
+`refused:invalid_params`, `refused:rate_limited` and
+`refused:protocol_error` for the refusals the core makes by itself; and
+when the tool ran and the plane refused its read, the word that HTTP
+status already has on every other row of this plane. The request
+metrics count the same word.
 
 Anyone holding a live token can send any header they like, so every
 asserted value is bounded in length and character set before it reaches
@@ -309,18 +346,25 @@ that is not true.
 
 ## Rate limiting
 
-Tool invocations are limited inside the server, because the
-specification requires a server to rate limit them and the stdio
-binding has no listener budget to inherit. Going over is a tool
-execution error, so the model sees it and can wait, rather than a
-protocol error it would read as a malfunction.
+Tool invocations are limited inside the server, per token: 120 calls a
+minute, in a fixed window, on both bindings. The specification requires
+a server to rate limit them, and nothing outside the server does: the
+automation listener's connection caps and per-IP limiter count
+connections at accept, and a keep-alive or HTTP/2 client issues
+requests without opening one. Going over is a tool execution error, so
+the model sees it and can wait, rather than a protocol error it would
+read as a malfunction.
 
-The Streamable HTTP binding is bounded by the automation listener
-instead: its connection caps and its per-IP limiter, the same ones
-every other path on that socket sits behind. It does not carry the
-core's own per-process budget, because there is no process to budget:
-each request builds its tool registry from the credential it presented
-and drops it again.
+Over stdio the window is the process's, since one process serves one
+token. Over Streamable HTTP the tool registry is rebuilt per request
+but the window is not: the node holds one limiter for the process,
+keyed by the token's `public_id`, and a token's window survives every
+request that spends from it. The limiter holds at most 1024 live
+windows; a window is opened only by a token that authenticated, and a
+token that finds no room while that many are live is refused for that
+call rather than handed somebody else's window, since evicting a live
+one would give a caller holding more tokens than the ceiling a fresh
+budget per call.
 
 ## The protocol revision, and keeping up with it
 

@@ -58,7 +58,7 @@
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::jsonrpc;
-use crate::server::McpServer;
+use crate::server::{McpServer, Outcome};
 use crate::ReadSource;
 
 /// The longest single message this binding will read.
@@ -138,7 +138,17 @@ where
         }
 
         let answer = match serde_json::from_slice(message) {
-            Ok(value) => server.handle(source, value).await,
+            Ok(value) => {
+                let handled = server.handle_reporting(source, value).await;
+                // A call this server refused by itself never reached
+                // the plane, so no audit row on the node records it.
+                // stderr is the one place it can be seen, in the
+                // server's own words and never the caller's.
+                if !matches!(handled.outcome, Outcome::Ok | Outcome::Silence) {
+                    eprintln!("lorica-mcp: a call was not served: {}", handled.outcome);
+                }
+                handled.answer
+            }
             // Not JSON at all: there is no id to answer under, which is
             // what the null id in this response means.
             Err(_) => Some(jsonrpc::parse_error()),
@@ -163,12 +173,20 @@ async fn read_message<R: AsyncBufRead + Unpin>(
     loop {
         let available = input.fill_buf().await?;
         if available.is_empty() {
-            // EOF: a partial line here is a client that was killed
-            // mid-write, and there is nothing to answer it on anyway.
+            // EOF. A final line with no newline is still one message:
+            // a client that wrote its last request and closed its end
+            // is answered, and a client killed mid-write sends bytes
+            // that do not parse, which is one parse error and then the
+            // session ends as it would have anyway.
             return Ok(!line.is_empty());
         }
         match available.iter().position(|byte| *byte == b'\n') {
             Some(at) => {
+                // The ceiling applies to the bytes before the newline
+                // too, or a line could run past it by one buffer.
+                if line.len() + at > MAX_MESSAGE_BYTES {
+                    return Err(SessionError::MessageTooLong);
+                }
                 line.extend_from_slice(&available[..at]);
                 input.consume(at + 1);
                 return Ok(true);
@@ -362,6 +380,24 @@ mod tests {
             .expect_err("a peer that never sends a newline does not get to choose our memory");
         assert!(matches!(refused, SessionError::MessageTooLong), "{refused}");
         assert!(written.is_empty(), "nothing was answered");
+
+        // And the same line WITH a newline is over the ceiling by the
+        // same byte: the check runs on both branches of the read, so a
+        // message cannot exceed it by however much one buffer holds.
+        let terminated = format!("{flood}\n");
+        let mut written: Vec<u8> = Vec::new();
+        let refused = serve(&server, &plane, terminated.as_bytes(), &mut written)
+            .await
+            .expect_err("a terminated line past the ceiling is still past it");
+        assert!(matches!(refused, SessionError::MessageTooLong), "{refused}");
+        // While one exactly at the ceiling is read and answered.
+        let at_ceiling = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{{\"pad\":\"{}\"}}}}\n",
+            "x".repeat(MAX_MESSAGE_BYTES - 80)
+        );
+        assert!(at_ceiling.len() - 1 <= MAX_MESSAGE_BYTES);
+        let answers = exchange(&server, &plane, &at_ceiling).await;
+        assert_eq!(answers.len(), 1);
     }
 
     #[tokio::test]

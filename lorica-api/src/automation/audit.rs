@@ -80,11 +80,11 @@
 //!
 //! Story 11.1 AC #6 asks that every MCP tool call be audited with the
 //! token's `public_id`, the tool name, the arguments after redaction
-//! and a marker identifying the transport as MCP. Two of those four are
-//! not things this layer can observe. The MCP server is a separate
-//! process that reaches this plane over HTTP; at the HTTP layer there
-//! is no tool, because a tool is a concept of the protocol that process
-//! speaks and not of the one it speaks over.
+//! and a marker identifying the transport as MCP. Over stdio, two of
+//! those four are not things this layer can observe. The MCP server is
+//! a separate process that reaches this plane over HTTP; at the HTTP
+//! layer there is no tool, because a tool is a concept of the protocol
+//! that process speaks and not of the one it speaks over.
 //!
 //! So the row says which is which, rather than flattening them into one
 //! sentence that reads as if the node had checked both:
@@ -99,6 +99,28 @@
 //!   `asserted[...]` clause and nowhere else, so nothing reads them as
 //!   a fact the node checked.
 //!
+//! Over the Streamable HTTP binding, on [`MCP_PATH`], the situation is
+//! not the stdio one and the row does not pretend it is. The transport
+//! is established by the path itself: this node routed the request
+//! there. When the core ran, the tool name is established too, because
+//! the handler parsed the body, the mirror check proved `Mcp-Name`
+//! equal to it, and the catalogue is what resolved the name; the
+//! handler attaches an [`McpCallRecord`] to the response saying which
+//! tool, which declared arguments and what the call came to, and the
+//! row writes those outside any `asserted[...]` clause. The two
+//! Lorica-specific assertion headers are ignored on that path entirely:
+//! a caller could otherwise overwrite the tool the node itself
+//! resolved. Only a POST the core never saw - refused by a gate or by
+//! the transport rules - still records the decoded `Mcp-Name` as a
+//! claim, because on that row it is one.
+//!
+//! The outcome word of an MCP row comes from that record and not from
+//! the status. The core answers everything it produced with a `200`,
+//! including a call on a tool the token does not hold and a result
+//! carrying `isError: true`; keyed on the status, every one of those
+//! would read `ok`. The vocabulary stays the plane's five words, with
+//! the reason after the colon saying which of the MCP refusals it was.
+//!
 //! An audit trail that cannot tell a claim from a proof is telling a
 //! story that is not true, which is the same reasoning Epic 11 gives
 //! for distinguishing a model from a person in the first place.
@@ -106,7 +128,8 @@
 //! Header values are attacker-influenced in the general case - anyone
 //! holding a live token can send any header they like - so
 //! [`asserted_clause`] bounds both length and character set before
-//! either reaches a row.
+//! either reaches a row, and the request path and `User-Agent` are cut
+//! to a fixed length for the same reason.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -116,9 +139,12 @@ use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use lorica_config::models::AutomationScope;
+use lorica_mcp::server::Outcome;
+use lorica_mcp::tools;
 
 use super::auth::AutomationPrincipal;
-use super::scope::ScopeRequirement;
+use super::mcp::{McpCallRecord, MCP_PATH, NAME_HEADER};
+use super::scope::{scope_str, ScopeRequirement};
 use crate::audit::AuditContext;
 use crate::server::AppState;
 
@@ -158,7 +184,18 @@ const ASSERTED_TRANSPORT_MAX_BYTES: usize = 32;
 ///
 /// The MCP tool-name grammar's own ceiling, so a legitimate name always
 /// fits and nothing longer than one can be stored.
-const ASSERTED_TOOL_MAX_BYTES: usize = 128;
+const ASSERTED_TOOL_MAX_BYTES: usize = tools::TOOL_NAME_MAX_BYTES;
+
+/// The most bytes of a request path that reach a row.
+///
+/// The path is the caller's own text, bounded until here only by what
+/// hyper accepts on a request line. Long enough for any path this plane
+/// declares many times over; the cut is on a char boundary and marks
+/// nothing, since a path that long is a scan and not a request.
+const PATH_MAX_BYTES: usize = 2048;
+
+/// The most bytes of a `User-Agent` that reach a row.
+const USER_AGENT_MAX_BYTES: usize = 512;
 
 /// The reason a 403 carries when the path itself declares no scope.
 ///
@@ -168,8 +205,27 @@ const ASSERTED_TOOL_MAX_BYTES: usize = 128;
 /// reads the trail instead of the journal.
 const NO_DECLARED_SCOPE: &str = "no_declared_scope";
 
-/// Every reason an automation audit row can name, and the vocabulary
-/// the "Reading a refusal" section of `docs/automation.md` publishes.
+/// The reason a 403 on [`MCP_PATH`] carries when the call named a tool
+/// no catalogue entry has. A tool the catalogue knows and the token
+/// does not hold names the scope it needed instead, as a read path's
+/// 403 does.
+const UNKNOWN_TOOL: &str = "unknown_tool";
+
+/// The reason a refused MCP call carries when its arguments did not fit
+/// the tool's declared schema, or a `tools/list` carried a cursor.
+const INVALID_PARAMS: &str = "invalid_params";
+
+/// The reason a refused MCP call carries when the token is over its
+/// invocation budget for the window.
+const RATE_LIMITED: &str = "rate_limited";
+
+/// The reason a refused MCP message carries when it was malformed or
+/// claimed a protocol revision this node does not speak.
+const PROTOCOL_ERROR: &str = "protocol_error";
+
+/// Every reason an automation audit row can name that is not a scope,
+/// and with the scope spellings the vocabulary the "Reading a refusal"
+/// section of `docs/automation.md` publishes.
 ///
 /// ONE list, because the alternative is three (the bearer gate, the
 /// scope gate, the document) and three is three chances for an
@@ -178,12 +234,10 @@ const NO_DECLARED_SCOPE: &str = "no_declared_scope";
 ///
 /// Two of these carry a parameter after a second colon:
 /// `missing_claim:jti`, `bound_claim_mismatch:project_path`. The scope
-/// spellings are the reasons a 403 names, and they contain a colon of
-/// their own, which is why membership is [`is_published_reason`] and
-/// not a bare `contains`. The test below walks
-/// [`AutomationScope::ALL`], so a scope missing from the block at the
-/// end of this list fails rather than reaching an operator as a word
-/// no table explains.
+/// spellings a 403 names are NOT restated here: [`is_published_reason`]
+/// reads them from [`AutomationScope::ALL`] through [`scope_str`], so a
+/// scope added to the enum is published the day it exists rather than
+/// the day somebody remembers this list.
 pub const AUTOMATION_AUDIT_REASONS: &[&str] = &[
     // The bearer gate, before either credential path.
     "no_bearer",
@@ -211,28 +265,26 @@ pub const AUTOMATION_AUDIT_REASONS: &[&str] = &[
     "missing_claim",
     "bound_claim_mismatch",
     "replayed",
-    // The scope gate: the grant the token did not carry, or the path
-    // that declares none.
-    "environments:write",
-    "environments:read",
-    "routes:read",
-    "certificates:read",
-    "logs:read",
-    "waf:read",
-    "sla:read",
-    "cluster:read",
-    "backends:read",
+    // The scope gate: the path that declares no scope. The grant a
+    // token did not carry is the scope's own spelling, derived.
     NO_DECLARED_SCOPE,
+    // The MCP endpoint, from what the core said the call came to.
+    UNKNOWN_TOOL,
+    INVALID_PARAMS,
+    RATE_LIMITED,
+    PROTOCOL_ERROR,
 ];
 
-/// Whether `reason` is in the published vocabulary: either a listed
-/// word exactly, or a listed word carrying its parameter after a colon.
+/// Whether `reason` is in the published vocabulary: a listed word
+/// exactly, a listed word carrying its parameter after a colon, or the
+/// wire spelling of a scope.
 ///
 /// ```
 /// use lorica_api::automation::audit::is_published_reason;
 /// assert!(is_published_reason("wrong_alg"));
 /// assert!(is_published_reason("bound_claim_mismatch:project_path"));
 /// assert!(is_published_reason("environments:write"));
+/// assert!(is_published_reason("rate_limited"));
 /// assert!(!is_published_reason("something_someone_invented"));
 /// ```
 pub fn is_published_reason(reason: &str) -> bool {
@@ -241,7 +293,9 @@ pub fn is_published_reason(reason: &str) -> bool {
             || reason
                 .strip_prefix(known)
                 .is_some_and(|rest| rest.starts_with(':'))
-    })
+    }) || AutomationScope::ALL
+        .iter()
+        .any(|scope| scope_str(*scope) == reason)
 }
 
 /// What the bearer gate decided about a request.
@@ -308,28 +362,6 @@ fn outcome(status: StatusCode) -> &'static str {
     }
 }
 
-/// The wire spelling of a scope, matching its serde rename so an
-/// operator reads the same string in the audit row, in the 403 body
-/// and in the token.
-///
-/// [`super::scope`] has the same arms for the error body. One copy
-/// here beats exporting a private helper to build one const: the test
-/// below walks [`AutomationScope::ALL`] and asserts both spell what
-/// serde does, which is the thing that must not drift.
-fn scope_wire_name(scope: AutomationScope) -> &'static str {
-    match scope {
-        AutomationScope::EnvironmentsWrite => "environments:write",
-        AutomationScope::EnvironmentsRead => "environments:read",
-        AutomationScope::RoutesRead => "routes:read",
-        AutomationScope::CertificatesRead => "certificates:read",
-        AutomationScope::LogsRead => "logs:read",
-        AutomationScope::WafRead => "waf:read",
-        AutomationScope::SlaRead => "sla:read",
-        AutomationScope::ClusterRead => "cluster:read",
-        AutomationScope::BackendsRead => "backends:read",
-    }
-}
-
 /// The reason to spell into the action verb, or `None` when the
 /// outcome needs no explaining.
 ///
@@ -353,7 +385,7 @@ fn refusal_reason(
             match super::scope::required_scope(method, path) {
                 None => Some(NO_DECLARED_SCOPE.to_string()),
                 Some(ScopeRequirement::Scope(needed)) if !scopes.contains(&needed) => {
-                    Some(scope_wire_name(needed).to_string())
+                    Some(scope_str(needed).to_string())
                 }
                 Some(_) => None,
             }
@@ -398,13 +430,7 @@ fn query_parameter_names(query: Option<&str>) -> String {
         .split('&')
         .filter_map(|pair| pair.split('=').next())
         .filter(|name| !name.is_empty())
-        .map(|name| {
-            let cut = (0..=name.len().min(MAX_NAME_BYTES))
-                .rev()
-                .find(|end| name.is_char_boundary(*end))
-                .unwrap_or(0);
-            &name[..cut]
-        })
+        .map(|name| bounded(name, MAX_NAME_BYTES))
         .collect();
     names.sort_unstable();
     names.dedup();
@@ -415,18 +441,16 @@ fn query_parameter_names(query: Option<&str>) -> String {
 /// One asserted value, or `None` when the caller sent nothing usable.
 ///
 /// Usable means: present, non-empty, within `max_bytes`, and built from
-/// `[A-Za-z0-9_.-]` alone. That set is the MCP tool-name grammar and it
-/// also happens to contain no byte that could end the clause, break the
-/// target string or read as a field separator further down. A value
-/// outside it is dropped whole rather than trimmed: half of what
-/// somebody claimed is not a smaller claim, it is a different one.
+/// the MCP tool-name character class, which is `lorica-mcp`'s own
+/// [`tools::fits_tool_name_grammar`] so the two crates cannot disagree
+/// about it. That set also happens to contain no byte that could end
+/// the clause, break the target string or read as a field separator
+/// further down. A value outside it is dropped whole rather than
+/// trimmed: half of what somebody claimed is not a smaller claim, it is
+/// a different one.
 fn assertable(value: Option<&str>, max_bytes: usize) -> Option<String> {
     let value = value?;
-    let fits = (1..=max_bytes).contains(&value.len())
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
-    fits.then(|| value.to_string())
+    tools::fits_tool_name_grammar(value, max_bytes).then(|| value.to_string())
 }
 
 /// What the caller CLAIMED this request was, as a clause to append to
@@ -437,6 +461,8 @@ fn assertable(value: Option<&str>, max_bytes: usize) -> Option<String> {
 /// six months later with none of this in front of them. Everything
 /// outside the clause is something the node established; everything
 /// inside it is something the caller said.
+///
+/// Not read on [`MCP_PATH`]: see [`mcp_claimed_clause`].
 fn asserted_clause(headers: &http::HeaderMap) -> String {
     let read = |name: &str| {
         headers
@@ -448,26 +474,7 @@ fn asserted_clause(headers: &http::HeaderMap) -> String {
         read(ASSERTED_TRANSPORT_HEADER),
         ASSERTED_TRANSPORT_MAX_BYTES,
     );
-    // Two headers, one claim. The stdio server is a separate process and
-    // declares its tool in a header of Lorica's own. A client of
-    // [`super::mcp`] does not have to: the revision's own `Mcp-Name` is
-    // already on the request, mirrored from the body's `params.name`, so
-    // asking for a second header saying the same thing would be asking a
-    // conforming client to speak a dialect.
-    //
-    // Both are read as ASSERTIONS, even though [`super::mcp`] refuses a
-    // request whose `Mcp-Name` and body disagree. That check runs inside
-    // this layer, which writes a row for the refusals too: on a row that
-    // answered 200 the mirror did hold, and on one that answered 400 the
-    // value is exactly what somebody claimed and nothing more. One
-    // labelling that is never wrong beats two that each need the status
-    // read first.
-    //
-    // The MCP transport itself is not claimed here and needs no claim:
-    // this node routed the request to `super::mcp::MCP_PATH`, so the path
-    // already in the row IS the transport, established.
-    let tool = assertable(read(ASSERTED_TOOL_HEADER), ASSERTED_TOOL_MAX_BYTES)
-        .or_else(|| assertable(read(super::mcp::NAME_HEADER), ASSERTED_TOOL_MAX_BYTES));
+    let tool = assertable(read(ASSERTED_TOOL_HEADER), ASSERTED_TOOL_MAX_BYTES);
 
     let mut claims: Vec<String> = Vec::with_capacity(2);
     if let Some(transport) = transport {
@@ -483,6 +490,94 @@ fn asserted_clause(headers: &http::HeaderMap) -> String {
     }
 }
 
+/// What the caller claimed on a POST to [`MCP_PATH`] the core never
+/// saw: the decoded `Mcp-Name`, as a clause, or nothing.
+///
+/// The two Lorica-specific assertion headers are ignored here on
+/// purpose. On this path the transport is the path, and the tool is
+/// whatever the body names; a caller sending `lorica-asserted-tool`
+/// could otherwise put a different tool in the row than the one the
+/// node ran, and a caller sending `Mcp-Name` in a Base64 sentinel
+/// would have left the row with nothing readable. The value is read
+/// through the same decoder [`super::mcp`] compares with, so what is
+/// recorded as claimed is what was compared.
+///
+/// A claim and not a fact, because this clause is only written when the
+/// core did not run: the mirror check may have been the thing that
+/// refused the POST, in which case the value is exactly what somebody
+/// said and nothing more.
+fn mcp_claimed_clause(headers: &http::HeaderMap) -> String {
+    let claimed = super::mcp::mirrored(headers, NAME_HEADER)
+        .ok()
+        .flatten()
+        .and_then(|name| assertable(Some(name.trim()), ASSERTED_TOOL_MAX_BYTES));
+    match claimed {
+        Some(tool) => format!(" asserted[tool={tool}]"),
+        None => String::new(),
+    }
+}
+
+/// What the node established about an MCP call, as a clause to append
+/// to the audit target: the tool the body named and the declared
+/// argument names it carried, in the same `?names` shape a read path's
+/// row uses for its query parameters. Empty off a `tools/call`.
+///
+/// Outside any `asserted[...]` clause, because none of it is a claim:
+/// the handler parsed the body, the mirror check proved the header
+/// equal to it, and the names come from the tool's own vocabulary.
+fn mcp_established_clause(record: &McpCallRecord) -> String {
+    let Some(tool) = &record.tool else {
+        return String::new();
+    };
+    if record.argument_names.is_empty() {
+        format!(" tool={tool}")
+    } else {
+        format!(" tool={tool}?{}", record.argument_names.join(","))
+    }
+}
+
+/// The outcome word and the reason for an MCP row, from what the core
+/// said the call came to rather than from the `200` it was answered
+/// with.
+///
+/// The words are the plane's own five. A tool the token does not hold
+/// is `forbidden` naming the scope it needed, exactly what the scope
+/// gate writes for the read path behind that tool; a tool no catalogue
+/// entry has is `forbidden:unknown_tool`. The plane's refusal of the
+/// read a tool made keeps the word its status has on every other row,
+/// and names no scope, since a tool that ran was registered and the
+/// token held it.
+fn mcp_outcome(record: &McpCallRecord) -> (&'static str, Option<String>) {
+    match record.outcome {
+        Outcome::Silence | Outcome::Ok => ("ok", None),
+        Outcome::ToolNotRegistered => {
+            let needed = record
+                .tool
+                .as_deref()
+                .and_then(tools::find)
+                .and_then(|spec| {
+                    serde_json::from_str::<AutomationScope>(&format!("\"{}\"", spec.scope)).ok()
+                })
+                .map_or(UNKNOWN_TOOL, scope_str);
+            ("forbidden", Some(needed.to_string()))
+        }
+        Outcome::InvalidParams => ("refused", Some(INVALID_PARAMS.to_string())),
+        Outcome::RateLimited => ("refused", Some(RATE_LIMITED.to_string())),
+        Outcome::Refused(status) => (StatusCode::from_u16(status).map_or("error", outcome), None),
+        Outcome::Failed => ("error", None),
+        Outcome::ProtocolError => ("refused", Some(PROTOCOL_ERROR.to_string())),
+    }
+}
+
+/// `text` cut to at most `max_bytes` on a char boundary.
+fn bounded(text: &str, max_bytes: usize) -> &str {
+    let cut = (0..=text.len().min(max_bytes))
+        .rev()
+        .find(|end| text.is_char_boundary(*end))
+        .unwrap_or(0);
+    &text[..cut]
+}
+
 /// Axum middleware recording one audit row per automation request.
 pub async fn audit_automation_request(
     State(state): State<AppState>,
@@ -491,11 +586,18 @@ pub async fn audit_automation_request(
 ) -> Response {
     let method: Method = req.method().clone();
     let path: String = req.uri().path().to_string();
+    let is_mcp = path == MCP_PATH;
     let filters: String = query_parameter_names(req.uri().query());
     // Read on the way DOWN, like everything else here: a layer below
     // could otherwise strip or rewrite the headers and change what the
-    // row says the caller claimed.
-    let asserted: String = asserted_clause(req.headers());
+    // row says the caller claimed. On the MCP path the two assertion
+    // headers are not read at all; the claim there is `Mcp-Name`, and
+    // only for a POST the core turns out never to have seen.
+    let claimed: String = if is_mcp {
+        mcp_claimed_clause(req.headers())
+    } else {
+        asserted_clause(req.headers())
+    };
     let ip: String = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -505,6 +607,7 @@ pub async fn audit_automation_request(
         .headers()
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
+        .map(|agent| bounded(agent, USER_AGENT_MAX_BYTES))
         .unwrap_or_default()
         .to_string();
 
@@ -513,9 +616,31 @@ pub async fn audit_automation_request(
 
     let response = next.run(req).await;
 
+    // What the MCP handler established, when it ran. Read from the
+    // response because this layer is outermost and the request's
+    // extensions are gone by now; absent on a POST a gate or the
+    // transport rules refused, whose row is written from the status.
+    let mcp: Option<McpCallRecord> = if is_mcp {
+        response.extensions().get::<McpCallRecord>().cloned()
+    } else {
+        None
+    };
+
     // Counted from the same word the audit row gets, so the scrape and
-    // the log never disagree on what a request was.
-    let outcome_word: &'static str = outcome(response.status());
+    // the log never disagree on what a request was. For an MCP call the
+    // word comes from the core's outcome, since the core answers a
+    // refused call with the same 200 as a served one.
+    let decision = slot.get();
+    let (outcome_word, reason): (&'static str, Option<String>) = match &mcp {
+        Some(record) => mcp_outcome(record),
+        None => {
+            let word = outcome(response.status());
+            (
+                word,
+                refusal_reason(response.status(), decision.as_ref(), &method, &path),
+            )
+        }
+    };
     crate::metrics::inc_automation_request(outcome_word);
     // Labelled by the TEMPLATE the matrix declares, never the raw path:
     // a route id is the caller's own text and would be a new time
@@ -532,13 +657,18 @@ pub async fn audit_automation_request(
     // Splitting them would put one of them in a column that already
     // means something else. A refusal names nobody, and carries its
     // reason in the action verb instead.
-    let decision = slot.get();
     let username: String = match &decision {
         Some(AuthOutcome::Accepted { identity, .. }) => identity.clone(),
         _ => ANONYMOUS_PRINCIPAL.to_string(),
     };
-    let reason: Option<String> =
-        refusal_reason(response.status(), decision.as_ref(), &method, &path);
+
+    // Established beats claimed: a record means the node parsed the
+    // body and ran the call, and the tool it names is a fact.
+    let call: String = match &mcp {
+        Some(record) => mcp_established_clause(record),
+        None => claimed,
+    };
+    let target: String = format!("{method} {}{filters}{call}", bounded(&path, PATH_MAX_BYTES));
 
     let ctx = AuditContext {
         username,
@@ -554,10 +684,7 @@ pub async fn audit_automation_request(
         &state,
         &ctx,
         &action_for(outcome_word, reason.as_deref()),
-        (
-            AUTOMATION_TARGET_TYPE,
-            &format!("{method} {path}{filters}{asserted}"),
-        ),
+        (AUTOMATION_TARGET_TYPE, &target),
         None,
         None,
     )
@@ -699,18 +826,178 @@ mod tests {
     }
 
     #[test]
-    fn every_scope_spells_itself_the_way_the_wire_does_and_is_published() {
+    fn every_scope_a_403_can_name_is_published_and_every_mcp_reason_too() {
+        // The spelling itself is pinned against serde in `scope.rs`,
+        // beside the one function that spells it. What this asserts is
+        // that the published vocabulary reaches every scope without a
+        // list to keep in step, and every word the MCP outcome mapping
+        // can write.
         for scope in AutomationScope::ALL {
-            let wire = scope_wire_name(*scope);
-            assert_eq!(
-                serde_json::to_string(scope).expect("a scope serialises"),
-                format!("\"{wire}\"")
-            );
+            let wire = scope_str(*scope);
             assert!(
                 is_published_reason(wire),
-                "`{wire}` is a scope a 403 can name and is not in AUTOMATION_AUDIT_REASONS"
+                "`{wire}` is a scope a 403 can name and is not published"
             );
         }
+        for reason in [UNKNOWN_TOOL, INVALID_PARAMS, RATE_LIMITED, PROTOCOL_ERROR] {
+            assert!(is_published_reason(reason), "{reason}");
+        }
+        // And the block that used to restate the scopes is gone: a
+        // scope spelling in the list would be a second copy of the
+        // enum, which is what the derivation replaced.
+        assert!(
+            !AUTOMATION_AUDIT_REASONS
+                .iter()
+                .any(|known| known.contains(':')),
+            "a scope spelling is restated in AUTOMATION_AUDIT_REASONS"
+        );
+    }
+
+    #[test]
+    fn on_the_mcp_path_the_assertion_headers_are_ignored_and_mcp_name_is_decoded() {
+        use base64::Engine as _;
+
+        // A caller sending Lorica's own assertion headers to the MCP
+        // endpoint could otherwise put a different tool in the row than
+        // the one the node ran, or a transport the path already
+        // establishes. Neither is read there.
+        assert_eq!(
+            mcp_claimed_clause(&headers_of(&[
+                (ASSERTED_TRANSPORT_HEADER, "mcp-stdio"),
+                (ASSERTED_TOOL_HEADER, "lorica_waf_stats"),
+                (NAME_HEADER, "lorica_logs"),
+            ])),
+            " asserted[tool=lorica_logs]"
+        );
+        // A sentinel-encoded name is decoded, the way the mirror check
+        // decodes it, rather than dropped for its `=` and `?`.
+        let sentinel = format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode("lorica_logs")
+        );
+        assert_eq!(
+            mcp_claimed_clause(&headers_of(&[(NAME_HEADER, &sentinel)])),
+            " asserted[tool=lorica_logs]"
+        );
+        // Bounded like every claim: a value outside the grammar is
+        // dropped whole, and a POST naming no tool claims nothing.
+        assert_eq!(
+            mcp_claimed_clause(&headers_of(&[(NAME_HEADER, "tool=x],transport=dashboard")])),
+            ""
+        );
+        assert_eq!(mcp_claimed_clause(&http::HeaderMap::new()), "");
+        assert_eq!(
+            mcp_claimed_clause(&headers_of(&[(ASSERTED_TOOL_HEADER, "lorica_logs")])),
+            ""
+        );
+    }
+
+    #[test]
+    fn what_the_node_established_about_an_mcp_call_is_written_outside_any_claim() {
+        let record = |tool: Option<&str>, names: &[&'static str]| McpCallRecord {
+            tool: tool.map(str::to_string),
+            argument_names: names.to_vec(),
+            outcome: Outcome::Ok,
+        };
+        assert_eq!(
+            mcp_established_clause(&record(Some("lorica_logs"), &["limit", "search"])),
+            " tool=lorica_logs?limit,search"
+        );
+        assert_eq!(
+            mcp_established_clause(&record(Some("lorica_waf_stats"), &[])),
+            " tool=lorica_waf_stats"
+        );
+        // A tools/list names no tool and adds nothing.
+        assert_eq!(mcp_established_clause(&record(None, &[])), "");
+    }
+
+    #[test]
+    fn an_mcp_row_takes_its_outcome_from_the_core_and_not_from_the_200() {
+        let record = |tool: Option<&str>, outcome: Outcome| McpCallRecord {
+            tool: tool.map(str::to_string),
+            argument_names: Vec::new(),
+            outcome,
+        };
+        let word = |tool: Option<&str>, outcome: Outcome| {
+            let (word, reason) = mcp_outcome(&record(tool, outcome));
+            action_for(word, reason.as_deref())
+        };
+        assert_eq!(
+            word(Some("lorica_logs"), Outcome::Ok),
+            "automation.request.ok"
+        );
+        assert_eq!(word(None, Outcome::Silence), "automation.request.ok");
+        // A tool the catalogue knows and the token does not hold reads
+        // like the read path's own 403: the scope it needed.
+        assert_eq!(
+            word(Some("lorica_certificates"), Outcome::ToolNotRegistered),
+            "automation.request.forbidden:certificates:read"
+        );
+        assert_eq!(
+            word(Some("lorica_routes_write"), Outcome::ToolNotRegistered),
+            "automation.request.forbidden:unknown_tool"
+        );
+        assert_eq!(
+            word(Some("lorica_logs"), Outcome::InvalidParams),
+            "automation.request.refused:invalid_params"
+        );
+        assert_eq!(
+            word(Some("lorica_logs"), Outcome::RateLimited),
+            "automation.request.refused:rate_limited"
+        );
+        assert_eq!(
+            word(None, Outcome::ProtocolError),
+            "automation.request.refused:protocol_error"
+        );
+        // The plane's refusal of the read keeps the word its status has
+        // on every other row, and names no scope: the tool ran, so the
+        // token held it.
+        assert_eq!(
+            word(Some("lorica_sla_route"), Outcome::Refused(404)),
+            "automation.request.refused"
+        );
+        assert_eq!(
+            word(Some("lorica_logs"), Outcome::Refused(403)),
+            "automation.request.forbidden"
+        );
+        assert_eq!(
+            word(Some("lorica_logs"), Outcome::Refused(500)),
+            "automation.request.error"
+        );
+        assert_eq!(
+            word(Some("lorica_logs"), Outcome::Failed),
+            "automation.request.error"
+        );
+        // Every word is one the plane already counts, so the metric's
+        // label set does not grow.
+        for outcome in [
+            Outcome::Ok,
+            Outcome::ToolNotRegistered,
+            Outcome::InvalidParams,
+            Outcome::RateLimited,
+            Outcome::Refused(404),
+            Outcome::Failed,
+            Outcome::ProtocolError,
+        ] {
+            let (word, reason) = mcp_outcome(&record(Some("lorica_logs"), outcome));
+            assert!(
+                ["ok", "unauthenticated", "forbidden", "refused", "error"].contains(&word),
+                "{word}"
+            );
+            if let Some(reason) = reason {
+                assert!(is_published_reason(&reason), "{reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_path_and_a_user_agent_are_cut_before_they_reach_a_row() {
+        assert_eq!(bounded("abc", 5), "abc");
+        assert_eq!(bounded("abcdef", 3), "abc");
+        // On a char boundary, never inside one.
+        assert_eq!(bounded("éé", 3), "é");
+        assert_eq!(bounded("", 3), "");
+        assert!(PATH_MAX_BYTES > "/automation/v1/environments/".len() * 8);
     }
 
     #[test]
@@ -1035,6 +1322,7 @@ mod tests {
             task_tracker: tokio_util::task::TaskTracker::new(),
             cluster: crate::cluster::ClusterRuntime::Standalone,
             oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
+            mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
         }
     }
 
@@ -1058,6 +1346,43 @@ mod tests {
             })
             .expect("the audit query runs");
         rows
+    }
+
+    #[tokio::test]
+    async fn a_long_path_and_a_long_user_agent_do_not_stretch_the_row() {
+        // Both are the caller's own text, bounded until this layer only
+        // by what hyper accepts, and this layer is outermost: the bound
+        // applies to a request the bearer gate refuses as much as to
+        // one it lets through.
+        let dir = tempfile::tempdir().expect("test setup: temp dir");
+        let log_store =
+            Arc::new(crate::log_store::LogStore::open(dir.path()).expect("test setup: log store"));
+        let state = test_state(Arc::clone(&log_store));
+        let router = crate::automation::build_automation_router(state);
+
+        let long_path = format!("/automation/v1/{}", "p".repeat(PATH_MAX_BYTES * 2));
+        let long_agent = "a".repeat(USER_AGENT_MAX_BYTES * 4);
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri(long_path)
+                    .header(header::USER_AGENT, &long_agent)
+                    .body(Body::empty())
+                    .expect("test setup: request builds"),
+            )
+            .await
+            .expect("test setup: request runs");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let rows = automation_rows(&log_store).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].target_id.len() <= PATH_MAX_BYTES + "GET ".len(),
+            "{} bytes",
+            rows[0].target_id.len()
+        );
+        assert_eq!(rows[0].user_agent.len(), USER_AGENT_MAX_BYTES);
     }
 
     #[tokio::test]

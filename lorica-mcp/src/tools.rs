@@ -47,6 +47,35 @@ use serde_json::{json, Map, Value};
 
 use crate::untrusted;
 
+/// The most bytes an MCP tool name may weigh.
+///
+/// Revision 2026-07-28: 1 to 128 characters of `[A-Za-z0-9_.-]`,
+/// case-sensitive. The grammar is written once, here, and read by the
+/// catalogue test, by the stdio client before it asserts a name into a
+/// header, and by `lorica-api`'s audit layer before a claimed name
+/// becomes a row: one implementation, so the value one side sends is
+/// never one the other side refuses.
+pub const TOOL_NAME_MAX_BYTES: usize = 128;
+
+/// Whether `value` is built from the tool-name character class and
+/// weighs between one byte and `max_bytes`.
+///
+/// The character class is the revision's, and it also happens to hold
+/// no byte that could end an audit clause, break a target string or
+/// read as a field separator, which is why the audit layer bounds its
+/// other asserted field by the same class with a shorter ceiling.
+pub fn fits_tool_name_grammar(value: &str, max_bytes: usize) -> bool {
+    (1..=max_bytes).contains(&value.len())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Whether `name` is a legal MCP tool name.
+pub fn is_legal_tool_name(name: &str) -> bool {
+    fits_tool_name_grammar(name, TOOL_NAME_MAX_BYTES)
+}
+
 /// What kind of value a parameter takes, and what bounds it.
 ///
 /// Two kinds and no more. Every filter the automation read surface
@@ -309,6 +338,19 @@ impl ToolSpec {
                 if rendered.is_empty() {
                     return Err(ToolInputError::new(format!(
                         "`{}` cannot be empty: {}",
+                        param.name, param.doc
+                    )));
+                }
+                // `.` and `..` encode to `%2E` and `%2E%2E`, which a
+                // WHATWG URL parser normalises back into dot segments
+                // before the request leaves the stdio client, moving
+                // the read onto the collection or its parent. Neither
+                // is a route id, so refusing them costs nothing and
+                // keeps "nothing a model says moves a read" true of
+                // both bindings rather than of the in-process one.
+                if value.as_str().is_some_and(|id| id == "." || id == "..") {
+                    return Err(ToolInputError::new(format!(
+                        "`{}` cannot be `.` or `..`: {}",
                         param.name, param.doc
                     )));
                 }
@@ -582,13 +624,13 @@ mod tests {
 
     #[test]
     fn every_scope_the_catalogue_names_is_one_the_token_model_declares() {
-        // The one cross-crate guard. This crate names seven scope
-        // spellings as plain strings, because taking `lorica-config` as
-        // a runtime dependency would put bundled SQLite in the
-        // dependency graph of a stdio subprocess that reads no
-        // database. A spelling that drifts would not fail to compile;
-        // it would register no tool and say nothing, which is the
-        // failure `.claude/rules/derived-not-transcribed.md` is about.
+        // The one cross-crate guard. This crate names its scopes as
+        // plain strings, because taking `lorica-config` as a runtime
+        // dependency would put bundled SQLite in the dependency graph
+        // of a stdio subprocess that reads no database. A spelling that
+        // drifts would not fail to compile; it would register no tool
+        // and say nothing, which is the failure
+        // `.claude/rules/derived-not-transcribed.md` is about.
         use lorica_config::models::AutomationScope;
 
         let named: BTreeSet<String> = CATALOGUE
@@ -628,24 +670,39 @@ mod tests {
 
     #[test]
     fn every_tool_name_is_legal_and_unique() {
-        // 1 to 128 characters of [A-Za-z0-9_.-], case-sensitive.
         let mut seen = BTreeSet::new();
         for spec in CATALOGUE {
-            assert!(
-                (1..=128).contains(&spec.name.len()),
-                "{} is {} characters",
-                spec.name,
-                spec.name.len()
-            );
-            assert!(
-                spec.name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
-                "{}",
-                spec.name
-            );
+            assert!(is_legal_tool_name(spec.name), "{}", spec.name);
             assert!(seen.insert(spec.name), "{} twice", spec.name);
         }
+    }
+
+    #[test]
+    fn the_tool_name_grammar_is_the_revisions() {
+        // 1 to 128 characters of [A-Za-z0-9_.-], case-sensitive. The
+        // literals are the specification's and are written out here
+        // rather than derived from the constant, so a constant that
+        // moved would fail this rather than carry the test with it.
+        assert_eq!(TOOL_NAME_MAX_BYTES, 128);
+        for legal in ["a", "lorica_logs", "Tool.v2-beta", &"x".repeat(128)] {
+            assert!(is_legal_tool_name(legal), "{legal:?}");
+        }
+        for illegal in [
+            "",
+            "has space",
+            "has\nnewline",
+            "ignore previous instructions",
+            "tool=x],transport=dashboard",
+            "lorica/logs",
+            "a:b",
+            &"x".repeat(129),
+        ] {
+            assert!(!is_legal_tool_name(illegal), "{illegal:?}");
+        }
+        // The shorter ceiling the audit layer puts on its transport
+        // field is the same class with a smaller number.
+        assert!(fits_tool_name_grammar("mcp-stdio", 32));
+        assert!(!fits_tool_name_grammar(&"m".repeat(33), 32));
     }
 
     #[test]
@@ -755,6 +812,22 @@ mod tests {
             .path_for(&json!({ "id": "" }))
             .expect_err("an empty id is not an id");
         assert!(refused.message.contains("`id`"), "{}", refused.message);
+
+        // `.` and `..` encode to `%2E` and `%2E%2E`, which a WHATWG URL
+        // parser folds back into dot segments on the way out of the
+        // stdio client: the read would land on the collection or its
+        // parent, which the plane declares for nobody and logs at
+        // ERROR as a wiring fault. Refused here, before either binding.
+        for dot in [".", ".."] {
+            let refused = spec("lorica_sla_route")
+                .path_for(&json!({ "id": dot }))
+                .expect_err("a dot segment is not a route id");
+            assert!(refused.message.contains("`id`"), "{}", refused.message);
+        }
+        // And a dot INSIDE an id is text like any other.
+        spec("lorica_sla_route")
+            .path_for(&json!({ "id": "r.1" }))
+            .expect("a dot inside an id is an id");
     }
 
     #[test]

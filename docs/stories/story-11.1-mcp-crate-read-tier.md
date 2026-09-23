@@ -272,6 +272,12 @@ have to exist before a client of them means anything.
       express as it stands. Decided 2026-09-23: the endpoint is
       declared `AnyLiveToken` and every `tools/call` is authorized
       against the presented token's scopes. See the Dev Note below.
+- [x] The fix pass over lots 2b, 3 and 4, from five parallel audits of
+      `1e19c93a`, `cc3a46c8` and `ebcf8874`: the invocation budget the
+      HTTP binding did not have, the audit row that said `ok` for every
+      refused call, the assertion headers a caller could overwrite the
+      tool with, the fence that rescanned per depth, and the guard that
+      guarded nothing. See the Completion Notes.
 
 ## Dev Notes
 
@@ -431,6 +437,13 @@ sanitise tool outputs. The HTTP binding inherits the automation
 listener's per-IP limiter for the third; stdio has no limiter at all
 and the crate owns that one itself.
 
+> Amended 2026-09-23 by the fix pass over lot 4: the sentence about
+> the HTTP binding was wrong. The listener's per-IP limiter counts
+> connections at accept, and a keep-alive or HTTP/2 caller issues
+> requests without opening one, so it bounds no invocation. The budget
+> is the core's on both bindings, per token, held by the process on
+> the HTTP binding. See the fix-pass Completion Notes.
+
 **Decision taken here:** this crate implements 2026-07-28 and nothing
 else. No `initialize` fallback for older clients, no legacy era. AC #11
 already requires the crate to state its revision, and a second era
@@ -473,6 +486,15 @@ What this does not give: proof. It gives provenance, clearly labelled.
 An audit trail that cannot tell a claim from a proof is telling a story
 that is not true, which is the reasoning the epic already gives for
 distinguishing a model from a person.
+
+> Amended 2026-09-23 by the fix pass over lot 4: this note is about
+> stdio. On the Streamable HTTP binding the node holds the facts: it
+> routed the request to the MCP path, parsed the body, refused it
+> unless `Mcp-Name` agreed, and resolved the tool against the
+> catalogue. The row for that binding records the tool and the
+> declared argument names as established, outside any `asserted[...]`
+> clause, and ignores the two `lorica-asserted-*` headers on that path.
+> See the fix-pass Completion Notes.
 
 ### AC #1 and AC #9 are not in conflict
 
@@ -990,6 +1012,85 @@ which is the direction the derived-not-transcribed rule runs in here:
 the constant is derived from the specification, not the test from the
 constant. Both probes fail against the corrected test.
 
+Lot 4, the fix pass, 2026-09-23. Gates run in `rust:1-bookworm` with
+`RUSTFLAGS=-D warnings` unless noted, one container at a time, after
+the post-lot-4 e2e suite had written its teardown line:
+
+- `cargo fmt --all -- --check` on the Windows host: clean (it needed
+  one pass of `cargo fmt --all` first, on eight files).
+- `cargo test -p lorica-mcp`: 74 passed, 0 failed. The crate went from
+  65 tests to 74. One failure on the first run,
+  `no_code_is_declared_that_this_server_never_answers_with`, because
+  the new module doc spelled the code the scan forbids; the sentence
+  was reworded to name it without the number.
+- `cargo test -p lorica-config -p lorica-api`: 894 + 495 unit (one
+  pre-existing ignored in `lorica-config`, untouched here), 3 in
+  `tests/automation_scope_fixture.rs`, 3 in
+  `tests/mcp_asserted_headers.rs`, 4 in `tests/mcp_catalogue_scopes.rs`,
+  4 in `tests/openapi_contract.rs`, 8 + 18 doctests. 0 failed. The
+  `lorica-api` lib count went 885 -> 894.
+- Every integration test under `lorica-api/tests/` by name, as above:
+  `automation_scope_fixture` 3, `mcp_asserted_headers` 3,
+  `mcp_catalogue_scopes` 4, `openapi_contract` 4.
+- `cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings`: clean.
+- `cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings`: clean.
+- `cargo clippy -p lorica --all-targets --features otel -- -D warnings`:
+  clean. Run because the binary constructs `AppState`, which gained a
+  field.
+- `cargo clippy -p lorica-mcp --all-targets -- -D warnings`: clean.
+- `git ls-files --eol`: index `lf` on every changed file; the working
+  tree shows `crlf` on the six of them the `core.autocrlf=true`
+  checkout already held that way (untouched neighbours such as
+  `lorica-api/src/logs.rs` show the same), and `lf` on the rest. No
+  file changed ending.
+- `README.md`'s product-crate test count, recomputed with the
+  `docs/BUMP-CHECKLIST.md` recipe rather than incremented by hand:
+  2796 -> 2814, in BOTH places, the shell comment and the
+  `Lorica%20Tests-N` badge. `grep -n 2796 README.md CONTRIBUTING.md`
+  answers nothing.
+
+`cargo audit` was NOT run: no dependency was added or bumped and
+`Cargo.lock` is untouched. `reqwest`'s `redirect` and `https_only` are
+builder calls on a crate already here. Nothing here touches the
+frontend.
+
+**Every fix was watched failing before it was watched passing.** Each
+defect was reintroduced in the tree with one substitution, the named
+test run in the container, and the file restored from a copy and
+checked with `md5sum` before and after (`8aed6ed4...` for `mcp.rs`,
+`e205a604...` for `audit.rs`, `e89a1fb6...` for `untrusted.rs`,
+`36bcdc69...` for `server.rs`, identical on every restore):
+
+- the HTTP binding built its server over a fresh limiter again:
+  `the_invocation_budget_binds_across_requests_on_this_binding` failed
+  at the call past the budget, which answered `isError: false`.
+- `McpServer::sharing` ignoring the limiter it is handed:
+  `a_shared_limiter_keeps_a_tokens_window_across_the_servers_built_over_it`
+  failed, the fresh server over the same token finding a fresh window.
+- the audit layer keying the MCP row on the status again:
+  `iv2_on_this_binding_a_tool_outside_the_grant_and_a_revoked_token_are_audited_as_refusals`
+  failed with `automation.request.ok` where it wanted
+  `automation.request.forbidden:certificates:read`.
+- the lot 4 precedence restored (`lorica-asserted-tool` read on the
+  MCP path and the claim kept over the record):
+  `the_assertion_headers_cannot_replace_the_tool_the_node_ran_on_this_binding`
+  failed with a row naming `lorica_waf_stats` for a call that ran
+  `lorica_logs`.
+- the one-pass fence choosing one past the deepest depth instead of
+  the first free one:
+  `the_one_pass_fence_answers_what_the_rescanning_one_did` failed on
+  the body carrying depth 3 alone.
+- the rescanning fence swapped back in, timed on the seeded input:
+  `a_body_seeded_with_every_depth_costs_one_pass_and_not_one_per_depth`
+  passed in 11.36 s (`finished in`), against 0.03 s one-pass. That
+  test asserts the marker and not the clock, so this is the
+  measurement rather than a probe that fails; the correctness probe is
+  the one above it.
+- a reference to `TRANSPORT_MARKER` added inside `mcp_endpoint`:
+  `the_streamable_http_binding_asserts_nothing_and_needs_no_marker_of_its_own`
+  failed. Its first version, which compared two path strings, would
+  have stayed green.
+
 ### Completion Notes
 
 **The third state is a type, not a sentinel scope.** `required_scope`
@@ -1491,6 +1592,13 @@ have and which is why the core carries a budget at all. Moving the
 budget to shared process state would make it a cross-token limiter on a
 multi-tenant socket, which is a different policy nobody has decided.
 
+> Amended 2026-09-23 by the fix pass below: that paragraph was wrong
+> on both counts. The listener's budgets count connections, not calls,
+> so the MUST was not met on this binding; and a budget keyed by the
+> token's `public_id` is per token and not cross-token, which answers
+> the objection. The budget is now held by the process and spent per
+> token on both bindings.
+
 **Not done, and named rather than hidden.** No per-token request-rate
 budget on the automation router, which lot 2 raised as open: the
 architecture audit's per-principal in-flight cap is still a design
@@ -1500,6 +1608,199 @@ from Story 10.3. `.claude/skills/bump-version/bump-checklist.md` and
 the crate lists in the `run-tests` and `build-deb` skills still need
 `lorica-mcp`, for the same reason lot 1 recorded: they live under
 `.claude/`, which this pass was told to read only.
+
+---
+
+Lot 4, the fix pass, 2026-09-23. Five parallel audits of `1e19c93a`,
+`cc3a46c8` and `ebcf8874` (security, architecture, quality,
+performance, debt). Every finding that is a fix is fixed here and has a
+test that was watched failing first; every finding that is a decision
+is named at the end with its reason, and nothing is silently skipped.
+
+**The HTTP binding had no invocation rate limit, and three documents
+said it did.** `McpServer::over` was built per request and dropped
+with it, so the core's budget counted one call and reset; the lot 2
+and lot 4 notes, `docs/mcp.md` and a `CHANGELOG.md` bullet said the
+listener's per-IP limiter bounded the binding, and that limiter counts
+connections at accept, not requests. The budget now lives in
+`lorica_mcp::server::InvocationLimiter`, a bounded map of fixed windows
+keyed by the token's `public_id`. `McpServer::sharing(identity,
+limiter)` is the constructor the HTTP binding uses over
+`AppState::mcp_invocations`, one limiter for the process; `over` keeps
+the stdio shape with a limiter of its own. The map holds at most
+`MAX_TRACKED_TOKENS` (1024) live windows, sweeps elapsed ones when
+full, and refuses a token that still finds no room rather than
+evicting a live window, because eviction would hand a caller holding
+more tokens than the ceiling a fresh budget per call. Every sentence
+that claimed the listener covered this is corrected: `server.rs`'s
+module and constant docs, `docs/mcp.md` "Rate limiting",
+`docs/automation.md`'s MCP section, the two `CHANGELOG.md` bullets
+that contradicted each other, and the two paragraphs of this file
+amended above. Guarded by
+`the_invocation_budget_binds_across_requests_on_this_binding` through
+the whole stack, and
+`a_shared_limiter_keeps_a_tokens_window_across_the_servers_built_over_it`
+and `the_limiter_holds_a_bounded_number_of_windows_and_refuses_past_it`
+in the core.
+
+**The HTTP audit row and both request metrics said `ok` for every
+refused call.** The audit layer keyed the outcome word on the status,
+and the core answers everything it produced with a 200: a call on a
+tool the token does not hold, a schema refusal, the rate limit and a
+plane refusal all audited as `automation.request.ok`. The core now
+reports what a message came to, `server::Outcome`, a closed vocabulary
+(`Silence`, `Ok`, `ToolNotRegistered`, `InvalidParams`, `RateLimited`,
+`Refused(status)`, `Failed`, `ProtocolError`), through
+`McpServer::handle_reporting` and `McpServer::respond`; `handle` is
+unchanged for stdio and the tests. The HTTP handler attaches an
+`McpCallRecord` (tool, declared argument names, outcome) to the
+response, and the audit layer, which is outermost and sees the
+response after the request's extensions are gone, derives the word
+from it: `ok`; `forbidden:<scope>` for a tool the catalogue knows and
+the token does not hold, the same word and scope the read path behind
+that tool writes; `forbidden:unknown_tool`; `refused:invalid_params`,
+`refused:rate_limited`, `refused:protocol_error`; and for a tool that
+ran and whose read the plane refused, the word that status already has
+on every other row. The vocabulary stays the plane's five words, so the
+metric label set does not grow; the four new reasons are in
+`AUTOMATION_AUDIT_REASONS` and in `docs/automation.md`. Guarded by
+`iv2_on_this_binding_a_tool_outside_the_grant_and_a_revoked_token_are_audited_as_refusals`
+through the whole stack, `every_answer_reports_what_it_came_to` in the
+core and `an_mcp_row_takes_its_outcome_from_the_core_and_not_from_the_200`
+on the mapping. One nuance in the finding as stated: the revoked-token
+half of IV2 was already true on this binding, since the bearer gate
+refuses a revoked token with a 401 before the core runs and that row
+said `unauthenticated:token_revoked` already; the test now proves it
+alongside the half that was wrong.
+
+**The asserted tool could be replaced or erased on the HTTP binding.**
+`asserted_clause` read `lorica-asserted-tool` first and `Mcp-Name` raw
+second, so a caller could name a different tool in the row than the one
+the node ran, or send `Mcp-Name` in a Base64 sentinel and leave the row
+with nothing readable. On `MCP_PATH` the audit layer now ignores both
+`lorica-asserted-*` headers entirely. When the core ran, the record
+above carries the tool the body named, which the mirror check proved
+equal to the header, and the declared argument names it carried, and
+the row writes them outside any clause:
+`POST /automation/v1/mcp tool=lorica_logs?limit,search`. The argument
+names are the `Param` vocabulary and never a caller's key, which is the
+AC #6 "arguments after redaction" this binding did not record at all.
+Only a POST the core never saw records the decoded `Mcp-Name`, through
+the same `mirrored` decoder the mismatch check uses, as
+`asserted[tool=...]`. Guarded by
+`the_assertion_headers_cannot_replace_the_tool_the_node_ran_on_this_binding`
+through the whole stack and the two unit tests on the clauses.
+
+**`fence()` rescanned the whole body once per marker depth.** The
+marker grew one `#` at a time and each step ran two `contains` over up
+to 256 KiB, and a WAF row can seed markers at every depth. `fence` is
+now one pass: every occurrence of either marker prefix yields the depth
+it takes (the run of `#` behind it, when closed by the dashes), and the
+answer is the first depth not taken, which is the same marker the loop
+chose for every input. The old loop is kept in the test module as
+`fence_by_rescanning` and
+`the_one_pass_fence_answers_what_the_rescanning_one_did` compares the
+two over the edge cases (a depth taken with no lower one taken, a run
+not closed by dashes, a run longer than the depth under test, markers
+touching). `a_body_seeded_with_every_depth_costs_one_pass_and_not_one_per_depth`
+is the input the old shape paid for, 2000 depths; its timings under
+both shapes are in the Debug Log. The performance report's bound on the
+number of depths was loose: a depth-`k` marker costs about 30 + `k`
+bytes, so a 256 KiB body holds roughly 700 distinct depths, not
+thousands. The fix stands either way.
+
+**A guard that guarded nothing.**
+`the_streamable_http_binding_asserts_nothing_and_needs_no_marker_of_its_own`
+compared two path strings and read no header. It now scans the
+adapter's own source, the house style its siblings in `mcp.rs` use,
+for the two assertion header constants, the transport marker and the
+`lorica-asserted-` spelling, with a positive control on
+`InProcessReads` and `McpCallRecord` so the scan cannot silently read
+the wrong file. Watched failing by adding a reference to
+`TRANSPORT_MARKER` inside `mcp_endpoint`.
+
+**The rest, all from the same audits.** `scope_wire_name` is gone;
+`scope::scope_str` is `pub(super)` and `audit.rs` calls it, one
+spelling and one test. The MCP tool-name grammar is one function,
+`tools::fits_tool_name_grammar` with `tools::TOOL_NAME_MAX_BYTES`, read
+by the catalogue test, by the stdio client and by `audit::assertable`;
+`http::is_assertable_tool` is gone. `jsonrpc::code::INTERNAL_ERROR` is
+removed with the sentence that claimed the server answers with it, and
+`no_code_is_declared_that_this_server_never_answers_with` pins the
+absence. `jsonrpc::unsupported_protocol_version` is the one shape for
+a revision this server does not speak, used by the core and by the
+HTTP adapter, so a client negotiating from
+`error.data.supportedVersions` works on both bindings.
+`is_published_reason` reads the scope spellings from
+`AutomationScope::ALL` through `scope_str` instead of a hand-typed
+block in `AUTOMATION_AUDIT_REASONS`. The stdio client follows no
+redirect and is `https_only`, pinned by a source scan. A route id of
+`.` or `..` is refused before it builds a path, because `%2E` and
+`%2E%2E` are dot segments to a WHATWG URL parser. The request path and
+`User-Agent` are cut to 2048 and 512 bytes on a char boundary before
+they reach a row. `stdio::read_message` applies the ceiling on the
+newline branch too, and its EOF comment now says what the code does.
+`ServerConfig::from_process` reads `args_os` so a non-UTF-8 argument
+is refused rather than printed by a panic. `ReadError`'s `Display`
+quotes at most 512 bytes of a refusal body, for the captive-portal
+case. `examine` hands the core the parsed `Request`, so the HTTP
+binding no longer clones the body's `Value` and parses it twice. Over
+stdio, a call the server refuses by itself now writes one line on
+stderr in the server's own words, since no row on the node can record
+it; `docs/mcp.md` says so. The "nine entries" and "seven scope
+spellings" counts are gone from the comments.
+
+**Recorded as decisions, not done.**
+
+- *A per-answer nonce in the fence marker* (security Low). The marker
+  stays deterministic. The string property holds: the chosen marker
+  occurs nowhere in the body, so the block cannot be closed early; the
+  residual is a model that has learned the unpadded terminator across
+  a session and must honour the notice about inner markers. A nonce
+  needs a CSPRNG, and none is reachable from `lorica-mcp` without a new
+  direct dependency (`rustls` holds one transitively through `reqwest`
+  and exposes no API this crate could call), which needs approval.
+  Revisit on evidence: a real client shown to follow a forged
+  terminator.
+- *A `client` feature flag on `lorica-mcp`* (architecture Low). Not
+  done. It would gate `config`, `http` and `stdio` behind a default-on
+  feature so `lorica-api` links only the core. The dead code is not a
+  hazard and every dependency is already in the tree; a feature is one
+  more thing the CI lists have to agree on.
+- *The four copies of a 256 KiB answer between the handler and the
+  wire* (performance Medium). Measure first, as the report itself says.
+  Not done.
+- *End-user secrets in query strings reach the model* (security
+  Medium). `docs/mcp.md` now says plainly that "no secret leaves" is
+  about Lorica's own secrets, and that request paths with their query
+  strings, client addresses, User-Agents and WAF matched values are
+  text end users and attackers wrote, may carry their own credentials,
+  and cross unredacted because this plane cannot recognise what it
+  would be redacting. Stripping query-string values in the management
+  plane's log pipeline is a behaviour change for the dashboard and a
+  decision, not a fix. **Open.**
+- *The tier has no representation in the code* (architecture Medium,
+  for Story 11.4). `over` is infallible and "the tier" is implicitly
+  the whole catalogue. Story 11.4's one-tier check needs a tier table
+  in `lorica-mcp` and a fallible constructor both bindings run, or the
+  HTTP binding will serve a `logs:read + routes:write` token both tool
+  sets. The overlap rule ("a token whose scopes span two tiers" when
+  the config tier includes read scopes) is undefined and must be
+  written down there. Recorded for 11.4; nothing here.
+- *The in-process read source is a second router that cannot carry a
+  write, and the tool model is GET-shaped* (architecture High and
+  Medium, for Story 11.2). Recorded as a Dev Note in
+  `docs/stories/story-11.2-config-tier.md` with the options the report
+  gives and the recommended one. Nothing structural changed here.
+- *A locally refused stdio call lands no row on the node.* The stderr
+  line is the trace; making the node record it would mean the stdio
+  server calling the plane about a call it refused, which is a design
+  choice not taken.
+- *A group- or world-readable `LORICA_MCP_CONFIG` file* (security
+  Info). No warning added: the file is the operator's, and the check is
+  platform-specific in a crate whose development host is Windows.
+- *Repeated `Mcp-*` headers judged on their first value* (security
+  Info). No change, as the report itself concludes.
 
 ## File List
 
@@ -1607,6 +1908,24 @@ Modified in lot 4:
 - `CHANGELOG.md`, `README.md`
 - `docs/mcp.md`, `docs/automation.md`
 - `docs/stories/story-11.1-mcp-crate-read-tier.md`
+
+Modified in lot 4 (the fix pass):
+
+- `lorica-mcp/src/server.rs`, `.../jsonrpc.rs`, `.../untrusted.rs`,
+  `.../tools.rs`, `.../http.rs`, `.../stdio.rs`, `.../config.rs`,
+  `.../lib.rs`
+- `lorica-api/src/automation/mcp.rs`, `.../audit.rs`, `.../scope.rs`,
+  `.../mod.rs`
+- `lorica-api/src/server.rs` (`AppState::mcp_invocations`), and the
+  `AppState` constructors in `lorica-api/src/tests.rs`,
+  `lorica-api/src/automation_tokens/tests.rs`,
+  `lorica-api/src/oidc_issuers/tests.rs`, `lorica-api/src/acme/tests.rs`,
+  `lorica/src/startup/single.rs`, `lorica/src/startup/supervisor.rs`
+- `lorica-api/tests/mcp_asserted_headers.rs`
+- `CHANGELOG.md`, `README.md`
+- `docs/mcp.md`, `docs/automation.md`
+- `docs/stories/story-11.1-mcp-crate-read-tier.md`,
+  `docs/stories/story-11.2-config-tier.md`
 
 ## Change Log
 
@@ -1769,3 +2088,43 @@ Modified in lot 4:
   probes; one was void and exposed a test that built its sentinel from
   the constant it was meant to guard, now corrected to the literal wire
   shape.
+
+- 2026-09-23: the fix pass over lots 2b, 3 and 4, from five parallel
+  audits (security, architecture, quality, performance, debt) of
+  `1e19c93a`, `cc3a46c8` and `ebcf8874`. **The Streamable HTTP binding
+  had no tool-invocation rate limit** while three documents said the
+  listener's per-IP limiter covered it; the budget is now the token's,
+  a bounded per-`public_id` window held by the process
+  (`AppState::mcp_invocations`, `McpServer::sharing`), on both
+  bindings, and every sentence that claimed otherwise is corrected,
+  the two contradicting `CHANGELOG.md` bullets included. **The HTTP
+  audit row and the request metrics said `ok` for every refused
+  call**, because the core answers everything it produced with a 200;
+  the core now reports an `Outcome` per message, the handler attaches
+  an `McpCallRecord` to the response, and the row and the metrics take
+  their word from it in the plane's existing five-word vocabulary,
+  with `unknown_tool`, `invalid_params`, `rate_limited` and
+  `protocol_error` as the new published reasons. **The asserted tool
+  could be replaced or erased on that binding**; the two
+  `lorica-asserted-*` headers are ignored on the MCP path, the tool
+  the node ran and the declared argument names it carried are written
+  as established, and only a POST the core never saw records the
+  decoded `Mcp-Name` as a claim. **`fence()` is one pass** with the
+  same marker for every input, pinned against the old loop kept as a
+  test reference: 11.36 s against 0.03 s on a body seeded with 2000
+  depths. **The guard that guarded nothing** scans the adapter's
+  source with a positive control. Also: one `scope_str`, one tool-name
+  grammar across the crates, `INTERNAL_ERROR` removed with the
+  sentence that claimed it, one shape for the unsupported-revision
+  refusal on both bindings, scope reasons derived from
+  `AutomationScope::ALL`, no redirect and HTTPS only on the stdio
+  client, `.` and `..` refused as route ids, path and `User-Agent`
+  bounded in the row, the stdio ceiling on both read branches, one
+  parse of the HTTP body instead of two, and a stderr line for a call
+  the stdio server refuses by itself. `docs/mcp.md` now says "no
+  secret leaves" is about Lorica's own secrets and that end-user query
+  strings cross unredacted; redaction there is recorded as open, not
+  done. The in-process seam's inability to carry a write is recorded
+  as a Dev Note in Story 11.2 with the options and a recommendation.
+  `lorica-mcp` went from 65 tests to 74 and `lorica-api` from 885 to
+  894.

@@ -116,12 +116,33 @@ pub enum ReadError {
     },
 }
 
+/// The most bytes of a refusal body [`ReadError`]'s `Display` quotes.
+///
+/// The plane's own error envelope is two short fields. What is being
+/// bounded is the case where the endpoint is not the plane, a captive
+/// portal or a proxy error page, whose megabytes of HTML would
+/// otherwise land whole in the client's MCP log at startup.
+pub const DISPLAYED_BODY_MAX_BYTES: usize = 512;
+
 impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ReadError::Transport(detail) => write!(f, "automation read failed: {detail}"),
             ReadError::Refused { status, body } => {
-                write!(f, "automation read refused with {status}: {body}")
+                let cut = (0..=body.len().min(DISPLAYED_BODY_MAX_BYTES))
+                    .rev()
+                    .find(|end| body.is_char_boundary(*end))
+                    .unwrap_or(0);
+                if cut < body.len() {
+                    write!(
+                        f,
+                        "automation read refused with {status}: {} [and {} more bytes]",
+                        &body[..cut],
+                        body.len() - cut
+                    )
+                } else {
+                    write!(f, "automation read refused with {status}: {body}")
+                }
             }
         }
     }
@@ -252,6 +273,29 @@ mod tests {
 
         let broken = ReadError::Transport("connection reset".to_string());
         assert!(broken.to_string().contains("connection reset"), "{broken}");
+    }
+
+    #[test]
+    fn a_displayed_refusal_quotes_a_bounded_slice_of_a_body_that_is_not_the_planes() {
+        // A captive portal answers megabytes of HTML; the startup
+        // refusal that quotes it goes to the client's MCP log.
+        let portal = ReadError::Refused {
+            status: 302,
+            body: "<html>".repeat(100_000),
+        };
+        let shown = portal.to_string();
+        assert!(
+            shown.len() < DISPLAYED_BODY_MAX_BYTES + 100,
+            "{}",
+            shown.len()
+        );
+        assert!(shown.contains("more bytes"), "{shown}");
+        // And a cut never splits a character.
+        let accented = ReadError::Refused {
+            status: 400,
+            body: "é".repeat(DISPLAYED_BODY_MAX_BYTES),
+        };
+        assert!(accented.to_string().contains("more bytes"));
     }
 
     #[test]

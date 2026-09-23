@@ -58,10 +58,17 @@ pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion
 
 /// JSON-RPC error codes this server answers with.
 ///
-/// The named set is the standard one; the revision's own `-32020`
-/// `HeaderMismatch` belongs to the Streamable HTTP binding and is
-/// declared by the adapter that can raise it, not here, where nothing
-/// reads a header.
+/// Four of the standard five. The fifth, the internal-error code, is
+/// deliberately not here because nothing produces it: a fault of this
+/// server's own while a tool runs is a tool EXECUTION error, carried in
+/// a result with `isError: true` so a model reads it and stops, and a
+/// fault outside any tool ends the session (stdio) or is the
+/// listener's 500 (Streamable HTTP). A constant nothing constructs
+/// would read as a code a client should handle, and it is not one.
+///
+/// The revision's own `-32020` `HeaderMismatch` belongs to the
+/// Streamable HTTP binding and is declared by the adapter that can
+/// raise it, not here, where nothing reads a header.
 pub mod code {
     /// The line was not JSON.
     pub const PARSE_ERROR: i64 = -32700;
@@ -71,9 +78,11 @@ pub mod code {
     pub const METHOD_NOT_FOUND: i64 = -32601;
     /// The method exists and its parameters do not fit it.
     pub const INVALID_PARAMS: i64 = -32602;
-    /// This server broke.
-    pub const INTERNAL_ERROR: i64 = -32603;
 }
+
+/// The error name revision 2026-07-28 gives a protocol version the
+/// server does not implement.
+pub const UNSUPPORTED_PROTOCOL_VERSION: &str = "UnsupportedProtocolVersionError";
 
 /// One well-formed message from a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +201,27 @@ pub fn parse_error() -> Value {
     error(&Value::Null, code::PARSE_ERROR, "the message is not JSON")
 }
 
+/// The answer to a request claiming a protocol revision this server
+/// does not implement: the revision's named error, carrying the
+/// versions it does.
+///
+/// Built here and not in a transport, so both bindings answer the same
+/// condition with the same shape. A client library that negotiates by
+/// reading `error.data.supportedVersions` then works on either.
+pub fn unsupported_protocol_version(id: &Value, supported: &str) -> Value {
+    let mut answer = error(
+        id,
+        code::INVALID_REQUEST,
+        "this server implements one MCP revision and the request named another; \
+         error.data.supportedVersions and server/discover both list what it speaks",
+    );
+    answer["error"]["data"] = json!({
+        "name": UNSUPPORTED_PROTOCOL_VERSION,
+        "supportedVersions": [supported],
+    });
+    answer
+}
+
 impl RequestError {
     /// This refusal as the message that goes back on the wire.
     pub fn into_response(self) -> Value {
@@ -288,5 +318,37 @@ mod tests {
 
         assert_eq!(parse_error()["error"]["code"], json!(code::PARSE_ERROR));
         assert_eq!(parse_error()["id"], Value::Null);
+    }
+
+    #[test]
+    fn an_unsupported_version_is_the_revisions_named_error_with_what_is_supported() {
+        // One shape for both bindings, with the machine-readable list a
+        // client negotiates from. The name is the specification's and
+        // is written out here rather than read from the constant.
+        let refused = unsupported_protocol_version(&json!(5), "2026-07-28");
+        assert_eq!(refused["id"], json!(5));
+        assert_eq!(refused["error"]["code"], json!(code::INVALID_REQUEST));
+        assert_eq!(
+            refused["error"]["data"]["name"],
+            json!("UnsupportedProtocolVersionError")
+        );
+        assert_eq!(
+            refused["error"]["data"]["supportedVersions"],
+            json!(["2026-07-28"])
+        );
+    }
+
+    #[test]
+    fn no_code_is_declared_that_this_server_never_answers_with() {
+        // The module doc says the internal-error code is deliberately
+        // absent. Asserted against the source so the claim cannot rot
+        // into a constant somebody adds for completeness.
+        let source = include_str!("jsonrpc.rs");
+        let body = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !body.contains("32603"),
+            "an internal-error code is declared"
+        );
+        assert!(body.contains("32602"), "the scan is reading the right file");
     }
 }

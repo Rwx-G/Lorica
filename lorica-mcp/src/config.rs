@@ -293,7 +293,14 @@ impl ServerConfig {
     /// Any [`ConfigError`], including [`ConfigError::FileUnreadable`],
     /// which only this entry point can produce.
     pub fn from_process() -> Result<ServerConfig, ConfigError> {
-        let arguments: Vec<String> = std::env::args().skip(1).collect();
+        // `args_os`, not `args`: the latter panics on an argument that
+        // is not UTF-8 and prints it in the panic message, and every
+        // argument is refused anyway, so nothing here needs to read
+        // one. Lossy is enough for a value whose only use is to count.
+        let arguments: Vec<String> = std::env::args_os()
+            .skip(1)
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
         // Read before `assemble` so the file's own failure is reported
         // as itself; an unreadable path must not surface as "no
         // endpoint", which sends an operator to the wrong variable.

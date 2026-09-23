@@ -322,15 +322,17 @@ pub async fn authorize_scope(req: Request, next: Next) -> Result<Response, ApiEr
 }
 
 /// The wire spelling of a scope, matching its serde rename so an
-/// operator reads the same string in the error and in the token.
+/// operator reads the same string in the error, in the audit row and
+/// in the token.
 ///
 /// The vocabulary is owned by the serde renames on `AutomationScope`.
-/// This match restates it for a message an operator reads, and the test
-/// below walks [`AutomationScope::ALL`] to assert the two agree, so a
+/// This match restates it once, for the messages an operator reads
+/// here and in [`super::audit`], and the test below walks
+/// [`AutomationScope::ALL`] to assert it agrees with serde, so a
 /// variant added to the enum stops this file compiling and a variant
 /// spelled differently here fails that test. The other restatements are
 /// named in the comment above the enum.
-fn scope_str(scope: AutomationScope) -> &'static str {
+pub(super) fn scope_str(scope: AutomationScope) -> &'static str {
     match scope {
         AutomationScope::EnvironmentsWrite => "environments:write",
         AutomationScope::EnvironmentsRead => "environments:read",

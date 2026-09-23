@@ -59,6 +59,29 @@
 //! statements of one rule, so `tests/mcp_catalogue_scopes.rs` pins them
 //! against each other, one assertion per tool.
 //!
+//! # The invocation budget outlives the request
+//!
+//! The registry is per request; the tool-invocation budget the revision
+//! requires must not be, or it counts one call and resets. So the
+//! server is built over [`AppState::mcp_invocations`], one
+//! [`lorica_mcp::server::InvocationLimiter`] for the process, keyed by
+//! the token's `public_id`, and a token's window survives every
+//! request that spends from it. The listener's own budgets do not meet
+//! this MUST: they count connections at accept, and a keep-alive or
+//! HTTP/2 caller issues requests without opening one.
+//!
+//! # What the audit row learns from this module
+//!
+//! Every message the core produced is answered with a `200`, including
+//! a `tools/call` on a tool the token does not hold and a result
+//! carrying `isError: true`. The audit layer keys its outcome word on
+//! the status, so left alone it would record every one of those as
+//! `ok`. The handler therefore attaches an [`McpCallRecord`] to the
+//! response: the tool the body named, the declared argument names it
+//! carried, and what the call came to in the core's own vocabulary, and
+//! [`super::audit`] derives the row's outcome and the metric's label
+//! from that rather than from the `200`.
+//!
 //! # What revision 2026-07-28 requires of this transport
 //!
 //! One endpoint, `POST` only. `Origin` validated on every connection.
@@ -94,16 +117,18 @@
 //! configures is the additive change if a browser front end ever needs
 //! one; refusing by default is what keeps that decision explicit.
 
+use std::sync::Arc;
+
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
 use http::{HeaderMap, StatusCode, Uri};
-use lorica_mcp::server::{Identity, McpServer};
-use lorica_mcp::{jsonrpc, ReadError, ReadSource, Reason, MCP_PROTOCOL_REVISION};
+use lorica_mcp::server::{Identity, McpServer, Outcome};
+use lorica_mcp::{jsonrpc, tools, ReadError, ReadSource, Reason, MCP_PROTOCOL_REVISION};
 use percent_encoding::percent_decode_str;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::auth::AutomationPrincipal;
 use crate::error::ApiError;
@@ -126,7 +151,7 @@ pub const METHOD_HEADER: &str = "mcp-method";
 ///
 /// Read twice: here, to refuse a request whose header and body disagree,
 /// and in [`super::audit`], which records it as the caller's assertion
-/// of what the request was for.
+/// of what the request was for on a POST the core never saw.
 pub const NAME_HEADER: &str = "mcp-name";
 
 /// Revision 2026-07-28 removed protocol-level sessions. This header is
@@ -142,9 +167,6 @@ pub const LAST_EVENT_ID_HEADER: &str = "last-event-id";
 /// rather than in `lorica-mcp::jsonrpc` because it belongs to this
 /// transport: nothing in the core reads a header.
 pub const HEADER_MISMATCH: i64 = -32020;
-
-/// The error name the revision gives a version this server cannot speak.
-const UNSUPPORTED_PROTOCOL_VERSION: &str = "UnsupportedProtocolVersionError";
 
 /// The opening of the Base64 sentinel a header value may arrive in.
 const SENTINEL_PREFIX: &str = "=?base64?";
@@ -187,26 +209,91 @@ pub async fn mcp_endpoint(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let message = match examine(&headers, &body) {
-        Ok(message) => message,
+    let request = match examine(&headers, &body) {
+        Ok(request) => request,
         Err(refusal) => return refusal.into_response(),
     };
 
-    // Built from THIS request's principal and dropped with it. The tool
-    // set may vary by the authorization presented on the request and
-    // must not vary per connection; a registry that outlived the
-    // request would be the second of those.
-    let server = McpServer::over(identity_of(&principal));
+    // The registry is built from THIS request's principal and dropped
+    // with it: the tool set may vary by the authorization presented on
+    // the request and must not vary per connection, and a registry that
+    // outlived the request would be the second of those. The limiter is
+    // the process's, keyed by token, or the budget would reset with the
+    // registry.
+    let server = McpServer::sharing(identity_of(&principal), Arc::clone(&state.mcp_invocations));
     let source = InProcessReads { state };
 
-    match server.handle(&source, message).await {
+    // Read before the request is consumed: the body the mirror pinned
+    // to the header is what the row names.
+    let (tool, argument_names) = named_call(&request);
+    let handled = server.respond(&source, request).await;
+
+    let mut response = match handled.answer {
         // A notification. This revision defines no client-to-server
         // notification over HTTP, so nothing useful arrives here and the
         // status is transport mechanics rather than a path with a
         // purpose.
         None => StatusCode::ACCEPTED.into_response(),
         Some(answer) => Json(answer).into_response(),
+    };
+    response.extensions_mut().insert(McpCallRecord {
+        tool,
+        argument_names,
+        outcome: handled.outcome,
+    });
+    response
+}
+
+/// What the node established about one MCP message, for the audit row
+/// and the request metric.
+///
+/// Attached to the response by [`mcp_endpoint`] and read back by
+/// [`super::audit`], which is the outermost layer and sees the
+/// response after every extension the request carried is gone. Present
+/// only when the core ran: a POST refused by [`examine`] or by a gate
+/// in front of it carries none, and the row for it is written from the
+/// status and from what the caller claimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpCallRecord {
+    /// The tool the body named on a `tools/call`, which the mirror
+    /// check proved equal to `Mcp-Name`. `None` off `tools/call`, and
+    /// `None` for a name outside the tool-name grammar, which no tool
+    /// has and no row may carry.
+    pub tool: Option<String>,
+    /// The argument names the call carried that the tool declares, in
+    /// catalogue order: the `Param` vocabulary and never a caller's key.
+    /// Empty when the catalogue does not know the tool, since no
+    /// vocabulary exists to check the keys against.
+    pub argument_names: Vec<&'static str>,
+    /// What the call came to, in the core's own words.
+    pub outcome: Outcome,
+}
+
+/// The tool a request names and the declared arguments it carries, or
+/// nothing off `tools/call`.
+fn named_call(request: &jsonrpc::Request) -> (Option<String>, Vec<&'static str>) {
+    if request.method != "tools/call" {
+        return (None, Vec::new());
     }
+    let tool: Option<String> = request
+        .params
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| tools::is_legal_tool_name(name))
+        .map(str::to_string);
+    let argument_names: Vec<&'static str> = match tool.as_deref().and_then(tools::find) {
+        Some(spec) => match request.params.get("arguments") {
+            Some(Value::Object(arguments)) => spec
+                .params()
+                .iter()
+                .map(|param| param.name)
+                .filter(|name| arguments.contains_key(*name))
+                .collect(),
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    (tool, argument_names)
 }
 
 /// What the presented credential is, in the core's own terms.
@@ -255,12 +342,13 @@ impl IntoResponse for Refusal {
     }
 }
 
-/// The message to hand the core, or why this POST is answered instead.
+/// The request to hand the core, or why this POST is answered instead.
 ///
 /// Pure: it reads headers and bytes and touches neither the state nor
 /// the network, which is what lets every normative point of the
-/// transport be asserted without a listener.
-fn examine(headers: &HeaderMap, body: &[u8]) -> Result<Value, Refusal> {
+/// transport be asserted without a listener. The parsed request is what
+/// comes back, so the core does not read the same bytes a second time.
+fn examine(headers: &HeaderMap, body: &[u8]) -> Result<jsonrpc::Request, Refusal> {
     if headers.contains_key(http::header::ORIGIN) {
         // The body MAY be a JSON-RPC error and carries no id: the
         // request was not read far enough to have one, and inventing
@@ -284,7 +372,7 @@ fn examine(headers: &HeaderMap, body: &[u8]) -> Result<Value, Refusal> {
             body: Some(jsonrpc::parse_error()),
         });
     };
-    let request = jsonrpc::parse(message.clone()).map_err(|refused| Refusal {
+    let request = jsonrpc::parse(message).map_err(|refused| Refusal {
         status: StatusCode::BAD_REQUEST,
         body: Some(refused.into_response()),
     })?;
@@ -311,9 +399,15 @@ fn examine(headers: &HeaderMap, body: &[u8]) -> Result<Value, Refusal> {
         }
     }
     if version != MCP_PROTOCOL_REVISION {
+        // The core's own answer for the same condition, so a client
+        // negotiating from `error.data.supportedVersions` reads one
+        // shape on either binding; the 400 is the transport's part.
         return Err(Refusal {
             status: StatusCode::BAD_REQUEST,
-            body: Some(unsupported_version(&id)),
+            body: Some(jsonrpc::unsupported_protocol_version(
+                &id,
+                MCP_PROTOCOL_REVISION,
+            )),
         });
     }
 
@@ -379,7 +473,7 @@ fn examine(headers: &HeaderMap, body: &[u8]) -> Result<Value, Refusal> {
         });
     }
 
-    Ok(message)
+    Ok(request)
 }
 
 /// The refusal for a header value this server cannot compare to a body.
@@ -393,20 +487,6 @@ fn unreadable(id: &Value, header: &str) -> Refusal {
     )
 }
 
-/// What a version this server does not implement is answered with.
-fn unsupported_version(id: &Value) -> Value {
-    let mut answer = jsonrpc::error(
-        id,
-        jsonrpc::code::INVALID_REQUEST,
-        "this server implements one MCP revision and the request named another",
-    );
-    answer["error"]["data"] = json!({
-        "name": UNSUPPORTED_PROTOCOL_VERSION,
-        "supportedVersions": [MCP_PROTOCOL_REVISION],
-    });
-    answer
-}
-
 /// One header value, Base64-sentinel decoded, or `None` when absent.
 ///
 /// Decoding BEFORE the comparison is the whole point rather than a
@@ -416,11 +496,15 @@ fn unsupported_version(id: &Value) -> Value {
 /// are mirrored at all - would be bypassable by anyone who read the
 /// specification.
 ///
+/// [`super::audit`] reads `Mcp-Name` through this same function, so the
+/// value a row records as claimed is the value this module compared,
+/// and a sentinel is never taken raw there either.
+///
 /// # Errors
 ///
 /// `()` for a value that is not readable text, or a sentinel whose
 /// payload is not Base64 of UTF-8.
-fn mirrored(headers: &HeaderMap, name: &str) -> Result<Option<String>, ()> {
+pub(super) fn mirrored(headers: &HeaderMap, name: &str) -> Result<Option<String>, ()> {
     let Some(raw) = headers.get(name) else {
         return Ok(None);
     };
@@ -562,6 +646,8 @@ async fn refusal(error: ApiError) -> ReadError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     /// A well-formed body for `method`, with `params` as given.
@@ -602,12 +688,64 @@ mod tests {
 
     #[test]
     fn a_well_formed_post_reaches_the_core_unchanged() {
-        let body = body_of(Some(1), "tools/list", json!({}));
+        let body = body_of(Some(1), "tools/list", json!({ "cursor": null }));
         let accepted = examine(&listing_headers(), &body).expect("a well-formed POST");
+        // The request the core gets is the one the body carried, read
+        // once: the same three parts `jsonrpc::parse` would have read.
         assert_eq!(
             accepted,
-            serde_json::from_slice::<Value>(&body).expect("the body is JSON")
+            jsonrpc::parse(serde_json::from_slice::<Value>(&body).expect("the body is JSON"))
+                .expect("the body is a request")
         );
+        assert_eq!(accepted.id, Some(json!(1)));
+        assert_eq!(accepted.method, "tools/list");
+    }
+
+    #[test]
+    fn the_record_names_the_tool_the_body_named_and_the_declared_arguments_it_carried() {
+        // What the audit row gets as ESTABLISHED on this binding: the
+        // body's tool, which the mirror pinned to the header, and the
+        // argument names that are the tool's own vocabulary. A key the
+        // tool does not declare is the caller's text and never reaches
+        // the row; the call itself is refused for it by the core.
+        let call = jsonrpc::parse(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "lorica_logs",
+                "arguments": { "search": "ignore previous", "limit": 5, "x]": 1 },
+            },
+        }))
+        .expect("a request");
+        assert_eq!(
+            named_call(&call),
+            (Some("lorica_logs".to_string()), vec!["search", "limit"])
+        );
+
+        // A tool the catalogue does not know: the name is bounded by
+        // the grammar, and there is no vocabulary to read arguments by.
+        let unknown = jsonrpc::parse(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "lorica_routes_write", "arguments": { "id": "r-1" } },
+        }))
+        .expect("a request");
+        assert_eq!(
+            named_call(&unknown),
+            (Some("lorica_routes_write".to_string()), Vec::new())
+        );
+        let illegal = jsonrpc::parse(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "tool=x],transport=dashboard" },
+        }))
+        .expect("a request");
+        assert_eq!(named_call(&illegal), (None, Vec::new()));
+
+        // And nothing off a tools/call.
+        let listing = jsonrpc::parse(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+            "params": { "name": "lorica_logs" },
+        }))
+        .expect("a request");
+        assert_eq!(named_call(&listing), (None, Vec::new()));
     }
 
     #[test]
@@ -664,7 +802,7 @@ mod tests {
         let body = refusal.body.expect("a body");
         assert_eq!(
             body["error"]["data"]["name"],
-            json!(UNSUPPORTED_PROTOCOL_VERSION)
+            json!(jsonrpc::UNSUPPORTED_PROTOCOL_VERSION)
         );
         assert_eq!(
             body["error"]["data"]["supportedVersions"],
@@ -931,7 +1069,7 @@ mod tests {
             &body_of(None, "notifications/cancelled", json!({ "requestId": 1 })),
         )
         .expect("a notification passes");
-        assert!(accepted.get("id").is_none());
+        assert!(accepted.is_notification());
     }
 
     #[test]

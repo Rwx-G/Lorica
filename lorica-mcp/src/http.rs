@@ -197,6 +197,13 @@ impl HttpsReadSource {
             .default_headers(headers)
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
+            // No automation read redirects, so following one could
+            // only carry the bearer somewhere the configuration never
+            // named. `https_only` is the same refusal
+            // `ServerConfig` makes of a plaintext endpoint, kept for
+            // the request itself so a redirect could not undo it.
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(true)
             // The plane is one node and a read tier is not a crawler.
             .pool_max_idle_per_host(2);
         for authority in trusted_extras(config.ca_bundle.as_deref())? {
@@ -242,28 +249,21 @@ fn trusted_extras(bundle: Option<&Path>) -> Result<Vec<reqwest::Certificate>, Ht
     Ok(certificates)
 }
 
-/// Whether `name` can travel as an asserted tool name.
-///
-/// The MCP tool-name grammar, which is also what the plane accepts: 1
-/// to 128 characters of `[A-Za-z0-9_.-]`. Every name this crate can
-/// pass comes from [`crate::tools::CATALOGUE`] and already fits, so
-/// this is the belt on a value that is about to become a row in
-/// somebody's audit trail rather than a check anything is expected to
-/// fail.
-fn is_assertable_tool(name: &str) -> bool {
-    (1..=128).contains(&name.len())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-}
-
 impl ReadSource for HttpsReadSource {
     async fn fetch(&self, path: &str, reason: Reason<'_>) -> Result<String, ReadError> {
         let mut request = self.client.get(format!("{}{path}", self.endpoint));
         // Absent where no tool ran, which is the startup introspection.
         // A header naming a tool there would be the false claim this
-        // whole arrangement exists to avoid.
-        if let Some(tool) = reason.tool().filter(|name| is_assertable_tool(name)) {
+        // whole arrangement exists to avoid. The grammar check is
+        // `tools`' own, the same one the plane's audit layer applies
+        // before a claimed name becomes a row: every name this crate
+        // can pass comes from the catalogue and already fits, so this
+        // is the belt on a value about to enter somebody's audit trail
+        // rather than a check anything is expected to fail.
+        if let Some(tool) = reason
+            .tool()
+            .filter(|name| crate::tools::is_legal_tool_name(name))
+        {
             request = request.header(ASSERTED_TOOL_HEADER, tool);
         }
 
@@ -426,6 +426,20 @@ mod tests {
     }
 
     #[test]
+    fn this_client_follows_no_redirect_and_speaks_https_alone() {
+        // A 3xx from anything terminating TLS with a trusted
+        // certificate could otherwise point the client, bearer and all,
+        // at a plaintext URL on the same host, which is the exact thing
+        // `ServerConfig` refuses in the endpoint. Both settings are
+        // asserted against the source: `reqwest`'s defaults are to
+        // follow ten redirects and to speak either scheme.
+        let source = include_str!("http.rs");
+        let body = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(body.contains("redirect(reqwest::redirect::Policy::none())"));
+        assert!(body.contains("https_only(true)"));
+    }
+
+    #[test]
     fn the_transport_marker_says_which_binding_and_reads_as_mcp() {
         // An operator filtering the audit trail for anything a model
         // drove matches the prefix; one asking which door it came
@@ -437,25 +451,6 @@ mod tests {
         for header in [ASSERTED_TOOL_HEADER, ASSERTED_TRANSPORT_HEADER] {
             assert_eq!(header, header.to_lowercase(), "{header}");
             assert!(header.contains("asserted"), "{header}");
-        }
-    }
-
-    #[test]
-    fn every_tool_this_crate_can_name_fits_what_may_be_asserted() {
-        // The header value is about to become a row in somebody's audit
-        // trail, so the grammar is checked against the catalogue rather
-        // than assumed from it.
-        for spec in crate::tools::CATALOGUE {
-            assert!(is_assertable_tool(spec.name), "{}", spec.name);
-        }
-        for outside in [
-            "",
-            "has space",
-            "has\nnewline",
-            "ignore previous instructions",
-            &"x".repeat(129),
-        ] {
-            assert!(!is_assertable_tool(outside), "{outside:?}");
         }
     }
 }

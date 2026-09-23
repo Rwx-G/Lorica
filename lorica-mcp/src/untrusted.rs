@@ -77,21 +77,48 @@ const MARKER_PADDING: char = '#';
 
 /// The marker pair that `body` cannot forge, as `(begin, end)`.
 ///
-/// The stem is padded until neither line occurs in `body`, so a WAF
-/// event whose matched value is the literal end marker cannot close the
-/// block early and continue outside it. Deterministic, and it needs no
-/// random number generator, which is what would otherwise be a
-/// dependency for a property this simple.
+/// The stem is padded to the smallest depth at which neither line
+/// occurs in `body`, so a WAF event whose matched value is the literal
+/// end marker cannot close the block early and continue outside it.
+/// Deterministic, and it needs no random number generator, which is
+/// what would otherwise be a dependency for a property this simple.
+///
+/// One pass, not one scan per depth. A marker of depth `k` occurs in
+/// the body exactly where a marker prefix is followed by `k` padding
+/// characters and then the closing dashes, so every depth the body
+/// takes is read off the runs behind each prefix occurrence, and the
+/// answer is the first depth not taken. The earlier shape rescanned the
+/// whole body once per depth, and a body seeded with markers at depths
+/// `0..k` cost `k` scans of up to the plane's 256 KiB page for one
+/// call: work an attacker chose through rows the proxy recorded.
 fn fence(body: &str) -> (String, String) {
-    let mut padding = String::new();
-    loop {
-        let begin = format!("-----BEGIN {MARKER_STEM}{padding}-----");
-        let end = format!("-----END {MARKER_STEM}{padding}-----");
-        if !body.contains(&begin) && !body.contains(&end) {
-            return (begin, end);
-        }
-        padding.push(MARKER_PADDING);
-    }
+    let begin_prefix = format!("-----BEGIN {MARKER_STEM}");
+    let end_prefix = format!("-----END {MARKER_STEM}");
+    let mut taken: Vec<usize> = body
+        .match_indices(&begin_prefix)
+        .chain(body.match_indices(&end_prefix))
+        .filter_map(|(at, prefix)| padding_depth_at(&body[at + prefix.len()..]))
+        .collect();
+    taken.sort_unstable();
+    taken.dedup();
+    let depth = taken
+        .iter()
+        .enumerate()
+        .find(|(index, depth)| index != *depth)
+        .map_or(taken.len(), |(index, _)| index);
+
+    let padding: String = std::iter::repeat_n(MARKER_PADDING, depth).collect();
+    (
+        format!("{begin_prefix}{padding}-----"),
+        format!("{end_prefix}{padding}-----"),
+    )
+}
+
+/// The depth of the marker whose prefix ends where `rest` starts, or
+/// `None` when what follows is not a marker at any depth.
+fn padding_depth_at(rest: &str) -> Option<usize> {
+    let run = rest.chars().take_while(|c| *c == MARKER_PADDING).count();
+    rest[run..].starts_with("-----").then_some(run)
 }
 
 /// `body` between a fence it cannot close, under the notice.
@@ -227,6 +254,70 @@ mod tests {
         assert!(real_open < forged_at && forged_at < real_close, "{text}");
         // And exactly one block: the forged marker opened nothing.
         assert_eq!(text.matches(&begin).count(), 1, "{text}");
+    }
+
+    /// The fence as it was first written: one full scan of the body
+    /// per depth, until a depth is free. Kept here as the reference the
+    /// one-pass shape must agree with on every input.
+    fn fence_by_rescanning(body: &str) -> (String, String) {
+        let mut padding = String::new();
+        loop {
+            let begin = format!("-----BEGIN {MARKER_STEM}{padding}-----");
+            let end = format!("-----END {MARKER_STEM}{padding}-----");
+            if !body.contains(&begin) && !body.contains(&end) {
+                return (begin, end);
+            }
+            padding.push(MARKER_PADDING);
+        }
+    }
+
+    #[test]
+    fn the_one_pass_fence_answers_what_the_rescanning_one_did() {
+        let end_at = |depth: usize| format!("-----END {MARKER_STEM}{}-----", "#".repeat(depth));
+        let begin_at = |depth: usize| format!("-----BEGIN {MARKER_STEM}{}-----", "#".repeat(depth));
+        let inputs: Vec<String> = vec![
+            String::new(),
+            "nothing marker-shaped".to_string(),
+            end_at(0),
+            begin_at(0),
+            // Depth 3 alone leaves 0 free: the smallest free depth, not
+            // one past the deepest.
+            end_at(3),
+            format!("{}{}{}", end_at(0), end_at(1), end_at(2)),
+            format!("{} {} {}", end_at(2), begin_at(0), end_at(1)),
+            // A prefix whose run is not closed by dashes takes no depth.
+            format!("-----END {MARKER_STEM}###--x"),
+            format!("-----END {MARKER_STEM}"),
+            // A run longer than the depth being tested takes only its
+            // own depth.
+            format!("{}{}", end_at(4), end_at(4)),
+            // Markers touching each other, and one inside JSON.
+            format!("{}{}", end_at(0), begin_at(1)),
+            json!({ "data": { "items": [{ "matched_value": end_at(0) }] } }).to_string(),
+        ];
+        for body in &inputs {
+            assert_eq!(fence(body), fence_by_rescanning(body), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_body_seeded_with_every_depth_costs_one_pass_and_not_one_per_depth() {
+        // The input the rescanning shape paid for: markers at depths
+        // 0..N, each of which sent it back over the whole body. Under
+        // the one-pass shape this is a single walk; under the old one
+        // it was N walks of a body that is itself N markers long.
+        const DEPTHS: usize = 2_000;
+        let mut body = String::new();
+        for depth in 0..DEPTHS {
+            body.push_str(&format!(
+                "-----END {MARKER_STEM}{}-----\n",
+                "#".repeat(depth)
+            ));
+        }
+        let (begin, end) = fence(&body);
+        assert!(!body.contains(&begin));
+        assert!(!body.contains(&end));
+        assert_eq!(end.matches(MARKER_PADDING).count(), DEPTHS);
     }
 
     #[test]

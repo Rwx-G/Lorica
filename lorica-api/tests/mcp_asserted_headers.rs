@@ -36,13 +36,15 @@ use lorica_mcp::http::{
     ASSERTED_TRANSPORT_HEADER as EMITTED_TRANSPORT_HEADER, TRANSPORT_MARKER,
 };
 
-/// The bounds `lorica_api::automation::audit::assertable` applies before
-/// a claimed value may become a row.
+/// The bound `lorica_api::automation::audit::assertable` applies to a
+/// claimed transport before it may become a row.
 ///
 /// Restated here because the function is private and the point is the
 /// VALUE, not the function: a marker outside these bounds is dropped
 /// whole, so the row would say nothing about the transport while every
-/// gate stayed green. The test below is the executable case.
+/// gate stayed green. The test below is the executable case. The
+/// character class itself is not restated: both crates read it from
+/// `lorica_mcp::tools::fits_tool_name_grammar`.
 const ASSERTED_TRANSPORT_MAX_BYTES: usize = 32;
 
 #[test]
@@ -72,10 +74,7 @@ fn the_transport_marker_the_mcp_server_asserts_fits_what_this_plane_will_record(
          {TRANSPORT_MARKER}"
     );
     assert!(
-        (1..=ASSERTED_TRANSPORT_MAX_BYTES).contains(&TRANSPORT_MARKER.len())
-            && TRANSPORT_MARKER
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
+        lorica_mcp::tools::fits_tool_name_grammar(TRANSPORT_MARKER, ASSERTED_TRANSPORT_MAX_BYTES),
         "`{TRANSPORT_MARKER}` is outside what lorica-api/src/automation/audit.rs will \
          record, so the assertion would be dropped and the row would say nothing about \
          the transport"
@@ -84,16 +83,47 @@ fn the_transport_marker_the_mcp_server_asserts_fits_what_this_plane_will_record(
 
 #[test]
 fn the_streamable_http_binding_asserts_nothing_and_needs_no_marker_of_its_own() {
-    // The in-process binding does not claim a transport, and that is the
-    // design rather than an omission: the node routed the request to
-    // `MCP_PATH` itself, so the path already in the audit row IS the
-    // transport, established. The stdio binding has no such path - it
-    // reaches `/automation/v1/logs` like any other client - which is
-    // exactly why it has to assert one.
+    // The in-process binding does not claim a transport or a tool, and
+    // that is the design rather than an omission: the node routed the
+    // request to `MCP_PATH` itself, so the path already in the audit
+    // row IS the transport, established, and the handler parsed the
+    // body, so the tool is established too. The stdio binding has no
+    // such path - it reaches `/automation/v1/logs` like any other
+    // client - which is exactly why it has to assert both.
+    //
+    // Asserted against the adapter's own source, the way its siblings
+    // in that module assert that it opens no connection: the assertion
+    // headers, the marker, and the constants that name them may appear
+    // nowhere in the module body. The first version of this test
+    // compared two path strings and would have stayed green while the
+    // adapter started asserting a transport.
+    let source = include_str!("../src/automation/mcp.rs");
+    let body = source.split("#[cfg(test)]").next().unwrap_or(source);
+    for asserting in [
+        EMITTED_TOOL_HEADER,
+        EMITTED_TRANSPORT_HEADER,
+        TRANSPORT_MARKER,
+        "ASSERTED_TOOL_HEADER",
+        "ASSERTED_TRANSPORT_HEADER",
+        "TRANSPORT_MARKER",
+        "lorica-asserted-",
+    ] {
+        assert!(
+            !body.contains(asserting),
+            "`{asserting}` appears in the Streamable HTTP adapter, which asserts nothing"
+        );
+    }
+    // And the scan is worth something: the read source it is about
+    // really is in the module, and so is the constant the audit layer
+    // keys the established row on.
+    assert!(body.contains("impl ReadSource for InProcessReads"));
+    assert!(body.contains("pub struct McpCallRecord"));
+
+    // The row-level half of the same property, which needs no source:
+    // the path is what tells an MCP row from a read row.
     assert_ne!(
         lorica_api::automation::MCP_PATH,
         "/automation/v1/logs",
         "the MCP endpoint and a read path must be distinguishable in a row"
     );
-    assert!(lorica_api::automation::MCP_PATH.ends_with("/mcp"));
 }

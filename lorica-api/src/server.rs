@@ -262,6 +262,12 @@ pub struct AppState {
     /// process. Issuer entries are read from the store per request,
     /// so this holds no trust configuration of its own.
     pub oidc: Arc<crate::automation::OidcVerifier>,
+    /// The MCP tool-invocation windows of the Streamable HTTP binding
+    /// (Story 11.1 AC #9), one per token, for the process. The binding
+    /// builds its protocol core per request, so the budget the MCP
+    /// revision requires has to be held here, where a token's window
+    /// outlives the request that opened it.
+    pub mcp_invocations: Arc<crate::automation::InvocationLimiter>,
 }
 
 impl AppState {

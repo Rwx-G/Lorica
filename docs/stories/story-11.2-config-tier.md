@@ -137,6 +137,72 @@ So the preview is an affordance, not a control. `docs/mcp.md` should
 say that in those terms rather than implying a guarantee the protocol
 cannot make.
 
+### The in-process seam cannot carry a write, and this story must resolve that before its first write tool
+
+Recorded 2026-09-23 from the architecture audit of Story 11.1's lot 4.
+Nothing structural was changed there; this is the constraint the first
+write tool on the Streamable HTTP binding meets.
+
+`InProcessReads` in `lorica-api/src/automation/mcp.rs` is a second,
+hand-written router. It dispatches over `scope.rs`'s path constants to
+`super::read::*` directly, so three tables route the same reads (the
+`.route(...)` literals in `router.rs`, the arms of
+`scope::declaration`, and that `match`), and because it calls the
+handlers rather than the router below its auth layer, the scope matrix
+does not run on the in-process path at all: `McpServer::sharing`'s
+registry filter is the only authorization, and
+`tests/mcp_catalogue_scopes.rs` is what makes that acceptable for a
+closed list of `GET` paths with no principal-dependent logic. The seam
+itself, `ReadSource::fetch(path, reason)`, carries a path and nothing
+else: no method, no body, no principal, no connection info, no headers.
+The one existing automation write handler
+(`environments::put_environment`) needs all five. The pin test compares
+each tool against `required_scope(&Method::GET, ..)` and cannot pin a
+write tool either, so a mis-declared write over this seam would be a
+write-tier privilege escalation guarded by a test that only knows how
+to ask about `GET`.
+
+The options the audit gives, in the order it ranks them:
+
+1. **Route in process instead of dispatching by hand.** Split
+   `build_automation_router` into an inner router (routes plus
+   `authorize_scope`, excluding `MCP_PATH`) and the outer layers (auth,
+   hardening, audit, panic net). The adapter's source builds an
+   `http::Request` carrying the method, path, body, the caller's
+   `AutomationPrincipal` and `ConnectInfo` as extensions, and `oneshot`s
+   it into the inner router. `ReadSource::fetch(path)` becomes
+   `call(method, path, body)` on both implementations. The scope matrix
+   then authorises every in-process call exactly as it does over stdio,
+   the dispatch `match` disappears, the write handlers work unchanged
+   with their per-token checks (`allowed_hostnames`,
+   `allowed_backend_cidrs`) and their own domain audit rows, and the pin
+   test degrades from security boundary to UX guard. Costs one request
+   construction and one middleware pass per tool call, and the inner
+   router must be built once (a `OnceLock` or a field on `AppState`).
+2. **Generalise the seam and grow the dispatch.** Widen `ReadSource`
+   to carry method, body and principal, and extend the hand-written
+   match with the write arms. Every write then lives in four tables,
+   and the only thing between a mis-declared write tool and an
+   unauthorised mutation is the pin test, which has to learn every
+   verb.
+
+The tool model has the same shape problem one level up: `ToolSpec` is
+`GET`-and-query shaped and validates every field, while AC #5 says
+`lorica-mcp` does not reimplement a single field check and route,
+backend and certificate bodies are nested objects `Text` and `Count`
+cannot express. The audit's direction: extend `ToolSpec` with a method
+and an optional body whose `inputSchema` is derived from the plane's
+request schema in `openapi-automation.yaml`, with `lorica-mcp` checking
+only shape, size and the single resource id; declare each mutation
+once and generate its preview and apply tools from it, so AC #3's
+"same arguments" is one declaration; and let the plane own preview as
+a dry-run variant of each write endpoint, declared in the matrix under
+the same scope.
+
+Option 1 is the recommendation. Decide it in lot 1, before the first
+write path is declared, because it changes what the write handlers are
+called through.
+
 ### The cluster case is the interesting one
 
 IV3 wants a config-tier mutation on a control plane to replicate with

@@ -45,13 +45,27 @@
 //! and says why in [`McpServer::startup_notice`], which an adapter puts
 //! where an operator reads it. A server whose every call failed would
 //! be the same fault reported once per call and never explained.
+//!
+//! # The invocation budget is the token's, not the server's
+//!
+//! Revision 2026-07-28 requires a server to rate limit tool
+//! invocations. The budget is spent through an [`InvocationLimiter`]
+//! keyed by the token's `public_id`, and the limiter is a value an
+//! adapter may hold for longer than one server: stdio builds one server
+//! for the life of the process and the limiter lives and dies with it,
+//! while the Streamable HTTP binding builds a server per request and
+//! hands every one of them the same process-wide limiter, so a token's
+//! window survives the request that opened it. A budget that lived on
+//! the server alone would count one call per request on that binding
+//! and refuse nothing, which is what the first cut of it did.
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::jsonrpc::{self, code};
+use crate::jsonrpc::{self, code, Request};
 use crate::tools::{self, ToolSpec};
 use crate::untrusted;
 use crate::{ReadError, ReadSource, Reason, MCP_PROTOCOL_REVISION};
@@ -59,19 +73,32 @@ use crate::{ReadError, ReadSource, Reason, MCP_PROTOCOL_REVISION};
 /// Where the automation plane reports the calling token back to it.
 const WHOAMI_PATH: &str = "/automation/v1/whoami";
 
-/// The most tool invocations this server runs in [`RATE_WINDOW`].
+/// The most tool invocations one token runs in [`RATE_WINDOW`].
 ///
 /// One of the four server MUSTs revision 2026-07-28 puts on tools is to
-/// rate limit invocations. The Streamable HTTP binding inherits the
-/// automation listener's per-IP limiter for its own traffic, but stdio
-/// has no limiter anywhere, so the budget lives in the core where every
-/// invocation passes rather than in one adapter. It bounds a model in a
-/// retry loop, not an operator: an operator reading a log does not make
-/// two calls a second for a minute.
-const RATE_BUDGET: u32 = 120;
+/// rate limit invocations, and the automation listener's own budgets do
+/// not meet it: they count connections at accept, and a keep-alive or
+/// HTTP/2 caller issues requests without opening one. So the budget is
+/// here, in the core, spent per token through an [`InvocationLimiter`]
+/// that both bindings pass through. It bounds a model in a retry loop,
+/// not an operator: an operator reading a log does not make two calls
+/// a second for a minute.
+pub const RATE_BUDGET: u32 = 120;
 
 /// The window [`RATE_BUDGET`] is spent over.
-const RATE_WINDOW: Duration = Duration::from_secs(60);
+pub const RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// The most tokens whose windows one [`InvocationLimiter`] holds.
+///
+/// A window is opened by a token that authenticated, so growing the map
+/// takes a live credential per entry; the ceiling is there so that even
+/// a stream of them cannot choose this process's memory. It is far above
+/// the number of MCP tokens any one node is minted for. When it is
+/// reached, windows that have already elapsed are dropped first, and a
+/// token that still finds no room is refused for that call rather than
+/// given somebody else's window: evicting a live window would hand a
+/// caller holding more tokens than the ceiling a fresh budget per call.
+pub const MAX_TRACKED_TOKENS: usize = 1024;
 
 /// What the automation plane says this server's own token is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,11 +150,134 @@ struct Budget {
     spent: u32,
 }
 
+/// Tool-invocation windows, one per token, for every server built over
+/// it.
+///
+/// See the module documentation for why this is a value of its own
+/// rather than a field the server owns. The lock is held across integer
+/// comparisons and never across an `await`.
+#[derive(Default)]
+pub struct InvocationLimiter {
+    windows: Mutex<HashMap<String, Budget>>,
+}
+
+impl InvocationLimiter {
+    /// A limiter with no window open.
+    pub fn new() -> InvocationLimiter {
+        InvocationLimiter::default()
+    }
+
+    /// Whether one more invocation by `public_id` fits in its current
+    /// window, spending it when it does.
+    ///
+    /// `false` when the window is spent, and also when this token has
+    /// no window yet and [`MAX_TRACKED_TOKENS`] live ones are already
+    /// held: see that constant for why that refuses rather than evicts.
+    pub fn allow(&self, public_id: &str) -> bool {
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        if let Some(budget) = windows.get_mut(public_id) {
+            if now.duration_since(budget.opened) >= RATE_WINDOW {
+                budget.opened = now;
+                budget.spent = 0;
+            }
+            if budget.spent >= RATE_BUDGET {
+                return false;
+            }
+            budget.spent += 1;
+            return true;
+        }
+        if windows.len() >= MAX_TRACKED_TOKENS {
+            windows.retain(|_, budget| now.duration_since(budget.opened) < RATE_WINDOW);
+            if windows.len() >= MAX_TRACKED_TOKENS {
+                return false;
+            }
+        }
+        windows.insert(
+            public_id.to_string(),
+            Budget {
+                opened: now,
+                spent: 1,
+            },
+        );
+        true
+    }
+
+    /// How many tokens currently hold a window.
+    pub fn tracked(&self) -> usize {
+        self.windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+/// What one message came to, in a closed vocabulary an adapter can
+/// audit and count without reading the answer back.
+///
+/// The Streamable HTTP binding answers every message the core produced
+/// with a 200, so a transport that keyed its audit row on the status
+/// would record a refused tool call as a success. This is the fact the
+/// core knows and the answer alone does not always say: a rate-limit
+/// refusal and a plane refusal are both `isError: true` results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// A notification: nothing to answer and nothing ran.
+    Silence,
+    /// The method answered, and a tool that ran succeeded.
+    Ok,
+    /// A `tools/call` naming a tool this server does not register,
+    /// whether the catalogue knows it or not. No read was attempted.
+    ToolNotRegistered,
+    /// The arguments did not fit the declared schema, or `tools/list`
+    /// carried a cursor. No read was attempted.
+    InvalidParams,
+    /// The token is over [`RATE_BUDGET`] in this window, or the limiter
+    /// holds no room for it. No read was attempted.
+    RateLimited,
+    /// The tool ran and the automation plane refused its read with this
+    /// HTTP status.
+    Refused(u16),
+    /// The tool ran and the plane could not be reached, or answered
+    /// something that is not JSON.
+    Failed,
+    /// A message too malformed to place, or one claiming a protocol
+    /// revision this server does not speak.
+    ProtocolError,
+}
+
+impl core::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Outcome::Silence => f.write_str("silence"),
+            Outcome::Ok => f.write_str("ok"),
+            Outcome::ToolNotRegistered => f.write_str("tool_not_registered"),
+            Outcome::InvalidParams => f.write_str("invalid_params"),
+            Outcome::RateLimited => f.write_str("rate_limited"),
+            Outcome::Refused(status) => write!(f, "refused:{status}"),
+            Outcome::Failed => f.write_str("failed"),
+            Outcome::ProtocolError => f.write_str("protocol_error"),
+        }
+    }
+}
+
+/// One message, answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handled {
+    /// What to send back, or `None` for a notification.
+    pub answer: Option<Value>,
+    /// What it came to.
+    pub outcome: Outcome,
+}
+
 /// The protocol core, over the tools this token turned out to allow.
 pub struct McpServer {
     identity: Identity,
     registered: Vec<&'static ToolSpec>,
-    budget: Mutex<Budget>,
+    limiter: Arc<InvocationLimiter>,
 }
 
 impl McpServer {
@@ -153,13 +303,26 @@ impl McpServer {
         Ok(McpServer::over(identity))
     }
 
-    /// The same server, from an identity already known.
+    /// The same server, from an identity already known, with an
+    /// invocation limiter of its own.
     ///
-    /// The seam the Streamable HTTP adapter needs: inside `lorica-api`
-    /// the principal is already on the request and asking `whoami` over
-    /// a socket to learn what the process just authenticated would be
-    /// absurd.
+    /// The shape for one process serving one token: the limiter lives
+    /// as long as the server and nothing else spends from it.
     pub fn over(identity: Identity) -> McpServer {
+        McpServer::sharing(identity, Arc::new(InvocationLimiter::new()))
+    }
+
+    /// The same server, spending its invocations through `limiter`.
+    ///
+    /// The seam the Streamable HTTP adapter needs. Inside `lorica-api`
+    /// the principal is already on the request, so asking `whoami` over
+    /// a socket to learn what the process just authenticated would be
+    /// absurd; and that adapter builds a server per request, so a
+    /// limiter the server owned would count one call and reset. It
+    /// holds one limiter for the process and hands it to every server
+    /// it builds, which is what makes a token's window outlive the
+    /// request that opened it.
+    pub fn sharing(identity: Identity, limiter: Arc<InvocationLimiter>) -> McpServer {
         let registered = tools::CATALOGUE
             .iter()
             .filter(|spec| identity.scopes.iter().any(|held| held == spec.scope))
@@ -167,10 +330,7 @@ impl McpServer {
         McpServer {
             identity,
             registered,
-            budget: Mutex::new(Budget {
-                opened: Instant::now(),
-                spent: 0,
-            }),
+            limiter,
         }
     }
 
@@ -228,21 +388,43 @@ impl McpServer {
     /// a field because the in-process binding holds a different one per
     /// request, while the registry is fixed for the life of the server.
     pub async fn handle<S: ReadSource>(&self, source: &S, message: Value) -> Option<Value> {
-        let request = match jsonrpc::parse(message) {
-            Ok(request) => request,
+        self.handle_reporting(source, message).await.answer
+    }
+
+    /// [`Self::handle`], and what the message came to.
+    ///
+    /// For an adapter that audits or counts: the answer alone does not
+    /// always say whether a tool ran, and a transport that answers every
+    /// produced message with one status cannot tell from the status.
+    pub async fn handle_reporting<S: ReadSource>(&self, source: &S, message: Value) -> Handled {
+        match jsonrpc::parse(message) {
+            Ok(request) => self.respond(source, request).await,
             // A message too malformed to place is answered under a null
             // id rather than swallowed: JSON-RPC prescribes silence for
             // a well-formed notification, and this was not one.
-            Err(refused) => return Some(refused.into_response()),
-        };
+            Err(refused) => Handled {
+                answer: Some(refused.into_response()),
+                outcome: Outcome::ProtocolError,
+            },
+        }
+    }
 
+    /// Answer one request already read out of its envelope.
+    ///
+    /// The entry point for a transport that had to parse the message
+    /// itself before it could let it through, so the same bytes are not
+    /// read twice.
+    pub async fn respond<S: ReadSource>(&self, source: &S, request: Request) -> Handled {
         if request.is_notification() {
             // `notifications/cancelled` is accepted and does nothing: a
             // read tier's calls are one fetch each, so by the time a
             // cancellation could be read the call it names has already
             // answered. The revision permits ignoring a cancellation
             // for a request that is unknown or already complete.
-            return None;
+            return Handled {
+                answer: None,
+                outcome: Outcome::Silence,
+            };
         }
         let id = request.id.clone().unwrap_or(Value::Null);
 
@@ -251,35 +433,45 @@ impl McpServer {
         if request.method != "server/discover" {
             if let Some(claimed) = request.protocol_version() {
                 if claimed != MCP_PROTOCOL_REVISION {
-                    return Some(jsonrpc::error(
-                        &id,
-                        code::INVALID_REQUEST,
-                        &format!(
-                            "this server implements MCP revision {MCP_PROTOCOL_REVISION} and \
-                             no other; server/discover lists what it supports"
-                        ),
-                    ));
+                    return Handled {
+                        answer: Some(jsonrpc::unsupported_protocol_version(
+                            &id,
+                            MCP_PROTOCOL_REVISION,
+                        )),
+                        outcome: Outcome::ProtocolError,
+                    };
                 }
             }
         }
 
-        Some(match request.method.as_str() {
-            "server/discover" => jsonrpc::result(&id, self.discovery()),
+        let (answer, outcome) = match request.method.as_str() {
+            "server/discover" => (jsonrpc::result(&id, self.discovery()), Outcome::Ok),
             "tools/list" => match request.params.get("cursor") {
-                Some(Value::Null) | None => jsonrpc::result(&id, self.tool_list()),
-                Some(_) => jsonrpc::error(
-                    &id,
-                    code::INVALID_PARAMS,
-                    "this server answers its whole tool list in one page and issues no cursor",
+                Some(Value::Null) | None => (jsonrpc::result(&id, self.tool_list()), Outcome::Ok),
+                Some(_) => (
+                    jsonrpc::error(
+                        &id,
+                        code::INVALID_PARAMS,
+                        "this server answers its whole tool list in one page and issues no \
+                         cursor",
+                    ),
+                    Outcome::InvalidParams,
                 ),
             },
             "tools/call" => self.call(source, &id, &request.params).await,
-            _ => jsonrpc::error(
-                &id,
-                code::METHOD_NOT_FOUND,
-                "this server implements server/discover, tools/list and tools/call",
+            _ => (
+                jsonrpc::error(
+                    &id,
+                    code::METHOD_NOT_FOUND,
+                    "this server implements server/discover, tools/list and tools/call",
+                ),
+                Outcome::ProtocolError,
             ),
-        })
+        };
+        Handled {
+            answer: Some(answer),
+            outcome,
+        }
     }
 
     /// What `server/discover` answers.
@@ -296,8 +488,8 @@ impl McpServer {
     /// What `tools/list` answers.
     ///
     /// `resultType: "complete"` and no `nextCursor`: the catalogue is
-    /// nine entries at most and never paginated, so there is no cursor
-    /// to issue and none to honour.
+    /// short and never paginated, so there is no cursor to issue and
+    /// none to honour.
     fn tool_list(&self) -> Value {
         json!({
             "resultType": "complete",
@@ -319,34 +511,54 @@ impl McpServer {
     /// authorization refusal from the plane is on that second channel
     /// deliberately: a model that met it as a protocol error would
     /// reword the call and try again.
-    async fn call<S: ReadSource>(&self, source: &S, id: &Value, params: &Value) -> Value {
+    async fn call<S: ReadSource>(
+        &self,
+        source: &S,
+        id: &Value,
+        params: &Value,
+    ) -> (Value, Outcome) {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
-            return jsonrpc::error(
-                id,
-                code::INVALID_PARAMS,
-                "tools/call takes the tool's `name`",
+            return (
+                jsonrpc::error(
+                    id,
+                    code::INVALID_PARAMS,
+                    "tools/call takes the tool's `name`",
+                ),
+                Outcome::InvalidParams,
             );
         };
         let Some(spec) = self.registered.iter().find(|spec| spec.name == name) else {
-            return jsonrpc::error(id, code::METHOD_NOT_FOUND, &self.why_not(name));
+            return (
+                jsonrpc::error(id, code::METHOD_NOT_FOUND, &self.why_not(name)),
+                Outcome::ToolNotRegistered,
+            );
         };
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
         let path = match spec.path_for(&arguments) {
             Ok(path) => path,
-            Err(refused) => return jsonrpc::error(id, code::INVALID_PARAMS, &refused.message),
+            Err(refused) => {
+                return (
+                    jsonrpc::error(id, code::INVALID_PARAMS, &refused.message),
+                    Outcome::InvalidParams,
+                )
+            }
         };
 
-        if !self.within_budget() {
-            return jsonrpc::result(
-                id,
-                untrusted::execution_error(
-                    &format!(
-                        "This server runs at most {RATE_BUDGET} tool calls a minute and this \
-                         one is over that. Wait before calling again, and narrow the read \
-                         with its filters rather than paging through everything."
+        if !self.limiter.allow(&self.identity.public_id) {
+            return (
+                jsonrpc::result(
+                    id,
+                    untrusted::execution_error(
+                        &format!(
+                            "This server runs at most {RATE_BUDGET} tool calls a minute per \
+                             token and this one is over that. Wait before calling again, and \
+                             narrow the read with its filters rather than paging through \
+                             everything."
+                        ),
+                        None,
                     ),
-                    None,
                 ),
+                Outcome::RateLimited,
             );
         }
 
@@ -355,22 +567,37 @@ impl McpServer {
         // own name and never the caller's string: `spec` was found by
         // matching against the catalogue, so an unknown name never
         // reaches here.
-        let answered = match source.fetch(&path, Reason::Tool(spec.name)).await {
-            Ok(body) => untrusted::answer(&body),
-            Err(ReadError::Refused { status, body }) => untrusted::execution_error(
-                &format!(
-                    "Lorica's automation plane refused this read with HTTP {status}. Its \
-                     answer follows as data. This is the plane's decision about the token \
-                     this server holds; calling again will not change it."
+        let (answered, outcome) = match source.fetch(&path, Reason::Tool(spec.name)).await {
+            Ok(body) => {
+                let answered = untrusted::answer(&body);
+                let outcome = if answered["isError"] == json!(true) {
+                    Outcome::Failed
+                } else {
+                    Outcome::Ok
+                };
+                (answered, outcome)
+            }
+            Err(ReadError::Refused { status, body }) => (
+                untrusted::execution_error(
+                    &format!(
+                        "Lorica's automation plane refused this read with HTTP {status}. Its \
+                         answer follows as data. This is the plane's decision about the token \
+                         this server holds; calling again will not change it."
+                    ),
+                    Some(&body),
                 ),
-                Some(&body),
+                Outcome::Refused(status),
             ),
-            Err(ReadError::Transport(detail)) => untrusted::execution_error(
-                "Lorica's automation plane could not be reached. The reason follows as data.",
-                Some(&detail),
+            Err(ReadError::Transport(detail)) => (
+                untrusted::execution_error(
+                    "Lorica's automation plane could not be reached. The reason follows as \
+                     data.",
+                    Some(&detail),
+                ),
+                Outcome::Failed,
             ),
         };
-        jsonrpc::result(id, answered)
+        (jsonrpc::result(id, answered), outcome)
     }
 
     /// Why a tool the catalogue knows is not on this server.
@@ -388,23 +615,6 @@ impl McpServer {
             // The name is the caller's text and is not repeated back.
             None => "no tool by that name exists; call tools/list for the ones that do".to_string(),
         }
-    }
-
-    /// Whether this invocation fits in the current window.
-    fn within_budget(&self) -> bool {
-        let mut budget = self
-            .budget
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if budget.opened.elapsed() >= RATE_WINDOW {
-            budget.opened = Instant::now();
-            budget.spent = 0;
-        }
-        if budget.spent >= RATE_BUDGET {
-            return false;
-        }
-        budget.spent += 1;
-        true
     }
 }
 
@@ -847,6 +1057,17 @@ mod tests {
             refused["error"]["code"],
             json!(jsonrpc::code::INVALID_REQUEST)
         );
+        // The revision's named error with the machine-readable list,
+        // the same shape the Streamable HTTP binding answers, so a
+        // client negotiating from `supportedVersions` works on both.
+        assert_eq!(
+            refused["error"]["data"]["name"],
+            json!(jsonrpc::UNSUPPORTED_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            refused["error"]["data"]["supportedVersions"],
+            json!([MCP_PROTOCOL_REVISION])
+        );
 
         // Discovery is how a client learns what is supported, so
         // refusing it on version grounds would be circular.
@@ -863,8 +1084,8 @@ mod tests {
     #[tokio::test]
     async fn tool_invocations_are_rate_limited_and_the_limit_is_an_execution_error() {
         // The third of the revision's four server MUSTs on tools. The
-        // HTTP binding inherits the listener's per-IP limiter; stdio
-        // has none, so the budget lives here where both pass.
+        // budget lives here, in the core, where both bindings pass:
+        // the listener's own budgets count connections, not calls.
         let plane = Plane::carrying(&["logs:read"]);
         let server = server_for(&plane).await;
         let call = |n: i64| request(n, "tools/call", json!({ "name": "lorica_logs" }));
@@ -877,9 +1098,10 @@ mod tests {
             assert_eq!(answered["result"]["isError"], json!(false), "call {n}");
         }
         let over = server
-            .handle(&plane, call(i64::from(RATE_BUDGET)))
-            .await
-            .expect("a request is answered");
+            .handle_reporting(&plane, call(i64::from(RATE_BUDGET)))
+            .await;
+        assert_eq!(over.outcome, Outcome::RateLimited);
+        let over = over.answer.expect("a request is answered");
         assert_eq!(over["result"]["isError"], json!(true));
         assert!(over["result"]["content"][0]["text"]
             .as_str()
@@ -887,6 +1109,151 @@ mod tests {
         // And the read never happened: one whoami plus the calls that
         // fitted in the budget.
         assert_eq!(plane.asked_for().len(), 1 + RATE_BUDGET as usize);
+    }
+
+    #[tokio::test]
+    async fn a_shared_limiter_keeps_a_tokens_window_across_the_servers_built_over_it() {
+        // The Streamable HTTP binding builds a server per request. A
+        // budget the server owned counted one call and reset, which is
+        // what the first cut of that binding did; the budget is the
+        // token's, so a fresh server over the same limiter and the
+        // same token finds the window already spent.
+        let plane = Plane::carrying(&["logs:read"]);
+        let limiter = Arc::new(InvocationLimiter::new());
+        let identity = Identity {
+            public_id: "0123456789abcdef01234567".to_string(),
+            scopes: vec!["logs:read".to_string()],
+        };
+        let call = |n: i64| request(n, "tools/call", json!({ "name": "lorica_logs" }));
+
+        for n in 0..i64::from(RATE_BUDGET) {
+            let fresh = McpServer::sharing(identity.clone(), Arc::clone(&limiter));
+            let handled = fresh.handle_reporting(&plane, call(n)).await;
+            assert_eq!(handled.outcome, Outcome::Ok, "call {n}");
+        }
+        let fresh = McpServer::sharing(identity.clone(), Arc::clone(&limiter));
+        let over = fresh
+            .handle_reporting(&plane, call(i64::from(RATE_BUDGET)))
+            .await;
+        assert_eq!(over.outcome, Outcome::RateLimited);
+
+        // Keyed by token: another token over the same limiter has its
+        // own window and is not refused for this one's spending.
+        let other = McpServer::sharing(
+            Identity {
+                public_id: "fedcba9876543210fedcba98".to_string(),
+                scopes: vec!["logs:read".to_string()],
+            },
+            Arc::clone(&limiter),
+        );
+        let allowed = other.handle_reporting(&plane, call(1)).await;
+        assert_eq!(allowed.outcome, Outcome::Ok);
+        assert_eq!(limiter.tracked(), 2);
+    }
+
+    #[test]
+    fn the_limiter_holds_a_bounded_number_of_windows_and_refuses_past_it() {
+        // A window is opened per authenticated token, so growing the
+        // map takes a live credential per entry; the ceiling is there
+        // so that even a stream of them cannot choose this process's
+        // memory. Past it, a token with no window is refused rather
+        // than handed somebody else's: evicting a live window would
+        // give a caller holding more tokens than the ceiling a fresh
+        // budget per call.
+        let limiter = InvocationLimiter::new();
+        for n in 0..MAX_TRACKED_TOKENS {
+            assert!(limiter.allow(&format!("token-{n}")), "token-{n}");
+        }
+        assert_eq!(limiter.tracked(), MAX_TRACKED_TOKENS);
+        assert!(!limiter.allow("one-too-many"));
+        assert_eq!(limiter.tracked(), MAX_TRACKED_TOKENS);
+        // A token already holding a window keeps spending it.
+        assert!(limiter.allow("token-0"));
+    }
+
+    #[tokio::test]
+    async fn every_answer_reports_what_it_came_to() {
+        // The vocabulary an adapter audits from. The HTTP binding
+        // answers every produced message with a 200, so this is what
+        // lets its audit row and its metric say `forbidden` for a tool
+        // the token does not hold rather than `ok`.
+        let plane = Plane::carrying(&["logs:read"]);
+        let server = server_for(&plane).await;
+
+        let cases: Vec<(Value, Outcome)> = vec![
+            (
+                json!({ "jsonrpc": "2.0", "method": "notifications/cancelled" }),
+                Outcome::Silence,
+            ),
+            (request(1, "tools/list", json!({})), Outcome::Ok),
+            (
+                request(2, "tools/call", json!({ "name": "lorica_logs" })),
+                Outcome::Ok,
+            ),
+            (
+                request(3, "tools/call", json!({ "name": "lorica_certificates" })),
+                Outcome::ToolNotRegistered,
+            ),
+            (
+                request(4, "tools/call", json!({ "name": "no such tool" })),
+                Outcome::ToolNotRegistered,
+            ),
+            (
+                request(
+                    5,
+                    "tools/call",
+                    json!({ "name": "lorica_logs", "arguments": { "limit": 0 } }),
+                ),
+                Outcome::InvalidParams,
+            ),
+            (
+                request(6, "tools/list", json!({ "cursor": "abc" })),
+                Outcome::InvalidParams,
+            ),
+            (
+                request(
+                    7,
+                    "tools/list",
+                    json!({ "_meta": { jsonrpc::META_PROTOCOL_VERSION: "2025-11-25" } }),
+                ),
+                Outcome::ProtocolError,
+            ),
+            (
+                json!({ "id": 8, "method": "tools/list" }),
+                Outcome::ProtocolError,
+            ),
+        ];
+        for (message, expected) in cases {
+            let handled = server.handle_reporting(&plane, message.clone()).await;
+            assert_eq!(handled.outcome, expected, "{message}");
+            assert_eq!(handled.answer.is_none(), expected == Outcome::Silence);
+        }
+
+        // The plane's refusal keeps its status, so an adapter that IS
+        // the plane can file it under the outcome word that status
+        // already has on every other row.
+        let refusing = Plane::carrying(&["logs:read"]).answering(Answer::Refused(
+            403,
+            "{\"error\":{\"message\":\"refused\"}}",
+        ));
+        let server = server_for(&refusing).await;
+        let handled = server
+            .handle_reporting(
+                &refusing,
+                request(9, "tools/call", json!({ "name": "lorica_logs" })),
+            )
+            .await;
+        assert_eq!(handled.outcome, Outcome::Refused(403));
+
+        let broken = Plane::carrying(&["logs:read"]).answering(Answer::Broken("reset"));
+        let server = server_for(&broken).await;
+        let handled = server
+            .handle_reporting(
+                &broken,
+                request(10, "tools/call", json!({ "name": "lorica_logs" })),
+            )
+            .await;
+        assert_eq!(handled.outcome, Outcome::Failed);
     }
 
     #[tokio::test]
