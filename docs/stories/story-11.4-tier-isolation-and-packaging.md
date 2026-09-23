@@ -116,6 +116,19 @@ once. AC #4 of Story 11.3 asks the hardening guide to recommend
 removing the admin tier after the task that needed it; this story is
 where that guidance actually lands.
 
+### What the existing e2e suite does and does not cover, measured
+
+On 2026-09-23, after lots 2a to 4 of Story 11.1 landed, the Docker
+suite (base, cluster, restart, automation and revocation phases) passed
+at 553 assertions and zero failures, the same 553 it passed before any
+of those lots existed. That is evidence of two things at once. Nothing
+already covered broke: the whoami scope change, the nine read paths,
+the MCP endpoint and the new audit row shape coexist with every
+existing assertion. And none of the new surface is covered: the count
+did not move because the automation smoke never calls a read path or
+the MCP endpoint. AC #4 is therefore the first end-to-end exercise of
+the whole read tier, not a regression net over one that exists.
+
 ## Dev Agent Record
 
 ### Debug Log
