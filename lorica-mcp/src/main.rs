@@ -52,16 +52,45 @@
 //!
 //! # What this binary does today
 //!
-//! It reports its identity and exits. The configuration intake, the
-//! JSON-RPC core, the startup introspection and the read tools are the
-//! remaining lots of Story 11.1; nothing here pretends to be them.
+//! It reads its configuration and reports what it found, then exits.
+//! That is the whole of AC #1 at the boundary where it matters: a
+//! process started with arguments refuses to start, and the token is
+//! only ever read from the environment or from a file.
+//!
+//! What it does NOT do yet is speak the protocol over stdin and
+//! stdout. The stdio adapter and the HTTPS [`lorica_mcp::ReadSource`]
+//! it drives are lot 3 of Story 11.1; the core they will run
+//! ([`lorica_mcp::McpServer`]) is complete and nothing here stands in
+//! for the transport.
 
-use lorica_mcp::MCP_PROTOCOL_REVISION;
+use std::process::ExitCode;
 
-fn main() {
-    println!(
-        "{} {} (MCP protocol revision {MCP_PROTOCOL_REVISION})",
+use lorica_mcp::{ServerConfig, MCP_PROTOCOL_REVISION};
+
+/// Refused configuration.
+///
+/// Separate from a protocol failure so a client launching this as a
+/// subprocess can tell "you configured me wrongly" from "I broke",
+/// which are fixed in different places.
+const EXIT_MISCONFIGURED: u8 = 78;
+
+fn main() -> ExitCode {
+    let config = match ServerConfig::from_process() {
+        Ok(config) => config,
+        Err(refused) => {
+            // stderr, never stdout: stdout carries MCP messages and
+            // nothing else once the adapter lands, and a client is told
+            // to read nothing into stderr.
+            eprintln!("lorica-mcp: {refused}");
+            return ExitCode::from(EXIT_MISCONFIGURED);
+        }
+    };
+
+    eprintln!(
+        "{} {} (MCP protocol revision {MCP_PROTOCOL_REVISION}) configured against {}",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
+        config.endpoint,
     );
+    ExitCode::SUCCESS
 }

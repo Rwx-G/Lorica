@@ -3365,6 +3365,14 @@ dependencies = [
 [[package]]
 name = "lorica-mcp"
 version = "1.8.0"
+dependencies = [
+ "lorica-config",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
 
 [[package]]
 name = "lorica-memory-cache"

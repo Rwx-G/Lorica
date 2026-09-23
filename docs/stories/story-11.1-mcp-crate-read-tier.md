@@ -214,22 +214,22 @@ have to exist before a client of them means anything.
       here too, ahead of the lot it serves, because it is free while
       the crate is empty. See the Completion Notes.
 
-- [ ] AC #1, the rest: configuration intake, endpoint and token from
+- [x] AC #1, the rest: configuration intake, endpoint and token from
       environment or config file, and a refusal with a clear message if
       either arrives on argv.
-- [ ] The protocol core: JSON-RPC framing, `server/discover`,
+- [x] The protocol core: JSON-RPC framing, `server/discover`,
       `tools/list`, `tools/call`, error mapping. Transport-agnostic, no
       I/O in it. **Not `initialize`**: that method belongs to the eras
       this revision replaced, and the Dev Note "What revision
       2026-07-28 actually requires" has the normative detail read from
       the specification rather than from the PRD.
-- [ ] AC #3: startup introspection against `whoami`, tool registration
+- [x] AC #3: startup introspection against `whoami`, tool registration
       from the returned scopes, and the no-scope case that produces a
       server with no tools and says why.
-- [ ] AC #4: the read tools, each one paginated with a hard row cap.
-- [ ] AC #5: the secret-name sweep over every tool's output, as a test
+- [x] AC #4: the read tools, each one paginated with a hard row cap.
+- [x] AC #5: the secret-name sweep over every tool's output, as a test
       that walks the field names rather than a review promise.
-- [ ] AC #7: the untrusted-text field, its delimiters, and the tool
+- [x] AC #7: the untrusted-text field, its delimiters, and the tool
       descriptions that say what it is. It lives in the shared core, so
       a tool added later gets it by construction.
 
@@ -684,6 +684,104 @@ restored byte-exact (md5 checked before and after):
 - the field-name pin failed on its first run by construction, listing
   all 139 names the surface answers; the committed list is that output.
 
+Lot 2, second half (the protocol core and the read tools), 2026-09-23.
+Gates run in `rust:1-bookworm` with `RUSTFLAGS=-D warnings` unless
+noted:
+
+- `cargo fmt --all -- --check` on the Windows host: clean (it needed
+  one pass of `cargo fmt --all` first, on the five new files).
+- `cargo build -p lorica-mcp`: clean.
+- `cargo test -p lorica-mcp`: 48 passed, 0 failed. The crate went from
+  2 tests to 48.
+- `cargo test -p lorica-config -p lorica-api`: 853 + 495 unit, 3 in
+  `tests/automation_scope_fixture.rs`, 4 in `tests/openapi_contract.rs`,
+  8 + 18 doctests. 0 failed, unchanged from the fix pass as expected:
+  nothing outside `lorica-mcp/` was touched.
+- `cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings`: clean.
+- `git ls-files --eol -o --exclude-standard lorica-mcp`: `w/lf` on all
+  five new files, and `i/lf w/lf` on the four already tracked. Checked
+  this way and not with the `awk` recipe, which reports 0 on CRLF files
+  on this host.
+- `README.md`'s product-crate test count, recomputed with the
+  `docs/BUMP-CHECKLIST.md` recipe rather than incremented by hand:
+  2694 -> 2740.
+
+`cargo audit`: run, because `lorica-mcp/Cargo.toml` gained entries and
+`Cargo.lock` changed. Exit 0 over 651 crate dependencies, no
+vulnerability, and the same two allowed unmaintained warnings the
+cycle already carries (`RUSTSEC-2024-0388` on `derivative`,
+`RUSTSEC-2025-0134` on `rustls-pemfile`). The `Cargo.lock` diff is
+eight lines naming the four runtime crates and the one dev crate under
+`lorica-mcp`: no `[[package]]` entry was added and no version moved
+anywhere, which is why the advisory result cannot differ from the
+previous run and why none of these is a new dependency in the sense
+the project forbids without approval. Run in a container with its own
+target directory rather than the shared `lorica-target` volume: with
+`CARGO_TARGET_DIR` pointed at the volume, `cargo install cargo-audit`
+contends with every other `cargo` in this session for the same lock
+and stalled for forty minutes on a link step.
+
+**Every new test was watched failing before it was watched passing.**
+Each property was removed from the tree with a one-line substitution,
+the named test run, and the tree restored from a pristine copy checked
+with `md5sum` before and after. Eighteen probes, seventeen of which
+introduced the defect they meant to (the eighteenth, a `sed` over an
+arm containing `&id`, was void because `&` is the whole match in a
+`sed` replacement; `discovery_names_the_one_revision_this_crate_implements`
+is therefore covered by `initialize` answering `METHOD_NOT_FOUND` in
+the same test rather than by a probe). What failed, and how:
+
+- the argv refusal removed: `an_argument_refuses_the_start_and_says_where_the_token_goes_instead`
+  built a configuration out of `--token <secret>` rather than refusing.
+- the token character check removed: `a_token_that_cannot_travel_in_a_header_is_refused_without_being_quoted`
+  accepted a token carrying a newline.
+- the scope filter in `McpServer::over` replaced by `true`: both
+  `the_server_asks_what_its_token_can_do_before_it_offers_anything` and
+  `a_token_carrying_no_scope_of_this_tier_starts_with_no_tools_and_says_why`
+  failed, the second registering nine tools for a token carrying only
+  `environments:write`.
+- the numeric range check removed: `a_value_outside_its_declaration_is_refused_before_it_reaches_the_plane`
+  let `limit=201` and `status=600` reach a built path.
+- the percent-encoding removed: `a_resource_id_is_one_encoded_segment_and_cannot_move_the_read`
+  built `/automation/v1/sla/routes/../../whoami`.
+- a `secret_hmac` key added to the `server/discover` result:
+  `no_answer_this_server_builds_carries_a_credential_field_name` drove
+  it immediately, which is the property a hand-listed sweep could not
+  have.
+- the untrusted notice dropped from `ToolSpec::description`:
+  `every_tool_description_states_that_the_delimited_text_is_data`
+  failed on every tool.
+- the fence suffix pinned rather than grown:
+  `a_payload_that_spells_the_marker_cannot_close_the_block` found the
+  forged END marker closing the block early, with the rest of the
+  payload outside it.
+- `delimited` bypassed in `answer`: `the_server_writes_no_prose_but_its_own_notice`
+  failed with no block to find.
+- `isError` flipped to false in `execution_error`:
+  `an_authorization_refusal_is_an_execution_error_and_not_a_protocol_one`
+  failed, which is the flag a model reads to stop.
+- the invocation budget removed: `tool_invocations_are_rate_limited_and_the_limit_is_an_execution_error`
+  ran past 120 calls.
+- `logs:read` misspelled as `log:read` in the catalogue:
+  `every_scope_the_catalogue_names_is_one_the_token_model_declares`
+  failed, which is the cross-crate edge this crate would otherwise
+  carry silently.
+- the notification guard removed: `a_notification_is_answered_by_silence`
+  got a `METHOD_NOT_FOUND` response to a `notifications/cancelled`.
+- the blank-variable filter removed:
+  `a_file_carries_them_when_the_environment_does_not_and_loses_when_it_does`
+  let an environment variable set to the empty string shadow the
+  file's value.
+- the self-decided refusal fenced anyway:
+  `a_failure_this_server_decided_by_itself_fences_nothing` found the
+  notice above an empty block, which tells a model that silence is
+  data.
+- `PAGINATION` appended twice in `ToolSpec::params`:
+  `every_input_schema_is_an_object_that_admits_nothing_undeclared`
+  failed on the name-uniqueness assertion, which is what stops a
+  filter that shares a name with a window argument from travelling
+  twice in one query string.
+
 ### Completion Notes
 
 **The third state is a type, not a sentinel scope.** `required_scope`
@@ -952,6 +1050,139 @@ either (inherited from Story 10.3). Neither is deferred debt from this
 story's own work; both are raised here so the next lot starts from a
 true picture.
 
+---
+
+Lot 2, second half, 2026-09-23. `lorica-api` was not touched: this half
+is entirely inside `lorica-mcp/`.
+
+**Five modules, and the boundary each one holds.** `config.rs` is
+AC #1, `jsonrpc.rs` the envelope, `untrusted.rs` AC #7, `tools.rs`
+AC #4 and `server.rs` AC #3 plus the dispatch. `lib.rs` keeps the fetch
+seam the fix pass landed and now names where each acceptance criterion
+lives, so the next reader does not have to grep for it.
+
+**AC #7 is the only way out, not a rule to follow.** The Dev Notes say
+the regression to expect is a tool added later that formats its own
+prose summary of a log row. A tool here cannot: `ToolSpec` is DATA, not
+code. It has a name, a scope, a path and a parameter list, and no body.
+The most a tool produces is a path; `untrusted::answer` and
+`untrusted::execution_error` are the only two constructors of a
+`tools/call` result in the crate and both take bytes that came from
+outside, never a sentence a tool wrote.
+`ToolSpec::description` appends `untrusted::NOTICE`
+and `ToolSpec::definition` attaches `untrusted::output_schema`, so a
+tool written in Story 11.2 carries the marking without its author
+knowing the module exists.
+
+The fence is grown, not fixed. `untrusted::fence` pads the marker stem
+until neither marker occurs in the body, so a WAF matched value that
+spells the END marker is inside the block rather than closing it. That
+is deterministic and needs no RNG, which would have been a dependency
+for a property this simple.
+
+`structuredContent` carries the plane's body verbatim under ONE key
+named `untrusted`, whose schema description is the same notice. The
+page envelope is Lorica's own and trustworthy and it still sits under
+that key: a boundary drawn INSIDE the answer is a boundary somebody has
+to keep drawing correctly, and over-marking costs a consumer one level
+of nesting.
+
+**The two error channels are wired the way the Dev Notes require.** An
+unknown tool, an unknown method, a malformed request and arguments that
+do not fit the declared schema are JSON-RPC errors: no tool ran. From
+the fetch onwards everything is a normal result with `isError: true`,
+including the plane's 403, so a model reads the refusal and stops
+instead of rewording the call. The prose above each fence is this
+server's own constant sentence; the plane's own words go inside the
+fence, because its 404 and 400 messages are shaped by what the caller
+asked for.
+
+**Nothing echoes the caller's text.** A rejected argument name, a
+rejected value, an unknown tool name: none of them is repeated into a
+message this server generates. The reader of those messages is the one
+party that acts on them, so the rule AC #7 states about row text is
+applied to argument text as well. The refusals name the declared
+vocabulary instead, which is what a client actually needs.
+
+**AC #3's registry is built once and never reconsulted.**
+`McpServer::introspect` fetches `whoami`, and `McpServer::over` filters
+the catalogue by the scopes it reported. There is no path that re-reads
+scopes on a running server, which is what keeps Story 11.4's
+one-process-one-tier check cheap. `over` is public because the
+Streamable HTTP adapter has the principal on the request already and
+asking `whoami` over a socket to learn what the process just
+authenticated would be absurd.
+
+The no-tool case is a token carrying scopes none of which this tier
+uses, as the Dev Notes require, never a scopeless one.
+`startup_notice()` names the token's `public_id`, what it carries, what
+the tier uses and what to do. It is written for the operator reading
+stderr and an adapter must not put it in a tool answer. The token's
+operator-facing NAME is deliberately not kept on `Identity`: the id is
+what somebody withdraws by, and the name is operator-authored text with
+nowhere safe to go.
+
+**A dependency decision, and why it is not a new dependency.** The four
+runtime crates (`serde`, `serde_json`, `toml`, `percent-encoding`) are
+each already in `Cargo.lock` at the version a sibling pins, and
+`Cargo.lock`'s diff is eight lines naming them under `lorica-mcp` with
+no version moving anywhere. `lorica-config` is a DEV dependency only:
+it is what lets `every_scope_the_catalogue_names_is_one_the_token_model_declares`
+parse this crate's seven scope strings back into `AutomationScope` and
+diff the complement, closing the edge
+`.claude/rules/derived-not-transcribed.md` is about, without putting
+bundled SQLite in the dependency graph of a stdio subprocess that reads
+no database. No MCP SDK, per D5.
+
+**A rate limiter landed here rather than in an adapter.** Revision
+2026-07-28 puts four server MUSTs on tools and the third is to rate
+limit invocations; the Dev Notes record that the HTTP binding inherits
+the listener's per-IP limiter and stdio has no limiter at all. The
+budget is in the core, where every invocation of either binding passes,
+rather than in the one adapter that lacks one. 120 calls a minute
+bounds a model in a retry loop and not an operator reading a log, and
+going over is an execution error so the model sees it.
+
+**The `_meta` key spelling, corrected against the specification.** It
+was first written `io.modelcontextprotocol/protocol-version` and
+flagged as unverified. The specification spells it
+**`io.modelcontextprotocol/protocolVersion`**, camelCase, and is
+explicit about it: the Streamable HTTP binding requires the
+`MCP-Protocol-Version` header to equal "the
+`io.modelcontextprotocol/protocolVersion` field carried in the request
+body's `_meta`". `jsonrpc::META_PROTOCOL_VERSION` now carries that
+spelling, and it remains the single place it is written.
+
+The sibling keys the same namespace defines, which lot 3 and lot 4 will
+need and which are camelCase for the same reason:
+`io.modelcontextprotocol/clientInfo`,
+`io.modelcontextprotocol/clientCapabilities`, and on stdio
+`io.modelcontextprotocol/subscriptionId` for correlating a
+`subscriptions/listen` stream.
+
+The version check stays deliberately lenient: a request carrying no
+such key makes no claim and is answered, and only a version that IS
+present and is not ours is refused. `server/discover` is exempt,
+because it is how a client learns which revisions the server speaks.
+
+**Not done here, and by scope.** No implementation of `ReadSource` that
+speaks HTTPS: the core is generic over the seam and both concrete
+sources belong to the bindings that hold a client or a request, which
+is lot 3 and lot 4. `main.rs` therefore reads its configuration,
+reports what it found on stderr and exits; the argv refusal is real and
+observable there, the transport is not. No `docs/mcp.md`, no audit
+transport marker, no `CHANGELOG.md` entry: the crate has no
+user-visible behaviour until a transport carries it, and a changelog
+line about a tool surface nobody can reach would be false for a lot.
+
+**Named rather than hidden.** The tool paths are this crate's copy of
+the automation plane's path vocabulary and nothing pins them against
+`scope::required_scope`. They cannot be derived without depending on
+`lorica-api`, which this crate must not do from `src/` and which lot 4
+inverts anyway by making `lorica-api` depend on this crate. The guard
+belongs in `lorica-api/tests/` in the lot that adds that dependency,
+and it is one assertion per catalogue entry.
+
 ## File List
 
 Added:
@@ -1019,6 +1250,21 @@ Modified in lot 2 (the fix pass):
 - `lorica-config/src/models/automation_token.rs`
 - `lorica-mcp/Cargo.toml`, `lorica-mcp/src/main.rs`
 - `CHANGELOG.md`, `README.md`, `docs/automation.md`
+- `docs/stories/story-11.1-mcp-crate-read-tier.md`
+
+Added in lot 2 (the second half):
+
+- `lorica-mcp/src/config.rs`
+- `lorica-mcp/src/jsonrpc.rs`
+- `lorica-mcp/src/untrusted.rs`
+- `lorica-mcp/src/tools.rs`
+- `lorica-mcp/src/server.rs`
+
+Modified in lot 2 (the second half):
+
+- `lorica-mcp/Cargo.toml`, `lorica-mcp/src/lib.rs`,
+  `lorica-mcp/src/main.rs`
+- `Cargo.lock`, `README.md`
 - `docs/stories/story-11.1-mcp-crate-read-tier.md`
 
 ## Change Log
@@ -1100,3 +1346,35 @@ Modified in lot 2 (the fix pass):
   counting commented-out entries. `lorica-mcp` gains a `lib.rs` with
   the fetch seam lot 4 needs and nothing else: no JSON-RPC core, no
   tools, no adapter.
+- 2026-09-23: the second half of lot 2 landed, entirely inside
+  `lorica-mcp/` and touching `lorica-api` not at all. Five modules:
+  `config.rs` (AC #1, endpoint and token from the environment or a
+  TOML file, argv refused outright because an argument publishes the
+  token to `/proc`, and a redacting `Secret` so no `Debug` rendering
+  prints it), `jsonrpc.rs` (the envelope, no I/O, no direction the
+  revision forbids), `untrusted.rs` (AC #7), `tools.rs` (AC #4, nine
+  read tools) and `server.rs` (AC #3 and the dispatch). The core
+  methods are `server/discover`, `tools/list` and `tools/call`, plus
+  `notifications/cancelled`; there is **no `initialize`**, and a test
+  asserts it answers `METHOD_NOT_FOUND`. **AC #7 is structural rather
+  than a convention**: a `ToolSpec` is data with no body, so the most
+  a tool produces is a path, `untrusted::answer` is the sole
+  constructor of a tool result, the notice is appended by
+  `ToolSpec::description` and the fence marker grows until it appears
+  nowhere in the payload, so a WAF matched value that spells the END
+  marker cannot close the block. **The two error channels are
+  separate**: an unknown tool or an argument outside the declared
+  schema is a JSON-RPC error, and everything from the fetch onwards,
+  the plane's 403 included, is a result with `isError: true` so a
+  model reads the refusal and stops. Nothing echoes caller text into a
+  message this server generates. The invocation rate limit the
+  revision requires lives in the core rather than in the stdio
+  adapter, because that is where both bindings pass. The four runtime
+  dependencies are all already in `Cargo.lock` at their siblings'
+  versions and no version moved; `lorica-config` is a dev dependency
+  alone, guarding the seven scope spellings this crate names against
+  `AutomationScope`. Not done and named: no HTTPS `ReadSource`, no
+  transport, no `docs/mcp.md`, no changelog line, and no guard pinning
+  the catalogue's paths against `scope::required_scope`, which belongs
+  in `lorica-api/tests/` in the lot that makes `lorica-api` depend on
+  this crate.

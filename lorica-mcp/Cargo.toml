@@ -20,8 +20,33 @@ path = "src/lib.rs"
 name = "lorica-mcp"
 path = "src/main.rs"
 
-# No dependencies yet. The protocol core is hand-rolled (Story 11.1
-# decision D5) and the transports reuse what the workspace already has,
-# so the intake, the JSON-RPC loop and the stdio adapter declare theirs
-# as they land rather than up front.
+# Every crate below is already a workspace dependency at the version its
+# siblings pin, so nothing here is a new dependency in the sense the
+# project forbids without approval. Story 11.1 decision D5 rules out an
+# MCP SDK: the protocol is hand-rolled, so there is no protocol crate in
+# this list and there is not meant to be one.
 [dependencies]
+# The JSON-RPC envelope, the tool schemas and every answer that crosses
+# the seam are JSON. `serde` derive is here for the config file alone.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# The config file is TOML because Lorica's own configuration is TOML;
+# an operator editing one is not learning a second format for the other.
+toml = "1"
+# A tool builds a query string from arguments a model chose. Encoding
+# them is what keeps a value inside the parameter it was given for, and
+# a route id inside its own path segment.
+percent-encoding = "2.1"
+
+[dev-dependencies]
+# The tool bodies are async because the fetch seam is. Polling them in a
+# test needs a runtime and nothing else.
+tokio = { version = "1", features = ["macros", "rt"] }
+# Test-only, and deliberately not a runtime dependency: the scope
+# vocabulary belongs to `AutomationScope` and this crate names seven of
+# its spellings as plain strings. The guard in `src/tools.rs` parses
+# every one of them back into the enum, so a rename there turns this
+# crate red instead of silently unregistering a tool. Taking it as a
+# runtime dependency would put `rusqlite`, bundled SQLite and all, in
+# the dependency graph of a stdio subprocess that reads no database.
+lorica-config = { path = "../lorica-config" }

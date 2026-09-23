@@ -43,15 +43,39 @@
 //!
 //! # What is here, and what is deliberately not
 //!
-//! Here: the protocol revision this crate implements, and the fetch
-//! seam. NOT here, and not stubbed anywhere: the configuration intake,
-//! the JSON-RPC core (`server/discover`, `tools/list`, `tools/call`),
-//! the read tools, the untrusted-text delimiting and either transport
-//! adapter. Those are the remaining lots of Story 11.1 and nothing in
-//! this file stands in for them.
+//! Here: the protocol revision this crate implements, the fetch seam,
+//! the configuration intake ([`config`]), the JSON-RPC envelope
+//! ([`jsonrpc`]), the untrusted-text delimiting ([`untrusted`]), the
+//! read tools ([`tools`]) and the protocol core that runs them
+//! ([`server`]).
+//!
+//! NOT here, and not stubbed anywhere: either transport adapter. The
+//! stdio binding and the Streamable HTTP binding are the remaining lots
+//! of Story 11.1, and nothing in this crate stands in for them. Neither
+//! is there an implementation of [`ReadSource`] that speaks HTTPS: the
+//! core is generic over the seam, and the two concrete sources belong
+//! to the bindings that hold a client or a request.
+//!
+//! # Where each acceptance criterion lives
+//!
+//! AC #1 is [`config`]. AC #3 is [`server::McpServer::introspect`] and
+//! [`server::McpServer::startup_notice`]. AC #4 is
+//! [`tools::CATALOGUE`]. AC #7 is [`untrusted`], and it is in the
+//! shared core rather than in each tool precisely so that a tool added
+//! in a later story gets it without knowing it exists.
 
 use core::fmt;
 use core::future::Future;
+
+pub mod config;
+pub mod jsonrpc;
+pub mod server;
+pub mod tools;
+pub mod untrusted;
+
+pub use config::{ConfigError, ServerConfig};
+pub use server::{Identity, McpServer, StartupError};
+pub use tools::ToolSpec;
 
 /// The MCP specification revision this crate implements.
 ///

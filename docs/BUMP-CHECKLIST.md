@@ -132,7 +132,15 @@ A handful of user-visible numbers live in code AND in marketing-style docs, and 
 # "Pingora-forked crates (N tests)", the Vitest figure) and in
 # CONTRIBUTING.md. They drift every cycle that adds a test and nothing
 # recomputes them. Sum the per-binary results rather than trusting the
-# last edit:
+# last edit.
+#
+# README.md carries the product-crate figure TWICE: once in the shell
+# comment around line 714 and once in the `Lorica%20Tests-N` shields
+# badge at the top. The badge is the one that gets missed; it was left
+# behind three separate times during the v1.9.0 cycle alone. Grep for
+# the OLD number after editing, not for the new one, and expect zero
+# hits:
+#   grep -n '<old count>' README.md CONTRIBUTING.md
 cargo test <the README product-crate list> 2>&1 \
   | grep -oE 'test result: ok\. [0-9]+ passed' | grep -oE '[0-9]+' \
   | python3 -c 'import sys; print(sum(int(x) for x in sys.stdin))'
