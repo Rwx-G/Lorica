@@ -1,7 +1,7 @@
 # Story 11.1: The `lorica-mcp` Crate and the Read Tier
 
 **Epic:** [Epic 11 - Management MCP Server with Tiered Access (v1.9.0)](../prd/epic-11-v1.9.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Epic 10 Story 10.3, merged in v1.8.0. It supplies the
@@ -2128,3 +2128,15 @@ Modified in lot 4 (the fix pass):
   as a Dev Note in Story 11.2 with the options and a recommendation.
   `lorica-mcp` went from 65 tests to 74 and `lorica-api` from 885 to
   894.
+
+- 2026-09-23: Done. Four lots, two five-auditor sweeps with a fix pass
+  after each, all gates green under `RUSTFLAGS=-D warnings`, the Docker
+  e2e suite green at 553 assertions, product-crate tests at 2814. One
+  acceptance criterion is served in part by the maintainer's decision:
+  AC #4's cluster read answers status and not the roster, recorded in
+  Dev Notes with the reason. Open and owned elsewhere: the in-process
+  seam cannot carry a write (Story 11.2), the tier partition and the
+  isolation check (Story 11.4), query-string redaction in the log
+  pipeline (a dashboard behaviour change, undecided), and the e2e
+  coverage of this surface, which Story 11.4's `mcp` profile is the
+  first to provide.
