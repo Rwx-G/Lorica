@@ -1,7 +1,7 @@
 # Story 11.2: The Config Tier
 
 **Epic:** [Epic 11 - Management MCP Server with Tiered Access (v1.9.0)](../prd/epic-11-v1.9.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:** Story 11.1, all of it. The shared core, both transport
@@ -1693,3 +1693,10 @@ Modified in lot 1:
   scheduled with Story 11.3's. IV3's replication half is a cluster
   property and is not proven here; Story 11.4's e2e profile is where
   it can be.
+
+- 2026-09-23: Done. The Docker e2e suite ran on the tree carrying both
+  fix passes and passed at 553 assertions, zero failures: the split
+  management write bodies, the target guards and dry run leave the
+  dashboard's own write path unchanged. The count did not move, so the
+  write tier itself is still covered only by the unit and integration
+  suites; Story 11.4's `mcp` profile is its first end-to-end exercise.
