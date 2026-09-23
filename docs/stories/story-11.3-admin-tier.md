@@ -157,6 +157,25 @@ that makes widening a decision with a name on it rather than a commit.
 Keep the exclusion reason beside each entry, because the reason is what
 a later reader needs and the entry alone will not carry it.
 
+### The allowlist must bind at the plane, not in the tool schema
+
+Recorded 2026-09-23 from the architecture audit of Story 11.2. That
+story withheld one field from a model (`basic_auth_password`) by
+leaving it out of the tool's body vocabulary in `lorica-mcp`. The
+automation plane still accepts the field: a token holding the write
+scope can send it straight to the path, without the tool. For one
+credential-bearing field on a surface a human also uses, that is a
+narrowing of what a model is offered, and it is recorded as such.
+
+Copied to this story it would bind nothing. The eighteen settings
+above are the whole of what an admin-tier credential may change, and
+the sixty-three others are what it must not reach however it calls.
+So the allowlist is enforced on the automation settings path itself:
+a body naming any field outside the eighteen is refused by the plane
+with the field named, before a validator runs, and the tool schema
+restates the same eighteen and is pinned against the plane's list by
+a test. The plane is the control; the schema is the affordance.
+
 ## Dev Agent Record
 
 ### Debug Log

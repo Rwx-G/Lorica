@@ -129,6 +129,28 @@ did not move because the automation smoke never calls a read path or
 the MCP endpoint. AC #4 is therefore the first end-to-end exercise of
 the whole read tier, not a regression net over one that exists.
 
+### There is no tier table yet, and two things already want one
+
+Recorded 2026-09-23 from the architecture audit of Story 11.2. The
+config tier's startup notice tells a token that carries write scopes
+and no read scope to add `logs:read`, because the tier's tools need
+the reads. Nothing defines what a config-tier token is allowed to
+carry, so that advice and this story's AC #1 refusal are written
+against no shared definition and can contradict each other the day
+either moves.
+
+AC #1's partition is therefore not only the startup check's input, it
+is what the startup notice, the `--tier` minting command, the printed
+blast radius and the tier filter in `McpServer` all read. One table,
+in `lorica-mcp`, naming for each tier the scopes it requires and the
+scopes it tolerates (the config tier tolerates the read scopes its
+tools need; the read tier tolerates none of the write scopes), with a
+test that every `AutomationScope` variant appears in exactly one
+tier's required set. A token is refused at startup when its scopes
+span two tiers' required sets, and the notice for a token missing a
+tolerated read scope names the tier's own definition rather than a
+sentence written beside it.
+
 ## Dev Agent Record
 
 ### Debug Log
