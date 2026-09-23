@@ -725,11 +725,17 @@ paths:
         is on the management path.
 
 
+        With `?dry_run=true`, the backend it would have created, and
+        nothing created (200): see `DryRun`.
+
+
         Required scope: `backends:write`.
       operationId: automationCreateBackend
       x-required-scope: backends:write
       security:
         - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/DryRun"
       requestBody:
         required: true
         content:
@@ -793,6 +799,10 @@ paths:
         `allowed_backend_cidrs` as on create.
 
 
+        With `?dry_run=true`, the backend before and after the patch,
+        and nothing changed: see `DryRun`.
+
+
         Required scope: `backends:write`.
       operationId: automationUpdateBackend
       x-required-scope: backends:write
@@ -800,6 +810,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
       requestBody:
         required: true
         content:
@@ -837,6 +848,10 @@ paths:
         which only the pipeline owns.
 
 
+        With `?dry_run=true`, the backend that would drain, and no
+        drain started: see `DryRun`.
+
+
         Required scope: `backends:write`.
       operationId: automationDeleteBackend
       x-required-scope: backends:write
@@ -844,6 +859,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
       responses:
         "200":
           description: Draining, or deleted at once when it was already draining.
@@ -878,11 +894,17 @@ paths:
         `managed_by` is refused (422) as it is on the management path.
 
 
+        With `?dry_run=true`, the route it would have created, and
+        nothing created (200): see `DryRun`.
+
+
         Required scope: `routes:write`.
       operationId: automationCreateRoute
       x-required-scope: routes:write
       security:
         - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/DryRun"
       requestBody:
         required: true
         content:
@@ -960,6 +982,10 @@ paths:
         token's `allowed_hostnames` (403).
 
 
+        With `?dry_run=true`, the route before and after the patch, and
+        nothing changed: see `DryRun`.
+
+
         Required scope: `routes:write`.
       operationId: automationUpdateRoute
       x-required-scope: routes:write
@@ -967,6 +993,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
       requestBody:
         required: true
         content:
@@ -1003,6 +1030,10 @@ paths:
         environment.
 
 
+        With `?dry_run=true`, the route that would go, its environment
+        named when one owns it, and nothing deleted: see `DryRun`.
+
+
         Required scope: `routes:write`.
       operationId: automationDeleteRoute
       x-required-scope: routes:write
@@ -1010,6 +1041,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
       responses:
         "200":
           description: Deleted.
@@ -1044,6 +1076,10 @@ paths:
         included, is a 422. Key material does not cross this listener.
 
 
+        With `?dry_run=true`, the route before and after the binding,
+        and nothing bound: see `DryRun`.
+
+
         Required scope: `certificates:write`.
       operationId: automationBindCertificate
       x-required-scope: certificates:write
@@ -1051,6 +1087,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
       requestBody:
         required: true
         content:
@@ -1128,6 +1165,11 @@ paths:
         least of all.
 
 
+        With `?dry_run=true`, the metadata of the certificate that would
+        be renewed, after the ACME-only refusal, and no order made: see
+        `DryRun`.
+
+
         Required scope: `certificates:write`.
       operationId: automationRenewCertificate
       x-required-scope: certificates:write
@@ -1135,6 +1177,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
       responses:
         "200":
           description: Renewed in place.
@@ -1313,6 +1356,37 @@ components:
         type: integer
         minimum: 0
         default: 0
+
+    DryRun:
+      name: dry_run
+      in: query
+      required: false
+      description: >-
+        `true` runs the write's own validators, computes the change it
+        would make against the configuration as it stands, and writes
+        nothing: no row, no reload signal, no management audit row. The
+        request row is written as for any request, with `?dry_run`
+        beside the verb. The answer is `200` with
+        `{"data": {"dry_run": true, "operation": "create" | "update" |
+        "delete" | "renew", "before": <view or null>, "after": <view or
+        null>, "changes": {<field>: {"from", "to"}} or null}}`: a
+        create's `after` is the row it would insert, less the id and the
+        clock the apply would mint; an update's `before` and `after` are
+        the views either side of the patch, with `changes` naming the
+        fields that differ; a delete's and a renewal's `before` is the
+        row that would go or be renewed. What only the store refuses (a
+        duplicate hostname, a backend id that names nothing) is refused
+        by the apply and not by the dry run. The token's grants are
+        checked first either way (403), so a dry run never shows a change
+        the apply would refuse on the grant.
+
+
+        This is the preview the MCP config tier's `*_preview` tools call
+        (Story 11.2 AC #3). It is an affordance and not a control: the
+        protocol offers no way to make a client call it first.
+      schema:
+        type: boolean
+        default: false
 
     McpProtocolVersion:
       name: MCP-Protocol-Version

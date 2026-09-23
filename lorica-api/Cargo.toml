@@ -112,11 +112,6 @@ thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots", "json"] }
 async-trait = { workspace = true }
 base64 = "0.23"
-# The MCP tool layer percent-encodes a resource id into one path
-# segment, and the in-process read source decodes it the way the
-# listener's own path extractor would have. Already a workspace
-# dependency: `lorica-mcp` pins the same version.
-percent-encoding = "2.1"
 dashmap = "6"
 tracing = "0.1"
 once_cell = { workspace = true }

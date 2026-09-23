@@ -18,58 +18,81 @@
 
 //! The Lorica management MCP server (Epic 11) as a library: the shared
 //! core both transports run, and the seam they reach the automation
-//! plane's read views through.
+//! plane through.
 //!
-//! # Why a library at all, before there is anything to put in it
+//! # Why a library at all
 //!
-//! Story 11.1 lands in four lots and the last one mounts the Streamable
-//! HTTP adapter INSIDE `lorica-api`, on the Story 10.3 listener that
-//! already owns the TLS, the source-CIDR allowlist, the connection caps
-//! and the audit layer. There is no third management plane, so that
-//! adapter cannot be a second process, and `lorica-api` has to be able
-//! to depend on this crate. A binary-only crate gives it nothing to
-//! depend on, and the only remaining shape is the in-process adapter
-//! looping back over its own listener, which the mandatory source
-//! allowlist and the per-source connection budget would refuse or
-//! throttle by default, and which would be absurd even if they did not.
+//! Story 11.1 mounts the Streamable HTTP adapter INSIDE `lorica-api`,
+//! on the Story 10.3 listener that already owns the TLS, the
+//! source-CIDR allowlist, the connection caps and the audit layer. There
+//! is no third management plane, so that adapter cannot be a second
+//! process, and `lorica-api` has to be able to depend on this crate. A
+//! binary-only crate gives it nothing to depend on, and the only
+//! remaining shape is the in-process adapter looping back over its own
+//! listener, which the mandatory source allowlist and the per-source
+//! connection budget would refuse or throttle by default, and which
+//! would be absurd even if they did not.
 //!
 //! The seam is cheap now and structural later. AC #10 requires one
 //! shared core across both bindings, and what decides whether that
-//! holds is how the FIRST tool body reaches a read view: a tool written
-//! against an HTTP client is a tool that has to be rewritten for the
-//! in-process case, and the two then drift in exactly the way AC #10
-//! forbids. [`ReadSource`] is that decision taken before the first tool
-//! exists rather than after.
+//! holds is how a tool body reaches the plane: a tool written against
+//! an HTTP client is a tool that has to be rewritten for the in-process
+//! case, and the two then drift in exactly the way AC #10 forbids.
+//! [`AutomationPlane`] is that decision taken before the first tool
+//! existed rather than after.
+//!
+//! # The seam carries a verb and a body, not only a path
+//!
+//! Story 11.1 shipped it as `fetch(path)`, which was the whole of what a
+//! read tier needs. Story 11.2's config tier adds mutations, and a
+//! mutation is a verb, a path and a body: the seam grew to
+//! [`AutomationPlane::call`] rather than a second seam beside the first,
+//! so a write tool and a read tool reach the plane through one method
+//! and both bindings implement one trait. The in-process binding does
+//! not dispatch by hand any more either: it builds the request the seam
+//! describes and runs it through the plane's own router, scope gate
+//! included, which is what lets the write handlers run unchanged with
+//! their per-token grants and their own audit rows.
 //!
 //! # What is here, and what is deliberately not
 //!
-//! Here: the protocol revision this crate implements, the fetch seam,
+//! Here: the protocol revision this crate implements, the call seam,
 //! the configuration intake ([`config`]), the JSON-RPC envelope
 //! ([`jsonrpc`]), the untrusted-text delimiting ([`untrusted`]), the
-//! read tools ([`tools`]), the protocol core that runs them
+//! tools of both tiers ([`tools`]), the protocol core that runs them
 //! ([`server`]), the HTTPS implementation of the seam ([`http`]) and
 //! the stdio binding ([`stdio`]).
 //!
 //! NOT here, and not stubbed anywhere: the Streamable HTTP adapter and
-//! the in-process [`ReadSource`] it calls the read handlers through.
-//! Both live in `lorica-api`, in `automation::mcp`, because that
-//! binding is a path on the Story 10.3 listener rather than a process
-//! of its own. `lorica-api` depends on this crate for [`server`] and
-//! [`tools`]; nothing here depends on `lorica-api`, or a stdio
+//! the in-process [`AutomationPlane`] it runs the plane's router
+//! through. Both live in `lorica-api`, in `automation::mcp`, because
+//! that binding is a path on the Story 10.3 listener rather than a
+//! process of its own. `lorica-api` depends on this crate for [`server`]
+//! and [`tools`]; nothing here depends on `lorica-api`, or a stdio
 //! subprocess would carry the whole management crate.
 //!
 //! # Where each acceptance criterion lives
 //!
-//! AC #1 is [`config`]. AC #3 is [`server::McpServer::introspect`] and
-//! [`server::McpServer::startup_notice`]. AC #4 is
-//! [`tools::CATALOGUE`]. AC #6 is [`http`], which is where the two
+//! Story 11.1: AC #1 is [`config`]. AC #3 is
+//! [`server::McpServer::introspect`] and
+//! [`server::McpServer::startup_notice`]. AC #4 is the read half of
+//! [`tools::catalogue`]. AC #6 is [`http`], which is where the two
 //! assertion headers are written. AC #7 is [`untrusted`], and it is in
 //! the shared core rather than in each tool precisely so that a tool
 //! added in a later story gets it without knowing it exists. AC #10 is
 //! [`stdio`].
+//!
+//! Story 11.2: AC #2 is [`server::McpServer::sharing`], which registers
+//! a tool for a scope the token holds and no other, over a catalogue
+//! whose write tools declare write scopes by construction. AC #3 and
+//! AC #4 are [`tools::MUTATIONS`] and what [`tools::catalogue`] builds
+//! from it. AC #6 is the field vocabulary each [`tools::Body`] declares,
+//! pinned in `lorica-api`'s tests against the handler that reads it.
 
 use core::fmt;
 use core::future::Future;
+
+use serde_json::Value;
 
 pub mod config;
 pub mod http;
@@ -80,7 +103,7 @@ pub mod tools;
 pub mod untrusted;
 
 pub use config::{ConfigError, ServerConfig};
-pub use http::HttpsReadSource;
+pub use http::HttpsPlane;
 pub use server::{Identity, McpServer, StartupError};
 pub use tools::ToolSpec;
 
@@ -92,7 +115,47 @@ pub use tools::ToolSpec;
 /// is a release note.
 pub const MCP_PROTOCOL_REVISION: &str = "2026-07-28";
 
-/// Why a read view could not be fetched.
+/// The HTTP verb one call across the seam carries.
+///
+/// Four and no more: the automation plane mounts nothing under any
+/// other verb, and a tool declares one of these rather than a string a
+/// typo could widen into a verb the plane never declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Verb {
+    /// A read. Every tool of the read tier is one.
+    Get,
+    /// A create, or an action on one named resource.
+    Post,
+    /// A patch of one named resource.
+    Put,
+    /// The removal of one named resource.
+    Delete,
+}
+
+impl Verb {
+    /// The verb as the request line spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verb::Get => "GET",
+            Verb::Post => "POST",
+            Verb::Put => "PUT",
+            Verb::Delete => "DELETE",
+        }
+    }
+
+    /// Whether this verb changes nothing.
+    pub fn is_read(self) -> bool {
+        matches!(self, Verb::Get)
+    }
+}
+
+impl fmt::Display for Verb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why a call to the plane did not answer.
 ///
 /// Deliberately two variants and not a rich taxonomy. The MCP layer
 /// owes a caller two different things and this is the boundary where
@@ -101,9 +164,11 @@ pub const MCP_PROTOCOL_REVISION: &str = "2026-07-28";
 /// and stop on rather than retry. Story 11.1's Dev Notes state that an
 /// authorization refusal from the API behind us is a tool EXECUTION
 /// error (`isError: true`), never a JSON-RPC protocol error, and the
-/// distinction only survives if the fetch seam keeps the status.
+/// distinction only survives if the seam keeps the status. The same
+/// holds for a validator's refusal of a write: the message is the
+/// plane's, verbatim, and the status says which kind of refusal it was.
 #[derive(Debug)]
-pub enum ReadError {
+pub enum PlaneError {
     /// The request never produced an answer: no connection, a broken
     /// stream, a body that did not arrive.
     Transport(String),
@@ -116,7 +181,7 @@ pub enum ReadError {
     },
 }
 
-/// The most bytes of a refusal body [`ReadError`]'s `Display` quotes.
+/// The most bytes of a refusal body [`PlaneError`]'s `Display` quotes.
 ///
 /// The plane's own error envelope is two short fields. What is being
 /// bounded is the case where the endpoint is not the plane, a captive
@@ -124,11 +189,11 @@ pub enum ReadError {
 /// otherwise land whole in the client's MCP log at startup.
 pub const DISPLAYED_BODY_MAX_BYTES: usize = 512;
 
-impl fmt::Display for ReadError {
+impl fmt::Display for PlaneError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ReadError::Transport(detail) => write!(f, "automation read failed: {detail}"),
-            ReadError::Refused { status, body } => {
+            PlaneError::Transport(detail) => write!(f, "automation call failed: {detail}"),
+            PlaneError::Refused { status, body } => {
                 let cut = (0..=body.len().min(DISPLAYED_BODY_MAX_BYTES))
                     .rev()
                     .find(|end| body.is_char_boundary(*end))
@@ -136,21 +201,21 @@ impl fmt::Display for ReadError {
                 if cut < body.len() {
                     write!(
                         f,
-                        "automation read refused with {status}: {} [and {} more bytes]",
+                        "automation call refused with {status}: {} [and {} more bytes]",
                         &body[..cut],
                         body.len() - cut
                     )
                 } else {
-                    write!(f, "automation read refused with {status}: {body}")
+                    write!(f, "automation call refused with {status}: {body}")
                 }
             }
         }
     }
 }
 
-impl std::error::Error for ReadError {}
+impl std::error::Error for PlaneError {}
 
-/// What one fetch across the seam is on behalf of.
+/// What one call across the seam is on behalf of.
 ///
 /// AC #6 is why this exists. The audit row the automation plane writes
 /// is anchored on the token's `public_id`, which the node established
@@ -158,7 +223,7 @@ impl std::error::Error for ReadError {}
 /// tool name because there is no tool at the HTTP layer. So the tool
 /// name has to be something this server DECLARES, and a declaration
 /// only reaches the wire if the seam carries it: an implementation that
-/// saw a path alone could not say what the read was for.
+/// saw a path alone could not say what the call was for.
 ///
 /// [`Reason::Introspection`] is not a tool and is not dressed up as
 /// one. The startup `whoami` runs before any client has spoken, and a
@@ -168,7 +233,7 @@ impl std::error::Error for ReadError {}
 pub enum Reason<'a> {
     /// The server's own startup `whoami`. No tool has been called.
     Introspection,
-    /// The single read of the named tool.
+    /// The single call of the named tool.
     Tool(&'a str),
 }
 
@@ -182,47 +247,53 @@ impl Reason<'_> {
     }
 }
 
-/// How a tool reaches one read view of the automation plane.
+/// How a tool reaches the automation plane.
 ///
-/// One method, taking the path a read is mounted at with its query
-/// string already built, and answering the JSON body verbatim. The
-/// verbatim part is the point: the automation read surface is already
-/// the management plane's own answer passed through untouched, and a
-/// second place that reshapes it is a second place that can stop
-/// stripping a field. The tool layer parses; this seam transports.
+/// One method, taking the verb, the path a call is mounted at with its
+/// query string already built, and the JSON body a write carries, and
+/// answering the response body verbatim. The verbatim part is the
+/// point: the automation surface is already the management plane's own
+/// answer passed through untouched, and a second place that reshapes
+/// it is a second place that can stop stripping a field. The tool layer
+/// parses; this seam transports.
 ///
-/// Two implementations exist. [`HttpsReadSource`] is the one the stdio
+/// Two implementations exist. [`HttpsPlane`] is the one the stdio
 /// binary drives. The other lives inside `lorica-api`, as
-/// `automation::mcp::InProcessReads`, where the Streamable HTTP adapter
-/// calls the read handlers directly rather than dialling the listener
-/// it is itself mounted on.
+/// `automation::mcp::InProcessPlane`, where the Streamable HTTP adapter
+/// runs the request through the plane's own router rather than dialling
+/// the listener it is itself mounted on.
 ///
 /// The bound is `Future` in return position rather than a boxed future,
 /// so a tool layer generic over this trait pays nothing for the
 /// indirection; no implementation of it is reached through a trait
 /// object today, and the day one is, the boxing belongs on that call
 /// site rather than in this signature.
-pub trait ReadSource {
-    /// Fetch `path` and answer the response body.
+pub trait AutomationPlane {
+    /// Send `verb path` with `body`, and answer the response body.
     ///
     /// `path` is an automation-plane path, `/automation/v1/...`, with
     /// any query string already appended. It is never caller text: a
     /// tool builds it from a vocabulary it owns, so nothing a model
-    /// says chooses which endpoint is reached.
+    /// says chooses which endpoint is reached. `body` is the management
+    /// request body a write carries, already bounded and checked for
+    /// shape by the tool layer, and `None` on a read and on a write
+    /// that takes none.
     ///
-    /// `reason` is what the read is for, which an implementation that
+    /// `reason` is what the call is for, which an implementation that
     /// talks to a remote plane declares on the request so the audit row
     /// can record it as a caller's assertion. See [`Reason`].
     ///
     /// # Errors
     ///
-    /// [`ReadError::Transport`] when no answer arrived,
-    /// [`ReadError::Refused`] for the status the plane chose.
-    fn fetch(
+    /// [`PlaneError::Transport`] when no answer arrived,
+    /// [`PlaneError::Refused`] for the status the plane chose.
+    fn call(
         &self,
+        verb: Verb,
         path: &str,
+        body: Option<&Value>,
         reason: Reason<'_>,
-    ) -> impl Future<Output = Result<String, ReadError>> + Send;
+    ) -> impl Future<Output = Result<String, PlaneError>> + Send;
 }
 
 #[cfg(test)]
@@ -235,18 +306,32 @@ mod tests {
     /// crate had nowhere to put.
     struct InProcess;
 
-    impl ReadSource for InProcess {
-        async fn fetch(&self, path: &str, _reason: Reason<'_>) -> Result<String, ReadError> {
-            Ok(format!("{{\"data\":{{\"path\":\"{path}\"}}}}"))
+    impl AutomationPlane for InProcess {
+        async fn call(
+            &self,
+            verb: Verb,
+            path: &str,
+            body: Option<&Value>,
+            _reason: Reason<'_>,
+        ) -> Result<String, PlaneError> {
+            Ok(format!(
+                "{{\"data\":{{\"verb\":\"{verb}\",\"path\":\"{path}\",\"body\":{}}}}}",
+                body.map_or("null".to_string(), Value::to_string)
+            ))
         }
     }
 
-    /// The shape every tool body will take: generic over the seam, so
-    /// one body serves the stdio client and the in-process adapter
-    /// alike rather than two bodies agreeing by discipline.
-    async fn a_tool_body<S: ReadSource>(source: &S) -> Result<String, ReadError> {
+    /// The shape every tool body takes: generic over the seam, so one
+    /// body serves the stdio client and the in-process adapter alike
+    /// rather than two bodies agreeing by discipline.
+    async fn a_tool_body<S: AutomationPlane>(source: &S) -> Result<String, PlaneError> {
         source
-            .fetch("/automation/v1/logs?limit=1", Reason::Tool("lorica_logs"))
+            .call(
+                Verb::Get,
+                "/automation/v1/logs?limit=1",
+                None,
+                Reason::Tool("lorica_logs"),
+            )
             .await
     }
 
@@ -260,18 +345,35 @@ mod tests {
     }
 
     #[test]
+    fn a_verb_spells_itself_the_way_the_request_line_does() {
+        // The four the plane mounts, and no way to spell a fifth: the
+        // in-process binding parses `as_str` back into an `http::Method`
+        // and the stdio client into a `reqwest::Method`, so a spelling
+        // that drifted would refuse every call rather than reach an
+        // undeclared verb.
+        assert_eq!(Verb::Get.as_str(), "GET");
+        assert_eq!(Verb::Post.as_str(), "POST");
+        assert_eq!(Verb::Put.as_str(), "PUT");
+        assert_eq!(Verb::Delete.as_str(), "DELETE");
+        assert!(Verb::Get.is_read());
+        for write in [Verb::Post, Verb::Put, Verb::Delete] {
+            assert!(!write.is_read(), "{write}");
+        }
+    }
+
+    #[test]
     fn a_refusal_keeps_the_status_the_plane_chose() {
         // A 403 from the automation plane is a tool execution error the
         // model reads and stops on, not a protocol error it retries.
         // That distinction only survives if the status crosses the seam.
-        let refused = ReadError::Refused {
+        let refused = PlaneError::Refused {
             status: 403,
             body: "{\"error\":{\"code\":\"forbidden\"}}".to_string(),
         };
         assert!(refused.to_string().contains("403"), "{refused}");
         assert!(refused.to_string().contains("forbidden"), "{refused}");
 
-        let broken = ReadError::Transport("connection reset".to_string());
+        let broken = PlaneError::Transport("connection reset".to_string());
         assert!(broken.to_string().contains("connection reset"), "{broken}");
     }
 
@@ -279,7 +381,7 @@ mod tests {
     fn a_displayed_refusal_quotes_a_bounded_slice_of_a_body_that_is_not_the_planes() {
         // A captive portal answers megabytes of HTML; the startup
         // refusal that quotes it goes to the client's MCP log.
-        let portal = ReadError::Refused {
+        let portal = PlaneError::Refused {
             status: 302,
             body: "<html>".repeat(100_000),
         };
@@ -291,7 +393,7 @@ mod tests {
         );
         assert!(shown.contains("more bytes"), "{shown}");
         // And a cut never splits a character.
-        let accented = ReadError::Refused {
+        let accented = PlaneError::Refused {
             status: 400,
             body: "é".repeat(DISPLAYED_BODY_MAX_BYTES),
         };

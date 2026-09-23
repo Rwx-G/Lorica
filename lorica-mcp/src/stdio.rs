@@ -37,10 +37,12 @@
 //!
 //! The loop reads a message, answers it, and only then reads the next.
 //! The protocol permits a client to have several requests outstanding,
-//! and serving them concurrently would buy a read tier nothing: each
-//! tool call is one `GET` against one node, the core caps invocations
+//! and serving them concurrently would buy either tier nothing: each
+//! tool call is one request against one node, the core caps invocations
 //! at a rate a human never reaches, and interleaving answers on one
 //! file descriptor is a framing bug waiting for its first slow read.
+//! For the config tier it is also what keeps a preview and the apply
+//! that follows it in the order the client sent them.
 //!
 //! It is also what makes `notifications/cancelled` honest here. A
 //! cancellation can only be read after the call it names has already
@@ -59,7 +61,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::jsonrpc;
 use crate::server::{McpServer, Outcome};
-use crate::ReadSource;
+use crate::AutomationPlane;
 
 /// The longest single message this binding will read.
 ///
@@ -124,7 +126,7 @@ pub async fn serve<R, W, S>(
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
-    S: ReadSource,
+    S: AutomationPlane,
 {
     let mut line: Vec<u8> = Vec::new();
     while read_message(&mut input, &mut line).await? {
@@ -224,15 +226,16 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::server::Identity;
-    use crate::tools::CATALOGUE;
-    use crate::{ReadError, Reason};
+    use crate::server::{read_scopes, Identity};
+    use crate::tools::{catalogue, MUTATIONS};
+    use crate::{PlaneError, Reason, Verb};
 
     /// A plane whose answer can change between calls, which is what a
     /// token revoked mid-session looks like from here.
     struct Plane {
         answers: std::sync::Mutex<Vec<Result<String, (u16, String)>>>,
         asked: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        sent: std::sync::Mutex<Vec<(Verb, String, Option<Value>)>>,
     }
 
     impl Plane {
@@ -240,6 +243,7 @@ mod tests {
             Plane {
                 answers: std::sync::Mutex::new(answers),
                 asked: std::sync::Mutex::new(Vec::new()),
+                sent: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -250,14 +254,28 @@ mod tests {
         fn asked(&self) -> Vec<(String, Option<String>)> {
             self.asked.lock().expect("the lock holds").clone()
         }
+
+        fn sent(&self) -> Vec<(Verb, String, Option<Value>)> {
+            self.sent.lock().expect("the lock holds").clone()
+        }
     }
 
-    impl ReadSource for Plane {
-        async fn fetch(&self, path: &str, reason: Reason<'_>) -> Result<String, ReadError> {
+    impl AutomationPlane for Plane {
+        async fn call(
+            &self,
+            verb: Verb,
+            path: &str,
+            body: Option<&Value>,
+            reason: Reason<'_>,
+        ) -> Result<String, PlaneError> {
             self.asked
                 .lock()
                 .expect("the lock holds")
                 .push((path.to_string(), reason.tool().map(str::to_string)));
+            self.sent
+                .lock()
+                .expect("the lock holds")
+                .push((verb, path.to_string(), body.cloned()));
             let next = {
                 let mut answers = self.answers.lock().expect("the lock holds");
                 if answers.is_empty() {
@@ -268,8 +286,8 @@ mod tests {
             };
             match next {
                 Some(Ok(body)) => Ok(body),
-                Some(Err((status, body))) => Err(ReadError::Refused { status, body }),
-                None => Err(ReadError::Transport("no answer left".to_string())),
+                Some(Err((status, body))) => Err(PlaneError::Refused { status, body }),
+                None => Err(PlaneError::Transport("no answer left".to_string())),
             }
         }
     }
@@ -402,33 +420,28 @@ mod tests {
 
     #[tokio::test]
     async fn iv1_a_read_tier_token_lists_only_read_tools_and_a_mutation_cannot_be_called() {
-        // IV1, end to end over the transport. Every tool the catalogue
-        // holds reads; nothing that would change anything is listed,
-        // and the names a client might guess for one do not exist to be
-        // called.
+        // Story 11.1 IV1 and Story 11.2 AC #2, end to end over the
+        // transport. A token carrying every read scope lists every read
+        // tool and not one of the catalogue's mutations, and neither
+        // the names a client might guess for one nor the real ones
+        // exist to be called.
         let plane = Plane::always(EMPTY_PAGE);
-        let server = server_carrying(&[
-            "logs:read",
-            "waf:read",
-            "sla:read",
-            "cluster:read",
-            "backends:read",
-            "routes:read",
-            "certificates:read",
-        ]);
+        let server = server_carrying(&read_scopes());
         let mut lines = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n".to_string();
-        for (n, name) in [
+        let guessed = [
             "lorica_environments_put",
             "lorica_routes_write",
             "lorica_certificates_issue",
             "lorica_config_apply",
-        ]
-        .iter()
-        .enumerate()
-        {
+        ];
+        let real: Vec<&str> = MUTATIONS
+            .iter()
+            .flat_map(|mutation| [mutation.apply, mutation.preview])
+            .collect();
+        for (n, name) in guessed.iter().chain(real.iter()).enumerate() {
             lines.push_str(&format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"tools/call\",\
-                  \"params\":{{\"name\":\"{name}\"}}}}\n",
+                  \"params\":{{\"name\":\"{name}\",\"arguments\":{{\"id\":\"r-1\"}}}}}}\n",
                 n + 2
             ));
         }
@@ -437,16 +450,23 @@ mod tests {
         let listed = answers[0]["result"]["tools"]
             .as_array()
             .expect("tools/list answers an array");
-        assert_eq!(listed.len(), CATALOGUE.len());
+        let reads = catalogue()
+            .iter()
+            .filter(|spec| spec.write().is_none())
+            .count();
+        assert_eq!(listed.len(), reads);
+        assert!(listed.len() < catalogue().len());
         for tool in listed {
             let name = tool["name"].as_str().expect("a tool has a name");
             let spec = crate::tools::find(name).expect("a listed tool is in the catalogue");
             assert!(spec.scope.ends_with(":read"), "{name} is not a read");
+            assert!(spec.verb().is_read(), "{name} is not a GET");
             assert!(spec.path.starts_with("/automation/v1/"), "{name}");
         }
 
         // A call that would mutate does not exist to be called, rather
         // than existing and failing.
+        assert_eq!(answers.len(), 1 + guessed.len() + real.len());
         for refused in &answers[1..] {
             assert_eq!(
                 refused["error"]["code"],
@@ -456,6 +476,82 @@ mod tests {
         }
         // And nothing reached the plane for any of them.
         assert!(plane.asked().is_empty(), "{:?}", plane.asked());
+    }
+
+    #[tokio::test]
+    async fn a_config_tier_token_over_stdio_lists_its_mutations_and_a_write_crosses_with_its_body()
+    {
+        // Story 11.2 AC #2 and AC #3 over the transport: one process,
+        // one token, the tier decided at startup from its scopes. The
+        // mutations come with their previews, the read tools the token
+        // holds come with them, and a write leaves this process as the
+        // verb and the body the tool declared.
+        let plane = Plane::always("{\"data\":{\"id\":\"r-1\",\"hostname\":\"app.example.com\"}}");
+        let server = server_carrying(&["backends:write", "backends:read"]);
+        let answers = exchange(
+            &server,
+            &plane,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n\
+             {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\
+              \"params\":{\"name\":\"lorica_backend_create_preview\",\
+              \"arguments\":{\"backend\":{\"address\":\"10.0.0.11:8080\"}}}}\n\
+             {\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\
+              \"params\":{\"name\":\"lorica_backend_create\",\
+              \"arguments\":{\"backend\":{\"address\":\"10.0.0.11:8080\"}}}}\n",
+        )
+        .await;
+
+        let listed: Vec<&str> = answers[0]["result"]["tools"]
+            .as_array()
+            .expect("tools/list answers an array")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("a name"))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                "lorica_backends",
+                "lorica_backend_create",
+                "lorica_backend_create_preview",
+                "lorica_backend_update",
+                "lorica_backend_update_preview",
+                "lorica_backend_delete",
+                "lorica_backend_delete_preview",
+            ]
+        );
+        assert_eq!(server.tier(), "config tier");
+
+        assert_eq!(answers[1]["result"]["isError"], json!(false));
+        assert_eq!(answers[2]["result"]["isError"], json!(false));
+        let body = json!({ "address": "10.0.0.11:8080" });
+        assert_eq!(
+            plane.sent(),
+            vec![
+                (
+                    Verb::Post,
+                    "/automation/v1/backends?dry_run=true".to_string(),
+                    Some(body.clone())
+                ),
+                (
+                    Verb::Post,
+                    "/automation/v1/backends".to_string(),
+                    Some(body)
+                ),
+            ]
+        );
+        assert_eq!(
+            plane.asked(),
+            vec![
+                (
+                    "/automation/v1/backends?dry_run=true".to_string(),
+                    Some("lorica_backend_create_preview".to_string())
+                ),
+                (
+                    "/automation/v1/backends".to_string(),
+                    Some("lorica_backend_create".to_string())
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

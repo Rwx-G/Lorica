@@ -113,7 +113,7 @@ pub struct CertificateDetailResponse {
     pub acme_method: Option<String>,
 }
 
-fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateResponse {
+pub(crate) fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateResponse {
     CertificateResponse {
         id: c.id.clone(),
         domain: c.domain.clone(),

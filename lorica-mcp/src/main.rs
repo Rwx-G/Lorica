@@ -22,8 +22,8 @@
 //!
 //! This is the stdio binding, and the only thing in the crate that ever
 //! reads a file descriptor. Everything it drives - the configuration
-//! intake, the JSON-RPC core, the read tools and the fetch seam they
-//! reach a read view through - lives in the library beside it, because
+//! intake, the JSON-RPC core, the tools of both tiers and the seam they
+//! reach the plane through - lives in the library beside it, because
 //! the Streamable HTTP binding runs inside `lorica-api` and has to be
 //! able to reach the same core. See `lorica-mcp/src/lib.rs` for why
 //! that seam exists.
@@ -59,7 +59,7 @@
 
 use std::process::ExitCode;
 
-use lorica_mcp::{HttpsReadSource, McpServer, ServerConfig, MCP_PROTOCOL_REVISION};
+use lorica_mcp::{HttpsPlane, McpServer, ServerConfig, MCP_PROTOCOL_REVISION};
 
 /// Refused configuration.
 ///
@@ -88,7 +88,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let source = match HttpsReadSource::new(&config) {
+    let source = match HttpsPlane::new(&config) {
         Ok(source) => source,
         Err(refused) => {
             eprintln!("lorica-mcp: {refused}");

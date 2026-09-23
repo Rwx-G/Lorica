@@ -1029,6 +1029,250 @@ fn no_automation_write_accepts_key_material() {
     );
 }
 
+/// The fields of a management request struct the MCP config tier does
+/// not offer a model, with the reason for each (Story 11.2).
+///
+/// `lorica-mcp` declares the field vocabulary of each write tool's
+/// body; the test below pins each declaration against the struct the
+/// automation handler deserialises, both ways, and this list is the
+/// only difference it tolerates. An entry here is a decision, and a
+/// field the struct grows lands on the "accepted and not offered" side
+/// until somebody makes one.
+const NOT_OFFERED_TO_A_MODEL: &[(&str, &str)] = &[
+    (
+        "managed_by",
+        "refused by the plane on input (422): offering it would be a field that always fails",
+    ),
+    (
+        "basic_auth_password",
+        "a credential a model would be choosing or relaying, crossing the model's host in \
+         the clear; the route's Basic auth is set in the dashboard by a human",
+    ),
+];
+
+/// The handler each MCP write tool's call reaches, as `(METHOD, path)`
+/// with the id normalised, taken from the tool's own call.
+fn mcp_write_targets() -> Vec<(&'static lorica_mcp::tools::ToolSpec, (String, String))> {
+    lorica_mcp::tools::catalogue()
+        .iter()
+        .filter(|spec| spec.write().is_some_and(|write| !write.previews))
+        .map(|spec| {
+            let mut arguments = serde_json::Map::new();
+            if let Some(param) = spec.resource {
+                arguments.insert(param.name.to_string(), serde_json::json!("{}"));
+            }
+            if let Some(body) = spec.body() {
+                arguments.insert(body.argument.to_string(), serde_json::json!({}));
+            }
+            let call = spec
+                .call_for(&serde_json::Value::Object(arguments))
+                .unwrap_or_else(|refused| panic!("{}: {}", spec.name, refused.message));
+            // The id was given as `{}` and travels percent-encoded;
+            // decoded it is the normalised parameter the router scan
+            // spells.
+            let path = call.path.replace("%7B%7D", "{}");
+            (spec, (call.verb.as_str().to_string(), path))
+        })
+        .collect()
+}
+
+#[test]
+fn every_mcp_write_tool_declares_exactly_the_fields_its_handler_accepts_less_the_ones_not_offered()
+{
+    // Story 11.2 AC #5 and AC #6 on the tool's schema. The tool
+    // declares the body's top-level field names so a client reads them
+    // and so a key outside them is refused before the call leaves; the
+    // plane's handler deserialises a struct. The two are one vocabulary
+    // less the entries above, and this is what turns red when either
+    // side moves: a field added to `CreateRouteRequest` for the
+    // dashboard is offered to a model by a decision, and a field the
+    // tool declares that the handler dropped is a promise nothing keeps.
+    let router_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/automation/router.rs"
+    ));
+    let writes = extract_write_routes(router_src);
+    let targets = mcp_write_targets();
+    assert!(
+        targets.len() >= 8,
+        "only {} MCP write tools; the catalogue is a shape this guard does not know",
+        targets.len()
+    );
+
+    let mut drift = String::new();
+    let mut bodies_pinned = 0usize;
+    for (spec, (method, path)) in &targets {
+        let handler = writes
+            .iter()
+            .find(|(m, p, _)| m == method && p == path)
+            .map(|(_, _, handler)| handler.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} calls {method} {path}, which the automation router does not mount",
+                    spec.name
+                )
+            });
+        let (_, module_src) = automation_handler_source(&handler)
+            .unwrap_or_else(|| panic!("`{handler}` is declared in no automation module"));
+        let struct_name = handler_body_struct(module_src, &handler);
+        let Some(body) = spec.body() else {
+            assert_eq!(
+                struct_name, None,
+                "{} carries no body and its handler `{handler}` takes one",
+                spec.name
+            );
+            continue;
+        };
+        bodies_pinned += 1;
+        let struct_name = struct_name.unwrap_or_else(|| {
+            panic!(
+                "{} carries a body and its handler `{handler}` takes none",
+                spec.name
+            )
+        });
+        assert_eq!(
+            body.schema, struct_name,
+            "{} names its body `{}` and the handler deserialises `{struct_name}`",
+            spec.name, body.schema
+        );
+        let (file, src) = source_declaring(&struct_name).unwrap_or_else(|| {
+            panic!("`pub struct {struct_name}` is declared nowhere this test reads")
+        });
+        let accepted: BTreeSet<String> = serde_field_names(src, &struct_name);
+        assert!(!accepted.is_empty(), "{struct_name} in {file} has no field");
+        let not_offered: BTreeSet<String> = NOT_OFFERED_TO_A_MODEL
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        let expected: BTreeSet<String> = accepted.difference(&not_offered).cloned().collect();
+        let declared: BTreeSet<String> = body.fields.iter().map(|f| (*f).to_string()).collect();
+
+        let accepted_and_not_offered: Vec<&String> = expected.difference(&declared).collect();
+        let declared_and_not_accepted: Vec<&String> = declared.difference(&expected).collect();
+        if !accepted_and_not_offered.is_empty() || !declared_and_not_accepted.is_empty() {
+            drift.push_str(&format!(
+                "\n{} (`{struct_name}` in {file}, argument `{}`):\n",
+                spec.name, body.argument
+            ));
+            drift.push_str(&format!(
+                "  accepted by the handler and not offered by the tool ({}):\n",
+                accepted_and_not_offered.len()
+            ));
+            for name in &accepted_and_not_offered {
+                drift.push_str(&format!("    {name}\n"));
+            }
+            drift.push_str(&format!(
+                "  offered by the tool and not accepted by the handler ({}):\n",
+                declared_and_not_accepted.len()
+            ));
+            for name in &declared_and_not_accepted {
+                drift.push_str(&format!("    {name}\n"));
+            }
+        }
+        // And the entries this test tolerates are real: each one is a
+        // field the struct has, or the exemption has rotted.
+        for (name, why) in NOT_OFFERED_TO_A_MODEL {
+            if accepted.contains(*name) {
+                assert!(
+                    !declared.contains(*name),
+                    "{} offers `{name}`, which is not offered because: {why}",
+                    spec.name
+                );
+            }
+        }
+    }
+    assert!(
+        bodies_pinned >= 5,
+        "only {bodies_pinned} bodies were pinned"
+    );
+    assert!(
+        drift.is_empty(),
+        "\nThe MCP config tier's body vocabulary and the automation handlers disagree.\n{drift}\n\
+         A name on an \"accepted and not offered\" list arrived because a management request \
+         model grew a field, not because anyone decided a model may set it through the config \
+         tier. Decide: either it belongs in the tier, and you add it to the tool's field list \
+         in lorica-mcp/src/tools.rs, sorted; or it does not, and you name it with its reason in \
+         NOT_OFFERED_TO_A_MODEL in tests/openapi_contract.rs. The mirror list is a field the \
+         handler stopped accepting, which the tool must stop offering.\n"
+    );
+}
+
+/// Every property name at any depth under `schema`.
+fn schema_property_names(schema: &serde_json::Value, into: &mut Vec<String>) {
+    if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+        for (name, nested) in properties {
+            into.push(name.clone());
+            schema_property_names(nested, into);
+        }
+    }
+}
+
+#[test]
+fn no_mcp_tool_argument_takes_key_material() {
+    // Story 11.2 AC #6, asserted on the tool schemas and not on the
+    // handlers: no property a client is shown, at any depth of any
+    // tool's inputSchema, matches a key-material marker, and the one
+    // credential-shaped field a management body has is not offered.
+    let mut swept = 0usize;
+    for spec in lorica_mcp::tools::catalogue() {
+        let mut names = Vec::new();
+        schema_property_names(&spec.input_schema(), &mut names);
+        swept += names.len();
+        for name in &names {
+            for marker in KEY_MATERIAL_MARKERS {
+                assert!(
+                    !name.contains(marker),
+                    "{} takes `{name}`, which matches the key-material marker `{marker}`. Key \
+                     material enters the node through the management API, by a human, never \
+                     through a token and never through a model.",
+                    spec.name
+                );
+            }
+            assert_ne!(name, "basic_auth_password", "{}", spec.name);
+        }
+    }
+    assert!(swept > 100, "the sweep walked only {swept} property names");
+}
+
+#[test]
+fn every_automation_write_documents_dry_run_and_no_read_does() {
+    // The preview is `?dry_run=true` on the write itself (Story 11.2
+    // AC #3), so every documented write names the parameter, the same
+    // component each time, and no read does: a read has nothing to
+    // preview and a documented `dry_run` on one would promise a
+    // behaviour the handler does not have.
+    let spec_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/openapi-automation.yaml"
+    ));
+    let components = extract_parameter_components(spec_src);
+    assert_eq!(
+        components
+            .get("DryRun")
+            .map(|(name, location)| (name.as_str(), location.as_str())),
+        Some(("dry_run", "query")),
+        "components.parameters.DryRun is not the query parameter `dry_run`"
+    );
+    let documented = extract_operation_query_parameters(spec_src, &components);
+    let mut writes = 0usize;
+    for (method, path) in extract_spec_paths(spec_src) {
+        if path == AUTOMATION_MCP_PATH || path.starts_with("/automation/v1/environments") {
+            // The environment resource is Story 10.4's and previews
+            // nothing; the MCP endpoint is not a resource.
+            continue;
+        }
+        let names = documented.get(&(method.clone(), path.clone()));
+        let has_dry_run = names.is_some_and(|names| names.contains("dry_run"));
+        if method == "GET" {
+            assert!(!has_dry_run, "{method} {path} documents dry_run on a read");
+        } else {
+            writes += 1;
+            assert!(has_dry_run, "{method} {path} documents no dry_run");
+        }
+    }
+    assert!(writes >= 8, "only {writes} documented writes were checked");
+}
+
 /// Each `components.parameters` entry as `component name -> (name, in)`.
 fn extract_parameter_components(yaml: &str) -> BTreeMap<String, (String, String)> {
     let mut out: BTreeMap<String, (String, String)> = BTreeMap::new();

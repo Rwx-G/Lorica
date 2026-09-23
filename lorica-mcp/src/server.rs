@@ -20,9 +20,9 @@
 //! [`McpServer::handle`] takes a parsed message and answers a value.
 //! Reading a line, writing a line, framing and every socket belong to
 //! the adapters, and the one thing here that reaches the network does
-//! it through [`ReadSource`], which is somebody else's implementation.
-//! That is what makes AC #10's "one shared core, two bindings" a
-//! property of the code rather than a promise.
+//! it through [`AutomationPlane`], which is somebody else's
+//! implementation. That is what makes AC #10's "one shared core, two
+//! bindings" a property of the code rather than a promise.
 //!
 //! # Asks before it offers
 //!
@@ -36,6 +36,19 @@
 //! The registry is built once, here, and never reconsulted. Nothing
 //! re-reads scopes on a running server, which is what keeps Story
 //! 11.4's one-process-one-tier check cheap to add later.
+//!
+//! # The tier is the token's scopes, on both bindings
+//!
+//! Story 11.2 AC #2: the catalogue holds the read tier's tools and the
+//! config tier's, and [`McpServer::sharing`] registers a tool for a
+//! scope the token holds and no other. Over stdio that runs once at
+//! startup through [`McpServer::over`]; over Streamable HTTP it runs
+//! per request through [`McpServer::sharing`], from the token that
+//! request presented. A token carrying a write scope gets that scope's
+//! mutations with their previews and whichever read tools its read
+//! scopes cover; a token carrying read scopes alone can never gain a
+//! write tool, because every write tool declares a write scope, which
+//! `tools` pins by construction rather than by exception.
 //!
 //! # A token with no tool still starts
 //!
@@ -68,7 +81,7 @@ use serde_json::{json, Value};
 use crate::jsonrpc::{self, code, Request};
 use crate::tools::{self, ToolSpec};
 use crate::untrusted;
-use crate::{ReadError, ReadSource, Reason, MCP_PROTOCOL_REVISION};
+use crate::{AutomationPlane, PlaneError, Reason, Verb, MCP_PROTOCOL_REVISION};
 
 /// Where the automation plane reports the calling token back to it.
 const WHOAMI_PATH: &str = "/automation/v1/whoami";
@@ -120,7 +133,7 @@ pub enum StartupError {
     ///
     /// A refusal here means the token is not live: `whoami` is the one
     /// path the plane lets any live token reach, whatever it carries.
-    Introspection(ReadError),
+    Introspection(PlaneError),
     /// `whoami` answered something that is not a whoami answer.
     Unreadable,
 }
@@ -289,13 +302,13 @@ impl McpServer {
     /// [`StartupError::Introspection`] when `whoami` could not be read,
     /// [`StartupError::Unreadable`] when what came back is not a whoami
     /// answer.
-    pub async fn introspect<S: ReadSource>(source: &S) -> Result<McpServer, StartupError> {
+    pub async fn introspect<S: AutomationPlane>(source: &S) -> Result<McpServer, StartupError> {
         // `Reason::Introspection` and not a tool name: no tool has been
         // called yet and no client has spoken, so a row claiming one
         // ran would be false in the place that exists to tell a claim
         // from a fact. See [`crate::http`] for the whole of AC #6.
         let body = source
-            .fetch(WHOAMI_PATH, Reason::Introspection)
+            .call(Verb::Get, WHOAMI_PATH, None, Reason::Introspection)
             .await
             .map_err(StartupError::Introspection)?;
         let answer: Value = serde_json::from_str(&body).map_err(|_| StartupError::Unreadable)?;
@@ -323,7 +336,7 @@ impl McpServer {
     /// it builds, which is what makes a token's window outlive the
     /// request that opened it.
     pub fn sharing(identity: Identity, limiter: Arc<InvocationLimiter>) -> McpServer {
-        let registered = tools::CATALOGUE
+        let registered = tools::catalogue()
             .iter()
             .filter(|spec| identity.scopes.iter().any(|held| held == spec.scope))
             .collect();
@@ -344,37 +357,58 @@ impl McpServer {
         &self.registered
     }
 
+    /// Which tier this server is, from what it registered: the config
+    /// tier once any tool that changes the configuration is registered,
+    /// the read tier otherwise.
+    ///
+    /// A name for the operator's notice and nothing more. Story 11.4
+    /// owns the tier table and the refusal of a token spanning two
+    /// tiers; nothing here decides that.
+    pub fn tier(&self) -> &'static str {
+        if self.registered.iter().any(|spec| !spec.changes_nothing()) {
+            "config tier"
+        } else {
+            "read tier"
+        }
+    }
+
     /// One line for the operator, naming what was registered and what
     /// was not.
     ///
     /// Written for a human reading stderr, not for the model: an
     /// adapter logs it and never puts it in a tool answer.
     pub fn startup_notice(&self) -> String {
-        let tier = tier_scopes().join(", ");
         if self.registered.is_empty() {
             return format!(
-                "Token {} carries no scope this MCP read tier uses, so no tool is registered \
+                "Token {} carries no scope either MCP tier uses, so no tool is registered \
                  and tools/list answers an empty set. It carries: {}. The read tier uses: \
-                 {tier}. Mint a token carrying at least one of those.",
+                 {}. The config tier adds: {}. Mint a token carrying at least one of those.",
                 self.identity.public_id,
                 self.identity.scopes.join(", "),
+                read_scopes().join(", "),
+                write_scopes().join(", "),
             );
         }
-        let missing: Vec<&'static str> = tools::CATALOGUE
+        let tier = self.tier();
+        // A read tier is complete without a write scope, so its notice
+        // does not ask for one; a config tier is asked about both
+        // kinds, since it is the tier that uses reads to find ids.
+        let missing: Vec<&'static str> = tools::catalogue()
             .iter()
+            .filter(|spec| tier == "config tier" || spec.write().is_none())
             .map(|spec| spec.scope)
             .filter(|scope| !self.identity.scopes.iter().any(|held| held == *scope))
             .collect();
         let registered: Vec<&str> = self.registered.iter().map(|spec| spec.name).collect();
         if missing.is_empty() {
             format!(
-                "Token {} registered every read tool: {}.",
+                "Token {} registered every tool of the {tier}: {}.",
                 self.identity.public_id,
                 registered.join(", "),
             )
         } else {
             format!(
-                "Token {} registered {}. Not registered for want of a scope: {}.",
+                "Token {} registered the {tier}: {}. Not registered for want of a scope: {}.",
                 self.identity.public_id,
                 registered.join(", "),
                 deduplicated(&missing).join(", "),
@@ -384,10 +418,10 @@ impl McpServer {
 
     /// Answer one message, or `None` when it was a notification.
     ///
-    /// `source` is where a tool's read goes. It is a parameter and not
+    /// `source` is where a tool's call goes. It is a parameter and not
     /// a field because the in-process binding holds a different one per
     /// request, while the registry is fixed for the life of the server.
-    pub async fn handle<S: ReadSource>(&self, source: &S, message: Value) -> Option<Value> {
+    pub async fn handle<S: AutomationPlane>(&self, source: &S, message: Value) -> Option<Value> {
         self.handle_reporting(source, message).await.answer
     }
 
@@ -396,7 +430,11 @@ impl McpServer {
     /// For an adapter that audits or counts: the answer alone does not
     /// always say whether a tool ran, and a transport that answers every
     /// produced message with one status cannot tell from the status.
-    pub async fn handle_reporting<S: ReadSource>(&self, source: &S, message: Value) -> Handled {
+    pub async fn handle_reporting<S: AutomationPlane>(
+        &self,
+        source: &S,
+        message: Value,
+    ) -> Handled {
         match jsonrpc::parse(message) {
             Ok(request) => self.respond(source, request).await,
             // A message too malformed to place is answered under a null
@@ -414,10 +452,10 @@ impl McpServer {
     /// The entry point for a transport that had to parse the message
     /// itself before it could let it through, so the same bytes are not
     /// read twice.
-    pub async fn respond<S: ReadSource>(&self, source: &S, request: Request) -> Handled {
+    pub async fn respond<S: AutomationPlane>(&self, source: &S, request: Request) -> Handled {
         if request.is_notification() {
-            // `notifications/cancelled` is accepted and does nothing: a
-            // read tier's calls are one fetch each, so by the time a
+            // `notifications/cancelled` is accepted and does nothing:
+            // every tool's call is one request each, so by the time a
             // cancellation could be read the call it names has already
             // answered. The revision permits ignoring a cancellation
             // for a request that is unknown or already complete.
@@ -505,13 +543,15 @@ impl McpServer {
     ///
     /// The two error channels part here. An unknown tool and arguments
     /// that do not fit the declared schema are PROTOCOL errors: the
-    /// call was malformed and no tool ran. Everything after the fetch
-    /// starts is an EXECUTION error carried in a normal result with
+    /// call was malformed and no tool ran. Everything after the call
+    /// leaves is an EXECUTION error carried in a normal result with
     /// `isError: true`, which is what a model reads and stops on. An
     /// authorization refusal from the plane is on that second channel
-    /// deliberately: a model that met it as a protocol error would
-    /// reword the call and try again.
-    async fn call<S: ReadSource>(
+    /// deliberately, and so is a validator's refusal of a write (Story
+    /// 11.2 IV2): a model that met either as a protocol error would
+    /// reword the call and try again, when what it should do is read
+    /// the plane's words.
+    async fn call<S: AutomationPlane>(
         &self,
         source: &S,
         id: &Value,
@@ -534,8 +574,8 @@ impl McpServer {
             );
         };
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-        let path = match spec.path_for(&arguments) {
-            Ok(path) => path,
+        let call = match spec.call_for(&arguments) {
+            Ok(call) => call,
             Err(refused) => {
                 return (
                     jsonrpc::error(id, code::INVALID_PARAMS, &refused.message),
@@ -552,7 +592,7 @@ impl McpServer {
                         &format!(
                             "This server runs at most {RATE_BUDGET} tool calls a minute per \
                              token and this one is over that. Wait before calling again, and \
-                             narrow the read with its filters rather than paging through \
+                             narrow a read with its filters rather than paging through \
                              everything."
                         ),
                         None,
@@ -562,12 +602,20 @@ impl McpServer {
             );
         }
 
-        // The tool name travels with the read so the plane can record
+        // The tool name travels with the call so the plane can record
         // what the caller says this request was for. It is the spec's
         // own name and never the caller's string: `spec` was found by
         // matching against the catalogue, so an unknown name never
         // reaches here.
-        let (answered, outcome) = match source.fetch(&path, Reason::Tool(spec.name)).await {
+        let (answered, outcome) = match source
+            .call(
+                call.verb,
+                &call.path,
+                call.body.as_ref(),
+                Reason::Tool(spec.name),
+            )
+            .await
+        {
             Ok(body) => {
                 let answered = untrusted::answer(&body);
                 let outcome = if answered["isError"] == json!(true) {
@@ -577,18 +625,18 @@ impl McpServer {
                 };
                 (answered, outcome)
             }
-            Err(ReadError::Refused { status, body }) => (
+            Err(PlaneError::Refused { status, body }) => (
                 untrusted::execution_error(
                     &format!(
-                        "Lorica's automation plane refused this read with HTTP {status}. Its \
-                         answer follows as data. This is the plane's decision about the token \
-                         this server holds; calling again will not change it."
+                        "Lorica's automation plane refused this call with HTTP {status}. Its \
+                         answer follows as data: it is the plane's own refusal, in its own \
+                         words, and calling again with the same arguments will not change it."
                     ),
                     Some(&body),
                 ),
                 Outcome::Refused(status),
             ),
-            Err(ReadError::Transport(detail)) => (
+            Err(PlaneError::Transport(detail)) => (
                 untrusted::execution_error(
                     "Lorica's automation plane could not be reached. The reason follows as \
                      data.",
@@ -631,11 +679,26 @@ fn identity_of(answer: &Value) -> Option<Identity> {
     Some(Identity { public_id, scopes })
 }
 
-/// Every scope this tier has a tool for, once each, in catalogue order.
-pub fn tier_scopes() -> Vec<&'static str> {
+/// Every scope the read tier has a tool for, once each, in catalogue
+/// order.
+pub fn read_scopes() -> Vec<&'static str> {
     deduplicated(
-        &tools::CATALOGUE
+        &tools::catalogue()
             .iter()
+            .filter(|spec| spec.write().is_none())
+            .map(|spec| spec.scope)
+            .collect::<Vec<&'static str>>(),
+    )
+}
+
+/// Every scope the config tier adds over the read tier, once each, in
+/// catalogue order. A preview sits behind its mutation's write scope,
+/// so it counts here although it changes nothing.
+pub fn write_scopes() -> Vec<&'static str> {
+    deduplicated(
+        &tools::catalogue()
+            .iter()
+            .filter(|spec| spec.write().is_some())
             .map(|spec| spec.scope)
             .collect::<Vec<&'static str>>(),
     )
@@ -664,12 +727,13 @@ mod tests {
     }
 
     /// A plane that answers `whoami` from one field and every other
-    /// read from another, recording what it was asked for and what the
-    /// server said the read was for.
+    /// call from another, recording what it was asked for, what it was
+    /// sent, and what the server said the call was for.
     struct Plane {
         whoami: String,
         answer: Answer,
         asked: Mutex<Vec<String>>,
+        sent: Mutex<Vec<(Verb, String, Option<Value>)>>,
         declared: Mutex<Vec<Option<String>>>,
     }
 
@@ -684,6 +748,7 @@ mod tests {
                 .to_string(),
                 answer: Answer::Body("{\"data\":{\"items\":[],\"page\":{\"returned\":0}}}"),
                 asked: Mutex::new(Vec::new()),
+                sent: Mutex::new(Vec::new()),
                 declared: Mutex::new(Vec::new()),
             }
         }
@@ -700,6 +765,13 @@ mod tests {
                 .clone()
         }
 
+        fn sent_calls(&self) -> Vec<(Verb, String, Option<Value>)> {
+            self.sent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
         fn declared_for(&self) -> Vec<Option<String>> {
             self.declared
                 .lock()
@@ -708,14 +780,25 @@ mod tests {
         }
     }
 
-    impl ReadSource for Plane {
-        async fn fetch(&self, path: &str, reason: Reason<'_>) -> Result<String, ReadError> {
+    impl AutomationPlane for Plane {
+        async fn call(
+            &self,
+            verb: Verb,
+            path: &str,
+            body: Option<&Value>,
+            reason: Reason<'_>,
+        ) -> Result<String, PlaneError> {
             {
                 let mut asked = self
                     .asked
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 asked.push(path.to_string());
+                let mut sent = self
+                    .sent
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                sent.push((verb, path.to_string(), body.cloned()));
                 let mut declared = self
                     .declared
                     .lock()
@@ -727,11 +810,11 @@ mod tests {
             }
             match self.answer {
                 Answer::Body(body) => Ok(body.to_string()),
-                Answer::Refused(status, body) => Err(ReadError::Refused {
+                Answer::Refused(status, body) => Err(PlaneError::Refused {
                     status,
                     body: body.to_string(),
                 }),
-                Answer::Broken(detail) => Err(ReadError::Transport(detail.to_string())),
+                Answer::Broken(detail) => Err(PlaneError::Transport(detail.to_string())),
             }
         }
     }
@@ -780,19 +863,257 @@ mod tests {
         assert!(notice.contains("no tool is registered"), "{notice}");
         assert!(notice.contains("environments:write"), "{notice}");
         assert!(notice.contains("logs:read"), "{notice}");
+        assert!(notice.contains("routes:write"), "{notice}");
         assert!(notice.contains("0123456789abcdef01234567"), "{notice}");
     }
 
     #[tokio::test]
-    async fn the_notice_names_what_a_partial_token_did_not_get() {
+    async fn the_notice_names_the_tier_and_what_a_partial_token_did_not_get() {
         let plane = Plane::carrying(&["logs:read"]);
-        let notice = server_for(&plane).await.startup_notice();
+        let server = server_for(&plane).await;
+        assert_eq!(server.tier(), "read tier");
+        let notice = server.startup_notice();
+        assert!(notice.contains("read tier"), "{notice}");
         assert!(notice.contains("lorica_logs"), "{notice}");
         assert!(notice.contains("waf:read"), "{notice}");
+        // A read tier is complete without a write scope, so it is not
+        // asked for one.
+        assert!(!notice.contains("routes:write"), "{notice}");
 
-        let plane = Plane::carrying(&tier_scopes());
+        let plane = Plane::carrying(&read_scopes());
         let notice = server_for(&plane).await.startup_notice();
-        assert!(notice.contains("every read tool"), "{notice}");
+        assert!(notice.contains("every tool of the read tier"), "{notice}");
+
+        // One write scope makes it the config tier, and that tier is
+        // asked about the reads it lacks, since it uses them for ids.
+        let plane = Plane::carrying(&["routes:write"]);
+        let server = server_for(&plane).await;
+        assert_eq!(server.tier(), "config tier");
+        let notice = server.startup_notice();
+        assert!(notice.contains("config tier"), "{notice}");
+        assert!(notice.contains("lorica_route_create_preview"), "{notice}");
+        assert!(notice.contains("routes:read"), "{notice}");
+        assert!(notice.contains("backends:write"), "{notice}");
+
+        let every: Vec<&str> = read_scopes().into_iter().chain(write_scopes()).collect();
+        let notice = server_for(&Plane::carrying(&every)).await.startup_notice();
+        assert!(notice.contains("every tool of the config tier"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn a_token_carrying_only_read_scopes_registers_no_write_tool_and_cannot_call_one() {
+        // Story 11.2 AC #2: a read-tier token can never gain a write
+        // tool. Every read scope there is, and not one mutation
+        // registered, listed or callable.
+        let plane = Plane::carrying(&read_scopes());
+        let server = server_for(&plane).await;
+        assert!(!server.tools().is_empty());
+        for spec in server.tools() {
+            assert!(spec.changes_nothing(), "{} is registered", spec.name);
+            assert!(spec.write().is_none(), "{} is registered", spec.name);
+        }
+        for mutation in tools::MUTATIONS {
+            for name in [mutation.apply, mutation.preview] {
+                let refused = server
+                    .handle(
+                        &plane,
+                        request(1, "tools/call", json!({ "name": name, "arguments": {} })),
+                    )
+                    .await
+                    .expect("a request is answered");
+                assert_eq!(
+                    refused["error"]["code"],
+                    json!(jsonrpc::code::METHOD_NOT_FOUND),
+                    "{name}"
+                );
+                assert!(
+                    refused["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(mutation.scope)),
+                    "{name}: {refused}"
+                );
+            }
+        }
+        // Nothing but the introspection reached the plane.
+        assert_eq!(plane.asked_for(), vec![WHOAMI_PATH.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_config_tier_token_registers_its_mutations_with_their_previews_and_the_reads_it_holds(
+    ) {
+        // Story 11.2 AC #2, the other half: a write scope registers
+        // that scope's mutations and previews, and the read tools the
+        // token's read scopes cover, and nothing behind a scope it does
+        // not carry.
+        let plane = Plane::carrying(&["routes:write", "routes:read"]);
+        let server = server_for(&plane).await;
+        let registered: Vec<&str> = server.tools().iter().map(|spec| spec.name).collect();
+        assert_eq!(
+            registered,
+            vec![
+                "lorica_routes",
+                "lorica_route_create",
+                "lorica_route_create_preview",
+                "lorica_route_update",
+                "lorica_route_update_preview",
+                "lorica_route_delete",
+                "lorica_route_delete_preview",
+            ]
+        );
+        for spec in server.tools() {
+            assert!(
+                spec.scope == "routes:write" || spec.scope == "routes:read",
+                "{}",
+                spec.name
+            );
+        }
+        // The binding sits behind certificates:write and is not here,
+        // although its path is a route's.
+        let refused = server
+            .handle(
+                &plane,
+                request(
+                    1,
+                    "tools/call",
+                    json!({ "name": "lorica_route_bind_certificate",
+                            "arguments": { "id": "r-1", "binding": { "certificate_id": "c-1" } } }),
+                ),
+            )
+            .await
+            .expect("a request is answered");
+        assert_eq!(
+            refused["error"]["code"],
+            json!(jsonrpc::code::METHOD_NOT_FOUND)
+        );
+        assert!(refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("certificates:write")));
+    }
+
+    #[tokio::test]
+    async fn a_write_tool_call_crosses_the_seam_with_its_verb_and_body_and_a_preview_with_dry_run()
+    {
+        // The seam carries what a mutation is: the verb, the path, the
+        // body verbatim. The plane below is what validates it; this
+        // proves the call arrived whole and the preview arrived marked.
+        let plane = Plane::carrying(&["routes:write"]);
+        let server = server_for(&plane).await;
+        let route = json!({ "hostname": "app.example.com", "waf_enabled": true });
+
+        let answered = server
+            .handle(
+                &plane,
+                request(
+                    1,
+                    "tools/call",
+                    json!({ "name": "lorica_route_create", "arguments": { "route": route } }),
+                ),
+            )
+            .await
+            .expect("a request is answered");
+        assert_eq!(answered["result"]["isError"], json!(false));
+        assert_eq!(
+            plane.sent_calls().last(),
+            Some(&(
+                Verb::Post,
+                "/automation/v1/routes".to_string(),
+                Some(route.clone())
+            ))
+        );
+        assert_eq!(
+            plane.declared_for().last(),
+            Some(&Some("lorica_route_create".to_string()))
+        );
+
+        server
+            .handle(
+                &plane,
+                request(
+                    2,
+                    "tools/call",
+                    json!({ "name": "lorica_route_update_preview",
+                            "arguments": { "id": "r-1", "route": route } }),
+                ),
+            )
+            .await
+            .expect("a request is answered");
+        assert_eq!(
+            plane.sent_calls().last(),
+            Some(&(
+                Verb::Put,
+                "/automation/v1/routes/r%2D1?dry_run=true".to_string(),
+                Some(route.clone())
+            ))
+        );
+
+        server
+            .handle(
+                &plane,
+                request(
+                    3,
+                    "tools/call",
+                    json!({ "name": "lorica_route_delete", "arguments": { "id": "r-1" } }),
+                ),
+            )
+            .await
+            .expect("a request is answered");
+        assert_eq!(
+            plane.sent_calls().last(),
+            Some(&(
+                Verb::Delete,
+                "/automation/v1/routes/r%2D1".to_string(),
+                None
+            ))
+        );
+        // And a read still crosses as a GET with no body.
+        let reader = Plane::carrying(&["logs:read"]);
+        let server = server_for(&reader).await;
+        server
+            .handle(
+                &reader,
+                request(4, "tools/call", json!({ "name": "lorica_logs" })),
+            )
+            .await
+            .expect("a request is answered");
+        assert_eq!(
+            reader.sent_calls().last(),
+            Some(&(Verb::Get, "/automation/v1/logs".to_string(), None))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_validators_refusal_of_a_write_is_an_execution_error_carrying_the_planes_words() {
+        // Story 11.2 IV2 at this layer: the field-level error is the
+        // plane's own, verbatim inside the fence, and it comes back as
+        // an execution error so the model reads it and stops.
+        let plane = Plane::carrying(&["routes:write"]).answering(Answer::Refused(
+            400,
+            "{\"error\":{\"message\":\"connect_timeout_s must be between 1 and 300\"}}",
+        ));
+        let server = server_for(&plane).await;
+        let handled = server
+            .handle_reporting(
+                &plane,
+                request(
+                    1,
+                    "tools/call",
+                    json!({ "name": "lorica_route_create",
+                            "arguments": { "route": { "hostname": "a", "connect_timeout_s": 0 } } }),
+                ),
+            )
+            .await;
+        assert_eq!(handled.outcome, Outcome::Refused(400));
+        let answered = handled.answer.expect("a request is answered");
+        assert!(answered.get("error").is_none(), "{answered}");
+        assert_eq!(answered["result"]["isError"], json!(true));
+        let text = answered["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("HTTP 400"), "{text}");
+        assert!(
+            text.contains("connect_timeout_s must be between 1 and 300"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -808,6 +1129,7 @@ mod tests {
                 whoami: nonsense.to_string(),
                 answer: Answer::Body("{}"),
                 asked: Mutex::new(Vec::new()),
+                sent: Mutex::new(Vec::new()),
                 declared: Mutex::new(Vec::new()),
             };
             let refused = McpServer::introspect(&plane)
@@ -1261,8 +1583,10 @@ mod tests {
         // AC #5 at this layer. The rows are the management plane's own
         // views and `lorica-api` sweeps those; what this crate owes is
         // that it adds nothing of its own, so the sweep walks every
-        // registered tool's answer, the tool list and the refusals.
-        let plane = Plane::carrying(&tier_scopes());
+        // registered tool's answer, the tool list and the refusals,
+        // over a token carrying every scope of both tiers.
+        let every: Vec<&str> = read_scopes().into_iter().chain(write_scopes()).collect();
+        let plane = Plane::carrying(&every);
         let server = server_for(&plane).await;
 
         let mut swept: Vec<Value> = vec![
@@ -1275,13 +1599,16 @@ mod tests {
                 .await
                 .expect("a request is answered"),
         ];
-        assert!(!server.tools().is_empty());
+        assert_eq!(server.tools().len(), tools::catalogue().len());
         for spec in server.tools() {
-            let arguments = spec.resource.map_or(json!({}), |param| {
-                let mut map = serde_json::Map::new();
+            let mut map = serde_json::Map::new();
+            if let Some(param) = spec.resource {
                 map.insert(param.name.to_string(), json!("r-1"));
-                Value::Object(map)
-            });
+            }
+            if let Some(body) = spec.body() {
+                map.insert(body.argument.to_string(), json!({}));
+            }
+            let arguments = Value::Object(map);
             swept.push(
                 server
                     .handle(

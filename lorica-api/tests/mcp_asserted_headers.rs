@@ -113,10 +113,10 @@ fn the_streamable_http_binding_asserts_nothing_and_needs_no_marker_of_its_own() 
             "`{asserting}` appears in the Streamable HTTP adapter, which asserts nothing"
         );
     }
-    // And the scan is worth something: the read source it is about
-    // really is in the module, and so is the constant the audit layer
-    // keys the established row on.
-    assert!(body.contains("impl ReadSource for InProcessReads"));
+    // And the scan is worth something: the in-process plane it is
+    // about really is in the module, and so is the constant the audit
+    // layer keys the established row on.
+    assert!(body.contains("impl AutomationPlane for InProcessPlane"));
     assert!(body.contains("pub struct McpCallRecord"));
 
     // The row-level half of the same property, which needs no source:

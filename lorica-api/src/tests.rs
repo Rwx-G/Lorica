@@ -11776,14 +11776,60 @@ async fn the_tool_set_is_the_one_the_presented_token_can_reach_and_nothing_else(
     assert!(refused.get("result").is_none(), "{refused}");
 }
 
+/// The ids a sweep of the config tier's previews names, read off the
+/// tier's own listings.
+struct SweptIds {
+    route: String,
+    backend: String,
+    certificate: String,
+}
+
+/// The arguments a sweep gives `spec`: the seeded resource it names,
+/// and for a preview a body the plane accepts.
+///
+/// A mutation added to the catalogue and absent here stops the sweep
+/// with its name, which is the decision the sweep exists to force: a
+/// preview nobody drove through the in-process router is a preview
+/// nobody proved reaches its handler.
+fn sweep_arguments(spec: &lorica_mcp::tools::ToolSpec, ids: &SweptIds) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if let Some(param) = spec.resource {
+        let id = match spec.path {
+            "/automation/v1/backends" => &ids.backend,
+            "/automation/v1/certificates" => &ids.certificate,
+            _ => &ids.route,
+        };
+        map.insert(param.name.to_string(), serde_json::json!(id));
+    }
+    if let Some(body) = spec.body() {
+        let value = match spec.name {
+            "lorica_route_create_preview" => serde_json::json!({
+                "hostname": "swept.read.example.com",
+                "backend_ids": [ids.backend],
+            }),
+            "lorica_route_update_preview" => serde_json::json!({ "waf_enabled": true }),
+            "lorica_route_bind_certificate_preview" => {
+                serde_json::json!({ "certificate_id": ids.certificate })
+            }
+            "lorica_backend_create_preview" => serde_json::json!({ "address": "10.0.0.12:8080" }),
+            "lorica_backend_update_preview" => serde_json::json!({ "name": "swept" }),
+            other => panic!("{other} is a mutation this sweep has no body for; give it one"),
+        };
+        map.insert(body.argument.to_string(), value);
+    }
+    serde_json::Value::Object(map)
+}
+
 #[tokio::test]
 async fn every_registered_tool_answers_through_the_endpoint_without_leaving_the_process() {
-    // Two things at once, deliberately. That the in-process read source
-    // dispatches every path the catalogue can build, which is what
-    // stops a tool added later reaching a handler nobody wired. And
-    // that what comes back is the plane's own filtered view, which is
-    // what stops the in-process route becoming a second way out for a
-    // field the HTTP route strips.
+    // Two things at once, deliberately. That the in-process plane
+    // routes every call the catalogue can build, reads and previews
+    // alike, which is what stops a tool added later reaching a handler
+    // nobody mounted. And that what comes back is the plane's own
+    // filtered view, which is what stops the in-process route becoming
+    // a second way out for a field the HTTP route strips. The apply
+    // tools are listed and not driven here: what they change, and what
+    // they land in the audit trail, is the config tier's own tests'.
     let (state, bearer, route_id) = a_node_and_a_token_for_every_tool().await;
 
     let listed = body_json(
@@ -11803,27 +11849,68 @@ async fn every_registered_tool_answers_through_the_endpoint_without_leaving_the_
         .collect();
     assert_eq!(
         offered.len(),
-        lorica_mcp::tools::CATALOGUE.len(),
+        lorica_mcp::tools::catalogue().len(),
         "a token carrying every scope registers every tool: {offered:?}"
     );
 
+    // The ids the previews name, read through the tier's own listings.
+    let first_id = |answered: &serde_json::Value| -> String {
+        answered["result"]["structuredContent"]["untrusted"]["data"]["items"][0]["id"]
+            .as_str()
+            .expect("a listing carries an id")
+            .to_string()
+    };
+    let ids = SweptIds {
+        route: route_id,
+        backend: first_id(
+            &mcp_call(&state, &bearer, "lorica_backends", serde_json::json!({})).await,
+        ),
+        certificate: first_id(
+            &mcp_call(
+                &state,
+                &bearer,
+                "lorica_certificates",
+                serde_json::json!({}),
+            )
+            .await,
+        ),
+    };
+    // The renewal preview refuses a certificate that was uploaded, as
+    // the apply would; the seeded one is marked as issued so the
+    // preview reaches its answer rather than its refusal.
+    {
+        let store = state.store.lock().await;
+        let mut certificate = store
+            .get_certificate(&ids.certificate)
+            .expect("store")
+            .expect("the seeded certificate");
+        certificate.is_acme = true;
+        store
+            .update_certificate(&certificate)
+            .expect("the mark lands");
+    }
+
     let mut walked = 0usize;
+    let mut driven = 0usize;
     for name in &offered {
         let spec = lorica_mcp::tools::find(name).expect("the catalogue knows what it offered");
-        let arguments = match spec.resource {
-            Some(param) => {
-                let mut map = serde_json::Map::new();
-                map.insert(param.name.to_string(), serde_json::json!(route_id));
-                serde_json::Value::Object(map)
-            }
-            None => serde_json::json!({}),
-        };
-        let answered = mcp_call(&state, &bearer, name, arguments).await;
+        if !spec.changes_nothing() {
+            continue;
+        }
+        driven += 1;
+        let answered = mcp_call(&state, &bearer, name, sweep_arguments(spec, &ids)).await;
         assert_eq!(
             answered["result"]["isError"],
             serde_json::json!(false),
             "{name} answered an execution error: {answered}"
         );
+        if spec.write().is_some() {
+            assert_eq!(
+                answered["result"]["structuredContent"]["untrusted"]["data"]["dry_run"],
+                serde_json::json!(true),
+                "{name} did not answer a preview: {answered}"
+            );
+        }
 
         let mut keys = Vec::new();
         let mut texts = Vec::new();
@@ -11848,6 +11935,14 @@ async fn every_registered_tool_answers_through_the_endpoint_without_leaving_the_
     assert!(
         walked > 100,
         "the sweep walked only {walked} field names across every tool, so it is broken"
+    );
+    assert_eq!(
+        driven,
+        lorica_mcp::tools::catalogue()
+            .iter()
+            .filter(|spec| spec.changes_nothing())
+            .count(),
+        "the sweep drove fewer tools than change nothing"
     );
 }
 
@@ -12352,5 +12447,679 @@ async fn the_assertion_headers_cannot_replace_the_tool_the_node_ran_on_this_bind
             "POST {} asserted[tool=lorica_certificates]",
             crate::automation::MCP_PATH
         )
+    );
+}
+
+// ---- The MCP config tier (Story 11.2), over the Streamable HTTP binding ----
+//
+// The write fixture's token carries every scope over
+// `*.write.example.com` and `10.0.0.0/8`, so the tier it starts on
+// this binding is the config tier with every read tool beside it. What
+// these tests prove is what the tier does to the store and to the
+// trail, through the whole stack: the bearer gate, the endpoint, the
+// core, the in-process router with its scope gate, the write handler,
+// and the audit layer around all of it.
+
+/// The plane's answer inside a tool result.
+fn plane_answer(result: &serde_json::Value) -> &serde_json::Value {
+    &result["result"]["structuredContent"]["untrusted"]["data"]
+}
+
+/// The text of a tool result's one content block.
+fn result_text(result: &serde_json::Value) -> &str {
+    result["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+}
+
+/// Every scope of the token model that reads, as the read tier is
+/// minted.
+fn every_read_scope() -> Vec<lorica_config::models::AutomationScope> {
+    lorica_config::models::AutomationScope::ALL
+        .iter()
+        .copied()
+        .filter(|scope| {
+            serde_json::to_value(scope)
+                .ok()
+                .and_then(|value| value.as_str().map(|spelled| spelled.ends_with(":read")))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_config_tier_on_this_binding_is_the_tokens_scopes_and_a_read_tier_token_gains_no_write()
+{
+    // Story 11.2 AC #2 through the whole stack. The tier is decided per
+    // request from the presented token: every scope lists every tool,
+    // and a token minted on the same node with every read scope lists
+    // the reads alone and cannot call a mutation, whose refusal is
+    // audited as the scope it needed.
+    let f = a_node_with_something_to_write().await;
+    let list = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+
+    let offered: Vec<String> = body_json(mcp_post(&f.state, &f.bearer, &list).await).await
+        ["result"]["tools"]
+        .as_array()
+        .expect("a tool list")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("a name").to_string())
+        .collect();
+    for mutation in lorica_mcp::tools::MUTATIONS {
+        assert!(offered.contains(&mutation.apply.to_string()), "{offered:?}");
+        assert!(
+            offered.contains(&mutation.preview.to_string()),
+            "{offered:?}"
+        );
+    }
+    assert!(offered.contains(&"lorica_routes".to_string()));
+
+    let read_tier = mint_automation(
+        &f.state,
+        "read-tier",
+        every_read_scope(),
+        &["*.write.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    let read_bearer = format!("Bearer {read_tier}");
+    let offered: Vec<String> = body_json(mcp_post(&f.state, &read_bearer, &list).await).await
+        ["result"]["tools"]
+        .as_array()
+        .expect("a tool list")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("a name").to_string())
+        .collect();
+    assert!(!offered.is_empty());
+    for name in &offered {
+        let spec = lorica_mcp::tools::find(name).expect("listed tools are in the catalogue");
+        assert!(
+            spec.write().is_none(),
+            "{name} is offered to a read-tier token"
+        );
+    }
+    let refused = mcp_call(
+        &f.state,
+        &read_bearer,
+        "lorica_route_create",
+        serde_json::json!({ "route": { "hostname": "app.write.example.com" } }),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"],
+        lorica_mcp::jsonrpc::code::METHOD_NOT_FOUND
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("routes:write")),
+        "{refused}"
+    );
+    let rows = mcp_audit_rows(&f.state).await;
+    assert_eq!(
+        rows[0].action, "automation.request.forbidden:routes:write",
+        "{:?}",
+        rows[0]
+    );
+    assert_eq!(canonical_now(&f.state).await.routes.len(), 0);
+}
+
+#[tokio::test]
+async fn iv1_a_route_created_through_the_config_tier_is_the_dashboards_route_byte_for_byte() {
+    // Story 11.2 IV1 through the tier: the same body through
+    // `lorica_route_create` and through the dashboard lands the same
+    // stored row, byte for byte in the canonical encoding once the id
+    // and the clock are set equal. It holds because the tool's call
+    // runs the management handler's own body, in process, and the tool
+    // layer never touches a field.
+    let f = a_node_with_something_to_write().await;
+    let route = serde_json::json!({
+        "hostname": "app.write.example.com",
+        "path_prefix": "/app",
+        "backend_ids": [f.backend_id],
+        "certificate_id": f.certificate_id,
+        "load_balancing": "random",
+        "waf_enabled": true,
+        "waf_mode": "blocking",
+        "force_https": true,
+        "connect_timeout_s": 7,
+        "group_name": "prod",
+        "hostname_aliases": ["app-alias.write.example.com"],
+    });
+
+    let answered = mcp_call(
+        &f.state,
+        &f.bearer,
+        "lorica_route_create",
+        serde_json::json!({ "route": route.clone() }),
+    )
+    .await;
+    assert_eq!(
+        answered["result"]["isError"],
+        serde_json::json!(false),
+        "{answered}"
+    );
+    let tier_view = plane_answer(&answered).clone();
+    assert_no_secret_field_name(&tier_view, "lorica_route_create");
+    let tier_id = tier_view["id"].as_str().expect("route id").to_string();
+    let through_tier = canonical_now(&f.state).await;
+
+    {
+        let store = f.state.store.lock().await;
+        store
+            .delete_route(&tier_id)
+            .expect("test setup: the row leaves");
+    }
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &f.admin,
+        Some(route),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let dashboard_view = parse_data(response).await;
+    let dashboard_id = dashboard_view["id"].as_str().expect("route id").to_string();
+    let mut through_dashboard = canonical_now(&f.state).await;
+
+    let tier_route = through_tier
+        .routes
+        .iter()
+        .find(|route| route.id == tier_id)
+        .expect("the tier's row is in the canonical config");
+    for route in &mut through_dashboard.routes {
+        if route.id == dashboard_id {
+            route.id = tier_id.clone();
+            route.created_at = tier_route.created_at;
+            route.updated_at = tier_route.updated_at;
+        }
+    }
+    for link in &mut through_dashboard.route_backends {
+        if link.route_id == dashboard_id {
+            link.route_id = tier_id.clone();
+        }
+    }
+    assert_eq!(
+        lorica_config::canonical::encode_canonical(&through_tier).expect("encodes"),
+        lorica_config::canonical::encode_canonical(&through_dashboard).expect("encodes"),
+        "the route the config tier wrote and the route the dashboard wrote differ"
+    );
+    let strip = |mut view: serde_json::Value| {
+        let object = view.as_object_mut().expect("a route view is an object");
+        for volatile in ["id", "created_at", "updated_at"] {
+            object.remove(volatile);
+        }
+        view
+    };
+    assert_eq!(strip(tier_view), strip(dashboard_view));
+}
+
+#[tokio::test]
+async fn iv2_a_refusal_through_the_config_tier_arrives_unchanged_and_writes_nothing() {
+    // Story 11.2 IV2 through the tier, both halves and both refusals:
+    // the management validator's, whose message crosses inside the
+    // fence exactly as the dashboard shows it, and the plane's own
+    // grant. Each is a tool EXECUTION error the model reads and stops
+    // on, each is audited as the refusal it is, and the store is the
+    // store it was.
+    let f = a_node_with_something_to_write().await;
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+
+    let refused_by_a_validator = serde_json::json!({
+        "hostname": "bad.write.example.com",
+        "backend_ids": [f.backend_id],
+        "connect_timeout_s": 0,
+    });
+    let through_dashboard = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &f.admin,
+        Some(refused_by_a_validator.clone()),
+    )
+    .await;
+    assert_eq!(through_dashboard.status(), StatusCode::BAD_REQUEST);
+    let dashboard_error = body_json(through_dashboard).await;
+    let dashboard_message = dashboard_error["error"]["message"]
+        .as_str()
+        .expect("the dashboard's message");
+    assert!(dashboard_message.contains("connect_timeout_s"));
+
+    let answered = mcp_call(
+        &f.state,
+        &f.bearer,
+        "lorica_route_create",
+        serde_json::json!({ "route": refused_by_a_validator }),
+    )
+    .await;
+    assert!(answered.get("error").is_none(), "{answered}");
+    assert_eq!(answered["result"]["isError"], serde_json::json!(true));
+    let text = result_text(&answered);
+    assert!(text.contains("HTTP 400"), "{text}");
+    assert!(text.contains(dashboard_message), "{text}");
+    assert!(text.contains(lorica_mcp::untrusted::NOTICE), "{text}");
+    let rows = mcp_audit_rows(&f.state).await;
+    assert_eq!(
+        rows[0].action, "automation.request.refused",
+        "{:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0].target_id,
+        format!(
+            "POST {} tool=lorica_route_create?route",
+            crate::automation::MCP_PATH
+        )
+    );
+
+    // The plane's own refusal, the grant, before the handler runs.
+    let answered = mcp_call(
+        &f.state,
+        &f.bearer,
+        "lorica_route_create",
+        serde_json::json!({ "route": { "hostname": "www.example.com" } }),
+    )
+    .await;
+    assert_eq!(answered["result"]["isError"], serde_json::json!(true));
+    let text = result_text(&answered);
+    assert!(text.contains("HTTP 403"), "{text}");
+    assert!(text.contains("allowed_hostnames"), "{text}");
+    let rows = mcp_audit_rows(&f.state).await;
+    assert_eq!(
+        rows[0].action, "automation.request.forbidden",
+        "{:?}",
+        rows[0]
+    );
+
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes"),
+        "a refused write changed the store"
+    );
+    assert!(audit_rows_under(&f.state, "route.").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_preview_through_the_config_tier_answers_the_change_and_writes_nothing() {
+    // Story 11.2 AC #3 through the tier. The preview takes the apply
+    // tool's arguments, answers the change as the plane's own JSON,
+    // lands the request row and no management row, and leaves the
+    // canonical configuration byte for byte where it was; the apply
+    // then makes exactly that change.
+    let f = a_node_with_something_to_write().await;
+    let created = mcp_call(
+        &f.state,
+        &f.bearer,
+        "lorica_route_create",
+        serde_json::json!({ "route": {
+            "hostname": "app.write.example.com",
+            "backend_ids": [f.backend_id],
+        } }),
+    )
+    .await;
+    assert_eq!(
+        created["result"]["isError"],
+        serde_json::json!(false),
+        "{created}"
+    );
+    let route_id = plane_answer(&created)["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+    let management_rows_before = audit_rows_under(&f.state, "route.").await.len();
+
+    let patch = serde_json::json!({ "id": route_id, "route": {
+        "waf_enabled": true,
+        "hostname_aliases": ["alias.write.example.com"],
+    } });
+    let previewed = mcp_call(
+        &f.state,
+        &f.bearer,
+        "lorica_route_update_preview",
+        patch.clone(),
+    )
+    .await;
+    assert_eq!(
+        previewed["result"]["isError"],
+        serde_json::json!(false),
+        "{previewed}"
+    );
+    let change = plane_answer(&previewed);
+    assert_eq!(change["dry_run"], serde_json::json!(true));
+    assert_eq!(change["operation"], serde_json::json!("update"));
+    assert_eq!(change["before"]["id"], serde_json::json!(route_id));
+    assert_eq!(change["before"]["waf_enabled"], serde_json::json!(false));
+    assert_eq!(change["after"]["waf_enabled"], serde_json::json!(true));
+    assert_eq!(
+        change["changes"]["waf_enabled"],
+        serde_json::json!({ "from": false, "to": true })
+    );
+    assert_eq!(
+        change["changes"]["hostname_aliases"],
+        serde_json::json!({ "from": [], "to": ["alias.write.example.com"] })
+    );
+    assert!(change["changes"].get("hostname").is_none(), "{change}");
+    // The backend links survive a preview's `after`, and the ones
+    // before are read for the `before` view.
+    assert_eq!(
+        change["before"]["backends"],
+        serde_json::json!([f.backend_id])
+    );
+    assert_eq!(
+        change["after"]["backends"],
+        serde_json::json!([f.backend_id])
+    );
+
+    let deleted = mcp_call(
+        &f.state,
+        &f.bearer,
+        "lorica_route_delete_preview",
+        serde_json::json!({ "id": route_id }),
+    )
+    .await;
+    let change = plane_answer(&deleted);
+    assert_eq!(change["operation"], serde_json::json!("delete"));
+    assert_eq!(change["before"]["id"], serde_json::json!(route_id));
+    assert_eq!(change["after"], serde_json::Value::Null);
+
+    let would_create = mcp_call(
+        &f.state,
+        &f.bearer,
+        "lorica_route_create_preview",
+        serde_json::json!({ "route": { "hostname": "new.write.example.com" } }),
+    )
+    .await;
+    let change = plane_answer(&would_create);
+    assert_eq!(change["operation"], serde_json::json!("create"));
+    assert_eq!(change["before"], serde_json::Value::Null);
+    assert_eq!(
+        change["after"]["hostname"],
+        serde_json::json!("new.write.example.com")
+    );
+    assert!(change["after"].get("id").is_none(), "{change}");
+
+    // Nothing moved: not the store, not the management trail. The
+    // request rows name the previews as what they are.
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes"),
+        "a preview changed the store"
+    );
+    assert_eq!(
+        audit_rows_under(&f.state, "route.").await.len(),
+        management_rows_before
+    );
+    let rows = mcp_audit_rows(&f.state).await;
+    assert!(
+        rows.iter().any(|row| {
+            row.action == "automation.request.ok"
+                && row.target_id
+                    == format!(
+                        "POST {} tool=lorica_route_update_preview?id,route",
+                        crate::automation::MCP_PATH
+                    )
+        }),
+        "{rows:?}"
+    );
+
+    // And the apply, with the same arguments, is the change the
+    // preview showed.
+    let applied = mcp_call(&f.state, &f.bearer, "lorica_route_update", patch).await;
+    assert_eq!(
+        applied["result"]["isError"],
+        serde_json::json!(false),
+        "{applied}"
+    );
+    let now = canonical_now(&f.state).await;
+    let route = now
+        .routes
+        .iter()
+        .find(|route| route.id == route_id)
+        .expect("the route is there");
+    assert!(route.waf_enabled);
+    assert_eq!(route.hostname_aliases, vec!["alias.write.example.com"]);
+    assert_eq!(
+        audit_rows_under(&f.state, "route.").await.len(),
+        management_rows_before + 1
+    );
+}
+
+#[tokio::test]
+async fn every_write_path_previews_under_dry_run_and_writes_nothing() {
+    // Story 11.2 AC #3 on the plane, one entry per write path: each
+    // answers the change under `?dry_run=true`, and when all eight have
+    // answered the canonical configuration and the management trail are
+    // what they were. The table is asserted against `WRITE_SURFACE`, so
+    // a write path added to the plane has to be given a preview here.
+    let f = a_node_with_something_to_write().await;
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "app.write.example.com",
+            "backend_ids": [f.backend_id],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    {
+        let store = f.state.store.lock().await;
+        let mut certificate = store
+            .get_certificate(&f.certificate_id)
+            .expect("store")
+            .expect("the seeded certificate");
+        certificate.is_acme = true;
+        store
+            .update_certificate(&certificate)
+            .expect("the mark lands");
+    }
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+    let management_rows = |state: AppState| async move {
+        audit_rows_under(&state, "route.").await.len()
+            + audit_rows_under(&state, "backend.").await.len()
+            + audit_rows_under(&state, "certificate.").await.len()
+    };
+    let rows_before = management_rows(f.state.clone()).await;
+
+    let previews: Vec<(&str, String, Option<serde_json::Value>, &str)> = vec![
+        (
+            "POST",
+            "/automation/v1/routes".to_string(),
+            Some(serde_json::json!({
+                "hostname": "dry.write.example.com",
+                "backend_ids": [f.backend_id],
+            })),
+            "create",
+        ),
+        (
+            "PUT",
+            format!("/automation/v1/routes/{route_id}"),
+            Some(serde_json::json!({ "waf_enabled": true })),
+            "update",
+        ),
+        (
+            "DELETE",
+            format!("/automation/v1/routes/{route_id}"),
+            None,
+            "delete",
+        ),
+        (
+            "PUT",
+            format!("/automation/v1/routes/{route_id}/certificate"),
+            Some(serde_json::json!({ "certificate_id": f.certificate_id })),
+            "update",
+        ),
+        (
+            "POST",
+            "/automation/v1/backends".to_string(),
+            Some(serde_json::json!({ "address": "10.0.0.12:8080" })),
+            "create",
+        ),
+        (
+            "PUT",
+            format!("/automation/v1/backends/{}", f.backend_id),
+            Some(serde_json::json!({ "name": "renamed" })),
+            "update",
+        ),
+        (
+            "DELETE",
+            format!("/automation/v1/backends/{}", f.backend_id),
+            None,
+            "delete",
+        ),
+        (
+            "POST",
+            format!("/automation/v1/certificates/{}/renew", f.certificate_id),
+            None,
+            "renew",
+        ),
+    ];
+    assert_eq!(
+        previews.len(),
+        crate::automation::scope::WRITE_SURFACE.len()
+    );
+
+    for (method, path, body, operation) in previews {
+        let response = automation_call(
+            &f.state,
+            method,
+            &format!("{path}?dry_run=true"),
+            &f.bearer,
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+        let change = parse_data(response).await;
+        assert_eq!(
+            change["dry_run"],
+            serde_json::json!(true),
+            "{method} {path}"
+        );
+        assert_eq!(
+            change["operation"],
+            serde_json::json!(operation),
+            "{method} {path}"
+        );
+        assert_no_secret_field_name(&change, &format!("{method} {path}?dry_run=true"));
+    }
+
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes"),
+        "a dry run changed the store"
+    );
+    assert_eq!(management_rows(f.state.clone()).await, rows_before);
+    let request_rows = audit_rows_under(&f.state, "automation.request.").await;
+    assert!(
+        request_rows.iter().any(
+            |row| row.target_id == "POST /automation/v1/backends?dry_run"
+                && row.action == "automation.request.ok"
+        ),
+        "{request_rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_write_through_the_config_tier_lands_the_management_row_and_the_mcp_row() {
+    // Story 11.2 AC #7's audit half, through the tier: a mutation
+    // lands the management-side row under the token's identity, as a
+    // write over the socket does, beside the MCP request row that names
+    // the tool the node ran and the argument names it carried; and a
+    // refusal by the plane is audited as the refusal it is, from the
+    // core's outcome and not from the 200 it travelled in.
+    let f = a_node_with_something_to_write().await;
+    let answered = mcp_call(
+        &f.state,
+        &f.bearer,
+        "lorica_backend_create",
+        serde_json::json!({ "backend": { "address": "10.0.0.11:8080", "name": "via-mcp" } }),
+    )
+    .await;
+    assert_eq!(
+        answered["result"]["isError"],
+        serde_json::json!(false),
+        "{answered}"
+    );
+    let backend_id = plane_answer(&answered)["id"]
+        .as_str()
+        .expect("backend id")
+        .to_string();
+
+    let management_rows = audit_rows_under(&f.state, "backend.").await;
+    let created = management_rows
+        .iter()
+        .find(|row| row.action == "backend.create" && row.target_id == backend_id)
+        .expect("the management-side row the handler writes");
+    assert_eq!(created.operator_role, "automation");
+    assert_eq!(
+        created.operator_username,
+        format!("{WRITE_TOKEN_NAME} ({})", f.public_id)
+    );
+
+    let rows = mcp_audit_rows(&f.state).await;
+    assert_eq!(rows[0].action, "automation.request.ok", "{:?}", rows[0]);
+    assert_eq!(
+        rows[0].target_id,
+        format!(
+            "POST {} tool=lorica_backend_create?backend",
+            crate::automation::MCP_PATH
+        )
+    );
+    assert!(rows[0].operator_username.contains(&f.public_id));
+    // No row for the in-process call itself: one request, one request
+    // row, and the management row beside it.
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.target_id.starts_with("POST /automation/v1/backends")),
+        "{rows:?}"
+    );
+
+    // A refusal the plane makes: the address outside the grant.
+    let refused = mcp_call(
+        &f.state,
+        &f.bearer,
+        "lorica_backend_create",
+        serde_json::json!({ "backend": { "address": "192.0.2.10:80" } }),
+    )
+    .await;
+    assert_eq!(refused["result"]["isError"], serde_json::json!(true));
+    assert!(result_text(&refused).contains("HTTP 403"), "{refused}");
+    let rows = mcp_audit_rows(&f.state).await;
+    assert_eq!(
+        rows[0].action, "automation.request.forbidden",
+        "{:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0].target_id,
+        format!(
+            "POST {} tool=lorica_backend_create?backend",
+            crate::automation::MCP_PATH
+        )
+    );
+    assert_eq!(
+        audit_rows_under(&f.state, "backend.").await.len(),
+        management_rows.len(),
+        "a refused write landed a management row"
     );
 }

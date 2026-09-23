@@ -152,9 +152,12 @@ pub fn output_schema() -> Value {
 /// A successful `tools/call` result carrying the automation plane's
 /// answer.
 ///
-/// `body` is the response body verbatim, as [`crate::ReadSource`]
+/// `body` is the response body verbatim, as [`crate::AutomationPlane`]
 /// answered it. It is parsed here and nowhere else, and it is not
-/// reshaped: what the plane sent is what arrives, under one key.
+/// reshaped: what the plane sent is what arrives, under one key. A
+/// preview's answer arrives the same way: the change a write would make
+/// is the plane's JSON, fenced as data, never a diff this server wrote
+/// in words.
 ///
 /// A body that is not JSON is a fault in the wiring rather than an
 /// answer, and it comes back as an execution error so a model reads it

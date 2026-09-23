@@ -257,7 +257,7 @@ pub async fn create_backend(
     Json(body): Json<CreateBackendRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    create_backend_as(&state, &audit_ctx, body).await
+    create_backend_as(&state, &audit_ctx, body, crate::preview::WriteMode::Apply).await
 }
 
 /// The whole of [`create_backend`] as `actor`: the validation, the
@@ -265,11 +265,13 @@ pub async fn create_backend(
 ///
 /// Split from the handler so the automation plane (Story 11.2) can run
 /// exactly this with a token as the actor rather than a session; see
-/// `crate::routes::crud::create_route_as` for the rule.
+/// `crate::routes::crud::create_route_as` for the rule, and for what
+/// [`crate::preview::WriteMode::Preview`] answers instead of the row.
 pub(crate) async fn create_backend_as(
     state: &AppState,
     actor: &crate::audit::AuditContext,
     body: CreateBackendRequest,
+    mode: crate::preview::WriteMode,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     if body.address.is_empty() {
@@ -307,6 +309,16 @@ pub(crate) async fn create_backend_as(
         updated_at: now,
     };
 
+    if mode.previews() {
+        return Ok((
+            StatusCode::OK,
+            crate::preview::previewed(
+                "create",
+                None,
+                serde_json::to_value(backend_to_response(&backend, 0.0, 0)).ok(),
+            ),
+        ));
+    }
     let backend = db_blocking(&state.store, move |store| {
         store.create_backend(&backend)?;
         Ok::<_, ApiError>(backend)
@@ -355,7 +367,14 @@ pub async fn update_backend(
     Json(body): Json<UpdateBackendRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    update_backend_as(&state, &audit_ctx, id, body).await
+    update_backend_as(
+        &state,
+        &audit_ctx,
+        id,
+        body,
+        crate::preview::WriteMode::Apply,
+    )
+    .await
 }
 
 /// The whole of [`update_backend`] as `actor`; see
@@ -367,6 +386,7 @@ pub(crate) async fn update_backend_as(
     actor: &crate::audit::AuditContext,
     id: String,
     body: UpdateBackendRequest,
+    mode: crate::preview::WriteMode,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     let (before_backend, backend) = db_blocking(&state.store, move |store| {
@@ -425,10 +445,20 @@ pub(crate) async fn update_backend_as(
         }
         backend.updated_at = Utc::now();
 
+        if mode.previews() {
+            return Ok::<_, ApiError>((before_backend, backend));
+        }
         store.update_backend(&backend)?;
         Ok::<_, ApiError>((before_backend, backend))
     })
     .await?;
+    if mode.previews() {
+        return Ok(crate::preview::previewed(
+            "update",
+            serde_json::to_value(backend_to_response(&before_backend, 0.0, 0)).ok(),
+            serde_json::to_value(backend_to_response(&backend, 0.0, 0)).ok(),
+        ));
+    }
     state.notify_config_changed();
     let score = get_ewma_score_async(state, &backend.address).await;
     let conns = get_backend_connections_async(state, &backend.address).await;
@@ -462,15 +492,19 @@ pub async fn delete_backend(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    delete_backend_as(&state, &audit_ctx, id).await
+    delete_backend_as(&state, &audit_ctx, id, crate::preview::WriteMode::Apply).await
 }
 
 /// The whole of [`delete_backend`] as `actor`, the drain included; see
 /// [`create_backend_as`] for why the split exists.
+///
+/// In [`crate::preview::WriteMode::Preview`] it answers the row that
+/// would drain and neither marks it closing nor starts the drain.
 pub(crate) async fn delete_backend_as(
     state: &AppState,
     actor: &crate::audit::AuditContext,
     id: String,
+    mode: crate::preview::WriteMode,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id_db = id.clone();
     let (backend, force_deleted) = db_blocking(&state.store, move |store| {
@@ -489,6 +523,9 @@ pub(crate) async fn delete_backend_as(
                 "Delete the environment, or update it through the pipeline, instead.",
             ));
         }
+        if mode.previews() {
+            return Ok((backend, false));
+        }
 
         // If already closing/closed, force delete immediately
         if backend.lifecycle_state != lorica_config::models::LifecycleState::Normal {
@@ -503,6 +540,13 @@ pub(crate) async fn delete_backend_as(
         Ok::<_, ApiError>((backend, false))
     })
     .await?;
+    if mode.previews() {
+        return Ok(crate::preview::previewed(
+            "delete",
+            serde_json::to_value(backend_to_response(&backend, 0.0, 0)).ok(),
+            None,
+        ));
+    }
     state.notify_config_changed();
 
     let before = serde_json::to_value(&backend).ok();

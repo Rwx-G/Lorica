@@ -49,8 +49,9 @@
 //!   certificate bindings, each the management handler's own body run
 //!   with the token as the actor, bounded by the token's grants.
 //! - [`mcp`] - the MCP Streamable HTTP binding (Story 11.1 AC #9): one
-//!   `POST` path over the shared `lorica-mcp` core, reaching [`read`]'s
-//!   handlers in process rather than over a socket of its own.
+//!   `POST` path over the shared `lorica-mcp` core, running each tool's
+//!   call through the plane's own router in process, scope gate
+//!   included, rather than over a socket of its own.
 //! - [`oidc`] - the GitLab ID-token verifier (Story 10.5): the pinned
 //!   algorithm, the JWKS cache and the bounded replay set.
 //!
@@ -100,10 +101,10 @@ pub use environments::{
 };
 pub use listener::{start_automation_server, AutomationListenerConfig, AutomationListenerError};
 pub use lorica_mcp::server::InvocationLimiter;
-pub use mcp::{InProcessReads, MCP_PATH};
+pub use mcp::{InProcessPlane, MCP_PATH};
 pub use oidc::{OidcVerifier, RefusalReason, OIDC_REPLAY_SET_CAP};
 pub use read::{
     AUTOMATION_READ_DEFAULT_ROWS, AUTOMATION_READ_MAX_ANSWER_BYTES, AUTOMATION_READ_MAX_ROWS,
 };
-pub use router::build_automation_router;
+pub use router::{build_automation_router, AUTOMATION_BODY_CAP};
 pub use scope::{path_template, required_scope, ScopeRequirement};

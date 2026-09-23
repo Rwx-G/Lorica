@@ -787,14 +787,18 @@ that exists on a machine-facing, TLS-only, bearer-only plane with no
 browser in the path; they are there for the client library or the
 future gateway that caches or sniffs without being asked to.
 
-### The MCP endpoint over the same reads
+### The MCP endpoint over the same reads and writes
 
-`POST /automation/v1/mcp` is the Model Context Protocol read tier,
-Streamable HTTP binding. It answers the nine reads above through the
-protocol an MCP client speaks, so a language model can ask what this
-node is seeing without anything being installed beside it.
-[mcp.md](mcp.md) is the document for it; what matters here is how it
-sits on this plane.
+`POST /automation/v1/mcp` is the Model Context Protocol server's
+Streamable HTTP binding, both tiers of it. It answers the nine reads
+above and the eight writes below through the protocol an MCP client
+speaks, so a language model can ask what this node is seeing, and
+since v1.9.0 (Story 11.2) change a route, a backend or a certificate
+binding, without anything being installed beside it. Which tier a POST
+is served is the token it presents: a write scope registers that
+scope's mutations with their previews, a read scope its reads, and
+nothing else. [mcp.md](mcp.md) is the document for it; what matters
+here is how it sits on this plane.
 
 It is a path and not a listener. Everything this socket enforces it
 enforces first: a source outside `automation_allowed_cidrs` is dropped
@@ -812,10 +816,18 @@ is built from the scopes the token on THAT request carries, against
 this same matrix, and a tool the token cannot reach is absent from its
 `tools/list` and unknown to its `tools/call`.
 
-The adapter reaches the read handlers in process. It does not dial this
-listener: the source allowlist would refuse it and the per-source
-connection budget would throttle it, and it would be paying a TLS
-handshake to ask the process a question it already holds the answer to.
+The adapter runs a tool's call through this plane's own router in
+process, scope gate included: the verb, the path and the body the tool
+built, with the presented principal and the caller's connection info as
+the request's extensions, which is where the gate and the handlers read
+them from on the socket. It does not dial this listener: the source
+allowlist would refuse it and the per-source connection budget would
+throttle it, and it would be paying a TLS handshake to ask the process
+a question it already holds the answer to. Because it is the same
+router, a write through the endpoint is bounded by the token's grants
+and lands the management-side audit row exactly as a write over the
+socket does, and the scope matrix refuses in process what it refuses
+on the socket.
 
 Its audit rows differ from the other rows here in two ways worth
 knowing when reading a trail. The target names the tool the node ran,
@@ -929,6 +941,24 @@ bodies unchanged (`CreateRouteRequest`, `UpdateRouteRequest`,
 `lorica-api/openapi.yaml`); they are not restated in the automation
 document, where a second copy would drift. The binding takes
 `{"certificate_id": "<id>"}` and the renewal takes no body.
+
+**`?dry_run=true`, on every write.** The write runs its own validators,
+computes the change it would make against the configuration as it
+stands, and answers it with `200` and nothing written: no row, no reload
+signal, no management audit row. The request row is written as for any
+request, with `?dry_run` beside the verb. The answer is
+`{"data": {"dry_run": true, "operation": ..., "before": ..., "after": ...,
+"changes": {...}}}`, documented under the `DryRun` parameter in
+`openapi-automation.yaml`: a create's `after` is the row it would
+insert less the id and the clock, an update's `before` and `after` are
+the views either side of the patch with `changes` naming the fields
+that differ, a delete's and a renewal's `before` is the row that would
+go or be renewed. The grants are checked first either way, so a dry run
+never shows a change the apply would refuse on the grant; what only the
+store refuses, a duplicate hostname or a backend id that names nothing,
+is refused by the apply and not by the dry run. This is the preview the
+MCP config tier's `*_preview` tools call: the plane owns it because the
+validators are the plane's alone, and the MCP server reimplements none.
 
 ## GitLab OIDC
 

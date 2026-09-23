@@ -113,17 +113,26 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Lot 2: the tier
 
-- [ ] AC #2: the tier is chosen by the token's scopes at startup, over
+- [x] The in-process seam: option 1 of the Dev Note below, decided and
+      built before the first write tool. `ReadSource::fetch(path)`
+      became `AutomationPlane::call(verb, path, body)` on both
+      implementations, and the in-process binding runs the plane's own
+      router under the scope gate instead of dispatching by hand.
+- [x] AC #2: the tier is chosen by the token's scopes at startup, over
       the same core. The read tools it needs come with it.
-- [ ] AC #3: a preview counterpart per mutating tool, sharing the apply
+- [x] AC #3: a preview counterpart per mutating tool, sharing the apply
       tool's arguments, computing the change against current state and
-      writing nothing.
-- [ ] AC #4: one named resource per call, enforced by the tool schemas
+      writing nothing. The plane owns it as `?dry_run=true` on every
+      write path.
+- [x] AC #4: one named resource per call, enforced by the tool schemas
       rather than by a check inside the handler.
-- [ ] AC #6: no argument anywhere in this tier accepts key material.
+- [x] AC #6: no argument anywhere in this tier accepts key material.
       A test asserts the tool schemas, not the handlers.
-- [ ] IV1, IV2, IV3.
-- [ ] AC #7: the `docs/mcp.md` section, and the Epic 10 PRD pointer.
+- [x] IV1, IV2 through the tier. IV3's follower half is Story 10.3's
+      startup refusal, run here; its replication half belongs in the
+      cluster e2e profile and is not proven by this lot.
+- [x] AC #7: the `docs/mcp.md` section (the Epic 10 PRD pointer landed
+      with lot 1), and audit as in 11.1 on both bindings, verified.
 
 ## Dev Notes
 
@@ -206,6 +215,20 @@ the same scope.
 Option 1 is the recommendation. Decide it in lot 1, before the first
 write path is declared, because it changes what the write handlers are
 called through.
+
+> Taken in lot 2, 2026-09-23: option 1, as recommended, and nothing in
+> the code argued against it. `build_automation_router` is now built
+> from `plane_routes()`, the route table without the MCP endpoint, and
+> `in_process_router()` is that table under `authorize_scope` alone,
+> held in a `OnceLock` because it captures no state: the `AppState`,
+> the `AutomationPrincipal` and the `ConnectInfo` travel as request
+> extensions, which is where the handlers and the gate read them from
+> on the listener. The dispatch `match` is gone, the write handlers run
+> unchanged with their grants and their audit rows, and the pin test
+> now compares every tool on its verb. What the tool model became is
+> under the Completion Notes: `ToolSpec` gained a `Kind`, a `Mutation`
+> is declared once and both its tools are built from it, and the plane
+> owns the preview as `?dry_run=true`.
 
 ### The cluster case is the interesting one
 
@@ -372,6 +395,163 @@ Which test guards what:
   refusal, unchanged; the replication half belongs in the e2e cluster
   profile, as the Dev Notes say.
 
+Lot 2, 2026-09-23. Gates run in `rust:1-bookworm` with
+`RUSTFLAGS=-D warnings`, one container at a time:
+
+- `cargo fmt --all -- --check` on the Windows host: clean (it needed
+  one pass of `cargo fmt --all` first, on eleven files).
+- `cargo test -p lorica-mcp`: 85 passed, 0 failed. The crate went from
+  74 to 85, and lot 1's expected failure on the complement assertion is
+  gone: the complement is the two environment scopes.
+- `cargo test --no-fail-fast -p lorica-config -p lorica-api`: 918 + 495
+  unit (the one pre-existing ignored in `lorica-config`), 3 in
+  `tests/automation_scope_fixture.rs`, 3 in `tests/mcp_asserted_headers.rs`,
+  6 in `tests/mcp_catalogue_scopes.rs`, 9 in `tests/openapi_contract.rs`,
+  8 + 18 doctests. 0 failed. `lorica-api` lib 908 -> 918,
+  `mcp_catalogue_scopes` 4 -> 6, `openapi_contract` 6 -> 9.
+- Every integration test under `lorica-api/tests/` by name:
+  `automation_scope_fixture` 3, `mcp_asserted_headers` 3,
+  `mcp_catalogue_scopes` 6, `openapi_contract` 9.
+- `cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings`:
+  one failure first, `using clone on type Option<ConnectInfo<SocketAddr>>
+  which implements the Copy trait` in `InProcessPlane`, fixed to a
+  copy; clean after. The two other Lint invocations reported the same
+  one line and are clean after it.
+- `cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings`: clean.
+- `cargo clippy -p lorica --all-targets --features otel -- -D warnings`:
+  clean. Run because the binary links `lorica-api`, whose router split.
+- `cargo clippy -p lorica-mcp --all-targets -- -D warnings`: clean.
+- `cargo test -p lorica --bin lorica -- a_follower_refuses_to_open_the_automation_listener`:
+  1 passed, the IV3 follower half, Story 10.3's test run on the target
+  it lives in (`startup::automation` is under `main.rs`, and the first
+  attempt on `--lib` filtered it out).
+- `cargo audit`: run, because `Cargo.lock` changed (`percent-encoding`
+  left `lorica-api`'s dependency list; no `[[package]]` entry moved).
+  Exit 0 over 651 crate dependencies, the same two allowed
+  unmaintained warnings the cycle carries (`RUSTSEC-2024-0388` on
+  `derivative`, `RUSTSEC-2025-0134` on `rustls-pemfile`). Run in a
+  container with its own target directory, for the reason Story 11.1
+  recorded.
+- `git ls-files --eol`: index `lf` on every changed file, the working
+  tree `crlf` on the ones the checkout already held that way and `lf`
+  on the rest; the new `preview.rs` at `w/lf`. No file changed ending.
+  Checked this way and not with `awk`.
+- No em dash (U+2014) in any changed file, checked with a byte grep.
+- `README.md`'s product-crate test count, recomputed with the
+  `docs/BUMP-CHECKLIST.md` recipe over the README's own crate list
+  with `--no-fail-fast`: 2830 -> 2856 in BOTH places, the shell
+  comment and the `Lorica%20Tests-N` badge; 66 binaries, none failed,
+  and the `ok.`-only sum equals the sum of every `passed`.
+  `grep -n 2830 README.md CONTRIBUTING.md` answers nothing.
+
+The frontend was not touched and its gates were not re-run.
+
+**Every new test was watched failing before it was watched passing.**
+Fifteen probes, each a one-substitution defect applied by a script on
+the host, the named tests run in the container, the file restored from
+a copy and its md5 compared before and after (identical on every
+restore). One was void on its first attempt: `cargo fmt` had rewrapped
+the line it targeted, and it was rerun against the formatted source.
+What failed, and how:
+
+- the scope filter in `McpServer::sharing` replaced by `true`:
+  `a_token_carrying_only_read_scopes_registers_no_write_tool_and_cannot_call_one`
+  and `iv1_a_read_tier_token_lists_only_read_tools_and_a_mutation_cannot_be_called`
+  (stdio) failed, a read-tier token finding `lorica_route_create`
+  registered.
+- `lorica_route_delete` declared behind `routes:read`:
+  `a_read_tool_is_a_get_behind_a_read_scope_and_a_write_tool_a_write_behind_a_write_scope`
+  failed in `lorica-mcp`, and `every_mcp_tool_names_the_scope_its_verb_and_path_sit_behind`
+  and `the_scopes_the_catalogue_uses_are_every_scope_but_the_environment_ones`
+  failed in `tests/mcp_catalogue_scopes.rs`: the cross-crate guard,
+  on the verb, doing what it is for.
+- the preview's `dry_run=true` not appended:
+  `every_mutation_declares_an_apply_tool_and_a_preview_taking_the_same_arguments`,
+  `a_write_call_carries_the_verb_the_body_and_for_a_preview_the_dry_run_flag`
+  and the stdio config-tier test failed.
+- the preview tool not built from the mutation (`all.push(mutation.tool(true))`
+  removed): the same AC #3 test failed on `find(preview)`, and
+  `a_config_tier_token_registers_its_mutations_with_their_previews_and_the_reads_it_holds`
+  failed on the registry.
+- the undeclared-field check on a body disabled:
+  `a_body_is_checked_for_shape_and_size_and_its_values_are_never_looked_at`
+  failed (rerun after the void attempt).
+- `basic_auth_password` added to the route create's field list:
+  `no_argument_of_any_tool_takes_key_material_or_a_credential` and
+  `no_tool_definition_names_a_credential` failed in `lorica-mcp`, and
+  `no_mcp_tool_argument_takes_key_material` and
+  `every_mcp_write_tool_declares_exactly_the_fields_its_handler_accepts_less_the_ones_not_offered`
+  failed in `tests/openapi_contract.rs`, the second naming the field
+  as offered against its recorded reason.
+- `ca_pem` added to the backend field list:
+  `no_argument_of_any_tool_takes_key_material_or_a_credential` failed
+  on the `pem` marker.
+- `lorica_route_delete` given a body with a `pattern` field:
+  `a_write_tool_names_one_resource_by_one_id_and_takes_no_selector`
+  failed.
+- the scope gate removed from `in_process_router()`:
+  `the_in_process_plane_runs_the_scope_gate_and_refuses_what_the_matrix_refuses`
+  failed, the principal lacking `logs:read` reading the log in process.
+  That is the whole reason for option 1, watched.
+- the preview branch of `update_route_as` disabled inside the store
+  closure: `a_preview_through_the_config_tier_answers_the_change_and_writes_nothing`
+  and `every_write_path_previews_under_dry_run_and_writes_nothing`
+  failed on the canonical bytes, a preview having written.
+- `InProcessPlane::call` sending a lookalike body with `waf_mode`
+  dropped: `iv1_a_route_created_through_the_config_tier_is_the_dashboards_route_byte_for_byte`
+  failed on the canonical bytes.
+- the refusal body emptied on the in-process seam:
+  `iv2_a_refusal_through_the_config_tier_arrives_unchanged_and_writes_nothing`
+  failed, the dashboard's message missing from the fence.
+- the principal's name swapped before the in-process request:
+  `a_write_through_the_config_tier_lands_the_management_row_and_the_mcp_row`
+  failed on the management row's identity.
+- `DryRun` replaced by `PageLimit` on one write in the document:
+  `every_automation_write_documents_dry_run_and_no_read_does` failed.
+
+Which test guards what:
+
+- The seam decision: `the_in_process_plane_runs_the_scope_gate_and_refuses_what_the_matrix_refuses`
+  (`automation/mcp.rs`), `this_module_opens_no_connection_of_its_own`
+  (its positive control now the router call and the absence of any
+  hand-called handler), and `the_streamable_http_binding_asserts_nothing_and_needs_no_marker_of_its_own`
+  (`tests/mcp_asserted_headers.rs`, positive control renamed).
+- AC #2: `a_read_tool_is_a_get_behind_a_read_scope_and_a_write_tool_a_write_behind_a_write_scope`,
+  `a_token_carrying_only_read_scopes_registers_no_write_tool_and_cannot_call_one`,
+  `a_config_tier_token_registers_its_mutations_with_their_previews_and_the_reads_it_holds`
+  (`lorica-mcp`), the stdio pair, `the_scopes_the_catalogue_uses_are_every_scope_but_the_environment_ones`
+  (`tests/mcp_catalogue_scopes.rs`) and
+  `the_config_tier_on_this_binding_is_the_tokens_scopes_and_a_read_tier_token_gains_no_write`
+  (`src/tests.rs`, whole stack; not probed separately, it shares the
+  filter the first probe replaced).
+- AC #3: `every_mutation_declares_an_apply_tool_and_a_preview_taking_the_same_arguments`,
+  `a_write_call_carries_the_verb_the_body_and_for_a_preview_the_dry_run_flag`,
+  `a_preview_through_the_config_tier_answers_the_change_and_writes_nothing`,
+  `every_write_path_previews_under_dry_run_and_writes_nothing`,
+  `every_automation_write_documents_dry_run_and_no_read_does`, and
+  the `preview.rs` unit tests (not probed; they pin the answer shape).
+- AC #4: `a_write_tool_names_one_resource_by_one_id_and_takes_no_selector`.
+- AC #5: `a_body_is_checked_for_shape_and_size_and_its_values_are_never_looked_at`
+  and the IV1 test.
+- AC #6: `no_argument_of_any_tool_takes_key_material_or_a_credential`
+  (`lorica-mcp`), `no_mcp_tool_argument_takes_key_material` and
+  `every_mcp_write_tool_declares_exactly_the_fields_its_handler_accepts_less_the_ones_not_offered`
+  (`tests/openapi_contract.rs`).
+- AC #7, audit: `a_write_through_the_config_tier_lands_the_management_row_and_the_mcp_row`
+  and the IV2 test's rows; `docs/mcp.md` is prose.
+- IV1: `iv1_a_route_created_through_the_config_tier_is_the_dashboards_route_byte_for_byte`.
+- IV2: `iv2_a_refusal_through_the_config_tier_arrives_unchanged_and_writes_nothing`,
+  and `a_validators_refusal_of_a_write_is_an_execution_error_carrying_the_planes_words`
+  at the core (not probed separately; it shares the refusal path the
+  emptied-body probe broke).
+- IV3: `a_follower_refuses_to_open_the_automation_listener`
+  (`lorica/src/startup/automation.rs`), Story 10.3's, run here and
+  not probed (it is not this lot's test). The replication half is not
+  proven by this lot.
+- The seam's shape: `a_verb_spells_itself_the_way_the_request_line_does`
+  and `the_write_tools_body_cap_is_the_planes` (not probed; they pin
+  constants).
+
 ### Completion Notes
 
 Lot 1, 2026-09-23. The write scopes and the automation plane's write
@@ -472,7 +652,196 @@ is untouched for the same reason. `README.md`'s v1.8.0 feature bullet
 still lists four scopes and has since Story 11.1 added five; not this
 lot's sentence to rewrite.
 
+---
+
+Lot 2, 2026-09-23. The tier, over the write surface lot 1 built.
+
+**The seam decision came first, and it is option 1.** Nothing in the
+code argued for option 2. `lorica-mcp`'s trait is `AutomationPlane`
+with one method, `call(verb, path, body, reason)`, where `Verb` is a
+four-variant enum of this crate's own (the plane mounts nothing under a
+fifth verb, and `lorica-mcp` takes no `http` dependency for four
+spellings) and the body is a `serde_json::Value` the tool layer already
+bounded. `ReadSource`, `ReadError` and `HttpsReadSource` are
+`AutomationPlane`, `PlaneError` and `HttpsPlane`: a trait whose method
+performs a `DELETE` cannot keep a name that says it reads. On the stdio
+side `HttpsPlane::call` serialises the body itself rather than through
+`reqwest`'s JSON helper, which is a feature this crate does not enable,
+and gives a write 120 seconds against a read's 30, because a
+certificate renewal is an ACME order made while the request is open and
+a client that gives up at a read's timeout is a handler the listener
+drops mid-order.
+
+On the in-process side `router.rs` now has `plane_routes()`, the route
+table without the MCP endpoint, from which both `build_automation_router`
+(every layer, endpoint included) and `in_process_router()` (the scope
+gate alone, in a `OnceLock` since it captures no state) are built.
+`InProcessPlane::call` builds the `http::Request` the seam describes,
+inserts the `AppState`, the caller's `AutomationPrincipal` and its
+`ConnectInfo` as extensions, carries the caller's `User-Agent`, and
+`oneshot`s it into that router. The dispatch `match`, `one_segment_under`,
+`query()` and `refusal()` are gone, and with them `lorica-api`'s
+`percent-encoding` dependency, which existed for the decoding the
+dispatch did by hand. The scope matrix therefore runs on every
+in-process call, which `the_in_process_plane_runs_the_scope_gate_and_refuses_what_the_matrix_refuses`
+proves with a principal lacking `logs:read` refused 403 on a read, a
+principal lacking `routes:write` refused 403 on a write before the body
+is looked at, a principal carrying every scope refused 403 on an
+undeclared path, and the MCP endpoint itself answering 404 from inside,
+so a tool cannot reach the endpoint running it. The write handlers run
+unchanged: their grant checks refuse with the listener's 403 and their
+`_as` bodies write the management row under the token's identity, with
+the MCP POST's own address, which the audit test through the tier
+asserts. The MCP POST is the request the audit layer records; the
+in-process router has no audit layer, so there is one request row per
+tool call and never a second for the call it made, which the same test
+pins.
+
+**The tool model.** `ToolSpec` gained a `Kind`: `Read`, or `Write`
+carrying the verb, the optional action segment after the id
+(`certificate`, `renew`), the optional `Body`, whether the tool
+previews, and the name of its counterpart. A `Mutation` is declared
+once in `MUTATIONS` (apply name, preview name, summary, scope, verb,
+path, resource, action, body) and `catalogue()`, a `OnceLock` over
+`READS` plus two tools per mutation, is what `CATALOGUE` became. That
+is AC #3's "same arguments" by construction and not by discipline: the
+preview is the same `ToolSpec` with `previews: true`, `call_for`
+appends `dry_run=true` to its query, and `description()` writes the
+sentence each way (`lorica_route_create_preview` names
+`lorica_route_create` and says it writes nothing; the apply names its
+preview and says a client configured to show a diff calls it first).
+`definition()` suffixes the preview's title. A `Body` names its
+argument (`route`, `backend`, `binding`), the management struct it is
+(`CreateRouteRequest` and its siblings, for the client to read the
+fields' meaning in `openapi.yaml`), and the sorted top-level field
+names this tier offers. `call_for` checks shape and nothing else: the
+body is an object, its keys are declared (an undeclared one refused
+without being echoed, because the plane would have dropped it silently
+and the caller would believe it set something), and its serialised
+weight is under `MAX_BODY_BYTES`, pinned by
+`the_write_tools_body_cap_is_the_planes` against
+`AUTOMATION_BODY_CAP`, now `pub`. Values are never looked at (AC #5),
+which `a_body_is_checked_for_shape_and_size_and_its_values_are_never_looked_at`
+asserts by passing a hostname that is a number through.
+
+**Where the field vocabulary comes from, and the two fields it does not
+carry.** The lists in `tools.rs` are typed, and
+`every_mcp_write_tool_declares_exactly_the_fields_its_handler_accepts_less_the_ones_not_offered`
+in `tests/openapi_contract.rs` pins each against the request struct the
+handler behind the tool's `(verb, path)` deserialises, both ways,
+reusing lot 1's source scanners and resolving the handler from the
+tool's own call. The only difference it tolerates is
+`NOT_OFFERED_TO_A_MODEL`, two entries with their reasons: `managed_by`,
+refused by the plane on input, and `basic_auth_password`, a credential
+a model would be choosing or relaying and which would cross the
+model's host in the clear. That second exclusion is a decision of this
+lot and not the story's: the story says nothing about it, the read
+tier's own `no_tool_definition_names_a_credential` would have failed
+on the word, and a narrowed vocabulary is not a narrowed body in AC #5's
+sense, since every field the tier does offer reaches the same
+validators. The plane still accepts the field from any other automation
+client. Recorded here so the maintainer can reverse it; if reversed,
+the read tier's credential test needs a home for the word.
+
+Deriving the schema from `openapi-automation.yaml`, as the audit's
+direction suggested, was not done: that document does not restate the
+management bodies, by lot 1's decision, and the management `openapi.yaml`
+is pinned to its structs by nothing. The struct is the one authority
+both crates can be checked against, and the pin above is that check.
+The property schemas are empty (`{}`): a type would be a transcription
+of the Rust type the pin cannot verify, and the body's description
+points a client at the schema name in `openapi.yaml` instead.
+
+**The preview is the plane's, as `?dry_run=true`.** A query rather
+than a header or a path of its own, because the matrix and the audit
+row read the path: a preview sits behind the write's scope by
+construction and its request row records `?dry_run` beside the verb.
+`crate::preview` holds `WriteMode { Apply, Preview }`, `DryRunQuery`,
+and `previewed(operation, before, after)`, which answers
+`{"data": {"dry_run": true, "operation", "before", "after", "changes"}}`
+with `changes` a field-level `{from, to}` map over the two views,
+`updated_at` left out, and a create's `after` stripped of the id and
+the clock the apply would mint. Every `_as` body took a `WriteMode`:
+create stops before `db_blocking`, update and delete return from inside
+the store closure before the write (update reads the backend links
+before the patch only on a preview, to fill the `before` view the audit
+row deliberately leaves empty), the backend delete returns before it
+marks the row closing, and the renewal returns the certificate's
+metadata after the ACME-only refusal. What only the store refuses, a
+duplicate hostname or an unknown backend id, is refused by the apply
+alone; `docs/mcp.md` and the `DryRun` parameter say so. The management
+wrappers pass `Apply`; the automation handlers read the query.
+
+**AC #2 by construction.** `McpServer::sharing` is the same filter it
+was, over a catalogue where every write tool declares a write scope and
+every read tool a read scope, which
+`a_read_tool_is_a_get_behind_a_read_scope_and_a_write_tool_a_write_behind_a_write_scope`
+pins in `lorica-mcp` and
+`the_scopes_the_catalogue_uses_are_every_scope_but_the_environment_ones`
+pins from the side that holds the enum. The complement both assert is
+now the two environment scopes alone. `startup_notice` names the tier
+(`McpServer::tier`, the config tier once any tool that changes
+something is registered, a naming for the operator and not Story
+11.4's table) and asks a config tier about the read scopes it lacks,
+since that tier finds ids through them, while a read tier is not asked
+for a write scope. A first cut of `read_scopes()` filtered on
+`changes_nothing()`, which a preview satisfies, and so counted the
+write scopes as the read tier's; three tests caught it on the first
+run and it filters on `Kind` now.
+
+**Audit on the tier, verified rather than assumed.** The lot 4 fix
+pass's plumbing carries a write unchanged: `named_call` reads
+`argument_names()` so the row shows `tool=lorica_route_update?id,route`
+and never a body field name, `mcp_outcome` maps `Outcome::Refused(403)`
+to `forbidden` with no reason for a grant refusal and `Refused(400)` to
+`refused` for a validator's, and the management row lands beside the
+request row under the token's identity. All three are asserted by
+`a_write_through_the_config_tier_lands_the_management_row_and_the_mcp_row`
+and the IV2 test through the tier. Over stdio the row is the plane's
+own `POST /automation/v1/routes asserted[transport=mcp-stdio,tool=...]`,
+`?dry_run` included for a preview; `docs/mcp.md` shows both.
+
+**IV3.** The follower half is `a_follower_refuses_to_open_the_automation_listener`
+in `lorica/src/startup/automation.rs`, unchanged and run in this lot's
+gates. The replication half is a cluster property no unit test on this
+crate can prove: a route written through the tier is the same row a
+dashboard write lands, so it rides Story 9.4's replication with no new
+code, and asserting that takes the e2e cluster profile. Not proven
+here, and said so rather than faked.
+
+**Not done, and named.** The stdio binding's HTTPS client is exercised
+against a real listener only by the e2e suite, so `HttpsPlane::call`'s
+body serialisation and the write timeout are covered by the source
+scans and by the in-process binding's tests of the same seam, not by a
+socket test in this lot. No tier table and no refusal of a token
+spanning two tiers: Story 11.4's, and `docs/mcp.md` says the operator
+keeps the two tokens apart until then.
+
 ## File List
+
+Added in lot 2:
+
+- `lorica-api/src/preview.rs`
+
+Modified in lot 2:
+
+- `lorica-mcp/src/lib.rs`, `.../tools.rs`, `.../server.rs`,
+  `.../http.rs`, `.../stdio.rs`, `.../main.rs`, `.../untrusted.rs`
+- `lorica-api/src/automation/mcp.rs`, `.../router.rs`, `.../write.rs`,
+  `.../mod.rs`
+- `lorica-api/src/routes/crud.rs`, `lorica-api/src/backends.rs`,
+  `lorica-api/src/acme/renewal.rs`, `lorica-api/src/certificates.rs`,
+  `lorica-api/src/lib.rs`
+- `lorica-api/src/tests.rs`
+- `lorica-api/tests/mcp_catalogue_scopes.rs`,
+  `lorica-api/tests/openapi_contract.rs`,
+  `lorica-api/tests/mcp_asserted_headers.rs`
+- `lorica-api/openapi-automation.yaml`
+- `lorica-api/Cargo.toml`, `Cargo.lock` (`percent-encoding` dropped
+  from `lorica-api`: the in-process decoding it was added for is gone
+  with the dispatch)
+- `CHANGELOG.md`, `README.md`, `docs/mcp.md`, `docs/automation.md`
+- `docs/stories/story-11.2-config-tier.md`
 
 Added in lot 1:
 
@@ -497,6 +866,36 @@ Modified in lot 1:
 - `docs/stories/story-11.2-config-tier.md`
 
 ## Change Log
+
+- 2026-09-23: Lot 2 landed, the tier itself. The in-process seam
+  decision was taken first and as recommended: `lorica-mcp`'s seam is
+  `AutomationPlane::call(verb, path, body, reason)` on both
+  implementations, and the Streamable HTTP binding builds the request
+  a tool describes and runs it through the plane's own router under
+  the scope gate, principal and connection info as extensions, so the
+  matrix authorizes an in-process call as it does one over the socket
+  and the write handlers run unchanged with their grants and their own
+  audit rows; the hand-written dispatch is gone. Eight `Mutation`s
+  declared once in `lorica-mcp/src/tools.rs`, each built into an apply
+  tool and a `_preview` tool by `catalogue()`, so the pair takes the
+  same arguments by construction and a mutation cannot ship without
+  its preview; the tier is `McpServer::sharing`'s scope filter over
+  that catalogue, per process over stdio and per request over
+  Streamable HTTP, and every write tool declares a write scope, pinned,
+  so a read-tier token can never gain one. A write tool checks shape
+  and nothing else: one `id`, a body whose top-level fields are the
+  handler's (pinned against the request struct both ways, less
+  `managed_by` and `basic_auth_password`, each named with its reason),
+  a weight under the plane's cap. The plane owns the preview:
+  `?dry_run=true` on every write path runs the management body in
+  `WriteMode::Preview`, which validates, builds what it would store,
+  and stops before the store, the reload and the audit row, answering
+  `{dry_run, operation, before, after, changes}`. IV1 and IV2 proven
+  through the tier over the HTTP binding; audit verified on both rows;
+  `docs/mcp.md` gains the config tier, the affordance-not-control
+  statement and the delegation section. `lorica-mcp` went from 74
+  tests to 85, `lorica-api` from 908 to 918, `mcp_catalogue_scopes`
+  from 4 to 6 and `openapi_contract` from 6 to 9.
 
 - 2026-09-23: Lot 1 landed. Three write scopes on `AutomationScope`,
   with every restatement moved (`scope_str`, both OpenAPI enums, the

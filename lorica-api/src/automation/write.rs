@@ -57,6 +57,21 @@
 //! no bulk verb, and the scope matrix declares none: a path that would
 //! delete what matches does not exist to be reached.
 //!
+//! # `?dry_run=true` is the preview, and the plane owns it
+//!
+//! Story 11.2 AC #3 asks every mutating MCP tool for a counterpart that
+//! answers the change it would make without making it, and AC #5 says
+//! the validators are the API's alone. So the preview is not computed
+//! by the MCP server: every write here takes `?dry_run=true`, hands
+//! [`crate::preview::WriteMode::Preview`] to the same management body,
+//! and that body runs its validators, builds the row it would store and
+//! stops before the store, the reload signal and the audit row. The
+//! grant checks run first either way, since an apply the grant refuses
+//! is a change the preview must not show as possible. A preview sits
+//! behind the write's own scope by construction, because the matrix
+//! reads the path and not the query, and its request row records
+//! `?dry_run` beside the verb.
+//!
 //! # No key material, anywhere
 //!
 //! A certificate can be bound to a route here and an ACME one renewed;
@@ -68,7 +83,7 @@
 //! asserts both halves against the document and against these
 //! handlers' request structs rather than promising it here.
 
-use axum::extract::{Extension, Path};
+use axum::extract::{Extension, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
@@ -79,6 +94,7 @@ use super::environments::{audit_context, ensure_backend_address_granted};
 use crate::audit::ClientConnectInfo;
 use crate::backends::{CreateBackendRequest, UpdateBackendRequest};
 use crate::error::ApiError;
+use crate::preview::{DryRunQuery, WriteMode};
 use crate::routes::{CreateRouteRequest, UpdateRouteRequest};
 use crate::server::AppState;
 
@@ -135,7 +151,8 @@ fn ensure_hostnames_granted(
 /// The management route create, as the token: same body, same
 /// validators, same defaults, same 201 and the same `route.create`
 /// audit row, naming the token. The hostname and every alias must be
-/// inside the token's `allowed_hostnames` (403).
+/// inside the token's `allowed_hostnames` (403). With `?dry_run=true`,
+/// the route it would have created, and nothing created.
 ///
 /// # Errors
 ///
@@ -146,6 +163,7 @@ pub async fn create_route(
     connect_info: ClientConnectInfo,
     headers: HeaderMap,
     Extension(state): Extension<AppState>,
+    Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     ensure_hostnames_granted(
@@ -154,7 +172,7 @@ pub async fn create_route(
         body.hostname_aliases.as_deref(),
     )?;
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::routes::crud::create_route_as(&state, &actor, body).await
+    crate::routes::crud::create_route_as(&state, &actor, body, WriteMode::from(dry_run)).await
 }
 
 /// `PUT /automation/v1/routes/{id}` (scope `routes:write`).
@@ -162,7 +180,8 @@ pub async fn create_route(
 /// The management route update, as the token: a patch of the fields
 /// sent and nothing else, the managed-row refusal (409) included. A
 /// hostname or an alias the patch names must be inside the token's
-/// `allowed_hostnames` (403).
+/// `allowed_hostnames` (403). With `?dry_run=true`, the route before
+/// and after the patch, and nothing changed.
 ///
 /// # Errors
 ///
@@ -174,6 +193,7 @@ pub async fn update_route(
     headers: HeaderMap,
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
+    Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_hostnames_granted(
@@ -182,14 +202,15 @@ pub async fn update_route(
         body.hostname_aliases.as_deref(),
     )?;
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::routes::crud::update_route_as(&state, &actor, id, body).await
+    crate::routes::crud::update_route_as(&state, &actor, id, body, WriteMode::from(dry_run)).await
 }
 
 /// `DELETE /automation/v1/routes/{id}` (scope `routes:write`).
 ///
 /// The management route delete, as the token. A managed route is
 /// deletable there and therefore here, and takes its environment with
-/// it; the audit row names the environment.
+/// it; the audit row names the environment. With `?dry_run=true`, the
+/// route that would go, and nothing deleted.
 ///
 /// # Errors
 ///
@@ -200,9 +221,10 @@ pub async fn delete_route(
     headers: HeaderMap,
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
+    Query(dry_run): Query<DryRunQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::routes::crud::delete_route_as(&state, &actor, id).await
+    crate::routes::crud::delete_route_as(&state, &actor, id, WriteMode::from(dry_run)).await
 }
 
 /// `PUT /automation/v1/routes/{id}/certificate` (scope
@@ -212,7 +234,8 @@ pub async fn delete_route(
 /// `PUT /api/v1/routes/{id}` would make, through the same function:
 /// the managed-row refusal (409) holds, and the empty string unbinds.
 /// Selecting a certificate is naming its id here; what the id names
-/// entered the node through the management API.
+/// entered the node through the management API. With `?dry_run=true`,
+/// the route before and after the binding, and nothing bound.
 ///
 /// # Errors
 ///
@@ -223,6 +246,7 @@ pub async fn bind_certificate(
     headers: HeaderMap,
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
+    Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<BindCertificateRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let actor = audit_context(&principal, &connect_info, &headers);
@@ -230,7 +254,7 @@ pub async fn bind_certificate(
         certificate_id: Some(body.certificate_id),
         ..UpdateRouteRequest::default()
     };
-    crate::routes::crud::update_route_as(&state, &actor, id, patch).await
+    crate::routes::crud::update_route_as(&state, &actor, id, patch, WriteMode::from(dry_run)).await
 }
 
 /// `POST /automation/v1/backends` (scope `backends:write`).
@@ -238,7 +262,9 @@ pub async fn bind_certificate(
 /// The management backend create, as the token. The address must be an
 /// `ip:port` (422, since a name cannot be checked against a CIDR
 /// grant) inside the token's `allowed_backend_cidrs` (403), the same
-/// rule the environment resource applies to its backends.
+/// rule the environment resource applies to its backends. With
+/// `?dry_run=true`, the backend it would have created, and nothing
+/// created.
 ///
 /// # Errors
 ///
@@ -249,18 +275,20 @@ pub async fn create_backend(
     connect_info: ClientConnectInfo,
     headers: HeaderMap,
     Extension(state): Extension<AppState>,
+    Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<CreateBackendRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     ensure_backend_address_granted(&principal, "address", &body.address)?;
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::backends::create_backend_as(&state, &actor, body).await
+    crate::backends::create_backend_as(&state, &actor, body, WriteMode::from(dry_run)).await
 }
 
 /// `PUT /automation/v1/backends/{id}` (scope `backends:write`).
 ///
 /// The management backend update, as the token, the managed-row
 /// refusal (409) included. An address the patch names is checked
-/// against the grant exactly as on create.
+/// against the grant exactly as on create. With `?dry_run=true`, the
+/// backend before and after the patch, and nothing changed.
 ///
 /// # Errors
 ///
@@ -272,19 +300,22 @@ pub async fn update_backend(
     headers: HeaderMap,
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
+    Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<UpdateBackendRequest>,
 ) -> Result<Json<Value>, ApiError> {
     if let Some(address) = body.address.as_deref() {
         ensure_backend_address_granted(&principal, "address", address)?;
     }
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::backends::update_backend_as(&state, &actor, id, body).await
+    crate::backends::update_backend_as(&state, &actor, id, body, WriteMode::from(dry_run)).await
 }
 
 /// `DELETE /automation/v1/backends/{id}` (scope `backends:write`).
 ///
 /// The management backend delete, as the token: the graceful drain,
-/// and the refusal of a backend an environment owns (409).
+/// and the refusal of a backend an environment owns (409). With
+/// `?dry_run=true`, the backend that would drain, and no drain
+/// started.
 ///
 /// # Errors
 ///
@@ -295,9 +326,10 @@ pub async fn delete_backend(
     headers: HeaderMap,
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
+    Query(dry_run): Query<DryRunQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::backends::delete_backend_as(&state, &actor, id).await
+    crate::backends::delete_backend_as(&state, &actor, id, WriteMode::from(dry_run)).await
 }
 
 /// `POST /automation/v1/certificates/{id}/renew` (scope
@@ -307,7 +339,8 @@ pub async fn delete_backend(
 /// node already holds, in place under the same id. A certificate that
 /// was uploaded rather than issued is refused (400) exactly as on the
 /// management plane, since there is nothing to renew it against, and
-/// no path here takes the replacement.
+/// no path here takes the replacement. With `?dry_run=true`, the
+/// certificate that would be renewed, and no order made.
 ///
 /// # Errors
 ///
@@ -318,9 +351,10 @@ pub async fn renew_certificate(
     headers: HeaderMap,
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
+    Query(dry_run): Query<DryRunQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::acme::renew_certificate_as(&state, &actor, id).await
+    crate::acme::renew_certificate_as(&state, &actor, id, WriteMode::from(dry_run)).await
 }
 
 #[cfg(test)]

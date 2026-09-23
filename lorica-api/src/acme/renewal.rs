@@ -366,7 +366,7 @@ pub async fn renew_certificate(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    renew_certificate_as(&state, &audit_ctx, id).await
+    renew_certificate_as(&state, &audit_ctx, id, crate::preview::WriteMode::Apply).await
 }
 
 /// The whole of [`renew_certificate`] as `actor`: the ACME-only
@@ -378,10 +378,15 @@ pub async fn renew_certificate(
 /// `crate::routes::crud::create_route_as` for the rule. No key
 /// material crosses this function's arguments: the renewal is an ACME
 /// order the node makes for a row it already holds.
+///
+/// In [`crate::preview::WriteMode::Preview`] it answers the metadata of
+/// the certificate that would be renewed, after the ACME-only refusal,
+/// and makes no order.
 pub(crate) async fn renew_certificate_as(
     state: &AppState,
     actor: &crate::audit::AuditContext,
     id: String,
+    mode: crate::preview::WriteMode,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let cert = db_blocking(&state.store, move |store| {
         store
@@ -393,6 +398,13 @@ pub(crate) async fn renew_certificate_as(
     if !cert.is_acme {
         return Err(ApiError::BadRequest(
             "only ACME certificates can be renewed (use upload for manual certs)".into(),
+        ));
+    }
+    if mode.previews() {
+        return Ok(crate::preview::previewed(
+            "renew",
+            serde_json::to_value(crate::certificates::cert_to_response(&cert)).ok(),
+            None,
         ));
     }
 

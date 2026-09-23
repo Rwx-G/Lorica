@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The HTTPS implementation of [`crate::ReadSource`]: the client the
-//! stdio binary reaches the Story 10.3 automation listener with.
+//! The HTTPS implementation of [`crate::AutomationPlane`]: the client
+//! the stdio binary reaches the Story 10.3 automation listener with.
 //!
 //! # Verification is not optional and there is no switch that says so
 //!
@@ -54,10 +54,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 
 use crate::config::ServerConfig;
-use crate::{ReadError, ReadSource, Reason};
+use crate::{AutomationPlane, PlaneError, Reason, Verb};
 
 /// The header this client declares the tool name in.
 ///
@@ -81,12 +81,23 @@ pub const TRANSPORT_MARKER: &str = "mcp-stdio";
 
 /// How long one read may take end to end.
 ///
-/// A read tier's calls are a single `GET` each against a node that
-/// answers from its own store, so a request still running after this
-/// is a network that stopped rather than a query that is slow. The
-/// model on the other side is waiting, and a client that hangs is worse
-/// for it than one that says the plane could not be reached.
+/// A read is a single `GET` against a node that answers from its own
+/// store, so a request still running after this is a network that
+/// stopped rather than a query that is slow. The model on the other
+/// side is waiting, and a client that hangs is worse for it than one
+/// that says the plane could not be reached.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long one write may take end to end.
+///
+/// Longer than a read for one call: a certificate renewal is an ACME
+/// order the node makes while the request is open, and an HTTP-01 or
+/// DNS-01 validation takes the authority's time and not the node's.
+/// The timeout matters more than it looks, because a request the
+/// client abandons is a handler the listener drops mid-order: an
+/// operator who waited this long has a renewal that ran, and one whose
+/// client gave up at a read's timeout has one that did not.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long the connection itself may take to come up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -151,16 +162,17 @@ impl core::fmt::Display for HttpsError {
 
 impl std::error::Error for HttpsError {}
 
-/// A [`ReadSource`] that reaches the automation listener over HTTPS.
+/// An [`AutomationPlane`] reached over HTTPS: the automation listener,
+/// from a separate process.
 ///
-/// One client, reused for every read, so the TLS handshake and the
+/// One client, reused for every call, so the TLS handshake and the
 /// connection are paid once rather than per tool call.
-pub struct HttpsReadSource {
+pub struct HttpsPlane {
     client: reqwest::Client,
     endpoint: String,
 }
 
-impl HttpsReadSource {
+impl HttpsPlane {
     /// Build a client for `config`.
     ///
     /// The bearer token becomes a default header marked sensitive, so
@@ -172,7 +184,7 @@ impl HttpsReadSource {
     /// [`HttpsError::BundleNotCertificates`] for a CA bundle that is
     /// named and unusable, [`HttpsError::ClientUnbuildable`] when the
     /// TLS backend refuses to start.
-    pub fn new(config: &ServerConfig) -> Result<HttpsReadSource, HttpsError> {
+    pub fn new(config: &ServerConfig) -> Result<HttpsPlane, HttpsError> {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {}", config.token.reveal()))
             .map_err(|reason| HttpsError::ClientUnbuildable(reason.to_string()))?;
         authorization.set_sensitive(true);
@@ -210,7 +222,7 @@ impl HttpsReadSource {
             builder = builder.add_root_certificate(authority);
         }
 
-        Ok(HttpsReadSource {
+        Ok(HttpsPlane {
             client: builder
                 .build()
                 .map_err(|reason| HttpsError::ClientUnbuildable(reason.to_string()))?,
@@ -249,9 +261,39 @@ fn trusted_extras(bundle: Option<&Path>) -> Result<Vec<reqwest::Certificate>, Ht
     Ok(certificates)
 }
 
-impl ReadSource for HttpsReadSource {
-    async fn fetch(&self, path: &str, reason: Reason<'_>) -> Result<String, ReadError> {
-        let mut request = self.client.get(format!("{}{path}", self.endpoint));
+impl AutomationPlane for HttpsPlane {
+    async fn call(
+        &self,
+        verb: Verb,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        reason: Reason<'_>,
+    ) -> Result<String, PlaneError> {
+        let method = match verb {
+            Verb::Get => reqwest::Method::GET,
+            Verb::Post => reqwest::Method::POST,
+            Verb::Put => reqwest::Method::PUT,
+            Verb::Delete => reqwest::Method::DELETE,
+        };
+        let mut request = self
+            .client
+            .request(method, format!("{}{path}", self.endpoint))
+            .timeout(if verb.is_read() {
+                REQUEST_TIMEOUT
+            } else {
+                WRITE_TIMEOUT
+            });
+        // Serialised here rather than through the client's own JSON
+        // helper, which is a feature this crate does not enable: the
+        // body is a `Value` the tool layer already bounded, and one
+        // `to_vec` is the whole of what that helper would do.
+        if let Some(body) = body {
+            let bytes = serde_json::to_vec(body)
+                .map_err(|reason| PlaneError::Transport(reason.to_string()))?;
+            request = request
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .body(bytes);
+        }
         // Absent where no tool ran, which is the startup introspection.
         // A header naming a tool there would be the false claim this
         // whole arrangement exists to avoid. The grammar check is
@@ -270,14 +312,14 @@ impl ReadSource for HttpsReadSource {
         let response = request
             .send()
             .await
-            .map_err(|reason| ReadError::Transport(reason.to_string()))?;
+            .map_err(|reason| PlaneError::Transport(reason.to_string()))?;
         let status = response.status();
         let body = bounded_body(response).await?;
 
         if status.is_success() {
             Ok(body)
         } else {
-            Err(ReadError::Refused {
+            Err(PlaneError::Refused {
                 status: status.as_u16(),
                 body,
             })
@@ -289,24 +331,25 @@ impl ReadSource for HttpsReadSource {
 ///
 /// Read in chunks rather than with `bytes()`, because the ceiling has
 /// to stop the transfer and not merely regret it afterwards.
-async fn bounded_body(mut response: reqwest::Response) -> Result<String, ReadError> {
+async fn bounded_body(mut response: reqwest::Response) -> Result<String, PlaneError> {
     let mut body: Vec<u8> = Vec::new();
     loop {
         let chunk = response
             .chunk()
             .await
-            .map_err(|reason| ReadError::Transport(reason.to_string()))?;
+            .map_err(|reason| PlaneError::Transport(reason.to_string()))?;
         let Some(chunk) = chunk else { break };
         if body.len() + chunk.len() > MAX_BODY_BYTES {
-            return Err(ReadError::Transport(format!(
-                "the answer is over {MAX_BODY_BYTES} bytes, which no automation read produces; \
+            return Err(PlaneError::Transport(format!(
+                "the answer is over {MAX_BODY_BYTES} bytes, which no automation call produces; \
                  check that the endpoint is a Lorica automation listener and not something in \
                  front of one"
             )));
         }
         body.extend_from_slice(&chunk);
     }
-    String::from_utf8(body).map_err(|_| ReadError::Transport("the answer is not UTF-8".to_string()))
+    String::from_utf8(body)
+        .map_err(|_| PlaneError::Transport("the answer is not UTF-8".to_string()))
 }
 
 #[cfg(test)]
@@ -351,7 +394,7 @@ mod tests {
 
     #[test]
     fn a_client_builds_with_no_bundle_and_with_one() {
-        HttpsReadSource::new(&config_with(None)).expect("the platform store alone is enough");
+        HttpsPlane::new(&config_with(None)).expect("the platform store alone is enough");
 
         let dir = tempfile::tempdir().expect("test setup: temp dir");
         let bundle = dir.path().join("internal-ca.pem");
@@ -362,7 +405,7 @@ mod tests {
             format!("{}{}", a_certificate_pem(), a_certificate_pem()),
         )
         .expect("test setup: the bundle is written");
-        HttpsReadSource::new(&config_with(Some(bundle))).expect("a named bundle is trusted");
+        HttpsPlane::new(&config_with(Some(bundle))).expect("a named bundle is trusted");
     }
 
     #[test]
@@ -374,7 +417,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("test setup: temp dir");
 
         let missing = dir.path().join("absent.pem");
-        let refused = HttpsReadSource::new(&config_with(Some(missing.clone())))
+        let refused = HttpsPlane::new(&config_with(Some(missing.clone())))
             .err()
             .expect("an unreadable bundle is refused");
         assert!(
@@ -385,7 +428,7 @@ mod tests {
 
         let garbage = dir.path().join("notes.txt");
         std::fs::write(&garbage, "this is not a certificate\n").expect("test setup: written");
-        let refused = HttpsReadSource::new(&config_with(Some(garbage)))
+        let refused = HttpsPlane::new(&config_with(Some(garbage)))
             .err()
             .expect("a file with no certificate in it is refused");
         assert!(

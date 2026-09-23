@@ -30,13 +30,28 @@
 //! this module is the transport around it and decides nothing a method
 //! means.
 //!
-//! # The read source does not dial its own listener
+//! # The in-process plane runs the plane's own router, and dials nothing
 //!
-//! [`InProcessReads`] implements [`ReadSource`] against
-//! [`super::read`]'s handlers directly. Looping back over the socket
-//! would be refused or throttled by the plane's own source allowlist and
-//! per-source connection budget, and would be absurd if it were not: the
-//! process holds the state the request is about.
+//! [`InProcessPlane`] implements [`AutomationPlane`] by building the
+//! request the seam describes - the verb, the path, the body - and
+//! running it through [`super::router::in_process_router`]: the plane's
+//! route table under its scope gate, with the caller's principal, the
+//! state and the connection info travelling as request extensions,
+//! which is where the handlers and the gate read them from on the
+//! listener. Looping back over the socket would be refused or throttled
+//! by the plane's own source allowlist and per-source connection
+//! budget, and would be absurd if it were not: the process holds the
+//! state the request is about.
+//!
+//! Story 11.1 dispatched by hand instead, a `match` over the read paths
+//! calling each handler, which was a second router that ran no scope
+//! gate and could carry no verb, no body and no principal. Story 11.2
+//! needed all three for its writes, and needed the write handlers to
+//! run unchanged with their per-token grants and their own audit rows,
+//! so the dispatch went and the router came in. The scope matrix now
+//! authorizes every in-process call exactly as it does one over the
+//! socket, and a tool mis-declared against it is refused by the plane
+//! rather than merely absent from a list.
 //!
 //! # Authorization is per tool, because the request carries the tool
 //!
@@ -44,20 +59,21 @@
 //! request carries its own tool with its own scope, so the endpoint
 //! cannot be declared behind any single scope. It is declared
 //! [`super::ScopeRequirement::AnyLiveToken`], and the authorization that
-//! matters happens per call: [`McpServer::over`] registers only the
+//! matters happens per call: [`McpServer::sharing`] registers only the
 //! tools the presented token's scopes cover, so a tool the caller cannot
 //! reach is absent from its `tools/list` and unknown to its
-//! `tools/call`. The specification blesses exactly this - a tool set
-//! "MAY vary by the authorization presented on the request ... since
-//! credentials are per-request input, not connection state" - while
-//! forbidding variation per connection, which nothing here does: the
-//! registry is built from the request's own principal and dropped with
-//! it.
+//! `tools/call`, and the matrix refuses it again in process if a tool
+//! ever declared a scope its path does not sit behind. The specification
+//! blesses exactly this - a tool set "MAY vary by the authorization
+//! presented on the request ... since credentials are per-request input,
+//! not connection state" - while forbidding variation per connection,
+//! which nothing here does: the registry is built from the request's
+//! own principal and dropped with it.
 //!
 //! The scope each tool names is `lorica-mcp`'s, and the scope each path
 //! sits behind is [`super::scope::required_scope`]'s. They are two
 //! statements of one rule, so `tests/mcp_catalogue_scopes.rs` pins them
-//! against each other, one assertion per tool.
+//! against each other, one assertion per tool, on the tool's verb.
 //!
 //! # The invocation budget outlives the request
 //!
@@ -117,21 +133,24 @@
 //! configures is the additive change if a browser front end ever needs
 //! one; refusing by default is what keeps that decision explicit.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::body::Bytes;
-use axum::extract::{Extension, Path, Query};
+use axum::body::{Body, Bytes};
+use axum::extract::{ConnectInfo, Extension};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
-use http::{HeaderMap, StatusCode, Uri};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use lorica_mcp::server::{Identity, McpServer, Outcome};
-use lorica_mcp::{jsonrpc, tools, ReadError, ReadSource, Reason, MCP_PROTOCOL_REVISION};
-use percent_encoding::percent_decode_str;
+use lorica_mcp::{
+    jsonrpc, tools, AutomationPlane, PlaneError, Reason, Verb, MCP_PROTOCOL_REVISION,
+};
 use serde_json::Value;
+use tower::ServiceExt as _;
 
 use super::auth::AutomationPrincipal;
-use crate::error::ApiError;
+use crate::audit::ClientConnectInfo;
 use crate::server::AppState;
 
 /// The one endpoint this transport defines.
@@ -188,12 +207,13 @@ const IMPLEMENTED_METHODS: &[&str] = &[
     "notifications/cancelled",
 ];
 
-/// The most bytes of a refusal body carried back across the read seam.
+/// The most bytes of an answer carried back across the seam.
 ///
-/// The plane's own error envelope is two short fields; this is here so a
-/// handler that somehow answered a large body cannot choose this
-/// process's memory on the way to a tool result.
-const MAX_REFUSAL_BYTES: usize = 64 * 1024;
+/// A read answers at most the plane's 256 KiB of rows plus its envelope
+/// and a write answers one row; this is here so a handler that somehow
+/// answered more cannot choose this process's memory on the way to a
+/// tool result.
+const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
 
 /// `POST /automation/v1/mcp` - one MCP message, answered in one object.
 ///
@@ -206,6 +226,7 @@ const MAX_REFUSAL_BYTES: usize = 64 * 1024;
 pub async fn mcp_endpoint(
     Extension(state): Extension<AppState>,
     principal: AutomationPrincipal,
+    connect_info: ClientConnectInfo,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -221,7 +242,12 @@ pub async fn mcp_endpoint(
     // the process's, keyed by token, or the budget would reset with the
     // registry.
     let server = McpServer::sharing(identity_of(&principal), Arc::clone(&state.mcp_invocations));
-    let source = InProcessReads { state };
+    let source = InProcessPlane {
+        state,
+        principal,
+        connect_info: connect_info.as_ref().copied(),
+        user_agent: headers.get(http::header::USER_AGENT).cloned(),
+    };
 
     // Read before the request is consumed: the body the mirror pinned
     // to the header is what the row names.
@@ -284,9 +310,8 @@ fn named_call(request: &jsonrpc::Request) -> (Option<String>, Vec<&'static str>)
     let argument_names: Vec<&'static str> = match tool.as_deref().and_then(tools::find) {
         Some(spec) => match request.params.get("arguments") {
             Some(Value::Object(arguments)) => spec
-                .params()
-                .iter()
-                .map(|param| param.name)
+                .argument_names()
+                .into_iter()
                 .filter(|name| arguments.contains_key(*name))
                 .collect(),
             _ => Vec::new(),
@@ -521,127 +546,105 @@ pub(super) fn mirrored(headers: &HeaderMap, name: &str) -> Result<Option<String>
     String::from_utf8(bytes).map(Some).map_err(|_| ())
 }
 
-/// The [`ReadSource`] the in-process binding runs, over the read
-/// handlers themselves.
+/// The [`AutomationPlane`] the in-process binding runs: the plane's own
+/// router, called with a request this process built.
 ///
 /// No client, no socket and no loopback. The alternative - this adapter
 /// dialling the listener it is mounted on - would be refused by the
 /// mandatory source-CIDR allowlist or throttled by the per-source
 /// connection budget, and it would be spending a TLS handshake to ask
 /// the process a question it already holds the answer to.
-pub struct InProcessReads {
+///
+/// What the request carries is what a request over the socket carries
+/// once the bearer gate has run: the [`AppState`] extension the handlers
+/// read, the [`AutomationPrincipal`] the scope gate and the write
+/// handlers read (the grants, the audit identity), the caller's
+/// [`ConnectInfo`] so a write's management audit row names the address
+/// the MCP POST came from, and the caller's `User-Agent` for the same
+/// row. The scope gate runs on every call, so the matrix authorizes an
+/// in-process call exactly as it would one over the listener.
+pub struct InProcessPlane {
     state: AppState,
+    principal: AutomationPrincipal,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    user_agent: Option<HeaderValue>,
 }
 
-impl InProcessReads {
-    /// A read source over `state`.
-    pub fn new(state: AppState) -> InProcessReads {
-        InProcessReads { state }
-    }
-
-    /// One read view, as the handler that owns it answers.
-    ///
-    /// The arms are the paths [`super::scope`] declares, reached through
-    /// its own constants rather than through strings typed again here.
-    /// A tool naming a path with no arm is a wiring fault and answers
-    /// 500: the test that drives every registered tool through this
-    /// source is what stops one reaching a release.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the read handler answers, plus `BadRequest` for a query
-    /// string the handler's own filter struct refuses.
-    async fn read(&self, path: &str) -> Result<String, ApiError> {
-        use super::scope::{
-            BACKENDS_PATH, CERTIFICATES_PATH, CLUSTER_STATUS_PATH, LOGS_PATH, ROUTES_PATH,
-            SLA_OVERVIEW_PATH, SLA_ROUTES_PATH, WAF_EVENTS_PATH, WAF_STATS_PATH,
-        };
-
-        let uri: Uri = path.parse().map_err(|_| {
-            ApiError::Internal(format!(
-                "automation MCP: a tool built a path that is not a URI: {path}"
-            ))
-        })?;
-        let route = uri.path().to_string();
-        let state = || Extension(self.state.clone());
-
-        let answered = match route.as_str() {
-            LOGS_PATH => super::read::list_logs(state(), query(&uri)?, query(&uri)?).await?,
-            WAF_EVENTS_PATH => {
-                super::read::list_waf_events(state(), query(&uri)?, query(&uri)?).await?
-            }
-            WAF_STATS_PATH => super::read::waf_stats(state()).await?,
-            SLA_OVERVIEW_PATH => super::read::sla_overview(state(), query(&uri)?).await?,
-            CLUSTER_STATUS_PATH => super::read::cluster_status(state()).await?,
-            BACKENDS_PATH => super::read::list_backends(state(), query(&uri)?).await?,
-            ROUTES_PATH => super::read::list_routes(state(), query(&uri)?, query(&uri)?).await?,
-            CERTIFICATES_PATH => super::read::list_certificates(state(), query(&uri)?).await?,
-            _ => match one_segment_under(&route, SLA_ROUTES_PATH) {
-                Some(id) => super::read::route_sla(state(), Path(id), query(&uri)?).await?,
-                None => {
-                    return Err(ApiError::Internal(format!(
-                        "automation MCP: no read is mounted in process at {route}"
-                    )))
-                }
-            },
-        };
-        serde_json::to_string(&answered.0)
-            .map_err(|reason| ApiError::Internal(format!("automation MCP: {reason}")))
-    }
-}
-
-impl ReadSource for InProcessReads {
-    async fn fetch(&self, path: &str, _reason: Reason<'_>) -> Result<String, ReadError> {
-        // `reason` is unused here and that is the honest shape. It exists
-        // so a source reaching a REMOTE plane can declare what the read
-        // was for; this one IS the plane, and the audit row for the POST
-        // that drove it is written by the layer wrapping this handler,
-        // from the request that carried the tool name.
-        match self.read(path).await {
-            Ok(body) => Ok(body),
-            Err(error) => Err(refusal(error).await),
+impl InProcessPlane {
+    /// A plane over `state`, calling as `principal` from nowhere in
+    /// particular: the shape for a caller that holds no connection.
+    pub fn new(state: AppState, principal: AutomationPrincipal) -> InProcessPlane {
+        InProcessPlane {
+            state,
+            principal,
+            connect_info: None,
+            user_agent: None,
         }
     }
 }
 
-/// The resource id one segment under `collection`, percent-decoded.
-///
-/// The tool layer encodes the segment whole, so the decoding here is
-/// what the listener's own path extractor would have done. Nothing wider
-/// than one segment is accepted, which is the property that keeps a
-/// route id from moving a read onto another path.
-fn one_segment_under(path: &str, collection: &str) -> Option<String> {
-    let last = path
-        .strip_prefix(collection)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .filter(|last| !last.is_empty() && !last.contains('/'))?;
-    Some(percent_decode_str(last).decode_utf8_lossy().into_owned())
-}
+impl AutomationPlane for InProcessPlane {
+    async fn call(
+        &self,
+        verb: Verb,
+        path: &str,
+        body: Option<&Value>,
+        _reason: Reason<'_>,
+    ) -> Result<String, PlaneError> {
+        // `reason` is unused here and that is the honest shape. It exists
+        // so a plane reached from a separate process can be told what
+        // the call is for; this one IS the plane, and the audit row for
+        // the POST that drove it is written by the layer wrapping this
+        // handler, from the request that carried the tool name.
+        let mut request = http::Request::builder().method(verb.as_str()).uri(path);
+        if body.is_some() {
+            request = request.header(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+        }
+        if let Some(agent) = &self.user_agent {
+            request = request.header(http::header::USER_AGENT, agent.clone());
+        }
+        let bytes: Vec<u8> = match body {
+            Some(body) => serde_json::to_vec(body)
+                .map_err(|reason| PlaneError::Transport(reason.to_string()))?,
+            None => Vec::new(),
+        };
+        let mut request = request.body(Body::from(bytes)).map_err(|reason| {
+            PlaneError::Transport(format!(
+                "automation MCP: a tool built a call the router cannot take: {reason}"
+            ))
+        })?;
+        request.extensions_mut().insert(self.state.clone());
+        request.extensions_mut().insert(self.principal.clone());
+        if let Some(connect_info) = self.connect_info {
+            request.extensions_mut().insert(connect_info);
+        }
 
-/// One typed query struct out of a built path.
-///
-/// # Errors
-///
-/// `BadRequest` carrying the extractor's own words, which is what the
-/// listener would have answered for the same query string.
-fn query<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<Query<T>, ApiError> {
-    Query::try_from_uri(uri).map_err(|rejection| ApiError::BadRequest(rejection.body_text()))
-}
-
-/// An API refusal as the seam carries it, status kept.
-///
-/// The status has to survive: `lorica-mcp` turns a refusal from the
-/// plane into a tool EXECUTION error the model reads and stops on,
-/// rather than a protocol error it would reword and retry, and that
-/// distinction is made from the status.
-async fn refusal(error: ApiError) -> ReadError {
-    let response = error.into_response();
-    let status = response.status().as_u16();
-    let body = axum::body::to_bytes(response.into_body(), MAX_REFUSAL_BYTES)
-        .await
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default();
-    ReadError::Refused { status, body }
+        let response = match super::router::in_process_router().oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), MAX_ANSWER_BYTES)
+            .await
+            .map_err(|reason| PlaneError::Transport(reason.to_string()))?;
+        let text = String::from_utf8(body.to_vec())
+            .map_err(|_| PlaneError::Transport("the answer is not UTF-8".to_string()))?;
+        if status.is_success() {
+            Ok(text)
+        } else {
+            // The status has to survive: `lorica-mcp` turns a refusal
+            // from the plane into a tool EXECUTION error the model reads
+            // and stops on, rather than a protocol error it would reword
+            // and retry, and that distinction is made from the status.
+            Err(PlaneError::Refused {
+                status: status.as_u16(),
+                body: text,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1009,8 +1012,14 @@ mod tests {
         // gains answers something other than METHOD_NOT_FOUND, and one
         // it loses answers exactly that.
         struct Nothing;
-        impl ReadSource for Nothing {
-            async fn fetch(&self, _path: &str, _reason: Reason<'_>) -> Result<String, ReadError> {
+        impl AutomationPlane for Nothing {
+            async fn call(
+                &self,
+                _verb: Verb,
+                _path: &str,
+                _body: Option<&Value>,
+                _reason: Reason<'_>,
+            ) -> Result<String, PlaneError> {
                 Ok("{\"data\":{}}".to_string())
             }
         }
@@ -1119,7 +1128,7 @@ mod tests {
 
     #[test]
     fn this_module_opens_no_connection_of_its_own() {
-        // The in-process source must not loop back over the listener it
+        // The in-process plane must not loop back over the listener it
         // is mounted on: the mandatory source-CIDR allowlist and the
         // per-source connection budget would refuse or throttle it, and
         // it would be absurd regardless. Asserted against the source
@@ -1132,9 +1141,146 @@ mod tests {
                 "{dialled} appears in the in-process MCP adapter"
             );
         }
-        // And the scan is worth something: the handlers it is meant to
-        // call instead really are called here.
-        assert!(body.contains("super::read::list_logs"));
+        // And the scan is worth something: the router it is meant to
+        // run the call through instead really is called here, and no
+        // read handler is called by hand any more.
+        assert!(body.contains("in_process_router()"));
+        assert!(!body.contains("super::read::"));
+    }
+
+    /// A principal carrying exactly `scopes`, with the grants the
+    /// write tests use.
+    fn principal_carrying(
+        scopes: Vec<lorica_config::models::AutomationScope>,
+    ) -> AutomationPrincipal {
+        AutomationPrincipal {
+            kind: lorica_config::models::OwnerKind::StaticToken,
+            principal: "mcp-in-process".to_string(),
+            grant_id: "0123456789abcdef01234567".to_string(),
+            scopes,
+            allowed_hostnames: vec!["*.write.example.com".to_string()],
+            allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
+            max_ttl_seconds: 3_600,
+            pipeline: None,
+            required_environment_slug: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_in_process_plane_runs_the_scope_gate_and_refuses_what_the_matrix_refuses() {
+        // The property Story 11.2 bought by routing in process instead
+        // of dispatching by hand: a call that reaches a handler through
+        // this plane has passed `authorize_scope`, so a token lacking
+        // the scope its path sits behind is refused by the plane with
+        // the same 403 the listener would answer, whatever `lorica-mcp`
+        // registered. The old dispatch ran no gate at all.
+        use lorica_config::models::AutomationScope;
+
+        let (state, _session_store, _rate_limiter) = crate::tests::test_state().await;
+
+        let lacking = InProcessPlane::new(
+            state.clone(),
+            principal_carrying(vec![AutomationScope::WafRead]),
+        );
+        let refused = lacking
+            .call(
+                Verb::Get,
+                "/automation/v1/logs",
+                None,
+                Reason::Tool("lorica_logs"),
+            )
+            .await
+            .expect_err("a scope the principal lacks is refused in process");
+        match refused {
+            PlaneError::Refused { status, body } => {
+                assert_eq!(status, 403);
+                assert!(body.contains("logs:read"), "{body}");
+            }
+            PlaneError::Transport(reason) => panic!("not a refusal: {reason}"),
+        }
+        // A write behind a scope the principal lacks, the same way, and
+        // before the handler could look at the body.
+        let refused = lacking
+            .call(
+                Verb::Post,
+                "/automation/v1/routes",
+                Some(&json!({ "hostname": "app.write.example.com" })),
+                Reason::Tool("lorica_route_create"),
+            )
+            .await
+            .expect_err("a write scope the principal lacks is refused in process");
+        assert!(
+            matches!(refused, PlaneError::Refused { status: 403, .. }),
+            "{refused}"
+        );
+
+        // With the scope, the same call reaches the handler, which
+        // answers as it would over the socket.
+        let holding = InProcessPlane::new(
+            state.clone(),
+            principal_carrying(vec![
+                AutomationScope::LogsRead,
+                AutomationScope::RoutesWrite,
+            ]),
+        );
+        let answered = holding
+            .call(
+                Verb::Get,
+                "/automation/v1/logs",
+                None,
+                Reason::Tool("lorica_logs"),
+            )
+            .await
+            .expect("the read answers");
+        let answered: Value = serde_json::from_str(&answered).expect("JSON");
+        assert!(answered["data"]["items"].is_array(), "{answered}");
+
+        // A write's body reaches the handler and its validators: the
+        // refusal is the management plane's own, with its status.
+        let refused = holding
+            .call(
+                Verb::Post,
+                "/automation/v1/routes",
+                Some(&json!({ "hostname": "app.write.example.com", "connect_timeout_s": 0 })),
+                Reason::Tool("lorica_route_create"),
+            )
+            .await
+            .expect_err("a validator refuses");
+        match refused {
+            PlaneError::Refused { status, body } => {
+                assert_eq!(status, 400);
+                assert!(body.contains("connect_timeout_s"), "{body}");
+            }
+            PlaneError::Transport(reason) => panic!("not a refusal: {reason}"),
+        }
+
+        // And a path the matrix declares for nobody is refused for a
+        // principal carrying every scope: the fail-closed default holds
+        // in process as on the listener.
+        let widest = InProcessPlane::new(state, principal_carrying(AutomationScope::ALL.to_vec()));
+        let refused = widest
+            .call(
+                Verb::Post,
+                "/automation/v1/certificates",
+                Some(&json!({ "domain": "x" })),
+                Reason::Tool("lorica_certificates"),
+            )
+            .await
+            .expect_err("an undeclared path is refused");
+        assert!(
+            matches!(refused, PlaneError::Refused { status: 403, .. }),
+            "{refused}"
+        );
+        // The MCP endpoint itself is not in the in-process router: a
+        // tool cannot call the endpoint that is running it.
+        let refused = widest
+            .call(Verb::Post, MCP_PATH, Some(&json!({})), Reason::Tool("x"))
+            .await
+            .expect_err("the endpoint is not reachable from inside itself");
+        assert!(
+            matches!(refused, PlaneError::Refused { status: 404, .. }),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -1146,34 +1292,6 @@ mod tests {
         assert!(
             router.contains(&format!("\"{MCP_PATH}\"")),
             "{MCP_PATH} is not mounted in router.rs"
-        );
-    }
-
-    #[test]
-    fn a_resource_segment_is_decoded_the_way_the_listener_would_have() {
-        let collection = crate::automation::scope::SLA_ROUTES_PATH;
-        assert_eq!(
-            one_segment_under("/automation/v1/sla/routes/r%2D1", collection).as_deref(),
-            Some("r-1")
-        );
-        // A traversal attempt was encoded whole by the tool layer, so it
-        // decodes to one id that names no route rather than to a path.
-        assert_eq!(
-            one_segment_under(
-                "/automation/v1/sla/routes/%2E%2E%2F%2E%2E%2Fwhoami",
-                collection
-            )
-            .as_deref(),
-            Some("../../whoami")
-        );
-        // The collection itself is not one segment under itself.
-        assert_eq!(
-            one_segment_under("/automation/v1/sla/routes", collection),
-            None
-        );
-        assert_eq!(
-            one_segment_under("/automation/v1/sla/routes/a/b", collection),
-            None
         );
     }
 }

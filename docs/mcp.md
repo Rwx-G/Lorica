@@ -1,10 +1,13 @@
 # The Lorica management MCP server
 
-`lorica-mcp` lets an operator ask a Model Context Protocol client what
-Lorica is seeing: access-log rows, WAF events, SLA windows, cluster
-status and the configuration as it stands. It is a read tier. It
-cannot change anything, and that is the point rather than a limitation
-of the first release.
+`lorica-mcp` lets an operator talk to Lorica from a Model Context
+Protocol client. It has two tiers, and a server is one of them by the
+token it was started with. The **read tier** asks what Lorica is
+seeing: access-log rows, WAF events, SLA windows, cluster status and the
+configuration as it stands, and cannot change anything. The **config
+tier** creates and adjusts routes, backends and certificate bindings,
+through the same validators the dashboard uses, with a preview of every
+change before it is made.
 
 It speaks two transports over one core: **stdio**, for a client that
 launches it as a subprocess, and **Streamable HTTP**, as one path on
@@ -13,7 +16,7 @@ untrusted-text marking and the protocol revision are the same on both,
 because both run the same code; what differs is what carries the
 messages and what each one can honestly put in an audit row.
 
-## Why the tier exists before the tools do
+## Why there are tiers, and why they are separate processes
 
 The text an operator most wants to reason about is text Lorica
 collected from whoever was attacking them: User-Agent strings, request
@@ -25,10 +28,15 @@ deletes a route, that path is an instruction channel into production.
 
 So the authority a session holds is decided by the token it was started
 with, not by a mode it can switch. A read-tier server has no mutating
-tool to be talked into using, because the tools were never registered.
-That is a property of the process, not a rule it follows.
+tool to be talked into using, because the tools were never registered:
+every mutating tool sits behind a write scope, and a token carrying
+read scopes alone registers none of them. That is a property of the
+process, not a rule it follows. The config tier is therefore a
+**separate token and a separate server process**: one that holds write
+scopes, started for the work of changing things, and not the one an
+operator reads hostile text through.
 
-## What this tier can see
+## The read tier
 
 Nine tools, one per read the automation plane serves. Each needs the
 scope beside it.
@@ -95,6 +103,154 @@ makes a field arriving here a visible event rather than a silent one.
 single-certificate endpoint that returns the public certificate is
 deliberately not on this plane.
 
+## The config tier
+
+Eight mutations, each with a preview, over the automation plane's
+write surface. Each pair needs the scope beside it, and a token
+carrying that scope registers the pair; a token carrying read scopes as
+well registers the read tools they cover beside them, which is how the
+tier finds the ids it acts on.
+
+| Tool, and its `_preview` | Does | Scope |
+|---|---|---|
+| `lorica_route_create` | create a route, as the dashboard's route form would | `routes:write` |
+| `lorica_route_update` | patch one route by id; only the fields sent change | `routes:write` |
+| `lorica_route_delete` | delete one route by id | `routes:write` |
+| `lorica_route_bind_certificate` | bind a stored certificate to one route by id, or unbind with the empty string | `certificates:write` |
+| `lorica_backend_create` | create a backend | `backends:write` |
+| `lorica_backend_update` | patch one backend by id | `backends:write` |
+| `lorica_backend_delete` | delete one backend by id, with the graceful drain | `backends:write` |
+| `lorica_certificate_renew` | renew one ACME certificate by id, in place | `certificates:write` |
+
+**Every mutation is the dashboard's own.** A tool's call runs the
+management handler's body, in process on the Streamable HTTP binding
+and over the automation listener from stdio, with the token as the
+actor where the dashboard's session would be. The validators, the
+defaults, the refusal of a row an environment owns and the
+management-side audit row are that handler's; `lorica-mcp` does not
+reimplement a single field check, so the two surfaces cannot drift, and
+a route created through the tier is the dashboard's route byte for byte
+in the canonical configuration. What the tool checks is shape: the body
+is an object, its top-level keys are ones the handler deserialises, and
+it weighs under the listener's cap. A field the handler does not know
+is refused before the call leaves, rather than dropped silently by the
+node.
+
+**The token's grants apply.** A hostname and every alias a route write
+claims must be inside the token's `allowed_hostnames`, and a backend's
+address must be an `ip:port` inside its `allowed_backend_cidrs`, both
+refused with a 403 before the handler runs. A config-tier token is
+bounded by the same two fields an operator reads on it.
+
+**One named resource per call.** Every tool that acts on an existing
+resource takes exactly one `id`, a string, and the body of the one
+change. There is no argument that takes a list of ids, a pattern or a
+selector, and no tool that deletes what matches. That is the tool
+schema's doing, not a check in a handler: the schema admits nothing
+undeclared at either level.
+
+**No key material, anywhere.** A certificate is selected by naming its
+id, bound and renewed; it is not uploaded, replaced or generated
+through the tier, because no path on the automation plane takes a PEM
+body. No argument of any tool is named for a key, a certificate body or
+a CSR, and a test walks every tool's schema to say so. A route's
+Basic-auth password is deliberately not offered either: a model would
+be choosing or relaying a credential, and it would cross the model's
+host in the clear. Set it in the dashboard; the tier reads the username
+alone, as the read tier does.
+
+### Preview before apply
+
+Every mutation has a preview taking the same arguments: the tool's
+name with `_preview` appended. It runs the same validators, answers the
+change it would make against the configuration as it stands, and writes
+nothing: no row, no reload, no management audit row. The answer is the
+node's own JSON, fenced as data like every other answer, not a diff
+written in words:
+
+```json
+{
+  "dry_run": true,
+  "operation": "update",
+  "before": { "id": "...", "waf_enabled": false, "...": "..." },
+  "after": { "id": "...", "waf_enabled": true, "...": "..." },
+  "changes": { "waf_enabled": { "from": false, "to": true } }
+}
+```
+
+A create's `after` is the row it would insert, less the id and the
+clock the apply would mint; a delete's and a renewal's `before` is the
+row that would go or be renewed. What only the store refuses, a
+duplicate hostname or a backend id that names nothing, is refused by
+the apply and not by the preview, since the preview holds no lock and
+inserts nothing.
+
+**The preview is an affordance, not a control.** MCP revision
+2026-07-28 has no server-initiated confirmation: a server cannot make a
+client show a human the change before calling the apply tool, and a
+client is free to call the apply tool without ever calling the preview.
+The tool descriptions say which is which so a client can be configured
+to show the diff first, and that configuration is where the control is.
+Lorica's own guarantees are elsewhere: every tool is narrow, named
+unambiguously and impossible to invoke in bulk, and every change lands
+in the audit trail under the token that made it.
+
+### What is safe to delegate to this tier, and what is not
+
+The tier is safe to hand a change that is **one named resource, fully
+described by its arguments, reversible from the trail, and whose blast
+radius is the resource itself**. Adding a backend to a route's pool,
+toggling the WAF or its mode on a route, binding an already-uploaded
+certificate, renewing an ACME certificate, deleting a review route
+whose environment has gone: each is the work of one sentence in the
+dashboard, the preview shows exactly what will move, the audit trail
+records what moved and under which token, and undoing it is the same
+kind of call.
+
+It is not the tier to hand a change that reaches beyond the resource
+it names, or whose arguments are text a model wrote for other people
+to execute:
+
+- **Anything the tier does not have a tool for**, which is most of the
+  configuration: global settings, WAF rules, notification channels,
+  DNS providers, users, tokens and the cluster. Their absence is a
+  decision, not a gap to work around through a route field.
+- **A route's `error_page_html`**, `response_rewrite` rules, `proxy_headers`
+  and `response_headers`: they are text and code served to or acted on
+  by end users, and a model writing them while reading attacker-authored
+  text is the exact channel the tiering exists to close. Review them in
+  the dashboard, where a human writes them.
+- **Redirects and rewrites** (`redirect_to`, `redirect_hostname`,
+  `path_rewrite_*`, `strip_path_prefix`, `add_path_prefix`): a wrong one
+  sends every request on the route somewhere else, and a preview shows
+  the field and not the traffic.
+- **`hostname`, `hostname_aliases`, `backend_ids` and `node_selector`
+  on a route that carries production traffic**: the change is one
+  field, the consequence is every request on it. The grant bounds
+  which hostnames a token may claim, which is what to narrow rather
+  than the model.
+- **Deleting a backend** shared by several routes, or a route whose
+  environment a pipeline owns: the drain and the cascade are the
+  dashboard's own behaviour and are correct, and they are also more
+  than the one sentence the model was asked for.
+- **A Basic-auth credential**, which the tier refuses to take at all.
+
+The rule underneath: give the tier a token whose grants name the
+hostnames and address ranges the model is meant to touch and no
+others, run it as a separate process from the one reading logs, and
+treat the preview as a way to look before applying rather than as a
+gate that applies itself.
+
+### Minting a config-tier token
+
+Mint a token carrying the write scopes the work needs, plus the read
+scopes the tier uses to find ids: `routes:write` with `routes:read`,
+`backends:write` with `backends:read`, `certificates:write` with
+`certificates:read` and `routes:read`. Set `allowed_hostnames` and
+`allowed_backend_cidrs` to exactly what the model may touch. Start a
+server with that token for the change, and keep the read-tier server,
+with its read-tier token, for reading.
+
 ## Attacker-authored text arrives as data
 
 Log rows and WAF payloads come back inside a delimited block whose tool
@@ -117,7 +273,7 @@ correctly.
 **stdio** when the client and Lorica are on the same box, or when the
 client can launch a subprocess and hand it a token. The client starts
 `lorica-mcp`, which dials the automation listener over HTTPS and
-reaches the read paths like any other automation client.
+reaches the read and write paths like any other automation client.
 
 **Streamable HTTP** when the client speaks MCP over HTTP and there is
 no subprocess to launch: a hosted client, a client on another machine,
@@ -214,15 +370,21 @@ of them.
 
 **What the endpoint requires of the token.** Any live token reaches the
 path, and every `tools/call` is authorized against the scopes that
-token carries, in the same matrix the read paths use. A tool the token
-cannot reach is absent from that request's `tools/list` and unknown to
-its `tools/call`. The specification permits exactly this: a tool set
-may vary by the authorization presented on the request, since
-credentials are per-request input rather than connection state, while
-it must not vary per connection.
+token carries, in the same matrix the read and write paths use. A tool
+the token cannot reach is absent from that request's `tools/list` and
+unknown to its `tools/call`, and the call a registered tool makes runs
+through the plane's own router in process, scope gate included, so the
+matrix refuses it a second time if the two ever disagreed. The
+specification permits exactly this: a tool set may vary by the
+authorization presented on the request, since credentials are
+per-request input rather than connection state, while it must not vary
+per connection.
 
 That is why the endpoint is not declared behind one scope. It cannot
-be: the request names its own tool and each tool has its own.
+be: the request names its own tool and each tool has its own. On this
+binding the tier is per request too: a POST presenting a config-tier
+token is served the config tier, the next POST presenting a read-tier
+token the read tier.
 
 **What the transport requires of the client.** Every POST carries
 `MCP-Protocol-Version`, `Mcp-Method` mirrored from the body's `method`,
@@ -260,15 +422,21 @@ decision.
 ## Minting the token
 
 The tier is the token's scope set, so mint a token carrying exactly the
-read scopes the tier needs and nothing else. Use the automation token
-surface documented in [automation.md](automation.md): the management
-API, the CLI, or the Automation tokens page. The token is shown once,
-by the request that creates it, and the node stores only an HMAC of it.
+scopes the tier needs and nothing else: the read scopes for a read-tier
+server, the write scopes with the reads they need for a config-tier
+one. Use the automation token surface documented in
+[automation.md](automation.md): the management API, the CLI, or the
+Automation tokens page. The token is shown once, by the request that
+creates it, and the node stores only an HMAC of it.
 
 Give a read-tier server a read-tier token. A token that also carries a
 write scope would start a server that reads attacker-authored text
 while holding a mutating tool, which is the one session this design
-exists to prevent.
+exists to prevent. Nothing in this release refuses such a token: a
+token carrying both kinds of scope is served both kinds of tool, and
+keeping the two apart is the operator's, by minting two tokens and
+running two processes. Story 11.4 is where the server itself refuses
+a token that spans two tiers.
 
 ## Paging
 
@@ -305,11 +473,22 @@ The MCP server is a separate process and the node sees HTTP requests,
 not tool calls; a tool is a concept of the protocol the server speaks,
 not of the one it speaks over. It declares them in
 `lorica-asserted-transport` and `lorica-asserted-tool`, and the row
-reads `GET /automation/v1/logs?limit,search asserted[transport=mcp-stdio,tool=lorica_logs]`.
+reads `GET /automation/v1/logs?limit,search asserted[transport=mcp-stdio,tool=lorica_logs]`,
+or for a write `POST /automation/v1/routes asserted[transport=mcp-stdio,tool=lorica_route_create]`
+and for its preview `POST /automation/v1/routes?dry_run asserted[...]`.
 A call the server refuses by itself - a tool the token does not hold,
-arguments outside the schema, the invocation budget - never reaches
-the node and lands no row there; the server writes one line about it
-on stderr, in its own words, and that is the only trace.
+arguments outside the schema, a body field the tool does not declare,
+the invocation budget - never reaches the node and lands no row there;
+the server writes one line about it on stderr, in its own words, and
+that is the only trace.
+
+A mutation that ran lands a second row beside the request row: the
+management-side one, `route.create`, `backend.update`,
+`certificate.renew` and so on, under the role `automation` and the
+principal `<token name> (<public_id>)`, exactly as a write over the
+automation listener does and exactly as the environment resource's rows
+are written. A preview lands the request row alone, since nothing was
+written for a management row to describe.
 
 Over **Streamable HTTP**, both are established. The node routed the
 request to `/automation/v1/mcp` itself, so the path in the row is the
@@ -317,7 +496,11 @@ transport. The node parsed the body, refused it unless `Mcp-Name`
 equalled the tool it named, and resolved that name against the
 catalogue, so the tool is a fact the node holds and is written outside
 any clause, with the declared argument names the call carried and never
-their values: `POST /automation/v1/mcp tool=lorica_logs?limit,search`.
+their values: `POST /automation/v1/mcp tool=lorica_logs?limit,search`,
+or `POST /automation/v1/mcp tool=lorica_route_update?id,route` for a
+mutation, whose body's own field names stay out of the row. The
+management-side row of a mutation names the address the MCP POST came
+from, since the call runs in process with the caller's connection info.
 The two `lorica-asserted-*` headers are ignored on this path; a caller
 sending them could otherwise put a different tool in the row than the
 one the node ran. Only a POST the core never saw - refused by the
@@ -333,9 +516,10 @@ word and the same scope the read path behind that tool would have
 written; `forbidden:unknown_tool` for a name no tool has;
 `refused:invalid_params`, `refused:rate_limited` and
 `refused:protocol_error` for the refusals the core makes by itself; and
-when the tool ran and the plane refused its read, the word that HTTP
-status already has on every other row of this plane. The request
-metrics count the same word.
+when the tool ran and the plane refused its call, the word that HTTP
+status already has on every other row of this plane: `forbidden` for a
+hostname outside the token's grant, `refused` for a validator's 400 or
+a row an environment owns. The request metrics count the same word.
 
 Anyone holding a live token can send any header they like, so every
 asserted value is bounded in length and character set before it reaches
@@ -347,7 +531,8 @@ that is not true.
 ## Rate limiting
 
 Tool invocations are limited inside the server, per token: 120 calls a
-minute, in a fixed window, on both bindings. The specification requires
+minute, in a fixed window, on both bindings and for both tiers, a
+preview counting as a call like any other. The specification requires
 a server to rate limit them, and nothing outside the server does: the
 automation listener's connection caps and per-IP limiter count
 connections at accept, and a keep-alive or HTTP/2 client issues
