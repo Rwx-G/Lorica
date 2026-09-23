@@ -1,7 +1,7 @@
 # Story 11.2: The Config Tier
 
 **Epic:** [Epic 11 - Management MCP Server with Tiered Access (v1.9.0)](../prd/epic-11-v1.9.0.md)
-**Status:** InProgress
+**Status:** Review
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:** Story 11.1, all of it. The shared core, both transport
@@ -1682,3 +1682,14 @@ Modified in lot 1:
   established that the automation plane had no read surface. The same
   is true of writes and is recorded here before anyone estimates this
   story.
+
+- 2026-09-23: Review. Two lots, one five-auditor sweep, two fix passes
+  (a Critical and a High on the write grants, then the Mediums and
+  Lows that a first reading had filed as decisions), every gate green
+  under `RUSTFLAGS=-D warnings`, product-crate tests at 2881. The Docker
+  e2e suite was green at 553 on the lot 2 tree and has not yet run on
+  the tree carrying the two fix passes, which touched the management
+  write bodies the dashboard uses; Done waits for that run, which is
+  scheduled with Story 11.3's. IV3's replication half is a cluster
+  property and is not proven here; Story 11.4's e2e profile is where
+  it can be.
