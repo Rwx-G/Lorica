@@ -56,6 +56,7 @@ pub(crate) async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         cluster: crate::cluster::ClusterRuntime::Standalone,
         oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
         mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
+        renewals: Arc::new(crate::acme::RenewalLedger::new()),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -5384,6 +5385,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         cluster: crate::cluster::ClusterRuntime::Standalone,
         oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
         mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
+        renewals: Arc::new(crate::acme::RenewalLedger::new()),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -5426,6 +5428,7 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         cluster: crate::cluster::ClusterRuntime::Standalone,
         oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
         mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
+        renewals: Arc::new(crate::acme::RenewalLedger::new()),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -13946,6 +13949,672 @@ async fn a_renewal_preview_refuses_what_the_apply_refuses() {
             "{method}: the preview and the apply disagree"
         );
     }
+}
+
+// ---- Story 11.2, security audit lot 4: the Mediums and Lows ----
+
+/// A self-signed CA, generated per test so no key bytes live in the
+/// repository: what `mtls.ca_cert_pem` takes.
+fn a_client_ca_pem() -> String {
+    let mut params =
+        rcgen::CertificateParams::new(vec!["Test CA".to_string()]).expect("test setup");
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Test CA");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let key = rcgen::KeyPair::generate().expect("test setup");
+    params.self_signed(&key).expect("test setup").pem()
+}
+
+#[tokio::test]
+async fn a_route_body_cannot_install_a_client_authentication_trust_anchor() {
+    // `mtls.ca_cert_pem` is the CA whose client certificates a route
+    // accepts. It is not private key material, so AC #6's letter held,
+    // but a model reading attacker text that can replace it lets any
+    // client certificate the attacker mints through that route. It is
+    // refused from a token outright, whatever the value, on the create,
+    // the update and their previews; the dashboard's own path still
+    // sets it.
+    let f = a_node_with_something_to_write().await;
+    let ca = a_client_ca_pem();
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "POST",
+            &format!("/automation/v1/routes{suffix}"),
+            &f.bearer,
+            Some(serde_json::json!({
+                "hostname": "anchored.write.example.com",
+                "mtls": { "ca_cert_pem": ca, "required": true },
+            })),
+        )
+        .await;
+        assert_forbidden_naming(response, "mtls", &format!("POST {suffix}")).await;
+    }
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&canonical_now(&f.state).await)
+            .expect("encodes"),
+        "a refused create changed the store"
+    );
+
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({ "hostname": "anchored.write.example.com" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    for (body, what) in [
+        (
+            serde_json::json!({ "mtls": { "ca_cert_pem": ca, "required": true } }),
+            "install",
+        ),
+        (
+            serde_json::json!({ "mtls": { "ca_cert_pem": "" } }),
+            "clear",
+        ),
+    ] {
+        for suffix in ["", "?dry_run=true"] {
+            let response = automation_call(
+                &f.state,
+                "PUT",
+                &format!("/automation/v1/routes/{route_id}{suffix}"),
+                &f.bearer,
+                Some(body.clone()),
+            )
+            .await;
+            assert_forbidden_naming(response, "mtls", &format!("PUT {what}{suffix}")).await;
+        }
+    }
+    {
+        let store = f.state.store.lock().await;
+        let route = store
+            .get_route(&route_id)
+            .expect("store")
+            .expect("the route");
+        assert!(route.mtls.is_none(), "a token installed a trust anchor");
+    }
+
+    // The dashboard's own path is unchanged: an operator sets it.
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{route_id}"),
+        &f.admin,
+        Some(serde_json::json!({ "mtls": { "ca_cert_pem": ca, "required": true } })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    {
+        let store = f.state.store.lock().await;
+        let route = store
+            .get_route(&route_id)
+            .expect("store")
+            .expect("the route");
+        assert!(route.mtls.is_some_and(|mtls| mtls.required));
+    }
+}
+
+#[tokio::test]
+async fn a_route_body_cannot_carry_a_static_header_map_to_the_upstream() {
+    // `proxy_headers` is a static map sent to the upstream on every
+    // request, which is where an operator puts an upstream credential.
+    // A model reading attacker text must neither set one nor clear one:
+    // refused from a token outright on the create, the update and their
+    // previews, the clearing value included, while the dashboard's own
+    // path still sets it.
+    let f = a_node_with_something_to_write().await;
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+    let headers = serde_json::json!({ "X-Upstream-Auth": "static-value" });
+
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "POST",
+            &format!("/automation/v1/routes{suffix}"),
+            &f.bearer,
+            Some(serde_json::json!({
+                "hostname": "headed.write.example.com",
+                "proxy_headers": headers,
+            })),
+        )
+        .await;
+        assert_forbidden_naming(response, "proxy_headers", &format!("POST {suffix}")).await;
+    }
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&canonical_now(&f.state).await)
+            .expect("encodes"),
+        "a refused create changed the store"
+    );
+
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({ "hostname": "headed.write.example.com" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    for (body, what) in [
+        (serde_json::json!({ "proxy_headers": headers }), "set"),
+        (serde_json::json!({ "proxy_headers": {} }), "clear"),
+    ] {
+        for suffix in ["", "?dry_run=true"] {
+            let response = automation_call(
+                &f.state,
+                "PUT",
+                &format!("/automation/v1/routes/{route_id}{suffix}"),
+                &f.bearer,
+                Some(body.clone()),
+            )
+            .await;
+            assert_forbidden_naming(response, "proxy_headers", &format!("PUT {what}{suffix}"))
+                .await;
+        }
+    }
+    {
+        let store = f.state.store.lock().await;
+        let route = store
+            .get_route(&route_id)
+            .expect("store")
+            .expect("the route");
+        assert!(route.proxy_headers.is_empty(), "a token set a header map");
+    }
+
+    // The dashboard's own path is unchanged: an operator sets it.
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{route_id}"),
+        &f.admin,
+        Some(serde_json::json!({ "proxy_headers": headers })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    {
+        let store = f.state.store.lock().await;
+        let route = store
+            .get_route(&route_id)
+            .expect("store")
+            .expect("the route");
+        assert_eq!(
+            route
+                .proxy_headers
+                .get("X-Upstream-Auth")
+                .map(String::as_str),
+            Some("static-value")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_certificate_binding_on_a_route_write_needs_the_certificates_write_scope() {
+    // The binding tool sits behind `certificates:write`, and the route
+    // create and update bodies carry `certificate_id` under
+    // `routes:write`, so withholding the certificate scope stopped
+    // nothing. It is a boundary now: a route write naming
+    // `certificate_id`, the empty string included, needs
+    // `certificates:write` beside `routes:write`.
+    use lorica_config::models::AutomationScope;
+    let f = a_node_with_something_to_write().await;
+    let routes_only = mint_automation(
+        &f.state,
+        "routes-only",
+        vec![AutomationScope::RoutesWrite, AutomationScope::RoutesRead],
+        &["*.write.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    let routes_only = format!("Bearer {routes_only}");
+
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "POST",
+            &format!("/automation/v1/routes{suffix}"),
+            &routes_only,
+            Some(serde_json::json!({
+                "hostname": "bound.write.example.com",
+                "certificate_id": f.certificate_id,
+            })),
+        )
+        .await;
+        assert_forbidden_naming(response, "certificates:write", &format!("POST {suffix}")).await;
+    }
+    assert_eq!(canonical_now(&f.state).await.routes.len(), 0);
+
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &routes_only,
+        Some(serde_json::json!({ "hostname": "bound.write.example.com" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    for certificate_id in [f.certificate_id.as_str(), ""] {
+        for suffix in ["", "?dry_run=true"] {
+            let response = automation_call(
+                &f.state,
+                "PUT",
+                &format!("/automation/v1/routes/{route_id}{suffix}"),
+                &routes_only,
+                Some(serde_json::json!({ "certificate_id": certificate_id })),
+            )
+            .await;
+            assert_forbidden_naming(
+                response,
+                "certificates:write",
+                &format!("PUT `{certificate_id}`{suffix}"),
+            )
+            .await;
+        }
+    }
+    {
+        let store = f.state.store.lock().await;
+        let route = store
+            .get_route(&route_id)
+            .expect("store")
+            .expect("the route");
+        assert_eq!(route.certificate_id, None);
+    }
+    // The same patch without the field is the write it was, and the
+    // fixture's token, which carries the certificate scope, binds.
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{route_id}"),
+        &routes_only,
+        Some(serde_json::json!({ "waf_enabled": true })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{route_id}"),
+        &f.bearer,
+        Some(serde_json::json!({ "certificate_id": f.certificate_id })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        parse_data(response).await["certificate_id"],
+        serde_json::json!(f.certificate_id)
+    );
+}
+
+#[tokio::test]
+async fn a_mistyped_dry_run_is_refused_and_never_an_apply() {
+    // `?dryrun=true` from a client that typed the preview by hand was
+    // an apply: the query struct ignored a key it did not know. Any key
+    // the write path's query does not declare is a 400 now, and the
+    // store is what it was.
+    let f = a_node_with_something_to_write().await;
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+    let route = serde_json::json!({
+        "hostname": "typo.write.example.com",
+        "backend_ids": [f.backend_id],
+    });
+    for query in [
+        "?dryrun=true",
+        "?dry-run=true",
+        "?dry_run=1",
+        "?dry_run=true&dryrun=true",
+    ] {
+        let response = automation_call(
+            &f.state,
+            "POST",
+            &format!("/automation/v1/routes{query}"),
+            &f.bearer,
+            Some(route.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&canonical_now(&f.state).await)
+            .expect("encodes"),
+        "a mistyped dry run wrote"
+    );
+    let response = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes?dry_run=true",
+        &f.bearer,
+        Some(route),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        parse_data(response).await["dry_run"],
+        serde_json::json!(true)
+    );
+}
+
+#[tokio::test]
+async fn a_token_renews_one_certificate_at_a_time_and_not_twice_inside_the_interval() {
+    // Each renewal places an ACME order against a budget the CA counts
+    // per identifier set, and rotates the node's bot HMAC. From a
+    // token: 409 while an order for that id is open, 429 for a
+    // certificate issued less than the interval ago, 429 while the
+    // background loop holds the id in a CA cooldown; the preview
+    // answers what the apply would. An operator's session is bounded by
+    // none of it.
+    let f = a_node_with_something_to_write().await;
+    let renew = format!("/automation/v1/certificates/{}/renew", f.certificate_id);
+    // The fixture's upload is a `certificate.` row of its own.
+    let management_rows_before = audit_rows_under(&f.state, "certificate.").await.len();
+    let set = |is_manual: bool, issued_ago: chrono::Duration| {
+        let state = f.state.clone();
+        let id = f.certificate_id.clone();
+        async move {
+            let store = state.store.lock().await;
+            let mut certificate = store
+                .get_certificate(&id)
+                .expect("store")
+                .expect("the seeded certificate");
+            certificate.is_acme = true;
+            certificate.acme_method = is_manual.then(|| "dns01-manual".to_string());
+            certificate.not_before = chrono::Utc::now() - issued_ago;
+            store
+                .update_certificate(&certificate)
+                .expect("the row lands");
+        }
+    };
+
+    // In flight: the token is refused, the operator reaches the plan's
+    // own refusal of a manual certificate, which is past the budget.
+    set(true, chrono::Duration::days(10)).await;
+    let held = f
+        .state
+        .renewals
+        .begin(&f.certificate_id)
+        .expect("nothing in flight yet");
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "POST",
+            &format!("{renew}{suffix}"),
+            &f.bearer,
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "in flight {suffix}"
+        );
+        let refusal = body_json(response).await;
+        assert!(
+            refusal["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(&f.certificate_id) && m.contains("in flight")),
+            "{refusal}"
+        );
+    }
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        &format!("/api/v1/certificates/{}/renew", f.certificate_id),
+        &f.admin,
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "the operator is not budgeted"
+    );
+    drop(held);
+    assert!(!f.state.renewals.is_in_flight(&f.certificate_id));
+
+    // Issued an hour ago: refused until the interval has passed, with
+    // the wait in the header.
+    set(false, chrono::Duration::hours(1)).await;
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "POST",
+            &format!("{renew}{suffix}"),
+            &f.bearer,
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "inside the interval {suffix}"
+        );
+        let retry_after: u64 = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("a Retry-After");
+        let hours = crate::acme::MIN_TOKEN_RENEWAL_INTERVAL_HOURS as u64;
+        assert!(
+            retry_after > (hours - 2) * 3_600 && retry_after <= (hours - 1) * 3_600,
+            "{retry_after}"
+        );
+        let refusal = body_json(response).await;
+        assert!(
+            refusal["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(&f.certificate_id) && m.contains("hours")),
+            "{refusal}"
+        );
+    }
+
+    // Issued long ago but on a CA cooldown the loop recorded.
+    set(false, chrono::Duration::days(10)).await;
+    f.state.renewals.record_cooldown(
+        &f.certificate_id,
+        chrono::Utc::now() + chrono::Duration::hours(2),
+    );
+    let response = automation_call(
+        &f.state,
+        "POST",
+        &format!("{renew}?dry_run=true"),
+        &f.bearer,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "cooldown");
+    let refusal = body_json(response).await;
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("rate limit")),
+        "{refusal}"
+    );
+    f.state.renewals.clear_cooldown(&f.certificate_id);
+
+    // Nothing in the way: the preview answers the row.
+    let response = automation_call(
+        &f.state,
+        "POST",
+        &format!("{renew}?dry_run=true"),
+        &f.bearer,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        parse_data(response).await["operation"],
+        serde_json::json!("renew")
+    );
+    assert_eq!(
+        audit_rows_under(&f.state, "certificate.").await.len(),
+        management_rows_before,
+        "a refused renewal landed a management row"
+    );
+}
+
+#[tokio::test]
+async fn a_preview_needs_the_read_scope_of_the_row_it_answers() {
+    // A preview answers the full row it would change, so a write scope
+    // alone read any route, backend or certificate inside the grant
+    // through it. It needs the matching read scope now, which the
+    // config tier's tokens carry anyway since the tier finds its ids
+    // through them; the apply is unchanged.
+    use lorica_config::models::AutomationScope;
+    let f = a_node_with_something_to_write().await;
+    let minted = |name: &'static str, scopes: Vec<AutomationScope>| {
+        let state = f.state.clone();
+        async move {
+            let token = mint_automation(
+                &state,
+                name,
+                scopes,
+                &["*.write.example.com"],
+                chrono::Utc::now() + chrono::Duration::days(30),
+                None,
+            )
+            .await;
+            format!("Bearer {token}")
+        }
+    };
+    let routes_write = minted("routes-write", vec![AutomationScope::RoutesWrite]).await;
+    let backends_write = minted("backends-write", vec![AutomationScope::BackendsWrite]).await;
+    let certificates_write = minted(
+        "certificates-write",
+        vec![AutomationScope::CertificatesWrite],
+    )
+    .await;
+
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &routes_write,
+        Some(serde_json::json!({ "hostname": "app.write.example.com" })),
+    )
+    .await;
+    assert_eq!(
+        created.status(),
+        StatusCode::CREATED,
+        "the apply needs no read scope"
+    );
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+
+    let previews: Vec<(&str, String, &str, Option<serde_json::Value>, &str)> = vec![
+        (
+            "POST",
+            "/automation/v1/routes".to_string(),
+            routes_write.as_str(),
+            Some(serde_json::json!({ "hostname": "new.write.example.com" })),
+            "routes:read",
+        ),
+        (
+            "PUT",
+            format!("/automation/v1/routes/{route_id}"),
+            routes_write.as_str(),
+            Some(serde_json::json!({})),
+            "routes:read",
+        ),
+        (
+            "DELETE",
+            format!("/automation/v1/routes/{route_id}"),
+            routes_write.as_str(),
+            None,
+            "routes:read",
+        ),
+        (
+            "PUT",
+            format!("/automation/v1/routes/{route_id}/certificate"),
+            certificates_write.as_str(),
+            Some(serde_json::json!({ "certificate_id": f.certificate_id })),
+            "routes:read",
+        ),
+        (
+            "POST",
+            "/automation/v1/backends".to_string(),
+            backends_write.as_str(),
+            Some(serde_json::json!({ "address": "10.0.0.12:8080" })),
+            "backends:read",
+        ),
+        (
+            "PUT",
+            format!("/automation/v1/backends/{}", f.backend_id),
+            backends_write.as_str(),
+            Some(serde_json::json!({})),
+            "backends:read",
+        ),
+        (
+            "DELETE",
+            format!("/automation/v1/backends/{}", f.backend_id),
+            backends_write.as_str(),
+            None,
+            "backends:read",
+        ),
+        (
+            "POST",
+            format!("/automation/v1/certificates/{}/renew", f.certificate_id),
+            certificates_write.as_str(),
+            None,
+            "certificates:read",
+        ),
+    ];
+    assert_eq!(
+        previews.len(),
+        crate::automation::scope::WRITE_SURFACE.len()
+    );
+    for (method, path, bearer, body, needed) in previews {
+        let response = automation_call(
+            &f.state,
+            method,
+            &format!("{path}?dry_run=true"),
+            bearer,
+            body,
+        )
+        .await;
+        assert_forbidden_naming(response, needed, &format!("{method} {path}?dry_run=true")).await;
+    }
+    // And a preview by the fixture's token, which reads, answers.
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{route_id}?dry_run=true"),
+        &f.bearer,
+        Some(serde_json::json!({ "waf_enabled": true })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

@@ -497,6 +497,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 cluster: cluster_runtime,
                 oidc: oidc_verifier,
                 mcp_invocations: Arc::new(lorica_api::automation::InvocationLimiter::new()),
+                renewals: Arc::new(lorica_api::acme::RenewalLedger::new()),
             };
 
             // The automation API rides the same `AppState` as the

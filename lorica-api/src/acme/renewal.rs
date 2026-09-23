@@ -19,12 +19,124 @@ use std::collections::{HashMap, HashSet};
 use axum::extract::{Extension, Path};
 use axum::Json;
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use tracing::{error, info, warn};
 
 use crate::db::db_blocking;
 use crate::error::ApiError;
 use crate::middleware::auth::Session;
 use crate::server::AppState;
+
+/// The least time, in hours, an automation token must leave between two
+/// renewals of one certificate.
+///
+/// Let's Encrypt issues at most five certificates per exact identifier
+/// set per seven days, a renewal not asked for through ARI counts
+/// against it, and every issuance here also rotates the node's
+/// bot-protection HMAC, invalidating every visitor's verdict cookie. A
+/// token asking twice inside this window is either retrying an order
+/// that succeeded, which spends that budget for nothing, or looping,
+/// which spends all of it and blocks the scheduled renewal for a week.
+/// Two days keeps a token under four orders a week and leaves the
+/// background loop, which renews on the same budget, its share. The
+/// interval is read off the certificate's own `not_before`, which every
+/// issuance path writes as the order's instant, so no column is added.
+/// An operator's session is not held to it: the dashboard's renew is
+/// unchanged.
+pub const MIN_TOKEN_RENEWAL_INTERVAL_HOURS: i64 = 48;
+
+/// What the two renewal paths, the background loop and the manual
+/// endpoint, know about each certificate between calls (Story 11.2).
+///
+/// Held on `AppState`, one per process, because a token's renewals are
+/// budgeted per certificate against what every other caller is doing
+/// to that same id: a renewal the loop has in flight is one a token
+/// must not start a second of, and a cooldown the CA imposed on the
+/// loop is one the token must honour too. Before this the cooldown map
+/// was the loop's local variable and the manual path could not see it.
+#[derive(Debug, Default)]
+pub struct RenewalLedger {
+    /// Certificate ids with an ACME order open right now.
+    in_flight: Mutex<HashSet<String>>,
+    /// Per-certificate instant before which the CA's rate limit makes
+    /// another order pointless, keyed by certificate id.
+    cooldown: Mutex<HashMap<String, DateTime<Utc>>>,
+}
+
+impl RenewalLedger {
+    /// An empty ledger: nothing in flight, nothing cooling down.
+    pub fn new() -> RenewalLedger {
+        RenewalLedger::default()
+    }
+
+    /// Mark `id` as having an order open, or `None` when it already
+    /// has one. The mark is released when the returned value drops,
+    /// whether the order completed, failed or the task unwound.
+    pub fn begin(&self, id: &str) -> Option<InFlightRenewal<'_>> {
+        self.in_flight
+            .lock()
+            .insert(id.to_string())
+            .then(|| InFlightRenewal {
+                ledger: self,
+                id: id.to_string(),
+            })
+    }
+
+    /// Whether `id` has an order open right now.
+    pub fn is_in_flight(&self, id: &str) -> bool {
+        self.in_flight.lock().contains(id)
+    }
+
+    /// The instant `id`'s cooldown ends, when one is active at `now`.
+    pub fn cooldown_until(&self, id: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let cooldown = self.cooldown.lock();
+        in_cooldown(&cooldown, id, now)
+            .then(|| cooldown.get(id).copied())
+            .flatten()
+    }
+
+    /// Record that the CA refused an order for `id` until `until`.
+    pub fn record_cooldown(&self, id: &str, until: DateTime<Utc>) {
+        self.cooldown.lock().insert(id.to_string(), until);
+    }
+
+    /// Forget `id`'s cooldown, after an order for it succeeded.
+    pub fn clear_cooldown(&self, id: &str) {
+        self.cooldown.lock().remove(id);
+    }
+
+    /// Drop every cooldown that has ended at `now`, so the map stays
+    /// bounded by the count of currently rate-limited certificates.
+    pub fn sweep_cooldowns(&self, now: DateTime<Utc>) {
+        self.cooldown.lock().retain(|_, until| *until > now);
+    }
+}
+
+/// The in-flight mark of one certificate's renewal, released on drop.
+#[derive(Debug)]
+pub struct InFlightRenewal<'a> {
+    ledger: &'a RenewalLedger,
+    id: String,
+}
+
+impl Drop for InFlightRenewal<'_> {
+    fn drop(&mut self) {
+        self.ledger.in_flight.lock().remove(&self.id);
+    }
+}
+
+/// How often the actor may renew one certificate by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenewalBudget {
+    /// An operator's session: as often as it asks. The dashboard's
+    /// renew path, unchanged.
+    Unbounded,
+    /// An automation token: one order per certificate at a time (409),
+    /// none within [`MIN_TOKEN_RENEWAL_INTERVAL_HOURS`] of the last
+    /// issuance (429), and none while the CA holds the certificate in a
+    /// cooldown the ledger recorded (429).
+    PerCertificate,
+}
 
 /// Pure predicate : does this certificate qualify for automated ACME
 /// renewal at `now`, given a "renew when days_remaining ≤ threshold"
@@ -192,12 +304,10 @@ pub fn spawn_renewal_task(
 ) -> tokio::task::JoinHandle<()> {
     let tracker = state.task_tracker.clone();
     tracker.spawn(async move {
-        // Per-process rate-limit cooldown, keyed by cert id. Declared
-        // outside the loop so it persists across `check_interval`
-        // ticks for the lifetime of the task. Not persisted across
-        // restarts (out of scope for this patch).
-        let mut rate_limit_cooldown: HashMap<String, DateTime<Utc>> = HashMap::new();
-
+        // The per-certificate cooldown and the in-flight marks live on
+        // `state.renewals`, shared with the manual renewal path, so a
+        // token asking for a certificate this loop is ordering or the
+        // CA has refused is told so. Not persisted across restarts.
         loop {
             tokio::time::sleep(check_interval).await;
 
@@ -228,7 +338,7 @@ pub fn spawn_renewal_task(
             // Drop expired cooldown entries so the map stays bounded by
             // the count of currently rate-limited certs (a cert that is
             // decommissioned mid-cooldown is swept once its window ends).
-            rate_limit_cooldown.retain(|_, until| *until > now);
+            state.renewals.sweep_cooldowns(now);
 
             for cert in &certs {
                 // Skip certs not bound to any route. An unbound cert
@@ -257,15 +367,13 @@ pub fn spawn_renewal_task(
                 // Honour an active rate-limit cooldown before doing any
                 // work for this cert (expired entries were swept above,
                 // so a present entry is still active).
-                if in_cooldown(&rate_limit_cooldown, &cert.id, now) {
-                    if let Some(until) = rate_limit_cooldown.get(&cert.id) {
-                        info!(
-                            domain = %cert.domain,
-                            cert_id = %cert.id,
-                            retry_after = %until,
-                            "skipping ACME renewal: rate-limit cooldown active"
-                        );
-                    }
+                if let Some(until) = state.renewals.cooldown_until(&cert.id, now) {
+                    info!(
+                        domain = %cert.domain,
+                        cert_id = %cert.id,
+                        retry_after = %until,
+                        "skipping ACME renewal: rate-limit cooldown active"
+                    );
                     continue;
                 }
 
@@ -317,12 +425,24 @@ pub fn spawn_renewal_task(
                         all_domains.push(d.clone());
                     }
                 }
+                // One order per certificate at a time, across this loop
+                // and the manual path: a manual renewal of this id that
+                // is still open is left to finish.
+                let Some(_in_flight) = state.renewals.begin(&cert.id) else {
+                    info!(
+                        domain = %cert.domain,
+                        cert_id = %cert.id,
+                        "skipping ACME renewal: an order for this certificate is in flight"
+                    );
+                    continue;
+                };
+
                 // In-place renewal : the leaf is written back onto the
                 // same row (`Some(cert.id)`), so the id and every route
                 // binding survive. No reassign, no delete, no orphan.
                 match renew_with_method(&state, cert, &config, &all_domains, Some(&cert.id)).await {
                     Ok(_) => {
-                        rate_limit_cooldown.remove(&cert.id);
+                        state.renewals.clear_cooldown(&cert.id);
                         state.rotate_bot_hmac_on_cert_event().await;
                         state.notify_config_changed();
                         info!(
@@ -335,7 +455,7 @@ pub fn spawn_renewal_task(
                     Err(e) => {
                         let msg = e.to_string();
                         if let Some(until) = cooldown_from_error(&msg, now) {
-                            rate_limit_cooldown.insert(cert.id.clone(), until);
+                            state.renewals.record_cooldown(&cert.id, until);
                             info!(
                                 domain = %cert.domain,
                                 cert_id = %cert.id,
@@ -372,6 +492,7 @@ pub async fn renew_certificate(
         id,
         crate::preview::WriteMode::Apply,
         crate::target::CertificateGuard::unbounded(),
+        RenewalBudget::Unbounded,
     )
     .await
 }
@@ -394,6 +515,15 @@ pub async fn renew_certificate(
 /// words, as a 400 the row provoked rather than a 500 from inside the
 /// order.
 ///
+/// `budget` is what bounds a token: [`RenewalBudget::PerCertificate`]
+/// refuses before the plan is resolved, so a token asking twice about a
+/// certificate learns about its own pace before it learns about the
+/// row, and its apply takes the in-flight mark the background loop and
+/// every other renewal share. An operator's session passes
+/// [`RenewalBudget::Unbounded`] and is refused by none of it; it takes
+/// the mark when free, so a token asking meanwhile is told 409, and
+/// proceeds unmarked otherwise, as it always did.
+///
 /// In [`crate::preview::WriteMode::Preview`] it answers the metadata of
 /// the certificate that would be renewed and makes no order.
 pub(crate) async fn renew_certificate_as(
@@ -402,6 +532,7 @@ pub(crate) async fn renew_certificate_as(
     id: String,
     mode: crate::preview::WriteMode,
     guard: crate::target::CertificateGuard,
+    budget: RenewalBudget,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (cert, provider) = db_blocking(&state.store, move |store| {
         let cert = store
@@ -421,6 +552,9 @@ pub(crate) async fn renew_certificate_as(
             "only ACME certificates can be renewed (use upload for manual certs)".into(),
         ));
     }
+    if budget == RenewalBudget::PerCertificate {
+        ensure_token_renewal_budget(&state.renewals, &cert, Utc::now())?;
+    }
     let plan = plan_renewal(&cert, provider.as_ref()).map_err(ApiError::BadRequest)?;
     if mode.previews() {
         return Ok(crate::preview::previewed(
@@ -429,6 +563,13 @@ pub(crate) async fn renew_certificate_as(
             None,
         ));
     }
+    let _in_flight = match (state.renewals.begin(&cert.id), budget) {
+        (Some(mark), _) => Some(mark),
+        (None, RenewalBudget::PerCertificate) => {
+            return Err(in_flight_refusal(&cert.id));
+        }
+        (None, RenewalBudget::Unbounded) => None,
+    };
 
     let config = AcmeConfig {
         staging: cert.issuer.contains("STAGING") || cert.issuer.contains("(staging)"),
@@ -436,15 +577,24 @@ pub(crate) async fn renew_certificate_as(
     };
 
     // In-place renewal : same id, route bindings untouched (AC1).
-    execute_renewal(
+    let ordered = execute_renewal(
         state,
         &config,
         &renewal_domains(&cert),
         plan,
         Some(&cert.id),
     )
-    .await
-    .map_err(|e| ApiError::Internal(format!("ACME renewal failed: {e}")))?;
+    .await;
+    if let Err(e) = ordered {
+        // The CA's refusal is the CA's, whoever asked: recording it
+        // here is what keeps the loop and the next token away from
+        // an identifier set the CA has already said no to.
+        if let Some(until) = cooldown_from_error(&e.to_string(), Utc::now()) {
+            state.renewals.record_cooldown(&cert.id, until);
+        }
+        return Err(ApiError::Internal(format!("ACME renewal failed: {e}")));
+    }
+    state.renewals.clear_cooldown(&cert.id);
 
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
@@ -475,6 +625,65 @@ pub(crate) async fn renew_certificate_as(
     // Both fields are retained for response-shape compatibility with
     // existing API clients (the dashboard types this exact shape).
     Ok(crate::error::json_data(payload))
+}
+
+/// The 409 a token gets for a certificate whose order is open.
+fn in_flight_refusal(id: &str) -> ApiError {
+    ApiError::Conflict(format!(
+        "certificate `{id}`: a renewal is in flight; one order per certificate at a time"
+    ))
+}
+
+/// [`RenewalBudget::PerCertificate`], applied to `cert` at `now`:
+/// nothing in flight for it, no CA cooldown on it, and its last
+/// issuance at least [`MIN_TOKEN_RENEWAL_INTERVAL_HOURS`] ago.
+///
+/// Read off the row's own `not_before`, which every issuance path
+/// writes as the order's instant. The refusal names the id and the
+/// wait, never a hostname the token may not hold.
+///
+/// # Errors
+///
+/// `Conflict` for an open order, `RateLimitedBecause` for the interval
+/// and for the cooldown, each carrying the seconds to wait.
+fn ensure_token_renewal_budget(
+    ledger: &RenewalLedger,
+    cert: &lorica_config::models::Certificate,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    if ledger.is_in_flight(&cert.id) {
+        return Err(in_flight_refusal(&cert.id));
+    }
+    if let Some(until) = ledger.cooldown_until(&cert.id, now) {
+        return Err(ApiError::RateLimitedBecause {
+            retry_after_s: seconds_until(now, until),
+            reason: format!(
+                "certificate `{}`: the CA's rate limit refused an order for it; nothing is \
+                 renewed until {until}",
+                cert.id
+            ),
+        });
+    }
+    let interval = chrono::Duration::hours(MIN_TOKEN_RENEWAL_INTERVAL_HOURS);
+    let open_again = cert.not_before + interval;
+    if now < open_again {
+        return Err(ApiError::RateLimitedBecause {
+            retry_after_s: seconds_until(now, open_again),
+            reason: format!(
+                "certificate `{}` was issued less than {MIN_TOKEN_RENEWAL_INTERVAL_HOURS} hours \
+                 ago; a token renews a certificate at most once in that many hours",
+                cert.id
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The whole seconds from `now` to `until`, at least one.
+fn seconds_until(now: DateTime<Utc>, until: DateTime<Utc>) -> u64 {
+    u64::try_from((until - now).num_seconds())
+        .unwrap_or(0)
+        .max(1)
 }
 
 /// Every name a renewal orders: the primary and the SANs, deduplicated.

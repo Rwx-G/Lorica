@@ -226,8 +226,33 @@ pub struct Body {
     pub schema: &'static str,
     /// The top-level field names this tier offers, sorted.
     pub fields: &'static [&'static str],
+    /// The fields among [`Self::fields`] that hold an object, or a list
+    /// of objects, whose own field names are declared too.
+    pub nested: &'static [Nested],
     /// What the body describes, for the schema a client reads.
     pub doc: &'static str,
+}
+
+/// A body field holding an object, or a list of objects, whose field
+/// names this tier declares the way it declares the top level's.
+///
+/// The plane's request structs ignore an unknown key at every depth
+/// (only the environment resource and the certificate binding are
+/// `deny_unknown_fields`), so a mistyped key inside `path_rules[]` or
+/// `rate_limit` would be dropped there and the caller would believe it
+/// set something. The top level was checked here from the start; this
+/// is the same check carried down. `lorica-api`'s pin holds each list
+/// against the nested struct, both ways, as it does the top level.
+#[derive(Debug, Clone, Copy)]
+pub struct Nested {
+    /// The field on the enclosing object.
+    pub field: &'static str,
+    /// Whether the field takes a list of such objects rather than one.
+    pub list: bool,
+    /// The field names the object takes, sorted.
+    pub fields: &'static [&'static str],
+    /// The fields among [`Self::fields`] that are objects themselves.
+    pub nested: &'static [Nested],
 }
 
 /// One mutation of the write surface, as a tool carries it.
@@ -497,11 +522,7 @@ impl ToolSpec {
         }
         let mut required: Vec<&str> = self.resource.iter().map(|param| param.name).collect();
         if let Some(body) = self.body() {
-            let fields: Map<String, Value> = body
-                .fields
-                .iter()
-                .map(|field| ((*field).to_string(), json!({})))
-                .collect();
+            let fields = field_schemas(body.fields, body.nested);
             properties.insert(
                 body.argument.to_string(),
                 json!({
@@ -664,11 +685,64 @@ impl ToolSpec {
     }
 }
 
+/// The schema of each field in `fields`: `{}` for a field whose value
+/// the plane alone judges, and for a field `nested` declares an object
+/// (or an array of objects) listing its own fields the same way,
+/// admitting nothing undeclared, so a client reads where an object's
+/// keys are declared and [`keys_declared`] refuses the same thing.
+fn field_schemas(fields: &[&str], nested: &[Nested]) -> Map<String, Value> {
+    fields
+        .iter()
+        .map(|field| {
+            let schema = match nested.iter().find(|entry| entry.field == *field) {
+                Some(entry) => {
+                    let object = json!({
+                        "type": "object",
+                        "properties": field_schemas(entry.fields, entry.nested),
+                        "additionalProperties": false,
+                    });
+                    if entry.list {
+                        json!({ "type": "array", "items": object })
+                    } else {
+                        object
+                    }
+                }
+                None => json!({}),
+            };
+            ((*field).to_string(), schema)
+        })
+        .collect()
+}
+
+/// Whether every key of `value` is in `fields`, and the same for every
+/// object under a field `nested` declares, an array's items included.
+///
+/// A value that is not an object where one is declared, `null` to
+/// leave a field alone or a wrong type, is passed as it is: its shape
+/// is the plane's validators' to refuse in their words (Story 11.2
+/// AC #5). What is checked here is the one thing they do not, the keys.
+fn keys_declared(value: &Value, fields: &[&str], nested: &[Nested]) -> bool {
+    let Some(object) = value.as_object() else {
+        return true;
+    };
+    if object.keys().any(|name| !fields.contains(&name.as_str())) {
+        return false;
+    }
+    nested.iter().all(|entry| match object.get(entry.field) {
+        None => true,
+        Some(Value::Array(items)) if entry.list => items
+            .iter()
+            .all(|item| keys_declared(item, entry.fields, entry.nested)),
+        Some(inner) => keys_declared(inner, entry.fields, entry.nested),
+    })
+}
+
 /// The body argument, checked for shape and size and nothing else.
 ///
 /// The values are the plane's to judge (Story 11.2 AC #5). What this
 /// refuses is a key the handler behind the path does not deserialise,
-/// which the plane would silently drop, and a weight the listener would
+/// at the top level and inside every object the body declares, which
+/// the plane would silently drop, and a weight the listener would
 /// refuse with a 413 in its own words.
 fn checked_body(body: &Body, value: Option<&Value>) -> Result<Value, ToolInputError> {
     let Some(value) = value else {
@@ -677,20 +751,17 @@ fn checked_body(body: &Body, value: Option<&Value>) -> Result<Value, ToolInputEr
             body.argument, body.doc
         )));
     };
-    let Some(fields) = value.as_object() else {
+    if !value.is_object() {
         return Err(ToolInputError::new(format!(
             "`{}` takes an object",
             body.argument
         )));
-    };
+    }
     // The field name is the caller's text and is not repeated back.
-    if fields
-        .keys()
-        .any(|name| !body.fields.contains(&name.as_str()))
-    {
+    if !keys_declared(value, body.fields, body.nested) {
         return Err(ToolInputError::new(format!(
-            "`{}` carries a field this tool does not declare; the fields it takes are the \
-             ones its inputSchema lists",
+            "`{}` carries a field this tool does not declare, at the top level or inside one \
+             of its objects; the fields it takes are the ones its inputSchema lists",
             body.argument
         )));
     }
@@ -957,19 +1028,23 @@ const CERTIFICATE_ID: Param = Param {
 
 /// The fields of `CreateRouteRequest` this tier offers.
 ///
-/// Four of the struct's fields are absent on purpose, and `lorica-api`'s
+/// Six of the struct's fields are absent on purpose, and `lorica-api`'s
 /// pin names each as a decision rather than drift. `managed_by` is
 /// refused by the plane on input (422): offering it would be a field
 /// that always fails. `basic_auth_password` is a credential a model
 /// would be choosing or relaying, and it would cross the model's host
 /// in the clear on its way here; the route's Basic auth is set in the
 /// dashboard, by a human, and this tier reads the username alone as the
-/// read tier does. `forward_auth` and `mirror` are refused by the plane
-/// from an automation token (403): the first is a URL the CIDR grant
-/// cannot weigh, to which the proxy forwards every downstream Cookie
-/// and Authorization header, and the second ships a copy of every
-/// request to a second set of backends; both are set in the dashboard,
-/// by a human.
+/// read tier does. `forward_auth`, `mirror`, `mtls` and `proxy_headers`
+/// are refused by the plane from an automation token (403): the first is
+/// a URL the CIDR grant cannot weigh, to which the proxy forwards every
+/// downstream Cookie and Authorization header; the second ships a copy
+/// of every request to a second set of backends; the third is the
+/// route's client-authentication trust anchor, the CA bundle whose
+/// client certificates it accepts, and it is not private key material
+/// only by the letter; the fourth is a static header map to the
+/// upstream, where a credential would go. All four are set in the
+/// dashboard, by a human.
 const ROUTE_CREATE_FIELDS: &[&str] = &[
     "access_log_enabled",
     "add_path_prefix",
@@ -1003,13 +1078,11 @@ const ROUTE_CREATE_FIELDS: &[&str] = &[
     "maintenance_mode",
     "max_connections",
     "max_request_body_bytes",
-    "mtls",
     "node_selector",
     "path_prefix",
     "path_rewrite_pattern",
     "path_rewrite_replacement",
     "path_rules",
-    "proxy_headers",
     "proxy_headers_remove",
     "rate_limit",
     "rate_limit_burst",
@@ -1051,7 +1124,7 @@ const ROUTE_UPDATE_ONLY_FIELDS: &[&str] = &[
 /// The fields of `UpdateRouteRequest` this tier offers:
 /// [`ROUTE_CREATE_FIELDS`] plus [`ROUTE_UPDATE_ONLY_FIELDS`], sorted,
 /// which a test asserts entry for entry since a `const` slice cannot be
-/// built from the two. The same four are absent, for the same reasons.
+/// built from the two. The same six are absent, for the same reasons.
 const ROUTE_UPDATE_FIELDS: &[&str] = &[
     "access_log_enabled",
     "add_path_prefix",
@@ -1088,13 +1161,11 @@ const ROUTE_UPDATE_FIELDS: &[&str] = &[
     "maintenance_mode",
     "max_connections",
     "max_request_body_bytes",
-    "mtls",
     "node_selector",
     "path_prefix",
     "path_rewrite_pattern",
     "path_rewrite_replacement",
     "path_rules",
-    "proxy_headers",
     "proxy_headers_remove",
     "rate_limit",
     "rate_limit_burst",
@@ -1121,6 +1192,113 @@ const ROUTE_UPDATE_FIELDS: &[&str] = &[
     "waf_enabled",
     "waf_mode",
     "websocket_enabled",
+];
+
+/// The fields of `PathRuleRequest`.
+const PATH_RULE_FIELDS: &[&str] = &[
+    "backend_ids",
+    "cache_enabled",
+    "cache_ttl_s",
+    "match_type",
+    "path",
+    "rate_limit_burst",
+    "rate_limit_rps",
+    "redirect_to",
+    "response_headers",
+    "response_headers_remove",
+    "return_status",
+];
+
+/// The fields of `HeaderRuleRequest` a caller may send. `disabled` is
+/// the struct's too, and `skip_deserializing`: a value sent for it is
+/// dropped, which is what this list exists to refuse.
+const HEADER_RULE_FIELDS: &[&str] = &["backend_ids", "header_name", "match_type", "value"];
+
+/// The fields of `TrafficSplitRequest`.
+const TRAFFIC_SPLIT_FIELDS: &[&str] = &["backend_ids", "name", "weight_percent"];
+
+/// The fields of `ResponseRewriteConfigRequest`.
+const RESPONSE_REWRITE_FIELDS: &[&str] = &["content_type_prefixes", "max_body_bytes", "rules"];
+
+/// The fields of `ResponseRewriteRuleRequest`, one entry of `rules`.
+const RESPONSE_REWRITE_RULE_FIELDS: &[&str] =
+    &["is_regex", "max_replacements", "pattern", "replacement"];
+
+/// The fields of the `RateLimit` model.
+const RATE_LIMIT_FIELDS: &[&str] = &["capacity", "refill_per_sec", "scope"];
+
+/// The fields of the `GeoIpConfig` model.
+const GEOIP_FIELDS: &[&str] = &["countries", "mode"];
+
+/// The fields of the `BotProtectionConfig` model.
+const BOT_PROTECTION_FIELDS: &[&str] = &[
+    "bypass",
+    "captcha_alphabet",
+    "cookie_ttl_s",
+    "mode",
+    "only_country",
+    "pow_difficulty",
+];
+
+/// The fields of the `BotBypassRules` model, `bot_protection.bypass`.
+const BOT_BYPASS_FIELDS: &[&str] = &["asns", "countries", "ip_cidrs", "rdns", "user_agents"];
+
+/// The nested objects of a route body, on the create and on the update
+/// alike: every field of [`ROUTE_CREATE_FIELDS`] whose value is an
+/// object or a list of objects, with the field names each takes.
+const ROUTE_NESTED: &[Nested] = &[
+    Nested {
+        field: "bot_protection",
+        list: false,
+        fields: BOT_PROTECTION_FIELDS,
+        nested: &[Nested {
+            field: "bypass",
+            list: false,
+            fields: BOT_BYPASS_FIELDS,
+            nested: &[],
+        }],
+    },
+    Nested {
+        field: "geoip",
+        list: false,
+        fields: GEOIP_FIELDS,
+        nested: &[],
+    },
+    Nested {
+        field: "header_rules",
+        list: true,
+        fields: HEADER_RULE_FIELDS,
+        nested: &[],
+    },
+    Nested {
+        field: "path_rules",
+        list: true,
+        fields: PATH_RULE_FIELDS,
+        nested: &[],
+    },
+    Nested {
+        field: "rate_limit",
+        list: false,
+        fields: RATE_LIMIT_FIELDS,
+        nested: &[],
+    },
+    Nested {
+        field: "response_rewrite",
+        list: false,
+        fields: RESPONSE_REWRITE_FIELDS,
+        nested: &[Nested {
+            field: "rules",
+            list: true,
+            fields: RESPONSE_REWRITE_RULE_FIELDS,
+            nested: &[],
+        }],
+    },
+    Nested {
+        field: "traffic_splits",
+        list: true,
+        fields: TRAFFIC_SPLIT_FIELDS,
+        nested: &[],
+    },
 ];
 
 /// The fields of `CreateBackendRequest` and `UpdateBackendRequest`
@@ -1169,6 +1347,7 @@ pub const MUTATIONS: &[Mutation] = &[
             argument: "route",
             schema: "CreateRouteRequest",
             fields: ROUTE_CREATE_FIELDS,
+            nested: ROUTE_NESTED,
             doc: "The route to create: `hostname` is required, every other field falls back \
                   to the management API's default.",
         }),
@@ -1192,6 +1371,7 @@ pub const MUTATIONS: &[Mutation] = &[
             argument: "route",
             schema: "UpdateRouteRequest",
             fields: ROUTE_UPDATE_FIELDS,
+            nested: ROUTE_NESTED,
             doc: "The fields to change; a field absent leaves the route's value alone.",
         }),
     },
@@ -1229,6 +1409,7 @@ pub const MUTATIONS: &[Mutation] = &[
             argument: "binding",
             schema: "BindCertificateRequest",
             fields: &["certificate_id"],
+            nested: &[],
             doc: "The certificate to bind, by id; the empty string unbinds.",
         }),
     },
@@ -1248,6 +1429,7 @@ pub const MUTATIONS: &[Mutation] = &[
             argument: "backend",
             schema: "CreateBackendRequest",
             fields: BACKEND_FIELDS,
+            nested: &[],
             doc: "The backend to create: `address` is required, every other field falls back \
                   to the management API's default.",
         }),
@@ -1268,6 +1450,7 @@ pub const MUTATIONS: &[Mutation] = &[
             argument: "backend",
             schema: "UpdateBackendRequest",
             fields: BACKEND_FIELDS,
+            nested: &[],
             doc: "The fields to change; a field absent leaves the backend's value alone.",
         }),
     },
@@ -1304,6 +1487,15 @@ pub const MUTATIONS: &[Mutation] = &[
         body: None,
     },
 ];
+
+/// The published field names that carry a credential-shaped word and
+/// are not a credential, for the two sweeps that read this crate's
+/// output for such words. `bot_protection.cookie_ttl_s` is the verdict
+/// cookie's lifetime in seconds, a number the dashboard's form offers;
+/// it is removed by its exact spelling so the word still catches a
+/// name or a description that invites a session cookie.
+#[cfg(test)]
+pub(crate) const NAMED_FOR_A_LIFETIME_NOT_A_CREDENTIAL: &[&str] = &["cookie_ttl_s"];
 
 /// Every tool of both tiers: the reads, then for each mutation its
 /// apply tool and its preview.
@@ -1353,8 +1545,8 @@ mod tests {
         Value::Object(map)
     }
 
-    /// Every property name anywhere under `schema`, nested objects
-    /// included.
+    /// Every property name anywhere under `schema`, nested objects and
+    /// the items of arrays included.
     fn property_names(schema: &Value, into: &mut Vec<String>) {
         if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
             for (name, nested) in properties {
@@ -1362,6 +1554,153 @@ mod tests {
                 property_names(nested, into);
             }
         }
+        if let Some(items) = schema.get("items") {
+            property_names(items, into);
+        }
+    }
+
+    /// Every [`Nested`] under `nested`, at any depth, with the dotted
+    /// path of the field it sits on.
+    fn every_nested(
+        nested: &'static [Nested],
+        path: &str,
+        into: &mut Vec<(String, &'static Nested)>,
+    ) {
+        for entry in nested {
+            let here = if path.is_empty() {
+                entry.field.to_string()
+            } else {
+                format!("{path}.{}", entry.field)
+            };
+            into.push((here.clone(), entry));
+            every_nested(entry.nested, &here, into);
+        }
+    }
+
+    #[test]
+    fn every_nested_vocabulary_sits_on_a_field_its_body_offers_and_is_sorted() {
+        // The shape the pin in `lorica-api` relies on: a nested list
+        // names a field of the object above it, is sorted and free of
+        // duplicates like the top level, and the two route bodies nest
+        // the same objects, since a patch takes the same nested shapes
+        // as a create.
+        let mut bodies = 0usize;
+        for spec in catalogue() {
+            let Some(body) = spec.body() else {
+                continue;
+            };
+            bodies += 1;
+            for entry in body.nested {
+                assert!(
+                    body.fields.contains(&entry.field),
+                    "{}: `{}` is nested but not offered",
+                    spec.name,
+                    entry.field
+                );
+            }
+            let mut all = Vec::new();
+            every_nested(body.nested, "", &mut all);
+            for (path, entry) in &all {
+                assert!(
+                    entry.fields.windows(2).all(|pair| pair[0] < pair[1]),
+                    "{}: the vocabulary of `{path}` is not sorted and unique",
+                    spec.name
+                );
+                assert!(
+                    !entry.fields.is_empty(),
+                    "{}: `{path}` declares nothing",
+                    spec.name
+                );
+                for child in entry.nested {
+                    assert!(
+                        entry.fields.contains(&child.field),
+                        "{}: `{path}.{}` is nested but not in `{path}`'s vocabulary",
+                        spec.name,
+                        child.field
+                    );
+                }
+            }
+        }
+        assert!(bodies >= 5, "{bodies} bodies");
+        let create = spec("lorica_route_create").body().expect("a body");
+        let update = spec("lorica_route_update").body().expect("a body");
+        assert_eq!(
+            create.nested.iter().map(|n| n.field).collect::<Vec<_>>(),
+            update.nested.iter().map(|n| n.field).collect::<Vec<_>>()
+        );
+        assert!(!create.nested.is_empty());
+    }
+
+    #[test]
+    fn a_nested_typo_is_refused_at_the_tool_and_a_declared_nested_key_passes() {
+        // The plane's request structs ignore an unknown key at every
+        // depth, so a key mistyped inside `path_rules[]` or
+        // `response_rewrite.rules[]` would be dropped there and the
+        // caller would believe it set something. The top-level check is
+        // carried into every object the body declares, a list's items
+        // included, and the refusal names no key of the caller's.
+        let create = spec("lorica_route_create");
+        let update = spec("lorica_route_update");
+        for (tool, body) in [
+            (
+                create,
+                json!({ "hostname": "a", "path_rules": [{ "path": "/x", "backend_idz": ["b"] }] }),
+            ),
+            (
+                update,
+                json!({ "response_rewrite": { "rules": [{ "patern": "a", "replacement": "b" }] } }),
+            ),
+            (
+                update,
+                json!({ "bot_protection": { "mode": "cookie", "bypass": { "cidrs": [] } } }),
+            ),
+            (
+                update,
+                json!({ "rate_limit": { "capacity": 1, "refil_per_sec": 1 } }),
+            ),
+            (
+                update,
+                json!({ "geoip": { "mode": "denylist", "country": ["FR"] } }),
+            ),
+        ] {
+            let arguments = if tool.resource.is_some() {
+                json!({ "id": "r-1", "route": body })
+            } else {
+                json!({ "route": body })
+            };
+            let refused = tool
+                .call_for(&arguments)
+                .expect_err("an undeclared nested key is refused");
+            assert!(
+                !refused.message.contains("backend_idz")
+                    && !refused.message.contains("patern")
+                    && !refused.message.contains("refil_per_sec"),
+                "{}",
+                refused.message
+            );
+            assert!(refused.message.contains("`route`"), "{}", refused.message);
+        }
+
+        // Declared nested keys pass, values untouched; a nested value
+        // that is not an object at all is the plane's to refuse, as is
+        // a null the model sends to leave a field alone.
+        let passed = update
+            .call_for(&json!({ "id": "r-1", "route": {
+                "path_rules": [{ "path": "/x", "backend_ids": ["b"], "return_status": "soon" }],
+                "response_rewrite": { "rules": [{ "pattern": "a", "replacement": "b" }], "max_body_bytes": 7 },
+                "bot_protection": { "mode": "cookie", "bypass": { "ip_cidrs": ["10.0.0.0/8"] } },
+                "rate_limit": { "capacity": 1, "refill_per_sec": 1 },
+                "geoip": null,
+                "traffic_splits": "not a list",
+            } }))
+            .expect("declared nested keys pass");
+        assert_eq!(
+            passed
+                .body
+                .as_ref()
+                .and_then(|b| b["path_rules"][0]["return_status"].as_str()),
+            Some("soon")
+        );
     }
 
     #[test]
@@ -1443,6 +1782,8 @@ mod tests {
         for absent in [
             "forward_auth",
             "mirror",
+            "mtls",
+            "proxy_headers",
             "basic_auth_password",
             "managed_by",
         ] {
@@ -1984,7 +2325,10 @@ mod tests {
         // invites a model to ask for key material, and nothing here
         // suggests a field that does not exist.
         for spec in catalogue() {
-            let published = spec.definition().to_string().to_lowercase();
+            let mut published = spec.definition().to_string().to_lowercase();
+            for lifetime in NAMED_FOR_A_LIFETIME_NOT_A_CREDENTIAL {
+                published = published.replace(lifetime, "");
+            }
             for forbidden in [
                 "private_key",
                 "privatekey",

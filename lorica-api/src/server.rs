@@ -268,6 +268,13 @@ pub struct AppState {
     /// revision requires has to be held here, where a token's window
     /// outlives the request that opened it.
     pub mcp_invocations: Arc<crate::automation::InvocationLimiter>,
+    /// What the two certificate-renewal paths, the background loop and
+    /// the manual endpoint, know about each certificate between calls
+    /// (Story 11.2): which ids have an ACME order open and which the CA
+    /// has put on a rate-limit cooldown. One ledger for the process,
+    /// because a token's renewals are budgeted per certificate against
+    /// what the loop and the other callers are doing to that same id.
+    pub renewals: Arc<crate::acme::RenewalLedger>,
 }
 
 impl AppState {

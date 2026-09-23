@@ -592,8 +592,10 @@ fn automation_handler_source(handler: &str) -> Option<(&'static str, &'static st
 }
 
 /// Every source a request struct an automation write takes is declared
-/// in: the automation modules and the management modules whose body
-/// the writes reuse verbatim.
+/// in: the automation modules, the management modules whose body the
+/// writes reuse verbatim, and the modules declaring the structs those
+/// bodies nest, down to the `lorica-config` models a route body embeds
+/// as they are.
 fn request_struct_sources() -> Vec<(&'static str, &'static str)> {
     vec![
         (
@@ -618,7 +620,117 @@ fn request_struct_sources() -> Vec<(&'static str, &'static str)> {
             "/src/backends.rs",
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/backends.rs")),
         ),
+        (
+            "/src/routes/path_rules.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/routes/path_rules.rs"
+            )),
+        ),
+        (
+            "/src/routes/header_rules.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/routes/header_rules.rs"
+            )),
+        ),
+        (
+            "/src/routes/traffic_splits.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/routes/traffic_splits.rs"
+            )),
+        ),
+        (
+            "/src/routes/response_rewrite.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/routes/response_rewrite.rs"
+            )),
+        ),
+        (
+            "/src/routes/forward_auth.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/routes/forward_auth.rs"
+            )),
+        ),
+        (
+            "/src/routes/mirror.rs",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/mirror.rs")),
+        ),
+        (
+            "/src/routes/mtls.rs",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/mtls.rs")),
+        ),
+        (
+            "/../lorica-config/src/models/route.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../lorica-config/src/models/route.rs"
+            )),
+        ),
     ]
+}
+
+/// The struct a field's type names once `Option<` and `Vec<` are
+/// peeled, and whether a `Vec<` was among them, or `None` for a type
+/// that is not one struct: a primitive, a map, a tuple, a generic
+/// container this scan does not know.
+fn nested_struct_of(field_type: &str) -> Option<(String, bool)> {
+    let mut inner = field_type.trim();
+    let mut list = false;
+    loop {
+        if let Some(rest) = inner.strip_prefix("Option<") {
+            inner = rest.strip_suffix('>').unwrap_or(rest).trim();
+        } else if let Some(rest) = inner.strip_prefix("Vec<") {
+            list = true;
+            inner = rest.strip_suffix('>').unwrap_or(rest).trim();
+        } else {
+            break;
+        }
+    }
+    if inner.contains('<') || inner.contains('(') || inner.contains('[') {
+        return None;
+    }
+    let name = inner.rsplit("::").next().unwrap_or(inner).trim();
+    if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    Some((name.to_string(), list))
+}
+
+/// Every field name under `struct_name` at any depth, as
+/// `(path, name)` with the path the dotted field chain above it:
+/// the fields of every field whose type is a struct one of the
+/// sources declares, recursively. `only` narrows the walk at the top
+/// level to the fields a tool offers; below that every field of a
+/// reached struct is walked, since a tool offers a nested object whole.
+fn nested_field_names(
+    struct_name: &str,
+    only: Option<&BTreeSet<String>>,
+    path: &str,
+    into: &mut Vec<(String, String)>,
+) {
+    let Some((_, src)) = source_declaring(struct_name) else {
+        return;
+    };
+    for (name, field_type) in serde_fields_with_types(src, struct_name) {
+        if only.is_some_and(|offered| !offered.contains(&name)) {
+            continue;
+        }
+        let here = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{path}.{name}")
+        };
+        into.push((path.to_string(), name.clone()));
+        if let Some((child, _)) = nested_struct_of(&field_type) {
+            if child != struct_name {
+                nested_field_names(&child, None, &here, into);
+            }
+        }
+    }
 }
 
 /// Every non-`GET` `(METHOD, normalised path, handler)` the automation
@@ -1059,6 +1171,17 @@ const NOT_OFFERED_TO_A_MODEL: &[(&str, &str)] = &[
         "refused by the plane from an automation token (403): it ships a copy of every request \
          to a second set of backends the preview does not show; set in the dashboard by a human",
     ),
+    (
+        "mtls",
+        "refused by the plane from an automation token (403): a client-authentication trust \
+         anchor, the CA bundle whose client certificates the route accepts, which a model \
+         reading attacker text must not be able to replace; set in the dashboard by a human",
+    ),
+    (
+        "proxy_headers",
+        "refused by the plane from an automation token (403): a static header map to the \
+         upstream is where a credential would go; set in the dashboard by a human",
+    ),
 ];
 
 /// The handler each MCP write tool's call reaches, as `(METHOD, path)`
@@ -1208,7 +1331,8 @@ fn every_mcp_write_tool_declares_exactly_the_fields_its_handler_accepts_less_the
     );
 }
 
-/// Every property name at any depth under `schema`.
+/// Every property name at any depth under `schema`, through the
+/// `items` of an array as well as the `properties` of an object.
 fn schema_property_names(schema: &serde_json::Value, into: &mut Vec<String>) {
     if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
         for (name, nested) in properties {
@@ -1216,14 +1340,18 @@ fn schema_property_names(schema: &serde_json::Value, into: &mut Vec<String>) {
             schema_property_names(nested, into);
         }
     }
+    if let Some(items) = schema.get("items") {
+        schema_property_names(items, into);
+    }
 }
 
 #[test]
 fn no_mcp_tool_argument_takes_key_material() {
-    // Story 11.2 AC #6, asserted on the tool schemas and not on the
-    // handlers: no property a client is shown, at any depth of any
-    // tool's inputSchema, matches a key-material marker, and the one
-    // credential-shaped field a management body has is not offered.
+    // Story 11.2 AC #6 on what a client is SHOWN: no property at any
+    // depth of any tool's inputSchema matches a key-material marker,
+    // and the one credential-shaped field a management body has is not
+    // offered. What the schema does not spell out, the test below
+    // reaches through the request structs.
     let mut swept = 0usize;
     for spec in lorica_mcp::tools::catalogue() {
         let mut names = Vec::new();
@@ -1243,6 +1371,250 @@ fn no_mcp_tool_argument_takes_key_material() {
         }
     }
     assert!(swept > 100, "the sweep walked only {swept} property names");
+}
+
+#[test]
+fn no_mcp_tool_body_field_takes_key_material_at_any_depth_of_its_request_struct() {
+    // Story 11.2 AC #6 on what a client can SEND. The schema sweep
+    // above walks what the tool publishes, and a body field whose
+    // schema is `{}` publishes nothing below itself: `mtls` was offered
+    // and `mtls.ca_cert_pem`, a client-authentication trust anchor,
+    // travelled under it with the sweep green. This walks the Rust
+    // request struct the handler deserialises instead, from each field
+    // the tool offers into every struct it nests, so the next nested
+    // credential-shaped field turns red whatever its schema says.
+    let router_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/automation/router.rs"
+    ));
+    let writes = extract_write_routes(router_src);
+    let mut nested_reached = 0usize;
+    let mut withheld_material: Vec<String> = Vec::new();
+    for (spec, (method, path)) in mcp_write_targets() {
+        let Some(body) = spec.body() else {
+            continue;
+        };
+        let handler = writes
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, handler)| handler.clone())
+            .unwrap_or_else(|| panic!("{} calls {method} {path}, which is not mounted", spec.name));
+        let (_, module_src) = automation_handler_source(&handler)
+            .unwrap_or_else(|| panic!("`{handler}` is declared in no automation module"));
+        let struct_name = handler_body_struct(module_src, &handler)
+            .unwrap_or_else(|| panic!("`{handler}` takes no body"));
+        let offered: BTreeSet<String> = body.fields.iter().map(|f| (*f).to_string()).collect();
+
+        let mut reachable = Vec::new();
+        nested_field_names(&struct_name, Some(&offered), "", &mut reachable);
+        assert_eq!(
+            reachable.iter().filter(|(path, _)| path.is_empty()).count(),
+            offered.len(),
+            "{}: the walk into `{struct_name}` did not reach every offered field; the scan is \
+             reading a shape the struct no longer has",
+            spec.name
+        );
+        for (path, name) in &reachable {
+            if path.is_empty() {
+                continue;
+            }
+            nested_reached += 1;
+            let lowered = name.to_ascii_lowercase();
+            for marker in KEY_MATERIAL_MARKERS {
+                assert!(
+                    !lowered.contains(marker),
+                    "{} offers `{path}`, under which `{name}` matches the key-material marker \
+                     `{marker}`. A trust anchor or a key entering through a nested field is \
+                     still a trust anchor or a key: withhold the field in \
+                     NOT_OFFERED_TO_A_MODEL with its reason.",
+                    spec.name
+                );
+            }
+        }
+
+        // The positive control, so a green run means the walk saw what
+        // it is for: over the WHOLE struct, offered or not, at least one
+        // nested name matches a marker, and every such name sits under
+        // a top-level field NOT_OFFERED_TO_A_MODEL withholds.
+        let mut every = Vec::new();
+        nested_field_names(&struct_name, None, "", &mut every);
+        for (path, name) in &every {
+            let lowered = name.to_ascii_lowercase();
+            if path.is_empty() || !KEY_MATERIAL_MARKERS.iter().any(|m| lowered.contains(m)) {
+                continue;
+            }
+            let top = path.split('.').next().unwrap_or(path);
+            assert!(
+                NOT_OFFERED_TO_A_MODEL
+                    .iter()
+                    .any(|(field, _)| *field == top),
+                "{}: `{path}.{name}` is key material under `{top}`, which is offered",
+                spec.name
+            );
+            withheld_material.push(format!("{}: {path}.{name}", spec.name));
+        }
+    }
+    assert!(
+        nested_reached >= 20,
+        "only {nested_reached} nested fields were walked; the scan went blind"
+    );
+    assert!(
+        !withheld_material.is_empty(),
+        "no nested field of any request struct matches a key-material marker, so this test \
+         cannot tell a walk that sees nested fields from one that does not; pick a new \
+         positive control before trusting it"
+    );
+}
+
+#[test]
+fn every_mcp_write_tool_declares_its_nested_vocabularies_against_the_nested_structs() {
+    // The tool refuses an undeclared key at the top level of a body and,
+    // since this, inside every object the body nests, because the
+    // plane's structs ignore an unknown key at every depth and a caller
+    // would otherwise believe it set `path_rules[].backend_idz`. The
+    // nested lists are typed in `lorica-mcp`; this pins each against
+    // the struct behind the field, both ways, checks that a list is
+    // declared as one exactly when the field is a `Vec`, and refuses a
+    // field that is a struct with no vocabulary declared for it.
+    let router_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/automation/router.rs"
+    ));
+    let writes = extract_write_routes(router_src);
+    let mut drift = String::new();
+    let mut nested_pinned = 0usize;
+    for (spec, (method, path)) in mcp_write_targets() {
+        let Some(body) = spec.body() else {
+            continue;
+        };
+        let handler = writes
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, handler)| handler.clone())
+            .unwrap_or_else(|| panic!("{} calls {method} {path}, which is not mounted", spec.name));
+        let (_, module_src) = automation_handler_source(&handler)
+            .unwrap_or_else(|| panic!("`{handler}` is declared in no automation module"));
+        let struct_name = handler_body_struct(module_src, &handler)
+            .unwrap_or_else(|| panic!("`{handler}` takes no body"));
+        let offered: Vec<&str> = body.fields.to_vec();
+        pin_nested(
+            spec.name,
+            &struct_name,
+            &offered,
+            body.nested,
+            &mut nested_pinned,
+            &mut drift,
+        );
+    }
+    assert!(
+        nested_pinned >= 5,
+        "only {nested_pinned} nested vocabularies were pinned"
+    );
+    assert!(
+        drift.is_empty(),
+        "\nThe MCP config tier's nested vocabularies and the nested request structs disagree.\n\
+         {drift}\nA nested struct grew or lost a field, or a body field became an object with \
+         no vocabulary declared for it. Edit the nested field lists in lorica-mcp/src/tools.rs, \
+         sorted, or withhold the top-level field in NOT_OFFERED_TO_A_MODEL with its reason.\n"
+    );
+}
+
+/// The nested half of the pin: for `struct_name` and the fields of it
+/// `offered`, every declared [`lorica_mcp::tools::Nested`] names an
+/// offered field whose type is a struct, is a list exactly when that
+/// type is a `Vec`, and lists that struct's fields exactly; and every
+/// offered field whose type is a struct has a vocabulary declared.
+fn pin_nested(
+    tool: &str,
+    struct_name: &str,
+    offered: &[&str],
+    nested: &[lorica_mcp::tools::Nested],
+    pinned: &mut usize,
+    drift: &mut String,
+) {
+    let (file, src) = source_declaring(struct_name).unwrap_or_else(|| {
+        panic!("`pub struct {struct_name}` is declared nowhere this test reads")
+    });
+    let fields = serde_fields_with_types(src, struct_name);
+    assert!(!fields.is_empty(), "{struct_name} in {file} has no field");
+
+    for declared in nested {
+        let Some((_, field_type)) = fields.iter().find(|(name, _)| name == declared.field) else {
+            drift.push_str(&format!(
+                "\n{tool}: a nested vocabulary is declared for `{}`, which `{struct_name}` \
+                 ({file}) has no field of\n",
+                declared.field
+            ));
+            continue;
+        };
+        if !offered.contains(&declared.field) {
+            drift.push_str(&format!(
+                "\n{tool}: a nested vocabulary is declared for `{}`, which the tool does not \
+                 offer\n",
+                declared.field
+            ));
+            continue;
+        }
+        let Some((child, list)) = nested_struct_of(field_type) else {
+            drift.push_str(&format!(
+                "\n{tool}: `{}` is declared nested but its type `{field_type}` is not one \
+                 struct\n",
+                declared.field
+            ));
+            continue;
+        };
+        if source_declaring(&child).is_none() {
+            drift.push_str(&format!(
+                "\n{tool}: `{}` is declared nested but `{child}` is declared in no source this \
+                 test reads (an enum, or a struct in a file to add to request_struct_sources)\n",
+                declared.field
+            ));
+            continue;
+        }
+        if list != declared.list {
+            drift.push_str(&format!(
+                "\n{tool}: `{}` is `{field_type}` and is declared with list = {}\n",
+                declared.field, declared.list
+            ));
+        }
+        let (child_file, child_src) = source_declaring(&child).expect("checked above");
+        let accepted: BTreeSet<String> = serde_field_names(child_src, &child);
+        let listed: BTreeSet<String> = declared.fields.iter().map(|f| (*f).to_string()).collect();
+        let accepted_not_listed: Vec<&String> = accepted.difference(&listed).collect();
+        let listed_not_accepted: Vec<&String> = listed.difference(&accepted).collect();
+        if !accepted_not_listed.is_empty() || !listed_not_accepted.is_empty() {
+            drift.push_str(&format!(
+                "\n{tool}: `{}` (`{child}` in {child_file}):\n  accepted by the struct and not \
+                 declared: {accepted_not_listed:?}\n  declared and not accepted: \
+                 {listed_not_accepted:?}\n",
+                declared.field
+            ));
+        }
+        *pinned += 1;
+        pin_nested(
+            tool,
+            &child,
+            declared.fields,
+            declared.nested,
+            pinned,
+            drift,
+        );
+    }
+
+    for (name, field_type) in &fields {
+        if !offered.contains(&name.as_str()) || nested.iter().any(|n| n.field == name) {
+            continue;
+        }
+        if let Some((child, _)) = nested_struct_of(field_type) {
+            if source_declaring(&child).is_some() {
+                drift.push_str(&format!(
+                    "\n{tool}: `{name}` is `{field_type}`, an object the tool offers with no \
+                     nested vocabulary, so a mistyped key inside it would be dropped by the \
+                     plane and refused by nothing\n"
+                ));
+            }
+        }
+    }
 }
 
 #[test]
@@ -1432,34 +1804,56 @@ fn extract_operation_query_parameters(
     out
 }
 
-/// The wire names of every field of `pub struct <name>` in `src`.
+/// The wire names of every field of `pub struct <name>` in `src` that
+/// a caller may send.
 ///
 /// A `#[serde(rename = "...")]` on a field wins, the way it does on the
-/// wire; everything else is the identifier.
+/// wire; everything else is the identifier. A `skip_deserializing`
+/// field is left out: a value sent for it is dropped, so it is not a
+/// field a caller may set and a tool must not offer it as one.
 fn serde_field_names(src: &str, struct_name: &str) -> BTreeSet<String> {
+    serde_fields_with_types(src, struct_name)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// [`serde_field_names`] with each field's declared type beside it,
+/// in declaration order, as the source spells it.
+fn serde_fields_with_types(src: &str, struct_name: &str) -> Vec<(String, String)> {
     let opening = format!("pub struct {struct_name} {{");
     let Some((_, body)) = src.split_once(&opening) else {
-        return BTreeSet::new();
+        return Vec::new();
     };
     let Some((body, _)) = body.split_once("\n}") else {
-        return BTreeSet::new();
+        return Vec::new();
     };
 
-    let mut out = BTreeSet::new();
+    let mut out = Vec::new();
     let mut renamed: Option<String> = None;
+    let mut skipped = false;
     for line in body.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("#[serde(rename = \"") {
             renamed = rest.split('"').next().map(str::to_string);
             continue;
         }
+        if line.starts_with("#[serde(") && line.contains("skip_deserializing") {
+            skipped = true;
+            continue;
+        }
         let Some(rest) = line.strip_prefix("pub ") else {
             continue;
         };
-        let Some((name, _)) = rest.split_once(':') else {
+        let Some((name, field_type)) = rest.split_once(':') else {
             continue;
         };
-        out.insert(renamed.take().unwrap_or_else(|| name.trim().to_string()));
+        let name = renamed.take().unwrap_or_else(|| name.trim().to_string());
+        if std::mem::take(&mut skipped) {
+            continue;
+        }
+        let field_type = field_type.trim().trim_end_matches(',').trim().to_string();
+        out.push((name, field_type));
     }
     out
 }

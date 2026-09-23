@@ -889,9 +889,13 @@ inside the token's `allowed_hostnames` (403), and a wildcard is refused
 outright because the grant is checked one exact host at a time. Every
 address a backend write points at must be an `ip:port` (422, since a
 name cannot be checked against a CIDR) inside the token's
-`allowed_backend_cidrs` (403). These are the two grants the environment
-resource already applies, through the same two functions, so a token
-minted for one shape of write is bounded the same way on the other.
+`allowed_backend_cidrs` (403). An IPv4-mapped IPv6 address such as
+`[::ffff:127.0.0.1]:80` is weighed as the IPv4 address it maps to,
+here and on the environment resource, so a grant over an IPv6 range
+that happens to cover the mapped space grants no IPv4 address through
+it. These are the two grants the environment resource already applies,
+through the same two functions, so a token minted for one shape of
+write is bounded the same way on the other.
 
 **The grant bounds the row a write names, not only what it claims.**
 A route update that names no hostname still names a route, and that
@@ -913,13 +917,42 @@ token was not granted. Every backend a route write links anew, at the
 top level or inside `path_rules`, `header_rules` or `traffic_splits`,
 must point inside the CIDR grant and belong to no other principal's
 environment; a backend the route already carries is not re-weighed by
-a patch that leaves the links alone. `forward_auth` and `mirror` are
-refused (403) when an automation token sends them, whatever the value,
-because the first is a URL the CIDR grant cannot weigh and the proxy
-forwards every downstream `Cookie` and `Authorization` header to it,
-and the second ships a copy of every request to a second set of
-backends. All of this holds for `?dry_run=true` as for the apply, so a
-preview is refused exactly where the write would be.
+a patch that leaves the links alone. `forward_auth`, `mirror`, `mtls`
+and `proxy_headers` are refused (403) when an automation token sends
+them, whatever the value, because the first is a URL the CIDR grant
+cannot weigh and the proxy forwards every downstream `Cookie` and
+`Authorization` header to it, the second ships a copy of every request
+to a second set of backends, the third is the route's
+client-authentication trust anchor, the CA bundle whose client
+certificates the route accepts, and the fourth is a static header map
+to the upstream, where a credential would go. All
+of this holds for `?dry_run=true` as for the apply, so a preview is
+refused exactly where the write would be.
+
+**The scopes bound each other.** A route write naming
+`certificate_id`, the empty string included, needs `certificates:write`
+beside `routes:write` (403 naming the scope): the binding path sits
+behind the certificate scope, and a route body that could bind under
+the route scope alone made withholding it mean nothing. A
+`?dry_run=true` needs the read scope of the row it answers,
+`routes:read` for a route or a binding, `backends:read` for a backend,
+`certificates:read` for a renewal (403 naming the scope), because a
+preview answers the full row and a write scope alone read any row
+inside the grant through it. The apply needs its write scope and no
+more.
+
+**A renewal from a token is budgeted per certificate.** Each renewal
+places an ACME order the CA counts per identifier set (Let's Encrypt:
+five per exact set per seven days) and rotates the node's
+bot-protection HMAC, so the request budget on the MCP endpoint, which
+counts calls, is the wrong bound. On this path a token is refused 409
+while an order for that certificate is open, on any path; 429 with a
+`Retry-After` when the certificate was issued less than 48 hours ago,
+read off its own `not_before`; and 429 while the background renewal
+loop holds the certificate in a CA rate-limit cooldown, which the loop
+and this path now share. The preview refuses what the apply refuses.
+An operator's session on `POST /api/v1/certificates/{id}/renew` is
+bounded by none of it.
 
 **One named resource per call.** Every write names one route, one
 backend or one certificate by id, or creates one. There is no pattern,
@@ -981,9 +1014,15 @@ that differ, a delete's and a renewal's `before` is the row that would
 go or be renewed. The grants are checked first either way, so a dry run
 never shows a change the apply would refuse on the grant; what only the
 store refuses, a duplicate hostname or a backend id that names nothing,
-is refused by the apply and not by the dry run. This is the preview the
-MCP config tier's `*_preview` tools call: the plane owns it because the
-validators are the plane's alone, and the MCP server reimplements none.
+is refused by the apply and not by the dry run. The query is strict: a
+key it does not declare is a 400, so `?dryrun=true` or `?dry-run=true`
+typed by hand is refused rather than applied. The request bodies are
+not: the management structs ignore an unknown key at every depth, on
+this plane as on the management one, so a mistyped body field is
+dropped here with nothing said, and the MCP tools are what refuse one
+before it leaves. This is the preview the MCP config tier's `*_preview`
+tools call: the plane owns it because the validators are the plane's
+alone, and the MCP server reimplements none.
 
 ## GitLab OIDC
 

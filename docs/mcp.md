@@ -131,10 +131,17 @@ management-side audit row are that handler's; `lorica-mcp` does not
 reimplement a single field check, so the two surfaces cannot drift, and
 a route created through the tier is the dashboard's route byte for byte
 in the canonical configuration. What the tool checks is shape: the body
-is an object, its top-level keys are ones the handler deserialises, and
-it weighs under the listener's cap. A field the handler does not know
-is refused before the call leaves, rather than dropped silently by the
-node.
+is an object, its keys are ones the handler deserialises, at the top
+level and inside every nested object the tool's schema declares
+(`path_rules[]`, `rate_limit`, `bot_protection.bypass` and the rest,
+each pinned against the struct behind it), and it weighs under the
+listener's cap. A field the handler does not know is refused before
+the call leaves. That check is the only one a body gets: the node's
+own request structs ignore a key they do not know at every depth, so
+a mistyped nested key that reached the plane would be dropped there
+with nothing said. The one query the plane reads on a write,
+`?dry_run`, is strict on its side: a key it does not declare is a 400,
+so `?dryrun=true` typed into a direct client is not an apply.
 
 **The token's grants bound what a write claims and what it targets.**
 A hostname and every alias a route write claims must be inside the
@@ -151,16 +158,42 @@ and a route or a backend an environment owns is refused unless the
 environment's own ownership rule would let this token reach it. Every
 backend a route write links anew, at the top level or inside
 `path_rules`, `header_rules` or `traffic_splits`, must point inside the
-CIDR grant and belong to no other pipeline's environment. `forward_auth`
-and `mirror` are refused from an automation token outright, in either
-direction: the first is a URL the CIDR grant cannot weigh, to which the
-proxy forwards every downstream `Cookie` and `Authorization` header;
-the second ships a copy of every request to a second set of backends.
-Neither is offered by the tools. A config-tier token is bounded by the
+CIDR grant and belong to no other pipeline's environment. `forward_auth`,
+`mirror`, `mtls` and `proxy_headers` are refused from an automation
+token outright, in either direction: the first is a URL the CIDR grant
+cannot weigh, to which the proxy forwards every downstream `Cookie` and
+`Authorization` header; the second ships a copy of every request to a
+second set of backends; the third is the route's client-authentication
+trust anchor, the CA bundle whose client certificates the route
+accepts, which a model reading attacker text must not be able to
+replace; the fourth is a static header map to the upstream, where a
+credential would go. None of the four is offered by the tools. A config-tier token is bounded by the
 same two fields an operator reads on it, on what it may claim and on
 what it may reach, and a preview is refused exactly where the apply
 would be, so a token learns nothing about a row outside its grant by
 previewing a change to it.
+
+**The scopes are boundaries too.** A route write that names
+`certificate_id`, the empty string included, needs `certificates:write`
+beside `routes:write`: the binding tool sits behind the certificate
+scope, and a route body that could bind under the route scope alone
+made withholding it mean nothing. A preview needs the read scope of
+the row it answers (`routes:read` for a route or a binding,
+`backends:read` for a backend, `certificates:read` for a renewal),
+since a preview answers the full row; a token minted as the section
+below says carries them already, and the apply needs nothing more than
+its write scope.
+
+**A renewal from a token is budgeted per certificate.** Each renewal
+places an ACME order the CA counts against a per-name budget, and
+rotates the node's bot-protection HMAC. From a token, a renewal of a
+certificate with an order already open answers 409, one issued less
+than 48 hours ago answers 429 with a `Retry-After`, and one the
+background loop holds in a CA rate-limit cooldown answers 429 as well;
+the preview answers what the apply would. The dashboard's own renew is
+bounded by none of it. The per-token call limit below is the wrong
+bound for this: it counts calls per token, and the scarce resource is
+orders per certificate.
 
 **One named resource per call.** Every tool that acts on an existing
 resource takes exactly one `id`, a string, and the body of the one
@@ -172,12 +205,17 @@ undeclared at either level.
 **No key material, anywhere.** A certificate is selected by naming its
 id, bound and renewed; it is not uploaded, replaced or generated
 through the tier, because no path on the automation plane takes a PEM
-body. No argument of any tool is named for a key, a certificate body or
-a CSR, and a test walks every tool's schema to say so. A route's
-Basic-auth password is deliberately not offered either: a model would
-be choosing or relaying a credential, and it would cross the model's
-host in the clear. Set it in the dashboard; the tier reads the username
-alone, as the read tier does.
+body. No field a tool accepts, at any depth of the request struct
+behind it, is named for a key, a certificate body or a CSR. Two tests
+say so, and the second is the one that counts: one walks every tool's
+published schema, and one walks the Rust request struct the handler
+deserialises, from each field the tool offers into every struct it
+nests, because a body field's schema does not spell out what sits
+below it and `mtls.ca_cert_pem` travelled under `mtls` while the schema
+sweep stayed green. A route's Basic-auth password is deliberately not
+offered either: a model would be choosing or relaying a credential, and
+it would cross the model's host in the clear. Set it in the dashboard;
+the tier reads the username alone, as the read tier does.
 
 ### Preview before apply
 
@@ -241,9 +279,9 @@ to execute:
   configuration: global settings, WAF rules, notification channels,
   DNS providers, users, tokens and the cluster. Their absence is a
   decision, not a gap to work around through a route field.
-- **A route's `error_page_html`**, `response_rewrite` rules, `proxy_headers`
-  and `response_headers`: they are text and code served to or acted on
-  by end users, and a model writing them while reading attacker-authored
+- **A route's `error_page_html`**, `response_rewrite` rules and
+  `response_headers`: they are text and code served to or acted on by
+  end users, and a model writing them while reading attacker-authored
   text is the exact channel the tiering exists to close. Review them in
   the dashboard, where a human writes them.
 - **Redirects and rewrites** (`redirect_to`, `redirect_hostname`,
@@ -260,8 +298,11 @@ to execute:
   are the dashboard's own behaviour and are correct, and they are also
   more than the one sentence the model was asked for. A route or a
   backend another pipeline's environment owns is refused outright.
-- **A Basic-auth credential, `forward_auth` and `mirror`**, which the
-  tier refuses to take at all.
+- **A Basic-auth credential, `forward_auth`, `mirror`, `mtls` and
+  `proxy_headers`**, which the tier refuses to take at all. The last is
+  a static header map sent to the upstream on every request, which is
+  where a credential would go; the tier reads it, as the read tier
+  does, and sets nothing in it.
 
 The rule underneath: give the tier a token whose grants name the
 hostnames and address ranges the model is meant to touch and no
@@ -272,12 +313,14 @@ gate that applies itself.
 ### Minting a config-tier token
 
 Mint a token carrying the write scopes the work needs, plus the read
-scopes the tier uses to find ids: `routes:write` with `routes:read`,
-`backends:write` with `backends:read`, `certificates:write` with
-`certificates:read` and `routes:read`. Set `allowed_hostnames` and
-`allowed_backend_cidrs` to exactly what the model may touch. Start a
-server with that token for the change, and keep the read-tier server,
-with its read-tier token, for reading.
+scopes the tier uses to find ids and that every preview requires:
+`routes:write` with `routes:read`, `backends:write` with
+`backends:read`, `certificates:write` with `certificates:read` and
+`routes:read`. A token that is to bind certificates through a route
+write needs `certificates:write` beside `routes:write`. Set
+`allowed_hostnames` and `allowed_backend_cidrs` to exactly what the
+model may touch. Start a server with that token for the change, and
+keep the read-tier server, with its read-tier token, for reading.
 
 ## Attacker-authored text arrives as data
 
@@ -578,6 +621,12 @@ token that finds no room while that many are live is refused for that
 call rather than handed somebody else's window, since evicting a live
 one would give a caller holding more tokens than the ceiling a fresh
 budget per call.
+
+This budget counts calls and not what a call spends. A certificate
+renewal spends an ACME order against the CA's per-name budget, and is
+bounded per certificate on the plane, as the config tier section says:
+one order at a time, none within 48 hours of the last issuance, none
+during a CA cooldown.
 
 ## The protocol revision, and keeping up with it
 

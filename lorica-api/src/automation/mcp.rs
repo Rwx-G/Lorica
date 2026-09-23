@@ -570,18 +570,11 @@ pub struct InProcessPlane {
     user_agent: Option<HeaderValue>,
 }
 
-impl InProcessPlane {
-    /// A plane over `state`, calling as `principal` from nowhere in
-    /// particular: the shape for a caller that holds no connection.
-    pub fn new(state: AppState, principal: AutomationPrincipal) -> InProcessPlane {
-        InProcessPlane {
-            state,
-            principal,
-            connect_info: None,
-            user_agent: None,
-        }
-    }
-}
+// There is no public constructor: a plane acts as whatever principal
+// it holds without any bearer having been checked, so the one
+// production way to build one is the struct literal in `mcp_endpoint`,
+// from the principal the outer gate installed. The tests below have a
+// constructor of their own, under `cfg(test)`.
 
 impl AutomationPlane for InProcessPlane {
     async fn call(
@@ -652,6 +645,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    impl InProcessPlane {
+        /// A plane over `state`, calling as `principal` from nowhere in
+        /// particular: the shape for a caller that holds no connection,
+        /// which only a test is.
+        fn new(state: AppState, principal: AutomationPrincipal) -> InProcessPlane {
+            InProcessPlane {
+                state,
+                principal,
+                connect_info: None,
+                user_agent: None,
+            }
+        }
+    }
 
     /// A well-formed body for `method`, with `params` as given.
     fn body_of(id: Option<i64>, method: &str, params: Value) -> Vec<u8> {

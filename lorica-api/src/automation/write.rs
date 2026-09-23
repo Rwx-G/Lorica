@@ -75,12 +75,36 @@
 //! grant reads no production hostname off the answer, and a preview is
 //! refused exactly where the apply would be.
 //!
-//! Two route fields are refused from a token outright, whatever their
+//! Four route fields are refused from a token outright, whatever their
 //! value: `forward_auth`, whose address is a URL the CIDR grant cannot
 //! weigh and to which the proxy forwards every downstream `Cookie` and
-//! `Authorization` header, and `mirror`, which ships a copy of every
-//! request to a second set of backends. The config tier's tools do not
-//! offer either.
+//! `Authorization` header; `mirror`, which ships a copy of every
+//! request to a second set of backends; `mtls`, the route's
+//! client-authentication trust anchor; and `proxy_headers`, a static
+//! header map to the upstream, where a credential would go. The config
+//! tier's tools offer none of them.
+//!
+//! # The scopes bound each other
+//!
+//! A route write naming `certificate_id` binds a certificate, which is
+//! `certificates:write`'s verb, so it needs that scope beside
+//! `routes:write`: without this the binding path's scope bounded
+//! nothing a route body could not do. A preview answers the full row
+//! it would change, so it needs the read scope of that row
+//! (`routes:read`, `backends:read`, `certificates:read`): without this
+//! a write scope alone read any row inside its grant through
+//! `?dry_run=true`. The apply needs its write scope and no more.
+//!
+//! # A renewal is budgeted per certificate
+//!
+//! Every renewal is an ACME order the CA counts per identifier set and
+//! a rotation of the node's bot-protection HMAC, and the MCP call
+//! budget counts calls, not orders. So the renewal handler hands the
+//! management body [`crate::acme::RenewalBudget::PerCertificate`]: one
+//! order per certificate at a time, none within
+//! [`crate::acme::MIN_TOKEN_RENEWAL_INTERVAL_HOURS`] of the last
+//! issuance, none during a CA cooldown the background loop recorded.
+//! The dashboard's own renew is bounded by none of it.
 //!
 //! # One named resource per call
 //!
@@ -120,13 +144,14 @@ use std::collections::BTreeSet;
 use axum::extract::{Extension, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use lorica_config::models::{Backend, ManagedBy, Route};
+use lorica_config::models::{AutomationScope, Backend, ManagedBy, Route};
 use lorica_config::ConfigStore;
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::auth::AutomationPrincipal;
 use super::environments::{audit_context, caller_may_access, ensure_backend_address_granted};
+use super::scope::scope_str;
 use crate::audit::ClientConnectInfo;
 use crate::backends::{CreateBackendRequest, UpdateBackendRequest};
 use crate::error::ApiError;
@@ -183,7 +208,7 @@ fn ensure_hostnames_granted(
     Ok(())
 }
 
-/// The two route fields a token may not send at all, whatever the
+/// The four route fields a token may not send at all, whatever the
 /// value, a clearing one included.
 ///
 /// `forward_auth.address` is any absolute URL: the CIDR grant cannot
@@ -191,10 +216,22 @@ fn ensure_hostnames_granted(
 /// `Authorization` header to it, so a model-authored body could send
 /// every visitor's session off-site or make the proxy call a metadata
 /// address per request. `mirror` ships a copy of every request,
-/// credentials included, to a second set of backends. Neither is the
-/// tier's in either direction; both are set in the dashboard, by a
-/// human, and the tools do not offer them.
-fn refuse_unbounded_reach(forward_auth: bool, mirror: bool) -> Result<(), ApiError> {
+/// credentials included, to a second set of backends. `mtls` is the
+/// route's client-authentication trust anchor: the CA bundle whose
+/// client certificates the route accepts, so a model reading attacker
+/// text that could replace it would let every client certificate the
+/// attacker mints through. `proxy_headers` is a static header map sent
+/// to the upstream on every request, which is where a credential would
+/// go, so a model must neither choose one nor clear one (the
+/// maintainer's decision, 2026-09-23). None is the tier's in either
+/// direction; all four are set in the dashboard, by a human, and the
+/// tools do not offer them.
+fn refuse_unbounded_reach(
+    forward_auth: bool,
+    mirror: bool,
+    mtls: bool,
+    proxy_headers: bool,
+) -> Result<(), ApiError> {
     if forward_auth {
         return Err(ApiError::Forbidden(
             "forward_auth is not accepted from an automation token: its address is a URL \
@@ -209,6 +246,60 @@ fn refuse_unbounded_reach(forward_auth: bool, mirror: bool) -> Result<(), ApiErr
              to a second set of backends; set it in the dashboard"
                 .to_string(),
         ));
+    }
+    if mtls {
+        return Err(ApiError::Forbidden(
+            "mtls is not accepted from an automation token: it is the route's \
+             client-authentication trust anchor, the CA whose client certificates the route \
+             accepts; set it in the dashboard"
+                .to_string(),
+        ));
+    }
+    if proxy_headers {
+        return Err(ApiError::Forbidden(
+            "proxy_headers is not accepted from an automation token: a static header map to \
+             the upstream is where a credential would go; set it in the dashboard"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A route write naming `certificate_id`, the empty string included,
+/// binds or unbinds a certificate, which is `certificates:write`'s
+/// verb: the binding path sits behind that scope, and a route body
+/// that could bind under `routes:write` alone made withholding it mean
+/// nothing. The environment resource applies the same rule to an
+/// explicit certificate id.
+fn ensure_certificate_binding_granted(
+    principal: &AutomationPrincipal,
+    certificate_id: Option<&str>,
+) -> Result<(), ApiError> {
+    if certificate_id.is_some() && !principal.has_scope(AutomationScope::CertificatesWrite) {
+        return Err(ApiError::Forbidden(
+            "certificate_id: binding or unbinding a certificate needs the certificates:write \
+             scope beside routes:write"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A preview answers the full row it would change, so a write scope
+/// alone would read any row inside the grant through it. It needs the
+/// read scope of that row, which a config-tier token carries anyway
+/// since the tier finds its ids through it; the apply needs nothing
+/// beyond its write scope.
+fn ensure_preview_readable(
+    principal: &AutomationPrincipal,
+    mode: WriteMode,
+    read: AutomationScope,
+) -> Result<(), ApiError> {
+    if mode.previews() && !principal.has_scope(read) {
+        return Err(ApiError::Forbidden(format!(
+            "dry_run: a preview answers the row it would change, which needs the {} scope",
+            scope_str(read)
+        )));
     }
     Ok(())
 }
@@ -406,14 +497,17 @@ fn certificate_guard(principal: &AutomationPrincipal) -> CertificateGuard {
 /// audit row, naming the token. The hostname and every alias must be
 /// inside the token's `allowed_hostnames` (403), every backend the body
 /// links must sit inside its `allowed_backend_cidrs` and belong to no
-/// other principal's environment (403), and `forward_auth` and `mirror`
-/// are refused (403). With `?dry_run=true`, the route it would have
-/// created, and nothing created.
+/// other principal's environment (403), `forward_auth`, `mirror`, `mtls`
+/// and `proxy_headers` are refused (403), and `certificate_id` needs
+/// `certificates:write` (403). With `?dry_run=true`, which needs
+/// `routes:read` (403), the route it would have created, and nothing
+/// created.
 ///
 /// # Errors
 ///
-/// `Forbidden` for a name, a link or a field outside the grant, then
-/// whatever [`crate::routes::crud::create_route_as`] answers.
+/// `Forbidden` for a name, a link, a field or a scope outside the
+/// grant, then whatever [`crate::routes::crud::create_route_as`]
+/// answers.
 pub async fn create_route(
     principal: AutomationPrincipal,
     connect_info: ClientConnectInfo,
@@ -422,7 +516,14 @@ pub async fn create_route(
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    refuse_unbounded_reach(body.forward_auth.is_some(), body.mirror.is_some())?;
+    ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::RoutesRead)?;
+    refuse_unbounded_reach(
+        body.forward_auth.is_some(),
+        body.mirror.is_some(),
+        body.mtls.is_some(),
+        body.proxy_headers.is_some(),
+    )?;
+    ensure_certificate_binding_granted(&principal, body.certificate_id.as_deref())?;
     ensure_hostnames_granted(
         &principal,
         Some(&body.hostname),
@@ -449,15 +550,16 @@ pub async fn create_route(
 /// hostname or an alias the patch names must be inside the grant too,
 /// every backend the patch links anew must sit inside
 /// `allowed_backend_cidrs` and belong to no other principal's
-/// environment, and `forward_auth` and `mirror` are refused (403 each).
-/// With `?dry_run=true`, the route before and after the patch, and
-/// nothing changed.
+/// environment, `forward_auth`, `mirror`, `mtls` and `proxy_headers` are
+/// refused, and `certificate_id` needs `certificates:write` (403 each). With
+/// `?dry_run=true`, which needs `routes:read` (403), the route before
+/// and after the patch, and nothing changed.
 ///
 /// # Errors
 ///
-/// `Forbidden` for a target, a name, a link or a field outside the
-/// grant, then whatever [`crate::routes::crud::update_route_as`]
-/// answers.
+/// `Forbidden` for a target, a name, a link, a field or a scope
+/// outside the grant, then whatever
+/// [`crate::routes::crud::update_route_as`] answers.
 pub async fn update_route(
     principal: AutomationPrincipal,
     connect_info: ClientConnectInfo,
@@ -467,7 +569,14 @@ pub async fn update_route(
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    refuse_unbounded_reach(body.forward_auth.is_some(), body.mirror.is_some())?;
+    ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::RoutesRead)?;
+    refuse_unbounded_reach(
+        body.forward_auth.is_some(),
+        body.mirror.is_some(),
+        body.mtls.is_some(),
+        body.proxy_headers.is_some(),
+    )?;
+    ensure_certificate_binding_granted(&principal, body.certificate_id.as_deref())?;
     ensure_hostnames_granted(
         &principal,
         body.hostname.as_deref(),
@@ -493,8 +602,8 @@ pub async fn update_route(
 /// therefore here, and takes its environment with it, so it is
 /// reachable exactly when the environment resource would let this token
 /// reach that environment (403 otherwise); the audit row names the
-/// environment. With `?dry_run=true`, the route that would go, and
-/// nothing deleted.
+/// environment. With `?dry_run=true`, which needs `routes:read` (403),
+/// the route that would go, and nothing deleted.
 ///
 /// # Errors
 ///
@@ -508,6 +617,7 @@ pub async fn delete_route(
     Path(id): Path<String>,
     Query(dry_run): Query<DryRunQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::RoutesRead)?;
     let actor = audit_context(&principal, &connect_info, &headers);
     crate::routes::crud::delete_route_as(
         &state,
@@ -528,8 +638,9 @@ pub async fn delete_route(
 /// The route named must be inside the token's `allowed_hostnames` on
 /// its current hostname and every current alias (403). Selecting a
 /// certificate is naming its id here; what the id names entered the
-/// node through the management API. With `?dry_run=true`, the route
-/// before and after the binding, and nothing bound.
+/// node through the management API. With `?dry_run=true`, which needs
+/// `routes:read` since it answers the route (403), the route before
+/// and after the binding, and nothing bound.
 ///
 /// # Errors
 ///
@@ -544,6 +655,7 @@ pub async fn bind_certificate(
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<BindCertificateRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::RoutesRead)?;
     let actor = audit_context(&principal, &connect_info, &headers);
     let patch = UpdateRouteRequest {
         certificate_id: Some(body.certificate_id),
@@ -566,8 +678,8 @@ pub async fn bind_certificate(
 /// `ip:port` (422, since a name cannot be checked against a CIDR
 /// grant) inside the token's `allowed_backend_cidrs` (403), the same
 /// rule the environment resource applies to its backends. With
-/// `?dry_run=true`, the backend it would have created, and nothing
-/// created.
+/// `?dry_run=true`, which needs `backends:read` (403), the backend it
+/// would have created, and nothing created.
 ///
 /// # Errors
 ///
@@ -581,6 +693,7 @@ pub async fn create_backend(
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<CreateBackendRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::BackendsRead)?;
     ensure_backend_address_granted(&principal, "address", &body.address)?;
     let actor = audit_context(&principal, &connect_info, &headers);
     crate::backends::create_backend_as(&state, &actor, body, WriteMode::from(dry_run)).await
@@ -593,8 +706,8 @@ pub async fn create_backend(
 /// token's `allowed_backend_cidrs` on its stored address and belong to
 /// no other principal's environment (403); an address the patch names
 /// is checked against the grant exactly as on create. With
-/// `?dry_run=true`, the backend before and after the patch, and
-/// nothing changed.
+/// `?dry_run=true`, which needs `backends:read` (403), the backend
+/// before and after the patch, and nothing changed.
 ///
 /// # Errors
 ///
@@ -609,6 +722,7 @@ pub async fn update_backend(
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<UpdateBackendRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::BackendsRead)?;
     if let Some(address) = body.address.as_deref() {
         ensure_backend_address_granted(&principal, "address", address)?;
     }
@@ -630,9 +744,9 @@ pub async fn update_backend(
 /// and the refusal of a backend an environment owns (409). The backend
 /// named must sit inside the token's `allowed_backend_cidrs` on its
 /// stored address and belong to no other principal's environment
-/// (403). With `?dry_run=true`, the backend marked closing as the
-/// drain would leave it, or the row that would go at once when it is
-/// already closing, and no drain started.
+/// (403). With `?dry_run=true`, which needs `backends:read` (403), the
+/// backend marked closing as the drain would leave it, or the row that
+/// would go at once when it is already closing, and no drain started.
 ///
 /// # Errors
 ///
@@ -646,6 +760,7 @@ pub async fn delete_backend(
     Path(id): Path<String>,
     Query(dry_run): Query<DryRunQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::BackendsRead)?;
     let actor = audit_context(&principal, &connect_info, &headers);
     crate::backends::delete_backend_as(
         &state,
@@ -667,13 +782,17 @@ pub async fn delete_backend(
 /// the row is said. A certificate that was uploaded rather than issued
 /// is refused (400) exactly as on the management plane, since there is
 /// nothing to renew it against, and no path here takes the replacement.
-/// With `?dry_run=true`, the certificate that would be renewed, and no
-/// order made.
+/// A token renews one certificate at a time (409) and not within
+/// [`crate::acme::MIN_TOKEN_RENEWAL_INTERVAL_HOURS`] of its last
+/// issuance or during a CA cooldown (429). With `?dry_run=true`, which
+/// needs `certificates:read` (403), the certificate that would be
+/// renewed, and no order made.
 ///
 /// # Errors
 ///
 /// The grant's refusal on the target, then whatever
-/// [`crate::acme::renew_certificate_as`] answers.
+/// [`crate::acme::renew_certificate_as`] answers, the budget's 409 and
+/// 429 included.
 pub async fn renew_certificate(
     principal: AutomationPrincipal,
     connect_info: ClientConnectInfo,
@@ -682,6 +801,11 @@ pub async fn renew_certificate(
     Path(id): Path<String>,
     Query(dry_run): Query<DryRunQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_preview_readable(
+        &principal,
+        dry_run.mode(),
+        AutomationScope::CertificatesRead,
+    )?;
     let actor = audit_context(&principal, &connect_info, &headers);
     crate::acme::renew_certificate_as(
         &state,
@@ -689,6 +813,7 @@ pub async fn renew_certificate(
         id,
         WriteMode::from(dry_run),
         certificate_guard(&principal),
+        crate::acme::RenewalBudget::PerCertificate,
     )
     .await
 }
@@ -813,18 +938,127 @@ mod tests {
     }
 
     #[test]
-    fn forward_auth_and_mirror_are_refused_from_a_token_whatever_the_value() {
-        refuse_unbounded_reach(false, false).expect("neither field");
-        for (forward_auth, mirror, field) in [
-            (true, false, "forward_auth"),
-            (false, true, "mirror"),
-            (true, true, "forward_auth"),
+    fn forward_auth_mirror_mtls_and_proxy_headers_are_refused_from_a_token_whatever_the_value() {
+        refuse_unbounded_reach(false, false, false, false).expect("no such field");
+        for (forward_auth, mirror, mtls, proxy_headers, field) in [
+            (true, false, false, false, "forward_auth"),
+            (false, true, false, false, "mirror"),
+            (false, false, true, false, "mtls"),
+            (false, false, false, true, "proxy_headers"),
+            (true, true, true, true, "forward_auth"),
         ] {
-            match refuse_unbounded_reach(forward_auth, mirror).expect_err(field) {
+            match refuse_unbounded_reach(forward_auth, mirror, mtls, proxy_headers)
+                .expect_err(field)
+            {
                 ApiError::Forbidden(message) => assert!(message.starts_with(field), "{message}"),
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_certificate_id_on_a_route_write_needs_the_certificate_scope_and_a_preview_its_read_scope()
+    {
+        let routes_only = principal();
+        ensure_certificate_binding_granted(&routes_only, None).expect("no binding named");
+        for certificate_id in ["c-1", ""] {
+            match ensure_certificate_binding_granted(&routes_only, Some(certificate_id))
+                .expect_err("a binding under routes:write alone")
+            {
+                ApiError::Forbidden(message) => {
+                    assert!(message.contains("certificates:write"), "{message}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let both = AutomationPrincipal {
+            scopes: vec![
+                AutomationScope::RoutesWrite,
+                AutomationScope::CertificatesWrite,
+            ],
+            ..principal()
+        };
+        ensure_certificate_binding_granted(&both, Some("c-1")).expect("the scope is held");
+
+        ensure_preview_readable(&routes_only, WriteMode::Apply, AutomationScope::RoutesRead)
+            .expect("an apply needs no read scope");
+        match ensure_preview_readable(
+            &routes_only,
+            WriteMode::Preview,
+            AutomationScope::RoutesRead,
+        )
+        .expect_err("a preview answers the row")
+        {
+            ApiError::Forbidden(message) => assert!(message.contains("routes:read"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        let reading = AutomationPrincipal {
+            scopes: vec![AutomationScope::RoutesWrite, AutomationScope::RoutesRead],
+            ..principal()
+        };
+        ensure_preview_readable(&reading, WriteMode::Preview, AutomationScope::RoutesRead)
+            .expect("the read scope is held");
+    }
+
+    #[test]
+    fn an_ipv4_mapped_address_is_weighed_as_the_ipv4_it_maps_to() {
+        // `[::ffff:127.0.0.1]:80` parses as an IPv6 socket address and
+        // connects to IPv4 loopback. A grant over a v6 range covering the
+        // mapped space (`::/0`, `::ffff:0:0/96`) accepted it as v6 and
+        // handed the token every IPv4 address there is; the same form
+        // under a v4 grant was refused by the family mismatch. The
+        // address is weighed as the IPv4 it maps to, on a claim and on
+        // a stored row alike.
+        let granted = |cidrs: &[&str]| AutomationPrincipal {
+            allowed_backend_cidrs: cidrs.iter().map(|c| (*c).to_string()).collect(),
+            ..principal()
+        };
+        let any_v6 = granted(&["::/0"]);
+        let refused = ensure_backend_address_granted(&any_v6, "address", "[::ffff:127.0.0.1]:80")
+            .expect_err("the report's input");
+        assert!(matches!(refused, ApiError::Forbidden(_)), "{refused:?}");
+        ensure_backend_address_granted(&any_v6, "address", "[2001:db8::10]:80")
+            .expect("a real v6 address inside the grant");
+
+        let mapped_space = granted(&["::ffff:0:0/96"]);
+        let refused =
+            ensure_backend_address_granted(&mapped_space, "address", "[::ffff:127.0.0.1]:80")
+                .expect_err("a v6 grant over the mapped space grants no v4 address");
+        assert!(matches!(refused, ApiError::Forbidden(_)), "{refused:?}");
+
+        let v4 = principal();
+        ensure_backend_address_granted(&v4, "address", "[::ffff:10.0.0.10]:8080")
+            .expect("weighed as 10.0.0.10, inside the grant");
+        let refused = ensure_backend_address_granted(&v4, "address", "[::ffff:192.0.2.10]:8080")
+            .expect_err("weighed as 192.0.2.10, outside the grant");
+        assert!(matches!(refused, ApiError::Forbidden(_)), "{refused:?}");
+
+        // The guard over a stored row goes through the same function.
+        let store = ConfigStore::open_in_memory().expect("store");
+        let stored = Backend {
+            id: "b-1".to_string(),
+            address: "[::ffff:127.0.0.1]:80".to_string(),
+            name: String::new(),
+            group_name: String::new(),
+            weight: 1,
+            health_status: lorica_config::models::HealthStatus::Unknown,
+            health_check_enabled: false,
+            health_check_interval_s: 10,
+            health_check_path: None,
+            lifecycle_state: lorica_config::models::LifecycleState::Normal,
+            active_connections: 0,
+            tls_upstream: false,
+            tls_skip_verify: false,
+            tls_sni: None,
+            h2_upstream: false,
+            managed_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let refused = backend_guard(&any_v6)
+            .check(&store, &stored)
+            .expect_err("the stored row is weighed the same way");
+        assert!(matches!(refused, ApiError::Forbidden(_)), "{refused:?}");
     }
 
     #[test]

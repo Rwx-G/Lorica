@@ -79,20 +79,34 @@ impl WriteMode {
 /// sits behind the same scope as the write by construction, and the row
 /// records `?dry_run` beside the verb the way it records any other
 /// parameter name. Absent or `false` is the write.
+///
+/// `deny_unknown_fields`, because the one thing this query decides is
+/// whether a write happens: `?dryrun=true` typed by hand into a direct
+/// client was an apply, the key ignored. Any key that is not `dry_run`
+/// is a 400 now. No management handler extracts this type, so the
+/// dashboard's contract is untouched.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DryRunQuery {
     /// `true` to compute the change and write nothing.
     #[serde(default)]
     pub dry_run: bool,
 }
 
-impl From<DryRunQuery> for WriteMode {
-    fn from(query: DryRunQuery) -> WriteMode {
-        if query.dry_run {
+impl DryRunQuery {
+    /// The mode this query asks for.
+    pub fn mode(&self) -> WriteMode {
+        if self.dry_run {
             WriteMode::Preview
         } else {
             WriteMode::Apply
         }
+    }
+}
+
+impl From<DryRunQuery> for WriteMode {
+    fn from(query: DryRunQuery) -> WriteMode {
+        query.mode()
     }
 }
 
@@ -218,5 +232,25 @@ mod tests {
         assert_eq!(WriteMode::from(absent), WriteMode::Apply);
         assert!(WriteMode::Preview.previews());
         assert!(!WriteMode::Apply.previews());
+    }
+
+    #[test]
+    fn a_key_that_is_not_dry_run_is_refused_rather_than_read_as_the_write() {
+        // The whole-stack case, through the handlers' `Query` extractor,
+        // is `a_mistyped_dry_run_is_refused_and_never_an_apply` in
+        // `crate::tests`; this pins the attribute itself, which serde
+        // applies the same way whatever the format.
+        for query in [
+            r#"{"dryrun": true}"#,
+            r#"{"dry-run": true}"#,
+            r#"{"dry_run": true, "dryrun": true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DryRunQuery>(query).is_err(),
+                "{query} was read"
+            );
+        }
+        let previewing: DryRunQuery = serde_json::from_str(r#"{"dry_run": true}"#).expect("parses");
+        assert_eq!(previewing.mode(), WriteMode::Preview);
     }
 }

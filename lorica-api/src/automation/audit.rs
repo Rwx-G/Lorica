@@ -1323,6 +1323,7 @@ mod tests {
             cluster: crate::cluster::ClusterRuntime::Standalone,
             oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
             mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
+            renewals: Arc::new(crate::acme::RenewalLedger::new()),
         }
     }
 

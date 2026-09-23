@@ -1630,6 +1630,9 @@ mod tests {
         }
         assert!(names.len() > 20, "the sweep walked nothing: {names:?}");
         for name in &names {
+            if tools::NAMED_FOR_A_LIFETIME_NOT_A_CREDENTIAL.contains(&name.as_str()) {
+                continue;
+            }
             let lowered = name.to_lowercase();
             for forbidden in [
                 "private_key",

@@ -69,6 +69,18 @@ pub enum ApiError {
     #[error("rate limited (retry after {0}s)")]
     RateLimited(u64),
 
+    /// 429 Too Many Requests, with the reason: the caller is inside a
+    /// per-resource interval rather than over a request bucket, and the
+    /// message says which resource and why. The seconds are the
+    /// `Retry-After`, as for [`ApiError::RateLimited`].
+    #[error("rate limited (retry after {retry_after_s}s): {reason}")]
+    RateLimitedBecause {
+        /// Seconds until the interval opens again.
+        retry_after_s: u64,
+        /// What was asked too soon, in the operator's words.
+        reason: String,
+    },
+
     /// 500 Internal Server Error: unexpected failure (DB, IO, serialization).
     #[error("internal error: {0}")]
     Internal(String),
@@ -140,7 +152,9 @@ impl ApiError {
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::RateLimited(_) | ApiError::RateLimitedBecause { .. } => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -154,7 +168,7 @@ impl ApiError {
             ApiError::Forbidden(_) => "forbidden",
             ApiError::Conflict(_) => "conflict",
             ApiError::Unprocessable(_) => "unprocessable_entity",
-            ApiError::RateLimited(_) => "rate_limited",
+            ApiError::RateLimited(_) | ApiError::RateLimitedBecause { .. } => "rate_limited",
             ApiError::Internal(_) => "internal_error",
             ApiError::ServiceUnavailable(_) => "service_unavailable",
         }
@@ -177,6 +191,7 @@ impl IntoResponse for ApiError {
         // seconds until the current window rolls over.
         let retry_after = match &self {
             ApiError::RateLimited(secs) => Some(*secs),
+            ApiError::RateLimitedBecause { retry_after_s, .. } => Some(*retry_after_s),
             _ => None,
         };
         // v1.5.1 audit M-12 : sanitise `Internal` errors at the
@@ -266,6 +281,14 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(
+            ApiError::RateLimitedBecause {
+                retry_after_s: 30,
+                reason: "x".into()
+            }
+            .status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
             ApiError::Internal("x".into()).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
@@ -287,6 +310,14 @@ mod tests {
             "unprocessable_entity"
         );
         assert_eq!(ApiError::RateLimited(30).code(), "rate_limited");
+        assert_eq!(
+            ApiError::RateLimitedBecause {
+                retry_after_s: 30,
+                reason: "x".into()
+            }
+            .code(),
+            "rate_limited"
+        );
         assert_eq!(ApiError::Internal("x".into()).code(), "internal_error");
         assert_eq!(
             ApiError::ServiceUnavailable("x".into()).code(),
@@ -307,6 +338,14 @@ mod tests {
         assert_eq!(
             ApiError::RateLimited(30).to_string(),
             "rate limited (retry after 30s)"
+        );
+        assert_eq!(
+            ApiError::RateLimitedBecause {
+                retry_after_s: 30,
+                reason: "renewed an hour ago".into()
+            }
+            .to_string(),
+            "rate limited (retry after 30s): renewed an hour ago"
         );
     }
 

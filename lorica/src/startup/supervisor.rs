@@ -1143,6 +1143,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 cluster: cluster_runtime,
                 oidc: oidc_verifier,
                 mcp_invocations: Arc::new(lorica_api::automation::InvocationLimiter::new()),
+                renewals: Arc::new(lorica_api::acme::RenewalLedger::new()),
             };
             // The automation API rides the same `AppState` as the
             // management API and starts before it, so a refused

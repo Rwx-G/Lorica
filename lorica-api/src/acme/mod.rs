@@ -63,7 +63,10 @@ pub use expiry::{check_cert_expiry, spawn_cert_expiry_check_task};
 pub use fleet::FleetHttp01Solver;
 pub use http01::{provision_certificate, serve_challenge, AcmeProvisionRequest};
 pub(crate) use renewal::renew_certificate_as;
-pub use renewal::{renew_certificate, spawn_renewal_task, superseded_orphans};
+pub use renewal::{
+    renew_certificate, spawn_renewal_task, superseded_orphans, InFlightRenewal, RenewalBudget,
+    RenewalLedger, MIN_TOKEN_RENEWAL_INTERVAL_HOURS,
+};
 pub use store::{AcmeChallengeStore, CHALLENGE_TTL};
 pub use types::{PendingDnsChallenge, PendingDnsChallenges};
 

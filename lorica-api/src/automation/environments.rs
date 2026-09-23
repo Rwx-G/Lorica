@@ -440,6 +440,16 @@ fn validate_path_prefix(raw: Option<&str>) -> Result<String, ApiError> {
 /// metadata address. The models refuse an empty list at write time;
 /// this refuses it again at use time, for the rows written before
 /// that rule landed.
+///
+/// # A mapped address is the IPv4 it maps to
+///
+/// `[::ffff:127.0.0.1]:80` parses as an IPv6 socket address and the
+/// upstream connect reaches IPv4 loopback. Weighed as IPv6, a grant
+/// over a v6 range covering the mapped space (`::/0`, `::ffff:0:0/96`)
+/// accepted it and handed the credential every IPv4 address there is;
+/// weighed as the IPv4 it maps to, the same grant refuses it and a v4
+/// grant covering that address accepts it, which is what the address
+/// connects to either way.
 pub(super) fn ensure_backend_address_granted(
     principal: &AutomationPrincipal,
     field: &str,
@@ -465,7 +475,7 @@ pub(super) fn ensure_backend_address_granted(
             "{field} `{raw}` must carry a non-zero port"
         )));
     }
-    if !policy.accepts(addr.ip()) {
+    if !policy.accepts(addr.ip().to_canonical()) {
         return Err(ApiError::Forbidden(format!(
             "{field} `{raw}` is outside this token's allowed_backend_cidrs"
         )));

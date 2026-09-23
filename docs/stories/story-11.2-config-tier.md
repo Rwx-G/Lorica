@@ -164,6 +164,40 @@ These are the PRD's, unchanged. They are the contract.
 - [x] Debt Low: the lot 2 probe count corrected to the fourteen bullets
       it counts.
 
+### Lot 4: the security Mediums and Lows the last pass recorded
+
+- [x] Security Medium: `mtls` refused from a token (403, the reason
+      named), withdrawn from the tools, named in
+      `NOT_OFFERED_TO_A_MODEL`; the key-material sweep walks the Rust
+      request structs into every struct they nest, with a positive
+      control. `docs/mcp.md`'s sentence corrected and made true again.
+- [x] Security Low: `certificate_id` on a route write needs
+      `certificates:write` (403). Watched failing before the fix.
+- [x] Security Low: `DryRunQuery` is `deny_unknown_fields`, so
+      `?dryrun=true` is a 400 and not an apply; the MCP tools carry
+      their key check into every nested object a route body declares,
+      each vocabulary pinned against the nested struct both ways; the
+      two document sentences corrected. Watched failing before the fix.
+- [x] Security Medium: a renewal from a token is budgeted per
+      certificate: 409 in flight, 429 inside the interval read off
+      `not_before`, 429 during the loop's CA cooldown, on a ledger the
+      loop and the manual path share. The dashboard's renew unchanged.
+      Watched failing before the fix.
+- [x] Security Low: a preview needs the read scope of the row it
+      answers. Watched failing before the fix on every write path.
+- [x] Security Info (the IPv6 finding): an IPv4-mapped address is
+      weighed as the IPv4 it maps to, in
+      `ensure_backend_address_granted`, on a claim and on a stored row.
+      Watched failing before the fix on the report's input.
+- [x] Security Info: `InProcessPlane::new` is test-only.
+- [x] `proxy_headers` withheld from the model, by the maintainer's
+      decision of 2026-09-23: refused from a token (403), withdrawn from
+      the tools, named in `NOT_OFFERED_TO_A_MODEL`. Watched failing
+      before the refusal existed.
+- [x] Recorded, not built: the dry run on the management API (the
+      report's own remediation is "none required"). Reason in the Dev
+      Note.
+
 ## Dev Notes
 
 ### What "diff before apply" can and cannot promise
@@ -322,6 +356,111 @@ and `proxy_headers` offered to a model, `certificate_id` under
 mapped-address grant) were not in this pass's brief and are recorded
 here for the maintainer. And the guard is a callback, not a tier table:
 the architecture report's two Highs are Stories 11.3 and 11.4's.
+
+> Taken in lot 4, 2026-09-23: every item of that list was a fix and not
+> a decision, and security does not bend to convenience, so lot 4 built
+> them. What each became is under "The Mediums and Lows were fixes"
+> below and in the lot 4 Completion Notes. `proxy_headers` was the one
+> this pass first left as recorded, because the field is also the
+> ordinary way to set `X-Forwarded-*` and cache headers and the read
+> tier already returns it; the maintainer decided the same day that it
+> is withheld from the model on the same footing as
+> `basic_auth_password`, `forward_auth`, `mirror` and `mtls`, for the
+> reason the refusal carries: a static header map to the upstream is
+> where a credential would go. It is refused from a token (403),
+> withdrawn from the tools and named in `NOT_OFFERED_TO_A_MODEL`; the
+> plane still accepts it from any other automation client, and the read
+> tier still returns it, which is the same shape as `basic_auth_username`
+> beside the withheld password.
+
+### The Mediums and Lows were fixes, and this is what they became
+
+Recorded 2026-09-23, lot 4.
+
+**`mtls` is a trust anchor, and a schema sweep cannot see below a body
+field.** `{"route": {"mtls": {"ca_cert_pem": "...", "required": true}}}`
+from a config-tier session replaced the CA whose client certificates a
+route accepts; the AC #6 sweep walked the published `inputSchema`,
+whose body properties are `{}`, so it saw `mtls` and never
+`mtls.ca_cert_pem`. The field is refused from a token outright,
+clearing included, beside `forward_auth` and `mirror`, withdrawn from
+the tools and named in `NOT_OFFERED_TO_A_MODEL` as a
+client-authentication trust anchor. The sweep now walks the Rust
+request struct the handler deserialises, from each field a tool offers
+into every struct it nests (`tests/openapi_contract.rs` reads the
+nested request modules and `lorica-config`'s `route.rs` for that), and
+carries a positive control: over the whole struct, offered or not, the
+walk must find at least one nested key-material name and every such
+name must sit under a withheld field, so a walk that had gone blind
+would fail rather than pass. The schema sweep stays, extended into
+array `items`, as the guard on what a client is shown.
+
+**A body's `deny_unknown_fields` is the dashboard's contract to change,
+and the query's is not.** `DryRunQuery` is `deny_unknown_fields`: the
+one thing it decides is whether a write happens, no management handler
+extracts it, and `?dryrun=true` from a direct client was an apply. The
+four request structs and what they nest stay as they are, because
+`deny_unknown_fields` on them changes what the dashboard may send, a
+decision the maintainer takes and not a fix pass. Instead the MCP tool
+carries its key check down: a `Body` declares `Nested` vocabularies
+for every field that is an object or a list of objects (`ROUTE_NESTED`
+in `tools.rs` is the list, and the pin is what says it is complete),
+the schema publishes them with `additionalProperties: false`, `checked_body`
+recurses through them, and `tests/openapi_contract.rs` pins each list
+against the nested struct both ways, checks `list` against the field
+being a `Vec`, and refuses an offered field whose type is a struct
+with no vocabulary declared, so the next nested object a route body
+grows is a red gate and not a silent drop. A `skip_deserializing`
+field (`HeaderRuleRequest::disabled`) is left out of what a caller may
+send, and the source scan learned to leave it out too. Values are
+still never looked at: a nested value that is not an object, `null`
+to leave a field alone or a wrong type, passes to the plane's
+validators as before.
+
+**The renewal budget is the certificate's, not the token's.** The MCP
+limiter counts calls per token and the scarce resource is orders per
+identifier set at the CA, so the bound went where the resource is. A
+`RenewalLedger` on `AppState` holds the in-flight ids and the CA
+cooldown map that was the background loop's local variable; the loop
+sweeps, reads and writes that ledger and marks its own orders in
+flight, the manual path takes the mark for the duration of the order
+(an RAII value released on completion, failure or unwind), and a
+token's renewal, apply and preview alike, is refused 409 while an
+order for the id is open, 429 while the CA cooldown stands, and 429
+when `not_before` is less than `MIN_TOKEN_RENEWAL_INTERVAL_HOURS` ago,
+with the wait in `Retry-After` and the reason in the message
+(`ApiError::RateLimitedBecause`, a 429 that can say why). The interval
+is read off `not_before`, which every issuance path writes as the
+order's instant, so no column was added; its value and reason sit on
+the constant. The budget runs before the plan is resolved, so a token
+asking twice about a manual certificate learns about its own pace
+before the row's method, and the test distinguishes the operator's
+path by that ordering without placing an order. Two things changed for
+everyone, deliberately: the loop skips a certificate a manual renewal
+has in flight rather than racing it on the HTTP-01 slot, and a manual
+renewal the CA rate-limits records the cooldown so the loop and the
+next token stay away from an identifier set the CA already refused.
+The operator's answers are unchanged.
+
+**Scopes bound each other now.** `certificate_id` on a route write
+needs `certificates:write`, the empty string included since unbinding
+is a binding change, the same rule the environment resource applies
+to an explicit certificate id; and a preview needs the read scope of
+the row it answers, `routes:read` for a route and for the binding
+(which answers the route), `backends:read` for a backend,
+`certificates:read` for a renewal. Both are checked in the automation
+handler before the body runs, in `write.rs`, the one place the grant
+rules are spelled. A token minted as `docs/mcp.md` says carries the
+read scopes already.
+
+**The mapped address.** The report ranked it Info and speculative; it
+is real on reading the code: `ConnectionFilterPolicy::accepts` asks
+`IpNet::contains` on the address as parsed, and `[::ffff:127.0.0.1]:80`
+parses as V6, so `::/0` contained it while the connect reached IPv4
+loopback. `ensure_backend_address_granted` weighs
+`addr.ip().to_canonical()`, which both writers of a backend row and the
+target guard go through; the stored address is unchanged, since what is
+stored is what the proxy dials.
 
 ### The cluster case is the interesting one
 
@@ -764,6 +903,168 @@ Which test guards what:
   and `the_in_process_plane_runs_the_scope_gate_and_refuses_what_the_matrix_refuses`
   still passing over `authorized()`.
 
+Lot 4, 2026-09-23. Gates run in `rust:1-bookworm` with
+`RUSTFLAGS=-D warnings`, one container at a time, each started only
+once no `rust:1-bookworm` container was running:
+
+- `cargo fmt --all -- --check` on the Windows host: clean, after a
+  `cargo fmt --all` pass before each container run (three in all).
+- The red run, on the sources as committed plus the tests and the
+  inert scaffolding they compile against: `cargo test -p lorica-mcp
+  --lib` 1 passed 2 failed, `--test openapi_contract` 0 passed 3
+  failed, `cargo test -p lorica-api --lib` 0 passed 6 failed, on the
+  names listed under "watched failing" below.
+- The first green run: the six whole-stack tests and the unit tests
+  passed on the fixes, and three OTHER tests failed, each on the
+  harness and not on a finding: `tests/mcp_asserted_headers.rs`
+  scans `mcp.rs` up to its first `#[cfg(test)]` and the attribute on
+  `InProcessPlane::new` had moved the `impl AutomationPlane` block past
+  it; `lorica-mcp`'s `no_answer_this_server_builds_carries_a_credential_field_name`
+  found `cookie_ttl_s` in the tool list now that nested schemas are
+  published; and the new struct walk asserted that every body nests
+  something, which `BindCertificateRequest` does not. Plus the
+  renewal test's last assertion, which expected no `certificate.`
+  audit row and found the fixture's own upload row. All four
+  corrected in the tests and the constructor, none in a fix.
+- The first full gate: the product recipe refused to compile
+  `lorica-api`, `associated function new is never used`, the
+  `pub(crate)` constructor being test-only in fact; moved into the
+  test module. Clippy 1 to 3 said the same line, clippy 4 clean.
+- The second full gate: `cargo test -p lorica-mcp` 88 passed (86 ->
+  88). The README product-crate list with `--no-fail-fast` and
+  `--features otel`, the `docs/BUMP-CHECKLIST.md` recipe and a
+  superset of `cargo test -p lorica-config -p lorica-api`: 69
+  binaries, `lorica-api` lib 937 (929 -> 937), `lorica-config` 495
+  (the one pre-existing ignored), `tests/automation_scope_fixture.rs`
+  3, `tests/mcp_asserted_headers.rs` 3, `tests/mcp_catalogue_scopes.rs`
+  6, `tests/openapi_contract.rs` 11 (9 -> 11), doctests 8 + 18, the
+  sum of every `passed` 2879 with ONE failure:
+  `proxy_wiring::ai_bot_reload_tests::rebuild_from_store_swaps_global_handle`
+  in the `lorica` lib, 433 passed 1 failed. That test writes the
+  process-wide merged-crawler handle and says it is the only one that
+  does; `worker_rpc.rs`'s two-phase reload tests in the same binary
+  reach `apply_per_process_reload_state`, which rebuilds the same
+  handle from their own store. Rerun in a container of its own: the
+  module alone 7 passed, the whole `lorica` lib twice 434 passed each.
+  A pre-existing race on a global, in a crate this lot touched only to
+  name the new `AppState` field, and left as a follow-up rather than
+  fixed here. With that binary green the sum is 2880, and the
+  `ok.`-only sum plus its 434 agrees.
+- The three Lint clippy invocations and
+  `cargo clippy -p lorica-mcp --all-targets -- -D warnings`: clean on
+  the second full gate.
+- `cargo audit`: NOT run. No dependency added or bumped; `Cargo.lock`
+  is untouched (`git status` names it nowhere).
+- The third full gate, after the maintainer's `proxy_headers`
+  decision, in one container: `cargo test -p lorica-mcp` 88 passed;
+  the product recipe 69 binaries, none failed (the `lorica` lib 434
+  this time), `lorica-api` lib 938, `openapi_contract` 11, the
+  `ok.`-only sum equal to the sum of every `passed`, 2881; the four
+  clippy invocations clean; `cargo fmt --all -- --check` clean on the
+  host before it.
+- `README.md`'s product-crate test count: 2868 -> 2881 in BOTH
+  places, the shell comment and the `Lorica%20Tests-N` badge;
+  `grep -n 2868 README.md CONTRIBUTING.md` answers nothing (nor 2880,
+  the figure the second gate gave before the `proxy_headers` test).
+  The thirteen are the nine `lorica-api` lib tests, the two contract
+  tests and the two `lorica-mcp` tests this lot added.
+- `git ls-files --eol`: index `lf` on every changed file. Working tree
+  `crlf` on the files the checkout held that way and `lf` on the
+  rest, with one exception: `lorica-api/src/acme/renewal.rs` was
+  `w/crlf` and is `w/lf` after rustfmt rewrote it on the host, an
+  ending the index never held. Checked this way and not with `awk`.
+- No em dash (U+2014) in any changed file, checked with a byte grep.
+
+**Every new test was watched failing before the fix, on the sources
+as committed.** The tests were written into the suite first with the
+scaffolding they need to compile and none of the checks, run in the
+container, then the fixes landed and they were run again. What failed,
+and how:
+
+- `a_route_body_cannot_install_a_client_authentication_trust_anchor`:
+  `POST /automation/v1/routes` with `{"mtls": {"ca_cert_pem": <a CA>,
+  "required": true}}` answered 201 where a 403 was owed, the report's
+  own body installed.
+- `no_mcp_tool_body_field_takes_key_material_at_any_depth_of_its_request_struct`:
+  `lorica_route_create offers mtls, under which ca_cert_pem matches the
+  key-material marker pem`, the sweep seeing what the schema sweep
+  could not; `every_mcp_write_tool_declares_exactly_the_fields_its_handler_accepts_less_the_ones_not_offered`
+  named `mtls` as offered against its recorded reason, and
+  `every_mcp_write_tool_declares_its_nested_vocabularies_against_the_nested_structs`
+  named `mtls` as `Option<MtlsConfigRequest>, an object the tool offers
+  with no nested vocabulary`; in `lorica-mcp`,
+  `the_update_vocabulary_is_the_create_vocabulary_plus_what_only_a_patch_has`
+  said `mtls is offered`.
+- `a_certificate_binding_on_a_route_write_needs_the_certificates_write_scope`:
+  the create with `certificate_id` from a token holding `routes:write`
+  and `routes:read` answered 201.
+- `a_mistyped_dry_run_is_refused_and_never_an_apply`:
+  `POST /automation/v1/routes?dryrun=true` answered 201, the route
+  created.
+- `a_nested_typo_is_refused_at_the_tool_and_a_declared_nested_key_passes`
+  (`lorica-mcp`): `{"path_rules": [{"path": "/x", "backend_idz":
+  ["b"]}]}` built a call, the typo travelling.
+- `a_token_renews_one_certificate_at_a_time_and_not_twice_inside_the_interval`:
+  the first assertion, a renewal of a certificate whose order is in
+  flight, answered 400 (the plan's refusal of the manual method) where
+  a 409 was owed, the budget absent; the 429 assertions sit behind it
+  in the same test and were first seen passing on the fix, not
+  separately seen failing.
+- `a_preview_needs_the_read_scope_of_the_row_it_answers`:
+  `POST /automation/v1/routes?dry_run=true` from a token holding
+  `routes:write` alone answered 200, the row shown.
+- `an_ipv4_mapped_address_is_weighed_as_the_ipv4_it_maps_to`
+  (`write.rs`): `[::ffff:127.0.0.1]:80` under a `::/0` grant was
+  accepted, the report's input.
+- `a_route_body_cannot_carry_a_static_header_map_to_the_upstream`, in
+  a container of its own after the maintainer's decision: the create
+  with `proxy_headers` answered 201 where a 403 was owed; in the same
+  run `every_mcp_write_tool_declares_exactly_the_fields_its_handler_accepts_less_the_ones_not_offered`
+  and `the_update_vocabulary_is_the_create_vocabulary_plus_what_only_a_patch_has`
+  named `proxy_headers` as offered.
+
+Not watched failing, because they pin functions that did not exist
+before this lot or a shape that held already:
+`forward_auth_mirror_mtls_and_proxy_headers_are_refused_from_a_token_whatever_the_value`
+(renamed from `forward_auth_and_mirror_...` and extended twice),
+`a_certificate_id_on_a_route_write_needs_the_certificate_scope_and_a_preview_its_read_scope`,
+`a_key_that_is_not_dry_run_is_refused_rather_than_read_as_the_write`
+(`preview.rs`),
+`every_nested_vocabulary_sits_on_a_field_its_body_offers_and_is_sorted`
+(`lorica-mcp`), and the three `RateLimitedBecause` lines in
+`error.rs`'s tests.
+
+Which test guards what:
+
+- Item 1, `mtls` and the blind sweep:
+  `a_route_body_cannot_install_a_client_authentication_trust_anchor`
+  (whole stack, create, update and previews, the clearing value, the
+  dashboard's own path still setting it),
+  `no_mcp_tool_body_field_takes_key_material_at_any_depth_of_its_request_struct`
+  (the struct walk, with its positive control), the vocabulary pin and
+  `the_update_vocabulary_...` on the withdrawal.
+- Item 2, `certificate_id` under `routes:write`:
+  `a_certificate_binding_on_a_route_write_needs_the_certificates_write_scope`.
+- Item 3, the typo: `a_mistyped_dry_run_is_refused_and_never_an_apply`
+  on the plane, `a_nested_typo_is_refused_at_the_tool_and_a_declared_nested_key_passes`
+  at the tool, and `every_mcp_write_tool_declares_its_nested_vocabularies_against_the_nested_structs`
+  holding the nested lists to the structs.
+- Item 4, the renewal budget:
+  `a_token_renews_one_certificate_at_a_time_and_not_twice_inside_the_interval`,
+  all three refusals, the preview, the operator's path and the
+  management trail.
+- Item 5, the preview's read scope:
+  `a_preview_needs_the_read_scope_of_the_row_it_answers`, one entry per
+  `WRITE_SURFACE` path.
+- Item 6, the mapped address:
+  `an_ipv4_mapped_address_is_weighed_as_the_ipv4_it_maps_to`, on the
+  claim and on the stored row through the guard.
+- `proxy_headers`, the maintainer's decision:
+  `a_route_body_cannot_carry_a_static_header_map_to_the_upstream`
+  (whole stack, create, update, both previews, the clearing `{}`, the
+  dashboard still setting it), the vocabulary pin and
+  `the_update_vocabulary_...` on the withdrawal.
+
 ### Completion Notes
 
 Lot 1, 2026-09-23. The write scopes and the automation plane's write
@@ -1107,7 +1408,117 @@ architecture Medium on observability (the resource id and a
 correlation id on the MCP request row, a per-tool metric) is a design
 choice about the audit row's columns and was left as one.
 
+---
+
+Lot 4, 2026-09-23. The security Mediums and Lows lot 3 recorded rather
+than built. The finding-by-finding account is in the Dev Note "The
+Mediums and Lows were fixes, and this is what they became"; what
+follows is how it was built and what it changed beyond the findings.
+
+**Red before green, on the code as committed.** The tests were written
+first, with the scaffolding they compile against (the `RenewalLedger`
+type and its `AppState` field, the `RenewalBudget` parameter plumbed
+and inert, the `Nested` type and `ROUTE_NESTED` declared and not yet
+read by `checked_body` or `input_schema`, `mtls` named in
+`NOT_OFFERED_TO_A_MODEL` while the tools still offered it), and run in
+the container before any fix landed. Every one failed on the finding's
+own input, as the Debug Log records; then the fixes landed and they
+were run again.
+
+**Two crates, one ledger.** `lorica-api/src/acme/renewal.rs` gained
+`RenewalLedger` (in-flight ids, the CA cooldown map), `InFlightRenewal`
+(the RAII mark), `RenewalBudget` and `MIN_TOKEN_RENEWAL_INTERVAL_HOURS`,
+all re-exported from `crate::acme`; `AppState.renewals` holds one per
+process, and every `AppState` literal in the workspace (seven in
+`lorica-api`, two in the `lorica` binary's startup) names it. The
+background loop's local `rate_limit_cooldown` map is gone into the
+ledger, and `in_cooldown` and `cooldown_from_error` stay the pure
+functions the acme tests exercise, the ledger calling the first.
+`ApiError` gained `RateLimitedBecause { retry_after_s, reason }`, a 429
+that names why, mapped to the same status, code and `Retry-After` as
+`RateLimited`. `renew_certificate_as` takes the budget as a parameter
+rather than reading it off the guard, because "the guard is bounded"
+and "the actor is a token" are one fact today and two tomorrow.
+
+**The tool model grew a depth.** `Body.nested: &'static [Nested]`,
+each `Nested { field, list, fields, nested }`; `field_schemas` builds
+the object or array schema with `additionalProperties: false` at every
+level and `keys_declared` walks a body the same way, so the schema a
+client validates against and the check the server performs still read
+one declaration. The lorica-api pin
+(`every_mcp_write_tool_declares_its_nested_vocabularies_against_the_nested_structs`)
+reads seven more sources than lot 2's: the nested request modules under
+`routes/` and `lorica-config`'s `models/route.rs`, through
+`include_str!` with a relative path, since the three model structs a
+route body embeds live there. The struct scanner (`serde_field_names`)
+learned `skip_deserializing`, and `serde_fields_with_types` keeps the
+declared type beside each name so the pin can follow it into the next
+struct and tell a `Vec` from a single object. The published
+`bot_protection.cookie_ttl_s` carries the word `cookie`, so the two
+credential-word sweeps in `lorica-mcp` skip exactly that name through
+one `#[cfg(test)]` constant with its reason
+(`NAMED_FOR_A_LIFETIME_NOT_A_CREDENTIAL`), rather than dropping the
+word.
+
+**`write.rs` stays the one place the scope rules are spelled.**
+`ensure_certificate_binding_granted` and `ensure_preview_readable`
+sit beside `ensure_hostnames_granted`; `refuse_unbounded_reach` took
+`mtls` as its third field. `DryRunQuery::mode()` was added so a
+handler can read the mode before handing the query on. The
+environment resource's `ensure_backend_address_granted` weighs
+`to_canonical()`, so the fix reaches the environment `PUT` as well as
+the backend writes and the target guard.
+
+**Two Infos taken along.** `InProcessPlane` has no production
+constructor any more: `new` lives in the module's test block, and the
+struct literal in `mcp_endpoint`, built from the principal the outer
+gate installed, is the one way a plane is made. Two cuts came before
+that one: `#[cfg(test)]` on the method moved the `impl AutomationPlane`
+block past the `#[cfg(test)]` split `tests/mcp_asserted_headers.rs`
+scans the module by, and that test caught it; `pub(crate)` alone left
+the method unused in the non-test build, which `-D warnings` refused
+in the product gate. The management API's
+`?dry_run` remains an ordinary write, as the report's own remediation
+says; the `DryRun` parameter's description now says the query is
+strict on this plane.
+
+**`proxy_headers`, the maintainer's decision.** Withheld on the same
+shape as the other four: a fourth argument to `refuse_unbounded_reach`
+(403, "a static header map to the upstream is where a credential would
+go"), out of both route vocabularies, into `NOT_OFFERED_TO_A_MODEL`
+with that reason, and a whole-stack sibling of the `mtls` test,
+`a_route_body_cannot_carry_a_static_header_map_to_the_upstream`, on
+create, update, both previews, the clearing `{}`, with the dashboard
+still setting it. Red before the refusal existed: the create answered
+201, and the two pins named the field as offered.
+
+**Not done, and named.** The request structs stay lenient to unknown
+keys, for the reason in the Dev Note. `openapi-automation.yaml` describes the new
+refusals on the three operations they land on and on the `DryRun`
+parameter; it does not restate the nested vocabularies, which are the
+tools' schema and the pin's.
+
 ## File List
+
+Added in lot 4: nothing.
+
+Modified in lot 4:
+
+- `lorica-api/src/automation/write.rs`, `.../environments.rs`,
+  `.../mcp.rs`
+- `lorica-api/src/acme/renewal.rs`, `lorica-api/src/acme/mod.rs`,
+  `lorica-api/src/acme/tests.rs`
+- `lorica-api/src/error.rs`, `lorica-api/src/preview.rs`,
+  `lorica-api/src/server.rs`
+- `lorica-api/src/tests.rs`, `lorica-api/src/automation/audit.rs`,
+  `lorica-api/src/automation_tokens/tests.rs`,
+  `lorica-api/src/oidc_issuers/tests.rs` (the `AppState` literals)
+- `lorica-api/tests/openapi_contract.rs`
+- `lorica-api/openapi-automation.yaml`
+- `lorica-mcp/src/tools.rs`, `lorica-mcp/src/server.rs`
+- `lorica/src/startup/single.rs`, `lorica/src/startup/supervisor.rs`
+- `CHANGELOG.md`, `README.md`, `docs/mcp.md`, `docs/automation.md`
+- `docs/stories/story-11.2-config-tier.md`
 
 Added in lot 3:
 
@@ -1173,6 +1584,25 @@ Modified in lot 1:
 - `docs/stories/story-11.2-config-tier.md`
 
 ## Change Log
+
+- 2026-09-23: Lot 4, the security Mediums and Lows lot 3 had recorded.
+  `mtls` refused from a token, withdrawn from the tools and named as a
+  client-authentication trust anchor; the key-material sweep walks the
+  request structs into every struct they nest, with a positive control.
+  `certificate_id` on a route write needs `certificates:write`.
+  `DryRunQuery` is `deny_unknown_fields`, so a mistyped `?dry_run` is a
+  400; the MCP tools carry their key check into every nested object a
+  route body declares, each vocabulary pinned against its struct. A
+  renewal from a token is budgeted per certificate (409 in flight, 429
+  inside 48 hours of issuance, 429 during a CA cooldown) on a ledger
+  the background loop and the manual path share. A preview needs the
+  read scope of the row it answers. An IPv4-mapped IPv6 address is
+  weighed as the IPv4 it maps to. `InProcessPlane::new` is test-only.
+  Both documents and the automation OpenAPI corrected.
+  Seven whole-stack tests and one unit test in `lorica-api`, each
+  watched failing before the fix on the finding's own input;
+  `proxy_headers` withheld from the model the same day, by the
+  maintainer's decision, on the same shape as `mtls`.
 
 - 2026-09-23: Lot 3, the audit findings on the tier. The security
   Critical: the grants bounded what a write claimed and never what it

@@ -892,10 +892,17 @@ paths:
         `allowed_hostnames` (403); a wildcard alias is refused outright,
         because the grant is checked one exact host at a time.
         `managed_by` is refused (422) as it is on the management path.
+        `forward_auth`, `mirror`, `mtls` and `proxy_headers` are refused
+        from a token whatever their value (403): a URL the CIDR grant
+        cannot weigh, a copy of every request to a second set of
+        backends, the route's client-authentication trust anchor, and a
+        static header map to the upstream where a credential would go.
+        `certificate_id` needs `certificates:write` beside
+        `routes:write` (403).
 
 
-        With `?dry_run=true`, the route it would have created, and
-        nothing created (200): see `DryRun`.
+        With `?dry_run=true`, which needs `routes:read` (403), the route
+        it would have created, and nothing created (200): see `DryRun`.
 
 
         Required scope: `routes:write`.
@@ -978,12 +985,16 @@ paths:
         token: a patch of the fields sent and nothing else, with a
         `route.update` audit row naming the token. A route an
         environment owns answers 409 naming the environment, exactly as
-        there. A hostname or an alias in the patch must be inside the
-        token's `allowed_hostnames` (403).
+        there. The route named, on its current hostname and aliases, and
+        a hostname or an alias in the patch must be inside the token's
+        `allowed_hostnames` (403). `forward_auth`, `mirror`, `mtls` and
+        `proxy_headers` are refused from a token whatever their value
+        (403), and `certificate_id` needs `certificates:write` beside
+        `routes:write` (403).
 
 
-        With `?dry_run=true`, the route before and after the patch, and
-        nothing changed: see `DryRun`.
+        With `?dry_run=true`, which needs `routes:read` (403), the route
+        before and after the patch, and nothing changed: see `DryRun`.
 
 
         Required scope: `routes:write`.
@@ -1165,8 +1176,20 @@ paths:
         least of all.
 
 
-        With `?dry_run=true`, the metadata of the certificate that would
-        be renewed, after the ACME-only refusal, and no order made: see
+        A token renews one certificate at a time and not twice in a
+        row: 409 while an order for this certificate is open, on any
+        path; 429 with a `Retry-After` when the certificate was issued
+        less than 48 hours ago, read off its own `not_before`; 429 while
+        the background renewal loop holds it in a CA rate-limit
+        cooldown. Each order spends the CA's per-name budget and rotates
+        the node's bot-protection HMAC, and the per-token call budget
+        counts calls, not orders. An operator's session on the
+        management path is bounded by none of it.
+
+
+        With `?dry_run=true`, which needs `certificates:read` (403), the
+        metadata of the certificate that would be renewed, after the
+        ACME-only refusal and the budget, and no order made: see
         `DryRun`.
 
 
@@ -1193,6 +1216,23 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/ManagementRefusal"
+        "409":
+          description: A renewal of this certificate is in flight, on this path, the management path or the background loop. One order per certificate at a time.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: The certificate was issued less than 48 hours ago, or the CA's rate limit refused an order for it and the cooldown has not ended. `Retry-After` carries the seconds to wait; the message names the certificate and which of the two it is.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Seconds until a renewal of this certificate is accepted again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "500":
           description: The ACME order failed; the message says why, and the stored certificate is untouched.
           content:
@@ -1378,7 +1418,17 @@ components:
         duplicate hostname, a backend id that names nothing) is refused
         by the apply and not by the dry run. The token's grants are
         checked first either way (403), so a dry run never shows a change
-        the apply would refuse on the grant.
+        the apply would refuse on the grant. A dry run answers the full
+        row it would change, so it needs the read scope of that row
+        beside the write scope: `routes:read` for a route or a
+        certificate binding, `backends:read` for a backend,
+        `certificates:read` for a renewal (403 naming the scope).
+
+
+        The query is strict: a key that is not `dry_run` is a 400, so
+        `?dryrun=true` or `?dry-run=true` typed by hand is refused rather
+        than applied. `dry_run` itself takes `true` or `false` and
+        nothing else.
 
 
         This is the preview the MCP config tier's `*_preview` tools call
