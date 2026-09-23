@@ -187,7 +187,75 @@ fn declaration(method: &http::Method, path: &str) -> Option<(&'static str, Scope
         }
     }
 
+    // The write surface (Story 11.2). Each entry is one management
+    // write behind its own write scope, consulted for the one verb the
+    // router mounts it under and for no other; a read scope reaches
+    // none of them, and `GET` is never consulted here.
+    if let Some((template, scope)) = write_declaration(method, path) {
+        return Some((template, ScopeRequirement::Scope(scope)));
+    }
+
     None
+}
+
+/// The template and the scope behind each `(verb, path)` of the write
+/// surface, or `None` for a pair that is not one of them.
+///
+/// Write-only by construction: a `GET` is answered `None` before any
+/// path is looked at, so the read surface cannot inherit a write scope
+/// from here, and each arm names its verb, so a verb the router does
+/// not mount stays undeclared and refused for every token.
+///
+/// What is absent is absent on purpose (Story 11.2 AC #6): no verb on
+/// the certificate collection, no `PUT` on one certificate, nothing
+/// under `self-signed`. Those are the management paths that accept a
+/// PEM body, and key material enters this node through the management
+/// API, by a human, never through a token.
+fn write_declaration(method: &http::Method, path: &str) -> Option<(&'static str, AutomationScope)> {
+    use http::Method;
+    if *method == Method::GET {
+        return None;
+    }
+    let is_post = *method == Method::POST;
+    let is_put = *method == Method::PUT;
+    let is_put_or_delete = is_put || *method == Method::DELETE;
+
+    if is_post && path == ROUTES_PATH {
+        return Some((ROUTES_PATH, AutomationScope::RoutesWrite));
+    }
+    if is_put_or_delete && one_segment_under(path, ROUTES_PATH) {
+        return Some((ROUTE_TEMPLATE, AutomationScope::RoutesWrite));
+    }
+    if is_put && one_resource_action(path, ROUTES_PATH, "certificate") {
+        return Some((
+            ROUTE_CERTIFICATE_TEMPLATE,
+            AutomationScope::CertificatesWrite,
+        ));
+    }
+    if is_post && path == BACKENDS_PATH {
+        return Some((BACKENDS_PATH, AutomationScope::BackendsWrite));
+    }
+    if is_put_or_delete && one_segment_under(path, BACKENDS_PATH) {
+        return Some((BACKEND_TEMPLATE, AutomationScope::BackendsWrite));
+    }
+    if is_post && one_resource_action(path, CERTIFICATES_PATH, "renew") {
+        return Some((
+            CERTIFICATE_RENEW_TEMPLATE,
+            AutomationScope::CertificatesWrite,
+        ));
+    }
+    None
+}
+
+/// Whether `path` is `<collection>/<id>/<action>` with a non-empty,
+/// single-segment id: one named resource and one verb on it, which is
+/// the only shape a write on a sub-resource takes on this plane.
+fn one_resource_action(path: &str, collection: &str, action: &str) -> bool {
+    path.strip_prefix(collection)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_suffix(action))
+        .and_then(|id_and_slash| id_and_slash.strip_suffix('/'))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// The template and the scope behind each path of the read surface, or
@@ -266,14 +334,30 @@ const SLA_ROUTE_TEMPLATE: &str = "/automation/v1/sla/routes/{id}";
 /// `Viewer` on both planes.
 pub(super) const CLUSTER_STATUS_PATH: &str = "/automation/v1/cluster/status";
 
-/// The backend listing.
+/// The backend listing, and the backend create.
 pub(super) const BACKENDS_PATH: &str = "/automation/v1/backends";
 
-/// The route listing.
+/// How `openapi-automation.yaml` spells one backend, and how the
+/// metric labels it.
+const BACKEND_TEMPLATE: &str = "/automation/v1/backends/{id}";
+
+/// The route listing, and the route create.
 pub(super) const ROUTES_PATH: &str = "/automation/v1/routes";
+
+/// How `openapi-automation.yaml` spells one route, and how the metric
+/// labels it.
+const ROUTE_TEMPLATE: &str = "/automation/v1/routes/{id}";
+
+/// How `openapi-automation.yaml` spells one route's certificate
+/// binding, and how the metric labels it.
+const ROUTE_CERTIFICATE_TEMPLATE: &str = "/automation/v1/routes/{id}/certificate";
 
 /// Certificate metadata; never a PEM body and never key material.
 pub(super) const CERTIFICATES_PATH: &str = "/automation/v1/certificates";
+
+/// How `openapi-automation.yaml` spells one certificate's renewal, and
+/// how the metric labels it.
+const CERTIFICATE_RENEW_TEMPLATE: &str = "/automation/v1/certificates/{id}/renew";
 
 /// Axum middleware enforcing [`required_scope`] against the
 /// authenticated principal.
@@ -343,6 +427,9 @@ pub(super) fn scope_str(scope: AutomationScope) -> &'static str {
         AutomationScope::SlaRead => "sla:read",
         AutomationScope::ClusterRead => "cluster:read",
         AutomationScope::BackendsRead => "backends:read",
+        AutomationScope::RoutesWrite => "routes:write",
+        AutomationScope::BackendsWrite => "backends:write",
+        AutomationScope::CertificatesWrite => "certificates:write",
     }
 }
 
@@ -375,10 +462,78 @@ pub(crate) const READ_SURFACE: &[(&str, AutomationScope)] = &[
     ),
 ];
 
+/// Every `(verb, path)` of the write surface beside the scope it sits
+/// behind, as a request a test can actually send.
+///
+/// The same statement [`READ_SURFACE`] makes for the reads, for the
+/// same reason: spelled out rather than read back from
+/// [`write_declaration`], walked by this module's matrix tests and by
+/// the write-surface tests in `crate::tests` alike, so a write path
+/// added to the matrix and forgotten in either place fails in the
+/// other. The verb is a `&str` and not an `http::Method` so the list
+/// can be a `const` without a question about drop glue.
+#[cfg(test)]
+pub(crate) const WRITE_SURFACE: &[(&str, &str, AutomationScope)] = &[
+    (
+        "POST",
+        "/automation/v1/routes",
+        AutomationScope::RoutesWrite,
+    ),
+    (
+        "PUT",
+        "/automation/v1/routes/r-1",
+        AutomationScope::RoutesWrite,
+    ),
+    (
+        "DELETE",
+        "/automation/v1/routes/r-1",
+        AutomationScope::RoutesWrite,
+    ),
+    (
+        "PUT",
+        "/automation/v1/routes/r-1/certificate",
+        AutomationScope::CertificatesWrite,
+    ),
+    (
+        "POST",
+        "/automation/v1/backends",
+        AutomationScope::BackendsWrite,
+    ),
+    (
+        "PUT",
+        "/automation/v1/backends/b-1",
+        AutomationScope::BackendsWrite,
+    ),
+    (
+        "DELETE",
+        "/automation/v1/backends/b-1",
+        AutomationScope::BackendsWrite,
+    ),
+    (
+        "POST",
+        "/automation/v1/certificates/c-1/renew",
+        AutomationScope::CertificatesWrite,
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use http::Method;
+
+    /// The verb of one [`WRITE_SURFACE`] entry.
+    fn verb(spelled: &str) -> Method {
+        spelled.parse().expect("the write surface spells its verbs")
+    }
+
+    /// What the write surface declares for `(method, path)`, or `None`
+    /// when it declares nothing there.
+    fn written(method: &Method, path: &str) -> Option<ScopeRequirement> {
+        WRITE_SURFACE
+            .iter()
+            .find(|(spelled, written_path, _)| verb(spelled) == *method && *written_path == path)
+            .map(|(_, _, scope)| ScopeRequirement::Scope(*scope))
+    }
 
     #[test]
     fn whoami_is_reachable_by_any_live_token_and_only_on_get() {
@@ -472,20 +627,29 @@ mod tests {
     /// already installed, against a handler that answers on every path
     /// the caller reaches.
     async fn through_the_layer(principal: AutomationPrincipal, path: &str) -> http::StatusCode {
+        through_the_layer_with(Method::GET, principal, path).await
+    }
+
+    /// [`through_the_layer`] for any verb.
+    async fn through_the_layer_with(
+        method: Method,
+        principal: AutomationPrincipal,
+        path: &str,
+    ) -> http::StatusCode {
         use axum::body::Body;
-        use axum::routing::get;
+        use axum::routing::any;
         use axum::{Extension, Router};
         use http::Request;
         use tower::ServiceExt;
 
         let app = Router::new()
-            .route(path, get(|| async { "reached" }))
+            .route(path, any(|| async { "reached" }))
             .layer(axum::middleware::from_fn(authorize_scope))
             .layer(Extension(principal));
 
         app.oneshot(
             Request::builder()
-                .method(Method::GET)
+                .method(method)
                 .uri(path)
                 .body(Body::empty())
                 .expect("test setup: request builds"),
@@ -548,11 +712,130 @@ mod tests {
                 "{path}"
             );
             // The read tier exists to be unable to change anything. A
-            // verb the router does not mount must inherit nothing from
-            // a rule written about a read.
+            // verb on a read path is either one the write surface
+            // declares, behind a write scope of its own, or nothing: a
+            // rule written about a read grants no other verb.
             for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
-                assert_eq!(required_scope(&method, path), None, "{method} {path}");
+                assert_eq!(
+                    required_scope(&method, path),
+                    written(&method, path),
+                    "{method} {path}"
+                );
             }
+        }
+    }
+
+    #[test]
+    fn every_write_path_declares_its_scope_on_its_verb_and_on_no_other() {
+        for (spelled, path, scope) in WRITE_SURFACE {
+            let method = verb(spelled);
+            assert_eq!(
+                required_scope(&method, path),
+                Some(ScopeRequirement::Scope(*scope)),
+                "{method} {path}"
+            );
+            assert!(
+                scope_str(*scope).ends_with(":write"),
+                "{method} {path} sits behind {}, which is not a write scope",
+                scope_str(*scope)
+            );
+            // `GET` on a write path is the read surface's business or
+            // nobody's; it never inherits the write scope.
+            assert_ne!(
+                required_scope(&Method::GET, path),
+                Some(ScopeRequirement::Scope(*scope)),
+                "GET {path} inherits the write scope"
+            );
+            for other in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+                if other == method {
+                    continue;
+                }
+                assert_eq!(
+                    required_scope(&other, path),
+                    written(&other, path),
+                    "{other} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_path_that_takes_key_material_is_declared_for_any_verb() {
+        // Story 11.2 AC #6. The management paths that accept a PEM body
+        // are the certificate create, the self-signed generate and the
+        // single-certificate update. None of them is declared here for
+        // any verb, so none is reachable by any token, whatever it
+        // carries; the binding and the renewal are the only certificate
+        // writes on this plane.
+        for (method, path) in [
+            (Method::POST, "/automation/v1/certificates"),
+            (Method::PUT, "/automation/v1/certificates"),
+            (Method::POST, "/automation/v1/certificates/self-signed"),
+            (Method::PUT, "/automation/v1/certificates/c-1"),
+            (Method::POST, "/automation/v1/certificates/c-1"),
+            (Method::DELETE, "/automation/v1/certificates/c-1"),
+            (Method::GET, "/automation/v1/certificates/c-1/download"),
+            (Method::POST, "/automation/v1/acme/provision"),
+        ] {
+            assert_eq!(required_scope(&method, path), None, "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn a_write_on_a_sub_resource_names_exactly_one_resource() {
+        let bind = Some(ScopeRequirement::Scope(AutomationScope::CertificatesWrite));
+        assert_eq!(
+            required_scope(&Method::PUT, "/automation/v1/routes/r-1/certificate"),
+            bind
+        );
+        // The OpenAPI gate asks with the parameter normalised away.
+        assert_eq!(
+            required_scope(&Method::PUT, "/automation/v1/routes/{}/certificate"),
+            bind
+        );
+        for path in [
+            "/automation/v1/routes//certificate",
+            "/automation/v1/routes/r-1/x/certificate",
+            "/automation/v1/routes/r-1/certificate/",
+            "/automation/v1/certificates//renew",
+            "/automation/v1/certificates/c-1/renew/now",
+        ] {
+            assert_eq!(required_scope(&Method::PUT, path), None, "PUT {path}");
+            assert_eq!(required_scope(&Method::POST, path), None, "POST {path}");
+        }
+        // `routes/certificate` is a route whose id is `certificate`,
+        // one segment under the collection, and a route update is what
+        // the matrix says it is; the binding needs the action segment
+        // after the id.
+        assert_eq!(
+            required_scope(&Method::PUT, "/automation/v1/routes/certificate"),
+            Some(ScopeRequirement::Scope(AutomationScope::RoutesWrite))
+        );
+    }
+
+    #[tokio::test]
+    async fn no_write_path_is_reachable_by_a_token_holding_every_other_scope() {
+        // Each write refused by the widest token that lacks exactly its
+        // own grant, through the layer: a token carrying every read
+        // scope there is, the environment write included, reaches no
+        // route, backend or certificate write.
+        for (spelled, path, scope) in WRITE_SURFACE {
+            let everything_else: Vec<AutomationScope> = AutomationScope::ALL
+                .iter()
+                .copied()
+                .filter(|held| held != scope)
+                .collect();
+            assert_eq!(
+                through_the_layer_with(verb(spelled), principal_carrying(everything_else), path)
+                    .await,
+                http::StatusCode::FORBIDDEN,
+                "{spelled} {path}"
+            );
+            assert_eq!(
+                through_the_layer_with(verb(spelled), principal_carrying(vec![*scope]), path).await,
+                http::StatusCode::OK,
+                "{spelled} {path}"
+            );
         }
     }
 
@@ -648,6 +931,26 @@ mod tests {
                 "{path} is declared and has no template"
             );
         }
+        for (spelled, path, _scope) in WRITE_SURFACE {
+            let template = path_template(&verb(spelled), path);
+            assert!(
+                template.is_some(),
+                "{spelled} {path} is declared and has no template"
+            );
+            assert!(
+                !template
+                    .is_some_and(|t| t.contains("r-1") || t.contains("b-1") || t.contains("c-1")),
+                "{spelled} {path} labels the metric with the caller's own id: {template:?}"
+            );
+        }
+        assert_eq!(
+            path_template(&Method::PUT, "/automation/v1/routes/r-1/certificate"),
+            Some("/automation/v1/routes/{id}/certificate")
+        );
+        assert_eq!(
+            path_template(&Method::POST, "/automation/v1/certificates/c-1/renew"),
+            Some("/automation/v1/certificates/{id}/renew")
+        );
         // Undeclared is unlabelled, the same way it is unreachable.
         assert_eq!(path_template(&Method::GET, "/automation/v1/tokens"), None);
     }

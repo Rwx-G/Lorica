@@ -2017,7 +2017,10 @@ export type AutomationScope =
   | 'waf:read'
   | 'sla:read'
   | 'cluster:read'
-  | 'backends:read';
+  | 'backends:read'
+  | 'routes:write'
+  | 'backends:write'
+  | 'certificates:write';
 
 /**
  * One automation token as the API renders it. There is no field for

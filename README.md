@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/version-1.8.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-2814-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-2830-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-748-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -123,7 +123,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :globe_with_meridians: Management
 
 - **Multi-node cluster** (v1.7.0) - one control plane, any number of followers over mutual TLS with a fleet CA; short-lived join tokens bound to a node name, explicit activation, two-phase configuration replication with per-node route targeting, fleet-wide certificate issuance with need-to-know key distribution, and access logs / WAF events / bans / audit trail aggregated per node with one verifiable hash chain each. Followers are read-only with an audited break-glass window. See `docs/cluster.md`
-- **CI automation API** (v1.8.0) - a second listener, `--automation-listen`, off by default, so a pipeline can configure Lorica while the management API stays on loopback. A source-CIDR allowlist (`automation_allowed_cidrs`, mandatory) is enforced at TCP accept before the TLS handshake, followed by the cluster plane's pre-authentication budgets; requests authenticate with `Authorization: Bearer` only, there is no session, cookie or CSRF path, and every one is audited. Tokens are scoped (`environments:write`, `environments:read`, `routes:read`, `certificates:read`), bound to hostname patterns and backend CIDRs, minted once on the management plane (never through the listener) and stored as an HMAC. One idempotent `PUT /automation/v1/environments/{name}` creates or replaces a route, its backends and a covering certificate in a single transaction and answers with the public URL; a TTL capped by the token and a reaper remove what the pipeline forgot, and the routes and backends it owns are read-only in the dashboard. Runs on a standalone node or the control plane, never on a follower. Optional GitLab OIDC mode (Story 10.5): the job's own ID token, RS256 with a pinned issuer and audience, bound claims on project, ref and environment, and replay protection, replaces the shared secret in CI variables. See `docs/automation.md`
+- **CI automation API** (v1.8.0) - a second listener, `--automation-listen`, off by default, so a pipeline can configure Lorica while the management API stays on loopback. A source-CIDR allowlist (`automation_allowed_cidrs`, mandatory) is enforced at TCP accept before the TLS handshake, followed by the cluster plane's pre-authentication budgets; requests authenticate with `Authorization: Bearer` only, there is no session, cookie or CSRF path, and every one is audited. Tokens carry scopes from a closed enum (read and write, the full list and what each one reaches in `docs/automation.md`), bound to hostname patterns and backend CIDRs, minted once on the management plane (never through the listener) and stored as an HMAC. One idempotent `PUT /automation/v1/environments/{name}` creates or replaces a route, its backends and a covering certificate in a single transaction and answers with the public URL; a TTL capped by the token and a reaper remove what the pipeline forgot, and the routes and backends it owns are read-only in the dashboard. Runs on a standalone node or the control plane, never on a follower. Optional GitLab OIDC mode (Story 10.5): the job's own ID token, RS256 with a pinned issuer and audience, bound claims on project, ref and environment, and replay protection, replaces the shared secret in CI variables. See `docs/automation.md`
 - **Multi-user RBAC** (v1.6.0) - team accounts with three roles: `super_admin` (users, settings, config import, upgrades, fleet mutations), `operator` (full CRUD on routes, backends, certificates, WAF, SLA, probes, load tests, cache, bans; fleet reads) and `viewer` (read-only, secrets masked, fleet views hidden). Any role change, disable or password reset ends the target's sessions at once
 - **Web dashboard** - Svelte 5 UI (~59 KB) embedded in the binary: routes, backends, certs, WAF, SLA, load tests, capture, cluster, team, settings
 - **REST API** - full CRUD for all entities, session-based auth, rate-limited login, a single fail-closed authorization middleware, OpenAPI description in `lorica-api/openapi.yaml`; the automation plane has its own, `lorica-api/openapi-automation.yaml`, because it is a different socket with a different credential
@@ -711,7 +711,7 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (2814 tests, Lorica-native)
+# Product crates only (2830 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-limits -p lorica-shmem \

@@ -127,10 +127,14 @@ fn every_mcp_tool_names_the_scope_its_path_sits_behind() {
 }
 
 #[test]
-fn every_mcp_tool_reads_a_path_this_plane_declares_for_get_and_for_nothing_else() {
+fn every_mcp_tool_reads_a_path_this_plane_declares_for_get_and_no_read_scope_reaches_another_verb()
+{
     // The tier exists to be unable to change anything. The catalogue
     // says every path is a GET; this says the plane agrees, which is the
-    // half the catalogue cannot assert about itself.
+    // half the catalogue cannot assert about itself: on a read tool's
+    // path, any other verb is either undeclared or behind a write scope
+    // of its own (Story 11.2 mounts `POST` on two of the collections),
+    // never behind a read scope and never open to any live token.
     for spec in CATALOGUE {
         let path = path_of(spec);
         assert!(
@@ -144,12 +148,20 @@ fn every_mcp_tool_reads_a_path_this_plane_declares_for_get_and_for_nothing_else(
             http::Method::DELETE,
             http::Method::PATCH,
         ] {
-            assert_eq!(
-                required_scope(&method, &path),
-                None,
-                "{} reads {path}, and the plane declares it for {method} as well",
-                spec.name
-            );
+            match required_scope(&method, &path) {
+                None => {}
+                Some(ScopeRequirement::Scope(scope)) => assert!(
+                    wire_name(scope).ends_with(":write"),
+                    "{} reads {path}, and the plane declares it for {method} behind the read \
+                     scope {}",
+                    spec.name,
+                    wire_name(scope)
+                ),
+                Some(ScopeRequirement::AnyLiveToken) => panic!(
+                    "{} reads {path}, and the plane opens {method} on it to any live token",
+                    spec.name
+                ),
+            }
         }
     }
 }
@@ -213,7 +225,13 @@ fn the_scopes_the_catalogue_uses_are_the_read_half_of_the_vocabulary() {
         outside,
         BTreeSet::from([
             "environments:read".to_string(),
-            "environments:write".to_string()
+            "environments:write".to_string(),
+            // Story 11.2's config tier. The write paths they gate are on
+            // the plane; the tools over them are that story's lot 2, and
+            // a read-tier catalogue must never name them.
+            "routes:write".to_string(),
+            "backends:write".to_string(),
+            "certificates:write".to_string(),
         ]),
         "a scope moved: either give it a read tool or add it to this complement, \
          deliberately"

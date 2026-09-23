@@ -78,6 +78,43 @@ tags:
       Nothing here mutates, and the scope gate declares these paths for
       `GET` alone, so a verb the router does not mount inherits no
       grant from a rule written about a read.
+  - name: Writes
+    description: >-
+      The write surface (Story 11.2): routes, backends and certificate
+      bindings, each behind its own write scope (`routes:write`,
+      `backends:write`, `certificates:write`). This is the reversal of
+      Story 10.3's decision that the automation surface is the
+      environment resource and never the management API behind a
+      different door, taken for the MCP config tier and recorded in the
+      Epic 10 PRD beside the decision it reverses.
+
+
+      Every path here runs the management API's own handler with the
+      token as the actor: the same validators the dashboard runs, the
+      same defaults, the same managed-row refusal and the same audit row
+      (`route.create`, `backend.update`, ...) naming the token under the
+      role `automation`, beside the `automation.request.ok` row every
+      request on this plane lands. A refusal names the field the way the
+      management path names it, and the row written is the row the
+      dashboard would have written. Nothing here reimplements a field
+      check, which is what keeps the two surfaces from drifting.
+
+
+      What this plane adds is the token's own grant, before the handler
+      runs and before anything is written: every hostname a route write
+      claims, aliases included, must be inside the token's
+      `allowed_hostnames` (403, and a wildcard is refused outright), and
+      every address a backend write points at must be an `ip:port` (422,
+      since a name cannot be checked against a CIDR) inside its
+      `allowed_backend_cidrs` (403). They are the two grants the
+      environment resource already applies, through the same functions.
+
+
+      One named resource per call, by id. No pattern, no selector, no
+      bulk. And no key material anywhere: no path on this listener
+      accepts a PEM body, a private key or a certificate upload. A
+      certificate is bound to a route and renewed here; it enters the
+      node through the management API, by a human.
   - name: Environments
     description: >-
       The environment resource (Story 10.4): a route, its backends, a
@@ -673,6 +710,47 @@ paths:
           $ref: "#/components/responses/Forbidden"
 
   /automation/v1/backends:
+    post:
+      tags: [Writes]
+      summary: Create a backend
+      description: >-
+        `POST /api/v1/backends` on the management API, run as the token:
+        the same body, the same validators, the same 201 with the same
+        view, and a `backend.create` audit row naming the token.
+
+
+        The address must be an `ip:port` (422): a name cannot be
+        checked against `allowed_backend_cidrs`, and every address must
+        be inside that grant (403). `managed_by` is refused (422) as it
+        is on the management path.
+
+
+        Required scope: `backends:write`.
+      operationId: automationCreateBackend
+      x-required-scope: backends:write
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagementBackendCreate"
+      responses:
+        "201":
+          description: Created; the backend as `GET /api/v1/backends/{id}` reports it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ManagementRefusal"
     get:
       tags: [Reads]
       summary: The configured backends
@@ -702,7 +780,132 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /automation/v1/backends/{id}:
+    put:
+      tags: [Writes]
+      summary: Update one backend
+      description: >-
+        `PUT /api/v1/backends/{id}` on the management API, run as the
+        token: a patch of the fields sent and nothing else, with a
+        `backend.update` audit row naming the token. A backend an
+        environment owns answers 409 naming the environment, exactly as
+        there. An `address` in the patch is checked against
+        `allowed_backend_cidrs` as on create.
+
+
+        Required scope: `backends:write`.
+      operationId: automationUpdateBackend
+      x-required-scope: backends:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagementBackendUpdate"
+      responses:
+        "200":
+          description: Updated; the backend as the management path reports it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "409":
+          $ref: "#/components/responses/ManagedRow"
+        "422":
+          $ref: "#/components/responses/ManagementRefusal"
+    delete:
+      tags: [Writes]
+      summary: Delete one backend
+      description: >-
+        `DELETE /api/v1/backends/{id}` on the management API, run as the
+        token: the graceful drain (the row leaves once its connections
+        are gone or after 60 s), and a `backend.delete` audit row naming
+        the token. A backend an environment owns answers 409: removing
+        one member of an environment's set is an edit of that set,
+        which only the pipeline owns.
+
+
+        Required scope: `backends:write`.
+      operationId: automationDeleteBackend
+      x-required-scope: backends:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Draining, or deleted at once when it was already draining.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "409":
+          $ref: "#/components/responses/ManagedRow"
+
   /automation/v1/routes:
+    post:
+      tags: [Writes]
+      summary: Create a route
+      description: >-
+        `POST /api/v1/routes` on the management API, run as the token:
+        the same body, the same validators, the same defaults, the same
+        201 with the same view, and a `route.create` audit row naming
+        the token. The route created is, field for field, the route the
+        dashboard would have created from the same body.
+
+
+        The hostname and every alias must be inside the token's
+        `allowed_hostnames` (403); a wildcard alias is refused outright,
+        because the grant is checked one exact host at a time.
+        `managed_by` is refused (422) as it is on the management path.
+
+
+        Required scope: `routes:write`.
+      operationId: automationCreateRoute
+      x-required-scope: routes:write
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagementRouteCreate"
+      responses:
+        "201":
+          description: Created; the route as `GET /api/v1/routes/{id}` reports it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/ManagementRefusal"
+        "422":
+          $ref: "#/components/responses/ManagementRefusal"
     get:
       tags: [Reads]
       summary: The configured routes
@@ -744,6 +947,134 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /automation/v1/routes/{id}:
+    put:
+      tags: [Writes]
+      summary: Update one route
+      description: >-
+        `PUT /api/v1/routes/{id}` on the management API, run as the
+        token: a patch of the fields sent and nothing else, with a
+        `route.update` audit row naming the token. A route an
+        environment owns answers 409 naming the environment, exactly as
+        there. A hostname or an alias in the patch must be inside the
+        token's `allowed_hostnames` (403).
+
+
+        Required scope: `routes:write`.
+      operationId: automationUpdateRoute
+      x-required-scope: routes:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagementRouteUpdate"
+      responses:
+        "200":
+          description: Updated; the route as the management path reports it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "409":
+          $ref: "#/components/responses/ManagedRow"
+        "422":
+          $ref: "#/components/responses/ManagementRefusal"
+    delete:
+      tags: [Writes]
+      summary: Delete one route
+      description: >-
+        `DELETE /api/v1/routes/{id}` on the management API, run as the
+        token, with a `route.delete` audit row naming the token. A route
+        an environment owns is deletable there and therefore here, and
+        takes the environment with it; the audit row names the
+        environment.
+
+
+        Required scope: `routes:write`.
+      operationId: automationDeleteRoute
+      x-required-scope: routes:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+
+  /automation/v1/routes/{id}/certificate:
+    put:
+      tags: [Writes]
+      summary: Bind a certificate to one route
+      description: >-
+        Binds a stored certificate to a route: the one-field patch
+        `PUT /api/v1/routes/{id}` would make with `certificate_id`,
+        through the same handler, with the same `route.update` audit row
+        naming the token and the same 409 for a route an environment
+        owns. Selecting a certificate is naming its id here; the
+        listing at `GET /automation/v1/certificates` is where an id
+        comes from.
+
+
+        The empty string unbinds, and clears `force_https` with it, as
+        the management path reads that value. The body takes the id and
+        nothing else: a field that is not `certificate_id`, a PEM field
+        included, is a 422. Key material does not cross this listener.
+
+
+        Required scope: `certificates:write`.
+      operationId: automationBindCertificate
+      x-required-scope: certificates:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BindCertificateRequest"
+      responses:
+        "200":
+          description: Bound; the route as the management path reports it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "409":
+          $ref: "#/components/responses/ManagedRow"
+        "422":
+          $ref: "#/components/responses/ManagementRefusal"
+
   /automation/v1/certificates:
     get:
       tags: [Reads]
@@ -778,6 +1109,53 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/certificates/{id}/renew:
+    post:
+      tags: [Writes]
+      summary: Renew one ACME certificate
+      description: >-
+        `POST /api/v1/certificates/{id}/renew` on the management API,
+        run as the token: an ACME order for a row the node already
+        holds, renewed in place under the same id so every route bound
+        to it keeps serving, with a `certificate.renew` audit row naming
+        the token. A certificate that was uploaded rather than issued
+        answers 400 exactly as there, because there is nothing to renew
+        it against, and no path on this listener takes the replacement.
+
+
+        No body. Nothing about the certificate is an argument, its key
+        least of all.
+
+
+        Required scope: `certificates:write`.
+      operationId: automationRenewCertificate
+      x-required-scope: certificates:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Renewed in place.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "500":
+          description: The ACME order failed; the message says why, and the stored certificate is untouched.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /automation/v1/mcp:
     post:
@@ -1089,7 +1467,11 @@ components:
 
     AutomationScope:
       type: string
-      description: One grant on the automation plane.
+      description: >-
+        One grant on the automation plane. The three write grants after
+        `backends:read` arrived with the MCP config tier (Story 11.2)
+        and reach the write surface above; the environment grants reach
+        the environment resource and nothing else.
       enum:
         - environments:write
         - environments:read
@@ -1100,6 +1482,80 @@ components:
         - sla:read
         - cluster:read
         - backends:read
+        - routes:write
+        - backends:write
+        - certificates:write
+
+    ManagementRouteCreate:
+      type: object
+      description: >-
+        The body `POST /api/v1/routes` accepts on the management API,
+        unchanged: `CreateRouteRequest` in `openapi.yaml`. It is not
+        restated here, where a second copy would drift; the field names
+        this path accepts are pinned in Rust against the struct the
+        handler deserialises by `tests/openapi_contract.rs`, so a field
+        the management model grows reaches this plane by a decision and
+        not by default. `managed_by` is refused (422) as it is there.
+      additionalProperties: true
+
+    ManagementRouteUpdate:
+      type: object
+      description: >-
+        The body `PUT /api/v1/routes/{id}` accepts on the management
+        API, unchanged: `UpdateRouteRequest` in `openapi.yaml`. Every
+        field optional; a field absent leaves the route's value alone.
+        Pinned the same way as `ManagementRouteCreate`.
+      additionalProperties: true
+
+    ManagementBackendCreate:
+      type: object
+      description: >-
+        The body `POST /api/v1/backends` accepts on the management API,
+        unchanged: `CreateBackendRequest` in `openapi.yaml`, pinned the
+        same way as `ManagementRouteCreate`. On this plane `address`
+        must be an `ip:port` inside the token's `allowed_backend_cidrs`.
+      additionalProperties: true
+
+    ManagementBackendUpdate:
+      type: object
+      description: >-
+        The body `PUT /api/v1/backends/{id}` accepts on the management
+        API, unchanged: `UpdateBackendRequest` in `openapi.yaml`, pinned
+        the same way as `ManagementRouteCreate`.
+      additionalProperties: true
+
+    BindCertificateRequest:
+      type: object
+      description: >-
+        The one field a certificate binding takes. Unknown fields are
+        refused (422): there is no field here that could carry a
+        certificate body or a key, and one that arrives is an error
+        rather than something ignored.
+      required: [certificate_id]
+      additionalProperties: false
+      properties:
+        certificate_id:
+          type: string
+          description: >-
+            A stored certificate's id, as `GET /automation/v1/certificates`
+            reports it. The empty string unbinds.
+          example: 6f1c2b7e-3a44-4d0e-9a2b-1f5c8d7e9a01
+
+    ManagementAnswer:
+      type: object
+      description: >-
+        The object the wrapped management path answers, passed through
+        untouched under `data`: a route as `RouteResponse`, a backend as
+        `BackendResponse`, or the renewal's `{renewed, old_cert_id,
+        new_cert_id, domain}`, each documented in `openapi.yaml` against
+        the management path rather than restated here. None of them
+        carries key material or a credential; the route view withholds
+        the Basic-auth hash there and therefore here.
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: true
 
     EnvironmentRequest:
       type: object
@@ -1476,6 +1932,35 @@ components:
             error:
               code: unprocessable_entity
               message: "unprocessable: no_certificate_covers_hostname: no certificate covers `pr-42.review.example.com`; provision *.review.example.com through POST /api/v1/acme/provision-dns (DNS-01), or name an explicit certificate id"
+    ManagementRefusal:
+      description: >-
+        The management handler refused the write, and the answer is that
+        handler's own, unchanged: the same status and the same message
+        the dashboard would have shown, naming the field. A 400 is a
+        value the handler could not read or a bound it refuses on the
+        paths that predate the 400/422 split; a 404 names no row with
+        that id; a 409 on a route create is a hostname another route
+        holds; a 422 is a rule that refuses the body on its merits,
+        `managed_by` on input included. Nothing was written.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ManagedRow:
+      description: >-
+        The row belongs to an automation environment and an in-place
+        edit of it would be overwritten by that environment's next
+        `PUT`. The message names the environment and says to update it
+        through its pipeline instead. The same 409 the management API
+        answers, from the same check.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: conflict
+              message: "conflict: cannot update this route: it is managed by the automation API for environment `pr-42`. Update the environment through the pipeline instead."
     Unauthorized:
       description: >-
         The credential was not accepted. Missing, malformed, unknown,

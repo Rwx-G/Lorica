@@ -3245,7 +3245,11 @@ pub struct CreateRouteRequest {
 /// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are
 /// mutated ; every field is optional. Semantics mirror the matching
 /// [`lorica_config::models::Route`] field.
-#[derive(Deserialize)]
+///
+/// `Default` is every field absent, which is the patch that changes
+/// nothing; the automation plane's certificate binding builds its
+/// one-field patch from it rather than restating seventy `None`s.
+#[derive(Deserialize, Default)]
 pub struct UpdateRouteRequest {
     /// New hostname (must stay unique across the route table).
     pub hostname: Option<String>,
@@ -3652,6 +3656,23 @@ pub async fn create_route(
     Extension(session): Extension<Session>,
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    create_route_as(&state, &audit_ctx, body).await
+}
+
+/// The whole of [`create_route`] as `actor`: the validation, the row,
+/// the reload signal and the `route.create` audit row.
+///
+/// Split from the handler so the automation plane (Story 11.2) can run
+/// exactly this with a token as the actor rather than a session. There
+/// is deliberately no second implementation of a route write anywhere:
+/// a route created through either plane is this function's row, so
+/// the two cannot drift on a validator or a default.
+pub(crate) async fn create_route_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    body: CreateRouteRequest,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     if body.hostname.is_empty() {
         return Err(ApiError::BadRequest("hostname is required".into()));
@@ -3803,7 +3824,7 @@ pub async fn create_route(
     // Read before the insert closure takes the store lock, and only
     // when the request actually pins the route.
     let node_roster = if body.node_selector.is_some() {
-        selector_roster(&state).await?
+        selector_roster(state).await?
     } else {
         None
     };
@@ -3992,11 +4013,10 @@ pub async fn create_route(
 
     // `after` uses the response view (no `basic_auth_password_hash`),
     // never the stored model.
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let after = serde_json::to_value(&response).ok();
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "route.create",
         ("route", &route.id),
         None,
@@ -4032,11 +4052,24 @@ pub async fn update_route(
     Path(id): Path<String>,
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    update_route_as(&state, &audit_ctx, id, body).await
+}
+
+/// The whole of [`update_route`] as `actor`; see [`create_route_as`]
+/// for why the split exists. The managed-row refusal (409) runs here,
+/// so it holds on every plane that reaches this function.
+pub(crate) async fn update_route_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    id: String,
+    body: UpdateRouteRequest,
+) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     // Read before the update closure takes the store lock, and only
     // when the patch actually touches the pinning.
     let node_roster = if body.node_selector.is_some() {
-        selector_roster(&state).await?
+        selector_roster(state).await?
     } else {
         None
     };
@@ -4480,12 +4513,11 @@ pub async fn update_route(
     // `basic_auth_password_hash`). The `before` snapshot omits backend
     // links (empty list) - capturing them would need an extra DB read
     // before the mutation.
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let before = serde_json::to_value(route_to_response(&before_route, Vec::new())).ok();
     let after = serde_json::to_value(&response).ok();
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "route.update",
         ("route", &route.id),
         before.as_ref(),
@@ -4511,6 +4543,17 @@ pub async fn delete_route(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    delete_route_as(&state, &audit_ctx, id).await
+}
+
+/// The whole of [`delete_route`] as `actor`; see [`create_route_as`]
+/// for why the split exists.
+pub(crate) async fn delete_route_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    id: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let route = db_blocking(&state.store, move |store| {
         let route = store
             .get_route(&id)?
@@ -4521,7 +4564,6 @@ pub async fn delete_route(
     .await?;
     state.notify_config_changed();
 
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let mut before = serde_json::to_value(route_to_response(&route, Vec::new())).ok();
     if let (Some(serde_json::Value::Object(payload)), Some(managed_by)) =
         (before.as_mut(), &route.managed_by)
@@ -4533,8 +4575,8 @@ pub async fn delete_route(
         );
     }
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "route.delete",
         ("route", &route.id),
         before.as_ref(),

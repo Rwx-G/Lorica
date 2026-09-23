@@ -415,12 +415,20 @@ fn validate_path_prefix(raw: Option<&str>) -> Result<String, ApiError> {
     Ok(value.to_string())
 }
 
-/// Parse and grant-check every backend against the credential.
+/// The backend grant, applied to one address a credential wants to
+/// point a hostname at: the parsed `ip:port`, or the refusal.
 ///
 /// The address has to be an `ip:port`: the grant is a CIDR list, and a
 /// name cannot be checked against one without a resolution the token
 /// holder would control. Outside the grant is 403, the same answer the
 /// scope gate gives: the token is real and the grant is not there.
+/// `field` names the input in the refusal so the caller knows which
+/// one it is about.
+///
+/// One function for both writers of a backend row on this plane, the
+/// environment resource and the backend write (Story 11.2), because
+/// the grant is a security rule and two copies of it would drift the
+/// day one of them is loosened.
 ///
 /// # An empty grant is deny-all here
 ///
@@ -432,6 +440,41 @@ fn validate_path_prefix(raw: Option<&str>) -> Result<String, ApiError> {
 /// metadata address. The models refuse an empty list at write time;
 /// this refuses it again at use time, for the rows written before
 /// that rule landed.
+pub(super) fn ensure_backend_address_granted(
+    principal: &AutomationPrincipal,
+    field: &str,
+    raw: &str,
+) -> Result<SocketAddr, ApiError> {
+    if principal.allowed_backend_cidrs.is_empty() {
+        return Err(ApiError::Forbidden(
+            "this credential names no allowed_backend_cidrs, so its backend grant covers no \
+             address; ask an operator to name the ranges it may reach"
+                .to_string(),
+        ));
+    }
+    let policy = ConnectionFilterPolicy::from_cidrs(&principal.allowed_backend_cidrs, &[]);
+    let raw = raw.trim();
+    let addr: SocketAddr = raw.parse().map_err(|_| {
+        ApiError::Unprocessable(format!(
+            "{field} `{raw}` must be `ip:port`; a name cannot be checked against \
+             allowed_backend_cidrs"
+        ))
+    })?;
+    if addr.port() == 0 {
+        return Err(ApiError::Unprocessable(format!(
+            "{field} `{raw}` must carry a non-zero port"
+        )));
+    }
+    if !policy.accepts(addr.ip()) {
+        return Err(ApiError::Forbidden(format!(
+            "{field} `{raw}` is outside this token's allowed_backend_cidrs"
+        )));
+    }
+    Ok(addr)
+}
+
+/// Parse and grant-check every backend against the credential, through
+/// [`ensure_backend_address_granted`].
 fn validate_backends(
     principal: &AutomationPrincipal,
     backends: &[EnvironmentBackendRequest],
@@ -449,34 +492,10 @@ fn validate_backends(
             backends.len()
         )));
     }
-    if principal.allowed_backend_cidrs.is_empty() {
-        return Err(ApiError::Forbidden(
-            "this credential names no allowed_backend_cidrs, so its backend grant covers no \
-             address; ask an operator to name the ranges it may reach"
-                .to_string(),
-        ));
-    }
-    let policy = ConnectionFilterPolicy::from_cidrs(&principal.allowed_backend_cidrs, &[]);
     let mut out = Vec::with_capacity(backends.len());
     for (index, backend) in backends.iter().enumerate() {
         let field = format!("backends[{index}].address");
-        let raw = backend.address.trim();
-        let addr: SocketAddr = raw.parse().map_err(|_| {
-            ApiError::Unprocessable(format!(
-                "{field} `{raw}` must be `ip:port`; a name cannot be checked against \
-                 allowed_backend_cidrs"
-            ))
-        })?;
-        if addr.port() == 0 {
-            return Err(ApiError::Unprocessable(format!(
-                "{field} `{raw}` must carry a non-zero port"
-            )));
-        }
-        if !policy.accepts(addr.ip()) {
-            return Err(ApiError::Forbidden(format!(
-                "{field} `{raw}` is outside this token's allowed_backend_cidrs"
-            )));
-        }
+        let addr = ensure_backend_address_granted(principal, &field, &backend.address)?;
         let weight = backend.weight.unwrap_or(DEFAULT_BACKEND_WEIGHT);
         if weight < 1 {
             return Err(ApiError::Unprocessable(format!(
@@ -1191,7 +1210,13 @@ fn view_for(
 
 /// The audit identity of an automation principal, the same shape the
 /// request-level audit layer stamps so the two rows join on it.
-fn audit_context(
+///
+/// Shared with the write surface (Story 11.2), whose management-side
+/// rows (`route.create`, `backend.update`, ...) name the token exactly
+/// as the environment rows do: `<name> (<public_id>)` under the role
+/// `automation`, so one filter on the audit page finds every
+/// machine-driven change whichever resource it touched.
+pub(super) fn audit_context(
     principal: &AutomationPrincipal,
     connect_info: &ClientConnectInfo,
     headers: &HeaderMap,

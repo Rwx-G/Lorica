@@ -5848,7 +5848,10 @@ components:
         so a token written against a newer Lorica fails loudly instead of
         silently losing a grant. The five read grants after `certificates:read`
         arrived with the management MCP server and are what its read tier is
-        built on.
+        built on; the three write grants after `backends:read` arrived with its
+        config tier and reach the automation plane's write surface
+        (`openapi-automation.yaml`), bounded by the token's hostname and
+        backend grants. None of them uploads key material.
       enum:
         - environments:write
         - environments:read
@@ -5859,6 +5862,9 @@ components:
         - sla:read
         - cluster:read
         - backends:read
+        - routes:write
+        - backends:write
+        - certificates:write
 
     AutomationTokenRequest:
       type: object

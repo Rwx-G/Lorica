@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The automation router: `whoami`, the environment resource and the
-//! read surface.
+//! The automation router: `whoami`, the environment resource, the read
+//! surface and the write surface.
 //!
 //! `GET /automation/v1/whoami` exists so the whole chain - source
 //! filter, TLS, bearer verification, scope gate, audit - is testable
@@ -21,14 +21,15 @@
 //! nothing else, so it stays useful as the call an automation makes to
 //! check that its credential is still live and still carries what it
 //! expects. The environment paths (Story 10.4) live in
-//! [`super::environments`] and the read paths (Story 11.1) in
-//! [`super::read`]; the MCP endpoint (Story 11.1 AC #9) is in
+//! [`super::environments`], the read paths (Story 11.1) in
+//! [`super::read`] and the write paths (Story 11.2) in
+//! [`super::write`]; the MCP endpoint (Story 11.1 AC #9) is in
 //! [`super::mcp`]. They are mounted here, and only here, so
 //! the OpenAPI drift gate in `tests/openapi_contract.rs` sees every
 //! automation route in one file.
 
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 use lorica_config::models::{AutomationScope, OwnerKind, PipelineIdentity};
 use serde::Serialize;
@@ -188,6 +189,34 @@ pub fn build_automation_router(state: AppState) -> Router {
         .route(
             "/automation/v1/certificates",
             get(super::read::list_certificates),
+        )
+        // The write surface (Story 11.2). Every one of these runs the
+        // management handler's own body with the token as the actor;
+        // the scope each sits behind is declared in
+        // [`super::scope::required_scope`] for its verb alone. There is
+        // no route that takes a PEM body: the certificate create, the
+        // self-signed generate and the single-certificate update are
+        // deliberately absent, and the matrix declares nothing for them.
+        .route("/automation/v1/routes", post(super::write::create_route))
+        .route(
+            "/automation/v1/routes/{id}",
+            put(super::write::update_route).delete(super::write::delete_route),
+        )
+        .route(
+            "/automation/v1/routes/{id}/certificate",
+            put(super::write::bind_certificate),
+        )
+        .route(
+            "/automation/v1/backends",
+            post(super::write::create_backend),
+        )
+        .route(
+            "/automation/v1/backends/{id}",
+            put(super::write::update_backend).delete(super::write::delete_backend),
+        )
+        .route(
+            "/automation/v1/certificates/{id}/renew",
+            post(super::write::renew_certificate),
         )
         // The MCP endpoint (Story 11.1 AC #9). `post` and nothing else:
         // revision 2026-07-28 removed the standalone GET stream and the

@@ -81,18 +81,25 @@ fn default_max_ttl_seconds() -> u32 {
 ///
 /// The enum is closed and [`AutomationScope::ALL`] is the whole surface.
 /// What is absent from it is absent deliberately: there is no
-/// `routes:write`, no `certificates:write` and no `settings:*`, because
-/// the automation surface is the environment resource plus read views
-/// over what the node is doing, not the management API behind a
-/// different door. An automation that needs to reshape routing or issue
-/// a certificate is asking for an operator's credential, and it should
-/// have to say so rather than find the capability already attached to
-/// the token it uses for ephemeral environments.
+/// `settings:*` and no `certificates:upload`, because key material and
+/// node-wide policy enter through the management API, by a human, and
+/// never through a token.
 ///
 /// The read grants beyond `routes:read` and `certificates:read` arrived
 /// with the management MCP server (Epic 11). Its read tier is what
 /// consumes them: a session that can only read has nothing an injected
 /// instruction can usefully reach.
+///
+/// The three write grants, `routes:write`, `backends:write` and
+/// `certificates:write`, arrived with that server's config tier (Story
+/// 11.2) and reverse the Story 10.3 decision that the automation
+/// surface is the environment resource and never the management API
+/// behind a different door. The reversal is recorded beside that
+/// decision in the Epic 10 PRD. A token carrying one of them reaches
+/// the management plane's own handler and validators for that
+/// resource, bounded by the token's hostname and backend grants; it is
+/// a different credential from the one a CI pipeline uses for
+/// ephemeral environments, and an operator mints it as such.
 ///
 /// An unknown scope string fails to deserialise rather than being
 /// dropped, so a token minted against a newer Lorica is refused here
@@ -107,11 +114,12 @@ fn default_max_ttl_seconds() -> u32 {
 /// ```
 // The serde renames below are this vocabulary's source of truth. The
 // surfaces named here carry the same strings and none of them is
-// maintained from memory: `scope_str` (`lorica-api/src/automation/scope.rs`, the
-// string an operator reads in a 403) and `scope_wire_name`
-// (`lorica-api/src/automation/audit.rs`) are each asserted against
-// these renames by a test that walks `ALL`; `AUTOMATION_AUDIT_REASONS`
-// publishes them as refusal reasons under the same walk; and
+// maintained from memory: `scope_str` (`lorica-api/src/automation/scope.rs`,
+// the string an operator reads in a 403 and in an audit row) is
+// asserted against these renames by a test that walks `ALL`;
+// `AUTOMATION_AUDIT_REASONS` publishes them as refusal reasons under
+// the same walk; the two OpenAPI documents restate the enum and are
+// read by `lorica-api/tests/openapi_contract.rs`; and
 // `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.generated.ts`,
 // what the mint form offers, is diffed against `ALL` by
 // `lorica-api/tests/automation_scope_fixture.rs`. Add a variant here
@@ -145,6 +153,18 @@ pub enum AutomationScope {
     /// Read the backends a route resolves to.
     #[serde(rename = "backends:read")]
     BackendsRead,
+    /// Create, update and delete routes, one by id, and bind a
+    /// certificate to one.
+    #[serde(rename = "routes:write")]
+    RoutesWrite,
+    /// Create, update and delete backends, one by id.
+    #[serde(rename = "backends:write")]
+    BackendsWrite,
+    /// Bind a stored certificate to a route and renew an ACME one.
+    /// Never an upload: key material is not an argument anywhere on
+    /// the automation plane.
+    #[serde(rename = "certificates:write")]
+    CertificatesWrite,
 }
 
 impl AutomationScope {
@@ -167,6 +187,9 @@ impl AutomationScope {
         AutomationScope::SlaRead,
         AutomationScope::ClusterRead,
         AutomationScope::BackendsRead,
+        AutomationScope::RoutesWrite,
+        AutomationScope::BackendsWrite,
+        AutomationScope::CertificatesWrite,
     ];
 }
 
@@ -632,8 +655,8 @@ mod tests {
         // operator wrote, and they would find out at the first call.
         for unknown in [
             "\"settings:write\"",
-            "\"routes:write\"",
-            "\"certificates:write\"",
+            "\"certificates:upload\"",
+            "\"waf:write\"",
             "\"environments\"",
             "\"\"",
         ] {

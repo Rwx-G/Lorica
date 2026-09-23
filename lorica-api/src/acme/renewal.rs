@@ -365,6 +365,24 @@ pub async fn renew_certificate(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    renew_certificate_as(&state, &audit_ctx, id).await
+}
+
+/// The whole of [`renew_certificate`] as `actor`: the ACME-only
+/// refusal, the in-place renewal, the reload signal and the
+/// `certificate.renew` audit row.
+///
+/// Split from the handler so the automation plane (Story 11.2) can run
+/// exactly this with a token as the actor rather than a session; see
+/// `crate::routes::crud::create_route_as` for the rule. No key
+/// material crosses this function's arguments: the renewal is an ACME
+/// order the node makes for a row it already holds.
+pub(crate) async fn renew_certificate_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    id: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let cert = db_blocking(&state.store, move |store| {
         store
             .get_certificate(&id)?
@@ -392,7 +410,7 @@ pub async fn renew_certificate(
     }
 
     // In-place renewal : same id, route bindings untouched (AC1).
-    renew_with_method(&state, &cert, &config, &all_domains, Some(&cert.id))
+    renew_with_method(state, &cert, &config, &all_domains, Some(&cert.id))
         .await
         .map_err(|e| ApiError::Internal(format!("ACME renewal failed: {e}")))?;
 
@@ -411,10 +429,9 @@ pub async fn renew_certificate(
         "new_cert_id": cert.id,
         "domain": cert.domain,
     });
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "certificate.renew",
         ("certificate", &cert.id),
         None,

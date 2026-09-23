@@ -312,9 +312,9 @@ pub(crate) enum AutomationTokenAction {
         name: String,
 
         /// A scope the token carries. Repeat the flag for each one;
-        /// at least one is required. Accepted values:
-        /// `environments:write`, `environments:read`, `routes:read`,
-        /// `certificates:read`.
+        /// at least one is required. The accepted spellings are the
+        /// `AutomationScope` enum's, listed in `docs/automation.md`
+        /// under "Static tokens"; the node refuses any other.
         #[arg(long = "scope", required = true)]
         scopes: Vec<String>,
 

@@ -328,6 +328,707 @@ fn automation_openapi_documents_the_query_vocabulary_the_handlers_reuse() {
     }
 }
 
+/// What a caller may send to each automation write, pinned per
+/// `(METHOD, path)` as the wire field names of the request struct the
+/// handler deserialises (Story 11.2).
+///
+/// The read side pins what each answer carries
+/// (`AUTOMATION_READ_FIELD_NAMES` in `src/tests.rs`); this is the
+/// request side of the same contract. Every write on this plane takes
+/// the management model's own body, so a field added to
+/// `CreateRouteRequest` for the dashboard becomes, with no other
+/// change, a field a network-reachable token may set. That is not
+/// wrong, it is a decision, and this list is what turns it into one:
+/// the test below diffs it both ways against the struct and names what
+/// to do. Sorted, and nothing writes it.
+///
+/// Top-level names only. A nested body (`path_rules[]`, `backends[]`)
+/// is the management model's inner shape, documented against the
+/// management path.
+const AUTOMATION_WRITE_FIELD_NAMES: &[(&str, &str, &[&str])] = &[
+    (
+        "POST",
+        "/automation/v1/backends",
+        &[
+            "address",
+            "group_name",
+            "h2_upstream",
+            "health_check_enabled",
+            "health_check_interval_s",
+            "health_check_path",
+            "managed_by",
+            "name",
+            "tls_skip_verify",
+            "tls_sni",
+            "tls_upstream",
+            "weight",
+        ],
+    ),
+    (
+        "PUT",
+        "/automation/v1/backends/{}",
+        &[
+            "address",
+            "group_name",
+            "h2_upstream",
+            "health_check_enabled",
+            "health_check_interval_s",
+            "health_check_path",
+            "managed_by",
+            "name",
+            "tls_skip_verify",
+            "tls_sni",
+            "tls_upstream",
+            "weight",
+        ],
+    ),
+    (
+        "PUT",
+        "/automation/v1/environments/{}",
+        &[
+            "backends",
+            "certificate",
+            "force_https",
+            "hostname",
+            "labels",
+            "path_prefix",
+            "ttl_seconds",
+            "waf_enabled",
+        ],
+    ),
+    (
+        "POST",
+        "/automation/v1/routes",
+        &[
+            "access_log_enabled",
+            "add_path_prefix",
+            "ai_bot_policy",
+            "ai_bot_spoofed_fallback",
+            "auto_ban_duration_s",
+            "auto_ban_threshold",
+            "backend_ids",
+            "basic_auth_password",
+            "basic_auth_username",
+            "bot_protection",
+            "cache_enabled",
+            "cache_max_bytes",
+            "cache_ttl_s",
+            "cache_vary_headers",
+            "certificate_id",
+            "compression_enabled",
+            "connect_timeout_s",
+            "cors_allowed_methods",
+            "cors_allowed_origins",
+            "cors_max_age_s",
+            "error_page_html",
+            "force_https",
+            "forward_auth",
+            "geoip",
+            "group_name",
+            "header_rules",
+            "hostname",
+            "hostname_aliases",
+            "ip_allowlist",
+            "ip_denylist",
+            "load_balancing",
+            "maintenance_mode",
+            "managed_by",
+            "max_connections",
+            "max_request_body_bytes",
+            "mirror",
+            "mtls",
+            "node_selector",
+            "path_prefix",
+            "path_rewrite_pattern",
+            "path_rewrite_replacement",
+            "path_rules",
+            "proxy_headers",
+            "proxy_headers_remove",
+            "rate_limit",
+            "rate_limit_burst",
+            "rate_limit_rps",
+            "read_timeout_s",
+            "redirect_hostname",
+            "redirect_to",
+            "response_headers",
+            "response_headers_remove",
+            "response_rewrite",
+            "retry_attempts",
+            "retry_on_methods",
+            "return_status",
+            "security_headers",
+            "send_timeout_s",
+            "serve_robots_txt",
+            "slowloris_threshold_ms",
+            "stale_if_error_s",
+            "stale_while_revalidate_s",
+            "sticky_session",
+            "strip_path_prefix",
+            "traffic_splits",
+            "waf_body_scan_max_bytes",
+            "waf_enabled",
+            "waf_mode",
+            "websocket_enabled",
+        ],
+    ),
+    (
+        "PUT",
+        "/automation/v1/routes/{}",
+        &[
+            "access_log_enabled",
+            "add_path_prefix",
+            "ai_bot_policy",
+            "ai_bot_spoofed_fallback",
+            "ai_bot_spoofed_fallback_inherit",
+            "auto_ban_duration_s",
+            "auto_ban_threshold",
+            "backend_ids",
+            "basic_auth_password",
+            "basic_auth_username",
+            "bot_protection",
+            "bot_protection_disable",
+            "cache_enabled",
+            "cache_max_bytes",
+            "cache_ttl_s",
+            "cache_vary_headers",
+            "certificate_id",
+            "compression_enabled",
+            "connect_timeout_s",
+            "cors_allowed_methods",
+            "cors_allowed_origins",
+            "cors_max_age_s",
+            "enabled",
+            "error_page_html",
+            "force_https",
+            "forward_auth",
+            "geoip",
+            "group_name",
+            "header_rules",
+            "hostname",
+            "hostname_aliases",
+            "ip_allowlist",
+            "ip_denylist",
+            "load_balancing",
+            "maintenance_mode",
+            "managed_by",
+            "max_connections",
+            "max_request_body_bytes",
+            "mirror",
+            "mtls",
+            "node_selector",
+            "path_prefix",
+            "path_rewrite_pattern",
+            "path_rewrite_replacement",
+            "path_rules",
+            "proxy_headers",
+            "proxy_headers_remove",
+            "rate_limit",
+            "rate_limit_burst",
+            "rate_limit_rps",
+            "read_timeout_s",
+            "redirect_hostname",
+            "redirect_to",
+            "response_headers",
+            "response_headers_remove",
+            "response_rewrite",
+            "retry_attempts",
+            "retry_on_methods",
+            "return_status",
+            "security_headers",
+            "send_timeout_s",
+            "serve_robots_txt",
+            "slowloris_threshold_ms",
+            "stale_if_error_s",
+            "stale_while_revalidate_s",
+            "sticky_session",
+            "strip_path_prefix",
+            "traffic_splits",
+            "waf_body_scan_max_bytes",
+            "waf_enabled",
+            "waf_mode",
+            "websocket_enabled",
+        ],
+    ),
+    (
+        "PUT",
+        "/automation/v1/routes/{}/certificate",
+        &["certificate_id"],
+    ),
+];
+
+/// The one path on the automation plane whose body is not a resource:
+/// a JSON-RPC message, documented as such and pinned by the MCP core's
+/// own tests rather than as a field set.
+const AUTOMATION_MCP_PATH: &str = "/automation/v1/mcp";
+
+/// A field name no automation write may accept, matched as a substring
+/// of the top-level name (Story 11.2 AC #6).
+const KEY_MATERIAL_MARKERS: &[&str] = &["pem", "private_key", "csr"];
+
+/// The automation module declaring `pub async fn <handler>(`, among
+/// the two that mount a write: the router names some handlers through
+/// `super::<module>::` and imports others by name, so the module is
+/// found from the handler rather than read off the route.
+fn automation_handler_source(handler: &str) -> Option<(&'static str, &'static str)> {
+    let opening = format!("pub async fn {handler}(");
+    [
+        (
+            "/src/automation/write.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/automation/write.rs"
+            )),
+        ),
+        (
+            "/src/automation/environments.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/automation/environments.rs"
+            )),
+        ),
+    ]
+    .into_iter()
+    .find(|(_, src)| src.contains(&opening))
+}
+
+/// Every source a request struct an automation write takes is declared
+/// in: the automation modules and the management modules whose body
+/// the writes reuse verbatim.
+fn request_struct_sources() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "/src/automation/write.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/automation/write.rs"
+            )),
+        ),
+        (
+            "/src/automation/environments.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/automation/environments.rs"
+            )),
+        ),
+        (
+            "/src/routes/crud.rs",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/crud.rs")),
+        ),
+        (
+            "/src/backends.rs",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/backends.rs")),
+        ),
+    ]
+}
+
+/// Every non-`GET` `(METHOD, normalised path, handler)` the automation
+/// router mounts, read off the `.route(` calls the way
+/// [`extract_routes`] reads the paths: the handler is the last segment
+/// of the token after each method combinator.
+fn extract_write_routes(src: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let marker = ".route(";
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find(marker) {
+        let open_paren = from + rel + marker.len() - 1;
+        let (span, after) = balanced_span(src, open_paren);
+        from = after;
+        let Some(path) = first_string_literal(&span) else {
+            continue;
+        };
+        let normalized = normalize_path(&path);
+        for method in ["post", "put", "delete", "patch"] {
+            for handler in handlers_after_combinator(&span, method) {
+                let name = handler.rsplit("::").next().unwrap_or_default().to_string();
+                out.push((method.to_uppercase(), normalized.clone(), name));
+            }
+        }
+    }
+    out
+}
+
+/// The handler tokens a route span applies `method(` to, on a word
+/// boundary, the way [`method_combinators`] finds the method itself.
+fn handlers_after_combinator(span: &str, method: &str) -> Vec<String> {
+    let bytes = span.as_bytes();
+    let mut found = Vec::new();
+    let mut search = 0usize;
+    while let Some(rel) = span[search..].find(method) {
+        let idx = search + rel;
+        let after = idx + method.len();
+        search = after;
+        let boundary_before = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+        let boundary_after = after >= bytes.len() || !is_ident_byte(bytes[after]);
+        if !boundary_before || !boundary_after {
+            continue;
+        }
+        let mut j = after;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'(' {
+            let (inner, _) = balanced_span(span, j);
+            found.push(inner.trim().to_string());
+        }
+    }
+    found
+}
+
+/// The type a handler's `Json<...>` extractor deserialises, or `None`
+/// when the handler takes no JSON body.
+fn handler_body_struct(module_src: &str, handler: &str) -> Option<String> {
+    let opening = format!("pub async fn {handler}(");
+    let at = module_src.find(&opening)?;
+    let (parameters, _) = balanced_span(module_src, at + opening.len() - 1);
+    let (_, after) = parameters.split_once("Json<")?;
+    let (name, _) = after.split_once('>')?;
+    Some(name.trim().to_string())
+}
+
+/// The source declaring `pub struct <name> {`, among
+/// [`request_struct_sources`].
+fn source_declaring(name: &str) -> Option<(&'static str, &'static str)> {
+    let opening = format!("pub struct {name} {{");
+    request_struct_sources()
+        .into_iter()
+        .find(|(_, src)| src.contains(&opening))
+}
+
+#[test]
+fn every_automation_write_accepts_exactly_the_field_names_this_surface_committed_to() {
+    let router_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/automation/router.rs"
+    ));
+    let writes = extract_write_routes(router_src);
+    assert!(
+        writes.len() >= 8,
+        "write-route extraction looks broken: only {} non-GET routes found in \
+         src/automation/router.rs",
+        writes.len()
+    );
+
+    let mut pinned_and_seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut drift = String::new();
+    for (method, path, handler) in &writes {
+        if path == AUTOMATION_MCP_PATH {
+            continue;
+        }
+        let (_, module_src) = automation_handler_source(handler).unwrap_or_else(|| {
+            panic!("{method} {path} is handled by `{handler}`, which no automation module this test reads declares")
+        });
+        let body = handler_body_struct(module_src, handler);
+        if method == "DELETE" {
+            assert_eq!(
+                body, None,
+                "{method} {path}: a delete names its resource in the path and takes no body"
+            );
+            continue;
+        }
+        let Some(struct_name) = body else {
+            if method == "POST" && path.ends_with("/renew") {
+                // The one bodiless POST: an action on a named resource.
+                continue;
+            }
+            panic!("{method} {path}: `{handler}` takes no `Json<...>` body, so its field set cannot be pinned");
+        };
+        let (file, src) = source_declaring(&struct_name).unwrap_or_else(|| {
+            panic!("`pub struct {struct_name}` is declared in no source this test reads")
+        });
+        let accepted: BTreeSet<String> = serde_field_names(src, &struct_name);
+        assert!(
+            !accepted.is_empty(),
+            "field extraction looks broken: no field found in `pub struct {struct_name}` in {file}"
+        );
+
+        let key = (method.clone(), path.clone());
+        let Some((_, _, committed)) = AUTOMATION_WRITE_FIELD_NAMES
+            .iter()
+            .find(|(m, p, _)| *m == method.as_str() && *p == path.as_str())
+        else {
+            drift.push_str(&format!(
+                "\n{method} {path} takes `{struct_name}` ({file}) and is not pinned in \
+                 AUTOMATION_WRITE_FIELD_NAMES at all. It accepts: {}\n",
+                accepted.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+            continue;
+        };
+        pinned_and_seen.insert(key);
+        let committed: BTreeSet<String> = committed.iter().map(|n| (*n).to_string()).collect();
+        let newly_accepted: Vec<&String> = accepted.difference(&committed).collect();
+        let no_longer_accepted: Vec<&String> = committed.difference(&accepted).collect();
+        if !newly_accepted.is_empty() || !no_longer_accepted.is_empty() {
+            drift.push_str(&format!("\n{method} {path} (`{struct_name}` in {file}):\n"));
+            drift.push_str(&format!(
+                "  accepted by the handler and not pinned ({}):\n",
+                newly_accepted.len()
+            ));
+            for name in &newly_accepted {
+                drift.push_str(&format!("    {name}\n"));
+            }
+            drift.push_str(&format!(
+                "  pinned and no longer accepted ({}):\n",
+                no_longer_accepted.len()
+            ));
+            for name in &no_longer_accepted {
+                drift.push_str(&format!("    {name}\n"));
+            }
+        }
+    }
+
+    let stale: Vec<String> = AUTOMATION_WRITE_FIELD_NAMES
+        .iter()
+        .filter(|(m, p, _)| !pinned_and_seen.contains(&((*m).to_string(), (*p).to_string())))
+        .map(|(m, p, _)| format!("{m} {p}"))
+        .collect();
+    if !stale.is_empty() {
+        drift.push_str(&format!(
+            "\nPinned in AUTOMATION_WRITE_FIELD_NAMES and mounted by no handler with a body: {}\n",
+            stale.join(", ")
+        ));
+    }
+
+    assert!(
+        drift.is_empty(),
+        "\nAutomation write surface: what a caller may send moved.\n{drift}\n\
+         A name on an \"accepted and not pinned\" list arrived here because a management \
+         request model grew a field, not because anyone decided a network-reachable token \
+         may set it. Decide: either it belongs on this plane, and you add it to \
+         AUTOMATION_WRITE_FIELD_NAMES in tests/openapi_contract.rs, sorted; or it does not, \
+         and the automation write takes a narrower body. The mirror list is a field the \
+         handler stopped accepting, which is a contract change for whoever sends it.\n"
+    );
+}
+
+/// The `$ref` a documented operation's request body points at, keyed
+/// by `(METHOD, path)`; an operation with no body or an inline schema
+/// is absent.
+fn extract_request_body_refs(yaml: &str) -> BTreeMap<(String, String), String> {
+    let mut out = BTreeMap::new();
+    let mut in_paths = false;
+    let mut current_path: Option<String> = None;
+    let mut current_method: Option<String> = None;
+    let mut in_body = false;
+
+    for line in yaml.lines() {
+        let first = line.as_bytes().first().copied();
+        if let Some(c) = first {
+            if c != b' ' && c != b'#' {
+                in_paths = line.starts_with("paths:");
+                current_path = None;
+                current_method = None;
+                in_body = false;
+                continue;
+            }
+        } else {
+            continue;
+        }
+        if !in_paths {
+            continue;
+        }
+        if let Some(rest) = strip_exact_indent(line, 2) {
+            if let Some(key) = rest.trim_end().strip_suffix(':') {
+                if key.starts_with('/') {
+                    current_path = Some(normalize_path(key));
+                    current_method = None;
+                }
+            }
+            in_body = false;
+            continue;
+        }
+        if let Some(rest) = strip_exact_indent(line, 4) {
+            let key = rest.trim_end().strip_suffix(':').unwrap_or("");
+            current_method = HTTP_METHODS.contains(&key).then(|| key.to_uppercase());
+            in_body = false;
+            continue;
+        }
+        if let Some(rest) = strip_exact_indent(line, 6) {
+            in_body = rest.trim_end() == "requestBody:";
+            continue;
+        }
+        if !in_body {
+            continue;
+        }
+        if let Some((_, reference)) = line.split_once("$ref:") {
+            if let (Some(path), Some(method)) = (&current_path, &current_method) {
+                let name = reference
+                    .trim()
+                    .trim_matches('"')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                out.insert((method.clone(), path.clone()), name);
+            }
+        }
+    }
+    out
+}
+
+/// The property names of `components.schemas.<name>`, or an empty set
+/// for a schema that declares none.
+fn extract_schema_properties(yaml: &str, name: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut in_components = false;
+    let mut in_schemas = false;
+    let mut in_named = false;
+    let mut in_properties = false;
+
+    for line in yaml.lines() {
+        let first = line.as_bytes().first().copied();
+        if let Some(c) = first {
+            if c != b' ' && c != b'#' {
+                in_components = line.starts_with("components:");
+                in_schemas = false;
+                in_named = false;
+                in_properties = false;
+                continue;
+            }
+        } else {
+            continue;
+        }
+        if !in_components {
+            continue;
+        }
+        if let Some(rest) = strip_exact_indent(line, 2) {
+            in_schemas = rest.trim_end() == "schemas:";
+            in_named = false;
+            in_properties = false;
+            continue;
+        }
+        if !in_schemas {
+            continue;
+        }
+        if let Some(rest) = strip_exact_indent(line, 4) {
+            in_named = rest.trim_end() == format!("{name}:");
+            in_properties = false;
+            continue;
+        }
+        if !in_named {
+            continue;
+        }
+        if let Some(rest) = strip_exact_indent(line, 6) {
+            in_properties = rest.trim_end() == "properties:";
+            continue;
+        }
+        if in_properties {
+            if let Some(rest) = strip_exact_indent(line, 8) {
+                if let Some(property) = rest.trim_end().strip_suffix(':') {
+                    out.insert(property.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn no_automation_write_accepts_key_material() {
+    // Story 11.2 AC #6, asserted three ways rather than promised.
+    let router_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/automation/router.rs"
+    ));
+    let spec_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/openapi-automation.yaml"
+    ));
+
+    // 1. The management paths that take a PEM body are mounted on this
+    //    listener under no verb, and the matrix declares nothing for
+    //    them, so two things refuse them.
+    let mounted = extract_routes(router_src);
+    for (method, path) in [
+        ("POST", "/automation/v1/certificates"),
+        ("PUT", "/automation/v1/certificates/{}"),
+        ("POST", "/automation/v1/certificates/self-signed"),
+    ] {
+        assert!(
+            !mounted.contains(&(method.to_string(), path.to_string())),
+            "{method} {path} is mounted on the automation listener"
+        );
+        let verb: http::Method = method.parse().expect("a method");
+        assert_eq!(
+            lorica_api::automation::required_scope(&verb, path),
+            None,
+            "{method} {path} is declared in the scope matrix"
+        );
+    }
+
+    // 2. No request struct an automation write deserialises has a
+    //    top-level field that could carry key material.
+    let writes = extract_write_routes(router_src);
+    let mut structs_checked = 0usize;
+    for (method, path, handler) in &writes {
+        if path == AUTOMATION_MCP_PATH {
+            continue;
+        }
+        let Some((_, module_src)) = automation_handler_source(handler) else {
+            continue;
+        };
+        let Some(struct_name) = handler_body_struct(module_src, handler) else {
+            continue;
+        };
+        let (file, src) = source_declaring(&struct_name).unwrap_or_else(|| {
+            panic!("`pub struct {struct_name}` is declared nowhere this test reads")
+        });
+        let accepted = serde_field_names(src, &struct_name);
+        assert!(!accepted.is_empty(), "{struct_name} in {file} has no field");
+        structs_checked += 1;
+        for name in &accepted {
+            for marker in KEY_MATERIAL_MARKERS {
+                assert!(
+                    !name.contains(marker),
+                    "{method} {path} accepts `{name}` (`{struct_name}` in {file}), which \
+                     matches the key-material marker `{marker}`. Key material enters the \
+                     node through the management API, by a human, never through a token."
+                );
+            }
+        }
+    }
+    assert!(
+        structs_checked >= 5,
+        "only {structs_checked} write bodies were checked; the scan is reading a shape the \
+         router no longer has"
+    );
+
+    // 3. The document says the same: no documented write body names a
+    //    key-material property, and the certificate binding's body is
+    //    the one field it is.
+    let bodies = extract_request_body_refs(spec_src);
+    assert!(
+        bodies.len() >= 6,
+        "request-body extraction looks broken: only {} documented bodies found",
+        bodies.len()
+    );
+    let mut documented_properties = 0usize;
+    for ((method, path), schema) in &bodies {
+        if path == AUTOMATION_MCP_PATH {
+            continue;
+        }
+        let properties = extract_schema_properties(spec_src, schema);
+        documented_properties += properties.len();
+        for property in &properties {
+            for marker in KEY_MATERIAL_MARKERS {
+                assert!(
+                    !property.contains(marker),
+                    "openapi-automation.yaml documents `{property}` on {method} {path} \
+                     (schema {schema}), which matches `{marker}`"
+                );
+            }
+        }
+    }
+    assert!(
+        documented_properties > 0,
+        "no documented write body declares a property; the schema scan went blind"
+    );
+    assert_eq!(
+        extract_schema_properties(spec_src, "BindCertificateRequest"),
+        BTreeSet::from(["certificate_id".to_string()]),
+        "the certificate binding takes the id and nothing else"
+    );
+}
+
 /// Each `components.parameters` entry as `component name -> (name, in)`.
 fn extract_parameter_components(yaml: &str) -> BTreeMap<String, (String, String)> {
     let mut out: BTreeMap<String, (String, String)> = BTreeMap::new();

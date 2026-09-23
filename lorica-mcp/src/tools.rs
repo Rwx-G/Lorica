@@ -644,9 +644,11 @@ mod tests {
         }
 
         // And the other direction, so a scope added to the enum does
-        // not quietly stay outside this tier. The two environment
+        // not quietly stay outside this tier. What stays outside is
+        // named here as the deliberate complement: the two environment
         // scopes are Story 10.4's resource, not AC #4's read surface,
-        // and are named here as the deliberate complement.
+        // and the three write scopes are Story 11.2's config tier,
+        // which a read-tier catalogue must never name.
         let declared: BTreeSet<String> = AutomationScope::ALL
             .iter()
             .map(|scope| {
@@ -660,8 +662,11 @@ mod tests {
         assert_eq!(
             outside,
             BTreeSet::from([
+                "backends:write".to_string(),
+                "certificates:write".to_string(),
                 "environments:read".to_string(),
-                "environments:write".to_string()
+                "environments:write".to_string(),
+                "routes:write".to_string(),
             ]),
             "a scope moved: either give it a read tool or add it to the complement here, \
              deliberately"

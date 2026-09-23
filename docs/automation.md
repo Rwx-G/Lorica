@@ -21,6 +21,13 @@ because the management MCP server runs against this listener and never
 holds a management credential, and it is useful to any automation that
 wants to check what it just deployed is actually serving.
 
+And, since the same release, a write surface behind three write
+scopes: routes and backends, one by id, and certificate bindings and
+renewals. That is the reversal of a decision this document made in
+v1.8.0, taken for the MCP config tier and recorded where the decision
+lives; see [The write surface](#the-write-surface) for what it is and
+what it deliberately is not.
+
 One sentence decides everything else in this document. **The
 management API stays on loopback with a session cookie; the automation
 listener is a second door that is narrow by construction: a different
@@ -45,10 +52,11 @@ tokens sub-page under Settings in the dashboard. The automation listener
 serves none of it, so a token can never mint a token, widen its own
 scopes or extend its own expiry. What the listener serves is
 `GET /automation/v1/whoami`, `GET /automation/v1/environments`,
-`GET|PUT|DELETE /automation/v1/environments/{name}` and the read
-surface below, described in `lorica-api/openapi-automation.yaml`, a
-separate document from the management API's because it is a different
-socket with a different security scheme.
+`GET|PUT|DELETE /automation/v1/environments/{name}`, the read surface
+and the write surface below, described in
+`lorica-api/openapi-automation.yaml`, a separate document from the
+management API's because it is a different socket with a different
+security scheme.
 
 ## The listener
 
@@ -246,20 +254,29 @@ when it was last presented.
 
 **The scope set is a closed list**, published as the `AutomationScope`
 enum in `lorica-api/openapi.yaml` and offered by the mint form: the two
-environment grants, `routes:read` and `certificates:read`, plus the
-read grants the management MCP server's read tier is built on
-(`logs:read`, `waf:read`, `sla:read`, `cluster:read`,
-`backends:read`). An unknown scope string fails to deserialise rather
-than being dropped, so a token minted against a newer Lorica is refused
-instead of silently losing a grant an operator wrote down; a 1.9.0
-token presented to a 1.8.0 node is refused outright for that reason.
-`routes:write`, `certificates:write` and `settings:*` are absent on
-purpose. The automation surface is the environment resource plus read
-views over what the node is doing, not the management API behind a
-different door; an automation that needs to reshape routing or issue a
-certificate is asking for an operator's credential, and it should have
-to say so rather than find the capability already attached to the token
-it uses for ephemeral environments.
+environment grants, `routes:read` and `certificates:read`, the read
+grants the management MCP server's read tier is built on (`logs:read`,
+`waf:read`, `sla:read`, `cluster:read`, `backends:read`), and the three
+write grants its config tier is built on (`routes:write`,
+`backends:write`, `certificates:write`). An unknown scope string fails
+to deserialise rather than being dropped, so a token minted against a
+newer Lorica is refused instead of silently losing a grant an operator
+wrote down; a 1.9.0 token presented to a 1.8.0 node is refused outright
+for that reason.
+
+Until v1.9.0 this paragraph said that `routes:write` and
+`certificates:write` were absent on purpose, because the automation
+surface was the environment resource and not the management API behind
+a different door. Story 11.2 reversed that for the three write scopes,
+and the reversal is recorded beside the decision it reverses, in the
+Epic 10 PRD at Story 10.3 AC #5. What stands is the reasoning about
+the CI caller: a pipeline that deploys review apps needs
+`environments:write` and nothing wider, and an operator minting a token
+for it should not add a write scope because it is there to add. The
+write scopes are a different credential for a different caller, the
+config tier of the MCP server, and `settings:*` and a certificate
+upload are still absent: key material and node-wide policy enter
+through the management API, by a human.
 
 **`allowed_hostnames` uses single-label wildcard semantics.**
 `*.review.example.com` covers `mr-42.review.example.com` and refuses
@@ -821,6 +838,98 @@ held by the process across requests. The listener's per-IP limiter is
 not that budget: it counts connections, and a keep-alive client issues
 requests without opening one.
 
+## The write surface
+
+Since v1.9.0 (Story 11.2) the listener answers these write paths, each
+behind the write scope beside it:
+
+| Verb and path | Scope | What it does |
+|---|---|---|
+| `POST /automation/v1/routes` | `routes:write` | Create a route: `POST /api/v1/routes`, as the token. |
+| `PUT /automation/v1/routes/{id}` | `routes:write` | Patch one route: `PUT /api/v1/routes/{id}`, as the token. |
+| `DELETE /automation/v1/routes/{id}` | `routes:write` | Delete one route; an environment's route takes the environment with it. |
+| `PUT /automation/v1/routes/{id}/certificate` | `certificates:write` | Bind a stored certificate to one route by id; the empty string unbinds. |
+| `POST /automation/v1/backends` | `backends:write` | Create a backend: `POST /api/v1/backends`, as the token. |
+| `PUT /automation/v1/backends/{id}` | `backends:write` | Patch one backend. |
+| `DELETE /automation/v1/backends/{id}` | `backends:write` | Delete one backend, with the graceful drain. |
+| `POST /automation/v1/certificates/{id}/renew` | `certificates:write` | Renew one ACME certificate in place. |
+
+**Each one is the management handler itself, run as the token.** The
+management handlers were split into the axum wrapper that reads the
+session and a body that takes an actor; the automation handler calls
+that body with the token's audit identity where the dashboard's session
+would be. So the validators, the defaults, the `managed_by` refusal on
+input (422), the refusal of a row an environment owns (409), the reload
+signal and the management-side audit row are all the same function's,
+and a route created through either door is the same stored row, field
+for field. A test proves that in the canonical encoding, byte for byte
+once the id and the timestamps are set equal; another proves a
+validator's refusal arrives with the same status and the same message
+the dashboard would have shown, and that nothing was written. Nothing
+on this plane reimplements a field check, which is what keeps the two
+surfaces from drifting: on a write surface, drift is one plane
+accepting what the other refuses.
+
+**What this plane adds is the token's grant**, applied before the
+handler runs and before anything is written, and it is authorization
+rather than validation. Every hostname a route write claims, the
+route's own and each alias, must be inside the token's
+`allowed_hostnames` (403), and a wildcard is refused outright because
+the grant is checked one exact host at a time. Every address a backend
+write points at must be an `ip:port` (422, since a name cannot be
+checked against a CIDR) inside the token's `allowed_backend_cidrs`
+(403). These are the two grants the environment resource already
+applies, through the same two functions, so a token minted for one
+shape of write is bounded the same way on the other. A route update
+that names no hostname and a backend update that names no address
+claim nothing and are checked against nothing.
+
+**One named resource per call.** Every write names one route, one
+backend or one certificate by id, or creates one. There is no pattern,
+no selector, no bulk verb, and the scope matrix declares none, so a
+path that would delete what matches does not exist to be reached.
+
+**No key material, anywhere.** A certificate can be bound and renewed
+here; it cannot be uploaded, replaced or generated. The management
+paths that take a PEM body (`POST /api/v1/certificates`,
+`PUT /api/v1/certificates/{id}`, `POST /api/v1/certificates/self-signed`)
+are not mounted on this listener and the matrix declares nothing for
+them, so they answer 403 to every token, one carrying every scope
+included. The binding's body is `deny_unknown_fields` with one field,
+so a PEM field that arrives beside the id is a 422 rather than a value
+ignored. `lorica-api/tests/openapi_contract.rs` asserts all of that
+against the router, the matrix, the handlers' request structs and the
+OpenAPI document rather than promising it here, and pins the field
+names each write accepts the way the read side pins the field names
+each answer carries: a field the management model grows reaches this
+plane by a decision and not by default.
+
+**Audit.** A write lands two rows, on two layers. The outermost layer
+writes `automation.request.ok` (or `forbidden:<scope>`) with the token
+named, as for every request on this plane. The handler writes the
+management-side row, `route.create`, `backend.update`,
+`certificate.renew` and so on, under the role `automation` and the
+principal `<name> (<public_id>)`, exactly as the environment rows are
+written, so one filter on the Audit page finds every machine-driven
+change whichever resource it touched, and a route the config tier
+created reads in the trail as created by that token and not by an
+operator.
+
+**Cluster.** The listener never runs on a follower, which is the
+refusal that keeps a write from landing where the next replication
+round would undo it (see [The listener](#the-listener)); on a control
+plane a route written here rides the same replication round as one
+written in the dashboard, since it is the same row, and
+`GET /api/v1/cluster/status` is where a caller watches the generation
+move.
+
+**Request bodies.** The route and backend paths take the management
+bodies unchanged (`CreateRouteRequest`, `UpdateRouteRequest`,
+`CreateBackendRequest`, `UpdateBackendRequest` in
+`lorica-api/openapi.yaml`); they are not restated in the automation
+document, where a second copy would drift. The binding takes
+`{"certificate_id": "<id>"}` and the renewal takes no body.
+
 ## GitLab OIDC
 
 A static token is a long-lived shared secret sitting in a CI variable.
@@ -1131,14 +1240,16 @@ translating:
 | `routes:read` | Same, for the routes an environment resolves to. |
 | `certificates:read` | Same, for certificate metadata. |
 | `logs:read`, `waf:read`, `sla:read`, `cluster:read`, `backends:read` | Same, for the read views the MCP server's read tier is built on. On `POST /automation/v1/mcp`, the scope the tool the call named needed and the credential does not carry. |
+| `routes:write`, `backends:write`, `certificates:write` | Same, for the write surface the MCP server's config tier is built on. |
 | `no_declared_scope` | The path has no entry in the scope matrix, so no token can reach it. A bug in Lorica, not in the caller: the scope gate also logs it at ERROR. |
 | `unknown_tool` | On `POST /automation/v1/mcp` only: the call named a tool no catalogue entry has. |
 
 A 403 a handler raised rather than the scope gate (an ownership rule, a
-hostname outside the credential's grant) carries no reason at all: the
-verb is a bare `automation.request.forbidden`. Naming the path's scope
-there would send an operator off to re-mint a token that was never the
-problem; the handler's own message on the wire is what explains those.
+hostname or a backend address outside the credential's grant on any
+write) carries no reason at all: the verb is a bare
+`automation.request.forbidden`. Naming the path's scope there would
+send an operator off to re-mint a token that was never the problem; the
+handler's own message on the wire is what explains those.
 
 #### The MCP endpoint's own refusals
 

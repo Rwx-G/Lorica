@@ -45,6 +45,9 @@
 //! - [`read`] - the read surface (Story 11.1): logs, WAF, SLA, cluster
 //!   status, backends, routes and certificate metadata, each a wrapper
 //!   over the management handler that already answers it.
+//! - [`write`] - the write surface (Story 11.2): routes, backends and
+//!   certificate bindings, each the management handler's own body run
+//!   with the token as the actor, bounded by the token's grants.
 //! - [`mcp`] - the MCP Streamable HTTP binding (Story 11.1 AC #9): one
 //!   `POST` path over the shared `lorica-mcp` core, reaching [`read`]'s
 //!   handlers in process rather than over a socket of its own.
@@ -84,6 +87,7 @@ pub mod oidc;
 pub mod read;
 pub mod router;
 pub mod scope;
+pub mod write;
 
 pub use auth::{
     AutomationPrincipal, AUTOMATION_BEARER_MAX_BYTES, AUTOMATION_LAST_USED_WRITE_INTERVAL,

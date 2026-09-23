@@ -256,6 +256,21 @@ pub async fn create_backend(
     Extension(session): Extension<Session>,
     Json(body): Json<CreateBackendRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    create_backend_as(&state, &audit_ctx, body).await
+}
+
+/// The whole of [`create_backend`] as `actor`: the validation, the
+/// row, the reload signal and the `backend.create` audit row.
+///
+/// Split from the handler so the automation plane (Story 11.2) can run
+/// exactly this with a token as the actor rather than a session; see
+/// `crate::routes::crud::create_route_as` for the rule.
+pub(crate) async fn create_backend_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    body: CreateBackendRequest,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     if body.address.is_empty() {
         return Err(ApiError::BadRequest("address is required".into()));
@@ -300,11 +315,10 @@ pub async fn create_backend(
     state.notify_config_changed();
 
     let response = backend_to_response(&backend, 0.0, 0);
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let after = serde_json::to_value(&response).ok();
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "backend.create",
         ("backend", &backend.id),
         None,
@@ -339,6 +353,20 @@ pub async fn update_backend(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdateBackendRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    update_backend_as(&state, &audit_ctx, id, body).await
+}
+
+/// The whole of [`update_backend`] as `actor`; see
+/// [`create_backend_as`] for why the split exists. The managed-row
+/// refusal (409) runs here, so it holds on every plane that reaches
+/// this function.
+pub(crate) async fn update_backend_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    id: String,
+    body: UpdateBackendRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     let (before_backend, backend) = db_blocking(&state.store, move |store| {
@@ -402,15 +430,14 @@ pub async fn update_backend(
     })
     .await?;
     state.notify_config_changed();
-    let score = get_ewma_score_async(&state, &backend.address).await;
-    let conns = get_backend_connections_async(&state, &backend.address).await;
+    let score = get_ewma_score_async(state, &backend.address).await;
+    let conns = get_backend_connections_async(state, &backend.address).await;
 
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let before = serde_json::to_value(&before_backend).ok();
     let after = serde_json::to_value(&backend).ok();
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "backend.update",
         ("backend", &backend.id),
         before.as_ref(),
@@ -433,6 +460,17 @@ pub async fn delete_backend(
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    delete_backend_as(&state, &audit_ctx, id).await
+}
+
+/// The whole of [`delete_backend`] as `actor`, the drain included; see
+/// [`create_backend_as`] for why the split exists.
+pub(crate) async fn delete_backend_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    id: String,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id_db = id.clone();
     let (backend, force_deleted) = db_blocking(&state.store, move |store| {
@@ -467,11 +505,10 @@ pub async fn delete_backend(
     .await?;
     state.notify_config_changed();
 
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let before = serde_json::to_value(&backend).ok();
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "backend.delete",
         ("backend", &backend.id),
         before.as_ref(),

@@ -30,12 +30,15 @@ import type { AutomationScope } from '../../lib/api';
 
 export const AUTOMATION_SCOPE_WIRE_STRINGS: readonly AutomationScope[] = [
   'backends:read',
+  'backends:write',
   'certificates:read',
+  'certificates:write',
   'cluster:read',
   'environments:read',
   'environments:write',
   'logs:read',
   'routes:read',
+  'routes:write',
   'sla:read',
   'waf:read',
 ];
