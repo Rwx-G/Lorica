@@ -27,7 +27,7 @@ It follows that:
 
 **D3 - A stream is its own object, not a kind of route.** A route is matched on hostname, path and headers; a stream has none of those. Grafting streams onto the route form would leave half of it meaningless. `Stream` gets its own model, its own join with backends, its own dashboard page, API resource, scopes and MCP tools.
 
-**D4 - Stream listeners exist only while a stream needs them.** Today the data plane binds two fixed ports once at startup (port arguments at `lorica/src/cli.rs:102-109`, bind at `lorica-worker/src/manager.rs:263-277`) and FR21's lazy bind was never built. Streams cannot work that way: creating a stream binds its port, deleting it releases the port, on a running process, without a restart. The supervisor binds (the unit's ambient `CAP_NET_BIND_SERVICE` is never dropped, so ports below 1024 work) and hands the socket to live workers over SCM_RIGHTS with the typed tags of `lorica-worker/src/fd_passing.rs`. Today fds cross only once, when a worker is forked (`manager.rs:309`), and the command channel carries no ancillary data, so this epic adds a runtime fd channel per worker. Pingora's listener set is fixed before `Server::run` and cannot grow afterwards, so stream listeners are served by a stream accept loop of their own, outside Pingora's listeners. The HTTP listeners are not changed by this epic.
+**D4 - Stream listeners exist only while a stream needs them.** Today the data plane binds two fixed ports once at startup (port arguments at `lorica/src/cli.rs:102-109`, bind at `lorica-worker/src/manager.rs:263-277`) and FR21's lazy bind was never built. Streams cannot work that way: creating a stream binds its port, deleting it releases the port, on a running process, without a restart. The supervisor binds (the unit's ambient `CAP_NET_BIND_SERVICE` is never dropped, so ports below 1024 work) and hands the socket to live workers over SCM_RIGHTS with the typed tags of `lorica-worker/src/fd_passing.rs`. Today fds cross only once, when a worker is forked (`manager.rs:309`), and the command channel carries no ancillary data, so this epic adds a runtime fd channel per worker. Pingora's listener set is fixed before `Server::run` and cannot grow afterwards, so stream listeners are served by a stream accept loop of their own, outside Pingora's listeners. The HTTP listeners keep their fixed ports; the one change they receive is optional PROXY protocol accept (Story 12.3 AC #9).
 
 **D5 - Established connections survive a hot upgrade where that can be done safely, and the PRD states where it cannot.** Today the old generation drains for a hard-coded 30 s and then kills its workers (`lorica-worker/src/manager.rs:554-597`), so any stream longer than 30 s is cut by every upgrade. The survey found no competitor that hands over established layer-4 connections: Envoy documents that they drain or are dropped, and forwards only in-flight UDP datagrams to the new process, not session state. This epic does:
 - **TCP passthrough streams and UDP sessions are transferred** to the new generation. A connection that does not reach a quiesce point (no forwarded bytes held in userspace) within `transfer_timeout`, or whose transfer fails at any step, stays with the old generation and drains. A connection is never left split between generations, and every per-connection outcome is counted.
@@ -45,7 +45,7 @@ It follows that:
 
 TLS-terminated and TLS-originating streams therefore drain (D5), and the documentation says so. No competitor transfers these connections either.
 
-**Integration Requirements:** All work lands on a single `feat/v1.10.0` branch with one final PR to `main`. If a new crate is introduced for the stream data plane, the three-Dockerfile rule applies (`Dockerfile`, `Dockerfile.dev`, `tests-e2e-docker/Dockerfile`), `docs/BUMP-CHECKLIST.md` gains it, and its version follows the product line. The HTTP data plane's behaviour is unchanged: every existing e2e profile passes untouched. `cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings` under `RUSTFLAGS=-D warnings`, `cargo audit`, and the frontend gates stay green at every commit.
+**Integration Requirements:** All work lands on a single `feat/v1.10.0` branch with one final PR to `main`. If a new crate is introduced for the stream data plane, the three-Dockerfile rule applies (`Dockerfile`, `Dockerfile.dev`, `tests-e2e-docker/Dockerfile`), `docs/BUMP-CHECKLIST.md` gains it, and its version follows the product line. The HTTP data plane's behaviour is unchanged while PROXY protocol accept stays off on its listeners, which is the default: every existing e2e profile passes untouched. `cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings` under `RUSTFLAGS=-D warnings`, `cargo audit`, and the frontend gates stay green at every commit.
 
 **Cross-cutting deliverables** (no single story owns them, all release-blocking):
 - `docs/streams.md` as the user-facing reference, including a directive-by-directive equivalence table from nginx `stream {}` and HAProxy `mode tcp`.
@@ -104,6 +104,7 @@ Verified against official documentation on 2026-09-28. nginx 1.31.x is the mainl
 | Session persistence | Hash | Stick tables | No | Hash | `ip_hash` | Story 12.3 (consistent hash); stick tables refused |
 | Protocol detection on one port | Preread only | Payload ACLs | SNI/ALPN | Inspectors | Richest set | Story 12.7 |
 | Arbitrary payload inspection | njs | `tcp-request content` | No | Wasm | Regexp | Refused |
+| PROXY protocol accept on the HTTP listeners | Yes | Yes | Yes | Yes | n/a | Story 12.3 |
 | Import from an nginx config | n/a | n/a | n/a | n/a | n/a | Stories 12.0 and 12.12 |
 
 "Paid" means nginx Plus or HAProxy Enterprise only. On UDP, HAProxy states that "general-purpose UDP load balancing ... is available only in HAProxy Enterprise" ([source](https://www.haproxy.com/solutions/udp-load-balancing)); the community edition has QUIC and UDP syslog forwarding only.
@@ -209,15 +210,17 @@ so that moving a TCP service behind Lorica loses nothing.
 6. **Timeouts**: connect, idle (no bytes either way) and optional total duration, each per stream, with documented defaults.
 7. **PROXY protocol send**, v1 or v2 per stream, towards the backend.
 8. **PROXY protocol accept**, v1 and v2, on a stream listener, **only from a configured list of trusted source CIDRs**. A PROXY header from any other source is refused and the connection closed, never interpreted: accepting it from anyone lets any client choose the source address every other control sees.
-9. **Transparent proxying, opt-in.** A stream can connect to its backend from the client's source address (`IP_TRANSPARENT`). This needs `CAP_NET_RAW` or `CAP_NET_ADMIN` in the workers, which open the upstream sockets, and policy routing (`ip rule` plus a local route) configured outside Lorica. The default systemd unit grants neither; the hardening guide ships a documented drop-in granting `CAP_NET_RAW`, the narrower of the two under the unit's address-family restriction, on both `CapabilityBoundingSet` and `AmbientCapabilities`. A stream configured transparent on a process that lacks the capability is in a failed state with that reason.
-10. **Bandwidth limits** per stream, upload and download, per connection.
-11. **Upstream DNS re-resolution.** A backend given as a hostname is re-resolved on a TTL-bounded schedule, and a resolution failure keeps the last known addresses and raises a health event.
-12. **Bounded resources.** Per-connection buffers are fixed-size; a slow reader on one side applies backpressure to the other, never unbounded buffering.
+9. **PROXY protocol accept on the HTTP and HTTPS listeners**, v1 and v2, off by default, under the same trusted-CIDR rule as AC #8. When on, the address it carries is the client address for every HTTP control: access logs, WAF and bot verdicts, rate limits, GeoIP, the connection filter and `X-Forwarded-For`. The header is read before TLS and HTTP parsing, in the forked listener path (`lorica-core`), so this is the one change this epic makes to the HTTP listeners.
+10. **Transparent proxying, opt-in.** A stream can connect to its backend from the client's source address (`IP_TRANSPARENT`). This needs `CAP_NET_RAW` or `CAP_NET_ADMIN` in the workers, which open the upstream sockets, and policy routing (`ip rule` plus a local route) configured outside Lorica. The default systemd unit grants neither; the hardening guide ships a documented drop-in granting `CAP_NET_RAW`, the narrower of the two under the unit's address-family restriction, on both `CapabilityBoundingSet` and `AmbientCapabilities`. A stream configured transparent on a process that lacks the capability is in a failed state with that reason.
+11. **Bandwidth limits** per stream, upload and download, per connection.
+12. **Upstream DNS re-resolution.** A backend given as a hostname is re-resolved on a TTL-bounded schedule, and a resolution failure keeps the last known addresses and raises a health event.
+13. **Bounded resources.** Per-connection buffers are fixed-size; a slow reader on one side applies backpressure to the other, never unbounded buffering.
 
 ### Integration Verification
 
 - IV1: A TCP stream in front of three PostgreSQL backends balances connections by the configured algorithm, survives one backend being killed with no failed new connection after the breaker trips, and a `psql` session opened before the kill on a surviving backend is unaffected.
 - IV2: A backend receiving PROXY v2 sees the real client address; a client outside the trusted CIDRs sending a PROXY header is disconnected.
+- IV3: Behind an L4 load balancer sending PROXY v2, an HTTPS route logs, rate-limits, GeoIP-filters and forwards `X-Forwarded-For` with the original client address, and a direct connection from outside the trusted CIDRs carrying a PROXY header is disconnected.
 
 ---
 
@@ -458,7 +461,3 @@ These rows of the survey are not shipped by this epic, and not deferred either: 
 - **WAF, bot protection and request capture on streams.** There is no request at layer 4. HTTP that needs them uses a route.
 - **The automation `environment` resource for streams.** It is a hostname-bound review-app primitive; a stream has no hostname.
 - **Live transfer of TLS-terminated and TLS-originating streams across an upgrade.** D8: the TLS 1.3 traffic secret cannot leave the process that did the handshake, and kernel rekey needs Linux 6.14. These streams drain.
-
-## Open Questions
-
-- **OQ1 - PROXY protocol on the HTTP listeners.** Accepting PROXY protocol on Lorica's HTTP and HTTPS listeners (Lorica behind a cloud L4 load balancer) shares code with Story 12.3 and is a frequent request, but it is an HTTP-listener change this epic otherwise avoids. In or out?
