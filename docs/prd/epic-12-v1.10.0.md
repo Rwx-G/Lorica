@@ -2,7 +2,7 @@
 
 **Author:** Romain G.
 **Target version:** 1.10.0
-**Status:** Draft (2026-09-28). Written against `feat/v1.9.0` at `1b83cf0d` plus the v1.9.0 work then uncommitted in the tree, so line numbers in cited files may drift; function and type names are the stable reference. Parity survey of nginx 1.31.6, HAProxy 3.4 LTS, Traefik 3.7, Envoy 1.40-dev and caddy-l4 taken the same day. Revised the same day after three passes: a verification that executed the nginx importer and checked every assumption and citation, a rubric review, and an adversarial review.
+**Status:** Final (2026-09-28). Written against `feat/v1.9.0` at `1b83cf0d` plus uncommitted v1.9.0 work; cite function and type names, since line numbers may drift. Parity survey of nginx 1.31.6, HAProxy 3.4 LTS, Traefik 3.7, Envoy 1.40-dev and caddy-l4 taken the same day. Revised the same day after a verification pass (the nginx importer executed, every assumption and citation checked), a rubric review and an adversarial review.
 
 **Epic Goal:** Make Lorica a layer-4 reverse proxy on a par with nginx `stream {}` and HAProxy `mode tcp`, for TCP and UDP. An operator who needs to front a database, a DNS resolver, an SSH bastion or a TLS service that must not be terminated should not have to run a second proxy next to Lorica, and should not drop Lorica from a shortlist because a layer-4 box is empty. Once parity is reached, the epic goes past it where the survey shows gaps the field leaves open.
 
@@ -14,7 +14,7 @@ There is no single use case behind this epic, and that is deliberate. An adopter
 
 It follows that:
 
-- **Parity is defined against nginx and HAProxy open source**, the two references adopters migrate from. Every table-stakes row they ship is a requirement. Every surveyed row this epic does not ship is refused in writing below, with the reason. "Coverage" is not an acceptance criterion; a closed list is.
+- **Parity is defined against nginx and HAProxy open source**, the two references adopters migrate from. Every table-stakes row they ship is a requirement. Every surveyed row this epic does not ship is listed with its reason in "Refused, in writing". "Coverage" is not an acceptance criterion; a closed list is.
 - **Parity first, then beyond.** The stories are ordered in two phases. Phase 1 reaches parity and ends with a verification checkpoint. Phase 2 goes past it. Nothing is cut and nothing is deferred to another release: the order says what gets built first, and if the cycle runs long, it says without debate what is still in flight.
 - **A stream is a full citizen.** Replicated across the fleet, targeted per node, audited, observed, readable on the automation API and the MCP read tier, and managed from the dashboard and the management API. Shipping a node-local feature and replicating it later is debt, and this cycle carries none.
 - **What Lorica already has for HTTP is reused, not reimplemented.** A backend is one object whether an HTTP route or a TCP stream points at it. The certificate resolver and ACME serve stream TLS termination. GeoIP and the IP blocklist protect stream listeners.
@@ -24,20 +24,20 @@ It follows that:
 
 **D1 - A reverse stream proxy, not a forward proxy.** Lorica listens on a port and forwards the byte stream (TCP) or the datagrams (UDP) to a backend it chose. An outbound forward proxy (CONNECT, Squid-style egress) is a different product with a different threat model and is not part of this epic.
 
-**D2 - One backend object for HTTP and TCP streams, UDP backends apart.** The `Backend` model (`lorica-config/src/models/backend.rs`, `struct Backend`) is shared by HTTP routes and TCP streams, with one health state visible in one place. What a state change does to live stream connections is defined per stream (Story 12.2). Fields that only mean something to HTTP consumers are named as such: `health_check_path`, `h2_upstream`, and the upstream TLS fields (`tls_upstream`, `tls_sni`, `tls_skip_verify`); a stream's upstream TLS lives on the stream (Story 12.4). A backend used by a UDP stream is UDP-only: one health state cannot prove both a TCP and a UDP service. The health check becomes a typed definition (HTTP probe, TCP connect, TCP send/expect, UDP send/expect) through an additive migration (Story 12.1).
+**D2 - One backend object for HTTP routes and TCP streams; UDP backends stand apart.** The `Backend` model (`lorica-config/src/models/backend.rs`, `struct Backend`) is shared by HTTP routes and TCP streams, with one health state visible in one place. What a state change does to live stream connections is defined per stream (Story 12.2). Fields that only mean something to HTTP consumers are named as such: `health_check_path`, `h2_upstream`, and the upstream TLS fields (`tls_upstream`, `tls_sni`, `tls_skip_verify`); a stream's upstream TLS lives on the stream (Story 12.4). A backend used by a UDP stream is UDP-only: one health state cannot prove both a TCP and a UDP service. The health check becomes a typed definition (HTTP probe, TCP connect, TCP send/expect, UDP send/expect) through an additive migration (Story 12.1).
 
 **D3 - A stream is its own object, not a kind of route.** A route is matched on hostname, path and headers; a stream has none of those. `Stream` gets its own model, its own join with backends, its own dashboard page, API resource, read scope and MCP read tools.
 
-**D4 - Stream listeners exist only while a stream needs them.** Today the data plane binds two fixed ports once at startup (port arguments in `lorica/src/cli.rs`, bind in `create_listen_sockets`, `lorica-worker/src/manager.rs`) and FR21's lazy bind was never built. Streams cannot work that way: creating a stream binds its port, deleting it releases the port, on a running process, without a restart.
+**D4 - Stream listeners exist only while a stream needs them.** Today the data plane binds two fixed ports once at startup (port arguments in `lorica/src/cli.rs`, bind in `create_listen_sockets`, `lorica-worker/src/manager.rs`) and the lazy bind that FR21 planned for dynamic listeners was never built. Streams cannot work that way: creating a stream binds its port, deleting it releases the port, on a running process, without a restart.
 - The supervisor binds. The unit's ambient `CAP_NET_BIND_SERVICE` is never dropped, so ports below 1024 work.
 - Sockets reach live workers over SCM_RIGHTS with the typed tags of `lorica-worker/src/fd_passing.rs`. Today fds cross only once, at worker fork, and the command channel carries no ancillary data, so this epic adds a **runtime fd channel per worker**.
 - A TCP stream listener is one socket shared by the workers. A **UDP stream gets one socket per worker**, created by the supervisor as a `SO_REUSEPORT` group, so the kernel keeps a client's datagrams on one worker for that worker's lifetime.
 - Pingora's listener set is fixed before `Server::run` and cannot grow afterwards, so stream sockets are served by a **stream accept loop of their own**, outside Pingora's listeners.
 - The HTTP listeners keep their fixed ports; the one change they receive is optional PROXY protocol accept (Story 12.8).
 
-**D5 - Established connections survive a hot upgrade where that can be done safely, and the PRD states where it cannot.** Today the old generation drains for a hard-coded 30 s and then kills its workers (`drain_for_handoff`, `lorica-worker/src/manager.rs`), so any stream longer than 30 s is cut by every upgrade, even though `docs/hot-upgrade.md` already documents a `worker_drain_timeout_s` setting that does not exist. The survey found no competitor that hands over established layer-4 connections: Envoy documents that they drain or are dropped, and forwards only in-flight UDP datagrams to the new process, not session state.
-- **Phase 1 (Story 12.11):** the drain delay becomes the real, configurable `worker_drain_timeout_s`, for HTTP and streams, and every connection an upgrade closes says so.
-- **Phase 2 (Story 12.16):** TCP passthrough connections and UDP sessions are transferred to the new generation. A connection that does not reach a quiesce point within `transfer_timeout`, or whose transfer fails at any step, stays with the old generation and drains. A connection is never split between generations.
+**D5 - Established connections survive a hot upgrade where that can be done safely, and the PRD states where it cannot.** Today the old generation (the supervisor and workers of the binary being replaced) drains for a hard-coded 30 s and then kills its workers (`drain_for_handoff`, `lorica-worker/src/manager.rs`), so any stream longer than 30 s is cut by every upgrade, even though `docs/hot-upgrade.md` already documents a `worker_drain_timeout_s` setting that does not exist. The survey found no competitor that hands over established layer-4 connections: Envoy documents that they drain or are dropped, and forwards only in-flight UDP datagrams to the new process, not session state.
+- **Phase 1 (Stories 12.2 and 12.11):** the drain delay becomes the real, configurable `worker_drain_timeout_s` (Story 12.2 AC #7), hot upgrade uses it for HTTP and streams (Story 12.11), and every connection an upgrade closes says so.
+- **Phase 2 (Story 12.16):** TCP passthrough connections and UDP sessions are transferred to the new generation. A connection that does not reach a quiesce point (no forwarded bytes held in userspace) within `transfer_timeout`, or whose transfer fails at any step, stays with the old generation and drains. A connection is never split between generations.
 - **Streams where Lorica terminates or originates TLS always drain** (D8).
 
 **D6 - Safe by default on UDP.** A UDP listener is a potential amplifier, and a UDP source address is spoofable, so every per-source control is a courtesy to honest clients, not a defence. The defaults bound the reflection itself:
@@ -45,18 +45,18 @@ It follows that:
 - a bound on requests per session, and a session closes as soon as its request or response bound is reached (nginx closes on `proxy_responses`), so short request/response protocols such as DNS do not hold a socket until the idle timeout;
 - a short idle timeout;
 - a per-source datagram rate and byte rate, a cap on concurrent sessions per source, and a total session cap per stream;
-- no UDP stream on a listen address that is not loopback, RFC 1918 or ULA without a source allowlist or an explicit per-source cap at or below a documented maximum.
+- a UDP stream on any listen address other than loopback, RFC 1918 or ULA requires a source allowlist or an explicit per-source cap at or below a documented maximum.
 
 An operator can lift the response bounds; the stream then carries a permanent "unbounded responses" badge in the dashboard and a flag in API and MCP listings. No confirmation modal: a badge that stays visible is read, a modal that interrupts every save is clicked through.
 
 **D7 - No default backend, with two named, badged exceptions.** A connection that matches nothing is closed, never sent to a default backend: a default is an allowlist bypass. Two situations cannot be matched on client bytes and would otherwise force a default, so each gets an explicit matcher that the operator sets on purpose, that carries a permanent badge, and that is counted separately: the **"no SNI" matcher** for TLS clients that send no server name (Story 12.4), and the **"silent client after N ms" matcher** for server-first protocols such as MySQL, SMTP and FTP (Story 12.15). A stream using either requires a source allowlist or an explicit acknowledgement field.
 
-**D8 - No live transfer of TLS streams in 1.10.0, by decision.** Moving a TLS connection between processes was examined through kernel TLS and rejected:
+**D8 - No live transfer of TLS-terminating or TLS-originating streams in 1.10.0, by decision.** Moving a TLS connection between processes was examined through kernel TLS and rejected:
 - rustls cannot rebuild a connection from extracted secrets in userspace. Its kernel-TLS path (`KernelConnection`, rustls 0.23.27+) keeps the TLS 1.3 traffic secret inside the process that did the handshake, and exists only on the unbuffered API, not on the tokio-rustls path Lorica uses.
 - The kernel holds the derived key and sequence number, not the traffic secret. A transferred socket keeps its data path but the new process cannot answer the peer's next KeyUpdate, so the connection would die at the first rekey.
 - Kernel TLS 1.3 rekey support needs Linux 6.14; Debian 12, Ubuntu 24.04 and RHEL 9 ship older kernels. Loading the `tls` module on demand needs `CAP_NET_ADMIN`, which Lorica does not hold.
 
-TLS-terminated and TLS-originating streams therefore drain, and the documentation says so. No competitor transfers these connections either.
+TLS-terminated and TLS-originating streams therefore drain, and the documentation says so.
 
 **D9 - Stream mutations stay on the management plane.** Opening a port is a perimeter change. The `SettingsWrite` scope's own definition (`automation_token.rs`) says the automation plane never touches "a listener", and a stream is a listener; an automation token has no axis that could confine a listen address or port (`allowed_hostnames` means nothing for a stream). So:
 - the automation API gets `streams:read` only, and the MCP server gets stream tools in the read tier only;
@@ -65,17 +65,19 @@ TLS-terminated and TLS-originating streams therefore drain, and the documentatio
 
 What this gives up: creating streams from CI with a token. Adding listen-address and port confinement to tokens is possible later and would be its own decision.
 
+## Delivery requirements
+
 **Integration Requirements:** All work lands on a single `feat/v1.10.0` branch with one final PR to `main`; the version is bumped once, after Phase 2. If a new crate is introduced for the stream data plane, the three-Dockerfile rule applies (`Dockerfile`, `Dockerfile.dev`, `tests-e2e-docker/Dockerfile`), `docs/BUMP-CHECKLIST.md` gains it, and its version follows the product line. `cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings` under `RUSTFLAGS=-D warnings`, `cargo audit`, and the frontend gates stay green at every commit.
 
-**HTTP-visible changes, each with its non-regression test:** the typed health-check migration (Story 12.1); the configurable drain delay (Story 12.11); PROXY protocol accept on the HTTP listeners, off by default (Story 12.8); weighted P2C as a new balancing option (Story 12.13); the UDP-only backend validation (Story 12.1). With PROXY accept off and P2C unused, HTTP behaviour is unchanged and every existing e2e profile passes untouched.
+**HTTP-visible changes, each with its non-regression test:** the typed health-check migration and the UDP-only backend validation (Story 12.1); the configurable drain delay (Stories 12.2 and 12.11); PROXY protocol accept on the HTTP listeners, off by default (Story 12.8); weighted P2C as a new balancing option (Story 12.13). With PROXY accept off and P2C unused, HTTP behaviour is unchanged and every existing e2e profile passes untouched.
 
-**Cross-cutting deliverables** (no single story owns them, all release-blocking):
-- `docs/streams.md` as the user-facing reference: a directive-by-directive equivalence table from nginx `stream {}` and HAProxy `mode tcp`; the UDP capacity formula (session ceiling divided by idle timeout for one-shot protocols) and the preconditions for high session counts (`LimitNOFILE` drop-in, wider `ip_local_port_range`, several source addresses through `proxy_bind`); the hairpin pattern for sharing port 443 with Lorica's HTTPS listener; ClientHello and ECH behaviour.
+**Cross-cutting deliverables** (all release-blocking; where a story owns one, the story is named in its entry):
+- `docs/streams.md` as the user-facing reference: a directive-by-directive equivalence table from nginx `stream {}` and HAProxy `mode tcp`; the UDP capacity formula (session ceiling divided by idle timeout for one-shot protocols) and the preconditions for high session counts (`LimitNOFILE` drop-in, wider `ip_local_port_range`, several source addresses through `proxy_bind`); the hairpin pattern for sharing port 443 with Lorica's HTTPS listener (Story 12.15 AC #5); ClientHello and ECH behaviour.
 - `docs/security/threat-model.md` gains: UDP reflection and amplification, slow ClientHello and slow detection, PROXY-header spoofing, detection bypass, a stream exposing local services, forwarding loops, DNS rebinding of stream backends, log amplification, and the post-compromise consequence of the transparent-mode capability.
 - `docs/security/hardening-guide.md` gains stream guidance: the transparent-mode drop-in, raising UDP session capacity, and the drain delay versus `TimeoutStopSec`.
-- `docs/hot-upgrade.md` and `docs/installation.md` describe the `worker_drain_timeout_s` that now exists; `docs/cluster.md` "Running a Mixed-Version Fleet" covers the 1.9.0 to 1.10.0 step.
+- `docs/hot-upgrade.md` and `docs/installation.md` describe the `worker_drain_timeout_s` that now exists (Stories 12.2 AC #7 and 12.11 AC #1); `docs/cluster.md` "Running a Mixed-Version Fleet" covers the 1.9.0 to 1.10.0 step (Story 12.1 AC #5).
 - `lorica-api/openapi.yaml` for the stream resource and the backend health-check shape, kept green against the contract test.
-- `streams:read` turns red every artefact listed where `AutomationScope` is defined: the serde rename test, `AUTOMATION_AUDIT_REASONS`, `lorica-api/openapi.yaml`, `lorica-api/openapi-automation.yaml`, and `automation-scopes.generated.ts` checked by `lorica-api/tests/automation_scope_fixture.rs`. All move in one commit.
+- `streams:read` turns red every artefact listed where `AutomationScope` is defined: the serde rename test, `AUTOMATION_AUDIT_REASONS`, `lorica-api/openapi.yaml`, `lorica-api/openapi-automation.yaml`, and `automation-scopes.generated.ts` checked by `lorica-api/tests/automation_scope_fixture.rs`. All move in one commit (Story 12.10 AC #2).
 - `CHANGELOG.md` under Added and Security. The README feature list and roadmap.
 
 ---
@@ -86,7 +88,7 @@ Verified against official documentation on 2026-09-28. nginx 1.31.x is the mainl
 
 ### Coverage matrix and Lorica's commitment
 
-"P1" is Phase 1 (parity), "P2" is Phase 2 (beyond parity).
+"P1" is Phase 1 (parity), "P2" is Phase 2 (beyond parity). "Paid" means nginx Plus or HAProxy Enterprise only.
 
 | Feature | nginx `stream` | HAProxy `mode tcp` | Traefik | Envoy | caddy-l4 | Lorica 1.10.0 |
 |---|---|---|---|---|---|---|
@@ -102,7 +104,7 @@ Verified against official documentation on 2026-09-28. nginx 1.31.x is the mainl
 | PROXY protocol accept on the HTTP listeners | Yes | Yes | Yes | Yes | n/a | P1, Story 12.8 |
 | Round robin, least conn | Yes | Yes | WRR only | Yes | Plugin | P1, Story 12.3 |
 | Hash / consistent hash on source | Yes | Yes | No | Yes | Plugin | P1, Story 12.3 (`lorica-ketama`) |
-| Random / power of two | Yes | Yes | No | Yes | Plugin | Random P1; weighted P2C P2, Story 12.13 |
+| Random / power of two | Yes | Yes | No | Yes | Plugin | Random P1, Story 12.3; weighted P2C P2, Story 12.13 |
 | Latency-aware selection | `least_time` | No | No | No | No | P1, Story 12.3 (`peak_ewma`) |
 | Backup backends | Yes | Yes | No | Priority | No | P1, Story 12.3 |
 | Passive failure detection | Yes | Yes | No | Yes | Plugin | P1, Story 12.3 (circuit breaker) |
@@ -119,9 +121,9 @@ Verified against official documentation on 2026-09-28. nginx 1.31.x is the mainl
 | Chosen source address (`proxy_bind`) | Yes | Yes (`source`) | No | Yes | No | P1, Story 12.3 |
 | Transparent proxy | Yes | Yes | No | Yes | No | P2, Story 12.13, opt-in |
 | Backend TCP keepalive | Yes | Yes | No | Yes | No | P1, Story 12.3 |
-| Port ranges | Yes | Yes | No | No | Yes | P1, Story 12.2 |
+| Port ranges | Yes | Yes | No | No | Yes | P1, Story 12.1 |
 | Dynamic reconfiguration | Reload; API paid | Runtime API | Provider | xDS | Admin API | P1, Story 12.2, management API and cluster |
-| Connection draining | Yes | Yes | Yes | Yes | Plugin | P1, Story 12.11 |
+| Connection draining | Yes | Yes | Yes | Yes | Plugin | P1, Stories 12.2 and 12.11 |
 | Hot binary upgrade | USR2 | Reload with fd passing, drain | No | Hot restart, drain; in-flight UDP datagrams forwarded | No | Drain P1, Story 12.11; **live transfer of TCP passthrough and UDP sessions** P2, Story 12.16 |
 | L4 access log | Yes | Yes | Not verified | Yes | Not verified | P1, Story 12.9 |
 | L4 metrics | Paid | Yes | Gauge only | Yes | Not verified | P1, Story 12.9 |
@@ -133,7 +135,7 @@ Verified against official documentation on 2026-09-28. nginx 1.31.x is the mainl
 | Arbitrary payload inspection | njs | `tcp-request content` | No | Wasm | Regexp | Refused |
 | Import from an nginx config | n/a | n/a | n/a | n/a | n/a | Fix P1, Story 12.0; full import P2, Story 12.17 |
 
-"Paid" means nginx Plus or HAProxy Enterprise only. On UDP, HAProxy states that "general-purpose UDP load balancing ... is available only in HAProxy Enterprise" ([source](https://www.haproxy.com/solutions/udp-load-balancing)); the community edition has QUIC and UDP syslog forwarding only.
+On UDP, HAProxy states that "general-purpose UDP load balancing ... is available only in HAProxy Enterprise" ([source](https://www.haproxy.com/solutions/udp-load-balancing)); the community edition has QUIC and UDP syslog forwarding only.
 
 ### What the survey says beyond the matrix
 
@@ -149,13 +151,15 @@ nginx: [ngx_stream_proxy_module](https://nginx.org/en/docs/stream/ngx_stream_pro
 
 # Phase 1: Parity
 
-Stories are built in number order. Story 12.0 lands before any other. Phase 1 ends when Story 12.12 passes: at that point Lorica covers every table-stakes row, and Phase 2 starts.
+Stories are built in number order. Story 12.0 lands before any other. Phase 1 ends when Story 12.12 passes: at that point Lorica covers every table-stakes feature listed in "What the survey says beyond the matrix", and Phase 2 starts.
 
 ## Story 12.0: The nginx importer stops misreading `stream {}` blocks
 
 As an operator importing an existing nginx configuration,
 I want a `stream {}` block to be recognised as what it is,
 so that a TLS passthrough on 443 is never imported as an HTTP route, and a database port does not produce a misleading "use a subdomain on 443" hint.
+
+### What the importer does today
 
 Executed on a copy of `lorica-dashboard/frontend/src/lib/nginx-parser.ts` (2026-09-28):
 - `server` and `upstream` are recognised with no parent check, so a stream `server` and its `upstream` land in the HTTP-shaped output of `parseNginxConfig`.
@@ -190,7 +194,7 @@ so that one list of backends and one health state serve both my HTTP routes and 
 
 1. **New `Stream` model in `lorica-config`** with the fields this story gives meaning to: id, name, group name, protocol (`tcp` or `udp`), listen address and a single port or a port range, IPv4 and IPv6, a list of backends through a `stream_backends` join (the counterpart of `RouteBackend`), `node_selector`, `managed_by`, timestamps. Each later story adds its own fields, validation and migration; no field is stored before a story gives it a meaning.
 2. **Port ranges map port to port.** A range stream forwards listen port N to backend port N; its backends are given without a port. A range is capped at 1,024 ports per stream by default.
-3. **The typed health check, by additive migration (D2).** The migration adds the typed definition and keeps `health_check_path`. In 1.10.0 the typed definition is read and both are written; the management API, both OpenAPI documents, the dashboard backend form and `api.ts`, and the MCP and automation backend tools accept both shapes, with the old one documented as deprecated. A test proves the 1.9.0 binary still opens a 1.10.0 database, so a hot-upgrade rollback (`docs/hot-upgrade.md`) does not become an outage.
+3. **The typed health check, by additive migration (D2).** The migration adds the typed definition and keeps `health_check_path`. In 1.10.0 the typed definition is read, and both the typed definition and `health_check_path` are written; the management API, both OpenAPI documents, the dashboard backend form and `api.ts`, and the MCP and automation backend tools accept both shapes, with the old one documented as deprecated. A test proves the 1.9.0 binary still opens a 1.10.0 database, so a hot-upgrade rollback (`docs/hot-upgrade.md`) does not become an outage.
 4. **UDP-only backends.** A backend attached to a UDP stream cannot be attached to an HTTP route or a TCP stream, and cannot carry a non-UDP health check; the validation error names the stream. Until Story 12.14 ships UDP checks, a UDP backend has active checks disabled and relies on passive detection.
 5. **The canonical config decision is taken once, here, for the release.** `Stream` and `stream_backends` join `CanonicalConfig`, whose version check is strict equality and whose decoder refuses unknown fields. This story decides the `CANONICAL_FORMAT_VERSION` step for 1.10.0 and the fleet upgrade order it implies, and updates `docs/cluster.md` "Running a Mixed-Version Fleet". Later stories add fields inside that decision.
 6. **Replicated and targeted.** Streams take part in two-phase replication and honour `node_selector` exactly as routes do. A follower never binds a stream it was not targeted by.
@@ -249,7 +253,7 @@ so that moving a TCP service behind Lorica loses nothing.
 8. **PROXY protocol send**, v1 or v2 per stream.
 9. **PROXY protocol accept on TCP streams**, v1 and v2, only from a per-stream list of trusted source CIDRs. The header is bounded in size (4 KiB) and in time; a header from an untrusted source, an oversized one or a late one closes the connection with `proxy_header_invalid`. PROXY accept on UDP streams is refused in writing: a UDP source address is spoofable, so "trusted source" means nothing.
 10. **Chosen source address** (`proxy_bind`): a stream can connect from a configured local address, which is also how UDP session capacity is raised past one address's ephemeral ports.
-11. **Local backends are refused, at validation and at every connect.** A backend that resolves to a loopback, link-local or other local address on a reserved port (Story 12.1 AC #7) or on any stream listen port of the node is refused, which also prevents forwarding loops. Other local backends need an explicit per-stream `allow_local_backend` flag, badge-visible, never settable from the automation or MCP surfaces. The check runs again after every DNS resolution, so a hostname that re-resolves to a local address is marked down, not connected.
+11. **Local backends are refused, at validation and at every connect.** A backend that resolves to a loopback, link-local or other local address on a reserved port (Story 12.1 AC #7) or on any stream listen port of the node is refused, which also prevents forwarding loops. The one exception is the port 443 hairpin of Story 12.15 AC #5. Other local backends need an explicit per-stream `allow_local_backend` flag, badge-visible, never settable from the automation or MCP surfaces. The check runs again after every DNS resolution, so a hostname that re-resolves to a local address is marked down, not connected.
 12. **Bandwidth limits** per stream, upload and download, per connection.
 13. **Upstream DNS re-resolution** on a TTL-bounded schedule; a resolution failure keeps the last known addresses and raises a health event.
 14. **Bounded resources.** Per-connection buffers are fixed-size; a slow reader applies backpressure to the other side, never unbounded buffering. A per-stream cap on concurrent TCP connections has a documented default.
@@ -295,7 +299,7 @@ so that I can front UDP services without building an amplifier.
 
 1. **Sessions keyed on the client address and port**, each bound to one backend and served by one worker for that worker's lifetime (D4), with round robin, random, consistent hash on source and least sessions.
 2. **The D6 defaults**, each documented next to the survey's values: response datagrams per request, response bytes relative to request bytes, requests per session, idle timeout, per-source datagram and byte rate, per-source session cap, total session cap per stream. A session closes as soon as its request or response bound is reached (`request_bound_reached`, `response_bound_reached`).
-3. **Listen address rule (D6).** A UDP stream on an address that is not loopback, RFC 1918 or ULA is refused without a source allowlist or a per-source cap at or below the documented maximum.
+3. **Listen address rule (D6).** A UDP stream on any address other than loopback, RFC 1918 or ULA is refused unless it has a source allowlist or a per-source cap at or below the documented maximum.
 4. **Unbounded responses are explicit**: a separate field, a permanent badge, a flag in API and MCP listings.
 5. **Per-node caps on dedicated tables.** Stream caps are per node, shared across workers, on `lorica-shmem` tables of their own (not the WAF tables), sized per stream. A full table refuses new sessions on that stream only, counted as its own refusal reason. A concurrency slot is never evicted while it is held. The shared-memory layout version bump is part of this story.
 6. **A ceiling derived from the host.** Each session holds one connected upstream socket, so the per-node session ceiling defaults below the fd budget left after the HTTP reserve (Story 12.2 AC #5) and below the usable ephemeral port count per source address (about 28,000 with the default `ip_local_port_range`). It is recomputed on every stream change, reported with the limit that bound it, and a change that would break it is refused. Receive buffers are shared per worker, never allocated per session.
@@ -429,7 +433,7 @@ so that an upgrade never cuts a database session at an arbitrary 30 s.
 
 ### Integration Verification
 
-- IV1: With `worker_drain_timeout_s` set to 120 s, an SSH session through a stream survives a hot upgrade for up to 120 s after it starts and then ends with `drained_by_upgrade` in the log.
+- IV1: With `worker_drain_timeout_s` set to 120 s, an SSH session through a stream survives a hot upgrade for up to 120 s after the upgrade starts and then ends with `drained_by_upgrade` in the log.
 
 ---
 
@@ -442,13 +446,13 @@ so that "on a par" is a measured claim before Phase 2 starts.
 ### Acceptance Criteria
 
 1. **An L4 phase in `tests-e2e-docker/`** with real backends, running every Integration Verification of Stories 12.1 to 12.11 as its own named scenario, plus the fd-reserve scenario (filling UDP sessions to the ceiling leaves HTTP accept unaffected).
-2. **A performance phase** runs nginx `stream` (pinned version) and Lorica in the same compose, alternately, against the same backends, comparing **ratios, never absolute numbers**. The load generator, the proxy under test and the backends are pinned to disjoint `cpuset`s, and both proxies get the same core count. Each measurement is repeated at least 5 times per proxy, alternating; the phase reports median and spread, and proxy CPU per GiB forwarded.
+2. **A performance phase** runs nginx `stream` (pinned version) and Lorica in the same compose, alternately, against the same backends, comparing **ratios, never absolute numbers**. The load generator, the proxy under test and the backends are pinned to disjoint `cpuset`s, and both proxies get the same core count. Each measurement is repeated at least 5 times per proxy, alternating; the phase reports median and spread, and proxy CPU per GiB forwarded. This harness is separate from `lorica-bench`, which is Lorica's SLA and load-test feature.
    - TCP passthrough: Lorica median throughput at least 0.90 x the nginx median, and Lorica CPU per GiB at most 1.15 x nginx.
    - Connection setup: Lorica p99 accept-to-backend-connect latency at most 1.5 x the nginx p99, for non-TLS streams.
    - UDP: at a fixed session count equal to 80 % of Lorica's derived ceiling, both proxies hold every session with no loss and no premature eviction; Lorica's resident memory per 1,000 sessions is reported.
 3. **Inconclusive is not a pass.** A result whose spread exceeds 5 % of its median is re-run, at most 3 times; still inconclusive, it blocks the release pending an owner decision.
-4. **NFR1 by the same method**: HTTP throughput and p99 against the v1.9.0 binary in the same run, with and without one idle stream configured.
-5. **Gating.** The performance phase gates the local release run, which has the machine to itself as the e2e suite already requires. In CI it runs and publishes its numbers in the job summary without gating, because shared runners are too noisy for these ratios. `lorica-bench` is Lorica's SLA and load-test feature, not this harness.
+4. **NFR1 by the same method**: HTTP throughput and p99 against the v1.9.0 binary in the same run, with and without one idle stream configured, held to the NFR1 thresholds (0.95 x throughput, 1.05 x p99).
+5. **Gating.** The performance phase gates the local release run, which has the machine to itself as the e2e suite already requires. In CI it runs and publishes its numbers in the job summary without gating, because shared runners are too noisy for these ratios.
 6. **New test artefacts are named and approved at the start of this story**: the nginx image and version, a TCP load generator, a DNS load generator, and the PostgreSQL, DNS resolver, SSH and TLS echo backend images.
 7. Every existing e2e profile passes unchanged.
 
@@ -459,6 +463,8 @@ so that "on a par" is a measured claim before Phase 2 starts.
 ---
 
 # Phase 2: Beyond parity
+
+Stories are built in number order, starting from the Phase 1 head that passed Story 12.12 IV1. Phase 2 ends when Story 12.18 passes, and the version is bumped after it.
 
 ## Story 12.13: Weighted P2C and transparent proxying
 
@@ -520,7 +526,7 @@ so that I can cover network setups where only one port is open.
 ## Story 12.16: Live transfer across hot upgrades
 
 As an operator,
-I want an upgrade to hand my SSH sessions and UDP sessions to the new binary,
+I want an upgrade to hand my SSH connections and UDP sessions to the new binary,
 so that an upgrade stops being a maintenance window for them.
 
 ### Acceptance Criteria
@@ -538,7 +544,7 @@ so that an upgrade stops being a maintenance window for them.
 
 - IV1: An SSH session through a passthrough stream stays interactive across a hot upgrade.
 - IV2: A DNS client with a live UDP session keeps getting answers across a hot upgrade with no session re-created on the backend.
-- IV3: A transfer forced to fail mid-way (test hook) leaves the connection draining on the old generation, and it completes normally.
+- IV3: A transfer forced to fail mid-way (test hook) leaves the connection draining on the old generation, and the connection completes normally.
 
 ---
 
@@ -580,7 +586,9 @@ so that the release ships measured, not hoped for.
 
 ---
 
-## Non-Functional Requirements
+---
+
+# Non-Functional Requirements
 
 - **NFR1 - No HTTP regression.** Against the v1.9.0 binary in the same run (Story 12.12 AC #4): HTTP median throughput at least 0.95 x and p99 latency at most 1.05 x, and every existing e2e profile passes untouched.
 - **NFR2 - Bounded everything.** Every per-connection buffer, session table, cap table, PROXY header read, ClientHello read, detection read, pending-connection count and port range has a hard ceiling with a documented default. No stream setting can make memory or fd use grow with attacker-controlled input, and the HTTP fd reserve cannot be consumed by streams.
@@ -589,9 +597,9 @@ so that the release ships measured, not hoped for.
 - **NFR5 - Nothing ends or is refused silently.** Every way a connection can end has a named reason, and every refusal and drop is counted.
 - **NFR6 - Linux only**, as the rest of Lorica. Transparent mode depends on kernel features whose minimum versions are documented.
 
-## Refused, in writing
+# Refused, in writing
 
-These rows are not shipped by this epic, and not deferred either: each is a decision.
+These items are not shipped by this epic, and not deferred either: each is a decision.
 
 - **An outbound forward proxy** (CONNECT, egress). D1.
 - **Stream mutations through automation tokens or MCP.** D9. Read only.
