@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The tools of both tiers: Story 11.1 AC #4's reads, and Story 11.2's
-//! mutations with the preview each one carries.
+//! The tools of the three tiers: Story 11.1 AC #4's reads, Story 11.2's
+//! mutations with the preview each one carries, and Story 11.3's one
+//! admin mutation, the operational settings, with its preview.
 //!
 //! # A tool is data, not code
 //!
@@ -42,8 +43,9 @@
 //!
 //! Story 11.2 AC #3 asks every mutating tool for a preview counterpart
 //! taking the same arguments. That is not a convention a second tool
-//! follows: a [`Mutation`] is declared once in [`MUTATIONS`] and
-//! [`catalogue`] builds both tools from it, the apply and the preview,
+//! follows: a [`Mutation`] is declared once in [`MUTATIONS`] or
+//! [`ADMIN_MUTATIONS`] and [`catalogue`] builds both tools from it, the
+//! apply and the preview,
 //! so their arguments cannot differ and a mutation cannot ship without
 //! its preview. The preview is the same call with [`DRY_RUN_QUERY`]
 //! appended, and the plane is what computes the change: this crate
@@ -215,14 +217,18 @@ that did not fit. The ceiling is the server's and no argument raises it.";
 /// `lorica-api/tests/openapi_contract.rs` pins each list against the
 /// request struct behind the path, both ways, so a field the management
 /// model grows reaches a model by a decision and a field it drops is a
-/// red gate rather than a silent 422. Values are never examined here:
+/// red gate rather than a silent 422. The admin tier's settings body is
+/// pinned the same way against the plane's `SETTINGS_ALLOWLIST`, which
+/// is what bounds that path rather than a struct. Values are never
+/// examined here:
 /// every field check is the plane's (Story 11.2 AC #5).
 #[derive(Debug, Clone, Copy)]
 pub struct Body {
     /// The argument's name in the tool's schema.
     pub argument: &'static str,
-    /// The request struct behind it, as `openapi.yaml` and the handler
-    /// name it, so a client can read what each field means there.
+    /// The request body behind it, as the OpenAPI documents and the
+    /// handler name it, so a client can read what each field means
+    /// there.
     pub schema: &'static str,
     /// The top-level field names this tier offers, sorted.
     pub fields: &'static [&'static str],
@@ -529,7 +535,7 @@ impl ToolSpec {
                     "type": "object",
                     "description": format!(
                         "{} Each field is the management API's own, documented on `{}` in \
-                         Lorica's `openapi.yaml`; it is passed to the node unchanged and \
+                         Lorica's OpenAPI documents; it is passed to the node unchanged and \
                          validated there. A field not listed here is refused before the call \
                          leaves this server.",
                         body.doc, body.schema
@@ -1319,7 +1325,7 @@ const BACKEND_FIELDS: &[&str] = &[
 ];
 
 /// The mutations of the config tier (Story 11.2), one per write path
-/// the automation plane mounts, each declared once.
+/// of that tier the automation plane mounts, each declared once.
 ///
 /// What is absent is absent on purpose (AC #6): nothing here uploads,
 /// replaces or generates a certificate, because no path on the plane
@@ -1488,6 +1494,78 @@ pub const MUTATIONS: &[Mutation] = &[
     },
 ];
 
+/// The global settings the admin tier's tool offers, sorted.
+///
+/// A restatement, and a deliberate one: this crate cannot read
+/// `SETTINGS_ALLOWLIST` in `lorica-api` (the dependency runs the other
+/// way, so a stdio subprocess does not carry the management crate), and
+/// that constant, with the reason beside each entry, is the control.
+/// The automation plane refuses any other key with a 403 whoever calls
+/// it. `lorica-api/tests/openapi_contract.rs` pins this list against the
+/// constant both ways, so an entry added on either side alone is a red
+/// gate rather than a key one surface offers and the other refuses; and
+/// `lorica-api/tests/admin_tier.rs` pins the bound each key's entry
+/// carries against the one the tool's body states, and the fleet and
+/// restart claims of its summary against the entries' reach and
+/// takes-effect.
+const SETTINGS_FIELDS: &[&str] = &[
+    "access_log_retention",
+    "cert_critical_days",
+    "cert_warning_days",
+    "default_health_check_interval_s",
+    "health_max_concurrent_probes",
+    "sla_purge_retention_days",
+    "waf_ban_duration_s",
+    "waf_ban_threshold",
+    "waf_event_retention",
+];
+
+/// The mutations of the admin tier (Story 11.3): one, the operational
+/// global settings, declared once like the config tier's.
+///
+/// The tier is defined by what it refuses, and the refusals are not a
+/// tool here that says no: there is no tool for users, roles, the
+/// automation tokens, the cluster's nodes or enrolment tokens,
+/// revocation or break-glass, and the automation plane declares no path
+/// for any of them, so nothing an injected instruction names can reach
+/// one. `lorica-api/tests/admin_tier.rs` asserts both halves.
+pub const ADMIN_MUTATIONS: &[Mutation] = &[Mutation {
+    apply: "lorica_settings_update",
+    preview: "lorica_settings_update_preview",
+    title: "Change operational settings",
+    summary: "Change operational global settings, as the dashboard's settings page would, \
+              through the management API's own validators: log and WAF-event retention, SLA \
+              retention, certificate expiry alert thresholds, the WAF auto-ban threshold and \
+              duration, and the health-check interval and probe budget. Each field is bounded, \
+              and the retentions may only be raised; the node refuses a value outside its \
+              bound, naming the field and the bound, and refuses any key the schema does not \
+              list, whoever sends it. On a cluster's control plane every one of these is fleet \
+              policy, replicated to every follower. Each takes effect without a restart. \
+              Users, roles, automation and cluster credentials, the management listener, the \
+              connection and automation allowlists, the node's trust anchors, the log level \
+              and the data plane's capacity limits are not reachable from here: they are \
+              changed in the dashboard, by a human. The answer is the listed fields and no \
+              other part of the settings document.",
+    scope: "settings:write",
+    verb: Verb::Put,
+    path: "/automation/v1/settings",
+    resource: None,
+    action: None,
+    body: Some(Body {
+        argument: "settings",
+        schema: "SettingsPatch",
+        fields: SETTINGS_FIELDS,
+        nested: &[],
+        doc: "The settings to change; a field absent leaves its value alone. The bound each \
+              field may be set within: `access_log_retention` raise-only, 1..=100000000; \
+              `waf_event_retention` raise-only, 1..=100000000; `sla_purge_retention_days` \
+              raise-only, 1..=3650; `cert_warning_days` 14..=365; `cert_critical_days` \
+              3..=365, and below `cert_warning_days`; `waf_ban_threshold` 3..=100; \
+              `waf_ban_duration_s` 60..=86400; `default_health_check_interval_s` 5..=60; \
+              `health_max_concurrent_probes` 16..=512.",
+    }),
+}];
+
 /// The published field names that carry a credential-shaped word and
 /// are not a credential, for the two sweeps that read this crate's
 /// output for such words. `bot_protection.cookie_ttl_s` is the verdict
@@ -1497,10 +1575,12 @@ pub const MUTATIONS: &[Mutation] = &[
 #[cfg(test)]
 pub(crate) const NAMED_FOR_A_LIFETIME_NOT_A_CREDENTIAL: &[&str] = &["cookie_ttl_s"];
 
-/// Every tool of both tiers: the reads, then for each mutation its
-/// apply tool and its preview.
+/// Every tool of the three tiers: the reads, then for each mutation of
+/// the config tier and then of the admin tier its apply tool and its
+/// preview.
 ///
-/// Built once for the process from [`READS`] and [`MUTATIONS`]. A
+/// Built once for the process from [`READS`], [`MUTATIONS`] and
+/// [`ADMIN_MUTATIONS`]. A
 /// token's registry is a filter over this list by scope
 /// (`McpServer::sharing`), which is what makes the tiers a property of
 /// the token rather than of a mode: a read scope registers a read tool
@@ -1510,7 +1590,7 @@ pub fn catalogue() -> &'static [ToolSpec] {
     static CATALOGUE: OnceLock<Vec<ToolSpec>> = OnceLock::new();
     CATALOGUE.get_or_init(|| {
         let mut all: Vec<ToolSpec> = READS.to_vec();
-        for mutation in MUTATIONS {
+        for mutation in MUTATIONS.iter().chain(ADMIN_MUTATIONS) {
             all.push(mutation.tool(false));
             all.push(mutation.tool(true));
         }
@@ -1771,6 +1851,7 @@ mod tests {
             ("ROUTE_UPDATE_ONLY_FIELDS", ROUTE_UPDATE_ONLY_FIELDS),
             ("ROUTE_UPDATE_FIELDS", ROUTE_UPDATE_FIELDS),
             ("BACKEND_FIELDS", BACKEND_FIELDS),
+            ("SETTINGS_FIELDS", SETTINGS_FIELDS),
         ] {
             let sorted: BTreeSet<&str> = list.iter().copied().collect();
             assert_eq!(
@@ -1791,6 +1872,35 @@ mod tests {
                 !ROUTE_CREATE_FIELDS.contains(&absent) && !ROUTE_UPDATE_FIELDS.contains(&absent),
                 "{absent} is offered"
             );
+        }
+    }
+
+    #[test]
+    fn the_admin_tier_is_one_scope_one_path_and_names_nothing_it_refuses() {
+        // Story 11.3. Every admin tool sits behind `settings:write`, and
+        // no other tool does, so a token holding that one scope
+        // registers the admin tier and nothing else; every admin tool
+        // calls the settings path and no other.
+        for spec in catalogue() {
+            let admin = ADMIN_MUTATIONS
+                .iter()
+                .any(|m| m.apply == spec.name || m.preview == spec.name);
+            assert_eq!(spec.scope == "settings:write", admin, "{}", spec.name);
+            if admin {
+                assert_eq!(spec.path, "/automation/v1/settings", "{}", spec.name);
+                assert_eq!(spec.verb(), Verb::Put, "{}", spec.name);
+                assert!(spec.resource.is_none(), "{}", spec.name);
+            }
+        }
+        // No tool anywhere in the catalogue is named for, or calls a path
+        // under, an identity or a fleet-membership operation.
+        for spec in catalogue() {
+            for refused in [
+                "user", "role", "token", "enrol", "revoke", "break", "glass", "node", "leave",
+            ] {
+                assert!(!spec.name.contains(refused), "{}", spec.name);
+                assert!(!spec.path.contains(refused), "{}: {}", spec.name, spec.path);
+            }
         }
     }
 
@@ -2071,7 +2181,7 @@ mod tests {
             }
         }
         assert_eq!(reads, READS.len());
-        assert_eq!(writes, 2 * MUTATIONS.len());
+        assert_eq!(writes, 2 * (MUTATIONS.len() + ADMIN_MUTATIONS.len()));
     }
 
     #[test]
@@ -2082,7 +2192,8 @@ mod tests {
         // the preview sending the dry-run flag and nothing else
         // different, and the apply sending nothing of the kind.
         assert!(!MUTATIONS.is_empty());
-        for mutation in MUTATIONS {
+        assert!(!ADMIN_MUTATIONS.is_empty());
+        for mutation in MUTATIONS.iter().chain(ADMIN_MUTATIONS) {
             assert_eq!(
                 mutation.preview,
                 format!("{}{PREVIEW_SUFFIX}", mutation.apply),

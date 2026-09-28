@@ -78,6 +78,7 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
         mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
         renewals: Arc::new(crate::acme::RenewalLedger::new()),
+        automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
     };
     let session_store = SessionStore::new(store).await;
     (state, session_store, RateLimiter::new())

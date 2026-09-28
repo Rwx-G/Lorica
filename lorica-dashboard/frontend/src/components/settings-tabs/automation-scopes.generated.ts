@@ -39,6 +39,7 @@ export const AUTOMATION_SCOPE_WIRE_STRINGS: readonly AutomationScope[] = [
   'logs:read',
   'routes:read',
   'routes:write',
+  'settings:write',
   'sla:read',
   'waf:read',
 ];

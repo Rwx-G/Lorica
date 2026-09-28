@@ -256,9 +256,10 @@ when it was last presented.
 enum in `lorica-api/openapi.yaml` and offered by the mint form: the two
 environment grants, `routes:read` and `certificates:read`, the read
 grants the management MCP server's read tier is built on (`logs:read`,
-`waf:read`, `sla:read`, `cluster:read`, `backends:read`), and the three
+`waf:read`, `sla:read`, `cluster:read`, `backends:read`), the three
 write grants its config tier is built on (`routes:write`,
-`backends:write`, `certificates:write`). An unknown scope string fails
+`backends:write`, `certificates:write`), and `settings:write`, the one
+grant its admin tier is built on. An unknown scope string fails
 to deserialise rather than being dropped, so a token minted against a
 newer Lorica is refused instead of silently losing a grant an operator
 wrote down; a 1.9.0 token presented to a 1.8.0 node is refused outright
@@ -274,9 +275,12 @@ the CI caller: a pipeline that deploys review apps needs
 `environments:write` and nothing wider, and an operator minting a token
 for it should not add a write scope because it is there to add. The
 write scopes are a different credential for a different caller, the
-config tier of the MCP server, and `settings:*` and a certificate
-upload are still absent: key material and node-wide policy enter
-through the management API, by a human.
+config tier of the MCP server, and a certificate upload is still
+absent: key material enters through the management API, by a human.
+Story 11.3 reversed the same decision for node-wide settings, for one
+scope and one path, bounded by an allowlist the plane enforces: see
+[The admin write](#the-admin-write). Identity and the cluster's
+membership stay out of reach of every token.
 
 **`allowed_hostnames` uses single-label wildcard semantics.**
 `*.review.example.com` covers `mr-42.review.example.com` and refuses
@@ -1023,6 +1027,66 @@ dropped here with nothing said, and the MCP tools are what refuse one
 before it leaves. This is the preview the MCP config tier's `*_preview`
 tools call: the plane owns it because the validators are the plane's
 alone, and the MCP server reimplements none.
+
+## The admin write
+
+Since v1.9.0 (Story 11.3) the listener answers one more write, the one
+the MCP admin tier is built on:
+
+| Verb and path | Scope | What it does |
+|---|---|---|
+| `PUT /automation/v1/settings` | `settings:write` | Patch operational global settings: `PUT /api/v1/settings`, as the token, bounded by an allowlist and a bound per key. |
+
+**The allowlist binds here, on the plane.** The body is read as a JSON
+object, and a key outside `SETTINGS_ALLOWLIST`
+(`lorica-api/src/automation/write.rs`, each entry with its reason) is
+refused with a 403 naming the key, before any value is read and before
+any validator runs. That holds for every caller: the MCP tool, a direct
+client with the same token, a token carrying every scope there is. The
+keys it accepts, and the families it refuses and why, are in
+[mcp.md](mcp.md#the-admin-tier-and-where-it-stops); the
+`SettingsPatch` schema in `openapi-automation.yaml` lists the keys and
+their bounds, and a test pins it against the constant. A value of the
+wrong type is a 422 naming its key; a value outside its key's bound, or
+a retention lowered below the stored value, is a 422 naming the key and
+the bound, checked under the store lock on the document about to be
+written; a value the validators refuse is the dashboard's own 400.
+
+**On a control plane, the write is fleet policy.** Every key on the
+list replicates from a control plane to every follower, so the admin
+write changes the fleet. The listener does not start on a follower.
+
+**The rest is the dashboard's write.** `update_settings_as`, the body
+the management handler was split into, runs with the token as the
+actor: the same validators and cross-field checks, the same reload, and
+the same `settings.update` audit row under the role `automation` and
+the token's `<name> (<public_id>)`. On this path the row's target
+lists each key the write changed as `key:old->new`, since the payload
+itself is only ever hashed and every key on the list is a non-secret
+number; the dashboard's own row names the keys its write changed,
+without values. A write that changes no stored value writes nothing,
+reloads nothing and lands no row, on either plane.
+
+**A budget per credential.** The plane's writes are budgeted per token
+(per issuer entry for an ID token): 30 settings writes a minute, the
+dashboard's own figure for its settings page, and 100 of every other
+write together. Going over is a 429 with `Retry-After`; a request the
+scope gate refuses spends nothing.
+
+**No read, and an answer bounded like the write.** There is no `GET` on
+the path, and the answer to a write, or to its `?dry_run=true`, is the
+allowlisted part of the settings document and nothing else of it. That
+is why the dry run needs no read scope beside `settings:write`, the one
+write on this plane whose preview does not: it shows only what that
+scope writes.
+
+**Where it stops.** Nothing on this listener reaches users, roles, the
+automation tokens, the OIDC issuer entries, the cluster's nodes,
+enrolment tokens or fleet-wide bans, revocation, `leave` or
+break-glass. Those paths are declared for no token in the
+scope matrix, so they answer 403 to the widest one, and a test derives
+them from the management route table so a new path under one of those
+families is covered the day it lands.
 
 ## GitLab OIDC
 

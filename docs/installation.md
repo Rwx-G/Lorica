@@ -61,6 +61,12 @@ ExecStart=/usr/bin/lorica --data-dir /var/lib/lorica \
 sudo systemctl restart lorica
 ```
 
+`--log-level` sets the level the process starts with. Once the
+configuration store is open, the log level saved in Settings replaces
+it in every Lorica process, the supervisor and each worker, and a
+change saved there applies without a restart. `RUST_LOG`, when set,
+takes precedence over both and is never replaced.
+
 ## systemd unit
 
 The packaged unit is hardened against the sandbox checklist in

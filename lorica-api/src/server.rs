@@ -275,6 +275,11 @@ pub struct AppState {
     /// because a token's renewals are budgeted per certificate against
     /// what the loop and the other callers are doing to that same id.
     pub renewals: Arc<crate::acme::RenewalLedger>,
+    /// The automation plane's write budget, one window per credential
+    /// and kind of write (Story 11.3). The plane mounts none of the
+    /// management routes' rate-limit layers, so it holds its own, for
+    /// the process, where a credential's window outlives a request.
+    pub automation_writes: crate::middleware::rate_limit::RateLimiter,
 }
 
 impl AppState {

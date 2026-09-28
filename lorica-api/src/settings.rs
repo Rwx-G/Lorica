@@ -23,6 +23,10 @@ use crate::server::AppState;
 const HEALTH_MAX_CONCURRENT_PROBES_MIN: i32 = 1;
 const HEALTH_MAX_CONCURRENT_PROBES_MAX: i32 = 512;
 const DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN: i32 = 1;
+// The dashboard's own form cap. Above it a stored value slept the
+// health loop, which also completes drains, for as long as it said:
+// `i32::MAX` stopped failover for decades.
+const DEFAULT_HEALTH_CHECK_INTERVAL_S_MAX: i32 = 3600;
 const CERT_WARNING_DAYS_MIN: i32 = 1;
 const CERT_CRITICAL_DAYS_MIN: i32 = 1;
 const MAX_GLOBAL_CONNECTIONS_MIN: i32 = 0;
@@ -33,6 +37,10 @@ const HEADER_TIMEOUT_S_MIN: u32 = 0;
 const HEADER_TIMEOUT_S_MAX: u32 = 3600;
 const WAF_BAN_THRESHOLD_MIN: i32 = 0;
 const WAF_BAN_DURATION_S_MIN: i32 = 0;
+// Thirty days. Each ban copies the duration when it is issued, so
+// reverting the setting shortens no ban already standing: without a
+// ceiling one WAF false positive banned an address for 68 years.
+const WAF_BAN_DURATION_S_MAX: i32 = 2_592_000;
 const ACCESS_LOG_RETENTION_MIN: i64 = 0;
 const WAF_EVENT_RETENTION_MIN: i64 = 0;
 // Story 10.6 AC #7. The budget is a byte ceiling over every in-flight
@@ -93,6 +101,7 @@ pub fn settings_schema() -> serde_json::Value {
         "default_health_check_interval_s": {
             "type": "integer",
             "min": DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN,
+            "max": DEFAULT_HEALTH_CHECK_INTERVAL_S_MAX,
             "default": d.default_health_check_interval_s,
         },
         "health_max_concurrent_probes": {
@@ -141,6 +150,7 @@ pub fn settings_schema() -> serde_json::Value {
         "waf_ban_duration_s": {
             "type": "integer",
             "min": WAF_BAN_DURATION_S_MIN,
+            "max": WAF_BAN_DURATION_S_MAX,
             "default": d.waf_ban_duration_s,
         },
         "access_log_retention": {
@@ -302,7 +312,7 @@ fn withhold_sink_topology(settings: &mut lorica_config::models::GlobalSettings) 
 ///
 /// `bot_hmac_secret_hex` keeps its three-state contract (v1.5.1 audit
 /// H-1): empty = never initialised, sentinel = set but withheld.
-fn mask_settings_secrets(settings: &mut lorica_config::models::GlobalSettings) {
+pub(crate) fn mask_settings_secrets(settings: &mut lorica_config::models::GlobalSettings) {
     settings.bot_hmac_secret_hex = if settings.bot_hmac_secret_hex.is_empty() {
         String::new()
     } else {
@@ -509,11 +519,9 @@ pub struct UpdateSettingsRequest {
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
 ///
-/// Field application order matters: it matches the historical inline
-/// sequence so any future cross-field validation keeps seeing earlier
-/// assignments. Bound inconsistencies inherited from that inline era
-/// are kept on purpose (normalising them is a behaviour change) and
-/// flagged with `// NOTE: bound drift` comments for the next audit.
+/// The whole of the write is [`update_settings_as`], with the session
+/// as the actor; this wrapper answers the stored row with its secrets
+/// masked.
 pub async fn update_settings(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
@@ -521,16 +529,111 @@ pub async fn update_settings(
     Extension(session): Extension<Session>,
     Json(body): Json<UpdateSettingsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let change = update_settings_as(
+        &state,
+        &audit_ctx,
+        body,
+        crate::preview::WriteMode::Apply,
+        SettingsAuditTarget::ChangedKeys,
+        |_, _| Ok(()),
+    )
+    .await?;
+    let mut settings = change.after;
+    mask_settings_secrets(&mut settings);
+    Ok(json_data(settings))
+}
+
+/// The settings document before a write and after it, unmasked: each
+/// caller decides what of it to answer. After a preview, `after` is
+/// the document as the write would have stored it.
+pub(crate) struct SettingsChange {
+    /// The document as it was read under the store lock.
+    pub(crate) before: lorica_config::models::GlobalSettings,
+    /// The document with the patch applied and validated.
+    pub(crate) after: lorica_config::models::GlobalSettings,
+}
+
+/// What the `settings.update` audit row names as its target id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsAuditTarget {
+    /// The keys whose stored value the write changed, sorted and
+    /// comma-separated, names only: the payload itself is only ever
+    /// hashed, and the dashboard's write reaches secrets, so a value
+    /// never reaches the row.
+    ChangedKeys,
+    /// `key:old->new` for each key whose stored value the write
+    /// changed, sorted and comma-separated (Story 11.3). Only for a
+    /// caller that can change nothing but non-secret scalars, which the
+    /// admin tier's allowlist guarantees: without the values the row
+    /// says a retention moved and not whether it moved to 1 or to ten
+    /// million.
+    ChangedValues,
+}
+
+/// The whole of [`update_settings`] as `actor`, split out so the
+/// automation plane's admin tier (Story 11.3) runs the dashboard's own
+/// validators, reload signal and audit row rather than a second copy of
+/// them, the way the route and backend writes were split in Story 11.2.
+///
+/// Field application order matters: it matches the historical inline
+/// sequence so any future cross-field validation keeps seeing earlier
+/// assignments. Bound inconsistencies inherited from that inline era
+/// are kept on purpose (normalising them is a behaviour change) and
+/// flagged with `// NOTE: bound drift` comments for the next audit.
+///
+/// `caller_bounds` sees the stored document and the patched one, under
+/// the store lock, before the cross-field checks: a caller narrower
+/// than the dashboard (the admin tier) refuses there what it may not
+/// set, on the document it is about to write, so nothing can move
+/// between its check and the write. The dashboard passes a check that
+/// accepts everything.
+///
+/// The syslog TLS connector is built only when the patch names a
+/// `syslog_*` field. A write that touches none leaves the sink as
+/// stored, so it is not refused over sink material it did not send,
+/// and the refusal does not describe that material to it.
+///
+/// A write that changes no stored value writes nothing: no store
+/// write, no reload signal, no audit row, and the document answered
+/// as it stands.
+///
+/// In [`crate::preview::WriteMode::Preview`] every validator runs,
+/// the caller's bounds, the cross-field checks and the syslog TLS build
+/// included, and the function stops before the store, the reload
+/// signal, the cleartext warning and the audit row.
+pub(crate) async fn update_settings_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    body: UpdateSettingsRequest,
+    mode: crate::preview::WriteMode,
+    audit_target: SettingsAuditTarget,
+    caller_bounds: impl FnOnce(
+            &lorica_config::models::GlobalSettings,
+            &lorica_config::models::GlobalSettings,
+        ) -> Result<(), ApiError>
+        + Send
+        + 'static,
+) -> Result<SettingsChange, ApiError> {
     // Audit payload = the PATCH body (secret-free by construction),
     // never the resulting GlobalSettings row (carries
     // `bot_hmac_secret_hex`). Serialized before the closure consumes
     // the body; recorded only after the mutation succeeds.
     let audit_after = serde_json::to_value(&body).ok();
+    let touches_syslog = audit_after
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|patch| {
+            patch
+                .iter()
+                .any(|(key, value)| key.starts_with("syslog_") && !value.is_null())
+        });
     // The whole get -> validate/assign -> update sequence is sync and
     // runs in one closure on the blocking pool; the store mutex hold
     // window is unchanged.
-    let settings = db_blocking(&state.store, move |store| {
+    let (before, settings, changed) = db_blocking(&state.store, move |store| {
         let mut settings = store.get_global_settings()?;
+        let before = settings.clone();
 
         // NOTE: bound drift - no validation; port 0 is accepted.
         apply_plain(body.management_port, &mut settings.management_port);
@@ -540,13 +643,13 @@ pub async fn update_settings(
             &LOG_LEVEL_CHOICES,
             "log_level",
         )?;
-        // NOTE: bound drift - lower bound only, no upper cap unlike
-        // health_max_concurrent_probes.
-        apply_min_i32(
+        apply_ranged_i32(
             body.default_health_check_interval_s,
             &mut settings.default_health_check_interval_s,
-            DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN,
-            "default_health_check_interval_s",
+            DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN..=DEFAULT_HEALTH_CHECK_INTERVAL_S_MAX,
+            &format!(
+                "default_health_check_interval_s must be in {DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN}..={DEFAULT_HEALTH_CHECK_INTERVAL_S_MAX}"
+            ),
         )?;
         apply_ranged_i32(
             body.health_max_concurrent_probes,
@@ -556,8 +659,8 @@ pub async fn update_settings(
                 "health_max_concurrent_probes must be in {HEALTH_MAX_CONCURRENT_PROBES_MIN}..={HEALTH_MAX_CONCURRENT_PROBES_MAX}"
             ),
         )?;
-        // NOTE: bound drift - cert thresholds have no upper bound and
-        // no warning > critical cross-check.
+        // NOTE: bound drift - cert thresholds have no upper bound. The
+        // warning > critical rule is `validate_cross_fields`'.
         apply_min_i32(
             body.cert_warning_days,
             &mut settings.cert_warning_days,
@@ -605,11 +708,13 @@ pub async fn update_settings(
         )?;
         // NOTE: bound drift - 0 accepted (zero-duration ban), while the
         // interval fields above require >= 1.
-        apply_min_i32(
+        apply_ranged_i32(
             body.waf_ban_duration_s,
             &mut settings.waf_ban_duration_s,
-            WAF_BAN_DURATION_S_MIN,
-            "waf_ban_duration_s",
+            WAF_BAN_DURATION_S_MIN..=WAF_BAN_DURATION_S_MAX,
+            &format!(
+                "waf_ban_duration_s must be in {WAF_BAN_DURATION_S_MIN}..={WAF_BAN_DURATION_S_MAX} (30 days)"
+            ),
         )?;
         apply_min_i64(
             body.access_log_retention,
@@ -827,6 +932,7 @@ pub async fn update_settings(
             &mut settings.otlp_logs_capture_enabled,
         );
 
+        caller_bounds(&before, &settings)?;
         // Cross-field invariants (backlog #48). Per-field bounds are applied
         // above; these reject a partial update that inverts a related pair
         // (e.g. cert warning <= critical) on the merged result.
@@ -837,15 +943,26 @@ pub async fn update_settings(
         // exact connector the sink will use, so a bad pasted PEM is a
         // 400 here instead of a permanently dead sink discovered one
         // warn-line later.
-        let sinks = crate::log_sinks::LogSinksConfig::from_settings(&settings, false);
-        if let Some(syslog_cfg) = &sinks.syslog {
-            crate::log_sinks::syslog::validate_tls_config(syslog_cfg)
-                .map_err(ApiError::BadRequest)?;
+        if touches_syslog {
+            let sinks = crate::log_sinks::LogSinksConfig::from_settings(&settings, false);
+            if let Some(syslog_cfg) = &sinks.syslog {
+                crate::log_sinks::syslog::validate_tls_config(syslog_cfg)
+                    .map_err(ApiError::BadRequest)?;
+            }
         }
-        store.update_global_settings(&settings)?;
-        Ok::<_, ApiError>(settings)
+        let changed = changed_keys(&before, &settings);
+        if !mode.previews() && !changed.is_empty() {
+            store.update_global_settings(&settings)?;
+        }
+        Ok::<_, ApiError>((before, settings, changed))
     })
     .await?;
+    if mode.previews() || changed.is_empty() {
+        return Ok(SettingsChange {
+            before,
+            after: settings,
+        });
+    }
     state.notify_config_changed();
 
     // Story 9.8 QA (CWE-319 advisory): the exported records carry the
@@ -861,20 +978,55 @@ pub async fn update_settings(
         );
     }
 
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let target_id = match audit_target {
+        SettingsAuditTarget::ChangedKeys => changed.join(","),
+        SettingsAuditTarget::ChangedValues => changed_values(&before, &settings, &changed),
+    };
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "settings.update",
-        ("settings", ""),
+        ("settings", &target_id),
         None,
         audit_after.as_ref(),
     )
     .await;
 
-    let mut settings = settings;
-    mask_settings_secrets(&mut settings);
-    Ok(json_data(settings))
+    Ok(SettingsChange {
+        before,
+        after: settings,
+    })
+}
+
+/// The top-level keys whose value differs between two settings
+/// documents, sorted. Names only: a value never reaches a row.
+pub(crate) fn changed_keys(
+    before: &lorica_config::models::GlobalSettings,
+    after: &lorica_config::models::GlobalSettings,
+) -> Vec<String> {
+    let before = serde_json::to_value(before).unwrap_or_default();
+    let after = serde_json::to_value(after).unwrap_or_default();
+    let mut keys: Vec<String> = crate::preview::changes_between(&before, &after)
+        .as_object()
+        .map(|changes| changes.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    keys
+}
+
+/// `key:old->new` for each of `keys`, comma-separated, each value as
+/// the document serialises it.
+fn changed_values(
+    before: &lorica_config::models::GlobalSettings,
+    after: &lorica_config::models::GlobalSettings,
+    keys: &[String],
+) -> String {
+    let before = serde_json::to_value(before).unwrap_or_default();
+    let after = serde_json::to_value(after).unwrap_or_default();
+    keys.iter()
+        .map(|key| format!("{key}:{}->{}", before[key], after[key]))
+        .collect::<Vec<String>>()
+        .join(",")
 }
 
 // ---- update_settings field-application helpers ----

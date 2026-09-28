@@ -59,7 +59,7 @@
 //! Here: the protocol revision this crate implements, the call seam,
 //! the configuration intake ([`config`]), the JSON-RPC envelope
 //! ([`jsonrpc`]), the untrusted-text delimiting ([`untrusted`]), the
-//! tools of both tiers ([`tools`]), the protocol core that runs them
+//! tools of every tier ([`tools`]), the protocol core that runs them
 //! ([`server`]), the HTTPS implementation of the seam ([`http`]) and
 //! the stdio binding ([`stdio`]).
 //!
@@ -88,6 +88,12 @@
 //! AC #4 are [`tools::MUTATIONS`] and what [`tools::catalogue`] builds
 //! from it. AC #6 is the field vocabulary each [`tools::Body`] declares,
 //! pinned in `lorica-api`'s tests against the handler that reads it.
+//!
+//! Story 11.3: AC #1 is [`tools::ADMIN_MUTATIONS`], whose settings body
+//! restates the automation plane's allowlist and is pinned against it
+//! in `lorica-api`'s tests; the plane is what enforces it. AC #2 and
+//! IV2 hold by absence: no tool here names an identity or a cluster
+//! membership operation, which `tools` asserts.
 
 use core::fmt;
 use core::future::Future;

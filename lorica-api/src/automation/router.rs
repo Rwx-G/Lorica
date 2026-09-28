@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! The automation router: `whoami`, the environment resource, the read
-//! surface and the write surface.
+//! surface and the write surface, the admin tier's settings write
+//! included.
 //!
 //! `GET /automation/v1/whoami` exists so the whole chain - source
 //! filter, TLS, bearer verification, scope gate, audit - is testable
@@ -226,10 +227,78 @@ fn plane_routes() -> Router {
             "/automation/v1/certificates/{id}/renew",
             post(super::write::renew_certificate),
         )
+        // The admin tier (Story 11.3): one verb on the settings
+        // document, bounded by `super::write::SETTINGS_ALLOWLIST`. No
+        // `GET`: the document is not readable on this plane, and no
+        // path under users, tokens or the cluster's membership is
+        // mounted here for any verb.
+        .route(
+            "/automation/v1/settings",
+            put(super::write::update_settings),
+        )
+}
+
+/// The per-credential budget of every write on this plane, one window
+/// of [`crate::server::RL_WINDOW_S`] seconds.
+///
+/// The dashboard's writes are budgeted by a layer on each management
+/// route, which the automation plane does not mount, and every settings
+/// write is a proxy reload and, on a control plane, a replication round
+/// to the fleet. So the plane budgets its own writes, per credential
+/// rather than per address: a model in a retry loop or a leaked token
+/// spends its own window and nobody else's. The settings write keeps
+/// the dashboard's own figure for it; every other write shares the
+/// figure the dashboard gives route writes. The MCP endpoint is not a
+/// write here: its tool calls come back through [`in_process_router`],
+/// where this same budget weighs each write they make, beside the
+/// endpoint's own invocation budget.
+fn write_budget(method: &http::Method, path: &str) -> Option<(&'static str, u32)> {
+    if *method == http::Method::GET || *method == http::Method::HEAD {
+        return None;
+    }
+    if path == super::mcp::MCP_PATH {
+        return None;
+    }
+    if path == super::scope::SETTINGS_PATH {
+        return Some(("automation_settings", crate::server::RL_SETTINGS_UPDATE));
+    }
+    Some(("automation_write", crate::server::RL_ROUTES_CUD))
+}
+
+/// Refuse a write with a 429 once its credential has spent the window
+/// [`write_budget`] gives it. Runs inside the scope gate, so a request
+/// the gate refuses spends nothing.
+async fn budget_writes(
+    axum::extract::Extension(state): axum::extract::Extension<AppState>,
+    principal: AutomationPrincipal,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<Response, crate::error::ApiError> {
+    let Some((bucket, limit)) = write_budget(request.method(), request.uri().path()) else {
+        return Ok(next.run(request).await);
+    };
+    state
+        .automation_writes
+        .check_bucket(
+            bucket,
+            &principal.grant_id,
+            limit,
+            crate::server::RL_WINDOW_S,
+        )
+        .await
+        .map_err(|retry_after_s| crate::error::ApiError::RateLimitedBecause {
+            retry_after_s,
+            reason: format!(
+                "this credential has made {limit} writes of this kind in the last {} seconds, \
+                 the most this plane accepts",
+                crate::server::RL_WINDOW_S
+            ),
+        })?;
+    Ok(next.run(request).await)
 }
 
 /// Every authorization-class layer this plane runs on an authenticated
-/// request, on both routers.
+/// request, on both routers: the scope gate, then the write budget.
 ///
 /// [`in_process_router`] and [`build_automation_router`] are built
 /// through this one function so that what authorizes a call over the
@@ -241,7 +310,9 @@ fn plane_routes() -> Router {
 /// established principal, an outer request being audited, a body the
 /// tool layer bounded, and no wire.
 fn authorized(router: Router) -> Router {
-    router.layer(axum::middleware::from_fn(super::scope::authorize_scope))
+    router
+        .layer(axum::middleware::from_fn(budget_writes))
+        .layer(axum::middleware::from_fn(super::scope::authorize_scope))
 }
 
 /// The router the in-process MCP binding runs a tool's call through:

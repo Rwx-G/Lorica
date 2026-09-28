@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/version-1.8.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-2881-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-2914-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-748-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -262,7 +262,7 @@ Options:
   --https-port <PORT>               HTTPS proxy port (default: 8443)
   --workers <N|auto>                Worker processes (default: 0 = single-process)
   --upstream-crl-file <PATH>        CRL checked against upstream server certificates
-  --log-level <LEVEL>               Log level (default: info)
+  --log-level <LEVEL>               Log level until the stored setting is read (default: info)
   --log-format <FORMAT>             Log format: json (default) or text
   --log-file <PATH>                 Log to file (in addition to stdout)
   --cluster-listen <HOST:PORT>      Serve the cluster plane (makes this node a control plane)
@@ -711,7 +711,7 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (2881 tests, Lorica-native)
+# Product crates only (2914 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-limits -p lorica-shmem \

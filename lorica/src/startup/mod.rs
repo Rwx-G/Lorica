@@ -648,7 +648,8 @@ pub(crate) fn spawn_ocsp_refresh_loop(
 /// Spawn the backend health-check loop (audit H-9 dedup).
 ///
 /// Reads `default_health_check_interval_s` from `GlobalSettings`
-/// (default 10 s) and spawns `health::health_check_loop`.
+/// (default 10 s) as the loop's fallback and spawns
+/// `health::health_check_loop`, which re-reads it every cycle.
 ///
 /// Mode differences are explicit parameters:
 /// - `backend_connections`: `Some` in single-process mode (direct

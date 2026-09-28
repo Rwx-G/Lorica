@@ -2020,7 +2020,8 @@ export type AutomationScope =
   | 'backends:read'
   | 'routes:write'
   | 'backends:write'
-  | 'certificates:write';
+  | 'certificates:write'
+  | 'settings:write';
 
 /**
  * One automation token as the API renders it. There is no field for

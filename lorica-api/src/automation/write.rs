@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The automation plane's write surface (Story 11.2): routes, backends
-//! and certificate bindings, each behind its own write scope.
+//! The automation plane's write surface: routes, backends and
+//! certificate bindings, each behind its own write scope (Story 11.2),
+//! and the admin tier's one write, the operational settings named in
+//! [`SETTINGS_ALLOWLIST`] behind `settings:write` (Story 11.3).
 //!
 //! # The reversal this module is
 //!
@@ -89,11 +91,21 @@
 //! A route write naming `certificate_id` binds a certificate, which is
 //! `certificates:write`'s verb, so it needs that scope beside
 //! `routes:write`: without this the binding path's scope bounded
-//! nothing a route body could not do. A preview answers the full row
-//! it would change, so it needs the read scope of that row
-//! (`routes:read`, `backends:read`, `certificates:read`): without this
-//! a write scope alone read any row inside its grant through
-//! `?dry_run=true`. The apply needs its write scope and no more.
+//! nothing a route body could not do. The apply needs its write scope
+//! and no more.
+//!
+//! A preview needs the read scope of what it answers, unless what it
+//! answers is exactly its own write vocabulary. A route, backend or
+//! certificate preview answers the full row it would change, which
+//! carries fields the write scope cannot set, so it needs the read
+//! scope of that row (`routes:read`, `backends:read`,
+//! `certificates:read`): without this a write scope alone read any row
+//! inside its grant through `?dry_run=true`. The settings preview
+//! answers the allowlisted keys and nothing else, the keys
+//! `settings:write` itself sets, so it discloses nothing a no-op apply
+//! would not, and it needs no scope beside the write. The property, not
+//! the scope, is what exempts it, and the whole-stack test asserts the
+//! property on the answer.
 //!
 //! # A renewal is budgeted per certificate
 //!
@@ -138,6 +150,24 @@
 //! with no field that could carry one. `tests/openapi_contract.rs`
 //! asserts both halves against the document and against these
 //! handlers' request structs rather than promising it here.
+//!
+//! # The admin tier is defined by what it refuses
+//!
+//! `PUT /automation/v1/settings` is the management settings write, as
+//! the token, bounded by [`SETTINGS_ALLOWLIST`]: the body is read as a
+//! JSON object and a key outside the allowlist is refused with a 403
+//! naming it before any value is looked at, before any validator runs.
+//! Each key the allowlist names carries a bound and a direction, the
+//! safe way to move it, and a value outside either is refused with a
+//! 422 on the document the write is about to store, under the store
+//! lock. The plane is the control and the MCP tool's schema, which
+//! restates the same keys and bounds and is pinned against this
+//! constant by `tests/openapi_contract.rs`, is the affordance: a token
+//! holding `settings:write` reaches the same keys whether it calls the
+//! tool or the path. A preview and an apply answer the allowlisted part
+//! of the document and nothing else, so the scope that writes those
+//! keys reads back exactly those keys and needs no read scope beside
+//! it.
 
 use std::collections::BTreeSet;
 
@@ -147,18 +177,265 @@ use axum::Json;
 use lorica_config::models::{AutomationScope, Backend, ManagedBy, Route};
 use lorica_config::ConfigStore;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::auth::AutomationPrincipal;
 use super::environments::{audit_context, caller_may_access, ensure_backend_address_granted};
 use super::scope::scope_str;
 use crate::audit::ClientConnectInfo;
 use crate::backends::{CreateBackendRequest, UpdateBackendRequest};
-use crate::error::ApiError;
-use crate::preview::{DryRunQuery, WriteMode};
+use crate::error::{json_data, ApiError};
+use crate::preview::{previewed, DryRunQuery, WriteMode};
 use crate::routes::{CreateRouteRequest, UpdateRouteRequest};
 use crate::server::AppState;
+use crate::settings::{SettingsAuditTarget, UpdateSettingsRequest};
 use crate::target::{BackendGuard, CertificateGuard, RouteGuard, RouteTarget};
+
+/// Which way the admin tier may move a setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Anywhere inside the bound.
+    Either,
+    /// Up from the stored value, never below it, and inside the bound:
+    /// a retention lowered destroys rows that setting it back does not
+    /// bring back.
+    RaiseOnly,
+}
+
+/// How far a setting's effect reaches when it is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Fleet policy (`CanonicalGlobalSettings`): on a control plane it
+    /// replicates to every follower.
+    Fleet,
+    /// This node only.
+    Node,
+}
+
+/// When a stored value starts to act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakesEffect {
+    /// On the next reload or the next run of the loop that reads it,
+    /// without a restart.
+    Live,
+    /// At the next restart of the process that reads it.
+    Restart,
+}
+
+/// One global setting the admin tier may change, why it may, and how
+/// far it may move it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminSetting {
+    /// The key, as `GlobalSettings` and `UpdateSettingsRequest` spell it.
+    pub name: &'static str,
+    /// Why a model driving the admin tier may change it: what makes it
+    /// operational, and why a value inside its bound is undone from the
+    /// dashboard without having taken anything down.
+    pub why: &'static str,
+    /// The lowest value this tier may set, inclusive. The dashboard's
+    /// own validator still runs after this one and may be narrower.
+    pub min: i64,
+    /// The highest value this tier may set, inclusive.
+    pub max: i64,
+    /// Which way inside `min..=max` this tier may move it.
+    pub direction: Direction,
+    /// Where a write lands.
+    pub reach: Reach,
+    /// When a write acts.
+    pub takes_effect: TakesEffect,
+}
+
+impl AdminSetting {
+    /// The bound as the docs, the tool description and a refusal spell
+    /// it: `14..=365`, or `raise-only, 1..=100000000`.
+    pub fn bound_text(&self) -> String {
+        match self.direction {
+            Direction::Either => format!("{}..={}", self.min, self.max),
+            Direction::RaiseOnly => format!("raise-only, {}..={}", self.min, self.max),
+        }
+    }
+
+    /// Why `after` is not a value this tier may store when `before` is
+    /// stored, or `None` when it may.
+    pub fn refusal(&self, before: i64, after: i64) -> Option<String> {
+        if !(self.min..=self.max).contains(&after) {
+            return Some(format!(
+                "{}: {after} is outside what an automation token may set ({}); set it in the \
+                 dashboard",
+                self.name,
+                self.bound_text()
+            ));
+        }
+        if self.direction == Direction::RaiseOnly && after < before {
+            return Some(format!(
+                "{}: {after} is below the stored {before}, and an automation token may only \
+                 raise it ({}); lower it in the dashboard",
+                self.name,
+                self.bound_text()
+            ));
+        }
+        None
+    }
+}
+
+/// Every setting `PUT /automation/v1/settings` accepts: the admin tier's
+/// whole surface (Story 11.3 AC #1), decided by exclusion, each with
+/// the bound and the direction this tier may move it in.
+///
+/// The one statement of it. The plane refuses any other key with a 403
+/// before a validator runs, and a value outside its entry's bound with
+/// a 422 naming the key and the bound, on the document it is about to
+/// write. The MCP tool restates the names and the bounds, the
+/// `SettingsPatch` schema the names and the bounds, `docs/mcp.md` the
+/// whole row; tests pin each against this constant.
+///
+/// A key is here only when a model reading attacker-authored text can
+/// move it in a direction that harms nothing: every entry has a safe
+/// direction, a bound, and a dashboard field that undoes it (AC #3).
+///
+/// What is NOT here is the decision, and its reasons are in the story
+/// (`docs/stories/story-11.3-admin-tier.md`) and in `docs/mcp.md`, by
+/// family: anything that can lock the operator out of the management
+/// plane (its port, its TLS pair, the connection and automation
+/// allowlists, the trusted proxies); credentials and trust anchors
+/// (the bot HMAC secret, the scrape token and its switch, the upgrade
+/// signing key, the certificate export family); identity policy;
+/// data-plane capacity and mirroring concurrency, which are reversible
+/// and not harmless; the telemetry and log-sink destinations, since a
+/// redirect is not visibly wrong; `audit_log_retention_days`, because
+/// retention protecting the audit of this tier is not this tier's to
+/// shorten; and the probe and load-test budgets the dashboard has no
+/// write path for, so a value set here could not be undone there
+/// (AC #3), which `docs/backlog.md` records.
+///
+/// Taken out on 2026-09-28, each for a reason the first list missed:
+/// `flood_threshold_rps`, because either direction harms (lowered it
+/// makes every per-IP bucket answer 429, at 0 it switches the flood
+/// defence off); `flood_strict_rps` and `header_timeout_s`, because the
+/// dashboard has no field for them, so a value set here could not be
+/// undone there (`docs/backlog.md` #89); `sla_purge_enabled`, because
+/// off means unbounded growth; `sla_purge_schedule`, because the only
+/// direction it moves is purges more often; and `log_level`, because it
+/// has no safe direction: raised it floods the disk and writes request
+/// detail into the logs, lowered it blinds the investigation.
+///
+/// Every later request to add an entry will be reasonable on its own
+/// terms. An entry arrives with its reason and its bound or not at all.
+pub const SETTINGS_ALLOWLIST: &[AdminSetting] = &[
+    AdminSetting {
+        name: "access_log_retention",
+        why: "retention of the persistent access-log buffer; raised, it keeps more history, \
+              and 0 (unlimited) is refused because the table then grows until the disk fills",
+        min: 1,
+        max: 100_000_000,
+        direction: Direction::RaiseOnly,
+        reach: Reach::Fleet,
+        takes_effect: TakesEffect::Live,
+    },
+    AdminSetting {
+        name: "waf_event_retention",
+        why: "retention of the persistent WAF-event buffer, the data plane's security trail; \
+              raised, it keeps more of it, and 0 (unlimited) is refused",
+        min: 1,
+        max: 100_000_000,
+        direction: Direction::RaiseOnly,
+        reach: Reach::Fleet,
+        takes_effect: TakesEffect::Live,
+    },
+    AdminSetting {
+        name: "sla_purge_retention_days",
+        why: "how long SLA buckets are kept; raised, it keeps more history and purges nothing \
+              sooner",
+        min: 1,
+        max: 3650,
+        direction: Direction::RaiseOnly,
+        reach: Reach::Fleet,
+        takes_effect: TakesEffect::Live,
+    },
+    AdminSetting {
+        name: "cert_warning_days",
+        why: "when a certificate expiry raises a warning; an alert threshold, no traffic \
+              effect, and no lower than two weeks so an expiry cannot be hidden",
+        min: 14,
+        max: 365,
+        direction: Direction::Either,
+        reach: Reach::Fleet,
+        takes_effect: TakesEffect::Live,
+    },
+    AdminSetting {
+        name: "cert_critical_days",
+        why: "when a certificate expiry raises a critical alert; an alert threshold, no \
+              traffic effect, and no lower than three days",
+        min: 3,
+        max: 365,
+        direction: Direction::Either,
+        reach: Reach::Fleet,
+        takes_effect: TakesEffect::Live,
+    },
+    AdminSetting {
+        name: "waf_ban_threshold",
+        why: "how many WAF blocks earn an automatic ban; a protection threshold, never so \
+              low that one false positive bans a shared address and never so high that \
+              auto-ban is off in practice",
+        min: 3,
+        max: 100,
+        direction: Direction::Either,
+        reach: Reach::Fleet,
+        takes_effect: TakesEffect::Live,
+    },
+    AdminSetting {
+        name: "waf_ban_duration_s",
+        why: "how long an automatic WAF ban lasts; a ban keeps the duration it was issued \
+              with, so a day at most, and never so short that a ban does nothing",
+        min: 60,
+        max: 86_400,
+        direction: Direction::Either,
+        reach: Reach::Fleet,
+        takes_effect: TakesEffect::Live,
+    },
+    AdminSetting {
+        name: "default_health_check_interval_s",
+        why: "the fallback health-check interval; a probe budget read on every cycle, bounded \
+              far below the dashboard's own ceiling because a dead backend keeps its traffic \
+              for three probes of whatever interval is set",
+        min: 5,
+        max: 60,
+        direction: Direction::Either,
+        reach: Reach::Fleet,
+        takes_effect: TakesEffect::Live,
+    },
+    AdminSetting {
+        name: "health_max_concurrent_probes",
+        why: "the cap on concurrent health probes; a probe budget, never so low that a few \
+              unreachable backends starve the probes of every other",
+        min: 16,
+        max: 512,
+        direction: Direction::Either,
+        reach: Reach::Fleet,
+        takes_effect: TakesEffect::Live,
+    },
+];
+
+/// The entry of [`SETTINGS_ALLOWLIST`] named `key`.
+fn admin_setting(key: &str) -> Option<&'static AdminSetting> {
+    SETTINGS_ALLOWLIST
+        .iter()
+        .find(|setting| setting.name == key)
+}
+
+/// Whether `key` is one of [`SETTINGS_ALLOWLIST`]'s names.
+fn is_allowlisted_setting(key: &str) -> bool {
+    admin_setting(key).is_some()
+}
+
+/// The JSON body `PUT /automation/v1/settings` reads: an object whose
+/// keys are weighed against [`SETTINGS_ALLOWLIST`] before any value is.
+///
+/// Not `UpdateSettingsRequest`, on purpose: that struct ignores an
+/// unknown key and types every known one, so deserialising into it
+/// first would run a type check on a key the tier must refuse, and drop
+/// a key it must name.
+pub type SettingsPatch = Map<String, Value>;
 
 /// JSON body for `PUT /automation/v1/routes/{id}/certificate`.
 ///
@@ -818,6 +1095,164 @@ pub async fn renew_certificate(
     .await
 }
 
+/// The longest key a settings refusal repeats back.
+const SETTINGS_KEY_ECHO_MAX_BYTES: usize = 64;
+
+/// Every key of `body` inside [`SETTINGS_ALLOWLIST`], or a 403 naming
+/// the first key that is not.
+///
+/// The key is named when it is shaped like a settings field name, which
+/// every real field is; anything else is the caller's own text in a
+/// sentence this node writes, and is described rather than repeated.
+fn ensure_settings_allowlisted(body: &SettingsPatch) -> Result<(), ApiError> {
+    let Some(outside) = body.keys().find(|key| !is_allowlisted_setting(key)) else {
+        return Ok(());
+    };
+    let field_shaped = (1..=SETTINGS_KEY_ECHO_MAX_BYTES).contains(&outside.len())
+        && outside
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    let named = if field_shaped {
+        format!("`{outside}` is")
+    } else {
+        "a key that is not a settings field name is".to_string()
+    };
+    let allowed: Vec<&str> = SETTINGS_ALLOWLIST.iter().map(|s| s.name).collect();
+    Err(ApiError::Forbidden(format!(
+        "settings key {named} outside the admin tier's allowlist and is not accepted from an \
+         automation token; set it in the dashboard. The keys this path accepts: {}",
+        allowed.join(", ")
+    )))
+}
+
+/// The allowlisted body as the management request, with a type error
+/// naming the key it is on.
+///
+/// Each key is read alone first, because a whole-body error from serde
+/// names the value it choked on and not the field, and the field is
+/// what the caller needs.
+fn settings_request(body: SettingsPatch) -> Result<UpdateSettingsRequest, ApiError> {
+    for (key, value) in &body {
+        let alone = Map::from_iter([(key.clone(), value.clone())]);
+        serde_json::from_value::<UpdateSettingsRequest>(Value::Object(alone))
+            .map_err(|refused| ApiError::Unprocessable(format!("{key}: {refused}")))?;
+    }
+    serde_json::from_value(Value::Object(body))
+        .map_err(|refused| ApiError::Unprocessable(refused.to_string()))
+}
+
+/// The allowlisted keys of a settings document, and nothing else.
+///
+/// What a settings write answers on this plane, for the apply and the
+/// preview alike: the scope that writes these keys reads back these
+/// keys, and the rest of the document (listener addresses, sink
+/// destinations, secrets) stays where no automation scope reaches it.
+///
+/// The document is masked before it is projected, so an allowlist that
+/// ever named a secret by mistake would answer the sentinel and not the
+/// secret.
+fn allowlisted_view(settings: &lorica_config::models::GlobalSettings) -> Value {
+    let mut masked = settings.clone();
+    crate::settings::mask_settings_secrets(&mut masked);
+    let mut view = serde_json::to_value(&masked).unwrap_or_default();
+    if let Some(object) = view.as_object_mut() {
+        object.retain(|key, _| is_allowlisted_setting(key));
+    }
+    view
+}
+
+/// The admin tier's bound on each key `body` sets, as the check
+/// [`crate::settings::update_settings_as`] runs on the stored document
+/// and the patched one under the store lock.
+///
+/// A key sent as `null` sets nothing and is not weighed. The first key
+/// outside its entry's bound, or moved against its entry's direction,
+/// is refused with a 422 naming the key, the value and the bound.
+fn tier_bounds(
+    body: &SettingsPatch,
+) -> impl FnOnce(
+    &lorica_config::models::GlobalSettings,
+    &lorica_config::models::GlobalSettings,
+) -> Result<(), ApiError>
+       + Send
+       + 'static {
+    let named: Vec<&'static AdminSetting> = body
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .filter_map(|(key, _)| admin_setting(key))
+        .collect();
+    move |before, after| {
+        let before = serde_json::to_value(before).unwrap_or_default();
+        let after = serde_json::to_value(after).unwrap_or_default();
+        for setting in named {
+            let (Some(stored), Some(patched)) =
+                (before[setting.name].as_i64(), after[setting.name].as_i64())
+            else {
+                return Err(ApiError::Internal(format!(
+                    "{} is not an integer in the settings document",
+                    setting.name
+                )));
+            };
+            if let Some(refused) = setting.refusal(stored, patched) {
+                return Err(ApiError::Unprocessable(refused));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `PUT /automation/v1/settings` (scope `settings:write`).
+///
+/// The management settings write, as the token, bounded by
+/// [`SETTINGS_ALLOWLIST`]: a key outside it is refused with a 403
+/// naming it before any value is read, a value outside its entry's
+/// bound or against its direction with a 422 naming the key and the
+/// bound, then the body goes through the dashboard's own validators,
+/// reload signal and `settings.update` audit row, whose target names
+/// each key the write changed with its value before and after. The
+/// answer is the allowlisted part of the document after the write.
+/// With `?dry_run=true`, the same part before and after, and nothing
+/// written; the preview needs no scope beyond this one, because it
+/// shows only what this scope may write.
+///
+/// # Errors
+///
+/// `Forbidden` for a key outside the allowlist, `Unprocessable` for a
+/// value of the wrong type or outside the tier's bound, then whatever
+/// [`crate::settings::update_settings_as`] answers.
+pub async fn update_settings(
+    principal: AutomationPrincipal,
+    connect_info: ClientConnectInfo,
+    headers: HeaderMap,
+    Extension(state): Extension<AppState>,
+    Query(dry_run): Query<DryRunQuery>,
+    Json(body): Json<SettingsPatch>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_settings_allowlisted(&body)?;
+    let bounds = tier_bounds(&body);
+    let request = settings_request(body)?;
+    let actor = audit_context(&principal, &connect_info, &headers);
+    let mode = WriteMode::from(dry_run);
+    let change = crate::settings::update_settings_as(
+        &state,
+        &actor,
+        request,
+        mode,
+        SettingsAuditTarget::ChangedValues,
+        bounds,
+    )
+    .await?;
+    let after = allowlisted_view(&change.after);
+    if mode.previews() {
+        return Ok(previewed(
+            "update",
+            Some(allowlisted_view(&change.before)),
+            Some(after),
+        ));
+    }
+    Ok(json_data(after))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,5 +1512,283 @@ mod tests {
                 "{body} was accepted"
             );
         }
+    }
+
+    /// Every `settingsForm` field the dashboard's settings tabs bind to
+    /// an editable input, read off the components themselves.
+    ///
+    /// A binding on an element carrying a bare `disabled` attribute is
+    /// shown and not editable, so it is left out: the management port
+    /// is displayed there and changed nowhere in the form.
+    fn dashboard_form_vocabulary() -> BTreeSet<String> {
+        let tabs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../lorica-dashboard/frontend/src/components/settings-tabs");
+        let mut fields = BTreeSet::new();
+        let mut components = 0usize;
+        for entry in std::fs::read_dir(&tabs).expect("the settings tabs directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("svelte") {
+                continue;
+            }
+            components += 1;
+            let source = std::fs::read_to_string(&path).expect("a readable component");
+            for line in source.lines() {
+                let disabled = line
+                    .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+                    .any(|token| token == "disabled");
+                if disabled {
+                    continue;
+                }
+                let mut remaining = line;
+                while let Some(at) = remaining.find("={settingsForm.") {
+                    let before = &remaining[..at];
+                    let after = &remaining[at + "={settingsForm.".len()..];
+                    let is_binding = ["bind:value", "bind:checked", "bind:group"]
+                        .iter()
+                        .any(|directive| before.ends_with(directive));
+                    let name: String = after
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if is_binding && !name.is_empty() {
+                        fields.insert(name);
+                    }
+                    remaining = after;
+                }
+            }
+        }
+        assert!(
+            components > 0,
+            "no settings tab read under {}",
+            tabs.display()
+        );
+        assert!(
+            !fields.is_empty(),
+            "no `bind:...={{settingsForm.<field>}}` read in {components} settings tabs; the \
+             parse went blind"
+        );
+        fields
+    }
+
+    #[test]
+    fn every_allowlisted_setting_is_a_field_the_dashboard_form_edits_and_the_document_carries() {
+        // AC #3: reversible from the dashboard means a human who lost the
+        // MCP client finds the key on the dashboard's settings form. A
+        // field the management request merely accepts is not enough:
+        // only a hand-built request or a configuration import writes it.
+        let document = serde_json::to_value(lorica_config::models::GlobalSettings::default())
+            .expect("the settings document serialises");
+        let document = document.as_object().expect("an object");
+        let form = dashboard_form_vocabulary();
+        let mut seen = BTreeSet::new();
+        for setting in SETTINGS_ALLOWLIST {
+            assert!(seen.insert(setting.name), "{} twice", setting.name);
+            assert!(
+                document.contains_key(setting.name),
+                "{} is not a key of GlobalSettings",
+                setting.name
+            );
+            assert!(
+                !setting.why.trim().is_empty(),
+                "{} has no reason",
+                setting.name
+            );
+            assert!(
+                form.contains(setting.name),
+                "{} is bound to no editable field of the dashboard's settings form, so a human \
+                 could not undo it there",
+                setting.name
+            );
+        }
+        assert!(
+            SETTINGS_ALLOWLIST.len() < document.len(),
+            "the allowlist is the whole document"
+        );
+    }
+
+    #[test]
+    fn every_allowlisted_bound_lies_inside_the_dashboards_own_and_never_reaches_zero() {
+        // The tier is narrower than the dashboard or equal to it, never
+        // wider: a bound the shared validator would refuse is a bound
+        // this tier does not have. And no entry lets it write 0, which
+        // on every one of them means off or unlimited.
+        let schema = crate::settings::settings_schema();
+        for setting in SETTINGS_ALLOWLIST {
+            assert!(setting.min <= setting.max, "{}", setting.name);
+            assert!(setting.min > 0, "{} lets the tier write 0", setting.name);
+            let shared = &schema[setting.name];
+            assert!(
+                shared.is_object(),
+                "{} publishes no bound in the settings schema",
+                setting.name
+            );
+            if let Some(min) = shared["min"].as_i64() {
+                assert!(
+                    setting.min >= min,
+                    "{} below the shared minimum",
+                    setting.name
+                );
+            }
+            if let Some(max) = shared["max"].as_i64() {
+                assert!(
+                    setting.max <= max,
+                    "{} above the shared maximum",
+                    setting.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_setting_reaches_the_fleet_exactly_when_the_fleet_replicates_it() {
+        let canonical =
+            serde_json::to_value(lorica_config::canonical::CanonicalGlobalSettings::from(
+                &lorica_config::models::GlobalSettings::default(),
+            ))
+            .expect("the canonical settings serialise");
+        let replicated = canonical.as_object().expect("an object");
+        for setting in SETTINGS_ALLOWLIST {
+            assert_eq!(
+                setting.reach == Reach::Fleet,
+                replicated.contains_key(setting.name),
+                "{} says {:?}",
+                setting.name,
+                setting.reach
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_is_refused_outside_its_bound_and_against_its_direction() {
+        let retention = admin_setting("access_log_retention").expect("allowlisted");
+        assert_eq!(retention.refusal(100, 100), None);
+        assert_eq!(retention.refusal(100, 500), None);
+        let lowered = retention.refusal(500, 100).expect("a retention lowered");
+        assert!(lowered.starts_with("access_log_retention: 100 is below the stored 500"));
+        assert!(lowered.contains(&retention.bound_text()), "{lowered}");
+        let unlimited = retention.refusal(100, 0).expect("unlimited");
+        assert!(unlimited.contains("outside"), "{unlimited}");
+
+        let warning = admin_setting("cert_warning_days").expect("allowlisted");
+        assert_eq!(warning.bound_text(), "14..=365");
+        assert_eq!(
+            warning.refusal(30, 14),
+            None,
+            "either direction inside the bound"
+        );
+        assert_eq!(warning.refusal(30, 365), None);
+        let hidden = warning.refusal(30, 2).expect("an expiry hidden");
+        assert!(
+            hidden.starts_with("cert_warning_days: 2 is outside"),
+            "{hidden}"
+        );
+        assert!(warning.refusal(30, 366).is_some());
+    }
+
+    #[test]
+    fn the_tier_bounds_weigh_the_keys_the_body_sets_and_no_other() {
+        let stored = lorica_config::models::GlobalSettings {
+            waf_ban_threshold: 1,
+            ..Default::default()
+        };
+        // A key the body does not set is not weighed, even when the
+        // dashboard left it outside the tier's bound.
+        let body: SettingsPatch = Map::from_iter([(
+            "cert_warning_days".to_string(),
+            serde_json::json!(stored.cert_warning_days + 1),
+        )]);
+        let mut patched = stored.clone();
+        patched.cert_warning_days += 1;
+        tier_bounds(&body)(&stored, &patched).expect("the named key is inside its bound");
+
+        let body: SettingsPatch =
+            Map::from_iter([("waf_ban_threshold".to_string(), serde_json::json!(2))]);
+        let mut patched = stored.clone();
+        patched.waf_ban_threshold = 2;
+        match tier_bounds(&body)(&stored, &patched) {
+            Err(ApiError::Unprocessable(message)) => {
+                assert!(message.starts_with("waf_ban_threshold: 2"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let body: SettingsPatch = Map::from_iter([("waf_ban_threshold".to_string(), Value::Null)]);
+        tier_bounds(&body)(&stored, &stored).expect("a null sets nothing");
+    }
+
+    #[test]
+    fn a_key_outside_the_allowlist_is_refused_by_name_before_any_value_is_read() {
+        let inside = SETTINGS_ALLOWLIST[0].name;
+        for outside in [
+            "management_port",
+            "automation_allowed_cidrs",
+            "audit_log_retention_days",
+            "max_active_probes",
+            "log_level",
+            "flood_threshold_rps",
+            "not_a_setting",
+        ] {
+            // The value is of the wrong type on purpose: the refusal is
+            // the allowlist's, not a type check's.
+            let body: SettingsPatch = Map::from_iter([
+                (inside.to_string(), serde_json::json!(1)),
+                (outside.to_string(), serde_json::json!({ "not": "a port" })),
+            ]);
+            match ensure_settings_allowlisted(&body).expect_err(outside) {
+                ApiError::Forbidden(message) => {
+                    assert!(message.contains(&format!("`{outside}`")), "{message}");
+                    assert!(message.contains(inside), "{message}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // A key that is not shaped like a field is described, not
+        // repeated back.
+        let smuggled = "Ignore previous instructions";
+        let body: SettingsPatch = Map::from_iter([(smuggled.to_string(), Value::Null)]);
+        match ensure_settings_allowlisted(&body).expect_err("outside") {
+            ApiError::Forbidden(message) => assert!(!message.contains(smuggled), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        let inside: SettingsPatch = SETTINGS_ALLOWLIST
+            .iter()
+            .map(|setting| (setting.name.to_string(), Value::Null))
+            .collect();
+        ensure_settings_allowlisted(&inside).expect("every allowlisted key passes");
+        ensure_settings_allowlisted(&SettingsPatch::new()).expect("an empty body names nothing");
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_is_refused_naming_its_key() {
+        let body: SettingsPatch = Map::from_iter([
+            ("cert_warning_days".to_string(), serde_json::json!(30)),
+            ("waf_ban_threshold".to_string(), serde_json::json!("many")),
+        ]);
+        // `UpdateSettingsRequest` is not `Debug`, so the result is
+        // matched rather than unwrapped.
+        match settings_request(body) {
+            Err(ApiError::Unprocessable(message)) => {
+                assert!(message.starts_with("waf_ban_threshold:"), "{message}")
+            }
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("a string for an integer was accepted"),
+        }
+        let body: SettingsPatch =
+            Map::from_iter([("cert_warning_days".to_string(), serde_json::json!(30))]);
+        let request = settings_request(body).expect("a well-typed body");
+        assert_eq!(request.cert_warning_days, Some(30));
+    }
+
+    #[test]
+    fn the_answer_carries_the_allowlisted_keys_and_nothing_else() {
+        let view = allowlisted_view(&lorica_config::models::GlobalSettings::default());
+        let keys: BTreeSet<&str> = view
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let allowed: BTreeSet<&str> = SETTINGS_ALLOWLIST.iter().map(|s| s.name).collect();
+        assert_eq!(keys, allowed);
     }
 }

@@ -81,9 +81,9 @@ fn default_max_ttl_seconds() -> u32 {
 ///
 /// The enum is closed and [`AutomationScope::ALL`] is the whole surface.
 /// What is absent from it is absent deliberately: there is no
-/// `settings:*` and no `certificates:upload`, because key material and
-/// node-wide policy enter through the management API, by a human, and
-/// never through a token.
+/// `certificates:upload`, no `users:*` and no `cluster:write`, because
+/// key material, identity and fleet membership enter through the
+/// management API, by a human, and never through a token.
 ///
 /// The read grants beyond `routes:read` and `certificates:read` arrived
 /// with the management MCP server (Epic 11). Its read tier is what
@@ -101,6 +101,13 @@ fn default_max_ttl_seconds() -> u32 {
 /// a different credential from the one a CI pipeline uses for
 /// ephemeral environments, and an operator mints it as such.
 ///
+/// `settings:write` arrived with that server's admin tier (Story 11.3)
+/// and reverses the rest of the same Story 10.3 decision for node-wide
+/// settings, bounded: it reaches one path, and that path accepts only
+/// the keys `SETTINGS_ALLOWLIST` in `lorica-api` names, each with the
+/// reason it is there. Every other setting, and every identity and
+/// cluster operation, stays out of reach of any token.
+///
 /// An unknown scope string fails to deserialise rather than being
 /// dropped, so a token minted against a newer Lorica is refused here
 /// instead of silently losing the grant an operator wrote down.
@@ -110,7 +117,7 @@ fn default_max_ttl_seconds() -> u32 {
 /// let scope: AutomationScope =
 ///     serde_json::from_str("\"environments:write\"").expect("known scope");
 /// assert_eq!(scope, AutomationScope::EnvironmentsWrite);
-/// assert!(serde_json::from_str::<AutomationScope>("\"settings:write\"").is_err());
+/// assert!(serde_json::from_str::<AutomationScope>("\"users:write\"").is_err());
 /// ```
 // The serde renames below are this vocabulary's source of truth. The
 // surfaces named here carry the same strings and none of them is
@@ -165,6 +172,11 @@ pub enum AutomationScope {
     /// the automation plane.
     #[serde(rename = "certificates:write")]
     CertificatesWrite,
+    /// Change the operational global settings the admin tier's
+    /// allowlist names, and nothing else: never an identity, a
+    /// credential, a listener or the fleet.
+    #[serde(rename = "settings:write")]
+    SettingsWrite,
 }
 
 impl AutomationScope {
@@ -190,6 +202,7 @@ impl AutomationScope {
         AutomationScope::RoutesWrite,
         AutomationScope::BackendsWrite,
         AutomationScope::CertificatesWrite,
+        AutomationScope::SettingsWrite,
     ];
 }
 
@@ -654,7 +667,7 @@ mod tests {
         // an unknown entry would mint a token narrower than the
         // operator wrote, and they would find out at the first call.
         for unknown in [
-            "\"settings:write\"",
+            "\"users:write\"",
             "\"certificates:upload\"",
             "\"waf:write\"",
             "\"environments\"",

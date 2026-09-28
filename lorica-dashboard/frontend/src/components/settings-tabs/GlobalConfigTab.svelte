@@ -73,7 +73,7 @@
     maxGlobal: bound('max_global_connections', 0, 1_000_000),
     flood: bound('flood_threshold_rps', 0, 1_000_000),
     wafBanThreshold: bound('waf_ban_threshold', 0, 1000),
-    wafBanDur: bound('waf_ban_duration_s', 0, 604_800),
+    wafBanDur: bound('waf_ban_duration_s', 0, 2_592_000),
     wafScanBudget: bound('waf_body_scan_max_inflight_bytes', 1_048_576, 17_179_869_184),
     logRet: bound('access_log_retention', 0, 100_000_000),
     wafRet: bound('waf_event_retention', 0, 100_000_000),

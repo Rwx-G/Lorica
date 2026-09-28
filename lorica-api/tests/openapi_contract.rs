@@ -621,6 +621,10 @@ fn request_struct_sources() -> Vec<(&'static str, &'static str)> {
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/backends.rs")),
         ),
         (
+            "/src/settings.rs",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/settings.rs")),
+        ),
+        (
             "/src/routes/path_rules.rs",
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -806,6 +810,46 @@ fn source_declaring(name: &str) -> Option<(&'static str, &'static str)> {
         .find(|(_, src)| src.contains(&opening))
 }
 
+/// The one automation write whose body is bounded by an allowlist and
+/// not by a struct (Story 11.3): the body type its handler extracts,
+/// and the management struct the allowlisted keys are then read into.
+///
+/// The handler takes the body as a JSON object so it can refuse a key
+/// outside `SETTINGS_ALLOWLIST` by name before any value is typed, so
+/// there is no struct whose fields are the contract; the allowlist is.
+const ALLOWLISTED_BODY: (&str, &str) = ("SettingsPatch", "UpdateSettingsRequest");
+
+/// The keys the admin tier accepts, read from the constant the plane
+/// enforces rather than typed again here.
+fn settings_allowlist() -> BTreeSet<String> {
+    lorica_api::automation::write::SETTINGS_ALLOWLIST
+        .iter()
+        .map(|setting| setting.name.to_string())
+        .collect()
+}
+
+/// The field names a write body accepts, and where they were read
+/// from: the serde fields of its request struct, or for the settings
+/// patch the plane's allowlist, which is what bounds it.
+fn accepted_fields(body_type: &str) -> Option<(&'static str, BTreeSet<String>)> {
+    if body_type == ALLOWLISTED_BODY.0 {
+        return Some(("SETTINGS_ALLOWLIST", settings_allowlist()));
+    }
+    let (file, src) = source_declaring(body_type)?;
+    Some((file, serde_field_names(src, body_type)))
+}
+
+/// The struct a body's fields are declared on, for the walks that go
+/// below the top level: the body type itself, or for the settings patch
+/// the management struct its keys are read into.
+fn declaring_struct(body_type: &str) -> &str {
+    if body_type == ALLOWLISTED_BODY.0 {
+        ALLOWLISTED_BODY.1
+    } else {
+        body_type
+    }
+}
+
 #[test]
 fn every_automation_write_accepts_exactly_the_field_names_this_surface_committed_to() {
     let router_src: &str = include_str!(concat!(
@@ -844,6 +888,28 @@ fn every_automation_write_accepts_exactly_the_field_names_this_surface_committed
             }
             panic!("{method} {path}: `{handler}` takes no `Json<...>` body, so its field set cannot be pinned");
         };
+        if struct_name == ALLOWLISTED_BODY.0 {
+            // The settings patch is committed to by the allowlist the
+            // plane enforces, which is its own decision list with a
+            // reason per entry; a copy of it here would be a third
+            // statement of one list. What is left to pin is that every
+            // allowlisted key is one the management struct reads.
+            let (_, src) = source_declaring(ALLOWLISTED_BODY.1).unwrap_or_else(|| {
+                panic!("`pub struct {}` is declared nowhere", ALLOWLISTED_BODY.1)
+            });
+            let readable = serde_field_names(src, ALLOWLISTED_BODY.1);
+            assert!(!readable.is_empty(), "{} has no field", ALLOWLISTED_BODY.1);
+            let unread: Vec<String> = settings_allowlist()
+                .difference(&readable)
+                .cloned()
+                .collect();
+            assert!(
+                unread.is_empty(),
+                "{method} {path}: SETTINGS_ALLOWLIST names keys {} does not read: {unread:?}",
+                ALLOWLISTED_BODY.1
+            );
+            continue;
+        }
         let (file, src) = source_declaring(&struct_name).unwrap_or_else(|| {
             panic!("`pub struct {struct_name}` is declared in no source this test reads")
         });
@@ -1081,10 +1147,9 @@ fn no_automation_write_accepts_key_material() {
         let Some(struct_name) = handler_body_struct(module_src, handler) else {
             continue;
         };
-        let (file, src) = source_declaring(&struct_name).unwrap_or_else(|| {
+        let (file, accepted) = accepted_fields(&struct_name).unwrap_or_else(|| {
             panic!("`pub struct {struct_name}` is declared nowhere this test reads")
         });
-        let accepted = serde_field_names(src, &struct_name);
         assert!(!accepted.is_empty(), "{struct_name} in {file} has no field");
         structs_checked += 1;
         for name in &accepted {
@@ -1269,10 +1334,9 @@ fn every_mcp_write_tool_declares_exactly_the_fields_its_handler_accepts_less_the
             "{} names its body `{}` and the handler deserialises `{struct_name}`",
             spec.name, body.schema
         );
-        let (file, src) = source_declaring(&struct_name).unwrap_or_else(|| {
+        let (file, accepted) = accepted_fields(&struct_name).unwrap_or_else(|| {
             panic!("`pub struct {struct_name}` is declared nowhere this test reads")
         });
-        let accepted: BTreeSet<String> = serde_field_names(src, &struct_name);
         assert!(!accepted.is_empty(), "{struct_name} in {file} has no field");
         let not_offered: BTreeSet<String> = NOT_OFFERED_TO_A_MODEL
             .iter()
@@ -1403,6 +1467,7 @@ fn no_mcp_tool_body_field_takes_key_material_at_any_depth_of_its_request_struct(
             .unwrap_or_else(|| panic!("`{handler}` is declared in no automation module"));
         let struct_name = handler_body_struct(module_src, &handler)
             .unwrap_or_else(|| panic!("`{handler}` takes no body"));
+        let struct_name = declaring_struct(&struct_name).to_string();
         let offered: BTreeSet<String> = body.fields.iter().map(|f| (*f).to_string()).collect();
 
         let mut reachable = Vec::new();
@@ -1499,7 +1564,7 @@ fn every_mcp_write_tool_declares_its_nested_vocabularies_against_the_nested_stru
         let offered: Vec<&str> = body.fields.to_vec();
         pin_nested(
             spec.name,
-            &struct_name,
+            declaring_struct(&struct_name),
             &offered,
             body.nested,
             &mut nested_pinned,
@@ -1615,6 +1680,146 @@ fn pin_nested(
             }
         }
     }
+}
+
+/// The `minimum` and `maximum` each property of the schema `name`
+/// publishes in `components.schemas`, by property.
+fn extract_schema_property_bounds(
+    yaml: &str,
+    name: &str,
+) -> BTreeMap<String, (Option<i64>, Option<i64>)> {
+    let opening = format!("\n    {name}:\n");
+    let start = yaml
+        .find(&opening)
+        .unwrap_or_else(|| panic!("components.schemas.{name} is not in the document"))
+        + opening.len();
+    let mut bounds = BTreeMap::new();
+    let mut in_properties = false;
+    let mut current: Option<String> = None;
+    for line in yaml[start..].lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent <= 4 {
+            break;
+        }
+        let text = line.trim();
+        if indent == 6 {
+            in_properties = text == "properties:";
+            continue;
+        }
+        if !in_properties {
+            continue;
+        }
+        if indent == 8 {
+            let property = text.trim_end_matches(':').to_string();
+            bounds.insert(property.clone(), (None, None));
+            current = Some(property);
+            continue;
+        }
+        let Some(property) = &current else {
+            continue;
+        };
+        let entry = bounds.get_mut(property).expect("inserted above");
+        if let Some(value) = text.strip_prefix("minimum:") {
+            entry.0 = Some(value.trim().parse().expect("an integer minimum"));
+        } else if let Some(value) = text.strip_prefix("maximum:") {
+            entry.1 = Some(value.trim().parse().expect("an integer maximum"));
+        }
+    }
+    bounds
+}
+
+#[test]
+fn the_settings_patch_publishes_each_allowlisted_bound() {
+    // Story 11.3, decision A of 2026-09-28: the plane refuses a value
+    // outside its entry's bound, and the schema a caller reads before
+    // calling publishes the same bound, pinned here against the entry.
+    let spec_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/openapi-automation.yaml"
+    ));
+    let published = extract_schema_property_bounds(spec_src, ALLOWLISTED_BODY.0);
+    assert!(!published.is_empty(), "no property read off SettingsPatch");
+    for setting in lorica_api::automation::write::SETTINGS_ALLOWLIST {
+        assert_eq!(
+            published.get(setting.name),
+            Some(&(Some(setting.min), Some(setting.max))),
+            "SettingsPatch.{} publishes a bound other than {}",
+            setting.name,
+            setting.bound_text()
+        );
+    }
+}
+
+#[test]
+fn the_settings_patch_is_documented_and_offered_as_exactly_the_allowlist() {
+    // Story 11.3: the allowlist binds at the plane, and two surfaces
+    // restate it, the documented schema a caller reads and the MCP
+    // tool's body vocabulary a model is offered. Both are diffed against
+    // the constant here, both ways, so a key added to one surface alone
+    // is a red gate rather than a key one surface offers and the plane
+    // refuses, or one the plane accepts and nothing documents.
+    let spec_src: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/openapi-automation.yaml"
+    ));
+    let allowlist = settings_allowlist();
+    assert!(!allowlist.is_empty(), "SETTINGS_ALLOWLIST is empty");
+
+    let bodies = extract_request_body_refs(spec_src);
+    let documented_ref = bodies
+        .get(&("PUT".to_string(), "/automation/v1/settings".to_string()))
+        .expect("PUT /automation/v1/settings documents a request body by $ref");
+    assert_eq!(documented_ref, ALLOWLISTED_BODY.0);
+    let documented = extract_schema_properties(spec_src, ALLOWLISTED_BODY.0);
+
+    let tools: Vec<&lorica_mcp::tools::ToolSpec> = lorica_mcp::tools::catalogue()
+        .iter()
+        .filter(|spec| {
+            spec.body()
+                .is_some_and(|body| body.schema == ALLOWLISTED_BODY.0)
+        })
+        .collect();
+    assert!(
+        !tools.is_empty(),
+        "no MCP tool carries a {} body",
+        ALLOWLISTED_BODY.0
+    );
+
+    let mut drift = String::new();
+    let mut compare = |surface: &str, offered: &BTreeSet<String>| {
+        let missing: Vec<&String> = allowlist.difference(offered).collect();
+        let extra: Vec<&String> = offered.difference(&allowlist).collect();
+        if !missing.is_empty() || !extra.is_empty() {
+            drift.push_str(&format!(
+                "\n{surface}:\n  in SETTINGS_ALLOWLIST and missing here: {missing:?}\n  here and \
+                 not in SETTINGS_ALLOWLIST: {extra:?}\n"
+            ));
+        }
+    };
+    compare(
+        &format!(
+            "openapi-automation.yaml, components.schemas.{}",
+            ALLOWLISTED_BODY.0
+        ),
+        &documented,
+    );
+    for spec in &tools {
+        let offered: BTreeSet<String> = spec
+            .body()
+            .map(|body| body.fields.iter().map(|f| (*f).to_string()).collect())
+            .unwrap_or_default();
+        compare(&format!("the MCP tool {}", spec.name), &offered);
+    }
+    assert!(
+        drift.is_empty(),
+        "\nThe admin tier's settings allowlist and a surface restating it disagree.\n{drift}\n\
+         SETTINGS_ALLOWLIST in lorica-api/src/automation/write.rs is the control, each entry with \
+         its reason. Change it there first, by a decision, then SETTINGS_FIELDS in \
+         lorica-mcp/src/tools.rs and the SettingsPatch schema in openapi-automation.yaml.\n"
+    );
 }
 
 #[test]

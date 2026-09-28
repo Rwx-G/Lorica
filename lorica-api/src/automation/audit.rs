@@ -1324,6 +1324,7 @@ mod tests {
             oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
             mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
             renewals: Arc::new(crate::acme::RenewalLedger::new()),
+            automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
         }
     }
 

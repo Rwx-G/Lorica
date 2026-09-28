@@ -50,6 +50,10 @@
 //! write tool, because every write tool declares a write scope, which
 //! `tools` pins by construction rather than by exception.
 //!
+//! Story 11.3's admin tier is the same rule over one more scope:
+//! `settings:write` registers the settings mutation and its preview and
+//! nothing else, since no other tool declares it.
+//!
 //! # A token with no tool still starts
 //!
 //! Minting refuses an empty scope array, so the case AC #3 names is
@@ -357,15 +361,18 @@ impl McpServer {
         &self.registered
     }
 
-    /// Which tier this server is, from what it registered: the config
-    /// tier once any tool that changes the configuration is registered,
-    /// the read tier otherwise.
+    /// Which tier this server is, from what it registered: the admin
+    /// tier once any of its tools is registered, the config tier once
+    /// any other tool that changes the configuration is, the read tier
+    /// otherwise.
     ///
     /// A name for the operator's notice and nothing more. Story 11.4
     /// owns the tier table and the refusal of a token spanning two
     /// tiers; nothing here decides that.
     pub fn tier(&self) -> &'static str {
-        if self.registered.iter().any(|spec| !spec.changes_nothing()) {
+        if self.registered.iter().any(|spec| is_admin_tool(spec)) {
+            "admin tier"
+        } else if self.registered.iter().any(|spec| !spec.changes_nothing()) {
             "config tier"
         } else {
             "read tier"
@@ -380,22 +387,30 @@ impl McpServer {
     pub fn startup_notice(&self) -> String {
         if self.registered.is_empty() {
             return format!(
-                "Token {} carries no scope either MCP tier uses, so no tool is registered \
+                "Token {} carries no scope any MCP tier uses, so no tool is registered \
                  and tools/list answers an empty set. It carries: {}. The read tier uses: \
-                 {}. The config tier adds: {}. Mint a token carrying at least one of those.",
+                 {}. The config tier adds: {}. The admin tier uses: {}. Mint a token \
+                 carrying at least one of those.",
                 self.identity.public_id,
                 self.identity.scopes.join(", "),
                 read_scopes().join(", "),
                 write_scopes().join(", "),
+                admin_scopes().join(", "),
             );
         }
         let tier = self.tier();
         // A read tier is complete without a write scope, so its notice
         // does not ask for one; a config tier is asked about both
-        // kinds, since it is the tier that uses reads to find ids.
+        // kinds, since it is the tier that uses reads to find ids; an
+        // admin tier is asked about its own tools and nothing else,
+        // since it needs no read and must not be told to widen.
         let missing: Vec<&'static str> = tools::catalogue()
             .iter()
-            .filter(|spec| tier == "config tier" || spec.write().is_none())
+            .filter(|spec| match tier {
+                "admin tier" => is_admin_tool(spec),
+                "config tier" => !is_admin_tool(spec),
+                _ => spec.write().is_none(),
+            })
             .map(|spec| spec.scope)
             .filter(|scope| !self.identity.scopes.iter().any(|held| held == *scope))
             .collect();
@@ -698,10 +713,29 @@ pub fn write_scopes() -> Vec<&'static str> {
     deduplicated(
         &tools::catalogue()
             .iter()
-            .filter(|spec| spec.write().is_some())
+            .filter(|spec| spec.write().is_some() && !is_admin_tool(spec))
             .map(|spec| spec.scope)
             .collect::<Vec<&'static str>>(),
     )
+}
+
+/// Every scope the admin tier uses, once each, in catalogue order.
+pub fn admin_scopes() -> Vec<&'static str> {
+    deduplicated(
+        &tools::catalogue()
+            .iter()
+            .filter(|spec| is_admin_tool(spec))
+            .map(|spec| spec.scope)
+            .collect::<Vec<&'static str>>(),
+    )
+}
+
+/// Whether `spec` is one of the admin tier's tools, an apply or a
+/// preview of [`tools::ADMIN_MUTATIONS`].
+fn is_admin_tool(spec: &ToolSpec) -> bool {
+    tools::ADMIN_MUTATIONS
+        .iter()
+        .any(|mutation| mutation.apply == spec.name || mutation.preview == spec.name)
 }
 
 /// `names` with later repeats dropped, order kept.
@@ -864,6 +898,7 @@ mod tests {
         assert!(notice.contains("environments:write"), "{notice}");
         assert!(notice.contains("logs:read"), "{notice}");
         assert!(notice.contains("routes:write"), "{notice}");
+        assert!(notice.contains("settings:write"), "{notice}");
         assert!(notice.contains("0123456789abcdef01234567"), "{notice}");
     }
 
@@ -898,6 +933,17 @@ mod tests {
         let every: Vec<&str> = read_scopes().into_iter().chain(write_scopes()).collect();
         let notice = server_for(&Plane::carrying(&every)).await.startup_notice();
         assert!(notice.contains("every tool of the config tier"), "{notice}");
+
+        // The admin tier is complete with its own scope and is asked for
+        // nothing else: telling it which reads or config writes it lacks
+        // would be advice to widen the one tier meant to stay narrow.
+        let plane = Plane::carrying(&admin_scopes());
+        let server = server_for(&plane).await;
+        assert_eq!(server.tier(), "admin tier");
+        let notice = server.startup_notice();
+        assert!(notice.contains("every tool of the admin tier"), "{notice}");
+        assert!(!notice.contains("routes:write"), "{notice}");
+        assert!(!notice.contains("logs:read"), "{notice}");
     }
 
     #[tokio::test]
@@ -1585,7 +1631,11 @@ mod tests {
         // that it adds nothing of its own, so the sweep walks every
         // registered tool's answer, the tool list and the refusals,
         // over a token carrying every scope of both tiers.
-        let every: Vec<&str> = read_scopes().into_iter().chain(write_scopes()).collect();
+        let every: Vec<&str> = read_scopes()
+            .into_iter()
+            .chain(write_scopes())
+            .chain(admin_scopes())
+            .collect();
         let plane = Plane::carrying(&every);
         let server = server_for(&plane).await;
 

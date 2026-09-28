@@ -211,6 +211,13 @@ fn declaration(method: &http::Method, path: &str) -> Option<(&'static str, Scope
 /// under `self-signed`. Those are the management paths that accept a
 /// PEM body, and key material enters this node through the management
 /// API, by a human, never through a token.
+///
+/// The admin tier (Story 11.3) is one entry: `PUT` on the settings
+/// document, behind `settings:write`. What is absent there is the
+/// deliverable: nothing under users, the automation tokens, the
+/// cluster's nodes and enrolment tokens, `leave` or `break-glass` is
+/// declared for any verb, so no token reaches an identity or a fleet
+/// operation however it is scoped, and no MCP tool exists to name one.
 fn write_declaration(method: &http::Method, path: &str) -> Option<(&'static str, AutomationScope)> {
     use http::Method;
     if *method == Method::GET {
@@ -243,6 +250,9 @@ fn write_declaration(method: &http::Method, path: &str) -> Option<(&'static str,
             CERTIFICATE_RENEW_TEMPLATE,
             AutomationScope::CertificatesWrite,
         ));
+    }
+    if is_put && path == SETTINGS_PATH {
+        return Some((SETTINGS_PATH, AutomationScope::SettingsWrite));
     }
     None
 }
@@ -359,6 +369,11 @@ pub(super) const CERTIFICATES_PATH: &str = "/automation/v1/certificates";
 /// how the metric labels it.
 const CERTIFICATE_RENEW_TEMPLATE: &str = "/automation/v1/certificates/{id}/renew";
 
+/// The global settings document, the admin tier's one path (Story
+/// 11.3). Written, never read: the answer to a write is the allowlisted
+/// part of the document and nothing more.
+pub(super) const SETTINGS_PATH: &str = "/automation/v1/settings";
+
 /// Axum middleware enforcing [`required_scope`] against the
 /// authenticated principal.
 ///
@@ -430,6 +445,7 @@ pub(super) fn scope_str(scope: AutomationScope) -> &'static str {
         AutomationScope::RoutesWrite => "routes:write",
         AutomationScope::BackendsWrite => "backends:write",
         AutomationScope::CertificatesWrite => "certificates:write",
+        AutomationScope::SettingsWrite => "settings:write",
     }
 }
 
@@ -513,6 +529,11 @@ pub(crate) const WRITE_SURFACE: &[(&str, &str, AutomationScope)] = &[
         "POST",
         "/automation/v1/certificates/c-1/renew",
         AutomationScope::CertificatesWrite,
+    ),
+    (
+        "PUT",
+        "/automation/v1/settings",
+        AutomationScope::SettingsWrite,
     ),
 ];
 
@@ -897,6 +918,90 @@ mod tests {
             required_scope(&Method::GET, "/automation/v1/cluster/status"),
             Some(ScopeRequirement::Scope(AutomationScope::ClusterRead))
         );
+    }
+
+    #[test]
+    fn every_write_the_plane_mounts_is_on_the_write_surface() {
+        // The inverse of the tests above, which start from
+        // `WRITE_SURFACE`: every path the router mounts is asked of the
+        // matrix for every verb, and whatever it declares behind a write
+        // scope is on the list, so the list the secret and preview
+        // sweeps walk cannot be shorter than the writes the plane
+        // serves. The environment resource predates the list and has
+        // its own tests above.
+        let router = include_str!("router.rs");
+        let opening = "\"/automation/v1/";
+        let mut mounted = 0usize;
+        let mut writes = 0usize;
+        for (at, _) in router.match_indices(opening) {
+            let literal = &router[at + 1..];
+            let path = &literal[..literal.find('"').expect("a terminated literal")];
+            mounted += 1;
+            let concrete: String = path
+                .split('/')
+                .map(|segment| {
+                    if segment.starts_with('{') {
+                        "x-1"
+                    } else {
+                        segment
+                    }
+                })
+                .collect::<Vec<&str>>()
+                .join("/");
+            for method in [
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::PATCH,
+            ] {
+                let Some(ScopeRequirement::Scope(scope)) = required_scope(&method, &concrete)
+                else {
+                    continue;
+                };
+                if !scope_str(scope).ends_with(":write")
+                    || scope == AutomationScope::EnvironmentsWrite
+                {
+                    continue;
+                }
+                writes += 1;
+                let listed = WRITE_SURFACE.iter().any(|(spelled, written_path, listed)| {
+                    verb(spelled) == method
+                        && *listed == scope
+                        && path_template(&method, written_path) == path_template(&method, &concrete)
+                });
+                assert!(
+                    listed,
+                    "{method} {path} is declared behind {} and is not on WRITE_SURFACE",
+                    scope_str(scope)
+                );
+            }
+        }
+        assert!(mounted >= 10, "only {mounted} paths read off router.rs");
+        assert!(writes >= WRITE_SURFACE.len(), "only {writes} writes found");
+    }
+
+    #[test]
+    fn the_settings_document_is_written_behind_settings_write_and_read_by_nobody() {
+        // Story 11.3. One verb on one path: the document is not
+        // readable here at all, a verb the router does not mount
+        // inherits nothing, and nothing under the path is declared, so
+        // no key of the document is a path of its own.
+        assert_eq!(
+            required_scope(&Method::PUT, SETTINGS_PATH),
+            Some(ScopeRequirement::Scope(AutomationScope::SettingsWrite))
+        );
+        for method in [Method::GET, Method::POST, Method::DELETE, Method::PATCH] {
+            assert_eq!(required_scope(&method, SETTINGS_PATH), None, "{method}");
+        }
+        for deeper in [
+            "/automation/v1/settings/",
+            "/automation/v1/settings/log_level",
+            "/automation/v1/settings/schema",
+        ] {
+            assert_eq!(required_scope(&Method::PUT, deeper), None, "{deeper}");
+            assert_eq!(required_scope(&Method::GET, deeper), None, "{deeper}");
+        }
     }
 
     #[test]

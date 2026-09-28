@@ -1,13 +1,15 @@
 # The Lorica management MCP server
 
 `lorica-mcp` lets an operator talk to Lorica from a Model Context
-Protocol client. It has two tiers, and a server is one of them by the
+Protocol client. It has three tiers, and a server is one of them by the
 token it was started with. The **read tier** asks what Lorica is
 seeing: access-log rows, WAF events, SLA windows, cluster status and the
 configuration as it stands, and cannot change anything. The **config
 tier** creates and adjusts routes, backends and certificate bindings,
 through the same validators the dashboard uses, with a preview of every
-change before it is made.
+change before it is made. The **admin tier** changes a short, named
+list of operational global settings and nothing else; it is defined by
+what it refuses.
 
 It speaks two transports over one core: **stdio**, for a client that
 launches it as a subprocess, and **Streamable HTTP**, as one path on
@@ -276,8 +278,9 @@ it names, or whose arguments are text a model wrote for other people
 to execute:
 
 - **Anything the tier does not have a tool for**, which is most of the
-  configuration: global settings, WAF rules, notification channels,
-  DNS providers, users, tokens and the cluster. Their absence is a
+  configuration: global settings (a few of which are the admin tier's,
+  below), WAF rules, notification channels, DNS providers, users,
+  tokens and the cluster. Their absence is a
   decision, not a gap to work around through a route field.
 - **A route's `error_page_html`**, `response_rewrite` rules and
   `response_headers`: they are text and code served to or acted on by
@@ -321,6 +324,171 @@ write needs `certificates:write` beside `routes:write`. Set
 `allowed_hostnames` and `allowed_backend_cidrs` to exactly what the
 model may touch. Start a server with that token for the change, and
 keep the read-tier server, with its read-tier token, for reading.
+
+## The admin tier, and where it stops
+
+One mutation with its preview, over one path of the automation plane,
+behind one scope.
+
+| Tool, and its `_preview` | Does | Scope |
+|---|---|---|
+| `lorica_settings_update` | change operational global settings, as the dashboard's settings page would, inside the tier's bounds | `settings:write` |
+
+The call is `PUT /automation/v1/settings`, and it runs the dashboard's
+own settings write with the token as the actor: the same validators,
+the same cross-field checks, the same reload. What makes it a tier and
+not the management API behind a different door is the list of keys it
+accepts, and how far it lets each one move:
+
+| Setting | Tier bound | Reach | Takes effect |
+|---|---|---|---|
+| `access_log_retention` | raise-only, 1..=100000000 | fleet | live |
+| `waf_event_retention` | raise-only, 1..=100000000 | fleet | live |
+| `sla_purge_retention_days` | raise-only, 1..=3650 | fleet | live |
+| `cert_warning_days` | 14..=365 | fleet | live |
+| `cert_critical_days` | 3..=365 | fleet | live |
+| `waf_ban_threshold` | 3..=100 | fleet | live |
+| `waf_ban_duration_s` | 60..=86400 | fleet | live |
+| `default_health_check_interval_s` | 5..=60 | fleet | live |
+| `health_max_concurrent_probes` | 16..=512 | fleet | live |
+
+The list is `SETTINGS_ALLOWLIST` in
+`lorica-api/src/automation/write.rs`, where each entry carries the
+reason it is in, its bound, its direction, its reach and when it acts.
+This table, the tool's description and `inputSchema`, and the
+`SettingsPatch` schema in `openapi-automation.yaml` restate it, and a
+test pins each of them against the constant, so none of them can
+drift from what the node enforces.
+
+**Every key has a safe direction and a bound.** A key is on the list
+only when a model reading attacker-authored text can move it in a
+direction that harms nothing. The three retentions only go up: a
+retention lowered deletes rows that setting it back does not bring
+back, and 0, which means unlimited, is refused because the table then
+grows until the disk fills. The certificate alert thresholds cannot go
+low enough to hide an expiry. The WAF auto-ban cannot be switched off,
+cannot ban on one false positive, and cannot ban for more than a day,
+because a ban keeps the duration it was issued with and reverting the
+setting shortens none already standing. The probe budget cannot go low
+enough for a few unreachable backends to starve the checks of every
+other. The bound is the tier's; the dashboard's own validator still
+runs after it and may be narrower, as the cross-field rule that keeps
+`cert_critical_days` below `cert_warning_days` is.
+
+**The node enforces the list and the bounds, not the tool.** The body
+is read as a JSON object and a key outside the list is refused with a
+403 naming the key, before any value is read and before any validator
+runs, whoever sends it: the MCP tool, a direct call with the same
+token, or a token carrying every scope there is. A value outside its
+key's bound, or a retention below the stored one, is refused with a 422
+naming the key and the bound, checked on the document the write is
+about to store, under the store lock. The tool's schema lists the same
+keys and its description the same bounds, so a model is offered
+nothing the node would refuse; the schema is the affordance and the
+node is the control.
+
+**On a control plane, it changes the fleet.** Every setting on the
+list is fleet policy: on a cluster's control plane a write replicates
+to every follower, so the tier changes every node at once and not the
+one it is connected to. On a standalone node it changes that node. The
+automation listener does not start on a follower, so the tier is never
+run there.
+
+**Every setting on the list acts without a restart.** Each is read
+where it is used, by the reload or by the loop that uses it on its
+next run: the retention loop on its next hourly pass, the certificate
+expiry check on its next run, the WAF auto-ban on the next ban, the
+health loop on its next cycle.
+
+**Every setting on the list is undone from the dashboard.** Each is an
+editable field of the dashboard's settings form, written through the
+same function, so an operator who has lost the MCP client, or who does
+not like what a model did, puts it back in seconds. A test reads the
+dashboard's own form to hold that true. A setting only a full
+configuration import or a hand-built request can write is not on the
+list for that reason alone.
+
+**What it refuses, by family.** Each of these is out on purpose, and
+the story that built the tier names every field:
+
+- **Anything that can lock the operator out of the management plane**:
+  the management port and its TLS pair, the connection allow and deny
+  lists, the automation listener's own allowlist, the trusted proxies.
+  A wrong value there ends the session that would have fixed it.
+- **Credentials and trust anchors**: the bot-protection HMAC secret,
+  the metrics scrape credential and its switch, the upgrade signing
+  key, the whole certificate export family, which writes key material
+  to disk.
+- **Identity policy**, the password rules, and every user and role
+  operation.
+- **Reversible and not harmless**: the global connection limit, the
+  per-IP connection limits and the mirroring concurrency caps, and the
+  flood-defence threshold, which lowered makes every per-IP rate-limited
+  route answer 429 and at 0 switches flood defence off. Each is undone
+  in seconds and takes production traffic down, or silently stops a
+  protection, for as long as it stands. The OTLP and log-sink
+  destinations are out for the adjacent reason: a redirect of where
+  telemetry goes is not visibly wrong.
+- **No safe direction**: the log level. Raised, it floods the disk and
+  writes request detail into the logs; lowered, it blinds the
+  investigation. The SLA purge switch and its schedule are out for the
+  same reason from the other side: off means the table grows without
+  bound, and the schedule only moves purges closer together.
+- **`audit_log_retention_days`**, although it reads as retention:
+  shortening it destroys the trail that tells a model's actions from a
+  person's.
+- **The settings the dashboard's form cannot write**: `max_active_probes`
+  and the load-test ceilings, the flood strict rate and the header
+  timeout. A value set here could not be undone there, which fails the
+  rule above. They can join the tier the day the dashboard gains a
+  field for them, and not before.
+
+**Where it stops.** No path on the automation plane reaches users,
+roles, the automation tokens, the OIDC issuer entries, the cluster's
+nodes, its enrolment tokens or its fleet-wide bans, revocation, `leave`
+or break-glass, for any verb and any token, and no tool of any tier
+names one. The refusal is at the scope gate: those paths are declared
+for nobody, so they answer 403 to the widest token there is, and there
+is no tool for an injected instruction to name and no check in a
+handler for a later change to weaken. The settings document itself is
+not readable on the plane either: there is no `GET`.
+
+**The answer is what the scope writes, and nothing more.** The apply
+answers the listed settings as they now stand; the preview answers the
+same part of the document before and after, with the fields that
+differ, in the shape every preview has. Neither answers the rest of the
+settings document, so the preview needs no read scope beside
+`settings:write`: a token that may write these keys reads back these
+keys and no others. That is the one preview on the plane that needs no
+read scope, and the property, not the scope, is what exempts it. A
+write that changes no stored value writes nothing, reloads nothing and
+is answered with the settings as they stand.
+
+**What the audit records.** The request row, as for every call on this
+plane, and beside it the dashboard's own `settings.update` row under
+the role `automation` and the token's name and `public_id`, whose
+target lists each key the write changed with its value before and
+after, `waf_ban_threshold:3->5` for instance. The values are safe to
+record because every key on the list is a non-secret number. A key
+sent with the value it already had is not listed. The dashboard's own
+row names the keys its write changed, without their values, since the
+dashboard also writes secrets.
+
+**How often.** A token's settings writes share one window of 30 a
+minute, the dashboard's own figure for its settings page, whichever
+binding they come through; see [Rate limiting](#rate-limiting).
+
+### Minting an admin-tier token
+
+Mint a static token carrying `settings:write` and nothing else; the
+tier needs no read scope and must not share a process with one. Give
+it the shortest lifetime the task allows, start a server with it for
+that task, and revoke it when the task is done. An OIDC issuer entry
+cannot carry `settings:write`: an entry is a standing grant to every
+pipeline job whose claims match, the opposite of a token minted for one
+task, and the node refuses it. The
+[hardening guide](security/hardening-guide.md#the-mcp-admin-tier-v190-opt-in) says
+why it should exist only while a task needs it.
 
 ## Attacker-authored text arrives as data
 
@@ -495,7 +663,7 @@ decision.
 The tier is the token's scope set, so mint a token carrying exactly the
 scopes the tier needs and nothing else: the read scopes for a read-tier
 server, the write scopes with the reads they need for a config-tier
-one. Use the automation token surface documented in
+one, `settings:write` alone for an admin-tier one. Use the automation token surface documented in
 [automation.md](automation.md): the management API, the CLI, or the
 Automation tokens page. The token is shown once, by the request that
 creates it, and the node stores only an HMAC of it.
@@ -602,7 +770,7 @@ that is not true.
 ## Rate limiting
 
 Tool invocations are limited inside the server, per token: 120 calls a
-minute, in a fixed window, on both bindings and for both tiers, a
+minute, in a fixed window, on both bindings and for every tier, a
 preview counting as a call like any other. The specification requires
 a server to rate limit them, and nothing outside the server does: the
 automation listener's connection caps and per-IP limiter count
@@ -622,7 +790,18 @@ call rather than handed somebody else's window, since evicting a live
 one would give a caller holding more tokens than the ceiling a fresh
 budget per call.
 
-This budget counts calls and not what a call spends. A certificate
+The automation plane budgets writes too, on its own and per
+credential, whether a write arrives over the socket or from a tool
+call in process: 30 settings writes a minute, the dashboard's figure
+for its settings page, and 100 of every other write together, its
+figure for route writes. The dashboard's budgets are layers on its own
+routes, which the plane does not mount, and every settings write is a
+reload and, on a control plane, a replication round to the fleet, so
+the plane holds its own. Going over is a 429 with `Retry-After`; a
+request the scope gate refuses spends nothing, and a read spends
+nothing.
+
+Neither budget counts what a call spends. A certificate
 renewal spends an ACME order against the CA's per-name budget, and is
 bounded per certificate on the plane, as the config tier section says:
 one order at a time, none within 48 hours of the last issuance, none

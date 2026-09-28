@@ -5851,7 +5851,10 @@ components:
         built on; the three write grants after `backends:read` arrived with its
         config tier and reach the automation plane's write surface
         (`openapi-automation.yaml`), bounded by the token's hostname and
-        backend grants. None of them uploads key material.
+        backend grants. `settings:write` arrived with its admin tier and
+        reaches the operational global settings that tier's allowlist
+        names, and nothing else. None of them uploads key material, and
+        none reaches a user, a token or a cluster member.
       enum:
         - environments:write
         - environments:read
@@ -5865,6 +5868,7 @@ components:
         - routes:write
         - backends:write
         - certificates:write
+        - settings:write
 
     AutomationTokenRequest:
       type: object

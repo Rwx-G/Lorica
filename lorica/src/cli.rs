@@ -846,7 +846,14 @@ pub(crate) fn init_logging(log_level: &str, log_format: &str, log_file: Option<&
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+    let from_env = EnvFilter::try_from_default_env();
+    let pinned_by_env = from_env.is_ok();
+    let filter = from_env.unwrap_or_else(|_| EnvFilter::new(log_level));
+    // The stored `log_level` replaces this filter once the store is
+    // open, and on every reload after (`lorica::reload`), in this
+    // process whatever its role.
+    let (filter, reload) = lorica::reload::reloadable_log_filter(filter, pinned_by_env);
+    let _ = lorica::reload::LOG_FILTER_RELOAD.set(reload);
 
     // Resolve the writer + ANSI combo once here so the subscriber
     // composition below has a single source of truth. The non-blocking

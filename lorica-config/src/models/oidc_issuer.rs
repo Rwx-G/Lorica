@@ -287,6 +287,18 @@ impl OidcIssuer {
         if self.scopes.is_empty() {
             return Err("oidc issuer entry must grant at least one scope".to_string());
         }
+        // The admin tier is minted for one task and revoked after it.
+        // An issuer entry is the opposite, a standing grant to every
+        // pipeline job whose claims match, so one poisoned merge
+        // request would hold node-wide settings for as long as the
+        // entry stands, with no token to revoke.
+        if self.scopes.contains(&AutomationScope::SettingsWrite) {
+            return Err(
+                "oidc issuer entry may not grant settings:write; the admin tier is a static \
+                 token minted for one task with a short lifetime and revoked after it"
+                    .to_string(),
+            );
+        }
         if self.allowed_hostnames.is_empty() {
             return Err(
                 "oidc issuer entry must allow at least one hostname; an entry that matches no \
@@ -503,6 +515,25 @@ mod tests {
     #[test]
     fn a_well_formed_entry_validates() {
         assert_eq!(valid_issuer().validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_entry_granting_the_admin_tier_is_refused_and_every_other_scope_is_not() {
+        // Story 11.3: the admin tier is a short-lived static token, never
+        // a standing grant to every matching pipeline job.
+        let mut issuer = valid_issuer();
+        issuer.scopes.push(AutomationScope::SettingsWrite);
+        let refused = issuer.validate().expect_err("settings:write on an issuer");
+        assert!(refused.contains("settings:write"), "{refused}");
+        assert!(refused.contains("static token"), "{refused}");
+        for scope in AutomationScope::ALL {
+            if *scope == AutomationScope::SettingsWrite {
+                continue;
+            }
+            let mut issuer = valid_issuer();
+            issuer.scopes = vec![*scope];
+            assert_eq!(issuer.validate(), Ok(()), "{scope:?}");
+        }
     }
 
     #[test]

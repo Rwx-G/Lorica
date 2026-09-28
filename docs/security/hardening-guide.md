@@ -83,6 +83,33 @@ so its controls sit in the process rather than in the firewall alone.
   configuration is replaced at the next replication round, so a write there
   would be silently undone.
 
+### The MCP Admin Tier (v1.9.0+, opt-in)
+
+The admin tier of the management MCP server (`docs/mcp.md`) is a static
+token carrying `settings:write`, which changes a short allowlist of operational
+global settings (log, WAF-event and SLA retention, certificate expiry alert
+thresholds, the WAF auto-ban threshold and duration, the health-check interval
+and probe budget) and nothing else, each only inside a bound and the
+retentions only upwards. Configure it only when a task needs it, and remove it
+afterwards: mint the token for that task with the shortest lifetime the task
+allows, run it in its own `lorica-mcp` process that reads no logs, and revoke
+the token and drop the client entry once the task is done. An OIDC issuer
+entry cannot carry the scope: it would be a standing grant to every matching
+pipeline job.
+
+On a cluster's control plane every one of these settings is fleet policy and
+replicates to every follower, so a standing admin-tier token there is a
+standing path from a model to the whole fleet's behaviour, not one node's.
+Every setting it can reach is an editable field of the dashboard's settings
+form, so an operator puts any of them back in the time it takes to describe
+it; the tier earns its place for a bounded job, such as keeping more access
+log and WAF-event history ahead of an investigation or raising the
+certificate expiry warning before a renewal campaign, and not as a permanent
+fixture. It never reaches users, tokens, OIDC issuers, the cluster's
+membership or its fleet-wide bans, the management listener, the connection
+allowlists or the log level, whatever the token carries; that boundary is the
+node's, but the exposure window is the operator's to keep short.
+
 ### Firewall Rules
 
 ```bash
@@ -352,5 +379,6 @@ Run this checklist periodically:
 - [ ] (Clustered) No enrollment window left open (no live join token, enrollment listener closed)
 - [ ] (Automation) Listener reachable from CI runner sources only, and `automation_allowed_cidrs` no wider than the runner fleet
 - [ ] (Automation) One token per pipeline, tokens of decommissioned runners revoked, OIDC used instead of a static secret where the platform allows it
+- [ ] (MCP) No `settings:write` token live beyond the task it was minted for
 - [ ] (Capture) No rule left armed past the investigation that justified it, and every `output.dir` sized, pruned and off shared storage
 - [ ] (Capture) `lorica_captures_total{outcome="dropped_sink"}` alerted on
