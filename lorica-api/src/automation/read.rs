@@ -36,7 +36,9 @@
 //! has no reason to do (fix pass of Story 11.4, 2026-09-30):
 //!
 //! - it withholds the values that can carry a credential, through
-//!   [`super::redact`], and keeps every key;
+//!   [`super::redact`], and keeps every key, and the name of an
+//!   environment the reader could not look up on the environment
+//!   endpoint;
 //! - for a principal whose grants mean something
 //!   ([`AutomationPrincipal::carries_grants`]), it answers only the
 //!   routes, backends and certificates inside those grants.
@@ -102,12 +104,13 @@
 //! should.
 
 use axum::extract::{Extension, Path, Query};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::auth::AutomationPrincipal;
-use super::environments::ensure_backend_address_granted;
+use super::environments::{ensure_backend_address_granted, environments_visible_to};
 use super::redact;
 use super::write::{certificate_names_granted, route_names_granted};
 use crate::error::{json_data, ApiError};
@@ -183,6 +186,12 @@ struct PageInfo {
     offset: usize,
     returned: usize,
     has_more: bool,
+    /// On a read that pages by keyset (`/logs`), what to send as
+    /// `before_id` for the next window: the id of the last row
+    /// returned, or null when there is no next window. Absent on every
+    /// other read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<Option<u64>>,
 }
 
 impl PageQuery {
@@ -240,45 +249,96 @@ impl Page {
     }
 
     /// Wrap `rows` in the paginated envelope this surface answers with.
-    fn of(self, rows: Vec<Value>) -> Json<Value> {
-        self.of_window(
-            rows.into_iter()
-                .skip(self.offset)
-                .take(self.limit.saturating_add(1))
-                .collect(),
-        )
+    fn of(self, rows: Vec<Value>) -> Result<Response, ApiError> {
+        self.of_window(self.window_of(rows))
+    }
+
+    /// The rows of a full listing this window answers: from `offset`
+    /// on, one past the window when there is one.
+    fn window_of(self, rows: Vec<Value>) -> Vec<Value> {
+        rows.into_iter()
+            .skip(self.offset)
+            .take(self.limit.saturating_add(1))
+            .collect()
     }
 
     /// [`Page::of`] for a source that already skipped `offset`: `window`
     /// holds the rows from `offset` on, one past the window when there
     /// is one, and is built by a source that computes nothing before
     /// the window.
-    fn of_window(self, window: Vec<Value>) -> Json<Value> {
+    fn of_window(self, window: Vec<Value>) -> Result<Response, ApiError> {
+        Ok(json_text_response(self.envelope(window, None)?))
+    }
+
+    /// The answer's JSON text: `{"data": {"items": [...], "page": {...}}}`
+    /// with `cursor` read off the last row returned when it is given.
+    ///
+    /// Each row is serialised once, to weigh it against the byte
+    /// ceiling, and that text is the row's text in the answer: the
+    /// envelope is built around it rather than serialising every row a
+    /// second time on the way out. The text is what `json_data` of the
+    /// same items would serialise to, byte for byte (a test holds the
+    /// two together), since `serde_json` writes an object's keys in
+    /// sorted order either way.
+    fn envelope(
+        self,
+        window: Vec<Value>,
+        cursor: Option<fn(&Value) -> Option<u64>>,
+    ) -> Result<String, ApiError> {
         let beyond_the_window = window.len() > self.limit;
         let mut budget = AUTOMATION_READ_MAX_ANSWER_BYTES;
         let mut short_of_the_window = false;
-        let mut items: Vec<Value> = Vec::new();
+        let mut items = String::from("[");
+        let mut returned = 0usize;
+        let mut last_cursor = None;
         for row in window.into_iter().take(self.limit) {
-            let cost = serde_json::to_string(&row).map_or(0, |text| text.len());
+            let text = serde_json::to_string(&row)
+                .map_err(|e| ApiError::Internal(format!("automation read: a row: {e}")))?;
             // The first row crosses whatever it weighs. An answer with
             // nothing in it is the one shape a reader takes for "there
             // was nothing", and a single oversized row is exactly the
             // row an operator is looking for.
-            if cost > budget && !items.is_empty() {
+            if text.len() > budget && returned > 0 {
                 short_of_the_window = true;
                 break;
             }
-            budget = budget.saturating_sub(cost);
-            items.push(row);
+            budget = budget.saturating_sub(text.len());
+            if returned > 0 {
+                items.push(',');
+            }
+            items.push_str(&text);
+            returned += 1;
+            last_cursor = cursor.and_then(|read| read(&row));
         }
+        items.push(']');
+        let has_more = beyond_the_window || short_of_the_window;
         let page = PageInfo {
             limit: self.limit,
             offset: self.offset,
-            returned: items.len(),
-            has_more: beyond_the_window || short_of_the_window,
+            returned,
+            has_more,
+            next_cursor: cursor.map(|_| last_cursor.filter(|_| has_more)),
         };
-        json_data(serde_json::json!({ "items": items, "page": page }))
+        // Through `Value` so the page's keys are written in the order
+        // `json_data` writes them, which is sorted, not declared.
+        let page = serde_json::to_value(page)
+            .and_then(|page| serde_json::to_string(&page))
+            .map_err(|e| ApiError::Internal(format!("automation read: the page: {e}")))?;
+        Ok(format!(r#"{{"data":{{"items":{items},"page":{page}}}}}"#))
     }
+}
+
+/// `text`, already JSON, as the response `Json` would have made of the
+/// value it encodes.
+fn json_text_response(text: String) -> Response {
+    (
+        [(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        )],
+        text,
+    )
+        .into_response()
 }
 
 /// The array a management answer carries under `data.<field>`, or under
@@ -342,6 +402,30 @@ fn masked(mut rows: Vec<Value>, mask: fn(&mut Value)) -> Vec<Value> {
     rows
 }
 
+/// `rows` with every environment name their `managed_by` marks carry
+/// withheld, unless `principal` may look that environment up
+/// ([`environments_visible_to`]). The store is read only when a row
+/// names one.
+async fn without_foreign_environments(
+    state: &AppState,
+    principal: &AutomationPrincipal,
+    mut rows: Vec<Value>,
+) -> Result<Vec<Value>, ApiError> {
+    let named: std::collections::BTreeSet<String> = rows
+        .iter()
+        .filter_map(redact::managed_by_environment)
+        .map(str::to_string)
+        .collect();
+    if named.is_empty() {
+        return Ok(rows);
+    }
+    let visible = environments_visible_to(state, principal, named).await?;
+    for row in &mut rows {
+        redact::environment_outside(row, &visible);
+    }
+    Ok(rows)
+}
+
 /// Refuse a free-text filter longer than this surface accepts.
 ///
 /// `name` is this module's own vocabulary, never the caller's text, so
@@ -381,11 +465,15 @@ fn without_the_callers_echo(error: ApiError) -> ApiError {
 /// the query's: whatever the caller asks for, the store is read one row
 /// past the window and no further.
 ///
-/// Rows come back newest first, so `offset` walks backwards in time and
-/// page one is what just happened. `after_id` is the stable cursor for
-/// a log that is still growing; `offset` walks within the answer the
-/// filters produced, as deep as
-/// [`crate::logs::LOGS_QUERY_MAX_ROWS`] and no deeper.
+/// Rows come back newest first, so page one is what just happened.
+/// `before_id` is the keyset cursor that walks back in time: the answer
+/// names the next one as `page.next_cursor`, and a window taken by it
+/// reads only its own rows however deep it lies, where `offset` has the
+/// store read and discard every row above the window. `offset` is kept
+/// for the caller that wants a few windows and no cursor, as deep as
+/// [`crate::logs::LOGS_QUERY_MAX_ROWS`] and no deeper; it applies
+/// after `before_id` when both are sent. `after_id` bounds the other
+/// end, for a caller tailing a log that is still growing.
 ///
 /// # Errors
 ///
@@ -395,7 +483,7 @@ pub async fn list_logs(
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
     Query(filters): Query<crate::logs::LogsQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let page = page.page_within(crate::logs::LOGS_QUERY_MAX_ROWS)?;
     within_the_filter_ceiling("search", filters.search.as_deref())?;
     within_the_filter_ceiling("route", filters.route.as_deref())?;
@@ -421,7 +509,11 @@ pub async fn list_logs(
     // offset, and `has_more` never went false. `/waf/events` answers
     // newest first and pages correctly; this makes the two agree.
     rows.reverse();
-    Ok(page.of(masked(rows, redact::access_log_row)))
+    let window = page.window_of(masked(rows, redact::access_log_row));
+    Ok(json_text_response(page.envelope(
+        window,
+        Some(|row| row.get("id").and_then(Value::as_u64)),
+    )?))
 }
 
 /// `GET /automation/v1/waf/events` (scope `waf:read`).
@@ -440,7 +532,7 @@ pub async fn list_waf_events(
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
     Query(filters): Query<crate::waf::WafEventsQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let page = page.page_within(crate::waf::WAF_EVENTS_MAX_ROWS)?;
     within_the_filter_ceiling("category", filters.category.as_deref())?;
     let filters = crate::waf::WafEventsQuery {
@@ -448,21 +540,31 @@ pub async fn list_waf_events(
         ..filters
     };
     let answer = crate::waf::get_waf_events(Extension(state), Query(filters)).await?;
-    Ok(page.of(rows(answer, Some("events"))?))
+    page.of(rows(answer, Some("events"))?)
 }
+
+/// How old the WAF counters `/waf/stats` answers may be.
+///
+/// The persistent aggregates are whole-table passes under the log
+/// store's one connection, and this plane gives a token no per-request
+/// budget on reads, so a caller polling them in a loop scanned the
+/// table on every call. Counters a few seconds old answer the question
+/// this read exists for, and the table is scanned at most once per
+/// window however often it is asked.
+pub const WAF_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `GET /automation/v1/waf/stats` (scope `waf:read`).
 ///
-/// One summary object, answered unchanged. Not paginated and not a
-/// collection: its only array is the count per rule category, a fixed
-/// vocabulary of rule families rather than a row set that grows with
-/// traffic.
+/// One summary object, the dashboard's, with its persistent counters
+/// up to [`WAF_STATS_MAX_AGE`] old. Not paginated and not a collection:
+/// its only array is the count per rule category, a fixed vocabulary of
+/// rule families rather than a row set that grows with traffic.
 ///
 /// # Errors
 ///
 /// Whatever [`crate::waf::get_waf_stats`] answers.
 pub async fn waf_stats(Extension(state): Extension<AppState>) -> Result<Json<Value>, ApiError> {
-    crate::waf::get_waf_stats(Extension(state)).await
+    crate::waf::waf_stats(&state, Some(WAF_STATS_MAX_AGE)).await
 }
 
 /// `GET /automation/v1/sla/overview` (scope `sla:read`).
@@ -487,14 +589,14 @@ pub async fn waf_stats(Extension(state): Extension<AppState>) -> Result<Json<Val
 pub async fn sla_overview(
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let page = page.page();
     let window = crate::sla::SlaWindow {
         skip: page.offset,
         take: page.limit.saturating_add(1),
     };
     let summaries = crate::sla::local_sla_overview(&state, Some(window)).await?;
-    Ok(page.of_window(rows(json_data(summaries), None)?))
+    page.of_window(rows(json_data(summaries), None)?)
 }
 
 /// `GET /automation/v1/sla/routes/{id}` (scope `sla:read`).
@@ -510,12 +612,12 @@ pub async fn route_sla(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
     Query(page): Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let page = page.page();
     let summaries = crate::sla::local_route_sla(&state, route_id)
         .await
         .map_err(without_the_callers_echo)?;
-    Ok(page.of(rows(json_data(summaries), None)?))
+    page.of(rows(json_data(summaries), None)?)
 }
 
 /// `GET /automation/v1/cluster/status` (scope `cluster:read`).
@@ -543,7 +645,9 @@ pub async fn cluster_status(
 /// Every backend with its live EWMA score and connection count, the
 /// same view the dashboard's backend table reads, with its health-check
 /// query values withheld. A principal carrying grants sees the backends
-/// whose address is inside its `allowed_backend_cidrs`, and no other.
+/// whose address is inside its `allowed_backend_cidrs`, and no other. A
+/// backend an environment owns names that environment only to a
+/// principal the environment endpoint would answer for it.
 ///
 /// # Errors
 ///
@@ -552,13 +656,14 @@ pub async fn list_backends(
     principal: AutomationPrincipal,
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let page = page.page();
-    let answer = crate::backends::list_backends(Extension(state)).await?;
+    let answer = crate::backends::list_backends(Extension(state.clone())).await?;
     let rows = within_the_grant(&principal, rows(answer, Some("backends"))?, |row| {
         ensure_backend_address_granted(&principal, "address", text(row, "address")).is_ok()
     });
-    Ok(page.of(masked(rows, redact::backend_row)))
+    let window = page.window_of(masked(rows, redact::backend_row));
+    page.of_window(without_foreign_environments(&state, &principal, window).await?)
 }
 
 /// `GET /automation/v1/routes` (scope `routes:read`).
@@ -568,7 +673,9 @@ pub async fn list_backends(
 /// never its hash, because it is the management plane's own view, and
 /// its `proxy_headers` names without their values. A principal carrying
 /// grants sees the routes whose hostname and every alias are inside its
-/// `allowed_hostnames`, and no other.
+/// `allowed_hostnames`, and no other. A route an environment owns names
+/// that environment only to a principal the environment endpoint would
+/// answer for it, and every header rule's match value is withheld.
 ///
 /// The grant and the window are applied to the stored rows, and only
 /// the window's views are built, masked and serialised: the listing is
@@ -583,7 +690,7 @@ pub async fn list_routes(
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
     Query(filters): Query<crate::routes::ListRoutesQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let page = page.page();
     let bounded = principal.carries_grants();
     let window = crate::routes::crud::routes_with_links(&state, filters)
@@ -604,7 +711,8 @@ pub async fn list_routes(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ApiError::Internal(format!("automation read: a route view: {e}")))?;
-    Ok(page.of_window(masked(window, redact::route_row)))
+    let window = masked(window, redact::route_row);
+    page.of_window(without_foreign_environments(&state, &principal, window).await?)
 }
 
 /// `GET /automation/v1/certificates` (scope `certificates:read`).
@@ -624,14 +732,14 @@ pub async fn list_certificates(
     principal: AutomationPrincipal,
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let page = page.page();
     let answer = crate::certificates::list_certificates(Extension(state)).await?;
     let rows = within_the_grant(&principal, rows(answer, Some("certificates"))?, |row| {
         !text(row, "domain").is_empty()
             && certificate_names_granted(&principal, text(row, "domain"), texts(row, "san_domains"))
     });
-    Ok(page.of(rows))
+    page.of(rows)
 }
 
 #[cfg(test)]
@@ -652,6 +760,115 @@ mod tests {
 
     fn page_of(limit: Option<usize>, offset: Option<usize>) -> Page {
         PageQuery { limit, offset }.page()
+    }
+
+    impl Page {
+        /// What [`Page::of`] answers, parsed back.
+        fn answer(self, rows: Vec<Value>) -> Json<Value> {
+            let text = self
+                .envelope(self.window_of(rows), None)
+                .expect("an envelope");
+            Json(serde_json::from_str(&text).expect("the envelope is JSON"))
+        }
+    }
+
+    /// The bytes the envelope used to be: every item serialised again
+    /// inside the `json_data` value the handler answered.
+    fn as_json_data_wrote_it(page: Page, rows: Vec<Value>) -> String {
+        let parsed = page.answer(rows).0;
+        let items = parsed["data"]["items"].clone();
+        let info = parsed["data"]["page"].clone();
+        serde_json::to_string(&json_data(serde_json::json!({ "items": items, "page": info })).0)
+            .expect("a value serialises")
+    }
+
+    #[test]
+    fn the_envelope_is_byte_for_byte_what_json_data_wrote() {
+        // The rows are serialised once now and spliced; the answer must
+        // not move by a byte for it, escapes and key order included.
+        let awkward: Vec<Value> = (0..30)
+            .map(|n| {
+                serde_json::json!({
+                    "zeta": n,
+                    "alpha": "quote \" backslash \\ newline \n tab \t nul \u{0} emoji \u{1F600}",
+                    "nested": { "b": [1, 2.5, null, true], "a": {} },
+                    "path": "/p?a=[redacted]",
+                })
+            })
+            .collect();
+        for (limit, offset) in [
+            (Some(10), None),
+            (Some(10), Some(25)),
+            (Some(200), Some(99)),
+        ] {
+            let page = page_of(limit, offset);
+            let spliced = page
+                .envelope(page.window_of(awkward.clone()), None)
+                .expect("an envelope");
+            assert_eq!(spliced, as_json_data_wrote_it(page, awkward.clone()));
+        }
+        // An answer the byte ceiling ended early, and an empty one.
+        let heavy: Vec<Value> = (0..20)
+            .map(|n| serde_json::json!({ "n": n, "payload": "x".repeat(40 * 1024) }))
+            .collect();
+        let page = page_of(Some(20), None);
+        assert_eq!(
+            page.envelope(page.window_of(heavy.clone()), None)
+                .expect("an envelope"),
+            as_json_data_wrote_it(page, heavy)
+        );
+        let page = page_of(Some(5), None);
+        assert_eq!(
+            page.envelope(Vec::new(), None).expect("an envelope"),
+            as_json_data_wrote_it(page, Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_keyset_read_names_the_next_cursor_and_only_when_there_is_a_next_window() {
+        let id = |row: &Value| row.get("id").and_then(Value::as_u64);
+        let newest_first: Vec<Value> = (1..=5u64)
+            .rev()
+            .map(|n| serde_json::json!({ "id": n }))
+            .collect();
+        let parsed = |page: Page, rows: Vec<Value>| -> Value {
+            serde_json::from_str(
+                &page
+                    .envelope(page.window_of(rows), Some(id))
+                    .expect("an envelope"),
+            )
+            .expect("the envelope is JSON")
+        };
+
+        // Rows 5 and 4 came back; the next window is below 4.
+        let answered = parsed(page_of(Some(2), None), newest_first.clone());
+        assert_eq!(answered["data"]["page"]["next_cursor"], 4);
+
+        // The last window says so with a null, never an absent field.
+        let answered = parsed(page_of(Some(10), None), newest_first.clone());
+        assert_eq!(answered["data"]["page"]["has_more"], false);
+        assert_eq!(answered["data"]["page"]["next_cursor"], Value::Null);
+        assert!(answered["data"]["page"]
+            .as_object()
+            .is_some_and(|page| page.contains_key("next_cursor")));
+
+        // The byte ceiling ending a window early names the last row that
+        // did fit, so nothing is stepped over.
+        let heavy: Vec<Value> = (1..=20u64)
+            .rev()
+            .map(|n| serde_json::json!({ "id": n, "payload": "x".repeat(40 * 1024) }))
+            .collect();
+        let answered = parsed(page_of(Some(20), None), heavy);
+        let returned = answered["data"]["items"].as_array().map_or(0, Vec::len);
+        assert!(returned > 0 && returned < 20, "{returned}");
+        assert_eq!(
+            answered["data"]["page"]["next_cursor"],
+            answered["data"]["items"][returned - 1]["id"]
+        );
+
+        // A read that pages by offset alone says nothing of a cursor.
+        let answered = page_of(Some(2), None).answer(newest_first);
+        assert!(answered.0["data"]["page"].get("next_cursor").is_none());
     }
 
     #[test]
@@ -726,7 +943,7 @@ mod tests {
     fn has_more_is_true_exactly_when_a_row_was_left_behind() {
         // The source was asked for `scan()` rows: eleven back for a
         // window of ten means an eleventh exists.
-        let answered = page_of(Some(10), None).of(numbered(11));
+        let answered = page_of(Some(10), None).answer(numbered(11));
         assert_eq!(answered.0["data"]["page"]["has_more"], true);
         assert_eq!(answered.0["data"]["page"]["returned"], 10);
         assert_eq!(
@@ -734,18 +951,18 @@ mod tests {
             Some(10)
         );
 
-        let answered = page_of(Some(10), None).of(numbered(10));
+        let answered = page_of(Some(10), None).answer(numbered(10));
         assert_eq!(answered.0["data"]["page"]["has_more"], false);
         assert_eq!(answered.0["data"]["page"]["returned"], 10);
 
-        let answered = page_of(Some(10), None).of(numbered(3));
+        let answered = page_of(Some(10), None).answer(numbered(3));
         assert_eq!(answered.0["data"]["page"]["has_more"], false);
         assert_eq!(answered.0["data"]["page"]["returned"], 3);
     }
 
     #[test]
     fn the_offset_walks_the_window_forward() {
-        let answered = page_of(Some(2), Some(2)).of(numbered(6));
+        let answered = page_of(Some(2), Some(2)).answer(numbered(6));
         assert_eq!(
             answered.0["data"]["items"],
             serde_json::json!([{ "n": 2 }, { "n": 3 }])
@@ -754,7 +971,7 @@ mod tests {
         assert_eq!(answered.0["data"]["page"]["has_more"], true);
 
         // Past the end is an empty window, not an error and not a wrap.
-        let answered = page_of(Some(2), Some(99)).of(numbered(6));
+        let answered = page_of(Some(2), Some(99)).answer(numbered(6));
         assert_eq!(answered.0["data"]["items"], serde_json::json!([]));
         assert_eq!(answered.0["data"]["page"]["returned"], 0);
         assert_eq!(answered.0["data"]["page"]["has_more"], false);
@@ -769,7 +986,7 @@ mod tests {
         let heavy: Vec<Value> = (0..20)
             .map(|n| serde_json::json!({ "n": n, "payload": "x".repeat(40 * 1024) }))
             .collect();
-        let answered = page_of(Some(20), None).of(heavy);
+        let answered = page_of(Some(20), None).answer(heavy);
         let returned = answered.0["data"]["page"]["returned"]
             .as_u64()
             .expect("returned is a number") as usize;
@@ -787,7 +1004,7 @@ mod tests {
         let one_huge = vec![serde_json::json!({
             "payload": "x".repeat(AUTOMATION_READ_MAX_ANSWER_BYTES + 1)
         })];
-        let answered = page_of(Some(10), None).of(one_huge);
+        let answered = page_of(Some(10), None).answer(one_huge);
         assert_eq!(answered.0["data"]["page"]["returned"], 1);
     }
 

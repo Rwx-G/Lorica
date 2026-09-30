@@ -410,8 +410,9 @@ and audit, can be exercised on its own.
 management plane a read is a human looking at a page they are already
 allowed to see; here the caller is a credential, and the questions
 after an incident, which token was this and what was it reaching for,
-are answered by a read as much as by a write. The audit layer is the
-outermost one, so a request the bearer gate refuses still lands a row.
+are answered by a read as much as by a write. The audit layer sits
+outside every gate, so a request the bearer gate refuses still lands a
+row.
 Each row is `automation.request.<outcome>` where the outcome is the
 word derived from the response status (`ok`, `unauthenticated`,
 `forbidden`, `error` for the node's own fault, a `5xx`, or `refused`
@@ -742,9 +743,9 @@ nothing else:
 
 | Path | Scope | What it answers |
 |---|---|---|
-| `/automation/v1/logs` | `logs:read` | Access-log rows, newest first, with the filters the dashboard offers. |
+| `/automation/v1/logs` | `logs:read` | Access-log rows, newest first, with the filters the dashboard offers; `before_id` walks back by keyset. |
 | `/automation/v1/waf/events` | `waf:read` | Recent WAF matches, newest first, optionally one category. |
-| `/automation/v1/waf/stats` | `waf:read` | Totals, the 24 h count, the loaded rule count, the count per category. |
+| `/automation/v1/waf/stats` | `waf:read` | Totals, the 24 h count, the loaded rule count, the count per category, up to five seconds old. |
 | `/automation/v1/sla/overview` | `sla:read` | The 1 h and 24 h passive windows for every route. |
 | `/automation/v1/sla/routes/{id}` | `sla:read` | One route's passive windows (1 h, 24 h, 7 d, 30 d). |
 | `/automation/v1/cluster/status` | `cluster:read` | This node's role, build, applied generation and hash. |
@@ -793,6 +794,29 @@ this surface count differently, and one field meaning three things is
 worse than no field, so `has_more` answers the only question a pager
 actually has.
 
+**The access log pages by keyset.** An `offset` has the store read
+and discard every row above the window, so a deep one costs the whole
+prefix on every call. `/logs` therefore answers a `page.next_cursor`
+beside `has_more`: the id of the last row returned, or `null` on the
+last window. Send it back as `?before_id=` with the same filters and
+the next window is read directly, however deep it lies; `offset` is
+not needed at all, and when both are sent `offset` applies to the rows
+below `before_id`. `offset` still works as before for a caller that
+wants a few windows and no cursor, with the refusal below. The cursor
+also survives a log that is still growing, where an offset shifts by
+every row recorded between two calls; `after_id` bounds the other end,
+for a caller tailing new rows. `next_cursor` appears on `/logs` alone.
+
+**The WAF counters are up to five seconds old.** `/waf/stats` counts
+the whole retained table (three aggregate passes under the log store's
+one connection, which the access-log writer and the audit drain share),
+and a caller polling it paid that per call. The plane answers the
+counters it computed within the last `WAF_STATS_MAX_AGE`
+(`lorica-api/src/automation/read.rs`), so the table is scanned at most
+once per window however often it is asked; a clear of the WAF events
+drops them at once. The dashboard's own counters are computed per call,
+as before.
+
 **A window this surface cannot reach is a refusal, never an empty
 page.** Two of the sources clamp their own row budget: the access log
 at 10 000 rows, the WAF events at 500. Past that clamp an offset-based
@@ -812,12 +836,22 @@ hash never leaves the store, and the certificate listing carries
 metadata with no PEM body of any kind. What those views carry for the
 dashboard's sake, this plane withholds, replacing each value with
 `[redacted]` and keeping every key: a route's `proxy_headers` values
-(where an upstream credential goes), the userinfo and query values of a
+(where an upstream credential goes), each of its `header_rules`' match
+`value` (where a secret shared between a client and its canary goes),
+the userinfo and query values of a
 route's `forward_auth` address, the query values of a backend's
 `health_check_path`, and the query values and fragment of an access-log
 row's `path` (the proxy records the path without its query string, so
 that last one is a guard for rows from any other producer). The same
-holds on every write answer and preview (`lorica-api/src/automation/redact.rs`). The
+holds on every write answer and preview (`lorica-api/src/automation/redact.rs`).
+A route or a backend an environment owns carries `managed_by`, and the
+environment's name in it is answered only to a credential that `GET
+/automation/v1/environments/{name}` would answer for that name (it
+owns the environment, or its labels share it, and a credential bound to
+`environment_protected` asks about the one its job deploys); anyone
+else reads `{"kind": "automation", "environment": "[redacted]"}`, so a
+neighbour on a shared node learns that the row is managed and not which
+pipeline's it is. The
 single-certificate endpoint, which does return the public certificate
 PEM, is deliberately not mounted on this listener. Two tests in
 `lorica-api/src/tests.rs` hold that, and they walk the paths the scope
@@ -865,7 +899,10 @@ which filters a token reached for is what separates two reads of one
 path, and Story 9.9's rule that no payload is stored still holds. The
 same requests are counted per declared path template by
 `automation_requests_by_path_total`, beside the plane-wide
-`automation_requests_total`.
+`automation_requests_total`. With the `otel` build each request runs in
+an `automation_request` span carrying its method and path, never its
+query, around every gate and the handler: the management API's
+`api_request` span, on this listener.
 
 Every answer carries `Cache-Control: no-store` and
 `X-Content-Type-Options: nosniff`. Neither defends against a vector
@@ -1021,6 +1058,23 @@ CA bundle whose client certificates the route accepts; and
 `proxy_headers`, a static header map to the upstream, where a
 credential would go. All of this holds for `?dry_run=true` as for the
 apply, so a preview is refused exactly where the write would be.
+
+**A header rule read masked can be written back.** This plane answers
+every `header_rules[].value` as `[redacted]`, and `header_rules` in a
+write replaces the whole list, so a client that changed one rule and
+sent the list back would otherwise have stored the marker as the match
+value of every other rule. On a route write from a token, a rule whose
+`value` is exactly `[redacted]` keeps the value stored for the rule at
+the same position with the same `header_name` (case aside) and the same
+`match_type`, under the store lock of the write, and the marker is
+never stored. Position alone would move one rule's value onto another
+header after a reorder, and a name alone is ambiguous when two rules
+test one header; the match type is in the identity because the value is
+validated against it. A marker no stored rule answers to (a create, a
+rule added, moved, renamed or retyped) is a `400` naming the rule by
+its position, and nothing is written: send the value itself. A real
+value is stored as sent. The dashboard reads the values and is not
+subject to any of this.
 
 **Access control and upstream trust move one way.** The controls of
 `ROUTE_PROTECTIONS` and `BACKEND_PROTECTIONS`, beside the withheld list,

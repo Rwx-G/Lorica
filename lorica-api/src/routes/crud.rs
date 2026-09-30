@@ -3885,8 +3885,15 @@ pub(crate) async fn create_route_as(
         None
     };
 
+    // On the blocking pool: an Argon2id hash on this worker would stall
+    // every task scheduled on it for as long as the hash takes.
+    let basic_auth_password_hash = match body.basic_auth_password.clone() {
+        Some(password) => Some(crate::auth::hash_password_off_worker(password).await?),
+        None => None,
+    };
+
     let now = Utc::now();
-    let route = lorica_config::models::Route {
+    let mut route = lorica_config::models::Route {
         id: uuid::Uuid::new_v4().to_string(),
         hostname: body.hostname,
         path_prefix,
@@ -3958,11 +3965,7 @@ pub(crate) async fn create_route_as(
         return_status: body.return_status.filter(|&v| v != 0),
         sticky_session: body.sticky_session.unwrap_or(false),
         basic_auth_username: body.basic_auth_username.clone(),
-        basic_auth_password_hash: if let Some(ref pw) = body.basic_auth_password {
-            Some(crate::auth::hash_password(pw)?)
-        } else {
-            None
-        },
+        basic_auth_password_hash,
         stale_while_revalidate_s: body.stale_while_revalidate_s.unwrap_or(10),
         stale_if_error_s: body.stale_if_error_s.unwrap_or(60),
         retry_on_methods: {
@@ -4051,6 +4054,7 @@ pub(crate) async fn create_route_as(
         updated_at: now,
     };
 
+    guard.restore_withheld(None, &mut route)?;
     let backend_ids = body.backend_ids.unwrap_or_default();
     let (route, backend_ids) = db_blocking(&state.store, move |store| {
         // The guard resolves the backend ids against the rows they
@@ -4225,8 +4229,21 @@ pub(crate) async fn update_route_as(
         .await?
     };
 
+    // Hashed once, on the blocking pool, and handed to both patch
+    // passes below, the second of which runs under the store lock.
+    let basic_auth_password_hash: Option<Option<String>> = match body.basic_auth_password.clone() {
+        None => None,
+        Some(password) if password.is_empty() => Some(None),
+        Some(password) => Some(Some(crate::auth::hash_password_off_worker(password).await?)),
+    };
+
     let linked = body.backend_ids.clone();
-    let patched = apply_route_patch(snapshot.clone(), body.clone(), node_roster.as_deref())?;
+    let patched = apply_route_patch(
+        snapshot.clone(),
+        body.clone(),
+        node_roster.as_deref(),
+        basic_auth_password_hash.clone(),
+    )?;
     let snapshot_view = serde_json::to_value(&snapshot).ok();
 
     // The backend links before the patch are read only for a preview,
@@ -4253,11 +4270,17 @@ pub(crate) async fn update_route_as(
                     "Update the environment through the pipeline instead.",
                 ));
             }
-            let route = if serde_json::to_value(&before_route).ok() == snapshot_view {
+            let mut route = if serde_json::to_value(&before_route).ok() == snapshot_view {
                 patched
             } else {
-                apply_route_patch(before_route.clone(), body, node_roster.as_deref())?
+                apply_route_patch(
+                    before_route.clone(),
+                    body,
+                    node_roster.as_deref(),
+                    basic_auth_password_hash,
+                )?
             };
+            guard.restore_withheld(Some(&before_route), &mut route)?;
             guard.check(
                 store,
                 crate::target::RouteTarget {
@@ -4326,10 +4349,15 @@ pub(crate) async fn update_route_as(
 /// [`update_route_as`] run the validators, regex compiles included,
 /// with the store lock released. `node_roster` is the registry a
 /// `node_selector` is checked against, read by the caller beforehand.
+/// `basic_auth_password_hash` is `body.basic_auth_password` as the
+/// caller already hashed it, off the async worker: `None` leaves the
+/// hash alone, `Some(None)` clears it (an empty password), and
+/// `Some(Some(hash))` sets it.
 fn apply_route_patch(
     mut route: lorica_config::models::Route,
     body: UpdateRouteRequest,
     node_roster: Option<&[lorica_config::models::ClusterNode]>,
+    basic_auth_password_hash: Option<Option<String>>,
 ) -> Result<lorica_config::models::Route, ApiError> {
     validate_route_numeric_bounds(
         body.connect_timeout_s,
@@ -4575,12 +4603,8 @@ fn apply_route_patch(
             Some(username.clone())
         };
     }
-    if let Some(ref password) = body.basic_auth_password {
-        route.basic_auth_password_hash = if password.is_empty() {
-            None
-        } else {
-            Some(crate::auth::hash_password(password)?)
-        };
+    if let Some(hash) = basic_auth_password_hash {
+        route.basic_auth_password_hash = hash;
     }
     if let Some(swr) = body.stale_while_revalidate_s {
         route.stale_while_revalidate_s = swr;

@@ -78,11 +78,17 @@
 
 use std::sync::OnceLock;
 
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::{json, Map, Value};
 
 use crate::tier::Tier;
 use crate::{untrusted, Verb};
+
+/// Every byte but the alphanumerics and three of RFC 3986's unreserved
+/// marks. The marks stay literal so the path the audit row records reads
+/// as the id the operator will search for (a UUID's hyphens, above all);
+/// `.` stays encoded, so no argument can become a `.` or `..` segment.
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'~');
 
 /// The most bytes an MCP tool name may weigh.
 ///
@@ -799,9 +805,8 @@ fn checked_body(body: &Body, value: Option<&Value>) -> Result<Value, ToolInputEr
 
 /// One argument checked against its declaration and encoded for a URL.
 ///
-/// Percent-encoding every non-alphanumeric byte is wider than a URL
-/// needs and is chosen for exactly that: a bespoke safe set is a place
-/// to forget a byte, and the plane decodes `%2D` and `-` alike.
+/// Encoding starts from every non-alphanumeric byte, wider than a URL
+/// needs, and releases only [`PATH_SEGMENT`]'s unreserved marks.
 fn render(param: &Param, value: &Value) -> Result<String, ToolInputError> {
     match param.kind {
         ParamKind::Text { max_bytes } => {
@@ -823,7 +828,7 @@ fn render(param: &Param, value: &Value) -> Result<String, ToolInputError> {
                     param.name
                 )));
             }
-            Ok(utf8_percent_encode(text, NON_ALPHANUMERIC).to_string())
+            Ok(utf8_percent_encode(text, PATH_SEGMENT).to_string())
         }
         ParamKind::Count { min, max } => {
             let Some(count) = value.as_u64() else {
@@ -858,9 +863,11 @@ pub const READS: &[ToolSpec] = &[
         title: "Access log",
         summary: "Read rows of the Lorica access log, newest first, with the filters the \
                   dashboard offers. Each row carries the request line, the status, the \
-                  timing, the route and the backend that served it. `offset` walks \
-                  backwards in time; `after_id` is the stable cursor for a log that is \
-                  still growing.",
+                  timing, the route and the backend that served it. To walk back in \
+                  time, send the answer's `page.next_cursor` as `before_id` with the same \
+                  filters: each window then reads only its own rows, however deep. `offset` \
+                  also walks back, for a few windows; `after_id` bounds the other end for a \
+                  log that is still growing.",
         scope: "logs:read",
         path: "/automation/v1/logs",
         resource: None,
@@ -920,6 +927,15 @@ pub const READS: &[ToolSpec] = &[
                     max: u64::MAX,
                 },
             },
+            Param {
+                name: "before_id",
+                doc: "Only rows recorded before this row id: the cursor that walks back in \
+                      time. Send the previous answer's `page.next_cursor`.",
+                kind: ParamKind::Count {
+                    min: 0,
+                    max: u64::MAX,
+                },
+            },
         ],
         paginated: true,
         kind: Kind::Read,
@@ -948,7 +964,9 @@ pub const READS: &[ToolSpec] = &[
         name: "lorica_waf_stats",
         title: "WAF counters",
         summary: "Read the WAF's aggregate counters: the total matched, the count over the \
-                  last 24 hours, how many rules are loaded, and the count per rule category.",
+                  last 24 hours, how many rules are loaded, and the count per rule category. \
+                  The counters may be a few seconds old: the node recomputes them at most \
+                  once per short window.",
         scope: "waf:read",
         path: "/automation/v1/waf/stats",
         resource: None,
@@ -1015,7 +1033,10 @@ pub const READS: &[ToolSpec] = &[
         name: "lorica_routes",
         title: "Routes",
         summary: "Read every configured route with the backend ids it resolves to. A route \
-                  carrying Basic auth reports the username and never the stored hash.",
+                  carrying Basic auth reports the username and never the stored hash. The \
+                  value of every header rule and of every static upstream header reads as \
+                  `[redacted]`, and a route an environment owns names that environment only \
+                  to a token that may look the environment up.",
         scope: "routes:read",
         path: "/automation/v1/routes",
         resource: None,
@@ -1420,7 +1441,11 @@ pub const MUTATIONS: &[Mutation] = &[
                   changed or removed (`bot_protection_disable` included); `rate_limit`, \
                   `rate_limit_rps`, `rate_limit_burst` and `auto_ban_threshold` added or \
                   lowered, never raised or cleared. A write in the other direction is refused, \
-                  preview included; it is made in the dashboard.",
+                  preview included; it is made in the dashboard. `header_rules` replaces the \
+                  whole list: a rule sent back with the `[redacted]` value it was read with \
+                  keeps the value stored for the rule at the same position with the same \
+                  header_name and match_type, and is refused where no such rule is stored, so \
+                  a rule added, moved or retyped carries its value.",
         scope: "routes:write",
         verb: Verb::Put,
         path: "/automation/v1/routes",
@@ -2192,6 +2217,7 @@ mod tests {
             json!({ "status": 599 }),
             json!({ "offset": 0 }),
             json!({ "after_id": u64::MAX }),
+            json!({ "before_id": 42 }),
         ] {
             logs.path_for(&inside).expect("inside the declaration");
         }
@@ -2361,20 +2387,20 @@ mod tests {
             .call_for(&json!({ "id": "r-1", "route": { "waf_enabled": true } }))
             .expect("a preview builds");
         assert_eq!(previewed.verb, Verb::Put);
-        assert_eq!(previewed.path, "/automation/v1/routes/r%2D1?dry_run=true");
+        assert_eq!(previewed.path, "/automation/v1/routes/r-1?dry_run=true");
         assert_eq!(previewed.body, Some(json!({ "waf_enabled": true })));
 
         let bound = spec("lorica_route_bind_certificate")
             .call_for(&json!({ "id": "r-1", "binding": { "certificate_id": "c-1" } }))
             .expect("a binding builds");
         assert_eq!(bound.verb, Verb::Put);
-        assert_eq!(bound.path, "/automation/v1/routes/r%2D1/certificate");
+        assert_eq!(bound.path, "/automation/v1/routes/r-1/certificate");
 
         let deleted = spec("lorica_backend_delete")
             .call_for(&json!({ "id": "b-1" }))
             .expect("a delete builds");
         assert_eq!(deleted.verb, Verb::Delete);
-        assert_eq!(deleted.path, "/automation/v1/backends/b%2D1");
+        assert_eq!(deleted.path, "/automation/v1/backends/b-1");
         assert_eq!(deleted.body, None);
 
         let renewed = spec("lorica_certificate_renew_preview")
@@ -2383,7 +2409,7 @@ mod tests {
         assert_eq!(renewed.verb, Verb::Post);
         assert_eq!(
             renewed.path,
-            "/automation/v1/certificates/c%2D1/renew?dry_run=true"
+            "/automation/v1/certificates/c-1/renew?dry_run=true"
         );
         assert_eq!(renewed.body, None);
     }

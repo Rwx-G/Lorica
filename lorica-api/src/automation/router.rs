@@ -52,6 +52,7 @@ use axum::routing::{get, post, put};
 use axum::Router;
 use lorica_config::models::{AutomationScope, OwnerKind, PipelineIdentity};
 use serde::Serialize;
+use tracing::Instrument;
 
 use super::auth::AutomationPrincipal;
 use super::environments::{
@@ -112,9 +113,10 @@ pub async fn whoami(principal: AutomationPrincipal) -> axum::Json<serde_json::Va
 /// like any other and records it with outcome `error`.
 ///
 /// The panic net sits INSIDE the audit layer and OUTSIDE everything
-/// else, so it covers the bearer gate and the scope gate as well as the
-/// handlers, and so the audit layer itself is never the thing being
-/// caught.
+/// else but the request's tracing span, so it covers the bearer gate
+/// and the scope gate as well as the handlers, and so the audit layer
+/// itself is never the thing being caught. The span sits between the
+/// two, in the task the audit layer runs the request in.
 ///
 /// The test router in [`super::audit`] is built through this same
 /// function, which is the only way a test can assert the order the
@@ -122,6 +124,7 @@ pub async fn whoami(principal: AutomationPrincipal) -> axum::Json<serde_json::Va
 pub(super) fn with_audit_and_panic_net(router: Router, state: AppState) -> Router {
     router
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
+        .layer(axum::middleware::from_fn(automation_request_span))
         // `from_fn_with_state` rather than an `Extension`: the audit
         // layer is outermost, so it runs BEFORE any extension a layer
         // below inserts into the request on the way down.
@@ -129,6 +132,29 @@ pub(super) fn with_audit_and_panic_net(router: Router, state: AppState) -> Route
             state,
             super::audit::audit_automation_request,
         ))
+}
+
+/// Run the request inside an `automation_request` span naming its
+/// method and path, the automation plane's `api_request` (backlog #92
+/// a).
+///
+/// Directly inside the audit layer, so it runs in the task that layer
+/// spawns and needs no span carried across the spawn: every gate and the
+/// handler run inside it, and an MCP call's `mcp_tool_call` spans
+/// ([`super::mcp::InProcessPlane`]) are its children, so with the
+/// `otel` build a trace follows a model's call from the listener into
+/// the handler the tool ran. The path and never the query: a filter
+/// value is the caller's text.
+async fn automation_request_span(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let span = tracing::info_span!(
+        "automation_request",
+        "http.request.method" = %req.method(),
+        "url.path" = %req.uri().path(),
+    );
+    next.run(req).instrument(span).await
 }
 
 /// Add the two response headers every answer on this plane carries.
@@ -340,11 +366,13 @@ pub(super) fn in_process_router() -> Router {
 ///
 /// 1. [`super::audit::audit_automation_request`] - outermost, so a
 ///    request refused by the bearer gate still lands a row.
-/// 2. `CatchPanicLayer` - see [`with_audit_and_panic_net`].
-/// 3. [`hardened_response`] - outside the gates, so a 401 and a 403
+/// 2. [`automation_request_span`] - the request's tracing span, in the
+///    task the audit layer runs the request in.
+/// 3. `CatchPanicLayer` - see [`with_audit_and_panic_net`].
+/// 4. [`hardened_response`] - outside the gates, so a 401 and a 403
 ///    carry the headers too.
-/// 4. [`super::auth::require_automation_auth`] - the bearer check.
-/// 5. [`authorized`] - every authorization-class layer, the scope
+/// 5. [`super::auth::require_automation_auth`] - the bearer check.
+/// 6. [`authorized`] - every authorization-class layer, the scope
 ///    floor today, shared with [`in_process_router`].
 ///
 /// There is deliberately NO cookie layer, NO CSRF layer and NO session

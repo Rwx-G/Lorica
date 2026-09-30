@@ -142,6 +142,14 @@ pub struct LogStore {
     /// `LogStore` closes it, which is how the consumer thread learns
     /// to drain and exit.
     audit_tx: tokio::sync::mpsc::Sender<AuditWrite>,
+    /// The last [`LogStore::waf_event_stats`] and when it was computed,
+    /// read by [`LogStore::waf_event_stats_within`]. One entry whatever
+    /// the traffic: the per-category list holds one row per rule
+    /// category the table has ever recorded.
+    waf_stats_cache: Mutex<Option<(std::time::Instant, WafEventStats)>>,
+    /// Moved by every write that empties `waf_events`, so a computation
+    /// that raced one is not cached over the emptied table.
+    waf_stats_generation: std::sync::atomic::AtomicU64,
 }
 
 impl LogStore {
@@ -317,7 +325,12 @@ impl LogStore {
         let conn = Arc::new(Mutex::new(conn));
         let (audit_tx, audit_rx) = tokio::sync::mpsc::channel(AUDIT_QUEUE_CAPACITY);
         Self::spawn_audit_writer(Arc::clone(&conn), audit_rx);
-        Ok(Self { conn, audit_tx })
+        Ok(Self {
+            conn,
+            audit_tx,
+            waf_stats_cache: Mutex::new(None),
+            waf_stats_generation: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// Spawn the single consumer that owns audit chain writes.
@@ -585,6 +598,10 @@ impl LogStore {
         if let Some(after_id) = params.after_id {
             conditions.push("id > ?".to_string());
             bind_values.push(Box::new(after_id as i64));
+        }
+        if let Some(before_id) = params.before_id {
+            conditions.push("id < ?".to_string());
+            bind_values.push(Box::new(i64::try_from(before_id).unwrap_or(i64::MAX)));
         }
         if let Some(ref ip) = params.client_ip {
             conditions.push(format!("client_ip LIKE ? {LIKE_ESCAPE}"));
@@ -1018,12 +1035,46 @@ impl LogStore {
         Ok((total as u64, total_24h as u64, by_category))
     }
 
-    /// Clear all WAF events.
+    /// [`LogStore::waf_event_stats`], answered from the last
+    /// computation while it is younger than `max_age`.
+    ///
+    /// The aggregates are two `COUNT(*)` passes and a `GROUP BY` over
+    /// the whole retained table under the connection mutex the access
+    /// log writer and the audit drain share, and a caller polling them
+    /// (a model asking the automation plane in a loop) paid that per
+    /// call. Within `max_age` the answer is the one already computed:
+    /// counters that are up to `max_age` old, and a table scanned at
+    /// most once per `max_age` whoever asks. A clear drops the cached
+    /// answer, so an emptied table never reads as its old counts.
+    pub fn waf_event_stats_within(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<WafEventStats, String> {
+        use std::sync::atomic::Ordering;
+        if let Some((computed_at, stats)) = self.waf_stats_cache.lock().as_ref() {
+            if computed_at.elapsed() < max_age {
+                return Ok(stats.clone());
+            }
+        }
+        let generation = self.waf_stats_generation.load(Ordering::Acquire);
+        let computed_at = std::time::Instant::now();
+        let stats = self.waf_event_stats()?;
+        let mut cache = self.waf_stats_cache.lock();
+        if self.waf_stats_generation.load(Ordering::Acquire) == generation {
+            *cache = Some((computed_at, stats.clone()));
+        }
+        Ok(stats)
+    }
+
     /// Remove every persisted WAF event row.
     pub fn clear_waf_events(&self) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM waf_events", [])
             .map_err(|e| format!("failed to clear WAF events: {e}"))?;
+        drop(conn);
+        self.waf_stats_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        *self.waf_stats_cache.lock() = None;
         Ok(())
     }
 
@@ -2203,6 +2254,40 @@ mod waf_stats_tests {
     }
 
     #[test]
+    fn cached_waf_stats_are_reused_within_their_age_and_dropped_by_a_clear() {
+        let (store, _dir) = tmp_store();
+        let an_hour = std::time::Duration::from_secs(3600);
+        store
+            .insert_waf_event(&mk_event(1, lorica_waf::RuleCategory::Xss))
+            .expect("insert");
+        assert_eq!(store.waf_event_stats_within(an_hour).expect("stats").0, 1);
+
+        // A row recorded inside the window does not move the cached
+        // answer: the table is not scanned again.
+        store
+            .insert_waf_event(&mk_event(2, lorica_waf::RuleCategory::SqlInjection))
+            .expect("insert");
+        let cached = store.waf_event_stats_within(an_hour).expect("stats");
+        assert_eq!(cached.0, 1);
+        assert_eq!(cached.2.len(), 1);
+
+        // An answer older than the age asked for is recomputed, and is
+        // what the uncached aggregate says.
+        let fresh = store
+            .waf_event_stats_within(std::time::Duration::ZERO)
+            .expect("stats");
+        assert_eq!(fresh, store.waf_event_stats().expect("stats"));
+        assert_eq!(fresh.0, 2);
+
+        // A clear never reads as the counts it emptied.
+        store.clear_waf_events().expect("clear");
+        assert_eq!(
+            store.waf_event_stats_within(an_hour).expect("stats"),
+            (0, 0, Vec::new())
+        );
+    }
+
+    #[test]
     fn waf_event_stats_on_empty_table() {
         let (store, _dir) = tmp_store();
         let (total, total_24h, by_cat) = store.waf_event_stats().expect("stats");
@@ -3007,6 +3092,7 @@ mod retention_loss_tests {
                 search: search.map(str::to_string),
                 limit: Some(limit),
                 after_id: None,
+                before_id: None,
             };
         for params in [
             query(None, None, 5),

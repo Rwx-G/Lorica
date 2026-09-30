@@ -1175,7 +1175,10 @@ fn ensure_new_links_granted(
 
 /// The token's grant as the guard a route write runs inside its store
 /// closure: the row as stored, the row as it would be, and the
-/// backends linked anew.
+/// backends linked anew. A header-rule value sent back as the mask this
+/// plane answered it with keeps the stored value
+/// ([`redact::restore_header_rule_values`]) before any of that is
+/// weighed.
 fn route_guard(principal: &AutomationPrincipal) -> RouteGuard {
     let principal = principal.clone();
     RouteGuard::bounded(move |store, target| {
@@ -1195,6 +1198,7 @@ fn route_guard(principal: &AutomationPrincipal) -> RouteGuard {
         }
         ensure_new_links_granted(store, &principal, target)
     })
+    .restoring_withheld(redact::restore_header_rule_values)
 }
 
 /// A certificate a route write binds anew, weighed as a renewal would

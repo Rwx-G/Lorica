@@ -194,6 +194,10 @@ pub struct LogsQuery {
     pub limit: Option<usize>,
     /// Return entries after this ID (for pagination).
     pub after_id: Option<u64>,
+    /// Return entries before this ID: the keyset cursor for walking
+    /// back in time, which reads only the rows of the page it answers
+    /// however deep it is.
+    pub before_id: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -251,6 +255,11 @@ fn buffered_entries(state: &AppState, params: &LogsQuery) -> (Vec<LogEntry>, usi
         .filter(|e| {
             if let Some(after_id) = params.after_id {
                 if e.id <= after_id {
+                    return false;
+                }
+            }
+            if let Some(before_id) = params.before_id {
+                if e.id >= before_id {
                     return false;
                 }
             }
@@ -352,6 +361,7 @@ impl LogExportQuery {
             search: self.search.clone(),
             limit: None,
             after_id: None,
+            before_id: None,
         }
     }
 }
@@ -793,6 +803,7 @@ mod tests {
         assert_eq!(lq.time_to.as_deref(), Some("2026-01-02T00:00:00Z"));
         assert!(lq.limit.is_none());
         assert!(lq.after_id.is_none());
+        assert!(lq.before_id.is_none());
     }
 
     #[tokio::test]

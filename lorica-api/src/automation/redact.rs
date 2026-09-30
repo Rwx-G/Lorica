@@ -31,11 +31,18 @@
 //! credential, replacing each with [`REDACTED`] and keeping every key:
 //!
 //! - a route's `proxy_headers`: each header's value, names kept;
+//! - a route's `header_rules`: each rule's `value`, its header name,
+//!   match type and backends kept, since the value a routing rule
+//!   matches is where a shared secret between a client and its canary
+//!   goes;
 //! - a route's `forward_auth.address`: the URL's userinfo and every
 //!   query value, since an authentication endpoint is addressed with
 //!   whatever the verifier needs;
 //! - a backend's `health_check_path`: every query value;
-//! - an access-log row's `path`: every query value and the fragment.
+//! - an access-log row's `path`: every query value and the fragment;
+//! - a route's or a backend's `managed_by.environment`, unless the
+//!   reader may look that environment up
+//!   ([`super::environments::environments_visible_to`]).
 //!
 //! The mask applies wherever the automation plane or the MCP server
 //! answers such a row: the read listings, and every write answer and
@@ -43,11 +50,27 @@
 //! and the log sinks are unchanged: they sit behind a session or an
 //! operator's own export, not behind a model.
 //!
+//! # A masked header-rule value may be sent back
+//!
+//! `header_rules` is a field the config tier writes, and a patch that
+//! names it replaces the whole list, so a model that read the rules,
+//! changed one backend and wrote the list back would have stored the
+//! mask as the match value of every other rule. The write surface
+//! therefore reads a rule whose `value` is exactly [`REDACTED`] as
+//! "keep the value stored for this rule" ([`restore_header_rule_values`]),
+//! and never stores the marker. The rule it keeps the value of is the
+//! stored rule at the same position with the same header name (case
+//! aside) and the same match type: position alone would hand one
+//! rule's secret to a different header after a reorder, and a name
+//! alone is ambiguous when two rules test one header. A marker with no
+//! such stored rule, on a create, a rule added, moved or retyped, is
+//! refused and names the rule by its position, so the caller sends the
+//! value itself.
+//!
 //! # What is not masked, and why
 //!
-//! A route's `response_headers` go to every visitor, `header_rules`
-//! match values the config tier itself may write, and `mtls.ca_cert_pem`
-//! is a public CA certificate. A WAF event carries no URI and no query
+//! A route's `response_headers` go to every visitor, and
+//! `mtls.ca_cert_pem` is a public CA certificate. A WAF event carries no URI and no query
 //! string, only the span a signature matched, which is the attacker's
 //! payload the event exists to show. Basic-auth hashes and certificate
 //! key material never enter these views at all.
@@ -140,8 +163,78 @@ pub fn route_row(row: &mut Value) {
             *value = Value::String(REDACTED.to_string());
         }
     }
+    if let Some(Value::Array(rules)) = row.get_mut("header_rules") {
+        for rule in rules {
+            if let Some(value) = rule.get_mut("value") {
+                *value = Value::String(REDACTED.to_string());
+            }
+        }
+    }
     if let Some(forward_auth) = row.get_mut("forward_auth") {
         mask_string(forward_auth, "address", url_secrets);
+    }
+}
+
+/// `after`'s header rules with every [`REDACTED`] value replaced by the
+/// value `before` stores for the same rule: the rule at the same
+/// position, testing the same header (case aside) with the same match
+/// type. `before` is `None` on a create.
+///
+/// Run by the route write guard under the store lock, on the row the
+/// write replaces, so the value put back is the value stored. The match
+/// type is part of the identity because the value is validated against
+/// it: a stored exact value kept under a regex rule could be a pattern
+/// that does not compile.
+///
+/// # Errors
+///
+/// `BadRequest` naming the rule by position for a marker no stored rule
+/// answers to; nothing the caller sent is echoed.
+pub fn restore_header_rule_values(
+    before: Option<&lorica_config::models::Route>,
+    after: &mut lorica_config::models::Route,
+) -> Result<(), crate::error::ApiError> {
+    let stored: &[lorica_config::models::HeaderRule] =
+        before.map_or(&[], |route| route.header_rules.as_slice());
+    for (position, rule) in after.header_rules.iter_mut().enumerate() {
+        if rule.value != REDACTED {
+            continue;
+        }
+        let kept = stored.get(position).filter(|kept| {
+            kept.header_name.eq_ignore_ascii_case(&rule.header_name)
+                && kept.match_type == rule.match_type
+        });
+        let Some(kept) = kept else {
+            return Err(crate::error::ApiError::BadRequest(format!(
+                "header_rules[{position}].value: `{REDACTED}` keeps the value stored for the rule \
+                 at the same position with the same header_name and match_type, and this route \
+                 stores no such rule there; send the value itself"
+            )));
+        };
+        rule.value = kept.value.clone();
+    }
+    Ok(())
+}
+
+/// The environment `row`'s `managed_by` mark names, when it names one.
+pub fn managed_by_environment(row: &Value) -> Option<&str> {
+    row.get("managed_by")?.get("environment")?.as_str()
+}
+
+/// `row` with the environment its `managed_by` mark names withheld
+/// unless it is one of `visible`, the mark itself kept: the row still
+/// reads as owned by an environment, which is what tells a model that
+/// the management plane refuses it in place, and names none the reader
+/// could not look up.
+pub fn environment_outside(row: &mut Value, visible: &std::collections::BTreeSet<String>) {
+    let foreign = managed_by_environment(row).is_some_and(|name| !visible.contains(name));
+    if foreign {
+        if let Some(name) = row
+            .get_mut("managed_by")
+            .and_then(|mark| mark.get_mut("environment"))
+        {
+            *name = Value::String(REDACTED.to_string());
+        }
     }
 }
 
@@ -286,6 +379,130 @@ mod tests {
         let before = plain.clone();
         route_row(&mut plain);
         assert_eq!(plain, before);
+    }
+
+    #[test]
+    fn the_route_tools_spell_the_mask_this_module_answers_with() {
+        // `lorica-mcp` cannot depend on this crate, so its prose restates
+        // the marker; a model told to send back a different string would
+        // have every write-back refused.
+        for tool in ["lorica_routes", "lorica_route_update"] {
+            let spec = lorica_mcp::tools::find(tool).expect("the tool is in the catalogue");
+            assert!(spec.summary.contains(&format!("`{REDACTED}`")), "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_route_row_withholds_each_header_rule_value_and_keeps_the_rest_of_the_rule() {
+        let mut row = json!({
+            "header_rules": [
+                { "header_name": "X-Canary-Key", "match_type": "exact", "value": "s3cr3t", "backend_ids": ["b-1"], "disabled": false },
+                { "header_name": "X-Tenant", "match_type": "prefix", "value": "", "backend_ids": [], "disabled": false },
+            ],
+        });
+        route_row(&mut row);
+        assert_eq!(row["header_rules"][0]["value"], REDACTED);
+        assert_eq!(row["header_rules"][1]["value"], REDACTED);
+        assert_eq!(row["header_rules"][0]["header_name"], "X-Canary-Key");
+        assert_eq!(row["header_rules"][0]["backend_ids"], json!(["b-1"]));
+        assert_eq!(row["header_rules"][1]["match_type"], "prefix");
+    }
+
+    fn rule(name: &str, match_type: &str, value: &str) -> lorica_config::models::HeaderRule {
+        lorica_config::models::HeaderRule {
+            header_name: name.to_string(),
+            match_type: match_type.parse().expect("test setup: a match type"),
+            value: value.to_string(),
+            backend_ids: Vec::new(),
+        }
+    }
+
+    fn route_with(rules: Vec<lorica_config::models::HeaderRule>) -> lorica_config::models::Route {
+        let mut route: lorica_config::models::Route = serde_json::from_value(json!({
+            "id": "r-1",
+            "hostname": "a.example.com",
+            "path_prefix": "/",
+            "certificate_id": null,
+            "load_balancing": "round_robin",
+            "waf_enabled": false,
+            "waf_mode": "detection",
+            "enabled": true,
+            "created_at": "2026-09-30T00:00:00Z",
+            "updated_at": "2026-09-30T00:00:00Z",
+        }))
+        .expect("test setup: a route");
+        route.header_rules = rules;
+        route
+    }
+
+    #[test]
+    fn a_masked_header_rule_value_keeps_the_stored_value_of_the_same_rule_and_nothing_else() {
+        let stored = route_with(vec![
+            rule("X-Canary-Key", "exact", "s3cr3t"),
+            rule("X-Tenant", "prefix", "acme-"),
+        ]);
+
+        // Sent back as read, a header name in another case included:
+        // the stored values come back.
+        let mut after = route_with(vec![
+            rule("x-canary-key", "exact", REDACTED),
+            rule("X-Tenant", "prefix", REDACTED),
+        ]);
+        restore_header_rule_values(Some(&stored), &mut after).expect("both rules are known");
+        assert_eq!(after.header_rules[0].value, "s3cr3t");
+        assert_eq!(after.header_rules[1].value, "acme-");
+
+        // A real value is left as sent, beside a kept one.
+        let mut after = route_with(vec![
+            rule("X-Canary-Key", "exact", "rotated"),
+            rule("X-Tenant", "prefix", REDACTED),
+        ]);
+        restore_header_rule_values(Some(&stored), &mut after).expect("a value and a kept one");
+        assert_eq!(after.header_rules[0].value, "rotated");
+        assert_eq!(after.header_rules[1].value, "acme-");
+
+        // Every marker no stored rule answers to is refused, by position.
+        for (what, rules, position) in [
+            (
+                "a rule past the stored ones",
+                vec![
+                    rule("X-Canary-Key", "exact", REDACTED),
+                    rule("X-Tenant", "prefix", REDACTED),
+                    rule("X-New", "exact", REDACTED),
+                ],
+                2,
+            ),
+            (
+                "two rules swapped",
+                vec![
+                    rule("X-Tenant", "prefix", REDACTED),
+                    rule("X-Canary-Key", "exact", REDACTED),
+                ],
+                0,
+            ),
+            (
+                "a match type changed",
+                vec![rule("X-Canary-Key", "regex", REDACTED)],
+                0,
+            ),
+        ] {
+            let mut after = route_with(rules);
+            let refused = restore_header_rule_values(Some(&stored), &mut after).expect_err(what);
+            let crate::error::ApiError::BadRequest(message) = refused else {
+                panic!("{what}: the refusal is a 400")
+            };
+            assert!(
+                message.contains(&format!("header_rules[{position}]")),
+                "{what}: {message}"
+            );
+            assert!(!message.contains("s3cr3t"), "{what}: {message}");
+        }
+
+        // A create has no stored rule at all.
+        let mut created = route_with(vec![rule("X-Canary-Key", "exact", REDACTED)]);
+        restore_header_rule_values(None, &mut created).expect_err("nothing is stored on a create");
+        let mut created = route_with(vec![rule("X-Canary-Key", "exact", "v")]);
+        restore_header_rule_values(None, &mut created).expect("a create with values");
     }
 
     #[test]

@@ -116,6 +116,22 @@ pub async fn get_waf_events(
 pub async fn get_waf_stats(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    waf_stats(&state, None).await
+}
+
+/// The answer [`get_waf_stats`] gives, with the persistent aggregates
+/// reused while younger than `max_age` when one is given
+/// ([`crate::log_store::LogStore::waf_event_stats_within`]) and
+/// recomputed on every call otherwise, which is the dashboard's case.
+///
+/// # Errors
+///
+/// `Internal` when the blocking task could not be joined; a query
+/// error answers empty counters, as it always has.
+pub(crate) async fn waf_stats(
+    state: &AppState,
+    max_age: Option<std::time::Duration>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let rule_count = state.waf_rule_count.unwrap_or(0);
 
     // Read from persistent store if available, fall back to in-memory buffer
@@ -126,7 +142,13 @@ pub async fn get_waf_stats(
         // The query Result is passed through untouched so a query
         // error still falls back to empty stats below; only a join
         // failure is a hard error, as before.
-        let stats = log_db_blocking(store, move |s| Ok(s.waf_event_stats())).await?;
+        let stats = log_db_blocking(store, move |s| {
+            Ok(match max_age {
+                Some(max_age) => s.waf_event_stats_within(max_age),
+                None => s.waf_event_stats(),
+            })
+        })
+        .await?;
         match stats {
             Ok((total, total_24h, cats)) => {
                 let by_cat = cats

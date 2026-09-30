@@ -637,6 +637,48 @@ pub(super) fn caller_may_access(
     )
 }
 
+/// The names among `named` that `principal` may learn from a listing:
+/// the environments `GET /automation/v1/environments/{name}` answers it
+/// rather than refusing or hiding (backlog #94 d).
+///
+/// A route or a backend an environment owns carries the environment's
+/// name in its `managed_by` mark, and the route and backend listings
+/// answered it to every reader, so a neighbour on a shared node read
+/// off a listing the names the environment endpoint answers it 404 for.
+/// This is that endpoint's rule, applied by name: the environment
+/// exists, the caller may access it by its owner and labels, and a
+/// credential bound to `environment_protected` is asking about the one
+/// environment its job deploys. A mark whose environment row is gone
+/// is not visible either, since the endpoint answers that name 404.
+///
+/// # Errors
+///
+/// The store's error.
+pub(super) async fn environments_visible_to(
+    state: &AppState,
+    principal: &AutomationPrincipal,
+    named: std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeSet<String>, ApiError> {
+    let caller = principal.as_owner();
+    let principal = principal.clone();
+    db_blocking(&state.store, move |store| {
+        let mut visible = std::collections::BTreeSet::new();
+        for name in named {
+            if ensure_environment_binding(&name, &principal).is_err() {
+                continue;
+            }
+            let Some(environment) = store.get_automation_environment(&name)? else {
+                continue;
+            };
+            if caller_may_access(&environment, &caller) {
+                visible.insert(name);
+            }
+        }
+        Ok::<_, ConfigError>(visible)
+    })
+    .await
+}
+
 /// AC #3: a credential bound to `environment_protected = true` may only
 /// write the environment its job runs for, named by the GitLab slug of
 /// the job's `environment` claim.

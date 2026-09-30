@@ -1165,7 +1165,7 @@ mod tests {
             plane.sent_calls().last(),
             Some(&(
                 Verb::Put,
-                "/automation/v1/routes/r%2D1?dry_run=true".to_string(),
+                "/automation/v1/routes/r-1?dry_run=true".to_string(),
                 Some(route.clone())
             ))
         );
@@ -1183,11 +1183,7 @@ mod tests {
             .expect("a request is answered");
         assert_eq!(
             plane.sent_calls().last(),
-            Some(&(
-                Verb::Delete,
-                "/automation/v1/routes/r%2D1".to_string(),
-                None
-            ))
+            Some(&(Verb::Delete, "/automation/v1/routes/r-1".to_string(), None))
         );
         // And a read still crosses as a GET with no body.
         let reader = Plane::carrying(&["logs:read"]);

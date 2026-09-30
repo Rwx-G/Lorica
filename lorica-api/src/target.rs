@@ -78,26 +78,69 @@ pub struct BackendTarget<'a> {
 }
 
 type RouteCheck = Arc<dyn Fn(&ConfigStore, RouteTarget<'_>) -> Result<(), ApiError> + Send + Sync>;
+/// Puts back, in the row about to be written, the stored values a
+/// caller was shown masked and sent back unchanged; see
+/// [`RouteGuard::restoring_withheld`].
+type RouteRestore = fn(Option<&Route>, &mut Route) -> Result<(), ApiError>;
 type BackendCheck =
     Arc<dyn Fn(&ConfigStore, BackendTarget<'_>) -> Result<(), ApiError> + Send + Sync>;
 type CertificateCheck = Arc<dyn Fn(&Certificate) -> Result<(), ApiError> + Send + Sync>;
 
-/// Who may act on a route row.
+/// Who may act on a route row, and what a caller shown masked values
+/// means by sending them back.
 #[derive(Clone)]
-pub struct RouteGuard(Option<RouteCheck>);
+pub struct RouteGuard {
+    check: Option<RouteCheck>,
+    restore: Option<RouteRestore>,
+}
 
 impl RouteGuard {
     /// Every row is reachable: the management plane, whose session's
     /// role was checked at the door.
     pub fn unbounded() -> Self {
-        Self(None)
+        Self {
+            check: None,
+            restore: None,
+        }
     }
 
     /// Only the rows `check` accepts are reachable.
     pub fn bounded(
         check: impl Fn(&ConfigStore, RouteTarget<'_>) -> Result<(), ApiError> + Send + Sync + 'static,
     ) -> Self {
-        Self(Some(Arc::new(check)))
+        Self {
+            check: Some(Arc::new(check)),
+            restore: None,
+        }
+    }
+
+    /// This guard, with `restore` run on the row about to be written
+    /// before the check weighs it: `restore` is handed the row as
+    /// stored (`None` on a create) and puts back the stored values the
+    /// caller was shown masked, or refuses a masked value it cannot
+    /// place. It runs under the same lock as the write, on the row the
+    /// write replaces, so the value restored is the value stored.
+    pub fn restoring_withheld(self, restore: RouteRestore) -> Self {
+        Self {
+            restore: Some(restore),
+            ..self
+        }
+    }
+
+    /// Run the restore, if this guard has one.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the restore refuses with.
+    pub fn restore_withheld(
+        &self,
+        before: Option<&Route>,
+        after: &mut Route,
+    ) -> Result<(), ApiError> {
+        match self.restore {
+            Some(restore) => restore(before, after),
+            None => Ok(()),
+        }
     }
 
     /// Run the check, inside the store closure that writes the row.
@@ -106,7 +149,7 @@ impl RouteGuard {
     ///
     /// Whatever the check refuses with, a `Forbidden` for a grant.
     pub fn check(&self, store: &ConfigStore, target: RouteTarget<'_>) -> Result<(), ApiError> {
-        match &self.0 {
+        match &self.check {
             Some(check) => check(store, target),
             None => Ok(()),
         }
@@ -115,7 +158,7 @@ impl RouteGuard {
 
 impl std::fmt::Debug for RouteGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() {
+        f.write_str(if self.check.is_some() {
             "RouteGuard::bounded"
         } else {
             "RouteGuard::unbounded"

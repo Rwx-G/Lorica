@@ -154,6 +154,7 @@ use lorica_mcp::{
 };
 use serde_json::Value;
 use tower::ServiceExt as _;
+use tracing::Instrument;
 
 use super::auth::AutomationPrincipal;
 use crate::audit::ClientConnectInfo;
@@ -672,13 +673,37 @@ impl AutomationPlane for InProcessPlane {
         verb: Verb,
         path: &str,
         body: Option<&Value>,
-        _reason: Reason<'_>,
+        reason: Reason<'_>,
     ) -> Result<String, PlaneError> {
-        // `reason` is unused here and that is the honest shape. It exists
-        // so a plane reached from a separate process can be told what
-        // the call is for; this one IS the plane, and the audit row for
-        // the POST that drove it is written by the layer wrapping this
-        // handler, from the request that carried the tool name.
+        // `reason` names the tool for the trace and for nothing else. It
+        // exists so a plane reached from a separate process can be told
+        // what the call is for; this one IS the plane, and the audit row
+        // for the POST that drove it is written by the layer wrapping
+        // this handler, from the request that carried the tool name.
+        //
+        // The span is the tool call's, a child of the POST's
+        // `automation_request` span, and what the handler does runs
+        // inside it: the path without its query, which carries the
+        // caller's filter values.
+        let span = tracing::info_span!(
+            "mcp_tool_call",
+            "mcp.tool" = reason.tool().unwrap_or_default(),
+            "http.request.method" = verb.as_str(),
+            "url.path" = path.split_once('?').map_or(path, |(path, _)| path),
+        );
+        self.answer(verb, path, body).instrument(span).await
+    }
+}
+
+impl InProcessPlane {
+    /// The call [`AutomationPlane::call`] makes, run through
+    /// [`super::router::in_process_router`] and answered as text.
+    async fn answer(
+        &self,
+        verb: Verb,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<String, PlaneError> {
         let mut request = http::Request::builder().method(verb.as_str()).uri(path);
         if body.is_some() {
             request = request.header(
@@ -713,7 +738,10 @@ impl AutomationPlane for InProcessPlane {
         let body = axum::body::to_bytes(response.into_body(), MAX_ANSWER_BYTES)
             .await
             .map_err(|reason| PlaneError::Transport(reason.to_string()))?;
-        let text = String::from_utf8(body.to_vec())
+        // `Vec::from` takes the buffer the router answered with rather
+        // than copying it: the body is one unshared buffer here, which
+        // `Bytes` hands over whole.
+        let text = String::from_utf8(Vec::from(body))
             .map_err(|_| PlaneError::Transport("the answer is not UTF-8".to_string()))?;
         if status.is_success() {
             Ok(text)
@@ -1296,6 +1324,99 @@ mod tests {
             pipeline: None,
             required_environment_slug: None,
         }
+    }
+
+    /// Backlog #92 (d): what one MCP read answer at the plane's byte
+    /// ceiling costs on the in-process binding, the plane's half and the
+    /// whole call apart. A measurement and not a gate, since its figures
+    /// are the machine's: run it by name with `--ignored --nocapture`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "a measurement, not a gate: run it by name with --ignored --nocapture"]
+    async fn measure_an_mcp_read_answer_at_the_byte_ceiling() {
+        use lorica_config::models::AutomationScope;
+        use std::time::{Duration, Instant};
+
+        const WARM_UP: u32 = 20;
+        const ROUNDS: u32 = 300;
+
+        let (state, _session_store, _rate_limiter) = crate::tests::test_state().await;
+        // Paths carrying characters JSON escapes, so the answer pays
+        // for escaping as a real one does, and enough of them that the
+        // byte ceiling, not the row limit, ends the window.
+        for n in 0..300u64 {
+            state.log_buffer.push(crate::logs::LogEntry {
+                id: 0,
+                timestamp: "2026-09-30T00:00:00Z".to_string(),
+                method: "GET".to_string(),
+                path: format!("/measured/{n}/{}", "a\"b\\c/".repeat(160)),
+                host: "measure.example.com".to_string(),
+                status: 200,
+                latency_ms: 1,
+                backend: "10.0.0.10:8080".to_string(),
+                error: None,
+                client_ip: "192.0.2.10".to_string(),
+                is_xff: false,
+                xff_proxy_ip: String::new(),
+                source: String::new(),
+                request_id: format!("measured-{n}"),
+            });
+        }
+        let plane = InProcessPlane::new(state, principal_carrying(vec![AutomationScope::LogsRead]));
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "lorica_logs", "arguments": { "limit": 200 } },
+        });
+
+        let mut plane_time = Duration::ZERO;
+        let mut plane_bytes = 0usize;
+        for round in 0..WARM_UP + ROUNDS {
+            let started = Instant::now();
+            let text = plane
+                .call(
+                    Verb::Get,
+                    "/automation/v1/logs?limit=200",
+                    None,
+                    Reason::Tool("lorica_logs"),
+                )
+                .await
+                .expect("the read answers");
+            if round >= WARM_UP {
+                plane_time += started.elapsed();
+            }
+            plane_bytes = text.len();
+        }
+
+        let mut call_time = Duration::ZERO;
+        let mut answer_bytes = 0usize;
+        for round in 0..WARM_UP + ROUNDS {
+            // A server per call, as the endpoint builds one per request,
+            // with its own limiter so the budget never answers instead.
+            let server = McpServer::sharing(
+                Identity {
+                    public_id: "0123456789abcdef01234567".to_string(),
+                    scopes: vec!["logs:read".to_string()],
+                },
+                Arc::new(lorica_mcp::server::InvocationLimiter::new()),
+            )
+            .expect("one tier");
+            let request = jsonrpc::parse(call.clone()).expect("a request");
+            let started = Instant::now();
+            let handled = server.respond(&plane, request).await;
+            // What the endpoint's `Json(answer)` writes.
+            let written = serde_json::to_vec(&handled.answer.expect("an answer"))
+                .expect("the answer serialises");
+            if round >= WARM_UP {
+                call_time += started.elapsed();
+            }
+            answer_bytes = written.len();
+        }
+
+        println!(
+            "plane answer {plane_bytes} bytes, {:?} per call; whole MCP call {answer_bytes} \
+             bytes, {:?} per call; over {ROUNDS} rounds",
+            plane_time / ROUNDS,
+            call_time / ROUNDS,
+        );
     }
 
     #[tokio::test]

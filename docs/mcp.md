@@ -308,12 +308,24 @@ of arriving here unnoticed.
 credential an operator put there for the dashboard's sake, and the
 automation plane replaces their values with `[redacted]`, keeping every
 key: a route's `proxy_headers` (the header names stay, so a model still
-sees that a route sends one), the userinfo and query values of a
-route's `forward_auth` address, the query values of a backend's
-`health_check_path`, and the query values and fragment of an access-log
-row's `path`. It does so wherever it answers such a row: the listings,
-every write answer and every preview, including a preview's list of
-changed fields. The dashboard and the log sinks are unchanged. The
+sees that a route sends one), the match `value` of each of a route's
+`header_rules` (where a secret shared between a client and its canary
+goes; the header name, match type and backends stay), the userinfo and
+query values of a route's `forward_auth` address, the query values of a
+backend's `health_check_path`, and the query values and fragment of an
+access-log row's `path`. It does so wherever it answers such a row: the
+listings, every write answer and every preview, including a preview's
+list of changed fields. The dashboard and the log sinks are unchanged.
+A config-tier model that edits one header rule sends the whole list
+back, and a rule returned with the `[redacted]` value it was read with
+keeps the value stored for the rule at the same position with the same
+header name and match type; a marker the node cannot place that way, on
+a rule added, moved, renamed or retyped, is refused and names the rule
+by position, and the marker is never stored. The environment a route or
+backend belongs to (its `managed_by` mark) is named only to a token the
+environment endpoint would answer for that environment; every other
+token reads the mark with the name `[redacted]`, so the row still says
+it is managed without saying whose. The
 function and the reasoning are `lorica-api/src/automation/redact.rs`,
 and a test walks a route carrying an upstream credential through the
 listing, an apply, two previews and the MCP tool, asserting the value
@@ -1085,6 +1097,14 @@ ceiling (all three in `lorica-api/src/automation/read.rs`).
 two differ when the byte ceiling ended an answer early, and stepping by
 `limit` would skip rows.
 
+**The access log walks back by cursor.** `lorica_logs` answers a
+`page.next_cursor`, the id of the last row it returned (`null` on the
+last window); sent back as `before_id` with the same filters, it
+reads the next window directly, where a deep `offset` has the node read
+and discard every row above it on every call. The rows are the same
+either way, which a test walks on both log sources. `offset` stays for
+a model that wants a few windows and no cursor.
+
 The access log and the WAF events answer only as deep as the node keeps
 them. An offset past that depth is refused with a message naming the
 depth and the deepest window the requested `limit` can reach, rather
@@ -1230,6 +1250,15 @@ a row, and none is ever presented as something the node checked.
 
 An audit trail that cannot tell a claim from a proof is telling a story
 that is not true.
+
+**A trace follows the call.** With the `otel` build, every request the
+automation listener takes runs in an `automation_request` span, method
+and path, and over Streamable HTTP each tool call is an `mcp_tool_call`
+span under it naming the tool (`mcp.tool`), the verb and the path the
+tool reached, never its query; the handler the tool ran, its
+management-side audit event included, runs inside that span. Over
+stdio the node sees one HTTP request per call, each its own
+`automation_request` span; `lorica-mcp` itself exports no trace.
 
 ## Revocation and expiry
 

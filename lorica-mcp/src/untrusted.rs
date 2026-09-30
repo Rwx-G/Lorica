@@ -48,7 +48,7 @@
 //! still sits under that key, because a boundary drawn inside the
 //! answer is a boundary someone has to keep drawing correctly.
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// The prose that accompanies every delimited payload, and the only
 /// sentence this server writes about the rows it returns.
@@ -162,13 +162,28 @@ pub fn output_schema() -> Value {
 /// A body that is not JSON is a fault in the wiring rather than an
 /// answer, and it comes back as an execution error so a model reads it
 /// and stops instead of parsing prose.
+///
+/// The parsed answer and the fenced text are moved into the result, not
+/// interpolated with `json!`, which would serialise each into a copy of
+/// itself: at the plane's byte ceiling that was two more copies of the
+/// answer for a value no different.
 pub fn answer(body: &str) -> Value {
     match serde_json::from_str::<Value>(body) {
-        Ok(data) => json!({
-            "content": [{ "type": "text", "text": delimited(body) }],
-            "structuredContent": { "untrusted": data },
-            "isError": false,
-        }),
+        Ok(data) => {
+            let text_block = Map::from_iter([
+                ("type".to_string(), Value::from("text")),
+                ("text".to_string(), Value::String(delimited(body))),
+            ]);
+            let structured = Map::from_iter([("untrusted".to_string(), data)]);
+            Value::Object(Map::from_iter([
+                (
+                    "content".to_string(),
+                    Value::Array(vec![Value::Object(text_block)]),
+                ),
+                ("structuredContent".to_string(), Value::Object(structured)),
+                ("isError".to_string(), Value::Bool(false)),
+            ]))
+        }
         Err(_) => execution_error(
             "Lorica's automation plane answered something that is not JSON. Its answer follows \
              as data.",
@@ -231,6 +246,26 @@ mod tests {
         let closed = text.find(&end).expect("the block closes");
         let payload = text.find(INJECTED).expect("the payload crossed");
         assert!(opened < payload && payload < closed, "{text}");
+    }
+
+    #[test]
+    fn an_answer_built_by_moving_its_parts_is_the_answer_json_built() {
+        // The parts are moved in to spare two copies of a large answer;
+        // the value, and so every byte the endpoint writes, is the one
+        // the `json!` form built.
+        let body = json!({ "data": { "items": [{ "path": "/a\"b\\c", "n": 2 }] } }).to_string();
+        let built = answer(&body);
+        let data: Value = serde_json::from_str(&body).expect("the body is JSON");
+        let expected = json!({
+            "content": [{ "type": "text", "text": delimited(&body) }],
+            "structuredContent": { "untrusted": data },
+            "isError": false,
+        });
+        assert_eq!(built, expected);
+        assert_eq!(
+            serde_json::to_string(&built).expect("serialises"),
+            serde_json::to_string(&expected).expect("serialises")
+        );
     }
 
     #[test]

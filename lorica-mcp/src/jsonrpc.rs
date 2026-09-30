@@ -41,7 +41,7 @@
 //! is what lets a model tell "you asked for something that does not
 //! exist" from "the thing you asked for refused you".
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// The only JSON-RPC version this speaks.
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -180,8 +180,17 @@ pub fn parse(message: Value) -> Result<Request, RequestError> {
 }
 
 /// A successful answer to the request carrying `id`.
+///
+/// Built by moving `result` in rather than with `json!`, which
+/// serialises every value it interpolates into a new one: a tool's
+/// answer near the plane's byte ceiling was copied whole a second time
+/// here, for an identical value.
 pub fn result(id: &Value, result: Value) -> Value {
-    json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "result": result })
+    Value::Object(Map::from_iter([
+        ("jsonrpc".to_string(), Value::from(JSONRPC_VERSION)),
+        ("id".to_string(), id.clone()),
+        ("result".to_string(), result),
+    ]))
 }
 
 /// A protocol error answering the request carrying `id`.
@@ -232,6 +241,25 @@ impl RequestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_result_moved_into_its_envelope_is_the_envelope_json_built() {
+        let answer = json!({ "content": [{ "type": "text", "text": "a \"b\" \\ c" }], "n": 1.5 });
+        for id in [json!(7), json!("seven"), Value::Null] {
+            let built = result(&id, answer.clone());
+            assert_eq!(
+                built,
+                json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "result": answer })
+            );
+            assert_eq!(
+                serde_json::to_string(&built).expect("serialises"),
+                serde_json::to_string(
+                    &json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "result": answer })
+                )
+                .expect("serialises")
+            );
+        }
+    }
 
     #[test]
     fn a_request_parses_into_its_three_parts() {

@@ -455,10 +455,19 @@ paths:
       description: >-
         The access log this node holds, with the filters the dashboard
         already offers. Rows come back newest first, so page one is what
-        just happened and `offset` walks backwards in time. `after_id`
-        is the stable cursor for a log that is still growing; `offset`
-        walks within the answer the filters produced, as deep as 10000
-        rows and no deeper.
+        just happened.
+
+
+        `before_id` is the keyset cursor that walks back in time: every
+        answer here carries `page.next_cursor`, the id of the last row
+        it returned, or null on the last window, and sent back as
+        `before_id` with the same filters it reads the next window
+        directly however deep it lies. `offset` also walks back and is
+        kept for a caller that wants a few windows and no cursor: the
+        store reads and discards every row above an offset's window, as
+        deep as 10000 rows and no deeper. When both are sent, `offset`
+        applies to the rows below `before_id`. `after_id` bounds the
+        other end, for a caller tailing a log that is still growing.
 
 
         The rows carry text Lorica collected from whoever sent the
@@ -534,6 +543,16 @@ paths:
           schema:
             type: integer
             format: int64
+        - name: before_id
+          in: query
+          required: false
+          description: >-
+            Only rows whose id is strictly lower: the keyset cursor that
+            walks back in time. Send the previous answer's
+            `page.next_cursor`.
+          schema:
+            type: integer
+            format: int64
       responses:
         "200":
           description: One page of access-log rows
@@ -596,7 +615,12 @@ paths:
       summary: WAF counters
       description: >-
         Total events, events in the last 24 hours, the loaded rule
-        count and the count per category.
+        count and the count per category, the counters up to five
+        seconds old: they count the whole retained table under the log
+        store's one connection, so the plane computes them at most once
+        per five seconds however often it is asked, and a clear of the
+        WAF events drops them at once. The dashboard's own counters are
+        computed per call.
 
 
         Not paginated, because it is not a row set: the only array it
@@ -802,7 +826,11 @@ paths:
         Every backend with its address, weight, health status,
         lifecycle state, live connection count and EWMA latency score:
         the view the dashboard's backend table reads, with the query
-        values of `health_check_path` withheld (`[redacted]`).
+        values of `health_check_path` withheld (`[redacted]`). A backend
+        an environment owns carries `managed_by`; the environment's name
+        in it is `[redacted]` unless `GET
+        /automation/v1/environments/{name}` would answer this credential
+        for that name.
 
 
         For a credential carrying a scope a grant bounds, only the
@@ -1003,8 +1031,12 @@ paths:
         its password hash is not, because the hash never leaves the
         store. This plane also withholds what that view carries for the
         dashboard and a credential can ride in: each `proxy_headers`
-        value, name kept, and the userinfo and query values of
-        `forward_auth.address`, replaced by `[redacted]`.
+        value, name kept, each `header_rules[].value`, and the userinfo
+        and query values of `forward_auth.address`, replaced by
+        `[redacted]`. A route an environment owns carries `managed_by`;
+        the environment's name in it is `[redacted]` unless `GET
+        /automation/v1/environments/{name}` would answer this credential
+        for that name.
 
 
         For a credential carrying a scope a grant bounds, only the
@@ -1063,6 +1095,14 @@ paths:
         switched on and moved to blocking, and `rate_limit`,
         `rate_limit_rps`, `rate_limit_burst` and `auto_ban_threshold`
         added or lowered; `docs/mcp.md` has the rule for each.
+
+
+        `header_rules` replaces the whole list, and this plane answers
+        each rule's `value` as `[redacted]`: a rule sent with exactly
+        that value keeps the value stored for the rule at the same
+        position with the same `header_name` (case aside) and
+        `match_type`, and a marker no stored rule answers to is a 400
+        naming the rule's position. The marker is never stored.
 
 
         With `?dry_run=true`, which needs `routes:read` (403), the route
@@ -2135,6 +2175,15 @@ components:
         has_more:
           type: boolean
           description: Whether a row exists past this window.
+        next_cursor:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            On `/logs` alone, and always there: what to send as
+            `before_id` for the next window, the id of the last row this
+            answer returned, or null when `has_more` is false. Absent on
+            every other read.
 
     ErrorResponse:
       type: object

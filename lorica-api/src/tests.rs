@@ -9692,6 +9692,7 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "meets_target",
     "method",
     "name",
+    "next_cursor",
     "node_id",
     "node_name",
     "not_after",
@@ -11171,6 +11172,137 @@ async fn the_first_page_of_the_log_is_the_newest_rows_and_the_offset_walks_backw
     );
 }
 
+/// Every `request_id` a log read of `limit` rows per window answers,
+/// walked to the end by `offset` or by the `before_id` cursor each
+/// answer names, with the count of windows it took.
+async fn walk_the_log(
+    state: &AppState,
+    bearer: &str,
+    filter: &str,
+    limit: usize,
+    by_cursor: bool,
+) -> (Vec<String>, usize) {
+    let mut seen = Vec::new();
+    let mut windows = 0usize;
+    let mut offset = 0usize;
+    let mut cursor: Option<u64> = None;
+    loop {
+        let query = match (by_cursor, cursor) {
+            (true, Some(before)) => format!("?limit={limit}{filter}&before_id={before}"),
+            (true, None) => format!("?limit={limit}{filter}"),
+            (false, _) => format!("?limit={limit}{filter}&offset={offset}"),
+        };
+        let body = body_json(
+            automation_send(
+                state,
+                &format!("/automation/v1/logs{query}"),
+                Some(bearer),
+                None,
+            )
+            .await,
+        )
+        .await;
+        windows += 1;
+        let items = body["data"]["items"].as_array().expect("a page of rows");
+        seen.extend(items.iter().map(|row| {
+            row["request_id"]
+                .as_str()
+                .expect("every row carries its request id")
+                .to_string()
+        }));
+        let page = &body["data"]["page"];
+        assert!(
+            page.get("next_cursor").is_some(),
+            "a log answer always names its next cursor: {body}"
+        );
+        if page["has_more"] == false {
+            assert_eq!(page["next_cursor"], serde_json::Value::Null, "{body}");
+            return (seen, windows);
+        }
+        offset += items.len();
+        cursor = Some(
+            page["next_cursor"]
+                .as_u64()
+                .expect("a cursor while has_more"),
+        );
+        assert!(windows < 100, "the walk does not end: {body}");
+    }
+}
+
+#[tokio::test]
+async fn the_log_cursor_walks_the_same_rows_as_the_offset_on_both_log_sources() {
+    // Backlog #94 (e). `offset` reads and discards every row above the
+    // window, so a deep one re-read the prefix; `before_id` reads only
+    // the window. The two must answer the same rows in the same order,
+    // filtered or not, on the persistent store and the in-memory buffer.
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    for persistent in [false, true] {
+        let (mut state, _token, _route_id) = a_node_with_something_to_read().await;
+        let entries: Vec<crate::logs::LogEntry> = (0..47u64)
+            .map(|n| crate::logs::LogEntry {
+                id: n + 1,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                method: "GET".to_string(),
+                path: format!("/walked/{n}"),
+                host: "read.example.com".to_string(),
+                status: if n % 3 == 0 { 502 } else { 200 },
+                latency_ms: 1,
+                backend: "10.0.0.10:8080".to_string(),
+                error: None,
+                client_ip: "192.0.2.10".to_string(),
+                is_xff: false,
+                xff_proxy_ip: String::new(),
+                source: String::new(),
+                request_id: format!("walked-{n}"),
+            })
+            .collect();
+        if persistent {
+            let store = crate::log_store::LogStore::open(data_dir.path()).expect("a log store");
+            store.insert_batch(&entries).expect("rows land");
+            state.log_store = Some(Arc::new(store));
+        } else {
+            state.log_store = None;
+            state.log_buffer.clear();
+            for entry in entries {
+                state.log_buffer.push(entry);
+            }
+        }
+        let token = mint_automation(
+            &state,
+            "log-walker",
+            vec![lorica_config::models::AutomationScope::LogsRead],
+            &["*.read.example.com"],
+            chrono::Utc::now() + chrono::Duration::days(30),
+            None,
+        )
+        .await;
+        let bearer = format!("Bearer {token}");
+
+        for filter in ["", "&status=502"] {
+            let (by_offset, _) = walk_the_log(&state, &bearer, filter, 5, false).await;
+            let (by_cursor, windows) = walk_the_log(&state, &bearer, filter, 5, true).await;
+            assert!(!by_offset.is_empty(), "persistent={persistent} {filter}");
+            assert_eq!(
+                by_cursor, by_offset,
+                "persistent={persistent} filter={filter}"
+            );
+            assert_eq!(windows, by_cursor.len().div_ceil(5), "{filter}");
+            let expected = if filter.is_empty() { 47 } else { 16 };
+            assert_eq!(
+                by_cursor.len(),
+                expected,
+                "persistent={persistent} {filter}"
+            );
+            let newest = if filter.is_empty() {
+                "walked-46"
+            } else {
+                "walked-45"
+            };
+            assert_eq!(by_cursor[0], newest, "persistent={persistent} {filter}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_offset_past_what_a_source_can_answer_is_refused_and_not_an_empty_page() {
     // The WAF buffer answers at most `WAF_EVENTS_MAX_ROWS`. Past that,
@@ -12378,7 +12510,6 @@ async fn iv2_on_this_binding_a_tool_outside_the_grant_and_a_revoked_token_are_au
         )
     };
     let forbidden_before = by_path("forbidden");
-    let ok_before = by_path("ok");
 
     let refused = mcp_call(
         &state,
@@ -12405,8 +12536,12 @@ async fn iv2_on_this_binding_a_tool_outside_the_grant_and_a_revoked_token_are_au
             crate::automation::MCP_PATH
         )
     );
-    assert_eq!(by_path("forbidden"), forbidden_before + 1);
-    assert_eq!(by_path("ok"), ok_before);
+    // The counter is process-wide and other tests drive this endpoint in
+    // parallel, so only a lower bound holds here: the refusal was counted
+    // as `forbidden`. That it was not also counted as `ok` follows from
+    // the row above, whose word is the one the counter is given
+    // (`automation::audit`), and cannot be asserted from a shared counter.
+    assert!(by_path("forbidden") > forbidden_before);
 
     // And an execution error: the plane refusing the read the tool
     // made. An offset deeper than the log can answer is the plane's
@@ -14378,6 +14513,486 @@ async fn a_route_body_cannot_aim_traffic_or_credentials_outside_the_grant() {
             Some(&[f.backend_id.clone()][..])
         );
     }
+}
+
+/// The header rules of `route_id` as the store holds them, as
+/// `(header_name, match_type, value)`.
+async fn stored_header_rules(state: &AppState, route_id: &str) -> Vec<(String, String, String)> {
+    let store = state.store.lock().await;
+    store
+        .get_route(route_id)
+        .expect("store")
+        .expect("the route exists")
+        .header_rules
+        .into_iter()
+        .map(|rule| {
+            (
+                rule.header_name,
+                rule.match_type.as_str().to_string(),
+                rule.value,
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_header_rule_value_is_masked_on_the_plane_and_a_masked_value_sent_back_keeps_the_stored_one(
+) {
+    // Backlog #94 (c). The value a header rule matches is where a
+    // secret shared between a client and its canary goes, so no answer
+    // on this plane carries it. The config tier writes the list whole,
+    // so the mask it read must come back as "keep what is stored",
+    // matched by position, header name and match type, and never be
+    // stored itself.
+    use crate::automation::redact::REDACTED;
+    let f = a_node_with_something_to_write().await;
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &f.admin,
+        Some(serde_json::json!({
+            "hostname": "canary.write.example.com",
+            "backend_ids": [f.backend_id],
+            "header_rules": [
+                { "header_name": "X-Canary-Key", "value": "s3cr3t-one", "backend_ids": [f.backend_id] },
+                { "header_name": "X-Tenant", "match_type": "prefix", "value": "acme-s3cr3t-", "backend_ids": [] },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    let stored = stored_header_rules(&f.state, &route_id).await;
+
+    // Read: the values are masked, everything else of each rule kept.
+    let response = automation_call(&f.state, "GET", "/automation/v1/routes", &f.bearer, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let listing = body_json(response).await;
+    assert!(!listing.to_string().contains("s3cr3t"), "{listing}");
+    let read = listing["data"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|route| route["id"] == route_id.as_str())
+        .expect("the route is listed")
+        .clone();
+    assert_eq!(read["header_rules"][0]["value"], REDACTED);
+    assert_eq!(read["header_rules"][0]["header_name"], "X-Canary-Key");
+    assert_eq!(read["header_rules"][1]["value"], REDACTED);
+    assert_eq!(read["header_rules"][1]["match_type"], "prefix");
+
+    // Written back as read, with one backend list changed: the stored
+    // values stay, the change lands, and neither the apply nor the
+    // preview answer carries a value.
+    let mut rules = read["header_rules"].clone();
+    rules[1]["backend_ids"] = serde_json::json!([f.backend_id]);
+    for suffix in ["?dry_run=true", ""] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("/automation/v1/routes/{route_id}{suffix}"),
+            &f.bearer,
+            Some(serde_json::json!({ "header_rules": rules })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "PUT{suffix}");
+        let answer = body_json(response).await;
+        assert!(!answer.to_string().contains("s3cr3t"), "{answer}");
+    }
+    assert_eq!(stored_header_rules(&f.state, &route_id).await, stored);
+    {
+        let store = f.state.store.lock().await;
+        let route = store
+            .get_route(&route_id)
+            .expect("store")
+            .expect("the route");
+        assert_eq!(
+            route.header_rules[1].backend_ids,
+            vec![f.backend_id.clone()]
+        );
+    }
+
+    // A marker no stored rule answers to is refused, and nothing moves:
+    // a rule added, two rules swapped, a header renamed, a match type
+    // changed, and any marker on a create.
+    let mut added = rules.clone();
+    added
+        .as_array_mut()
+        .expect("a list")
+        .push(serde_json::json!({ "header_name": "X-New", "value": REDACTED }));
+    let swapped = serde_json::json!([rules[1].clone(), rules[0].clone()]);
+    let mut renamed = rules.clone();
+    renamed[0]["header_name"] = serde_json::json!("X-Other");
+    let mut retyped = rules.clone();
+    retyped[0]["match_type"] = serde_json::json!("regex");
+    for (what, header_rules) in [
+        ("added", added),
+        ("swapped", swapped),
+        ("renamed", renamed),
+        ("retyped", retyped),
+    ] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("/automation/v1/routes/{route_id}"),
+            &f.bearer,
+            Some(serde_json::json!({ "header_rules": header_rules })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{what}");
+        let refusal = body_json(response).await;
+        assert!(
+            refusal["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("header_rules[")),
+            "{what}: {refusal}"
+        );
+        assert_eq!(
+            stored_header_rules(&f.state, &route_id).await,
+            stored,
+            "{what}"
+        );
+    }
+    let response = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "fresh.write.example.com",
+            "header_rules": [{ "header_name": "X-Canary-Key", "value": REDACTED }],
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // A real value is a value, and is stored as sent.
+    let mut rotated = rules.clone();
+    rotated[0]["value"] = serde_json::json!("rotated-value");
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{route_id}"),
+        &f.bearer,
+        Some(serde_json::json!({ "header_rules": rotated })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let now = stored_header_rules(&f.state, &route_id).await;
+    assert_eq!(now[0].2, "rotated-value");
+    assert_eq!(now[1], stored[1]);
+
+    // The dashboard is not a token: it reads the values, and a marker
+    // it sends is the literal it typed.
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "GET",
+        &format!("/api/v1/routes/{route_id}"),
+        &f.admin,
+        None,
+    )
+    .await;
+    assert_eq!(
+        parse_data(response).await["header_rules"][0]["value"],
+        "rotated-value"
+    );
+}
+
+/// The row of `listing` (an automation collection answer) whose `id` is
+/// `id`.
+fn listed_row(listing: &serde_json::Value, id: &str) -> serde_json::Value {
+    listing["data"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap_or_else(|| panic!("{id} is listed: {listing}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn a_listing_names_an_environment_only_to_a_principal_the_environment_endpoint_answers() {
+    // Backlog #94 (d). `GET /environments/{name}` answers a neighbour
+    // 404 for an environment it may not access, and the route and
+    // backend listings named that same environment in each row's
+    // `managed_by`. The mark stays, so the row still reads as owned;
+    // the name follows the endpoint's rule.
+    use crate::automation::redact::REDACTED;
+    let f = a_node_with_something_to_write().await;
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &f.admin,
+        Some(serde_json::json!({
+            "hostname": "pr-11.write.example.com",
+            "backend_ids": [f.backend_id],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    an_environment_owning(&f.state, "pr-11", &route_id, "other-pipeline").await;
+    {
+        let store = f.state.store.lock().await;
+        let mut backend = store
+            .get_backend(&f.backend_id)
+            .expect("store")
+            .expect("the backend exists");
+        backend.managed_by = Some(lorica_config::models::ManagedBy::Automation {
+            environment: "pr-11".to_string(),
+        });
+        store.update_backend(&backend).expect("the mark lands");
+    }
+
+    let look = |bearer: String| {
+        let state = f.state.clone();
+        let route_id = route_id.clone();
+        let backend_id = f.backend_id.clone();
+        async move {
+            let environment = automation_call(
+                &state,
+                "GET",
+                "/automation/v1/environments/pr-11",
+                &bearer,
+                None,
+            )
+            .await
+            .status();
+            let routes = body_json(
+                automation_call(&state, "GET", "/automation/v1/routes", &bearer, None).await,
+            )
+            .await;
+            let backends = body_json(
+                automation_call(&state, "GET", "/automation/v1/backends", &bearer, None).await,
+            )
+            .await;
+            (
+                environment,
+                listed_row(&routes, &route_id)["managed_by"].clone(),
+                listed_row(&backends, &backend_id)["managed_by"].clone(),
+            )
+        }
+    };
+
+    // A neighbour: the endpoint hides the environment, and so do both
+    // listings, the mark kept.
+    let (environment, route_mark, backend_mark) = look(f.bearer.clone()).await;
+    assert_eq!(environment, StatusCode::NOT_FOUND);
+    for mark in [&route_mark, &backend_mark] {
+        assert_eq!(
+            mark,
+            &serde_json::json!({ "kind": "automation", "environment": REDACTED })
+        );
+    }
+
+    // Its owner: the endpoint answers, and both listings name it.
+    an_environment_owning(&f.state, "pr-11", &route_id, WRITE_TOKEN_NAME).await;
+    let (environment, route_mark, backend_mark) = look(f.bearer.clone()).await;
+    assert_eq!(environment, StatusCode::OK);
+    for mark in [&route_mark, &backend_mark] {
+        assert_eq!(
+            mark,
+            &serde_json::json!({ "kind": "automation", "environment": "pr-11" })
+        );
+    }
+
+    // A mark whose environment row is gone names nothing to anyone, as
+    // the endpoint answers that name 404.
+    {
+        let store = f.state.store.lock().await;
+        let mut route = store
+            .get_route(&route_id)
+            .expect("store")
+            .expect("the route");
+        route.managed_by = Some(lorica_config::models::ManagedBy::Automation {
+            environment: "pr-gone".to_string(),
+        });
+        store.update_route(&route).expect("the mark lands");
+    }
+    let (_, route_mark, _) = look(f.bearer.clone()).await;
+    assert_eq!(route_mark["environment"], REDACTED);
+}
+
+/// A span as [`SpanRecorder`] keeps it.
+type RecordedSpan = (&'static str, Option<u64>, String);
+
+/// A subscriber that remembers each span's name, parent and `mcp.tool`
+/// field, and the span each `lorica::audit` event was recorded in, for
+/// a test that asks what a trace would show.
+///
+/// Installed with `set_default` on a current-thread runtime, so every
+/// task the request spawns runs on the thread it is installed on.
+#[derive(Default)]
+struct SpanRecorder {
+    next_id: std::sync::atomic::AtomicU64,
+    /// Each span by id: its name, its parent and its `mcp.tool` field.
+    spans: std::sync::Mutex<std::collections::HashMap<u64, RecordedSpan>>,
+    entered: std::sync::Mutex<Vec<u64>>,
+    audit_events: std::sync::Mutex<Vec<(String, Option<u64>)>>,
+}
+
+/// The value of one named field, as the recorder keeps it.
+struct FieldNamed(&'static str, String);
+
+impl tracing::field::Visit for FieldNamed {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == self.0 {
+            self.1 = format!("{value:?}");
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == self.0 {
+            self.1 = value.to_string();
+        }
+    }
+}
+
+impl SpanRecorder {
+    fn current(&self) -> Option<u64> {
+        self.entered.lock().expect("recorder").last().copied()
+    }
+
+    /// The names of `span` and each of its ancestors, innermost first,
+    /// each with its `mcp.tool` field.
+    fn chain(&self, mut span: Option<u64>) -> Vec<(String, String)> {
+        let spans = self.spans.lock().expect("recorder");
+        let mut chain = Vec::new();
+        while let Some(id) = span {
+            let (name, parent, tool) = &spans[&id];
+            chain.push((name.to_string(), tool.clone()));
+            span = *parent;
+        }
+        chain
+    }
+}
+
+/// The recorder as the subscriber `set_default` installs.
+struct Recording(Arc<SpanRecorder>);
+
+impl tracing::Subscriber for Recording {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+
+    fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::Id {
+        let id = self
+            .0
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let parent = match attrs.parent() {
+            Some(parent) => Some(parent.into_u64()),
+            None if attrs.is_contextual() => self.0.current(),
+            None => None,
+        };
+        let mut tool = FieldNamed("mcp.tool", String::new());
+        attrs.record(&mut tool);
+        self.0
+            .spans
+            .lock()
+            .expect("recorder")
+            .insert(id, (attrs.metadata().name(), parent, tool.1));
+        tracing::Id::from_u64(id)
+    }
+
+    fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.metadata().target() != "lorica::audit" {
+            return;
+        }
+        let mut action = FieldNamed("action", String::new());
+        event.record(&mut action);
+        let span = match event.parent() {
+            Some(parent) => Some(parent.into_u64()),
+            None if event.is_contextual() => self.0.current(),
+            None => None,
+        };
+        self.0
+            .audit_events
+            .lock()
+            .expect("recorder")
+            .push((action.1, span));
+    }
+
+    fn enter(&self, span: &tracing::Id) {
+        self.0
+            .entered
+            .lock()
+            .expect("recorder")
+            .push(span.into_u64());
+    }
+
+    fn exit(&self, span: &tracing::Id) {
+        let mut entered = self.0.entered.lock().expect("recorder");
+        if let Some(at) = entered.iter().rposition(|id| *id == span.into_u64()) {
+            entered.remove(at);
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_trace_follows_an_mcp_call_into_the_handler_it_ran() {
+    // Backlog #92 (a). The automation plane opened no span, so an MCP
+    // call's trace stopped at the listener and nothing the handler did
+    // under it could be found from the call. Now the request is an
+    // `automation_request` span, each tool call an `mcp_tool_call`
+    // span under it naming the tool, and what the handler records sits
+    // under that. No log store, so the management audit event is
+    // emitted inside the handler rather than by the writer thread.
+    let mut f = a_node_with_something_to_write().await;
+    f.state.log_store = None;
+    let recorder = Arc::new(SpanRecorder::default());
+    let _installed = tracing::subscriber::set_default(Recording(Arc::clone(&recorder)));
+
+    let answer = mcp_call(
+        &f.state,
+        &f.mcp_bearer,
+        "lorica_route_create",
+        serde_json::json!({
+            "route": { "hostname": "traced.write.example.com", "backend_ids": [f.backend_id] },
+        }),
+    )
+    .await;
+    assert_eq!(answer["result"]["isError"], false, "{answer}");
+
+    let events = recorder.audit_events.lock().expect("recorder").clone();
+    let (_, span) = events
+        .iter()
+        .find(|(action, _)| action == "route.create")
+        .unwrap_or_else(|| panic!("the handler recorded its row: {events:?}"));
+    let chain = recorder.chain(*span);
+    let position = |name: &str| chain.iter().position(|(span, _)| span == name);
+    let tool_call = position("mcp_tool_call")
+        .unwrap_or_else(|| panic!("the handler ran inside the tool call's span: {chain:?}"));
+    assert_eq!(chain[tool_call].1, "lorica_route_create", "{chain:?}");
+    let request = position("automation_request")
+        .unwrap_or_else(|| panic!("inside the request's span: {chain:?}"));
+    assert!(
+        tool_call < request,
+        "the tool call is under the request: {chain:?}"
+    );
 }
 
 #[tokio::test]
