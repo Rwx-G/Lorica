@@ -309,6 +309,18 @@ impl AutomationPrincipal {
             .iter()
             .any(|pattern| lorica_config::models::matches_one_label(pattern, hostname))
     }
+
+    /// Whether this principal's grants mean anything: it carries a scope
+    /// a hostname or backend grant bounds.
+    ///
+    /// Typed absence makes the grants empty on every other credential,
+    /// except a row minted before that rule, which kept the grants the
+    /// old rule forced on it and which no path it reaches reads. Keying
+    /// on the scope rather than on the lists is what keeps such a row
+    /// behaving as it always has.
+    pub fn carries_grants(&self) -> bool {
+        self.scopes.iter().any(|scope| scope.is_grant_bounded())
+    }
 }
 
 impl<S> FromRequestParts<S> for AutomationPrincipal

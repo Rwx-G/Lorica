@@ -36,12 +36,13 @@ pub use automation_environment::{
 };
 pub use automation_token::{
     automation_public_id_is_valid, automation_secret_hmac_hex, dummy_automation_secret_hmac_hex,
-    mint_automation_token, parse_automation_token, verify_automation_secret, AutomationMintError,
-    AutomationScope, AutomationToken, AutomationTokenFormatError, MintedAutomationToken,
-    ParsedAutomationToken, AUTOMATION_TOKEN_DEFAULT_LIFETIME_DAYS,
+    mint_automation_token, parse_automation_token, validate_automation_grants,
+    verify_automation_secret, AutomationMintError, AutomationScope, AutomationToken,
+    AutomationTokenFormatError, MintedAutomationToken, ParsedAutomationToken,
+    AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS, AUTOMATION_TOKEN_DEFAULT_LIFETIME_DAYS,
     AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS, AUTOMATION_TOKEN_HMAC_KEY_LEN,
     AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP, AUTOMATION_TOKEN_PUBLIC_ID_LEN,
-    AUTOMATION_TOKEN_SECRET_LEN,
+    AUTOMATION_TOKEN_SECRET_LEN, AUTOMATION_TOKEN_SUBJECT,
 };
 pub use backend::{Backend, RouteBackend};
 pub use capture::{

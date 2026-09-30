@@ -655,6 +655,109 @@ async fn an_invalid_request_is_refused_by_the_models_validator_with_the_field_na
 }
 
 #[tokio::test]
+async fn a_token_carrying_no_bounded_scope_is_minted_without_grants_and_refused_with_them() {
+    // Typed absence through the mint route: the two grant fields may be
+    // omitted, which is what a read or an admin token sends, and the
+    // stored row answers them as empty lists. Sending one anyway is the
+    // model's 422, naming the field.
+    let (state, sessions, limiter) = test_state().await;
+    let admin = super_admin(&state, &sessions, &limiter).await;
+
+    let response = management(
+        &state,
+        &sessions,
+        &limiter,
+        "POST",
+        TOKENS_PATH,
+        &admin,
+        Some(serde_json::json!({ "name": "mcp read", "scopes": ["logs:read", "waf:read"] })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let data = body_json(response).await["data"].clone();
+    assert_eq!(data["allowed_hostnames"], serde_json::json!([]));
+    assert_eq!(data["allowed_backend_cidrs"], serde_json::json!([]));
+
+    for field in ["allowed_hostnames", "allowed_backend_cidrs"] {
+        let mut body = serde_json::json!({ "name": "mcp admin", "scopes": ["settings:write"] });
+        body[field] = serde_json::json!(["10.0.0.0/8"]);
+        let response = management(
+            &state,
+            &sessions,
+            &limiter,
+            "POST",
+            TOKENS_PATH,
+            &admin,
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{field}"
+        );
+        let message = body_json(response).await["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(message.contains(field), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn a_settings_write_token_is_minted_only_within_the_lifetime_ceiling() {
+    // The ceiling is the model's, so the mint route every surface uses
+    // (dashboard, both CLI commands) is bounded by it: at the ceiling is
+    // a 201, past it a 422 naming it, and no lifetime at all is past it
+    // too, since the node's default lifetime is longer.
+    use lorica_config::models::AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS;
+    let (state, sessions, limiter) = test_state().await;
+    let admin = super_admin(&state, &sessions, &limiter).await;
+    let admin_body = |lifetime_days: Option<i64>| {
+        let mut body = serde_json::json!({ "name": "mcp admin", "scopes": ["settings:write"] });
+        if let Some(days) = lifetime_days {
+            body["lifetime_days"] = serde_json::json!(days);
+        }
+        body
+    };
+    for (lifetime_days, expected) in [
+        (
+            Some(AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS),
+            StatusCode::CREATED,
+        ),
+        (
+            Some(AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS + 1),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (None, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let response = management(
+            &state,
+            &sessions,
+            &limiter,
+            "POST",
+            TOKENS_PATH,
+            &admin,
+            Some(admin_body(lifetime_days)),
+        )
+        .await;
+        assert_eq!(response.status(), expected, "{lifetime_days:?}");
+        if expected == StatusCode::UNPROCESSABLE_ENTITY {
+            let message = body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                message.contains(&format!(
+                    "{AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS} days"
+                )),
+                "the refusal names the ceiling: {message}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_server_owned_field_on_the_body_is_refused() {
     // `deny_unknown_fields`: `public_id`, `secret_hmac` and the two
     // usage stamps are the server's, and a client that sends one is

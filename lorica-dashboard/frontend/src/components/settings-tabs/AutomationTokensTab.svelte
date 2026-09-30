@@ -1,6 +1,9 @@
 <script lang="ts" module>
   import type { AutomationScope } from '../../lib/api';
-  import { AUTOMATION_SCOPE_WIRE_STRINGS } from './automation-scopes.generated';
+  import {
+    AUTOMATION_SCOPE_WIRE_STRINGS,
+    GRANT_BOUNDED_SCOPES,
+  } from './automation-scopes.generated';
 
   /**
    * What the create form offers, derived from the wire vocabulary
@@ -21,6 +24,20 @@
   ]
     .sort((a, b) => Number(a.endsWith(':write')) - Number(b.endsWith(':write')))
     .map((value) => ({ value, label: value }));
+
+  /**
+   * Whether a token carrying `scopes` has hostname and backend grants
+   * at all. The node requires both when one of these scopes is carried
+   * and refuses both when none is (typed absence), so a token without
+   * one has no blast radius to show and the form has nothing to ask.
+   * The set is `GRANT_BOUNDED_SCOPES`, which a Rust test pins against
+   * the enum.
+   *
+   * Exported for the test beside this file and for no other reason.
+   */
+  export function carriesGrants(scopes: readonly AutomationScope[]): boolean {
+    return scopes.some((scope) => GRANT_BOUNDED_SCOPES.includes(scope));
+  }
 </script>
 
 <script lang="ts">
@@ -111,14 +128,19 @@
     // Omitted fields are omitted, never sent as null: the API takes an
     // absent field as "use the model's default", and the model owns
     // every cap. The form restates none of them, so a refusal here is
-    // the server's message verbatim.
+    // the server's message verbatim. The grants are sent only when a
+    // scope they bound is selected: text typed before the operator
+    // unticked the last such scope is not a grant the token can carry.
+    const grants = carriesGrants(formScopes)
+      ? {
+          allowed_hostnames: lines(formHostnames),
+          allowed_backend_cidrs: lines(formBackendCidrs),
+        }
+      : {};
     const res = await api.createAutomationToken({
       name: formName.trim(),
       scopes: formScopes,
-      allowed_hostnames: lines(formHostnames),
-      ...(lines(formBackendCidrs).length > 0
-        ? { allowed_backend_cidrs: lines(formBackendCidrs) }
-        : {}),
+      ...grants,
       ...(lifetime !== '' ? { lifetime_days: Number(lifetime) } : {}),
       ...(maxTtl !== '' ? { max_ttl_seconds: Number(maxTtl) } : {}),
     });
@@ -226,9 +248,18 @@
                   {/each}
                 </td>
                 <td class="wrap-cell">
-                  {#each token.allowed_hostnames as hostname (hostname)}
-                    <code>{hostname}</code>
-                  {/each}
+                  {#if carriesGrants(token.scopes)}
+                    {#each token.allowed_hostnames as hostname (hostname)}
+                      <code>{hostname}</code>
+                    {/each}
+                  {:else}
+                    <!--
+                      A row minted before typed absence may still store
+                      grants; no path this token reaches reads them, so
+                      they are not its blast radius and are not shown.
+                    -->
+                    <span class="text-muted">not applicable</span>
+                  {/if}
                 </td>
                 <td class="text-muted">{when(token.expires_at)}</td>
                 <td class="text-muted">{when(token.last_used_at)}</td>
@@ -299,38 +330,48 @@
         {/each}
       </fieldset>
 
-      <div class="settings-form-row">
-        <label for="automation-token-hostnames">
-          Allowed hostnames <span class="settings-required">*</span>
-        </label>
-        <textarea
-          id="automation-token-hostnames"
-          rows="3"
-          bind:value={formHostnames}
-          placeholder="api.example.com&#10;*.preview.example.com"
-          autocomplete="off"
-          spellcheck="false"
-        ></textarea>
-        <span class="settings-hint">
-          One per line. An exact name, or a single leading <code>*.</code> wildcard
-          covering one label, the way a certificate wildcard reads.
-        </span>
-      </div>
+      {#if carriesGrants(formScopes)}
+        <div class="settings-form-row">
+          <label for="automation-token-hostnames">
+            Allowed hostnames <span class="settings-required">*</span>
+          </label>
+          <textarea
+            id="automation-token-hostnames"
+            rows="3"
+            bind:value={formHostnames}
+            placeholder="api.example.com&#10;*.preview.example.com"
+            autocomplete="off"
+            spellcheck="false"
+          ></textarea>
+          <span class="settings-hint">
+            One per line. An exact name, or a single leading <code>*.</code> wildcard
+            covering one label, the way a certificate wildcard reads.
+          </span>
+        </div>
 
-      <div class="settings-form-row">
-        <label for="automation-token-cidrs">Allowed backend CIDRs</label>
-        <textarea
-          id="automation-token-cidrs"
-          rows="2"
-          bind:value={formBackendCidrs}
-          placeholder="10.0.0.0/8"
-          autocomplete="off"
-          spellcheck="false"
-        ></textarea>
-        <span class="settings-hint">
-          One per line. Leave empty to apply the node's default backend policy.
-        </span>
-      </div>
+        <div class="settings-form-row">
+          <label for="automation-token-cidrs">
+            Allowed backend CIDRs <span class="settings-required">*</span>
+          </label>
+          <textarea
+            id="automation-token-cidrs"
+            rows="2"
+            bind:value={formBackendCidrs}
+            placeholder="10.0.0.0/8"
+            autocomplete="off"
+            spellcheck="false"
+          ></textarea>
+          <span class="settings-hint">
+            One per line. An empty list admits no address: there is no node-wide
+            default to fall back on.
+          </span>
+        </div>
+      {:else}
+        <p class="settings-hint">
+          Hostname and backend grants: not applicable. None of the selected scopes
+          reaches a path that reads them, so the token carries none.
+        </p>
+      {/if}
 
       <div class="settings-form-row">
         <label for="automation-token-lifetime">Lifetime (days)</label>

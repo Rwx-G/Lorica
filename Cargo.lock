@@ -2956,6 +2956,7 @@ dependencies = [
  "lorica-ketama",
  "lorica-lb",
  "lorica-limits",
+ "lorica-mcp",
  "lorica-notify",
  "lorica-proxy",
  "lorica-shmem",

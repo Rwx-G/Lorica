@@ -1424,6 +1424,45 @@ services:
     networks:
       - e2e
 
+  # ---- MCP profile (Story 11.4 AC #4, IV2) ---------------------------
+  # A standalone node serving the automation listener on loopback (see
+  # entrypoint-mcp.sh), and a smoke that drives each tier by spawning
+  # `lorica-mcp` and writing newline-delimited JSON-RPC to its stdin.
+  #
+  # The smoke runs from the LORICA image, not the test-runner one: the
+  # alpine runner cannot execute the glibc `lorica` and `lorica-mcp`
+  # binaries, and the smoke has to run both for real. It shares the
+  # node's network namespace because `lorica mcp token create` mints
+  # through 127.0.0.1 and nowhere else. The Lorica image has no jq, so
+  # the smoke reads JSON with the sqlite3 CLI it already carries.
+  lorica-mcp:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-mcp.sh"]
+    profiles: ["mcp"]
+    volumes:
+      - lorica-mcp-data:/var/lib/lorica
+      - shared-mcp:/shared
+    networks:
+      - e2e
+
+  mcp-smoke:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["mcp"]
+    entrypoint: ["bash", "/tests/run-mcp-smoke.sh"]
+    network_mode: "service:lorica-mcp"
+    depends_on:
+      - lorica-mcp
+    volumes:
+      - shared-mcp:/shared:ro
+      - ./test-runner/helpers.sh:/tests/helpers.sh:ro
+      - ./test-runner/run-mcp-smoke.sh:/tests/run-mcp-smoke.sh:ro
+    environment:
+      - SHARED_DIR=/shared
+
 volumes:
   lorica-data:
   lorica-workers-data:
@@ -1468,6 +1507,8 @@ volumes:
   shared-cluster:
   lorica-acme-data:
   shared-acme:
+  lorica-mcp-data:
+  shared-mcp:
 
 networks:
   e2e:

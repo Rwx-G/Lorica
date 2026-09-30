@@ -41,6 +41,10 @@ lorica-ketama = { version = "0.1.0", path = "../lorica-ketama" }
 lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, default-features = false }
 lorica-config = { version = "1.8.0", path = "../lorica-config" }
 lorica-api = { version = "1.8.0", path = "../lorica-api" }
+# `lorica mcp token create --tier` reads the MCP tier table and tool
+# catalogue from here, so the scopes it mints and the blast radius it
+# prints are the ones the MCP server enforces rather than a copy.
+lorica-mcp = { version = "1.8.0", path = "../lorica-mcp" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 lorica-worker = { version = "1.8.0", path = "../lorica-worker" }

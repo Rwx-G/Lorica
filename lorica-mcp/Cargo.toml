@@ -57,10 +57,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 
 [dev-dependencies]
 # Test-only, and deliberately not a runtime dependency: the scope
-# vocabulary belongs to `AutomationScope` and this crate names seven of
-# its spellings as plain strings. The guard in `src/tools.rs` parses
-# every one of them back into the enum, so a rename there turns this
-# crate red instead of silently unregistering a tool. Taking it as a
+# vocabulary belongs to `AutomationScope` and this crate names its
+# spellings as plain strings, in the tool catalogue and in the tier
+# table. Tests parse every one of them back into the enum
+# (`src/tools.rs` for the catalogue, `src/tier.rs` for the table), so a
+# rename there turns this crate red instead of silently unregistering a
+# tool or leaving a scope in no tier. Taking it as a
 # runtime dependency would put `rusqlite`, bundled SQLite and all, in
 # the dependency graph of a stdio subprocess that reads no database.
 lorica-config = { path = "../lorica-config" }

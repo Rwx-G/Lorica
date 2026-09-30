@@ -2041,11 +2041,15 @@ export interface AutomationTokenResponse {
   revoked_at: string | null;
 }
 
-/** Body of `POST /api/v1/automation/tokens`. */
+/**
+ * Body of `POST /api/v1/automation/tokens`. The two grants are sent when
+ * a scope in `GRANT_BOUNDED_SCOPES` is, and omitted otherwise: the node
+ * requires them in the first case and refuses them in the second.
+ */
 export interface CreateAutomationTokenRequest {
   name: string;
   scopes: AutomationScope[];
-  allowed_hostnames: string[];
+  allowed_hostnames?: string[];
   allowed_backend_cidrs?: string[];
   max_ttl_seconds?: number;
   /** Mutually exclusive with `expires_at`, which the UI does not send. */

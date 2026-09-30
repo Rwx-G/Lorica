@@ -13,9 +13,9 @@
  * It is the only guard on this language boundary. Without it a variant
  * added on the Rust side passes the Rust suite, passes the frontend
  * suite, and leaves the mint form unable to offer the scope, silently
- * in both directions. `AutomationTokensTab.svelte` restates the set in
- * `ALL_SCOPES` and the test beside it pins that against this file, so
- * the chain runs enum to fixture to form.
+ * in both directions. `AutomationTokensTab.svelte` derives `ALL_SCOPES`
+ * from the list below rather than restating it, so the chain runs enum
+ * to fixture to form.
  *
  * Typed as the `AutomationScope` union rather than `string[]` on
  * purpose: that makes a scope present here and absent from the union a
@@ -42,4 +42,19 @@ export const AUTOMATION_SCOPE_WIRE_STRINGS: readonly AutomationScope[] = [
   'settings:write',
   'sla:read',
   'waf:read',
+];
+
+/**
+ * The scopes whose paths consult a token's hostname and backend
+ * grants, sorted. Owned by `AutomationScope::is_grant_bounded` in the
+ * same Rust file, and diffed against it in both directions by the same
+ * test. A token carrying one of these needs both grants; a token
+ * carrying none carries neither, and the dashboard renders its grants
+ * as not applicable.
+ */
+export const GRANT_BOUNDED_SCOPES: readonly AutomationScope[] = [
+  'backends:write',
+  'certificates:write',
+  'environments:write',
+  'routes:write',
 ];

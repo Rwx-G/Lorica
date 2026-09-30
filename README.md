@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/version-1.8.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-2914-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-2975-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-748-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -45,7 +45,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Tamper-evident audit log** (v1.6.0) - every state-mutating management call records operator, role, action, target, source IP, user agent and before/after payload hashes in a SHA-256 hash chain; `GET /api/v1/audit/verify` walks the chain and localises tampering to the earliest broken row; day-based retention is chain-safe. In a fleet (v1.7.0) every follower's trail fans in to the control plane as its own chain, verified separately
 - **Per-recipient replication** (v1.8.0) - a follower receives only the routes it serves: the control plane resolves `node_selector` itself, against the node id the recipient's certificate proves, so a compromised edge no longer discloses the fleet's routing topology (every other node's upstream addresses, IP lists, mTLS configuration and Basic-auth hashes). Drift is judged against a per-node hash while the generation stays fleet-wide; the wire format did not move, so a mixed-version fleet upgrades in the documented order
 - **Management plane over TLS** (v1.6.0) - the loopback dashboard/API is served over HTTPS with a self-signed certificate generated on first boot (or an operator-supplied one), so the session cookie is `Secure`; `/metrics` requires a session or the bearer token in `prometheus_scrape_token` by default since v1.7.0
-- **Secrets never on argv** (v1.7.0) - every management CLI command (`unban`, `upgrade`, `cluster token|leave|status|break-glass`, `automation token create`) reads its password from `--password-file`, `--password-stdin` or `LORICA_ADMIN_PASSWORD`, and a join token only from a file, stdin or `LORICA_JOIN_TOKEN`
+- **Secrets never on argv** (v1.7.0) - every management CLI command (`unban`, `upgrade`, `cluster token|leave|status|break-glass`, `automation token create`, `mcp token create`) reads its password from `--password-file`, `--password-stdin` or `LORICA_ADMIN_PASSWORD`, and a join token only from a file, stdin or `LORICA_JOIN_TOKEN`
 - **mTLS client verification** - per-route CA bundle + optional organization allowlist. Chain validated at the TLS handshake (rustls `WebPkiClientVerifier`), per-route enforcement returns 496 ("cert required") or 495 ("cert error"). `required` and org-allowlist hot-reload; CA edits take effect on restart
 - **Forward authentication** - per-route sub-request to Authelia / Authentik / Keycloak / oauth2-proxy before proxying; 2xx injects response headers into upstream, 401/403/3xx forwarded verbatim to the client, timeout = fail-closed 503. Optional opt-in verdict cache (TTL-capped at 60s, Cookie-keyed) to shortcut hot paths. Under `--workers N` the cache is owned by the supervisor and routed through the pipelined RPC channel, so an Allow verdict cached by one worker is served from every worker, and a session revocation invalidates the cache uniformly (WPAR-2, design § 7)
 - **Connection pre-filter** - global IP allow/deny CIDR policy enforced at TCP accept, before the TLS handshake. Deny always wins; non-empty allow switches to default-deny. Hot-reloaded via arc-swap in single-process and worker modes
@@ -285,8 +285,9 @@ Commands:
   cluster status                    This node's fleet role and, with credentials, the live roster
   cluster break-glass [--close]     Re-enable local edits on a follower for a bounded window
   cluster leave                     Wipe this node's fleet identity (SuperAdmin, or proof of revocation)
-  automation token create --name <NAME> --scope <SCOPE>... --hostname <PATTERN>...
+  automation token create --name <NAME> --scope <SCOPE>... [--hostname <PATTERN>]...
                                     Mint a scoped automation token (SuperAdmin), printed once
+  mcp token create --tier <TIER>    Front end over the above: one MCP tier's scopes, and its blast radius
 ```
 
 Every command that needs the admin password reads it from `--password-file`
@@ -711,7 +712,7 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (2914 tests, Lorica-native)
+# Product crates only (2975 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-limits -p lorica-shmem \
@@ -731,7 +732,7 @@ cargo test -p lorica-core -p lorica-proxy -p lorica-http \
 # wire corpus (every message's encoding, pinned)
 cargo test -p lorica-cluster --tests
 
-# Frontend (480 Vitest cases across 25 files) and its gates
+# Frontend (506 Vitest cases across 25 files) and its gates
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 

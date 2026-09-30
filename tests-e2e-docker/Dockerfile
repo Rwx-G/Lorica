@@ -63,6 +63,10 @@ RUN if [ -n "$LORICA_FEATURES" ]; then \
     else \
         cargo build --release -p lorica; \
     fi
+# The MCP server the `mcp` profile drives over stdio (Story 11.4). A
+# separate build so LORICA_FEATURES, which names lorica's features, is
+# never applied to a crate that does not have them.
+RUN cargo build --release -p lorica-mcp
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim
@@ -71,6 +75,7 @@ RUN useradd -r -s /bin/false lorica
 RUN mkdir -p /var/lib/lorica && chown lorica:lorica /var/lib/lorica
 
 COPY --from=builder /app/target/release/lorica /usr/local/bin/lorica
+COPY --from=builder /app/target/release/lorica-mcp /usr/local/bin/lorica-mcp
 COPY tests-e2e-docker/entrypoint.sh /entrypoint.sh
 COPY tests-e2e-docker/entrypoint-workers.sh /entrypoint-workers.sh
 COPY tests-e2e-docker/entrypoint-geoip.sh /entrypoint-geoip.sh
@@ -84,7 +89,8 @@ COPY tests-e2e-docker/entrypoint-cluster-cp.sh /entrypoint-cluster-cp.sh
 COPY tests-e2e-docker/entrypoint-cluster-follower.sh /entrypoint-cluster-follower.sh
 COPY tests-e2e-docker/entrypoint-capture.sh /entrypoint-capture.sh
 COPY tests-e2e-docker/entrypoint-capture-workers.sh /entrypoint-capture-workers.sh
-RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh /entrypoint-hot-upgrade.sh /entrypoint-log-sinks.sh /entrypoint-acme.sh /entrypoint-cluster-cp.sh /entrypoint-cluster-follower.sh /entrypoint-capture.sh /entrypoint-capture-workers.sh
+COPY tests-e2e-docker/entrypoint-mcp.sh /entrypoint-mcp.sh
+RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh /entrypoint-hot-upgrade.sh /entrypoint-log-sinks.sh /entrypoint-acme.sh /entrypoint-cluster-cp.sh /entrypoint-cluster-follower.sh /entrypoint-capture.sh /entrypoint-capture-workers.sh /entrypoint-mcp.sh
 
 # Pre-create the `/shared` mount point owned by the non-root lorica
 # user so the entrypoint can write `/shared/admin_password` after the

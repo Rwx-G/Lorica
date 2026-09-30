@@ -34,34 +34,46 @@
 //! the tier design is the sanctioned pattern rather than a deviation.
 //!
 //! The registry is built once, here, and never reconsulted. Nothing
-//! re-reads scopes on a running server, which is what keeps Story
-//! 11.4's one-process-one-tier check cheap to add later.
+//! re-reads scopes on a running server.
 //!
 //! # The tier is the token's scopes, on both bindings
 //!
-//! Story 11.2 AC #2: the catalogue holds the read tier's tools and the
-//! config tier's, and [`McpServer::sharing`] registers a tool for a
-//! scope the token holds and no other. Over stdio that runs once at
-//! startup through [`McpServer::over`]; over Streamable HTTP it runs
-//! per request through [`McpServer::sharing`], from the token that
-//! request presented. A token carrying a write scope gets that scope's
-//! mutations with their previews and whichever read tools its read
-//! scopes cover; a token carrying read scopes alone can never gain a
-//! write tool, because every write tool declares a write scope, which
-//! `tools` pins by construction rather than by exception.
+//! Story 11.2 AC #2: the catalogue holds every tier's tools, and
+//! [`McpServer::sharing`] registers a tool for a scope the token holds
+//! and no other. Over stdio that runs once at startup through
+//! [`McpServer::over`]; over Streamable HTTP it runs per request
+//! through [`McpServer::sharing`], from the token that request
+//! presented. A config-tier token gets its write scopes' mutations with
+//! their previews and the read tools of the reads its tier tolerates;
+//! since Story 11.4 a token carrying any other read beside a write
+//! scope is refused outright (see below) rather than given that read's
+//! tool. A token carrying read scopes alone can never gain a write
+//! tool, because every write tool declares a write scope, which `tools`
+//! pins by construction rather than by exception.
 //!
 //! Story 11.3's admin tier is the same rule over one more scope:
 //! `settings:write` registers the settings mutation and its preview and
 //! nothing else, since no other tool declares it.
 //!
+//! # One process, one tier
+//!
+//! Story 11.4 AC #1: before anything registers, [`McpServer::sharing`]
+//! resolves the token's scopes to ONE tier through
+//! [`crate::tier::resolve`], and a token spanning two is refused with
+//! the scopes named. The registry is then that tier's tools, and the
+//! read tools whose scopes the tier tolerates, filtered by what the
+//! token holds. Both bindings build their server through that one
+//! constructor, so neither can serve a token the other refuses.
+//!
 //! # A token with no tool still starts
 //!
 //! Minting refuses an empty scope array, so the case AC #3 names is
-//! never a scopeless token: it is a token carrying scopes none of which
-//! this tier uses. Such a server starts, publishes an empty tool list
-//! and says why in [`McpServer::startup_notice`], which an adapter puts
-//! where an operator reads it. A server whose every call failed would
-//! be the same fault reported once per call and never explained.
+//! never a scopeless token: it is a token carrying scopes of one tier
+//! that no tool of it uses, `environments:write` alone for instance.
+//! Such a server starts, publishes an empty tool list and says why in
+//! [`McpServer::startup_notice`], which an adapter puts where an
+//! operator reads it. A server whose every call failed would be the
+//! same fault reported once per call and never explained.
 //!
 //! # The invocation budget is the token's, not the server's
 //!
@@ -83,6 +95,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::jsonrpc::{self, code, Request};
+use crate::tier::{self, Tier, TierError};
 use crate::tools::{self, ToolSpec};
 use crate::untrusted;
 use crate::{AutomationPlane, PlaneError, Reason, Verb, MCP_PROTOCOL_REVISION};
@@ -140,6 +153,11 @@ pub enum StartupError {
     Introspection(PlaneError),
     /// `whoami` answered something that is not a whoami answer.
     Unreadable,
+    /// The token's scopes span two tiers, or name no tier at all.
+    ///
+    /// A configuration fault and not an unreachable plane: the token
+    /// was read, and it is the wrong token for one process.
+    Tier(TierError),
 }
 
 impl core::fmt::Display for StartupError {
@@ -155,11 +173,25 @@ impl core::fmt::Display for StartupError {
                  array of strings at `data.scopes`. Check that the endpoint is a Lorica \
                  automation listener and not something in front of one."
             ),
+            // Only the stdio binding introspects, and it runs on a
+            // static token, so the static token's remedy is the one to
+            // name.
+            StartupError::Tier(refused) => {
+                write!(f, "{refused} {}", refused.remedy_for_static_token())
+            }
         }
     }
 }
 
-impl std::error::Error for StartupError {}
+impl std::error::Error for StartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StartupError::Introspection(reason) => Some(reason),
+            StartupError::Unreadable => None,
+            StartupError::Tier(refused) => Some(refused),
+        }
+    }
+}
 
 /// A fixed window of tool invocations.
 struct Budget {
@@ -264,6 +296,12 @@ pub enum Outcome {
     /// A message too malformed to place, or one claiming a protocol
     /// revision this server does not speak.
     ProtocolError,
+    /// The token's scopes span two tiers, so no server was built for it
+    /// and nothing ran. [`McpServer::handle`] never answers this: a
+    /// server exists only for a token of one tier. The Streamable HTTP
+    /// binding, which builds a server per request, records it for the
+    /// request whose token [`McpServer::sharing`] refused.
+    SpansTiers,
 }
 
 impl core::fmt::Display for Outcome {
@@ -277,6 +315,7 @@ impl core::fmt::Display for Outcome {
             Outcome::Refused(status) => write!(f, "refused:{status}"),
             Outcome::Failed => f.write_str("failed"),
             Outcome::ProtocolError => f.write_str("protocol_error"),
+            Outcome::SpansTiers => f.write_str("spans_tiers"),
         }
     }
 }
@@ -293,6 +332,7 @@ pub struct Handled {
 /// The protocol core, over the tools this token turned out to allow.
 pub struct McpServer {
     identity: Identity,
+    tier: Tier,
     registered: Vec<&'static ToolSpec>,
     limiter: Arc<InvocationLimiter>,
 }
@@ -305,7 +345,8 @@ impl McpServer {
     ///
     /// [`StartupError::Introspection`] when `whoami` could not be read,
     /// [`StartupError::Unreadable`] when what came back is not a whoami
-    /// answer.
+    /// answer, [`StartupError::Tier`] when the token it describes spans
+    /// two tiers.
     pub async fn introspect<S: AutomationPlane>(source: &S) -> Result<McpServer, StartupError> {
         // `Reason::Introspection` and not a tool name: no tool has been
         // called yet and no client has spoken, so a row claiming one
@@ -317,7 +358,7 @@ impl McpServer {
             .map_err(StartupError::Introspection)?;
         let answer: Value = serde_json::from_str(&body).map_err(|_| StartupError::Unreadable)?;
         let identity = identity_of(&answer).ok_or(StartupError::Unreadable)?;
-        Ok(McpServer::over(identity))
+        McpServer::over(identity).map_err(StartupError::Tier)
     }
 
     /// The same server, from an identity already known, with an
@@ -325,7 +366,12 @@ impl McpServer {
     ///
     /// The shape for one process serving one token: the limiter lives
     /// as long as the server and nothing else spends from it.
-    pub fn over(identity: Identity) -> McpServer {
+    ///
+    /// # Errors
+    ///
+    /// [`TierError`] when the token's scopes span two tiers; see
+    /// [`Self::sharing`].
+    pub fn over(identity: Identity) -> Result<McpServer, TierError> {
         McpServer::sharing(identity, Arc::new(InvocationLimiter::new()))
     }
 
@@ -339,16 +385,31 @@ impl McpServer {
     /// holds one limiter for the process and hands it to every server
     /// it builds, which is what makes a token's window outlive the
     /// request that opened it.
-    pub fn sharing(identity: Identity, limiter: Arc<InvocationLimiter>) -> McpServer {
+    ///
+    /// This is also where Story 11.4 AC #1 is enforced, for both
+    /// bindings at once: every server is built here, so a token whose
+    /// scopes span two tiers never becomes one, whichever adapter
+    /// asked.
+    ///
+    /// # Errors
+    ///
+    /// [`TierError`] naming the scopes that put the token in two tiers,
+    /// or a scope no tier knows.
+    pub fn sharing(
+        identity: Identity,
+        limiter: Arc<InvocationLimiter>,
+    ) -> Result<McpServer, TierError> {
+        let tier = tier::resolve(&identity.scopes)?;
         let registered = tools::catalogue()
             .iter()
-            .filter(|spec| identity.scopes.iter().any(|held| held == spec.scope))
+            .filter(|spec| tier.registers(spec, &identity.scopes))
             .collect();
-        McpServer {
+        Ok(McpServer {
             identity,
+            tier,
             registered,
             limiter,
-        }
+        })
     }
 
     /// The token this server is running as.
@@ -361,74 +422,68 @@ impl McpServer {
         &self.registered
     }
 
-    /// Which tier this server is, from what it registered: the admin
-    /// tier once any of its tools is registered, the config tier once
-    /// any other tool that changes the configuration is, the read tier
-    /// otherwise.
-    ///
-    /// A name for the operator's notice and nothing more. Story 11.4
-    /// owns the tier table and the refusal of a token spanning two
-    /// tiers; nothing here decides that.
-    pub fn tier(&self) -> &'static str {
-        if self.registered.iter().any(|spec| is_admin_tool(spec)) {
-            "admin tier"
-        } else if self.registered.iter().any(|spec| !spec.changes_nothing()) {
-            "config tier"
-        } else {
-            "read tier"
-        }
+    /// The one tier this server is, which its token's scopes decided.
+    pub fn tier(&self) -> Tier {
+        self.tier
     }
 
     /// One line for the operator, naming what was registered and what
     /// was not.
     ///
     /// Written for a human reading stderr, not for the model: an
-    /// adapter logs it and never puts it in a tool answer.
+    /// adapter logs it and never puts it in a tool answer. What it asks
+    /// for is read from the tier's row of [`tier::TIERS`], never from a
+    /// sentence written beside it: a tier is asked about its own tools'
+    /// scopes and what it tolerates, and nothing a second tier owns.
     pub fn startup_notice(&self) -> String {
+        let tier = self.tier;
+        let lacking = |scopes: Vec<&'static str>| -> Vec<&'static str> {
+            scopes
+                .into_iter()
+                .filter(|scope| !self.identity.scopes.iter().any(|held| held == scope))
+                .collect()
+        };
         if self.registered.is_empty() {
             return format!(
-                "Token {} carries no scope any MCP tier uses, so no tool is registered \
-                 and tools/list answers an empty set. It carries: {}. The read tier uses: \
-                 {}. The config tier adds: {}. The admin tier uses: {}. Mint a token \
-                 carrying at least one of those.",
+                "Token {} is a {tier} token and registers no tool, so tools/list answers an \
+                 empty set. It carries: {}. The {tier}'s tools sit behind: {}. Mint a token \
+                 carrying those, with `lorica mcp token create --tier {}`.",
                 self.identity.public_id,
                 self.identity.scopes.join(", "),
-                read_scopes().join(", "),
-                write_scopes().join(", "),
-                admin_scopes().join(", "),
+                tier.tool_scopes().join(", "),
+                tier.as_str(),
             );
         }
-        let tier = self.tier();
-        // A read tier is complete without a write scope, so its notice
-        // does not ask for one; a config tier is asked about both
-        // kinds, since it is the tier that uses reads to find ids; an
-        // admin tier is asked about its own tools and nothing else,
-        // since it needs no read and must not be told to widen.
-        let missing: Vec<&'static str> = tools::catalogue()
-            .iter()
-            .filter(|spec| match tier {
-                "admin tier" => is_admin_tool(spec),
-                "config tier" => !is_admin_tool(spec),
-                _ => spec.write().is_none(),
-            })
-            .map(|spec| spec.scope)
-            .filter(|scope| !self.identity.scopes.iter().any(|held| held == *scope))
-            .collect();
         let registered: Vec<&str> = self.registered.iter().map(|spec| spec.name).collect();
-        if missing.is_empty() {
-            format!(
+        let missing_tools = lacking(tier.tool_scopes());
+        let missing_tolerated = lacking(tier.tolerates().to_vec());
+        if missing_tools.is_empty() && missing_tolerated.is_empty() {
+            return format!(
                 "Token {} registered every tool of the {tier}: {}.",
                 self.identity.public_id,
                 registered.join(", "),
-            )
-        } else {
-            format!(
-                "Token {} registered the {tier}: {}. Not registered for want of a scope: {}.",
-                self.identity.public_id,
-                registered.join(", "),
-                deduplicated(&missing).join(", "),
-            )
+            );
         }
+        let mut notice = format!(
+            "Token {} registered the {tier}: {}.",
+            self.identity.public_id,
+            registered.join(", "),
+        );
+        if !missing_tools.is_empty() {
+            notice.push_str(&format!(
+                " Not registered for want of a scope: {}.",
+                missing_tools.join(", ")
+            ));
+        }
+        if !missing_tolerated.is_empty() {
+            notice.push_str(&format!(
+                " The {tier} also allows {}, which its tools need to find the ids they act \
+                 on and to preview a change; this token lacks {}.",
+                tier.tolerates().join(", "),
+                missing_tolerated.join(", "),
+            ));
+        }
+        notice
     }
 
     /// Answer one message, or `None` when it was a notification.
@@ -670,6 +725,12 @@ impl McpServer {
     /// is guess which grant this tool wanted.
     fn why_not(&self, name: &str) -> String {
         match tools::find(name) {
+            Some(spec) if !self.tier.serves(spec) => format!(
+                "no tool by that name is registered on this server: it belongs to the {}, \
+                 behind the {} scope, and this server serves the {}; one process serves one \
+                 tier",
+                spec.tier, spec.scope, self.tier
+            ),
             Some(spec) => format!(
                 "no tool by that name is registered on this server: it needs the {} scope and \
                  this server's token does not carry it",
@@ -692,61 +753,6 @@ fn identity_of(answer: &Value) -> Option<Identity> {
         .map(|scope| scope.as_str().map(str::to_string))
         .collect::<Option<Vec<String>>>()?;
     Some(Identity { public_id, scopes })
-}
-
-/// Every scope the read tier has a tool for, once each, in catalogue
-/// order.
-pub fn read_scopes() -> Vec<&'static str> {
-    deduplicated(
-        &tools::catalogue()
-            .iter()
-            .filter(|spec| spec.write().is_none())
-            .map(|spec| spec.scope)
-            .collect::<Vec<&'static str>>(),
-    )
-}
-
-/// Every scope the config tier adds over the read tier, once each, in
-/// catalogue order. A preview sits behind its mutation's write scope,
-/// so it counts here although it changes nothing.
-pub fn write_scopes() -> Vec<&'static str> {
-    deduplicated(
-        &tools::catalogue()
-            .iter()
-            .filter(|spec| spec.write().is_some() && !is_admin_tool(spec))
-            .map(|spec| spec.scope)
-            .collect::<Vec<&'static str>>(),
-    )
-}
-
-/// Every scope the admin tier uses, once each, in catalogue order.
-pub fn admin_scopes() -> Vec<&'static str> {
-    deduplicated(
-        &tools::catalogue()
-            .iter()
-            .filter(|spec| is_admin_tool(spec))
-            .map(|spec| spec.scope)
-            .collect::<Vec<&'static str>>(),
-    )
-}
-
-/// Whether `spec` is one of the admin tier's tools, an apply or a
-/// preview of [`tools::ADMIN_MUTATIONS`].
-fn is_admin_tool(spec: &ToolSpec) -> bool {
-    tools::ADMIN_MUTATIONS
-        .iter()
-        .any(|mutation| mutation.apply == spec.name || mutation.preview == spec.name)
-}
-
-/// `names` with later repeats dropped, order kept.
-fn deduplicated(names: &[&'static str]) -> Vec<&'static str> {
-    let mut kept: Vec<&'static str> = Vec::with_capacity(names.len());
-    for name in names {
-        if !kept.contains(name) {
-            kept.push(name);
-        }
-    }
-    kept
 }
 
 #[cfg(test)]
@@ -879,12 +885,13 @@ mod tests {
     #[tokio::test]
     async fn a_token_carrying_no_scope_of_this_tier_starts_with_no_tools_and_says_why() {
         // AC #3's other half. Minting refuses an empty scope array, so
-        // the real case is a token carrying scopes none of which this
-        // tier uses, and the answer is a running server with an empty
-        // list rather than a server whose every call fails.
+        // the real case is a token carrying scopes of one tier that no
+        // tool of it uses, and the answer is a running server with an
+        // empty list rather than a server whose every call fails.
         let plane = Plane::carrying(&["environments:write"]);
         let server = server_for(&plane).await;
         assert!(server.tools().is_empty());
+        assert_eq!(server.tier(), Tier::Config);
 
         let listed = server
             .handle(&plane, request(1, "tools/list", json!({})))
@@ -894,19 +901,55 @@ mod tests {
         assert_eq!(listed["result"]["resultType"], json!("complete"));
 
         let notice = server.startup_notice();
-        assert!(notice.contains("no tool is registered"), "{notice}");
+        assert!(notice.contains("registers no tool"), "{notice}");
         assert!(notice.contains("environments:write"), "{notice}");
-        assert!(notice.contains("logs:read"), "{notice}");
-        assert!(notice.contains("routes:write"), "{notice}");
-        assert!(notice.contains("settings:write"), "{notice}");
+        assert!(notice.contains("--tier config"), "{notice}");
+        for scope in Tier::Config.tool_scopes() {
+            assert!(notice.contains(scope), "{notice}");
+        }
+        // Another tier's scopes are not advice this token should take.
+        assert!(!notice.contains("logs:read"), "{notice}");
+        assert!(!notice.contains("settings:write"), "{notice}");
         assert!(notice.contains("0123456789abcdef01234567"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn iv1_a_token_spanning_two_tiers_never_becomes_a_server_on_either_constructor() {
+        // Story 11.4 IV1 at the core. `introspect` is what the stdio
+        // binding runs and `sharing` what the Streamable HTTP binding
+        // runs per request; `over` is the one they both reach.
+        let plane = Plane::carrying(&["logs:read", "routes:write"]);
+        let refused = McpServer::introspect(&plane)
+            .await
+            .err()
+            .expect("a token spanning two tiers is refused at startup");
+        let refused = match refused {
+            StartupError::Tier(refused) => refused,
+            other => panic!("refused for another reason: {other}"),
+        };
+        assert_eq!(refused.offending, vec!["logs:read".to_string()]);
+        assert_eq!(refused.anchoring, vec!["routes:write".to_string()]);
+        let told = StartupError::Tier(refused).to_string();
+        assert!(
+            told.contains("logs:read") && told.contains("routes:write"),
+            "{told}"
+        );
+        // Nothing but the introspection reached the plane.
+        assert_eq!(plane.asked_for(), vec![WHOAMI_PATH.to_string()]);
+
+        let identity = Identity {
+            public_id: "0123456789abcdef01234567".to_string(),
+            scopes: vec!["logs:read".to_string(), "routes:write".to_string()],
+        };
+        assert!(McpServer::sharing(identity.clone(), Arc::new(InvocationLimiter::new())).is_err());
+        assert!(McpServer::over(identity).is_err());
     }
 
     #[tokio::test]
     async fn the_notice_names_the_tier_and_what_a_partial_token_did_not_get() {
         let plane = Plane::carrying(&["logs:read"]);
         let server = server_for(&plane).await;
-        assert_eq!(server.tier(), "read tier");
+        assert_eq!(server.tier(), Tier::Read);
         let notice = server.startup_notice();
         assert!(notice.contains("read tier"), "{notice}");
         assert!(notice.contains("lorica_logs"), "{notice}");
@@ -915,31 +958,37 @@ mod tests {
         // asked for one.
         assert!(!notice.contains("routes:write"), "{notice}");
 
-        let plane = Plane::carrying(&read_scopes());
+        let plane = Plane::carrying(&Tier::Read.minted_scopes());
         let notice = server_for(&plane).await.startup_notice();
         assert!(notice.contains("every tool of the read tier"), "{notice}");
 
         // One write scope makes it the config tier, and that tier is
-        // asked about the reads it lacks, since it uses them for ids.
+        // asked about the reads it tolerates and lacks, since its tools
+        // use them for ids and previews, and never about a read it does
+        // not tolerate.
         let plane = Plane::carrying(&["routes:write"]);
         let server = server_for(&plane).await;
-        assert_eq!(server.tier(), "config tier");
+        assert_eq!(server.tier(), Tier::Config);
         let notice = server.startup_notice();
         assert!(notice.contains("config tier"), "{notice}");
         assert!(notice.contains("lorica_route_create_preview"), "{notice}");
-        assert!(notice.contains("routes:read"), "{notice}");
         assert!(notice.contains("backends:write"), "{notice}");
+        for tolerated in Tier::Config.tolerates() {
+            assert!(notice.contains(tolerated), "{notice}");
+        }
+        assert!(!notice.contains("logs:read"), "{notice}");
 
-        let every: Vec<&str> = read_scopes().into_iter().chain(write_scopes()).collect();
-        let notice = server_for(&Plane::carrying(&every)).await.startup_notice();
+        let notice = server_for(&Plane::carrying(&Tier::Config.minted_scopes()))
+            .await
+            .startup_notice();
         assert!(notice.contains("every tool of the config tier"), "{notice}");
 
         // The admin tier is complete with its own scope and is asked for
         // nothing else: telling it which reads or config writes it lacks
         // would be advice to widen the one tier meant to stay narrow.
-        let plane = Plane::carrying(&admin_scopes());
+        let plane = Plane::carrying(&Tier::Admin.minted_scopes());
         let server = server_for(&plane).await;
-        assert_eq!(server.tier(), "admin tier");
+        assert_eq!(server.tier(), Tier::Admin);
         let notice = server.startup_notice();
         assert!(notice.contains("every tool of the admin tier"), "{notice}");
         assert!(!notice.contains("routes:write"), "{notice}");
@@ -951,7 +1000,7 @@ mod tests {
         // Story 11.2 AC #2: a read-tier token can never gain a write
         // tool. Every read scope there is, and not one mutation
         // registered, listed or callable.
-        let plane = Plane::carrying(&read_scopes());
+        let plane = Plane::carrying(Tier::Read.requires());
         let server = server_for(&plane).await;
         assert!(!server.tools().is_empty());
         for spec in server.tools() {
@@ -972,15 +1021,66 @@ mod tests {
                     json!(jsonrpc::code::METHOD_NOT_FOUND),
                     "{name}"
                 );
+                let message = refused["error"]["message"].as_str().unwrap_or_default();
+                assert!(message.contains(mutation.scope), "{name}: {refused}");
+                // The tier answer, not the scope answer: adding the
+                // scope would make this token span two tiers, so
+                // "needs the scope" is advice it could never follow.
                 assert!(
-                    refused["error"]["message"]
-                        .as_str()
-                        .is_some_and(|message| message.contains(mutation.scope)),
+                    message.contains("belongs to the config tier"),
                     "{name}: {refused}"
                 );
+                assert!(
+                    message.contains("one process serves one tier"),
+                    "{name}: {refused}"
+                );
+                assert!(!message.contains("does not carry it"), "{name}: {refused}");
             }
         }
         // Nothing but the introspection reached the plane.
+        assert_eq!(plane.asked_for(), vec![WHOAMI_PATH.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_missing_tool_is_named_by_tier_across_tiers_and_by_scope_within_one() {
+        // A config token holding routes:write alone. A read-tier tool
+        // its tier does not tolerate belongs to another tier; a config
+        // tool behind a scope it does not hold is a scope it could add.
+        let plane = Plane::carrying(&["routes:write", "routes:read"]);
+        let server = server_for(&plane).await;
+        let answered = |name: &'static str| {
+            let server = &server;
+            let plane = &plane;
+            async move {
+                let refused = server
+                    .handle(
+                        plane,
+                        request(1, "tools/call", json!({ "name": name, "arguments": {} })),
+                    )
+                    .await
+                    .expect("a request is answered");
+                assert_eq!(
+                    refused["error"]["code"],
+                    json!(jsonrpc::code::METHOD_NOT_FOUND),
+                    "{name}"
+                );
+                refused["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            }
+        };
+        let foreign = answered("lorica_logs").await;
+        assert!(foreign.contains("belongs to the read tier"), "{foreign}");
+        assert!(foreign.contains("serves the config tier"), "{foreign}");
+        let same_tier = answered("lorica_backend_create").await;
+        assert!(
+            same_tier.contains("needs the backends:write scope"),
+            "{same_tier}"
+        );
+        assert!(!same_tier.contains("belongs to"), "{same_tier}");
+        let admin = answered("lorica_settings_update").await;
+        assert!(admin.contains("belongs to the admin tier"), "{admin}");
         assert_eq!(plane.asked_for(), vec![WHOAMI_PATH.to_string()]);
     }
 
@@ -1495,11 +1595,12 @@ mod tests {
         let call = |n: i64| request(n, "tools/call", json!({ "name": "lorica_logs" }));
 
         for n in 0..i64::from(RATE_BUDGET) {
-            let fresh = McpServer::sharing(identity.clone(), Arc::clone(&limiter));
+            let fresh =
+                McpServer::sharing(identity.clone(), Arc::clone(&limiter)).expect("one tier");
             let handled = fresh.handle_reporting(&plane, call(n)).await;
             assert_eq!(handled.outcome, Outcome::Ok, "call {n}");
         }
-        let fresh = McpServer::sharing(identity.clone(), Arc::clone(&limiter));
+        let fresh = McpServer::sharing(identity.clone(), Arc::clone(&limiter)).expect("one tier");
         let over = fresh
             .handle_reporting(&plane, call(i64::from(RATE_BUDGET)))
             .await;
@@ -1513,7 +1614,8 @@ mod tests {
                 scopes: vec!["logs:read".to_string()],
             },
             Arc::clone(&limiter),
-        );
+        )
+        .expect("one tier");
         let allowed = other.handle_reporting(&plane, call(1)).await;
         assert_eq!(allowed.outcome, Outcome::Ok);
         assert_eq!(limiter.tracked(), 2);
@@ -1630,49 +1732,55 @@ mod tests {
         // views and `lorica-api` sweeps those; what this crate owes is
         // that it adds nothing of its own, so the sweep walks every
         // registered tool's answer, the tool list and the refusals,
-        // over a token carrying every scope of both tiers.
-        let every: Vec<&str> = read_scopes()
-            .into_iter()
-            .chain(write_scopes())
-            .chain(admin_scopes())
-            .collect();
-        let plane = Plane::carrying(&every);
-        let server = server_for(&plane).await;
-
-        let mut swept: Vec<Value> = vec![
-            server
-                .handle(&plane, request(1, "tools/list", json!({})))
-                .await
-                .expect("a request is answered"),
-            server
-                .handle(&plane, request(2, "server/discover", json!({})))
-                .await
-                .expect("a request is answered"),
-        ];
-        assert_eq!(server.tools().len(), tools::catalogue().len());
-        for spec in server.tools() {
-            let mut map = serde_json::Map::new();
-            if let Some(param) = spec.resource {
-                map.insert(param.name.to_string(), json!("r-1"));
+        // over one token per tier, each carrying every scope its tier
+        // mints, which between them register the whole catalogue.
+        let mut swept: Vec<Value> = Vec::new();
+        let mut registered = 0usize;
+        for tier in Tier::ALL {
+            let plane = Plane::carrying(&tier.minted_scopes());
+            let server = server_for(&plane).await;
+            assert_eq!(server.tier(), tier);
+            registered += server
+                .tools()
+                .iter()
+                .filter(|spec| spec.tier == tier)
+                .count();
+            for message in [
+                request(1, "tools/list", json!({})),
+                request(2, "server/discover", json!({})),
+            ] {
+                swept.push(
+                    server
+                        .handle(&plane, message)
+                        .await
+                        .expect("a request is answered"),
+                );
             }
-            if let Some(body) = spec.body() {
-                map.insert(body.argument.to_string(), json!({}));
+            for spec in server.tools() {
+                let mut map = serde_json::Map::new();
+                if let Some(param) = spec.resource {
+                    map.insert(param.name.to_string(), json!("r-1"));
+                }
+                if let Some(body) = spec.body() {
+                    map.insert(body.argument.to_string(), json!({}));
+                }
+                let arguments = Value::Object(map);
+                swept.push(
+                    server
+                        .handle(
+                            &plane,
+                            request(
+                                3,
+                                "tools/call",
+                                json!({ "name": spec.name, "arguments": arguments }),
+                            ),
+                        )
+                        .await
+                        .expect("a request is answered"),
+                );
             }
-            let arguments = Value::Object(map);
-            swept.push(
-                server
-                    .handle(
-                        &plane,
-                        request(
-                            3,
-                            "tools/call",
-                            json!({ "name": spec.name, "arguments": arguments }),
-                        ),
-                    )
-                    .await
-                    .expect("a request is answered"),
-            );
         }
+        assert_eq!(registered, tools::catalogue().len());
 
         let mut names: Vec<String> = Vec::new();
         for answer in &swept {

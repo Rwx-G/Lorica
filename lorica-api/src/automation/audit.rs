@@ -223,6 +223,10 @@ const RATE_LIMITED: &str = "rate_limited";
 /// claimed a protocol revision this node does not speak.
 const PROTOCOL_ERROR: &str = "protocol_error";
 
+/// The reason a 403 on [`MCP_PATH`] carries when the token's scopes
+/// span two MCP tiers, so no server was built for it (Story 11.4 AC #1).
+const SPANS_TIERS: &str = "spans_tiers";
+
 /// Every reason an automation audit row can name that is not a scope,
 /// and with the scope spellings the vocabulary the "Reading a refusal"
 /// section of `docs/automation.md` publishes.
@@ -273,6 +277,7 @@ pub const AUTOMATION_AUDIT_REASONS: &[&str] = &[
     INVALID_PARAMS,
     RATE_LIMITED,
     PROTOCOL_ERROR,
+    SPANS_TIERS,
 ];
 
 /// Whether `reason` is in the published vocabulary: a listed word
@@ -566,6 +571,7 @@ fn mcp_outcome(record: &McpCallRecord) -> (&'static str, Option<String>) {
         Outcome::Refused(status) => (StatusCode::from_u16(status).map_or("error", outcome), None),
         Outcome::Failed => ("error", None),
         Outcome::ProtocolError => ("refused", Some(PROTOCOL_ERROR.to_string())),
+        Outcome::SpansTiers => ("forbidden", Some(SPANS_TIERS.to_string())),
     }
 }
 
@@ -839,7 +845,13 @@ mod tests {
                 "`{wire}` is a scope a 403 can name and is not published"
             );
         }
-        for reason in [UNKNOWN_TOOL, INVALID_PARAMS, RATE_LIMITED, PROTOCOL_ERROR] {
+        for reason in [
+            UNKNOWN_TOOL,
+            INVALID_PARAMS,
+            RATE_LIMITED,
+            PROTOCOL_ERROR,
+            SPANS_TIERS,
+        ] {
             assert!(is_published_reason(reason), "{reason}");
         }
         // And the block that used to restate the scopes is gone: a
@@ -949,6 +961,12 @@ mod tests {
             word(None, Outcome::ProtocolError),
             "automation.request.refused:protocol_error"
         );
+        // A token spanning two tiers built no server: a refusal of the
+        // credential for this endpoint, named as such.
+        assert_eq!(
+            word(Some("lorica_logs"), Outcome::SpansTiers),
+            "automation.request.forbidden:spans_tiers"
+        );
         // The plane's refusal of the read keeps the word its status has
         // on every other row, and names no scope: the tool ran, so the
         // token held it.
@@ -978,6 +996,7 @@ mod tests {
             Outcome::Refused(404),
             Outcome::Failed,
             Outcome::ProtocolError,
+            Outcome::SpansTiers,
         ] {
             let (word, reason) = mcp_outcome(&record(Some("lorica_logs"), outcome));
             assert!(

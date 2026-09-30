@@ -463,7 +463,10 @@ paths:
 
         The rows carry text Lorica collected from whoever sent the
         request: paths, hostnames, backend addresses and error strings.
-        Treat every one of those as attacker-controlled data.
+        Treat every one of those as attacker-controlled data. A path
+        is recorded without its query string; any query value or
+        fragment a row's `path` carries is answered as `[redacted]`,
+        names kept.
 
 
         Required scope: `logs:read`.
@@ -796,7 +799,13 @@ paths:
       description: >-
         Every backend with its address, weight, health status,
         lifecycle state, live connection count and EWMA latency score:
-        the view the dashboard's backend table reads.
+        the view the dashboard's backend table reads, with the query
+        values of `health_check_path` withheld (`[redacted]`).
+
+
+        For a credential carrying a scope a grant bounds, only the
+        backends whose address is inside its `allowed_backend_cidrs`,
+        and the window pages over those.
 
 
         Required scope: `backends:read`.
@@ -985,7 +994,15 @@ paths:
         The view is the management API's own, so what it withholds it
         withholds here: a route's Basic-auth username is present and
         its password hash is not, because the hash never leaves the
-        store.
+        store. This plane also withholds what that view carries for the
+        dashboard and a credential can ride in: each `proxy_headers`
+        value, name kept, and the userinfo and query values of
+        `forward_auth.address`, replaced by `[redacted]`.
+
+
+        For a credential carrying a scope a grant bounds, only the
+        routes whose hostname and every alias are inside its
+        `allowed_hostnames`, and the window pages over those.
 
 
         Required scope: `routes:read`.
@@ -1181,6 +1198,11 @@ paths:
         key material crosses no path on this listener at all: the
         single-certificate endpoint, which does return the public
         certificate PEM, is deliberately not mounted here.
+
+
+        For a credential carrying a scope a grant bounds, only the
+        certificates whose domain and every SAN are inside its
+        `allowed_hostnames`, and the window pages over those.
 
 
         Required scope: `certificates:read`.
@@ -1388,6 +1410,14 @@ paths:
         connection state.
 
 
+        One process serves one MCP tier, and this path builds one
+        server per request: a token whose scopes span two tiers (a read
+        scope the config tier does not tolerate beside a config write,
+        for instance) is refused with a `403` naming the offending
+        scopes, before any tool is listed or called. The stdio binary
+        refuses the same token at startup, through the same check.
+
+
         Every POST carries `MCP-Protocol-Version`, `Mcp-Method` mirrored
         from the body's `method`, and, on a `tools/call`, `Mcp-Name`
         mirrored from `params.name`. Each is VALIDATED against the body
@@ -1443,7 +1473,7 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
-          $ref: "#/components/responses/McpOriginRefused"
+          $ref: "#/components/responses/McpForbidden"
         "404":
           $ref: "#/components/responses/McpMethodNotFound"
 
@@ -2366,18 +2396,24 @@ components:
               code: -32020
               message: "`mcp-name` does not equal the body's `params.name`"
 
-    McpOriginRefused:
+    McpForbidden:
       description: >-
+        Either of two refusals, each a JSON-RPC error.
+
+
         An `Origin` header was present. This endpoint serves no browser
         origin, so every one is refused: the specification's one MUST on
         this transport is against DNS rebinding, and a present `Origin`
         on a machine-facing API behind a bearer token means a page is
-        driving it.
+        driving it. The body carries no `id`: the request was not read
+        far enough to have one, and inventing one would answer a
+        correlation nobody made.
 
 
-        The body carries no `id`: the request was not read far enough to
-        have one, and inventing one would answer a correlation nobody
-        made.
+        Or the presented token's scopes span two MCP tiers, so no server
+        is built for it. The body carries the request's `id` and a
+        message naming the scopes that put the token in two tiers; the
+        audit row reads `automation.request.forbidden:spans_tiers`.
       content:
         application/json:
           schema:

@@ -81,6 +81,7 @@ use std::sync::OnceLock;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{json, Map, Value};
 
+use crate::tier::Tier;
 use crate::{untrusted, Verb};
 
 /// The most bytes an MCP tool name may weigh.
@@ -319,6 +320,12 @@ pub struct ToolSpec {
     pub paginated: bool,
     /// A read, or a mutation applied or previewed.
     pub kind: Kind,
+    /// The tier this tool belongs to, which is the array it is
+    /// declared in: [`READS`], [`MUTATIONS`] or [`ADMIN_MUTATIONS`].
+    /// [`catalogue`] sets it for a mutation's pair from the array the
+    /// mutation comes from, and a test pins every tool against its
+    /// array, so membership is data and never a name matched later.
+    pub tier: Tier,
 }
 
 /// One mutation, declared once: [`catalogue`] builds its apply tool
@@ -352,9 +359,10 @@ pub struct Mutation {
 }
 
 impl Mutation {
-    /// The apply tool, or the preview when `previews`.
-    fn tool(&self, previews: bool) -> ToolSpec {
+    /// The apply tool, or the preview when `previews`, in `tier`.
+    fn tool(&self, previews: bool, tier: Tier) -> ToolSpec {
         ToolSpec {
+            tier,
             name: if previews { self.preview } else { self.apply },
             title: self.title,
             summary: self.summary,
@@ -900,6 +908,7 @@ pub const READS: &[ToolSpec] = &[
         ],
         paginated: true,
         kind: Kind::Read,
+        tier: Tier::Read,
     },
     ToolSpec {
         name: "lorica_waf_events",
@@ -916,6 +925,7 @@ pub const READS: &[ToolSpec] = &[
         }],
         paginated: true,
         kind: Kind::Read,
+        tier: Tier::Read,
     },
     ToolSpec {
         name: "lorica_waf_stats",
@@ -928,6 +938,7 @@ pub const READS: &[ToolSpec] = &[
         filters: &[],
         paginated: false,
         kind: Kind::Read,
+        tier: Tier::Read,
     },
     ToolSpec {
         name: "lorica_sla_overview",
@@ -940,6 +951,7 @@ pub const READS: &[ToolSpec] = &[
         filters: &[],
         paginated: true,
         kind: Kind::Read,
+        tier: Tier::Read,
     },
     ToolSpec {
         name: "lorica_sla_route",
@@ -952,6 +964,7 @@ pub const READS: &[ToolSpec] = &[
         filters: &[],
         paginated: true,
         kind: Kind::Read,
+        tier: Tier::Read,
     },
     ToolSpec {
         name: "lorica_cluster_status",
@@ -966,6 +979,7 @@ pub const READS: &[ToolSpec] = &[
         filters: &[],
         paginated: false,
         kind: Kind::Read,
+        tier: Tier::Read,
     },
     ToolSpec {
         name: "lorica_backends",
@@ -978,6 +992,7 @@ pub const READS: &[ToolSpec] = &[
         filters: &[],
         paginated: true,
         kind: Kind::Read,
+        tier: Tier::Read,
     },
     ToolSpec {
         name: "lorica_routes",
@@ -994,6 +1009,7 @@ pub const READS: &[ToolSpec] = &[
         }],
         paginated: true,
         kind: Kind::Read,
+        tier: Tier::Read,
     },
     ToolSpec {
         name: "lorica_certificates",
@@ -1008,6 +1024,7 @@ pub const READS: &[ToolSpec] = &[
         filters: &[],
         paginated: true,
         kind: Kind::Read,
+        tier: Tier::Read,
     },
 ];
 
@@ -1580,19 +1597,21 @@ pub(crate) const NAMED_FOR_A_LIFETIME_NOT_A_CREDENTIAL: &[&str] = &["cookie_ttl_
 /// preview.
 ///
 /// Built once for the process from [`READS`], [`MUTATIONS`] and
-/// [`ADMIN_MUTATIONS`]. A
-/// token's registry is a filter over this list by scope
-/// (`McpServer::sharing`), which is what makes the tiers a property of
-/// the token rather than of a mode: a read scope registers a read tool
-/// and nothing else, because every write tool here declares a write
-/// scope, and a test pins that.
+/// [`ADMIN_MUTATIONS`], each tool carrying the [`Tier`] of the array it
+/// came from. A token's registry is a filter over this list by the
+/// token's one tier and its scopes (`McpServer::sharing`, reading
+/// [`crate::tier::TIERS`]): a read scope registers a read tool and
+/// nothing else, because every write tool here declares a write scope,
+/// and a test pins that.
 pub fn catalogue() -> &'static [ToolSpec] {
     static CATALOGUE: OnceLock<Vec<ToolSpec>> = OnceLock::new();
     CATALOGUE.get_or_init(|| {
         let mut all: Vec<ToolSpec> = READS.to_vec();
-        for mutation in MUTATIONS.iter().chain(ADMIN_MUTATIONS) {
-            all.push(mutation.tool(false));
-            all.push(mutation.tool(true));
+        for (tier, mutations) in [(Tier::Config, MUTATIONS), (Tier::Admin, ADMIN_MUTATIONS)] {
+            for mutation in mutations {
+                all.push(mutation.tool(false, tier));
+                all.push(mutation.tool(true, tier));
+            }
         }
         all
     })
@@ -1805,7 +1824,9 @@ mod tests {
         }
 
         // And the other direction, so a scope added to the enum does
-        // not quietly stay outside both tiers. What stays outside is
+        // not quietly stay without a tool. Which tier it belongs to is
+        // `tier.rs`'s question, walked there; this one is whether any
+        // tool sits behind it. What stays toolless is
         // named here as the deliberate complement: the two environment
         // scopes are Story 10.4's resource, which is a pipeline's
         // surface and not an operator's.
@@ -1882,9 +1903,7 @@ mod tests {
         // registers the admin tier and nothing else; every admin tool
         // calls the settings path and no other.
         for spec in catalogue() {
-            let admin = ADMIN_MUTATIONS
-                .iter()
-                .any(|m| m.apply == spec.name || m.preview == spec.name);
+            let admin = spec.tier == Tier::Admin;
             assert_eq!(spec.scope == "settings:write", admin, "{}", spec.name);
             if admin {
                 assert_eq!(spec.path, "/automation/v1/settings", "{}", spec.name);

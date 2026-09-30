@@ -86,6 +86,7 @@ pub mod listener;
 pub mod mcp;
 pub mod oidc;
 pub mod read;
+pub mod redact;
 pub mod router;
 pub mod scope;
 pub mod write;

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the Lorica E2E test suite with Docker Compose.
-# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-rbac] [--skip-hot-upgrade] [--skip-log-sinks] [--skip-acme]
+# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-rbac] [--skip-hot-upgrade] [--skip-log-sinks] [--skip-acme] [--skip-mcp]
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
@@ -14,6 +14,7 @@
 #   --skip-cluster      Skip the v1.7.0 Epic 9 cluster profile (faster)
 #   --skip-capture      Skip the v1.8.0 Stories 10.1/10.2 capture profile (faster)
 #   --skip-capture-workers  Skip the worker-mode variant of the capture profile
+#   --skip-mcp          Skip the v1.9.0 Story 11.4 MCP profile (faster)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -31,6 +32,7 @@ SKIP_ACME=false
 SKIP_CLUSTER=false
 SKIP_CAPTURE=false
 SKIP_CAPTURE_WORKERS=false
+SKIP_MCP=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -47,6 +49,7 @@ for arg in "$@"; do
         --skip-cluster)      SKIP_CLUSTER=true ;;
         --skip-capture)      SKIP_CAPTURE=true ;;
         --skip-capture-workers) SKIP_CAPTURE_WORKERS=true ;;
+        --skip-mcp)          SKIP_MCP=true ;;
     esac
 done
 
@@ -76,7 +79,7 @@ dump_node_log() {
 # run boots against stale data - e.g. the cert-export smoke rotates the
 # admin password, and a stale volume 401s the next login), and on BUILD a
 # plain `docker compose build` (no profile flags) skips them entirely.
-ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks --profile acme --profile cluster --profile capture --profile capture-workers"
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks --profile acme --profile cluster --profile capture --profile capture-workers --profile mcp"
 
 # `docker compose run` never rebuilds an existing image, so a stale runner
 # would silently run old assertions. With --build, build every service
@@ -458,6 +461,40 @@ if [ "$SKIP_CAPTURE_WORKERS" = false ] && [ "$SKIP_CAPTURE" = false ] \
 
     if [ "$EXIT_CODE" = "0" ]; then
         docker compose --profile capture-workers run --rm capture-workers-smoke || EXIT_CODE=$?
+    fi
+fi
+
+# ---- Phase 11: MCP profile (Story 11.4 AC #4, IV1, IV2) --------------
+# A standalone node with the automation listener, and a smoke that
+# spawns `lorica-mcp` over stdio for each tier: tokens minted by the
+# real `lorica mcp token create --tier`, tool lists, one mutation and
+# one refusal per mutating tier, the audit rows, a revocation mid
+# session, the two-tier refusal (exit 78) and the audit chain.
+# Opt-out via --skip-mcp (default ON).
+if [ "$SKIP_MCP" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (mcp profile) ==="
+    echo ""
+
+    docker compose --profile mcp up $BUILD_FLAG -d lorica-mcp
+
+    echo "Waiting for Lorica (mcp) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose --profile mcp exec -T lorica-mcp sh -c 'test -f /shared/mcp_ready' >/dev/null 2>&1; then
+            echo "Lorica (mcp) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (mcp) did not start within 120s"
+            docker compose logs lorica-mcp | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    if ! docker compose --profile mcp run --rm mcp-smoke; then
+        EXIT_CODE=1
+        dump_node_log lorica-mcp
     fi
 fi
 

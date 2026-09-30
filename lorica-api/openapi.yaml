@@ -5875,7 +5875,7 @@ components:
       description: >-
         Body for minting an automation token. Unknown fields are refused, which
         is what makes the server-owned facts server-owned rather than ignored.
-      required: [name, scopes, allowed_hostnames]
+      required: [name, scopes]
       properties:
         name:
           type: string
@@ -5888,15 +5888,21 @@ components:
         allowed_hostnames:
           type: array
           description: >-
-            At least one. An exact name (`api.example.com`) or a single leading
-            wildcard (`*.preview.example.com`), read with TLS wildcard semantics:
-            one label. A bare `*` is refused.
+            Required, at least one, when a scope the grants bound is carried
+            (the set `AutomationScope::is_grant_bounded` decides, described in
+            docs/automation.md); refused, empty or omitted, otherwise, since no
+            path such a token reaches reads it. An exact name
+            (`api.example.com`) or a single leading wildcard
+            (`*.preview.example.com`), read with TLS wildcard semantics: one
+            label. A bare `*` is refused. An empty list admits no host.
           items:
             type: string
         allowed_backend_cidrs:
           type: array
-          description: "CIDRs (or bare addresses) this token may point a hostname at. At least one: there is no node-wide default backend policy, and an empty list would be read as every address."
-          minItems: 1
+          description: >-
+            CIDRs (or bare addresses) this token may point a hostname at. Same
+            rule as `allowed_hostnames`. An empty list admits no address: there
+            is no node-wide default backend policy to fall back on.
           items:
             type: string
         max_ttl_seconds:
@@ -5908,7 +5914,7 @@ components:
           description: Absolute instant the token stops being accepted. Mutually exclusive with `lifetime_days`.
         lifetime_days:
           type: integer
-          description: Lifetime from now, in days. Mutually exclusive with `expires_at`. Defaults to 365 when neither is sent.
+          description: Lifetime from now, in days. Mutually exclusive with `expires_at`. Defaults to 365 when neither is sent. A token carrying `settings:write` may live at most 7 days, the default included, and is refused with a 422 naming the ceiling past it.
 
     AutomationToken:
       type: object
@@ -5962,7 +5968,7 @@ components:
         Body for registering an OIDC issuer entry. Unknown fields are refused,
         which is what makes the server-owned facts server-owned rather than
         ignored.
-      required: [issuer, audience, allowed_hostnames, scopes]
+      required: [issuer, audience, scopes]
       properties:
         issuer:
           type: string
@@ -5994,13 +6000,17 @@ components:
             the two `_protected` claims take exactly `true` or `false`.
         allowed_hostnames:
           type: array
-          description: At least one; the same one-label wildcard rule as a static token.
+          description: >-
+            The static token's rule: required, at least one, when a scope is
+            bounded by the grants, refused otherwise; the same one-label
+            wildcard rule. An empty list admits no host.
           items:
             type: string
         allowed_backend_cidrs:
           type: array
-          description: "CIDRs a token from this entry may point a hostname at. At least one: there is no node-wide default backend policy, and an empty list would be read as every address."
-          minItems: 1
+          description: >-
+            CIDRs a token from this entry may point a hostname at, under the
+            same rule. An empty list admits no address.
           items:
             type: string
         max_ttl_seconds:

@@ -28,12 +28,38 @@
 //!
 //! Each one calls the management handler or the function that handler
 //! was split out of, and re-wraps the rows it returns. Nothing in this
-//! module computes a figure, filters a row set or serialises a record.
-//! Two surfaces that compute the same answer independently drift, and
-//! the drift shows up as a field one of them stopped stripping, which
-//! is a leak nobody's test notices. The rows cross unchanged; what this
-//! module adds is the window around them, and the ordering the window
-//! walks.
+//! module computes a figure or serialises a record. Two surfaces that
+//! compute the same answer independently drift, and the drift shows up
+//! as a field one of them stopped stripping, which is a leak nobody's
+//! test notices. What this module adds is the window around the rows,
+//! the ordering the window walks, and two things the management plane
+//! has no reason to do (fix pass of Story 11.4, 2026-09-30):
+//!
+//! - it withholds the values that can carry a credential, through
+//!   [`super::redact`], and keeps every key;
+//! - for a principal whose grants mean something
+//!   ([`AutomationPrincipal::carries_grants`]), it answers only the
+//!   routes, backends and certificates inside those grants.
+//!
+//! # A granted principal sees what it may act on, and nothing else
+//!
+//! A config-tier token reads routes, backends and certificates to find
+//! the ids its tools act on, and those listings used to be node-wide.
+//! Their free-text fields (an error page, a rewrite, a backend name) are
+//! written by every other principal holding a write scope, OIDC
+//! pipelines included, so a config-tier model read text a lower-trust
+//! writer planted and could act on it with a wider grant than that
+//! writer's. The listing is therefore the set the write guard admits,
+//! by the same predicates ([`super::write::route_names_granted`],
+//! [`super::write::certificate_names_granted`] and the backend address
+//! check), so what a granted token sees and what it may change are one
+//! set. Paging walks the filtered set. A principal whose grants bound
+//! nothing (the read tier) sees every row, as before.
+//!
+//! No read on this plane fetches a route, a backend or a certificate by
+//! id; the single-row management paths are not mounted. The one place
+//! an id outside the grant is named is a write or a preview, which is
+//! refused with a `403` naming the id and nothing about the row.
 //!
 //! # The window is the server's, not the caller's
 //!
@@ -62,11 +88,12 @@
 //!
 //! # No secret crosses this boundary
 //!
-//! Because the views are the management plane's own, the filtering is
-//! too: certificate key material never leaves [`crate::certificates`]'s
-//! list view, and a route's Basic-auth hash never leaves
-//! [`crate::routes`]'s. That is an inherited property and not a
-//! promise, so `lorica-api/src/tests.rs` walks every path
+//! Most of that is inherited from the management plane's views:
+//! certificate key material never leaves [`crate::certificates`]'s list
+//! view, and a route's Basic-auth hash never leaves [`crate::routes`]'s.
+//! What those views do carry for the dashboard's sake, a route's
+//! `proxy_headers` values above all, [`super::redact`] withholds. None
+//! of it is a promise, so `lorica-api/src/tests.rs` walks every path
 //! [`super::scope`] declares - the list it walks is derived from that
 //! matrix, not retyped beside it - for the field names that must never
 //! appear (Story 11.1 AC #5), and pins the whole set of key names each
@@ -79,6 +106,10 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::auth::AutomationPrincipal;
+use super::environments::ensure_backend_address_granted;
+use super::redact;
+use super::write::{certificate_names_granted, route_names_granted};
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
@@ -260,6 +291,43 @@ fn rows(answer: Json<Value>, field: Option<&str>) -> Result<Vec<Value>, ApiError
     }
 }
 
+/// The string at `row[field]`, or the empty string when there is none.
+fn text<'a>(row: &'a Value, field: &str) -> &'a str {
+    row.get(field).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// Every string in the array at `row[field]`.
+fn texts<'a>(row: &'a Value, field: &str) -> impl Iterator<Item = &'a str> {
+    row.get(field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
+/// `rows`, reduced to the ones `inside` admits when `principal` carries
+/// grants, and every row otherwise.
+///
+/// A row missing the field its predicate reads is outside: a management
+/// view that renamed a field fails closed here, and the field-set pin in
+/// `lorica-api/src/tests.rs` is what reports the rename.
+fn within_the_grant(
+    principal: &AutomationPrincipal,
+    rows: Vec<Value>,
+    inside: impl Fn(&Value) -> bool,
+) -> Vec<Value> {
+    if !principal.carries_grants() {
+        return rows;
+    }
+    rows.into_iter().filter(|row| inside(row)).collect()
+}
+
+/// `rows` with `mask` applied to each.
+fn masked(mut rows: Vec<Value>, mask: fn(&mut Value)) -> Vec<Value> {
+    rows.iter_mut().for_each(mask);
+    rows
+}
+
 /// Refuse a free-text filter longer than this surface accepts.
 ///
 /// `name` is this module's own vocabulary, never the caller's text, so
@@ -333,7 +401,7 @@ pub async fn list_logs(
     // offset, and `has_more` never went false. `/waf/events` answers
     // newest first and pages correctly; this makes the two agree.
     rows.reverse();
-    Ok(page.of(rows))
+    Ok(page.of(masked(rows, redact::access_log_row)))
 }
 
 /// `GET /automation/v1/waf/events` (scope `waf:read`).
@@ -446,37 +514,54 @@ pub async fn cluster_status(
 /// `GET /automation/v1/backends` (scope `backends:read`).
 ///
 /// Every backend with its live EWMA score and connection count, the
-/// same view the dashboard's backend table reads.
+/// same view the dashboard's backend table reads, with its health-check
+/// query values withheld. A principal carrying grants sees the backends
+/// whose address is inside its `allowed_backend_cidrs`, and no other.
 ///
 /// # Errors
 ///
 /// Whatever [`crate::backends::list_backends`] answers.
 pub async fn list_backends(
+    principal: AutomationPrincipal,
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let page = page.page();
     let answer = crate::backends::list_backends(Extension(state)).await?;
-    Ok(page.of(rows(answer, Some("backends"))?))
+    let rows = within_the_grant(&principal, rows(answer, Some("backends"))?, |row| {
+        ensure_backend_address_granted(&principal, "address", text(row, "address")).is_ok()
+    });
+    Ok(page.of(masked(rows, redact::backend_row)))
 }
 
 /// `GET /automation/v1/routes` (scope `routes:read`).
 ///
 /// Every route with its linked backend ids, `?group=` narrowing them as
 /// on the management plane. The view carries a Basic-auth username and
-/// never its hash, because it is the management plane's own view.
+/// never its hash, because it is the management plane's own view, and
+/// its `proxy_headers` names without their values. A principal carrying
+/// grants sees the routes whose hostname and every alias are inside its
+/// `allowed_hostnames`, and no other.
 ///
 /// # Errors
 ///
 /// Whatever [`crate::routes::list_routes`] answers.
 pub async fn list_routes(
+    principal: AutomationPrincipal,
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
     Query(filters): Query<crate::routes::ListRoutesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let page = page.page();
     let answer = crate::routes::list_routes(Extension(state), Query(filters)).await?;
-    Ok(page.of(rows(answer, Some("routes"))?))
+    let rows = within_the_grant(&principal, rows(answer, Some("routes"))?, |row| {
+        route_names_granted(
+            &principal,
+            text(row, "hostname"),
+            texts(row, "hostname_aliases"),
+        )
+    });
+    Ok(page.of(masked(rows, redact::route_row)))
 }
 
 /// `GET /automation/v1/certificates` (scope `certificates:read`).
@@ -485,18 +570,25 @@ pub async fn list_routes(
 /// window and ACME settings. Never a PEM body and never key material,
 /// because this is the management plane's list view, which carries
 /// neither. The single-certificate path, which does return the public
-/// PEM, is deliberately not mounted here.
+/// PEM, is deliberately not mounted here. A principal carrying grants
+/// sees the certificates whose domain and every SAN are inside its
+/// `allowed_hostnames`, and no other.
 ///
 /// # Errors
 ///
 /// Whatever [`crate::certificates::list_certificates`] answers.
 pub async fn list_certificates(
+    principal: AutomationPrincipal,
     Extension(state): Extension<AppState>,
     Query(page): Query<PageQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let page = page.page();
     let answer = crate::certificates::list_certificates(Extension(state)).await?;
-    Ok(page.of(rows(answer, Some("certificates"))?))
+    let rows = within_the_grant(&principal, rows(answer, Some("certificates"))?, |row| {
+        !text(row, "domain").is_empty()
+            && certificate_names_granted(&principal, text(row, "domain"), texts(row, "san_domains"))
+    });
+    Ok(page.of(rows))
 }
 
 #[cfg(test)]

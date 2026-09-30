@@ -1,5 +1,8 @@
 # The Lorica management MCP server
 
+**Author:** Romain G.
+**Since:** v1.9.0
+
 `lorica-mcp` lets an operator talk to Lorica from a Model Context
 Protocol client. It has three tiers, and a server is one of them by the
 token it was started with. The **read tier** asks what Lorica is
@@ -17,6 +20,32 @@ the automation listener. The tools, the scopes, the paging, the
 untrusted-text marking and the protocol revision are the same on both,
 because both run the same code; what differs is what carries the
 messages and what each one can honestly put in an audit row.
+
+## What it is not
+
+- **Not a client of the management API.** It never holds a dashboard
+  session or a management credential. It is a client of the automation
+  plane ([automation.md](automation.md)), with a scoped automation
+  token, and it can do nothing that token's scopes and grants do not
+  allow. An operator who has not enabled `--automation-listen` has no
+  MCP surface at all.
+- **Not a service.** Neither binding opens a socket of its own: the
+  stdio server is a subprocess the MCP client launches for the length
+  of its session, and the Streamable HTTP endpoint is a path on a
+  listener that already exists. No systemd unit starts it (see
+  [Running it](#running-it)).
+- **Not a way to reach identity, tokens or the fleet's membership.** No
+  path on the automation plane reaches users, roles, the automation
+  tokens, the OIDC issuer entries, the cluster's nodes, its enrolment
+  tokens or its fleet-wide bans, for any verb and any token, and no
+  tool of any tier names one.
+- **Not a key-material channel.** No tool takes or returns a private
+  key, a certificate body or a CSR.
+- **Not a filter on what users and attackers wrote.** Log rows and WAF
+  events reach the model as recorded, less a short list of values the
+  plane withholds; see
+  [What it cannot see, and why](#what-it-cannot-see-and-why) for which,
+  and for what the rest means when the model is hosted.
 
 ## Why there are tiers, and why they are separate processes
 
@@ -38,57 +67,272 @@ process, not a rule it follows. The config tier is therefore a
 scopes, started for the work of changing things, and not the one an
 operator reads hostile text through.
 
+**One process serves one tier, and the server enforces it.** Which
+scopes make a token which tier is one table, `TIERS` in
+`lorica-mcp/src/tier.rs`: for each tier the scopes it requires and the
+scopes of another tier it tolerates because its own tools need them.
+Every automation scope is required by exactly one tier, which a test
+derives from the token model's enum. The read tier tolerates no write
+scope. The config tier tolerates the read scopes its previews answer
+and its tools find ids through, and nothing else; the admin tier
+tolerates nothing. A token whose scopes span two tiers is refused
+before any tool registers, with the offending scopes named: `logs:read`
+beside `routes:write` is refused, because the config tier does not
+tolerate a read of attacker-authored text. A token carrying a scope no
+tier knows is refused the same way.
+
+Both refusals come from the one constructor both bindings build their
+server through, so neither binding can serve a token the other refuses:
+
+- **stdio** refuses at startup. The message goes to stderr and names
+  the scopes that anchor the tier, the ones it does not allow and the
+  tier each belongs to, then the process exits with code **78**, the
+  code it uses for every configuration fault:
+
+  ```
+  lorica-mcp: this token's scopes span more than one MCP tier, and one
+  process serves one tier. routes:write makes it the config tier, which
+  does not allow logs:read (read tier). Mint one token per tier with
+  `lorica mcp token create --tier read|config|admin`.
+  ```
+
+  A test renders that refusal and holds this example to it. A token
+  carrying a scope this build does not know, minted on a newer node, is
+  told so and told to run the `lorica-mcp` that ships with that node,
+  rather than to split tiers.
+
+- **Streamable HTTP** refuses on every request that presents such a
+  token, with a **`403`** whose body is a JSON-RPC error (`-32600`)
+  carrying the same text under the request's id, followed by the remedy
+  for the credential that presented it: a static token is minted again
+  per tier, and an OIDC issuer entry, which grants its scopes to every
+  job it matches, is split into one entry per tier. No server is built
+  and nothing runs, and the audit row reads
+  `automation.request.forbidden:spans_tiers`.
+
+Where each refusal runs matters. Over Streamable HTTP the node refuses:
+the check is in the handler, and no client can skip it. Over stdio it
+runs in the `lorica-mcp` process the client launched, and the node
+itself knows scopes, not tiers. Against the actor the tiers exist for, a
+model steered by what it reads, that is enough: the model cannot swap
+the binary its client launches. Against an operator who points some
+other MCP client at the automation plane with a token spanning two
+tiers, it is no control at all; the check guards the operator from a
+mistake, not the node from a hostile client.
+
+What the check cannot refuse is an operator who mints three tokens and
+hands all three to one client, or who keeps the admin tier configured
+because it was convenient once. Processes are separate; a model given
+a server of each tier is still one model reading hostile text with a
+mutating tool in reach. Those are the
+[hardening guide's](security/hardening-guide.md#the-mcp-server-tiers-v190-opt-in).
+
+## Setting it up, the first time
+
+1. **Enable the automation listener** on a standalone node or a
+   control plane: `--automation-listen <host:port>` and a non-empty
+   `automation_allowed_cidrs` naming where the MCP server or client
+   will connect from ([automation.md](automation.md#the-listener)). A
+   stdio server on the Lorica host itself connects from loopback, so
+   the allowlist must name it; nothing is allowed by default.
+2. **Mint one token per tier you need**, with
+   `lorica mcp token create --tier` ([Minting a token](#minting-a-token)).
+   Start with the read tier alone; mint the config tier for a change
+   and the admin tier for a task, each with a short lifetime.
+3. **Configure one client entry per tier**, over stdio or Streamable
+   HTTP ([Running it](#running-it)), and hand each entry its own token.
+4. **Check what it registered.** The stdio server prints one line on
+   stderr at startup naming the token's `public_id`, its tier and the
+   tools it registered, and what it did not register for want of a
+   scope. `tools/list` answers the same set.
+5. **Revoke what you are done with** ([Revocation](#revocation-and-expiry)).
+
+## Minting a token
+
+```bash
+(umask 077; lorica mcp token create --tier read|config|admin [--name <label>] \
+  [--hostname <pattern>]... [--backend-cidr <cidr>]... \
+  [--lifetime-days <days>] [--user <superadmin>] \
+  --password-file <path-to-0600-file> > <tier>.token)
+```
+
+The `umask 077` subshell is what makes the redirect create the file
+`0600`: a shell creates it with the ambient umask, `0644` on most
+systems, and the file holds a live credential. Piping the output
+straight into the client's secret store is better still.
+
+`lorica mcp token create` is a front end over
+`lorica automation token create`, not an alternative to it. It resolves
+the tier to its scope set from the same `TIERS` table the server
+enforces (`Tier::minted_scopes`), and mints through the same request on
+the local management API, as a SuperAdmin, so the token is the same
+credential, validated by the same model and audited as the same
+`automation.token.create` row. The SuperAdmin password is read from
+`--password-file` (mode 0600), `--password-stdin` or
+`LORICA_ADMIN_PASSWORD`, as for every management CLI command.
+
+The scopes it mints are the tier's tools' scopes and the scopes the
+tier tolerates. The config tier therefore carries the read scopes of the
+rows its previews answer and its tools find ids through: a config token
+without them would register previews the plane refuses. The environment
+scopes belong to a tier for the refusal but are never minted, because
+no MCP tool uses them. `--name` defaults to `mcp-<tier>`.
+
+**Standard output carries the token and nothing else**, as the command
+it fronts, so `> read.token` stores exactly the credential. Standard
+error carries the minted `public_id` and expiry, then the tier's blast
+radius: the scopes, every tool the token registers with the scope it
+sits behind and whether it reads or changes, the grants for the config
+tier, and for the admin tier every setting the plane's allowlist names
+with its bound, its reach and when it takes effect. That text is
+computed from the tier table, the tool catalogue and the allowlist when
+it is printed, never written beside them, so it is the authoritative
+answer to "what can this token do" for the build you run.
+
+**Lifetime.** Without `--lifetime-days` a token lives its tier's
+default, the `default_lifetime_days` column of the same `TIERS` table,
+shorter the further the tier reaches; the command prints it with the
+blast radius. Pass a shorter one when the task is shorter: a read-tier
+token for as long as the client is meant to exist, a config-tier token
+for the change, an admin-tier token for the task. **A token carrying
+`settings:write` has a ceiling the node enforces**,
+`AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS` in `lorica-config`:
+`AutomationToken::validate` refuses a longer one with a `422` naming it,
+whichever surface mints it (this command, `lorica automation token
+create`, the dashboard or the management API), and a test holds the
+admin tier's default beneath it. Every other token defaults to
+`AUTOMATION_TOKEN_DEFAULT_LIFETIME_DAYS` when it is minted by a surface
+that names no lifetime.
+
+### Grants: required exactly when a scope needs them
+
+A token's hostname and backend grants (`allowed_hostnames`,
+`allowed_backend_cidrs`) bound what a write may claim and reach. Only
+the grant-bounded scopes consult them, and which scopes those are is
+decided in one place, `AutomationScope::is_grant_bounded` in
+`lorica-config`: the config tier's write scopes, which a test pins
+against the tier table. The rule is typed absence
+([automation.md](automation.md#static-tokens)):
+
+- **The config tier requires both.** `--hostname` and `--backend-cidr`
+  at least once each, or the command refuses before it logs in. Set
+  them to exactly what the model may touch: `'*.app.example.com'`
+  rather than a parent zone, a /24 rather than a /8.
+- **The read and admin tiers refuse both.** No path those tiers reach
+  reads a grant, and a grant that bounds nothing would read as a blast
+  radius the token does not have.
+- **An empty list means nothing, never everything.** A hostname grant
+  with no pattern matches no host, and a CIDR grant with no entry admits
+  no address.
+
+```bash
+umask 077
+
+# Read tier: no grant, a lifetime chosen for the client.
+lorica mcp token create --tier read --lifetime-days 30 \
+  --password-file <path-to-0600-file> > read.token
+
+# Config tier: both grants, as narrow as the change; the tier's
+# default lifetime.
+lorica mcp token create --tier config \
+  --hostname '*.app.example.com' --backend-cidr 10.0.4.0/24 \
+  --password-file <path-to-0600-file> > config.token
+
+# Admin tier: no grant, the tier's default lifetime, the shortest.
+lorica mcp token create --tier admin \
+  --password-file <path-to-0600-file> > admin.token
+```
+
+A narrower token than a whole tier (routes only, say) is minted with
+`lorica automation token create --scope ...`: any subset of one tier's
+required scopes and the scopes it tolerates is one tier and is served.
+The management API, the plain CLI and the dashboard's Automation tokens
+page mint any scope set at all; it is the server that refuses a token
+spanning two tiers, on both transports, rather than serving both kinds
+of tool.
+
+**An OIDC issuer entry cannot carry `settings:write`.** An entry is a
+standing grant to every pipeline job whose claims match, the opposite
+of a token minted for one task, and the node refuses it. It may carry
+the config tier's write scopes: a keyless, short-lived CI credential is
+what OIDC is for. That is a CI pipeline's credential rather than an MCP
+client's, and the threat model records the decision.
+
 ## The read tier
 
-Nine tools, one per read the automation plane serves. Each needs the
-scope beside it.
+The read tier is one tool per read the automation plane serves: the
+access log with the filters the dashboard offers, WAF events and their
+aggregate counts, the SLA summary and one route's SLA windows, this
+node's cluster status, and the route, backend and certificate listings.
+Each tool sits behind the read scope of its family. The catalogue is
+`READS` in `lorica-mcp/src/tools.rs`; `lorica mcp token create --tier
+read` prints it with each tool's scope, and `tools/list` answers it.
 
-Over stdio that is decided once, at startup, from the token the server
-was started with: a server whose token carries none of these scopes
-starts with no tools and says so on stderr rather than failing every
-call. Over Streamable HTTP it is decided per request, from the token
-that request presented, because there is no startup to decide it at.
-Either way a tool the token cannot reach is not in the list and is
-unknown to a call.
-
-| Tool | Reads | Scope |
-|---|---|---|
-| `lorica_logs` | access-log rows, with the filters the dashboard offers | `logs:read` |
-| `lorica_waf_events` | WAF events, narrowed by category | `waf:read` |
-| `lorica_waf_stats` | WAF aggregate counts | `waf:read` |
-| `lorica_sla_overview` | the SLA summary across routes | `sla:read` |
-| `lorica_sla_route` | one route's SLA windows | `sla:read` |
-| `lorica_cluster_status` | this node's cluster status | `cluster:read` |
-| `lorica_backends` | the backend listing | `backends:read` |
-| `lorica_routes` | the route listing | `routes:read` |
-| `lorica_certificates` | certificate metadata | `certificates:read` |
+Over stdio which tools register is decided once, at startup, from the
+token the server was started with: a server whose token carries a
+scope of the tier that no tool uses starts with no tools and says so on
+stderr rather than failing every call. Over Streamable HTTP it is
+decided per request, from the token that request presented, because
+there is no startup to decide it at. Either way a tool the token cannot
+reach is not in the list and is unknown to a call.
 
 ## What it cannot see, and why
 
 **No secret of Lorica's own leaves through it.** Certificate private
 keys, notification-channel credentials, DNS-provider credentials,
-Basic-auth hashes and session cookies are absent from every answer.
-That is inherited rather than re-filtered: these are the management
-plane's own views, so what they withhold there they withhold here. A
-test walks every answer for credential-shaped field names, and a second
-test pins the entire set of field names each read answers, so a field
-added to a management view tomorrow turns a gate red and forces a
-decision instead of arriving here unnoticed.
+Basic-auth hashes and session cookies are absent from every answer,
+because the management plane's own views never carry them. A test walks
+every answer for credential-shaped field names, and a second test pins
+the entire set of field names each read answers, so a field added to a
+management view tomorrow turns a gate red and forces a decision instead
+of arriving here unnoticed.
 
-**What does cross, and is not filtered.** That sentence is about
-Lorica's secrets and only those. The rows themselves are text end users
-and attackers wrote: request paths including their query strings,
-client addresses, User-Agent strings, WAF matched values, SNI names,
-usernames from failed Basic-auth attempts. A query string routinely
-carries somebody's own credential - a password-reset token, an OAuth
-`code`, a signed-URL signature, an API key a client put in the URL -
-and this plane does not redact it, because it cannot recognise it: a
-filter that stripped what it thought was a token would leave the rest
-and read as if it had stripped everything. Those values reach the model
-verbatim, and through it whatever hosts the model. Pointing a hosted
-model at this tier is a decision that this node's access log, with
-everything its users put in a URL, leaves the node; make it knowing
-that.
+**Values the plane withholds.** Some fields of those views carry a
+credential an operator put there for the dashboard's sake, and the
+automation plane replaces their values with `[redacted]`, keeping every
+key: a route's `proxy_headers` (the header names stay, so a model still
+sees that a route sends one), the userinfo and query values of a
+route's `forward_auth` address, the query values of a backend's
+`health_check_path`, and the query values and fragment of an access-log
+row's `path`. It does so wherever it answers such a row: the listings,
+every write answer and every preview, including a preview's list of
+changed fields. The dashboard and the log sinks are unchanged. The
+function and the reasoning are `lorica-api/src/automation/redact.rs`,
+and a test walks a route carrying an upstream credential through the
+listing, an apply, two previews and the MCP tool, asserting the value
+never appears.
+
+**What does cross.** The rest of each row is text end users and
+attackers wrote: request paths, client addresses, User-Agent strings,
+WAF matched values, SNI names, usernames from failed Basic-auth
+attempts. The access log records the request path without its query
+string (the proxy logs the URI's path), so no query value of a proxied
+request reaches a row, and one that did would be withheld as above. A
+WAF event is different on purpose: it carries the span of the request (the path,
+the query, a header or the body) that a signature matched, verbatim,
+because that span is the attack the event exists to show. A span can
+include part of something a user sent, a query value or a header's,
+when the signature matched across it. Those values reach the model as recorded, and
+through it whatever hosts the model. Pointing a hosted model at this
+tier is a decision that this node's WAF events and access-log rows
+leave the node; make it knowing that.
+
+**A token with grants sees what its grants cover.** For a token
+carrying a scope a grant bounds (the config tier), the route, backend
+and certificate listings answer only the rows inside its grants: a
+route whose hostname and every alias are inside `allowed_hostnames`, a
+backend whose address is inside `allowed_backend_cidrs`, a certificate
+whose domain and every SAN are inside `allowed_hostnames`. Those are
+the write guard's own predicates, so the rows a config-tier session can
+see are the rows it can act on. Free text in a route or a backend (an
+error page, a rewrite, a name) is written by every principal holding a
+write scope, OIDC pipelines included, and a config-tier model no longer
+reads what a lower-trust writer planted outside its own grant. Paging
+walks the filtered set. A token carrying no bounded scope (the read
+tier) sees every row. No read on the plane fetches one of these rows by
+id, so there is no single-row answer to hide; a write or a preview
+naming an id outside the grant is refused with a `403` that names the
+id and nothing about the row.
 
 **No fleet roster.** `/cluster/status` is served;
 `/cluster/nodes` is not. The roster discloses each follower's source
@@ -98,8 +342,9 @@ that at the Operator role on purpose, and an automation credential
 carries scopes and no role, so there is no honest way to serve it at
 the same level of trust. Serving it behind a projection that strips
 those three fields was considered and refused: this tier's answers are
-the management plane's own views, unfiltered, and that property is what
-makes a field arriving here a visible event rather than a silent one.
+the management plane's own views, with nothing projected away but the
+withheld values above, and that property is what makes a field arriving
+here a visible event rather than a silent one.
 
 **No certificate PEM body.** The listing answers metadata. The
 single-certificate endpoint that returns the public certificate is
@@ -107,22 +352,16 @@ deliberately not on this plane.
 
 ## The config tier
 
-Eight mutations, each with a preview, over the automation plane's
-write surface. Each pair needs the scope beside it, and a token
-carrying that scope registers the pair; a token carrying read scopes as
-well registers the read tools they cover beside them, which is how the
-tier finds the ids it acts on.
-
-| Tool, and its `_preview` | Does | Scope |
-|---|---|---|
-| `lorica_route_create` | create a route, as the dashboard's route form would | `routes:write` |
-| `lorica_route_update` | patch one route by id; only the fields sent change | `routes:write` |
-| `lorica_route_delete` | delete one route by id | `routes:write` |
-| `lorica_route_bind_certificate` | bind a stored certificate to one route by id, or unbind with the empty string | `certificates:write` |
-| `lorica_backend_create` | create a backend | `backends:write` |
-| `lorica_backend_update` | patch one backend by id | `backends:write` |
-| `lorica_backend_delete` | delete one backend by id, with the graceful drain | `backends:write` |
-| `lorica_certificate_renew` | renew one ACME certificate by id, in place | `certificates:write` |
+The config tier is a set of mutations over the automation plane's write
+surface, each with a preview: create, update and delete a route by id;
+bind a stored certificate to a route or unbind it; create, update and
+delete a backend by id, the delete with the dashboard's graceful drain;
+renew an ACME certificate in place. Each sits behind the write scope of
+its family. The catalogue is `MUTATIONS` in `lorica-mcp/src/tools.rs`,
+from which each apply tool and its `_preview` are built;
+`lorica mcp token create --tier config` prints them with their scopes.
+A config-tier server also registers the read tools of the scopes the
+tier tolerates, which is how it finds the ids it acts on.
 
 **Every mutation is the dashboard's own.** A tool's call runs the
 management handler's body, in process on the Streamable HTTP binding
@@ -169,33 +408,31 @@ second set of backends; the third is the route's client-authentication
 trust anchor, the CA bundle whose client certificates the route
 accepts, which a model reading attacker text must not be able to
 replace; the fourth is a static header map to the upstream, where a
-credential would go. None of the four is offered by the tools. A config-tier token is bounded by the
-same two fields an operator reads on it, on what it may claim and on
-what it may reach, and a preview is refused exactly where the apply
-would be, so a token learns nothing about a row outside its grant by
-previewing a change to it.
+credential would go. None of the four is offered by the tools. A
+config-tier token is bounded by the same two fields an operator reads
+on it, on what it may claim and on what it may reach, and a preview is
+refused exactly where the apply would be, so a token learns nothing
+about a row outside its grant by previewing a change to it.
 
 **The scopes are boundaries too.** A route write that names
 `certificate_id`, the empty string included, needs `certificates:write`
 beside `routes:write`: the binding tool sits behind the certificate
 scope, and a route body that could bind under the route scope alone
-made withholding it mean nothing. A preview needs the read scope of
-the row it answers (`routes:read` for a route or a binding,
-`backends:read` for a backend, `certificates:read` for a renewal),
-since a preview answers the full row; a token minted as the section
-below says carries them already, and the apply needs nothing more than
-its write scope.
+made withholding it mean nothing. A preview needs the read scope of the
+row it answers, since a preview answers the full row; a token minted
+with `--tier config` carries those, and the apply needs nothing more
+than its write scope.
 
 **A renewal from a token is budgeted per certificate.** Each renewal
 places an ACME order the CA counts against a per-name budget, and
 rotates the node's bot-protection HMAC. From a token, a renewal of a
 certificate with an order already open answers 409, one issued less
-than 48 hours ago answers 429 with a `Retry-After`, and one the
-background loop holds in a CA rate-limit cooldown answers 429 as well;
-the preview answers what the apply would. The dashboard's own renew is
-bounded by none of it. The per-token call limit below is the wrong
-bound for this: it counts calls per token, and the scarce resource is
-orders per certificate.
+than `MIN_TOKEN_RENEWAL_INTERVAL_HOURS` (in `lorica-api/src/acme`) ago
+answers 429 with a `Retry-After`, and one the background loop holds in
+a CA rate-limit cooldown answers 429 as well; the preview answers what
+the apply would. The dashboard's own renew is bounded by none of it.
+The per-token call limit below is the wrong bound for this: it counts
+calls per token, and the scarce resource is orders per certificate.
 
 **One named resource per call.** Every tool that acts on an existing
 resource takes exactly one `id`, a string, and the body of the one
@@ -249,7 +486,9 @@ the DNS provider the apply would use, so a certificate the apply cannot
 renew is refused by the preview with the same words. What only the
 store refuses, a duplicate hostname or a backend id that names
 nothing, is refused by the apply and not by the preview, since the
-preview inserts nothing.
+preview inserts nothing. On the wire a preview is the apply's own
+request with `?dry_run=true`, so it spends from the same write budget
+as the apply (see [Rate limits and write budgets](#rate-limits-and-write-budgets)).
 
 **The preview is an affordance, not a control.** MCP revision
 2026-07-28 has no server-initiated confirmation: a server cannot make a
@@ -285,8 +524,9 @@ to execute:
 - **A route's `error_page_html`**, `response_rewrite` rules and
   `response_headers`: they are text and code served to or acted on by
   end users, and a model writing them while reading attacker-authored
-  text is the exact channel the tiering exists to close. Review them in
-  the dashboard, where a human writes them.
+  text is the exact channel the tiering exists to close. The tier
+  accepts them, inside the hostname grant; review them in the
+  dashboard, where a human writes them.
 - **Redirects and rewrites** (`redirect_to`, `redirect_hostname`,
   `path_rewrite_*`, `strip_path_prefix`, `add_path_prefix`): a wrong one
   sends every request on the route somewhere else, and a preview shows
@@ -304,26 +544,14 @@ to execute:
 - **A Basic-auth credential, `forward_auth`, `mirror`, `mtls` and
   `proxy_headers`**, which the tier refuses to take at all. The last is
   a static header map sent to the upstream on every request, which is
-  where a credential would go; the tier reads it, as the read tier
-  does, and sets nothing in it.
+  where a credential would go; the tier reads its header names, as the
+  read tier does, never their values, and sets nothing in it.
 
 The rule underneath: give the tier a token whose grants name the
 hostnames and address ranges the model is meant to touch and no
 others, run it as a separate process from the one reading logs, and
 treat the preview as a way to look before applying rather than as a
 gate that applies itself.
-
-### Minting a config-tier token
-
-Mint a token carrying the write scopes the work needs, plus the read
-scopes the tier uses to find ids and that every preview requires:
-`routes:write` with `routes:read`, `backends:write` with
-`backends:read`, `certificates:write` with `certificates:read` and
-`routes:read`. A token that is to bind certificates through a route
-write needs `certificates:write` beside `routes:write`. Set
-`allowed_hostnames` and `allowed_backend_cidrs` to exactly what the
-model may touch. Start a server with that token for the change, and
-keep the read-tier server, with its read-tier token, for reading.
 
 ## The admin tier, and where it stops
 
@@ -443,15 +671,12 @@ the story that built the tier names every field:
   rule above. They can join the tier the day the dashboard gains a
   field for them, and not before.
 
-**Where it stops.** No path on the automation plane reaches users,
-roles, the automation tokens, the OIDC issuer entries, the cluster's
-nodes, its enrolment tokens or its fleet-wide bans, revocation, `leave`
-or break-glass, for any verb and any token, and no tool of any tier
-names one. The refusal is at the scope gate: those paths are declared
-for nobody, so they answer 403 to the widest token there is, and there
-is no tool for an injected instruction to name and no check in a
-handler for a later change to weaken. The settings document itself is
-not readable on the plane either: there is no `GET`.
+**Where it stops.** The paths listed in [What it is not](#what-it-is-not)
+are declared for nobody in the scope matrix, so they answer 403 to the
+widest token there is: there is no tool for an injected instruction to
+name and no check in a handler for a later change to weaken. The
+settings document itself is not readable on the plane either: there is
+no `GET`.
 
 **The answer is what the scope writes, and nothing more.** The apply
 answers the listed settings as they now stand; the preview answers the
@@ -474,30 +699,26 @@ sent with the value it already had is not listed. The dashboard's own
 row names the keys its write changed, without their values, since the
 dashboard also writes secrets.
 
-**How often.** A token's settings writes share one window of 30 a
-minute, the dashboard's own figure for its settings page, whichever
-binding they come through; see [Rate limiting](#rate-limiting).
-
-### Minting an admin-tier token
-
-Mint a static token carrying `settings:write` and nothing else; the
-tier needs no read scope and must not share a process with one. Give
-it the shortest lifetime the task allows, start a server with it for
-that task, and revoke it when the task is done. An OIDC issuer entry
-cannot carry `settings:write`: an entry is a standing grant to every
-pipeline job whose claims match, the opposite of a token minted for one
-task, and the node refuses it. The
-[hardening guide](security/hardening-guide.md#the-mcp-admin-tier-v190-opt-in) says
-why it should exist only while a task needs it.
+**Keep it configured only for the task.** Mint the admin-tier token
+with the shortest lifetime the task allows (the node refuses one past
+`AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS` whatever is asked), give
+it to a client entry of its own that reads no logs, and revoke the
+token and remove the entry when the task is done. The
+[hardening guide](security/hardening-guide.md#the-mcp-server-tiers-v190-opt-in)
+says why.
 
 ## Attacker-authored text arrives as data
 
 Log rows and WAF payloads come back inside a delimited block whose tool
 description states, in terms, that the delimited content is data and
 not instructions. The server never writes prose about what it read: the
-only sentence it produces is that notice. A tool cannot summarise a log
-row in its own words, because no tool builds a result from anything but
-the bytes the plane returned.
+only sentence it produces is that notice, `NOTICE` in
+`lorica-mcp/src/untrusted.rs`. A tool cannot summarise a log row in its
+own words, because no tool builds a result from anything but the bytes
+the plane returned. The same bytes travel as `structuredContent` under
+a single key, `untrusted`, whose schema description carries the same
+notice. A refusal from the plane arrives the same way: the plane's own
+words, fenced.
 
 The fence around that block grows its marker until the marker occurs
 nowhere in the body, so a WAF payload that spells the terminator cannot
@@ -505,9 +726,12 @@ close the block it is quoted in.
 
 None of this makes the text safe. It makes its provenance unambiguous,
 which is what the reader, human or model, needs in order to treat it
-correctly.
+correctly. A model can still be persuaded by what it reads; the tier is
+what bounds what a persuaded model can do.
 
-## Which transport to use
+## Running it
+
+### Which transport
 
 **stdio** when the client and Lorica are on the same box, or when the
 client can launch a subprocess and hand it a token. The client starts
@@ -516,42 +740,121 @@ reaches the read and write paths like any other automation client.
 
 **Streamable HTTP** when the client speaks MCP over HTTP and there is
 no subprocess to launch: a hosted client, a client on another machine,
-a client you do not control. Nothing is installed on the Lorica host
-for it. The endpoint is a path on the automation listener, so it exists
-exactly when that listener does and not otherwise: an operator who has
-not enabled `--automation-listen` has no MCP surface, which is the
-point rather than a side effect.
+a client you do not control. Nothing is installed beside it. The
+endpoint is a path on the automation listener, so it exists exactly
+when that listener does and not otherwise. A hosted client connects
+from its provider's addresses, which `automation_allowed_cidrs` then
+has to name; that is a wider allowlist than a local stdio server needs.
 
 Neither binding opens a socket of its own. `lorica-mcp` is a subprocess
 and a library; the automation listener stays the only thing that binds.
 
-## Configuring a client, stdio
+### From the packages, and why no unit starts it
+
+The `.deb` and the `.rpm` install `/usr/bin/lorica-mcp` beside
+`/usr/bin/lorica`, from the same build, so the server and the node it
+drives never drift apart in version. **No systemd unit starts it, and
+that is deliberate.** An MCP server is launched by the client that
+talks to it, for the length of that client's session, with the token
+the operator hands it; it exits when the client closes its standard
+input. A long-running service holding an automation token would be an
+ambient credential waiting for whoever reaches it, which is exactly
+what this design refuses. `dist/lorica.service` says so in its header
+so nobody adds one.
+
+### When Lorica runs in a container
+
+**Prefer stdio from the client's own host.** Run the `lorica-mcp` that
+matches the node's version (from the packages, or the release binary)
+on the machine the MCP client runs on, against the automation listener
+published by the container, with `automation_allowed_cidrs` naming that
+machine and nothing wider, and a copy of the listener's certificate as
+`LORICA_MCP_CA_BUNDLE`. The client then needs no access to Docker, and
+`lorica-mcp` runs as the client's user with nothing but its token.
+
+**`docker exec` into the node's container is a fallback, with two
+costs.** The production image carries `/usr/bin/lorica-mcp` beside
+`lorica`, and only `lorica` runs, so a client can launch the server
+inside the running container for each session with `docker exec -i`,
+which keeps standard input open for the protocol:
+
+```bash
+LORICA_MCP_TOKEN="$(cat read.token)" \
+docker exec -i \
+  -e LORICA_MCP_ENDPOINT=https://127.0.0.1:9446 \
+  -e LORICA_MCP_CA_BUNDLE=/var/lib/lorica/management/cert.pem \
+  -e LORICA_MCP_TOKEN \
+  lorica lorica-mcp
+```
+
+- **The client's account needs the Docker daemon**, which is
+  root-equivalent on the host. Most MCP clients also give the model a
+  shell or command tool; a model steered by what it reads through the
+  read tier then needs no Lorica write scope to change the host. **A
+  client with Docker access and a shell tool is outside the tier
+  model**, whatever token it holds.
+- **The server runs as the proxy's own identity.** The exec inherits
+  the image's `lorica` user, which owns the data directory: the
+  configuration database, the encryption key and the management key. A
+  defect in the process that parses the plane's answers and the
+  client's input is then a node compromise rather than a token
+  compromise. The packaged binary on a host runs as the client's user,
+  with no access to the `0750` data directory.
+
+`-e LORICA_MCP_TOKEN` with no value passes the variable from the
+calling environment: `-e LORICA_MCP_TOKEN=<token>` would put the token
+on the `docker` command line, in the process table of the host, which
+is what the server refuses to accept on its own. The endpoint is the
+automation listener as the container sees it; with host networking and
+`--automation-listen 127.0.0.1:9446` added to the container's command,
+that is loopback, which `automation_allowed_cidrs` must then name, and
+every process on the host then passes the listener's source check. The
+bundle names the node's own self-signed leaf, readable by the `lorica`
+user, and follows its rotation. A token can be minted in the same
+container:
+`(umask 077; docker exec -i lorica lorica mcp token create --tier read --lifetime-days 30 --password-stdin < <path-to-0600-file> > read.token)`.
+
+### Configuring a client, stdio
 
 The server reads its endpoint and its token from the environment or
 from a TOML file, and **never from the command line**: an argument
 would put the token in the process table where every user on the box
 can read it. Any argument at all refuses the start.
 
-```
-LORICA_MCP_ENDPOINT   https origin of the automation listener
-LORICA_MCP_TOKEN      the token, as minted, once
-LORICA_MCP_CONFIG     path to a TOML file carrying the same keys
-LORICA_MCP_CA_BUNDLE  PEM file of certificate authorities to trust
-```
+| Variable | Carries |
+|---|---|
+| `LORICA_MCP_ENDPOINT` | the automation listener's origin, `https://host:port`, no path |
+| `LORICA_MCP_TOKEN` | the token, as minted |
+| `LORICA_MCP_CONFIG` | path to a TOML file carrying the same keys |
+| `LORICA_MCP_CA_BUNDLE` | PEM file of certificate authorities to trust |
 
-The environment wins over the file, so a client that always writes both
+The four are the constants of `lorica-mcp/src/config.rs`. The
+environment wins over the file, so a client that always writes both
 variables does not silently shadow a file an operator maintains. A
 blank variable reads as unset rather than as an empty value.
 
-The TOML file takes `endpoint`, `token` and `ca_bundle`. A malformed
-file is reported by path and not by the parser's message, because that
-message quotes the offending line and the offending line may be the
-token.
+The TOML file takes `endpoint`, `token` and `ca_bundle`, and refuses
+any other key. A malformed file is reported by path and not by the
+parser's message, because that message quotes the offending line and
+the offending line may be the token. The server does not check the
+file's mode: keep it `0600` and owned by the user the client runs as.
+
+The endpoint must be `https://`, must carry no user information and
+must be an origin with no path, query or fragment; each is refused at
+startup with a message saying which.
 
 `LORICA_MCP_CA_BUNDLE` matters more than it looks. The automation
-listener's default certificate is self-signed, and the bearer token
-travels over it. Name the bundle that signs it rather than reaching for
-a switch that disables verification: there is no such switch.
+listener presents the management plane's certificate: by default a
+self-signed leaf the node generates under `<data_dir>/management/`,
+valid for `localhost`, the machine's hostname, `127.0.0.1` and `::1`,
+and regenerated in place when it nears expiry; or the operator's own
+pair named by `management_cert_pem_path` and `management_key_pem_path`.
+The bearer token travels over it. Name the bundle that signs it (for
+the default leaf, a copy of the leaf itself, readable by the user the
+client runs as) rather than reaching for a switch that disables
+verification: there is no such switch. The bundle is trusted in
+addition to the platform's roots, never instead of them, and the
+endpoint's host must be a name the certificate carries.
 
 A client entry looks like this, with the token supplied by whatever
 secret mechanism the client offers rather than typed into a file that
@@ -560,7 +863,7 @@ gets committed:
 ```json
 {
   "mcpServers": {
-    "lorica": {
+    "lorica-read": {
       "command": "/usr/bin/lorica-mcp",
       "env": {
         "LORICA_MCP_ENDPOINT": "https://lorica.internal.example.org:9446",
@@ -571,7 +874,17 @@ gets committed:
 }
 ```
 
-## Configuring a client, Streamable HTTP
+One entry per tier, each with its own token, and preferably in a client
+or a profile of its own: see
+[the hardening guide](security/hardening-guide.md#the-mcp-server-tiers-v190-opt-in).
+
+stdout carries JSON-RPC messages and nothing else, one per line.
+Everything the server writes for a human goes to stderr: the version
+and the endpoint, the startup notice naming the token's `public_id` and
+the tools it registered, and one line for each call it did not serve.
+A client must not read stderr into the conversation.
+
+### Configuring a client, Streamable HTTP
 
 ```
 POST https://<automation host>:<automation port>/automation/v1/mcp
@@ -588,16 +901,20 @@ secret mechanism the client offers:
 ```json
 {
   "mcpServers": {
-    "lorica": {
+    "lorica-read": {
       "type": "http",
       "url": "https://lorica.internal.example.org:9446/automation/v1/mcp",
       "headers": {
-        "Authorization": "Bearer <the token>"
+        "Authorization": "Bearer <the read-tier token>"
       }
     }
   }
 }
 ```
+
+The client must trust the listener's certificate as a stdio server
+would, and must speak revision 2026-07-28 (see
+[The protocol revision](#the-protocol-revision-and-keeping-up-with-it)).
 
 The same three things gate it that gate every other path on that
 listener, and they gate it first: the source-CIDR allowlist drops a
@@ -623,7 +940,8 @@ That is why the endpoint is not declared behind one scope. It cannot
 be: the request names its own tool and each tool has its own. On this
 binding the tier is per request too: a POST presenting a config-tier
 token is served the config tier, the next POST presenting a read-tier
-token the read tier.
+token the read tier, and a POST presenting a token that spans two is
+refused with a `403` as above.
 
 **What the transport requires of the client.** Every POST carries
 `MCP-Protocol-Version`, `Mcp-Method` mirrored from the body's `method`,
@@ -645,7 +963,7 @@ sessions, the standalone `GET` stream and `Last-Event-ID`
 resumability. `GET` and `DELETE` on the endpoint answer `405`. An
 `Mcp-Session-Id` is ignored and never echoed; a `Last-Event-ID` is
 ignored. An answer is one JSON object, not an SSE stream: every method
-this tier implements answers in one message.
+this server implements answers in one message.
 
 **Every `Origin` is refused with a `403`.** The specification's one
 MUST on this transport is against DNS rebinding, and the usual
@@ -658,48 +976,80 @@ a browser front end ever needs it, an operator-configured allowlist is
 the additive change; refusing by default is what keeps that an explicit
 decision.
 
-## Minting the token
-
-The tier is the token's scope set, so mint a token carrying exactly the
-scopes the tier needs and nothing else: the read scopes for a read-tier
-server, the write scopes with the reads they need for a config-tier
-one, `settings:write` alone for an admin-tier one. Use the automation token surface documented in
-[automation.md](automation.md): the management API, the CLI, or the
-Automation tokens page. The token is shown once, by the request that
-creates it, and the node stores only an HMAC of it.
-
-Give a read-tier server a read-tier token. A token that also carries a
-write scope would start a server that reads attacker-authored text
-while holding a mutating tool, which is the one session this design
-exists to prevent. Nothing in this release refuses such a token: a
-token carrying both kinds of scope is served both kinds of tool, and
-keeping the two apart is the operator's, by minting two tokens and
-running two processes. Story 11.4 is where the server itself refuses
-a token that spans two tiers.
-
 ## Paging
 
 Every collection answers `{"items": [...], "page": {...}}`. The window
-is the server's: 200 rows is the ceiling whatever the caller asks for,
-50 is the default, and there is a byte ceiling on the row data as well
-as a row ceiling.
+is the server's: `AUTOMATION_READ_MAX_ROWS` (200) is the ceiling
+whatever the caller asks for, `AUTOMATION_READ_DEFAULT_ROWS` (50) the
+default, and there is a byte ceiling on the row data as well as a row
+ceiling (all three in `lorica-api/src/automation/read.rs`).
 
 **Advance `offset` by the answer's `returned`, never by `limit`.** The
 two differ when the byte ceiling ended an answer early, and stepping by
 `limit` would skip rows.
 
-Two sources answer only so deep: the access log to ten thousand rows,
-WAF events to five hundred. An offset past that depth is refused with a
-message naming the deepest window the requested `limit` can reach,
-rather than answered with an empty page. An empty page is the one
-failure that reads as "there was nothing", and it is exactly the wrong
-conclusion for a model to draw and report to an operator.
+The access log and the WAF events answer only as deep as the node keeps
+them. An offset past that depth is refused with a message naming the
+depth and the deepest window the requested `limit` can reach, rather
+than answered with an empty page. An empty page is the one failure that
+reads as "there was nothing", and it is exactly the wrong conclusion
+for a model to draw and report to an operator.
+
+## Rate limits and write budgets
+
+Two budgets apply to a model, both per credential, and a third bounds
+certificate renewals.
+
+**Tool invocations, in the server.** `RATE_BUDGET` calls per
+`RATE_WINDOW` (120 a minute, in `lorica-mcp/src/server.rs`), per token,
+in a fixed window, on both bindings and for every tier, a preview and a
+read counting as a call like any other. The specification requires a
+server to rate limit tool invocations, and nothing outside the server
+does: the automation listener's connection caps and per-IP limiter
+count connections at accept, and a keep-alive or HTTP/2 client issues
+requests without opening one. Going over is a tool execution error
+naming the budget, so the model sees it and can wait, rather than a
+protocol error it would read as a malfunction. The call never reaches
+the plane.
+
+Over stdio the window is the process's, since one process serves one
+token. Over Streamable HTTP the tool registry is rebuilt per request
+but the window is not: the node holds one limiter for the process,
+keyed by the token's `public_id`, and a token's window survives every
+request that spends from it. The limiter holds at most
+`MAX_TRACKED_TOKENS` live windows; a window is opened only by a token
+that authenticated, and a token that finds no room while that many are
+live is refused for that call rather than handed somebody else's
+window, since evicting a live one would give a caller holding more
+tokens than the ceiling a fresh budget per call.
+
+**Writes, on the plane.** The automation plane budgets writes on its
+own and per credential, whether a write arrives over the socket from a
+stdio server or from a tool call in process: `RL_SETTINGS_UPDATE`
+settings writes a window (30 a minute, the dashboard's figure for its
+settings page), and `RL_ROUTES_CUD` of every other write together (100,
+its figure for route writes), both in `lorica-api/src/server.rs`. The
+dashboard's budgets are layers on its own routes, which the plane does
+not mount, and every settings write is a reload and, on a control
+plane, a replication round to the fleet, so the plane holds its own.
+Going over is a 429 with `Retry-After` and a message naming the figure.
+A preview is the apply's own request with `?dry_run`, so it spends from
+the same budget; a request the scope gate refuses spends nothing, and a
+read spends nothing.
+
+**Renewals, per certificate.** Neither budget counts what a call
+spends. A certificate renewal spends an ACME order against the CA's
+per-name budget, and is bounded per certificate on the plane, as the
+config tier section says: one order at a time, none within the minimum
+interval of the last issuance, none during a CA cooldown.
 
 ## What the audit records, and what it merely repeats
 
-Every call lands an audit row on the node, in the same tamper-evident
-chain as everything else on the automation plane. The row distinguishes
-two kinds of fact, because they are not the same kind:
+Every call that reaches the node lands an audit row there, in the same
+tamper-evident chain as everything else on the automation plane, readable from the
+dashboard's audit view or `GET /api/v1/audit` and verified with
+`GET /api/v1/audit/verify`. The row distinguishes two kinds of fact,
+because they are not the same kind:
 
 - **Established by the node**: the principal, from verifying the
   credential; the method, the path and the names of the query
@@ -715,19 +1065,20 @@ not of the one it speaks over. It declares them in
 reads `GET /automation/v1/logs?limit,search asserted[transport=mcp-stdio,tool=lorica_logs]`,
 or for a write `POST /automation/v1/routes asserted[transport=mcp-stdio,tool=lorica_route_create]`
 and for its preview `POST /automation/v1/routes?dry_run asserted[...]`.
-A call the server refuses by itself - a tool the token does not hold,
-arguments outside the schema, a body field the tool does not declare,
-the invocation budget - never reaches the node and lands no row there;
-the server writes one line about it on stderr, in its own words, and
-that is the only trace.
+The startup `whoami` lands a row too, with the transport asserted and
+no tool, since no tool has run. A call the server refuses by itself - a
+tool the token does not hold, arguments outside the schema, a body
+field the tool does not declare, the invocation budget - never reaches
+the node and lands no row there; the server writes one line about it on
+stderr, in its own words, and that is the only trace.
 
 A mutation that ran lands a second row beside the request row: the
 management-side one, `route.create`, `backend.update`,
-`certificate.renew` and so on, under the role `automation` and the
-principal `<token name> (<public_id>)`, exactly as a write over the
-automation listener does and exactly as the environment resource's rows
-are written. A preview lands the request row alone, since nothing was
-written for a management row to describe.
+`certificate.renew`, `settings.update` and so on, under the role
+`automation` and the principal `<token name> (<public_id>)`, exactly as
+a write over the automation listener does and exactly as the
+environment resource's rows are written. A preview lands the request
+row alone, since nothing was written for a management row to describe.
 
 Over **Streamable HTTP**, both are established. The node routed the
 request to `/automation/v1/mcp` itself, so the path in the row is the
@@ -753,12 +1104,17 @@ call included, so the outcome word comes from what the call came to:
 `ok`; `forbidden:<scope>` for a tool the token does not hold, the same
 word and the same scope the read path behind that tool would have
 written; `forbidden:unknown_tool` for a name no tool has;
-`refused:invalid_params`, `refused:rate_limited` and
-`refused:protocol_error` for the refusals the core makes by itself; and
-when the tool ran and the plane refused its call, the word that HTTP
-status already has on every other row of this plane: `forbidden` for a
-hostname outside the token's grant, `refused` for a validator's 400 or
-a row an environment owns. The request metrics count the same word.
+`forbidden:spans_tiers` for a token spanning two tiers, which unlike
+the others in this list is answered `403`, since no server was built to
+produce a message; `refused:invalid_params`,
+`refused:rate_limited` and `refused:protocol_error` for the refusals
+the core makes by itself; and when the tool ran and the plane refused
+its call, the word that HTTP status already has on every other row of
+this plane: `forbidden` for a hostname outside the token's grant,
+`refused` for a validator's 400 or a row an environment owns. The
+request metrics count the same word. The whole vocabulary is
+`AUTOMATION_AUDIT_REASONS` in `lorica-api/src/automation/audit.rs`,
+and [automation.md](automation.md#reading-a-refusal) explains each.
 
 Anyone holding a live token can send any header they like, so every
 asserted value is bounded in length and character set before it reaches
@@ -767,45 +1123,105 @@ a row, and none is ever presented as something the node checked.
 An audit trail that cannot tell a claim from a proof is telling a story
 that is not true.
 
-## Rate limiting
+## Revocation and expiry
 
-Tool invocations are limited inside the server, per token: 120 calls a
-minute, in a fixed window, on both bindings and for every tier, a
-preview counting as a call like any other. The specification requires
-a server to rate limit them, and nothing outside the server does: the
-automation listener's connection caps and per-IP limiter count
-connections at accept, and a keep-alive or HTTP/2 client issues
-requests without opening one. Going over is a tool execution error, so
-the model sees it and can wait, rather than a protocol error it would
-read as a malfunction.
+A token is revoked on the management API,
+`DELETE /api/v1/automation/tokens/{public_id}` (SuperAdmin), or from the
+dashboard's Automation tokens page; there is no CLI command for it.
+The `public_id` is the one the mint printed on stderr and the one the
+stdio server prints in its startup notice. Nothing about a token is
+cached, so revocation and expiry bite on the very next request:
 
-Over stdio the window is the process's, since one process serves one
-token. Over Streamable HTTP the tool registry is rebuilt per request
-but the window is not: the node holds one limiter for the process,
-keyed by the token's `public_id`, and a token's window survives every
-request that spends from it. The limiter holds at most 1024 live
-windows; a window is opened only by a token that authenticated, and a
-token that finds no room while that many are live is refused for that
-call rather than handed somebody else's window, since evicting a live
-one would give a caller holding more tokens than the ceiling a fresh
-budget per call.
+- **Over Streamable HTTP**, the next POST presenting it is a `401` from
+  the bearer gate, before the core sees it, and the row reads
+  `automation.request.unauthenticated:token_revoked` (or
+  `token_expired`).
+- **Over stdio**, a server already running keeps its tool list, since
+  the list was built at startup, but every call it forwards is refused
+  by the plane with a 401, which the model reads as an execution error
+  carrying the plane's own words. A server started with a revoked or
+  expired token fails its startup `whoami` and exits with code 69.
 
-The automation plane budgets writes too, on its own and per
-credential, whether a write arrives over the socket or from a tool
-call in process: 30 settings writes a minute, the dashboard's figure
-for its settings page, and 100 of every other write together, its
-figure for route writes. The dashboard's budgets are layers on its own
-routes, which the plane does not mount, and every settings write is a
-reload and, on a control plane, a replication round to the fleet, so
-the plane holds its own. Going over is a 429 with `Retry-After`; a
-request the scope gate refuses spends nothing, and a read spends
-nothing.
+Revoking stops the credential, not what it already did. Every change it
+made is in the trail under its `public_id`, and each is undone the way
+it was made: a route or backend from the dashboard, a setting from the
+dashboard's settings form. After revoking, remove the client entry
+that held the token, so nothing launches a server with a dead
+credential.
 
-Neither budget counts what a call spends. A certificate
-renewal spends an ACME order against the CA's per-name budget, and is
-bounded per certificate on the plane, as the config tier section says:
-one order at a time, none within 48 hours of the last issuance, none
-during a CA cooldown.
+## Troubleshooting
+
+**The stdio server exits before the client sees a tool.** Read its
+stderr; the exit code says where to look (the constants are in
+`lorica-mcp/src/main.rs`):
+
+| Exit | Means | Look at |
+|---|---|---|
+| 78 | Configuration refused: an argument on the command line, a missing or malformed endpoint or token, an unreadable or malformed TOML file, an unusable CA bundle, or a token whose scopes span two tiers or name no tier | the message, which names the variable, the file or the scopes |
+| 69 | The plane could not be reached, or refused the token at `whoami` | the network path, the allowlist, the certificate, then the token |
+| 74 | The session failed: a standard stream broke, a message ran past the size limit (with or without a newline), or the process could not start its async runtime | the client, then the host |
+
+**69, and nothing reaches the node.** A source outside
+`automation_allowed_cidrs` is dropped before the TLS handshake, so the
+client sees a reset connection and no HTTP status, and the node counts
+it in `lorica_automation_source_refused_total`. A stdio server on the
+Lorica host connects from loopback, which the allowlist must name.
+
+**69, a certificate error.** The endpoint's host is not a name the
+listener's certificate carries, or `LORICA_MCP_CA_BUNDLE` does not name
+what signed it. For the default self-signed leaf, use `localhost`,
+`127.0.0.1`, `::1` or the machine's hostname, and a copy of the leaf as
+the bundle; after the node regenerates the leaf, refresh the copy.
+
+**69, a 401.** The token is unknown, wrong, revoked or expired. The
+node's `automation.request.unauthenticated` row carries the reason.
+Mint a new one; a 401 is never fixed by retrying.
+
+**The server started with no tools, or fewer than expected.** The
+startup notice names what was registered and what was not for want of
+a scope. A token minted with `lorica automation token create` may carry
+a scope of the tier that no tool uses (`environments:read` alone, for
+instance), or lack the reads a config tier tolerates; mint it with
+`--tier` instead.
+
+**A tool is "not registered", naming another tier.** One process serves
+one tier; that tool belongs to a server started with a token of the
+tier it names.
+
+**The config tier lists fewer routes, backends or certificates than the
+dashboard.** A token with grants lists only the rows inside them (see
+[What it cannot see](#what-it-cannot-see-and-why)). A row it cannot see
+is one it could not act on either; widen the grant by minting a new
+token if the row is genuinely the model's to touch.
+
+**A mint carrying `settings:write` is refused with a 422 naming a number
+of days.** That is the node's lifetime ceiling for the admin tier's
+scope. `lorica mcp token create --tier admin` stays under it by default;
+with `lorica automation token create` or the dashboard, name a lifetime
+within it.
+
+**A call failed with "refused this call with HTTP 403".** The token
+held the tool's scope and the plane refused the call: a hostname or a
+backend address outside the token's grants, a row another pipeline's
+environment owns, or a setting outside the admin allowlist. The fenced
+answer is the plane's own message. Do not re-mint for it; narrow the
+request or, if the grant is genuinely wrong, mint a token with the
+right one.
+
+**A call failed with a 422 or a 400.** A validator refused the value;
+the fenced answer says which field and why. A 429 is a write budget or
+a renewal bound, with `Retry-After`.
+
+**Streamable HTTP answers 400 with `-32020`.** A mirrored header is
+missing or disagrees with the body; the message names which. A `404`
+for `initialize` means the client speaks an older revision. A `403`
+whose JSON-RPC error is about `Origin` means a browser page, or a
+client that sends `Origin`, is driving the endpoint. A `403` naming
+scopes is a token spanning two tiers.
+
+**"over that" on every call.** The token spent its invocation budget
+for the window; wait, and narrow reads with their filters rather than
+paging through everything.
 
 ## The protocol revision, and keeping up with it
 
@@ -822,7 +1238,8 @@ revision's own answer and is how a client makes that determination.
 
 **This is a maintenance obligation, not a footnote.** The specification
 has moved three times in eighteen months. The revision this crate
-implements is stated in one constant and in this section, and a change
-to it is a release note. When the specification moves again, the crate
-does not follow automatically and nothing in the build will notice: a
-human has to read the changelog for that revision and decide.
+implements is stated in one constant, `MCP_PROTOCOL_REVISION` in
+`lorica-mcp/src/lib.rs`, and in this section, and a change to it is a
+release note. When the specification moves again, the crate does not
+follow automatically and nothing in the build will notice: a human has
+to read the changelog for that revision and decide.

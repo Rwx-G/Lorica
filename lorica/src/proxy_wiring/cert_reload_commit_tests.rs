@@ -212,6 +212,9 @@ async fn handle_config_reload_commit_reloads_cert_resolver() {
     let inc = IncomingCommand::for_test(cmd, tx_out);
 
     // === Act : drive the worker-side commit handler ===
+    // A commit rebuilds the process-wide AI-crawler registry, which
+    // another test in this binary writes and reads back.
+    let _registry_writers = super::ai_bot_merged::TEST_HANDLE_WRITERS.lock().await;
     handle_config_reload_commit(
         inc,
         &proxy_config,
@@ -332,6 +335,9 @@ async fn handle_config_reload_commit_unreferenced_cert_stays_unloaded() {
     let (tx_out, mut rx_out) = tokio::sync::mpsc::channel(8);
     let inc = IncomingCommand::for_test(cmd, tx_out);
 
+    // A commit rebuilds the process-wide AI-crawler registry, which
+    // another test in this binary writes and reads back.
+    let _registry_writers = super::ai_bot_merged::TEST_HANDLE_WRITERS.lock().await;
     handle_config_reload_commit(
         inc,
         &proxy_config,
@@ -427,6 +433,9 @@ async fn handle_config_reload_commit_stale_generation_replies_error_and_skips_re
     let (tx_out, mut rx_out) = tokio::sync::mpsc::channel(8);
     let inc = IncomingCommand::for_test(cmd, tx_out);
 
+    // A commit rebuilds the process-wide AI-crawler registry, which
+    // another test in this binary writes and reads back.
+    let _registry_writers = super::ai_bot_merged::TEST_HANDLE_WRITERS.lock().await;
     handle_config_reload_commit(
         inc,
         &proxy_config,

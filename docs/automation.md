@@ -93,8 +93,13 @@ so a caller outside the list gets no handshake, no certificate and no
 byte read from them; it never sees a 401 or a 403 because it never
 reaches HTTP. The rule is the same `ConnectionFilterPolicy` the proxy's
 TCP pre-filter uses, held with an empty deny list and never empty on
-the allow side, so it is default-deny in practice. It is fixed when the
-listener opens. An entry that is neither a CIDR nor an address refuses
+the allow side, so it is default-deny in practice. It reloads with the
+configuration: a settings write followed by the reload takes effect on
+the next accepted connection, with no restart, and a reload that would
+leave it empty or unreadable is refused and the previous list stands.
+Connections already established are not dropped, since it is a check
+on accept and not a session killer; revoke the credential to cut a
+keep-alive client off. An entry that is neither a CIDR nor an address refuses
 the listener rather than being skipped with a warning: a typo that
 silently narrows an allowlist is the failure an operator discovers
 during an incident.
@@ -236,10 +241,10 @@ A token carries:
 |---|---|---|
 | `name` | Operator-facing label, and the ownership principal (see Ownership). | Not blank. |
 | `scopes` | What it may do. | At least one, from the closed list below. |
-| `allowed_hostnames` | Hostname patterns it may claim. | At least one. An exact name or a single leading `*.`; a bare `*` is refused. |
-| `allowed_backend_cidrs` | CIDRs or bare addresses it may point a hostname at. | At least one. There is no node-wide default backend policy to fall back on, and the filter reads an empty allow list as allow-every-address, so an empty list is refused at mint time and the grant covers nothing at use time. |
+| `allowed_hostnames` | Hostname patterns it may claim. | Typed absence (below): at least one when a scope the grants bound is carried, none otherwise. An exact name or a single leading `*.`; a bare `*` is refused. An empty list admits no host. |
+| `allowed_backend_cidrs` | CIDRs or bare addresses it may point a hostname at. | Same rule. There is no node-wide default backend policy to fall back on, and an empty list admits no address: the backend check refuses on it before it builds the connection filter, whose own empty allow list would read as every address. |
 | `max_ttl_seconds` | Ceiling on the lifetime any environment it creates may request. | Default seven days, hard cap thirty. |
-| `expires_at` | Absolute UTC instant after which the token is refused. | Mandatory. Given as `expires_at` or as `lifetime_days` from now, never both; default 365 days. |
+| `expires_at` | Absolute UTC instant after which the token is refused. | Mandatory. Given as `expires_at` or as `lifetime_days` from now, never both; default `AUTOMATION_TOKEN_DEFAULT_LIFETIME_DAYS` (365 days). A token carrying `settings:write` lives at most `AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS` (7 days) and is refused with a 422 naming the ceiling past it, the default included, so its mint names a lifetime. |
 | `last_used_at` | When the token was last accepted. | Stamped at most once a minute per token, best effort: the field answers "is anybody still using this", and one SQLite write per request on the single store lock is not what that question costs. The signal to retire a token nobody presents. |
 | `revoked_at` | When an operator withdrew it. | `DELETE /api/v1/automation/tokens/{public_id}` stamps it and keeps the row. |
 
@@ -281,6 +286,37 @@ Story 11.3 reversed the same decision for node-wide settings, for one
 scope and one path, bounded by an allowlist the plane enforces: see
 [The admin write](#the-admin-write). Identity and the cluster's
 membership stay out of reach of every token.
+
+**The grants are typed absence (decided 2026-09-30).** Only some paths
+read a credential's hostname and backend grants: the environment write,
+and the route, backend and certificate writes, which check every name
+and address a body claims and the stored row it names. No read and not
+the settings write consults either grant. The scopes reaching those
+paths are the grant-bounded ones, decided in one place,
+`AutomationScope::is_grant_bounded` in `lorica-config`; today they are
+every write scope except `settings:write`. So:
+
+- a token carrying at least one grant-bounded scope must name at least
+  one hostname pattern AND at least one backend CIDR, or the mint is
+  refused (422, naming the field);
+- a token carrying none must name neither, or the mint is refused the
+  same way. A grant that bounds nothing would still read as the token's
+  blast radius in the listing, and a read or an admin-tier token has
+  no blast radius on those two axes.
+
+An empty list means "nothing" on every consumer, never "everything":
+`allows_hostname` over an empty list matches no name, and the backend
+check refuses an empty CIDR list before it builds a filter. The two
+fields may simply be omitted from the mint body, and a token minted
+without them answers them as empty lists. The same rule holds for an
+OIDC issuer entry, which grants the same two things.
+
+The rule is enforced when a credential is minted or registered, not
+when a stored row is loaded. A read token minted before v1.9.0 carries
+the grants the mint used to require; it keeps working exactly as it
+did, since no path it reaches reads them, and the dashboard renders its
+grants as "not applicable" rather than as a blast radius it does not
+have. Re-mint it without them whenever convenient; nothing forces it.
 
 **`allowed_hostnames` uses single-label wildcard semantics.**
 `*.review.example.com` covers `mr-42.review.example.com` and refuses
@@ -699,11 +735,28 @@ nothing else:
 **Each one is the management API's own answer, not a second
 implementation of it.** The handler on this listener calls the
 management handler, or the function that handler was split out of, and
-re-wraps the rows it returns; nothing on this plane computes a figure,
-filters a row set or serialises a record of its own. That is not
-tidiness. Two surfaces that compute one answer independently drift, and
-on a read surface the drift takes the shape of a field one of them
-stopped stripping, which no test on either side notices.
+re-wraps the rows it returns; nothing on this plane computes a figure
+or serialises a record of its own. That is not tidiness. Two surfaces
+that compute one answer independently drift, and on a read surface the
+drift takes the shape of a field one of them stopped stripping, which
+no test on either side notices. What this plane does add is two things
+the management plane has no reason to do, both below: it withholds a
+short list of values, and it narrows three listings to a credential's
+grants.
+
+**A credential with grants lists what its grants cover.** For a
+principal carrying a scope a grant bounds, `/routes` answers the routes
+whose hostname and every alias are inside `allowed_hostnames`,
+`/backends` the backends whose address is inside
+`allowed_backend_cidrs`, and `/certificates` the certificates whose
+domain and every SAN are inside `allowed_hostnames`: the predicates the
+write guard applies, so what such a credential can see and what it can
+act on are one set, and text another principal wrote outside that set
+(an error page, a rewrite, a backend name) never reaches it. The window
+pages over the filtered set. A credential carrying no bounded scope
+lists every row. None of these resources has a single-row read here;
+a write naming an id outside the grant is refused with a 403 naming the
+id and nothing about the row.
 
 **The cap is the server's, and it counts bytes as well as rows.** Every
 collection answers `{"data": {"items": [...], "page": {...}}}` where
@@ -733,10 +786,18 @@ becomes five unanchored `LIKE` predicates plus a `COUNT(*)` over the
 whole retained log, so its length is a per-request cost the caller
 would otherwise choose, and it is capped at 256 bytes here.
 
-**No secret crosses this boundary**, and the reason is the first point
-above rather than a filter written here: the views are the management
-plane's, so a route's Basic-auth hash never leaves the store, and the
-certificate listing carries metadata with no PEM body of any kind. The
+**No secret crosses this boundary.** Most of that is the first point
+above: the views are the management plane's, so a route's Basic-auth
+hash never leaves the store, and the certificate listing carries
+metadata with no PEM body of any kind. What those views carry for the
+dashboard's sake, this plane withholds, replacing each value with
+`[redacted]` and keeping every key: a route's `proxy_headers` values
+(where an upstream credential goes), the userinfo and query values of a
+route's `forward_auth` address, the query values of a backend's
+`health_check_path`, and the query values and fragment of an access-log
+row's `path` (the proxy records the path without its query string, so
+that last one is a guard for rows from any other producer). The same
+holds on every write answer and preview (`lorica-api/src/automation/redact.rs`). The
 single-certificate endpoint, which does return the public certificate
 PEM, is deliberately not mounted on this listener. Two tests in
 `lorica-api/src/tests.rs` hold that, and they walk the paths the scope
@@ -751,8 +812,9 @@ or not.
 
 **What the rows contain is attacker-controlled text.** Access-log paths
 and hostnames, WAF matched values, User-Agent strings: that is the
-point of reading them and it is also the hazard. They cross unchanged,
-in the field the node recorded them in. Lorica does not summarise them,
+point of reading them and it is also the hazard. They cross unchanged
+but for the withheld values above, in the field the node recorded them
+in. Lorica does not summarise them,
 quote them or interpret them, and whatever consumes this surface must
 treat them as data.
 
@@ -794,15 +856,16 @@ future gateway that caches or sniffs without being asked to.
 ### The MCP endpoint over the same reads and writes
 
 `POST /automation/v1/mcp` is the Model Context Protocol server's
-Streamable HTTP binding, both tiers of it. It answers the nine reads
-above and the eight writes below through the protocol an MCP client
-speaks, so a language model can ask what this node is seeing, and
-since v1.9.0 (Story 11.2) change a route, a backend or a certificate
-binding, without anything being installed beside it. Which tier a POST
-is served is the token it presents: a write scope registers that
-scope's mutations with their previews, a read scope its reads, and
-nothing else. [mcp.md](mcp.md) is the document for it; what matters
-here is how it sits on this plane.
+Streamable HTTP binding, all three tiers of it. It answers the reads
+above, the writes below and the admin write through the protocol an
+MCP client speaks, so a language model can ask what this node is
+seeing and, with a token of the right tier, change a route, a backend,
+a certificate binding or an allowlisted setting, without anything being
+installed beside it. Which tier a POST is served is the token it
+presents, and a token is one tier or none: a token whose scopes span
+two tiers is refused with a `403` (`spans_tiers`, below) and nothing
+runs. [mcp.md](mcp.md) is the document for it; what matters here is
+how it sits on this plane.
 
 It is a path and not a listener. Everything this socket enforces it
 enforces first: a source outside `automation_allowed_cidrs` is dropped
@@ -849,8 +912,8 @@ have written, and the core's own refusals are `refused:invalid_params`,
 core never saw carries the decoded `Mcp-Name` as `asserted[tool=...]`.
 [mcp.md](mcp.md) has the whole of it.
 
-Tool invocations on this path are budgeted per token, 120 a minute,
-held by the process across requests. The listener's per-IP limiter is
+Tool invocations on this path are budgeted per token, `RATE_BUDGET` a
+`RATE_WINDOW` (120 a minute), held by the process across requests. The listener's per-IP limiter is
 not that budget: it counts connections, and a keep-alive client issues
 requests without opening one.
 
@@ -1175,8 +1238,8 @@ Field by field:
 | `jwks_url` | Where the signing keys are fetched from. | `https` only. Defaults to `<issuer>/oauth/discovery/keys`, which is where GitLab publishes them. |
 | `ca_pem` | A CA this entry pins for its own JWKS fetch. | Optional. One or more PEM certificates, 64 KiB at most; at least one must parse or the registration is refused. Never returned: a listing answers with `ca_fingerprint`. |
 | `bound_claims` | Claims that must match exactly. | Keys from the closed set `project_path`, `namespace_path`, `ref_protected`, `environment_protected`, `deployment_tier`. At least one of `project_path` and `namespace_path`: `aud` is not a secret, so an entry binding neither accepts a token from every project on the instance. A `*` glob is accepted in `project_path` ONLY, must carry a `/` before its first `*` (`acme/*`, never `acme*`, which would also cover `acme-evil/pwn`), and never spans a `/`, so `acme/*` is the acme group's own projects and `acme/sub/*` is how a subgroup is granted. The two `_protected` claims take exactly `true` or `false`. |
-| `allowed_hostnames` | Hostname patterns a token may claim. | At least one. Same one-label wildcard rule as a static token; a bare `*` is refused. |
-| `allowed_backend_cidrs` | CIDRs a token may point a hostname at. | Same rule as a static token: at least one, and an empty list is refused rather than read as every address. |
+| `allowed_hostnames` | Hostname patterns a token may claim. | The static token's typed-absence rule: at least one when a scope the grants bound is granted, none otherwise. Same one-label wildcard rule; a bare `*` is refused. |
+| `allowed_backend_cidrs` | CIDRs a token may point a hostname at. | Same rule as a static token. An empty list admits no address. |
 | `max_ttl_seconds` | Ceiling on the lifetime an environment may request. | Defaults to seven days, capped at thirty. |
 | `scopes` | What a token may do. | At least one; the same closed list as a static token. |
 
@@ -1399,8 +1462,10 @@ translating:
 | `certificates:read` | Same, for certificate metadata. |
 | `logs:read`, `waf:read`, `sla:read`, `cluster:read`, `backends:read` | Same, for the read views the MCP server's read tier is built on. On `POST /automation/v1/mcp`, the scope the tool the call named needed and the credential does not carry. |
 | `routes:write`, `backends:write`, `certificates:write` | Same, for the write surface the MCP server's config tier is built on. |
+| `settings:write` | Same, for the settings write the MCP server's admin tier is built on. |
 | `no_declared_scope` | The path has no entry in the scope matrix, so no token can reach it. A bug in Lorica, not in the caller: the scope gate also logs it at ERROR. |
 | `unknown_tool` | On `POST /automation/v1/mcp` only: the call named a tool no catalogue entry has. |
+| `spans_tiers` | On `POST /automation/v1/mcp` only: the credential's scopes span two MCP tiers, so no server was built for it and nothing ran. The `403` body names the offending scopes. Mint one token per tier (`lorica mcp token create --tier`). |
 
 A 403 a handler raised rather than the scope gate (an ownership rule, a
 hostname or a backend address outside the credential's grant on any

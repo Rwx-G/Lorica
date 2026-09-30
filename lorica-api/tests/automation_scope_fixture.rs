@@ -40,9 +40,21 @@ const FIXTURE_PATH: &str =
 /// The exported array's name, which is also where the parse starts.
 const EXPORT: &str = "AUTOMATION_SCOPE_WIRE_STRINGS";
 
+/// The second export: the scopes whose paths consult a token's grants.
+const GRANT_BOUNDED_EXPORT: &str = "GRANT_BOUNDED_SCOPES";
+
+/// How the enum spells `scope`.
+fn wire(scope: AutomationScope) -> String {
+    serde_json::to_value(scope)
+        .expect("a scope serialises")
+        .as_str()
+        .expect("a scope serialises to a string")
+        .to_string()
+}
+
 #[test]
 fn the_dashboard_fixture_carries_exactly_the_scopes_the_enum_declares() {
-    let in_typescript: BTreeSet<String> = scopes_in_fixture(GENERATED_FIXTURE);
+    let in_typescript: BTreeSet<String> = scopes_in_fixture(GENERATED_FIXTURE, EXPORT);
     assert!(
         !in_typescript.is_empty(),
         "no scope string found in {FIXTURE_PATH}: the array was reshaped and this \
@@ -50,16 +62,7 @@ fn the_dashboard_fixture_carries_exactly_the_scopes_the_enum_declares() {
          `= [` and a list of single-quoted strings."
     );
 
-    let in_rust: BTreeSet<String> = AutomationScope::ALL
-        .iter()
-        .map(|scope| {
-            serde_json::to_value(scope)
-                .expect("a scope serialises")
-                .as_str()
-                .expect("a scope serialises to a string")
-                .to_string()
-        })
-        .collect();
+    let in_rust: BTreeSet<String> = AutomationScope::ALL.iter().copied().map(wire).collect();
 
     let missing_from_typescript: Vec<&String> = in_rust.difference(&in_typescript).collect();
     let typescript_without_rust: Vec<&String> = in_typescript.difference(&in_rust).collect();
@@ -91,23 +94,54 @@ fn the_dashboard_fixture_carries_exactly_the_scopes_the_enum_declares() {
 }
 
 #[test]
+fn the_dashboard_fixture_names_exactly_the_scopes_the_enum_says_its_grants_bound() {
+    // Typed absence (2026-09-30) is enforced by the model and rendered
+    // by the dashboard, which asks for grants only when a bounded scope
+    // is selected and shows "not applicable" otherwise. The set is the
+    // enum's `is_grant_bounded`; this is the edge that keeps the form
+    // asking for exactly what the node will require and refuse.
+    let in_typescript: BTreeSet<String> =
+        scopes_in_fixture(GENERATED_FIXTURE, GRANT_BOUNDED_EXPORT);
+    assert!(
+        !in_typescript.is_empty(),
+        "no scope string found under `export const {GRANT_BOUNDED_EXPORT}` in {FIXTURE_PATH}: \
+         the array was reshaped and this gate went blind"
+    );
+    let in_rust: BTreeSet<String> = AutomationScope::ALL
+        .iter()
+        .copied()
+        .filter(|scope| scope.is_grant_bounded())
+        .map(wire)
+        .collect();
+    assert_eq!(
+        in_typescript, in_rust,
+        "\nEdit `{GRANT_BOUNDED_EXPORT}` in {FIXTURE_PATH} by hand so it is exactly the scopes \
+         `AutomationScope::is_grant_bounded` answers true for, sorted. A scope missing there is \
+         one the mint form mints without the grants the node then refuses it for.\n"
+    );
+}
+
+#[test]
 fn the_fixture_is_sorted_so_its_shape_is_one_canonical_thing() {
     // The comparison above is set-based and would accept any order.
     // Pinning the order keeps the file a byte-comparable artefact:
     // whoever adds a scope inserts it in one predictable place, and a
     // diff on this file shows the change and nothing else.
-    let listed: Vec<String> = ordered_scopes_in_fixture(GENERATED_FIXTURE);
-    let mut sorted: Vec<String> = listed.clone();
-    sorted.sort();
-    assert_eq!(
-        listed, sorted,
-        "{FIXTURE_PATH} is not sorted; keep the list in ascending order"
-    );
+    for export in [EXPORT, GRANT_BOUNDED_EXPORT] {
+        let listed: Vec<String> = ordered_scopes_in_fixture(GENERATED_FIXTURE, export);
+        let mut sorted: Vec<String> = listed.clone();
+        sorted.sort();
+        assert_eq!(
+            listed, sorted,
+            "`{export}` in {FIXTURE_PATH} is not sorted; keep the list in ascending order"
+        );
+    }
 }
 
-/// Every single-quoted string inside the exported array literal.
-fn ordered_scopes_in_fixture(source: &str) -> Vec<String> {
-    let after_export: &str = match source.split_once(EXPORT) {
+/// Every single-quoted string inside the array literal `export` names.
+fn ordered_scopes_in_fixture(source: &str, export: &str) -> Vec<String> {
+    let declaration = format!("export const {export}");
+    let after_export: &str = match source.split_once(declaration.as_str()) {
         Some((_, rest)) => rest,
         None => return Vec::new(),
     };
@@ -165,8 +199,10 @@ fn without_comments(body: &str) -> String {
 }
 
 /// The same strings as a set, which is what the diff compares.
-fn scopes_in_fixture(source: &str) -> BTreeSet<String> {
-    ordered_scopes_in_fixture(source).into_iter().collect()
+fn scopes_in_fixture(source: &str, export: &str) -> BTreeSet<String> {
+    ordered_scopes_in_fixture(source, export)
+        .into_iter()
+        .collect()
 }
 
 #[test]
@@ -183,7 +219,7 @@ fn a_commented_out_entry_is_not_counted_as_present() {
          ];\n"
     );
     assert_eq!(
-        ordered_scopes_in_fixture(&commented),
+        ordered_scopes_in_fixture(&commented, EXPORT),
         vec!["cluster:read".to_string()]
     );
 }

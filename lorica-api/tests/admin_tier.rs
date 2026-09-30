@@ -38,6 +38,7 @@ use lorica_api::automation::write::{AdminSetting, Reach, TakesEffect, SETTINGS_A
 use lorica_config::models::AutomationScope;
 use lorica_mcp::server::{Identity, McpServer};
 use lorica_mcp::tools::{catalogue, ToolSpec};
+use lorica_mcp::Tier;
 
 /// The management route table, read as source.
 const MANAGEMENT_ROUTES: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs"));
@@ -178,12 +179,14 @@ fn wire(scope: AutomationScope) -> String {
         .expect("a scope serialises to a string")
 }
 
-/// A server over a token carrying exactly `scopes`.
+/// A server over a token carrying exactly `scopes`, which must be one
+/// tier's.
 fn server_carrying(scopes: &[AutomationScope]) -> McpServer {
     McpServer::over(Identity {
         public_id: "0123456789abcdef01234567".to_string(),
         scopes: scopes.iter().copied().map(wire).collect(),
     })
+    .unwrap_or_else(|refused| panic!("test setup: {refused}"))
 }
 
 #[test]
@@ -201,7 +204,7 @@ fn iv1_the_admin_tiers_tools_change_exactly_the_allowlist() {
 
     let server = server_carrying(&[AutomationScope::SettingsWrite]);
     let registered: &[&ToolSpec] = server.tools();
-    assert_eq!(server.tier(), "admin tier");
+    assert_eq!(server.tier(), Tier::Admin);
 
     // Exactly the catalogue's tools behind the scope, and each of them
     // is a mutation or its preview on the settings path.
@@ -251,18 +254,12 @@ const ALLOWLIST_TABLE_HEADER: &str = "| Setting | Tier bound | Reach | Takes eff
 /// The row `docs/mcp.md` must carry for `setting`, rendered from the
 /// entry itself.
 fn documented_row(setting: &AdminSetting) -> String {
-    let reach = match setting.reach {
-        Reach::Fleet => "fleet",
-        Reach::Node => "this node",
-    };
-    let takes_effect = match setting.takes_effect {
-        TakesEffect::Live => "live",
-        TakesEffect::Restart => "at restart",
-    };
     format!(
-        "| `{}` | {} | {reach} | {takes_effect} |",
+        "| `{}` | {} | {} | {} |",
         setting.name,
-        setting.bound_text()
+        setting.bound_text(),
+        setting.reach.describe(),
+        setting.takes_effect.describe()
     )
 }
 
@@ -404,14 +401,13 @@ fn iv2_nothing_the_automation_plane_mounts_and_declares_is_an_identity_or_fleet_
 #[test]
 fn iv2_no_tool_of_any_tier_calls_an_identity_or_fleet_operation() {
     // The refusal is at the gate because the tool does not exist, not
-    // because it exists and says no. A token carrying every scope there
-    // is registers every tool, and not one of them calls a path under a
-    // human-only family.
-    let widest = server_carrying(AutomationScope::ALL);
-    assert_eq!(widest.tools().len(), catalogue().len());
+    // because it exists and says no. No tool of any tier calls a path
+    // under a human-only family. The catalogue is walked directly: no
+    // one token registers every tool any more, since one process
+    // serves one tier.
     let mirrored_families: Vec<String> =
         HUMAN_ONLY_FAMILIES.iter().copied().map(mirrored).collect();
-    for spec in widest.tools() {
+    for spec in catalogue() {
         let path = path_of(spec);
         for family in &mirrored_families {
             assert!(

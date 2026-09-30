@@ -4,8 +4,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { auth } from '../../lib/auth';
 import { clusterStatus } from '../../lib/cluster';
 import { api, type AutomationTokenResponse } from '../../lib/api';
-import AutomationTokensTab, { ALL_SCOPES } from './AutomationTokensTab.svelte';
-import { AUTOMATION_SCOPE_WIRE_STRINGS } from './automation-scopes.generated';
+import AutomationTokensTab, { ALL_SCOPES, carriesGrants } from './AutomationTokensTab.svelte';
+import {
+  AUTOMATION_SCOPE_WIRE_STRINGS,
+  GRANT_BOUNDED_SCOPES,
+} from './automation-scopes.generated';
 
 const FULL_TOKEN = '0123456789abcdef01234567.SGVsbG9Xb3JsZFNlY3JldFZhbHVlSGVyZTEyMzQ1Ng';
 
@@ -89,6 +92,28 @@ describe('AutomationTokensTab listing', () => {
     expect(screen.getByText('never')).toBeInTheDocument();
   });
 
+  it('renders the grants of a token that carries no bounded scope as not applicable', async () => {
+    // Typed absence: no path a read or settings token reaches consults
+    // a grant. A row minted before the rule may still store one, and
+    // it is not that token's blast radius, so it is not shown.
+    vi.spyOn(api, 'listAutomationTokens').mockResolvedValue({
+      data: {
+        tokens: [
+          token({
+            name: 'mcp read',
+            scopes: ['logs:read', 'waf:read'],
+            allowed_hostnames: ['*.legacy.example.com'],
+          }),
+        ],
+      },
+    });
+    render(AutomationTokensTab, { props: props() });
+
+    await waitFor(() => expect(screen.getByText('mcp read')).toBeInTheDocument());
+    expect(screen.getByText('not applicable')).toBeInTheDocument();
+    expect(screen.queryByText('*.legacy.example.com')).not.toBeInTheDocument();
+  });
+
   it('badges a revoked token and offers no revoke action on it', async () => {
     vi.spyOn(api, 'listAutomationTokens').mockResolvedValue({
       data: { tokens: [token({ revoked_at: '2026-02-01T00:00:00Z' })] },
@@ -113,6 +138,7 @@ describe('AutomationTokensTab create-once display', () => {
     );
     await fireEvent.click(screen.getByRole('button', { name: 'Create Token' }));
     await fireEvent.input(screen.getByLabelText(/^Name/), { target: { value: 'ci pipeline' } });
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'environments:write' }));
     await fireEvent.input(screen.getByLabelText(/^Allowed hostnames/), {
       target: { value: '*.preview.example.com' },
     });
@@ -152,6 +178,60 @@ describe('AutomationTokensTab create-once display', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(FULL_TOKEN));
     expect(screen.getByRole('button', { name: 'Copied' })).toBeInTheDocument();
+  });
+});
+
+describe('AutomationTokensTab grants', () => {
+  async function openForm() {
+    vi.spyOn(api, 'listAutomationTokens').mockResolvedValue({ data: { tokens: [] } });
+    const create = vi.spyOn(api, 'createAutomationToken').mockResolvedValue({
+      data: { ...token(), token: FULL_TOKEN },
+    });
+    render(AutomationTokensTab, { props: props() });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Create Token' })).toBeInTheDocument(),
+    );
+    await fireEvent.click(screen.getByRole('button', { name: 'Create Token' }));
+    await fireEvent.input(screen.getByLabelText(/^Name/), { target: { value: 'mcp' } });
+    return create;
+  }
+
+  it('asks for no grant while no selected scope is bounded, and sends none', async () => {
+    const create = await openForm();
+    expect(screen.queryByLabelText(/^Allowed hostnames/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Allowed backend CIDRs/)).not.toBeInTheDocument();
+    expect(screen.getByText(/not applicable/)).toBeInTheDocument();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    const body = create.mock.calls[0][0];
+    expect(body).not.toHaveProperty('allowed_hostnames');
+    expect(body).not.toHaveProperty('allowed_backend_cidrs');
+  });
+
+  it('asks for both grants once a bounded scope is selected, and sends them', async () => {
+    const create = await openForm();
+    for (const bounded of GRANT_BOUNDED_SCOPES) {
+      expect(carriesGrants([bounded])).toBe(true);
+    }
+    await fireEvent.click(screen.getByRole('checkbox', { name: GRANT_BOUNDED_SCOPES[0] }));
+    await fireEvent.input(screen.getByLabelText(/^Allowed hostnames/), {
+      target: { value: 'app.example.com' },
+    });
+    await fireEvent.input(screen.getByLabelText(/^Allowed backend CIDRs/), {
+      target: { value: '10.0.0.0/8' },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    const body = create.mock.calls[0][0];
+    expect(body.allowed_hostnames).toEqual(['app.example.com']);
+    expect(body.allowed_backend_cidrs).toEqual(['10.0.0.0/8']);
+  });
+
+  it('treats every scope outside the bounded set as carrying no grant', () => {
+    for (const scope of AUTOMATION_SCOPE_WIRE_STRINGS) {
+      expect(carriesGrants([scope])).toBe(GRANT_BOUNDED_SCOPES.includes(scope));
+    }
   });
 });
 

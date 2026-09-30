@@ -282,6 +282,89 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: AutomationAction,
     },
+    /// Management MCP server commands (Epic 11).
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum McpAction {
+    /// Tokens for the MCP server's tiers.
+    Token {
+        #[command(subcommand)]
+        action: McpTokenAction,
+    },
+}
+
+/// `--tier`'s accepted values, read from the MCP crate's tier table so
+/// the help lists exactly the tiers the server knows.
+pub(crate) fn tier_parser() -> impl clap::builder::TypedValueParser<Value = lorica_mcp::Tier> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::PossibleValuesParser::new(lorica_mcp::Tier::ALL.map(lorica_mcp::Tier::as_str))
+        .try_map(|value| value.parse::<lorica_mcp::Tier>())
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum McpTokenAction {
+    /// Mint a token carrying exactly one MCP tier's scopes, print it
+    /// once on standard output, and print what the tier can do on
+    /// standard error.
+    ///
+    /// A thin front end over `lorica automation token create`, not an
+    /// alternative to it: the tier is resolved to its scope set from
+    /// the MCP server's own tier table, and the token is minted through
+    /// the same management request, audited the same way, as that
+    /// command mints any other. The blast radius printed beside it is
+    /// derived from the same table and the tool catalogue when it is
+    /// printed.
+    Create {
+        /// The tier the token serves.
+        #[arg(long, value_parser = tier_parser())]
+        tier: lorica_mcp::Tier,
+
+        /// Operator-facing label for the token. Defaults to
+        /// `mcp-<tier>`.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// A hostname pattern the token may claim. Required, at least
+        /// once, for the config tier, whose write tools are bounded by
+        /// it; refused for a tier none of whose scopes it bounds.
+        #[arg(long = "hostname")]
+        hostnames: Vec<String>,
+
+        /// A CIDR (or bare address) the token may point a hostname at.
+        /// Same rule as `--hostname`.
+        #[arg(long = "backend-cidr")]
+        backend_cidrs: Vec<String>,
+
+        /// The token's own lifetime in days. Defaults to the tier's own
+        /// lifetime, which the tier table sets shorter the further a
+        /// tier reaches and the command prints with the blast radius.
+        /// The node refuses a settings:write token (the admin tier)
+        /// past its ceiling whatever is asked here.
+        #[arg(long)]
+        lifetime_days: Option<i64>,
+
+        /// SuperAdmin username on the local management API.
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// Read the SuperAdmin password from this file (preferred).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Read the SuperAdmin password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// SuperAdmin password on the command line (discouraged; see
+        /// `automation token create`).
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -319,15 +402,17 @@ pub(crate) enum AutomationTokenAction {
         scopes: Vec<String>,
 
         /// A hostname pattern the token may claim. Repeat the flag
-        /// for each one; at least one is required. An exact name or a
-        /// single leading `*.` wildcard.
-        #[arg(long = "hostname", required = true)]
+        /// for each one. An exact name or a single leading `*.`
+        /// wildcard. At least one is required when a scope is bounded
+        /// by the grants (the write scopes other than `settings:write`)
+        /// and none is accepted otherwise: a grant on a token whose
+        /// every path ignores it would only read as a blast radius.
+        #[arg(long = "hostname")]
         hostnames: Vec<String>,
 
         /// A CIDR (or bare address) the token may point a hostname
-        /// at. Repeat the flag for each one; at least one is
-        /// required.
-        #[arg(long = "backend-cidr", required = true)]
+        /// at. Repeat the flag for each one. Same rule as `--hostname`.
+        #[arg(long = "backend-cidr")]
         backend_cidrs: Vec<String>,
 
         /// Ceiling, in seconds, on the lifetime any environment this
@@ -335,7 +420,9 @@ pub(crate) enum AutomationTokenAction {
         #[arg(long)]
         max_ttl_seconds: Option<u32>,
 
-        /// The token's own lifetime in days. Defaults to 365.
+        /// The token's own lifetime in days. Defaults to the node's
+        /// default token lifetime; a token carrying settings:write is
+        /// refused past a much shorter ceiling, so name one for it.
         #[arg(long)]
         lifetime_days: Option<i64>,
 
@@ -1269,11 +1356,13 @@ mod tests {
     }
 
     #[test]
-    fn minting_a_token_without_a_backend_cidr_is_refused_at_parse_time() {
-        // There is no node-wide default backend policy to fall back
-        // on any more, and the server refuses an empty grant, so the
-        // CLI has to refuse it here rather than send a mint that
-        // cannot succeed.
+    fn minting_a_token_parses_without_grants_and_the_grant_rule_is_the_models() {
+        // Typed absence: a read token carries no grant, so neither flag
+        // is required at parse time any more. Whether a set of scopes
+        // needs them is the model's rule, which the command runs before
+        // it logs in (`cli_automation::grants_refusal`), so an
+        // environment token without a CIDR still fails before any
+        // request.
         let argv = [
             "lorica",
             "automation",
@@ -1286,10 +1375,47 @@ mod tests {
             "--hostname",
             "*.review.example.com",
         ];
-        assert!(Cli::try_parse_from(argv).is_err());
-        let mut with_cidr = argv.to_vec();
-        with_cidr.extend(["--backend-cidr", "10.0.0.0/8"]);
-        assert!(Cli::try_parse_from(with_cidr).is_ok());
+        assert!(Cli::try_parse_from(argv).is_ok());
+        assert!(crate::cli_automation::grants_refusal(
+            &["environments:write".to_string()],
+            &["*.review.example.com".to_string()],
+            &[],
+        )
+        .is_err());
+        let read_only = [
+            "lorica",
+            "automation",
+            "token",
+            "create",
+            "--name",
+            "mcp",
+            "--scope",
+            "logs:read",
+        ];
+        assert!(Cli::try_parse_from(read_only).is_ok());
+    }
+
+    #[test]
+    fn mcp_token_create_takes_a_tier_the_table_knows_and_nothing_else() {
+        for tier in lorica_mcp::Tier::ALL {
+            let parsed =
+                Cli::try_parse_from(["lorica", "mcp", "token", "create", "--tier", tier.as_str()])
+                    .expect("a tier the table names");
+            match parsed.command {
+                Some(Commands::Mcp {
+                    action:
+                        McpAction::Token {
+                            action: McpTokenAction::Create { tier: parsed, .. },
+                        },
+                }) => assert_eq!(parsed, tier),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(
+            Cli::try_parse_from(["lorica", "mcp", "token", "create", "--tier", "everything"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["lorica", "mcp", "token", "create"]).is_err());
     }
 
     const RESERVED: ReservedPorts = ReservedPorts {

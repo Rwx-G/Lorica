@@ -70,6 +70,11 @@
 //! which nothing here does: the registry is built from the request's
 //! own principal and dropped with it.
 //!
+//! Before any of that, the principal has to be ONE tier: Story 11.4 AC
+//! #1 refuses a token whose scopes span two, in the constructor this
+//! handler and the stdio binding share, and this handler answers the
+//! refusal as a `403` naming the scopes (see `Refusal::spans_tiers`).
+//!
 //! The scope each tool names is `lorica-mcp`'s, and the scope each path
 //! sits behind is [`super::scope::required_scope`]'s. They are two
 //! statements of one rule, so `tests/mcp_catalogue_scopes.rs` pins them
@@ -142,9 +147,10 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
 use http::{HeaderMap, HeaderValue, StatusCode};
+use lorica_config::models::OwnerKind;
 use lorica_mcp::server::{Identity, McpServer, Outcome};
 use lorica_mcp::{
-    jsonrpc, tools, AutomationPlane, PlaneError, Reason, Verb, MCP_PROTOCOL_REVISION,
+    jsonrpc, tools, AutomationPlane, PlaneError, Reason, TierError, Verb, MCP_PROTOCOL_REVISION,
 };
 use serde_json::Value;
 use tower::ServiceExt as _;
@@ -240,8 +246,28 @@ pub async fn mcp_endpoint(
     // the request and must not vary per connection, and a registry that
     // outlived the request would be the second of those. The limiter is
     // the process's, keyed by token, or the budget would reset with the
-    // registry.
-    let server = McpServer::sharing(identity_of(&principal), Arc::clone(&state.mcp_invocations));
+    // registry. The constructor is also Story 11.4's tier check, the one
+    // the stdio binding runs at startup, so a token spanning two tiers
+    // is refused here on every request rather than served.
+    let server =
+        match McpServer::sharing(identity_of(&principal), Arc::clone(&state.mcp_invocations)) {
+            Ok(server) => server,
+            Err(refused) => {
+                let (tool, argument_names) = named_call(&request);
+                let mut response = Refusal::spans_tiers(
+                    &request.id.clone().unwrap_or(Value::Null),
+                    &refused,
+                    principal.kind,
+                )
+                .into_response();
+                response.extensions_mut().insert(McpCallRecord {
+                    tool,
+                    argument_names,
+                    outcome: Outcome::SpansTiers,
+                });
+                return response;
+            }
+        };
     let source = InProcessPlane {
         state,
         principal,
@@ -276,7 +302,9 @@ pub async fn mcp_endpoint(
 /// Attached to the response by [`mcp_endpoint`] and read back by
 /// [`super::audit`], which is the outermost layer and sees the
 /// response after every extension the request carried is gone. Present
-/// only when the core ran: a POST refused by [`examine`] or by a gate
+/// when the core ran, and on the one refusal the core's constructor
+/// made before anything ran: a token spanning two tiers, recorded with
+/// [`Outcome::SpansTiers`]. A POST refused by [`examine`] or by a gate
 /// in front of it carries none, and the row for it is written from the
 /// status and from what the caller claimed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,11 +360,7 @@ fn identity_of(principal: &AutomationPrincipal) -> Identity {
         scopes: principal
             .scopes
             .iter()
-            .filter_map(|scope| {
-                serde_json::to_value(scope)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_string))
-            })
+            .map(|scope| scope.as_str().to_string())
             .collect(),
     }
 }
@@ -354,6 +378,42 @@ impl Refusal {
         Refusal {
             status: StatusCode::BAD_REQUEST,
             body: Some(jsonrpc::error(id, HEADER_MISMATCH, detail)),
+        }
+    }
+
+    /// A token whose scopes span two MCP tiers, under the id the request
+    /// named, with the scopes named.
+    ///
+    /// `403` because it is the answer this listener gives every refusal
+    /// of a credential that authenticated and may not do what it asked:
+    /// the scope gate's missing grant and this endpoint's own `Origin`
+    /// refusal are both `403`. It is not a `200` carrying an execution
+    /// error, because no server was built and no tool could have run,
+    /// and it is not a `401`, because the credential is live and the
+    /// fix is a different token rather than a valid one. The body is a
+    /// JSON-RPC error, as the transport's other refusals are, and names
+    /// the scopes: the caller holds the token and reads the same list
+    /// from `whoami`.
+    ///
+    /// The remedy follows the credential. A static token is minted
+    /// again per tier; an OIDC issuer entry grants its scopes to every
+    /// job its claims match, so the fix is one entry per tier, and
+    /// telling a pipeline to run `lorica mcp token create` would name a
+    /// command it cannot use.
+    fn spans_tiers(id: &Value, refused: &TierError, kind: OwnerKind) -> Refusal {
+        let remedy = match kind {
+            OwnerKind::StaticToken => refused.remedy_for_static_token(),
+            OwnerKind::OidcProject => "This OIDC issuer entry grants its scopes to every job it \
+                                       matches: register one entry per tier."
+                .to_string(),
+        };
+        Refusal {
+            status: StatusCode::FORBIDDEN,
+            body: Some(jsonrpc::error(
+                id,
+                jsonrpc::code::INVALID_REQUEST,
+                &format!("{refused} {remedy}"),
+            )),
         }
     }
 }
@@ -1034,7 +1094,8 @@ mod tests {
         let server = McpServer::over(Identity {
             public_id: "0123456789abcdef01234567".to_string(),
             scopes: vec!["logs:read".to_string()],
-        });
+        })
+        .expect("a token of one tier");
         for method in IMPLEMENTED_METHODS {
             // A notification carries no id, and the core answers one
             // with silence. Sending it as a request would ask a

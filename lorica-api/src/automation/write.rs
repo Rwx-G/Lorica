@@ -181,6 +181,7 @@ use serde_json::{Map, Value};
 
 use super::auth::AutomationPrincipal;
 use super::environments::{audit_context, caller_may_access, ensure_backend_address_granted};
+use super::redact;
 use super::scope::scope_str;
 use crate::audit::ClientConnectInfo;
 use crate::backends::{CreateBackendRequest, UpdateBackendRequest};
@@ -212,6 +213,17 @@ pub enum Reach {
     Node,
 }
 
+impl Reach {
+    /// How an operator reads it, in `docs/mcp.md`'s settings table and
+    /// in the blast radius `lorica mcp token create --tier admin` prints.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Reach::Fleet => "fleet",
+            Reach::Node => "this node",
+        }
+    }
+}
+
 /// When a stored value starts to act.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TakesEffect {
@@ -220,6 +232,17 @@ pub enum TakesEffect {
     Live,
     /// At the next restart of the process that reads it.
     Restart,
+}
+
+impl TakesEffect {
+    /// How an operator reads it, in the same two places as
+    /// [`Reach::describe`].
+    pub fn describe(self) -> &'static str {
+        match self {
+            TakesEffect::Live => "live",
+            TakesEffect::Restart => "at restart",
+        }
+    }
 }
 
 /// One global setting the admin tier may change, why it may, and how
@@ -617,11 +640,11 @@ fn ensure_route_row_granted(
     principal: &AutomationPrincipal,
     route: &Route,
 ) -> Result<(), ApiError> {
-    let outside = std::iter::once(route.hostname.as_str())
-        .chain(route.hostname_aliases.iter().map(String::as_str))
-        .map(str::trim)
-        .any(|name| name.contains('*') || !principal.allows_hostname(name));
-    if outside {
+    if !route_names_granted(
+        principal,
+        &route.hostname,
+        route.hostname_aliases.iter().map(String::as_str),
+    ) {
         return Err(ApiError::Forbidden(format!(
             "route `{}` names a host outside this token's allowed_hostnames",
             route.id
@@ -631,6 +654,43 @@ fn ensure_route_row_granted(
         ensure_environment_granted(store, principal, environment, "route", &route.id)?;
     }
     Ok(())
+}
+
+/// Whether a route answering to `hostname` and `aliases` is inside the
+/// principal's hostname grant: every name, one exact host at a time, a
+/// wildcard name never.
+///
+/// The one predicate the write guard and the grant-filtered route
+/// listing ([`super::read::list_routes`]) both apply, so a route a
+/// config-tier token may act on and a route it may see are the same set.
+pub(super) fn route_names_granted<'a>(
+    principal: &AutomationPrincipal,
+    hostname: &'a str,
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    std::iter::once(hostname)
+        .chain(aliases)
+        .map(str::trim)
+        .all(|name| !name.contains('*') && principal.allows_hostname(name))
+}
+
+/// Whether a certificate naming `domain` and `sans` is inside the
+/// principal's hostname grant: every name, weighed as the grant spells
+/// it, so a wildcard certificate covering exactly the grant's own
+/// namespace is inside it and one covering a wider or a different one
+/// is not.
+///
+/// Shared by the renewal guard and the grant-filtered certificate
+/// listing ([`super::read::list_certificates`]).
+pub(super) fn certificate_names_granted<'a>(
+    principal: &AutomationPrincipal,
+    domain: &'a str,
+    sans: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    std::iter::once(domain)
+        .chain(sans)
+        .map(str::trim)
+        .all(|name| principal.allows_hostname(name))
 }
 
 /// The rule a stored backend is held to before a token may act on it
@@ -753,11 +813,11 @@ fn backend_guard(principal: &AutomationPrincipal) -> BackendGuard {
 fn certificate_guard(principal: &AutomationPrincipal) -> CertificateGuard {
     let principal = principal.clone();
     CertificateGuard::bounded(move |certificate| {
-        let outside = std::iter::once(certificate.domain.as_str())
-            .chain(certificate.san_domains.iter().map(String::as_str))
-            .map(str::trim)
-            .any(|name| !principal.allows_hostname(name));
-        if outside {
+        if !certificate_names_granted(
+            &principal,
+            &certificate.domain,
+            certificate.san_domains.iter().map(String::as_str),
+        ) {
             return Err(ApiError::Forbidden(format!(
                 "certificate `{}` covers a name outside this token's allowed_hostnames",
                 certificate.id
@@ -807,14 +867,15 @@ pub async fn create_route(
         body.hostname_aliases.as_deref(),
     )?;
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::routes::crud::create_route_as(
+    let (status, answer) = crate::routes::crud::create_route_as(
         &state,
         &actor,
         body,
         WriteMode::from(dry_run),
         route_guard(&principal),
     )
-    .await
+    .await?;
+    Ok((status, redact::write_answer(answer, redact::route_row)))
 }
 
 /// `PUT /automation/v1/routes/{id}` (scope `routes:write`).
@@ -860,7 +921,7 @@ pub async fn update_route(
         body.hostname_aliases.as_deref(),
     )?;
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::routes::crud::update_route_as(
+    let answer = crate::routes::crud::update_route_as(
         &state,
         &actor,
         id,
@@ -868,7 +929,8 @@ pub async fn update_route(
         WriteMode::from(dry_run),
         route_guard(&principal),
     )
-    .await
+    .await?;
+    Ok(redact::write_answer(answer, redact::route_row))
 }
 
 /// `DELETE /automation/v1/routes/{id}` (scope `routes:write`).
@@ -896,14 +958,15 @@ pub async fn delete_route(
 ) -> Result<Json<Value>, ApiError> {
     ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::RoutesRead)?;
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::routes::crud::delete_route_as(
+    let answer = crate::routes::crud::delete_route_as(
         &state,
         &actor,
         id,
         WriteMode::from(dry_run),
         route_guard(&principal),
     )
-    .await
+    .await?;
+    Ok(redact::write_answer(answer, redact::route_row))
 }
 
 /// `PUT /automation/v1/routes/{id}/certificate` (scope
@@ -938,7 +1001,7 @@ pub async fn bind_certificate(
         certificate_id: Some(body.certificate_id),
         ..UpdateRouteRequest::default()
     };
-    crate::routes::crud::update_route_as(
+    let answer = crate::routes::crud::update_route_as(
         &state,
         &actor,
         id,
@@ -946,7 +1009,8 @@ pub async fn bind_certificate(
         WriteMode::from(dry_run),
         route_guard(&principal),
     )
-    .await
+    .await?;
+    Ok(redact::write_answer(answer, redact::route_row))
 }
 
 /// `POST /automation/v1/backends` (scope `backends:write`).
@@ -973,7 +1037,9 @@ pub async fn create_backend(
     ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::BackendsRead)?;
     ensure_backend_address_granted(&principal, "address", &body.address)?;
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::backends::create_backend_as(&state, &actor, body, WriteMode::from(dry_run)).await
+    let (status, answer) =
+        crate::backends::create_backend_as(&state, &actor, body, WriteMode::from(dry_run)).await?;
+    Ok((status, redact::write_answer(answer, redact::backend_row)))
 }
 
 /// `PUT /automation/v1/backends/{id}` (scope `backends:write`).
@@ -1004,7 +1070,7 @@ pub async fn update_backend(
         ensure_backend_address_granted(&principal, "address", address)?;
     }
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::backends::update_backend_as(
+    let answer = crate::backends::update_backend_as(
         &state,
         &actor,
         id,
@@ -1012,7 +1078,8 @@ pub async fn update_backend(
         WriteMode::from(dry_run),
         backend_guard(&principal),
     )
-    .await
+    .await?;
+    Ok(redact::write_answer(answer, redact::backend_row))
 }
 
 /// `DELETE /automation/v1/backends/{id}` (scope `backends:write`).
@@ -1039,14 +1106,15 @@ pub async fn delete_backend(
 ) -> Result<Json<Value>, ApiError> {
     ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::BackendsRead)?;
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::backends::delete_backend_as(
+    let answer = crate::backends::delete_backend_as(
         &state,
         &actor,
         id,
         WriteMode::from(dry_run),
         backend_guard(&principal),
     )
-    .await
+    .await?;
+    Ok(redact::write_answer(answer, redact::backend_row))
 }
 
 /// `POST /automation/v1/certificates/{id}/renew` (scope
@@ -1493,6 +1561,99 @@ mod tests {
         let refused = backend_guard(&any_v6)
             .check(&store, &stored)
             .expect_err("the stored row is weighed the same way");
+        assert!(matches!(refused, ApiError::Forbidden(_)), "{refused:?}");
+    }
+
+    #[test]
+    fn a_stored_grant_whose_entries_do_not_parse_admits_no_address() {
+        // The connection filter skips what it cannot parse, and an allow
+        // list left empty by the skipping reads as every address. The
+        // mint refuses such entries; a row stored before that rule, or
+        // repaired by hand, reaches this guard without passing it again.
+        for stored in [
+            vec![String::new()],
+            vec!["not-a-cidr".to_string()],
+            vec!["10.0.0.0/33".to_string()],
+            // One good entry does not rescue a list holding a bad one.
+            vec!["10.0.0.0/8".to_string(), "   ".to_string()],
+        ] {
+            let unparsable = AutomationPrincipal {
+                allowed_backend_cidrs: stored.clone(),
+                ..principal()
+            };
+            for address in ["127.0.0.1:80", "169.254.169.254:80", "10.0.0.10:8080"] {
+                let refused = ensure_backend_address_granted(&unparsable, "address", address)
+                    .expect_err("an unparsable grant admits nothing");
+                assert!(
+                    matches!(refused, ApiError::Forbidden(_)),
+                    "{stored:?} {address}: {refused:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_grant_admits_no_address_and_no_host_on_every_path_that_reads_one() {
+        // Typed absence (2026-09-30): a credential with no grant-bounded
+        // scope carries empty grants, and a row stored before the rule
+        // can too. Empty must mean nothing on every consumer, never the
+        // connection filter's own reading of an empty allow list as
+        // every address. Walked over the claim checks and the guards a
+        // write runs on the stored row.
+        let empty = AutomationPrincipal {
+            allowed_hostnames: Vec::new(),
+            allowed_backend_cidrs: Vec::new(),
+            ..principal()
+        };
+        for address in [
+            "10.0.0.10:8080",
+            "127.0.0.1:80",
+            "169.254.169.254:80",
+            "[::1]:80",
+            "[::ffff:127.0.0.1]:80",
+            "0.0.0.0:80",
+        ] {
+            let refused = ensure_backend_address_granted(&empty, "address", address)
+                .expect_err("an empty CIDR grant admits no address");
+            assert!(
+                matches!(refused, ApiError::Forbidden(_)),
+                "{address}: {refused:?}"
+            );
+        }
+        for host in ["pr-42.review.example.com", "localhost", "example.com"] {
+            assert!(!empty.allows_hostname(host), "{host}");
+            let refused = ensure_hostnames_granted(&empty, Some(host), None)
+                .expect_err("an empty hostname grant admits no host");
+            assert!(
+                matches!(refused, ApiError::Forbidden(_)),
+                "{host}: {refused:?}"
+            );
+        }
+
+        let store = ConfigStore::open_in_memory().expect("store");
+        let stored = Backend {
+            id: "b-1".to_string(),
+            address: "10.0.0.10:8080".to_string(),
+            name: String::new(),
+            group_name: String::new(),
+            weight: 1,
+            health_status: lorica_config::models::HealthStatus::Unknown,
+            health_check_enabled: false,
+            health_check_interval_s: 10,
+            health_check_path: None,
+            lifecycle_state: lorica_config::models::LifecycleState::Normal,
+            active_connections: 0,
+            tls_upstream: false,
+            tls_skip_verify: false,
+            tls_sni: None,
+            h2_upstream: false,
+            managed_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let refused = backend_guard(&empty)
+            .check(&store, &stored)
+            .expect_err("a stored backend is outside an empty grant");
         assert!(matches!(refused, ApiError::Forbidden(_)), "{refused:?}");
     }
 

@@ -26,12 +26,12 @@
 - Cluster plane (v1.7.0, opt-in): `--cluster-listen`, `--cluster-listen-any`, `--cluster-enrollment-listen`, `--cluster-advertise`, `--cluster-auto-activate`
 - Automation plane (v1.8.0, opt-in): `--automation-listen`, `--automation-listen-any`
 - Every opt-in listener bind goes through one shared validator: an explicit `host:port`, a non-zero port, a wildcard host only under that family's `-any` flag, and no port another listener in the process already holds
-- Subcommands: `worker` (internal, launched by the supervisor), `rotate-key`, `unban`, `upgrade`, `cluster {init, join, leave, status, break-glass, token}`, `automation token create`
+- Subcommands: `worker` (internal, launched by the supervisor), `rotate-key`, `unban`, `upgrade`, `cluster {init, join, leave, status, break-glass, token}`, `automation token create`, `mcp token create --tier`
 - Signal handlers: SIGTERM (graceful shutdown), SIGQUIT (graceful upgrade), SIGINT (fast shutdown)
 
 **Dependencies:**
 - **Existing Components:** lorica-core, lorica-proxy, lorica-runtime, lorica-tls, lorica-lb
-- **New Components:** lorica-config, lorica-api, lorica-dashboard, lorica-worker (Phase 2), lorica-command (Phase 2), lorica-cluster (v1.7.0, opt-in)
+- **New Components:** lorica-config, lorica-api, lorica-dashboard, lorica-worker (Phase 2), lorica-command (Phase 2), lorica-cluster (v1.7.0, opt-in), lorica-mcp (v1.9.0: the tier table and tool catalogue `lorica mcp token create` reads; the `lorica-mcp` binary itself is a separate process the MCP client launches)
 
 **Technology Stack:** Rust, clap, tracing
 

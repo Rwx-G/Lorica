@@ -16,6 +16,7 @@ mod cli;
 mod cli_automation;
 mod cli_client;
 mod cli_cluster;
+mod cli_mcp;
 mod health;
 mod startup;
 
@@ -23,7 +24,7 @@ use clap::Parser;
 
 use crate::cli::{
     init_logging, run_rotate_key, run_unban, run_upgrade, startup_banner, AutomationAction,
-    AutomationTokenAction, Cli, ClusterAction, Commands,
+    AutomationTokenAction, Cli, ClusterAction, Commands, McpAction, McpTokenAction,
 };
 
 fn main() {
@@ -201,14 +202,50 @@ fn main() {
                     .unwrap_or_else(|e| cli_client::fail(e));
                     cli_automation::run_automation_token_create(
                         cli.management_port,
-                        name,
-                        scopes,
-                        hostnames,
-                        backend_cidrs,
-                        max_ttl_seconds,
-                        lifetime_days,
-                        user,
+                        &cli_automation::TokenMint {
+                            name,
+                            scopes,
+                            hostnames,
+                            backend_cidrs,
+                            max_ttl_seconds,
+                            lifetime_days,
+                        },
+                        &user,
+                        &password,
+                    );
+                }
+            },
+        },
+        Some(Commands::Mcp { action }) => match action {
+            McpAction::Token { action } => match action {
+                McpTokenAction::Create {
+                    tier,
+                    name,
+                    hostnames,
+                    backend_cidrs,
+                    lifetime_days,
+                    user,
+                    password_file,
+                    password_stdin,
+                    password,
+                } => {
+                    let password = cli_client::read_admin_password(
                         password,
+                        password_file.as_deref(),
+                        password_stdin,
+                    )
+                    .unwrap_or_else(|e| cli_client::fail(e));
+                    cli_mcp::run_mcp_token_create(
+                        cli.management_port,
+                        &cli_mcp::TierMint {
+                            tier,
+                            name,
+                            hostnames,
+                            backend_cidrs,
+                            lifetime_days,
+                        },
+                        &user,
+                        &password,
                     );
                 }
             },

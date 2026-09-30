@@ -226,7 +226,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::server::{read_scopes, Identity};
+    use crate::server::Identity;
+    use crate::tier::Tier;
     use crate::tools::{catalogue, MUTATIONS};
     use crate::{PlaneError, Reason, Verb};
 
@@ -297,6 +298,7 @@ mod tests {
             public_id: "0123456789abcdef01234567".to_string(),
             scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
         })
+        .expect("a token of one tier")
     }
 
     /// Drive `session` with `lines` and answer what came back on stdout.
@@ -426,7 +428,7 @@ mod tests {
         // the names a client might guess for one nor the real ones
         // exist to be called.
         let plane = Plane::always(EMPTY_PAGE);
-        let server = server_carrying(&read_scopes());
+        let server = server_carrying(Tier::Read.requires());
         let mut lines = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n".to_string();
         let guessed = [
             "lorica_environments_put",
@@ -519,7 +521,7 @@ mod tests {
                 "lorica_backend_delete_preview",
             ]
         );
-        assert_eq!(server.tier(), "config tier");
+        assert_eq!(server.tier(), Tier::Config);
 
         assert_eq!(answers[1]["result"]["isError"], json!(false));
         assert_eq!(answers[2]["result"]["isError"], json!(false));
@@ -557,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn iv2_a_token_revoked_mid_session_fails_the_next_call_as_an_authorization_error() {
         // IV2. The first call succeeds, the token is withdrawn, and the
-        // second meets the plane's 403. It comes back as an EXECUTION
+        // second meets the plane's 401. It comes back as an EXECUTION
         // error, which is what a model reads and stops on; a protocol
         // error would invite it to reword the call and try again.
         let plane = Plane::answering(vec![

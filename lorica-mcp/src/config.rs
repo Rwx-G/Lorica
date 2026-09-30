@@ -213,8 +213,9 @@ impl fmt::Display for ConfigError {
             ConfigError::FileMalformed { path } => write!(
                 f,
                 "the configuration file named by {CONFIG_ENV} ({}) is not valid TOML with \
-                 optional string keys `endpoint` and `token`. The parse error is withheld \
-                 because it would quote the line it failed on, and that line may be the token.",
+                 optional string keys `endpoint`, `token` and `ca_bundle`. The parse error is \
+                 withheld because it would quote the line it failed on, and that line may be \
+                 the token.",
                 path.display()
             ),
         }
@@ -223,8 +224,10 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// The two keys the TOML file may carry, both optional so the file can
-/// name the endpoint while the environment carries the token.
+/// The keys the TOML file may carry, every one optional so the file
+/// can name the endpoint while the environment carries the token. The
+/// malformed-file message names them, and a test holds that message to
+/// the list serde itself reports for this struct.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -509,6 +512,34 @@ mod tests {
         )
         .expect_err("an undeclared key is refused");
         assert!(matches!(refused, ConfigError::FileMalformed { .. }));
+    }
+
+    #[test]
+    fn the_malformed_file_message_names_exactly_the_keys_the_file_may_carry() {
+        // serde names the struct's own fields when it refuses an
+        // unknown one, so the expected set is read from it rather than
+        // typed here: a field added to `ConfigFile` and not to the
+        // message, or the reverse, turns this red.
+        let backticked = |text: &str| -> std::collections::BTreeSet<String> {
+            text.split('`')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect()
+        };
+        let serde_says = toml::from_str::<ConfigFile>("not_a_key = 1\n")
+            .expect_err("an unknown key is refused")
+            .to_string();
+        let (_, expected) = serde_says
+            .split_once("expected")
+            .expect("serde lists the fields it expected");
+        let expected = backticked(expected);
+        assert!(!expected.is_empty(), "{serde_says}");
+        let message = ConfigError::FileMalformed {
+            path: Path::new("/etc/lorica/mcp.toml").to_path_buf(),
+        }
+        .to_string();
+        assert_eq!(backticked(&message), expected, "{message}");
     }
 
     #[test]

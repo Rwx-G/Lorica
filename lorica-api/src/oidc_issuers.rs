@@ -87,11 +87,12 @@ const CA_PEM_MAX_LEN: usize = 64 * 1024;
 /// `created_by`, `created_at`) are refused on input rather than
 /// quietly ignored. `jwks_url` defaults to
 /// `<issuer>/oauth/discovery/keys` and `max_ttl_seconds` to the
-/// static-token default. `bound_claims` and `allowed_backend_cidrs`
-/// have no usable default: an entry binding neither `project_path`
-/// nor `namespace_path` accepts every project on the instance, and an
-/// empty CIDR list is read as every address, so the model refuses
-/// both.
+/// static-token default. `bound_claims` has no usable default: an
+/// entry binding neither `project_path` nor `namespace_path` accepts
+/// every project on the instance, so the model refuses one. The two
+/// grant fields follow the static token's typed-absence rule: omitted
+/// is empty, required when a scope is grant-bounded, refused when none
+/// is.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateOidcIssuerRequest {
@@ -108,9 +109,9 @@ pub struct CreateOidcIssuerRequest {
     #[serde(default)]
     pub bound_claims: BTreeMap<String, String>,
     /// Hostname patterns a token from this entry may claim.
+    #[serde(default)]
     pub allowed_hostnames: Vec<String>,
-    /// CIDRs a token from this entry may point a hostname at. At
-    /// least one.
+    /// CIDRs a token from this entry may point a hostname at.
     #[serde(default)]
     pub allowed_backend_cidrs: Vec<String>,
     /// Ceiling on the lifetime any environment a token from this entry

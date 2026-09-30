@@ -59,7 +59,8 @@
 //! Here: the protocol revision this crate implements, the call seam,
 //! the configuration intake ([`config`]), the JSON-RPC envelope
 //! ([`jsonrpc`]), the untrusted-text delimiting ([`untrusted`]), the
-//! tools of every tier ([`tools`]), the protocol core that runs them
+//! tier partition ([`tier`]), the tools of every tier ([`tools`]), the
+//! protocol core that runs them
 //! ([`server`]), the HTTPS implementation of the seam ([`http`]) and
 //! the stdio binding ([`stdio`]).
 //!
@@ -94,6 +95,12 @@
 //! in `lorica-api`'s tests; the plane is what enforces it. AC #2 and
 //! IV2 hold by absence: no tool here names an identity or a cluster
 //! membership operation, which `tools` asserts.
+//!
+//! Story 11.4: AC #1 is [`tier`], the one table naming what each tier
+//! requires and tolerates, and [`server::McpServer::sharing`], the
+//! constructor both bindings build through, which refuses a token whose
+//! scopes span two tiers. AC #3's minting command lives in the `lorica`
+//! binary and reads the same table.
 
 use core::fmt;
 use core::future::Future;
@@ -105,12 +112,14 @@ pub mod http;
 pub mod jsonrpc;
 pub mod server;
 pub mod stdio;
+pub mod tier;
 pub mod tools;
 pub mod untrusted;
 
 pub use config::{ConfigError, ServerConfig};
 pub use http::HttpsPlane;
 pub use server::{Identity, McpServer, StartupError};
+pub use tier::{Tier, TierError};
 pub use tools::ToolSpec;
 
 /// The MCP specification revision this crate implements.

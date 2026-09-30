@@ -61,7 +61,7 @@ use lorica_config::models::{
     ManagedBy, PipelineIdentity, Route, WafMode, AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT,
     AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL,
 };
-use lorica_config::{ConfigError, ConfigStore, ConnectionFilterPolicy};
+use lorica_config::{parse_cidr, ConfigError, ConfigStore, ConnectionFilterPolicy};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -441,6 +441,14 @@ fn validate_path_prefix(raw: Option<&str>) -> Result<String, ApiError> {
 /// this refuses it again at use time, for the rows written before
 /// that rule landed.
 ///
+/// The same holds one step later. The connection filter skips an entry
+/// it cannot parse, so a stored list whose every entry is blank or
+/// malformed would build that same empty allow list. The models refuse
+/// such an entry at mint, but the store never re-validates a row it
+/// loads, so each entry is parsed here and a list holding one that does
+/// not parse is refused whole: the grant is either what the operator
+/// wrote or nothing.
+///
 /// # A mapped address is the IPv4 it maps to
 ///
 /// `[::ffff:127.0.0.1]:80` parses as an IPv6 socket address and the
@@ -462,7 +470,20 @@ pub(super) fn ensure_backend_address_granted(
                 .to_string(),
         ));
     }
-    let policy = ConnectionFilterPolicy::from_cidrs(&principal.allowed_backend_cidrs, &[]);
+    let granted = principal
+        .allowed_backend_cidrs
+        .iter()
+        .map(|entry| parse_cidr(entry))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|_| {
+            ApiError::Forbidden(
+                "this credential's allowed_backend_cidrs holds an entry that does not parse, so \
+                 its backend grant is refused whole rather than read as wider than written; ask \
+                 an operator to mint it again"
+                    .to_string(),
+            )
+        })?;
+    let policy = ConnectionFilterPolicy::from_nets(granted, Vec::new());
     let raw = raw.trim();
     let addr: SocketAddr = raw.parse().map_err(|_| {
         ApiError::Unprocessable(format!(

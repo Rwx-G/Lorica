@@ -22,7 +22,7 @@
 //!
 //! This is the stdio binding, and the only thing in the crate that ever
 //! reads a file descriptor. Everything it drives - the configuration
-//! intake, the JSON-RPC core, the tools of both tiers and the seam they
+//! intake, the JSON-RPC core, the tools of every tier and the seam they
 //! reach the plane through - lives in the library beside it, because
 //! the Streamable HTTP binding runs inside `lorica-api` and has to be
 //! able to reach the same core. See `lorica-mcp/src/lib.rs` for why
@@ -59,13 +59,15 @@
 
 use std::process::ExitCode;
 
-use lorica_mcp::{HttpsPlane, McpServer, ServerConfig, MCP_PROTOCOL_REVISION};
+use lorica_mcp::{HttpsPlane, McpServer, ServerConfig, StartupError, MCP_PROTOCOL_REVISION};
 
-/// Refused configuration.
+/// Refused configuration, a token whose scopes span two tiers included.
 ///
 /// Separate from a protocol failure so a client launching this as a
 /// subprocess can tell "you configured me wrongly" from "I broke",
-/// which are fixed in different places.
+/// which are fixed in different places. A token spanning two tiers is
+/// the wrong token for this process, which is a configuration fault
+/// even though the plane answered.
 const EXIT_MISCONFIGURED: u8 = 78;
 
 /// The automation plane could not be reached, or refused the token.
@@ -118,9 +120,14 @@ fn main() -> ExitCode {
             config.endpoint,
         );
 
-        // AC #3: ask what this token may do before offering anything.
+        // AC #3: ask what this token may do before offering anything,
+        // and refuse a token spanning two tiers (Story 11.4 AC #1).
         let server = match McpServer::introspect(&source).await {
             Ok(server) => server,
+            Err(refused @ StartupError::Tier(_)) => {
+                eprintln!("lorica-mcp: {refused}");
+                return ExitCode::from(EXIT_MISCONFIGURED);
+            }
             Err(refused) => {
                 eprintln!("lorica-mcp: {refused}");
                 return ExitCode::from(EXIT_PLANE_UNREACHABLE);
