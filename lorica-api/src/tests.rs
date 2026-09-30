@@ -9785,9 +9785,10 @@ fn json_keys_and_strings(
 /// One entry of `automation::scope::READ_SURFACE` as a request this
 /// suite can actually send.
 ///
-/// The surface is walked as the scope matrix declares it and never as a
-/// second list typed beside it, so a path added there enters every
-/// sweep below by construction. The one entry naming a resource id gets
+/// `READ_SURFACE` is a list of requests, not the matrix itself; what
+/// holds it to the plane is `every_read_the_plane_mounts_is_on_the_read_surface`
+/// in `automation::scope`, which fails naming any read the router mounts
+/// and the list does not carry. The one entry naming a resource id gets
 /// the id the fixture seeded: a path added later that takes an id and
 /// is not handled here answers 404, and the sweep's own 200 assertion
 /// is where that surfaces.
@@ -10458,7 +10459,6 @@ async fn iv1_a_route_created_through_the_automation_plane_is_the_dashboards_rout
         "group_name": "prod",
         "hostname_aliases": ["app-alias.write.example.com"],
         "basic_auth_username": "user01",
-        "basic_auth_password": "Write-surface-pass-42!",
     });
 
     let response = automation_call(
@@ -10519,17 +10519,9 @@ async fn iv1_a_route_created_through_the_automation_plane_is_the_dashboards_rout
             link.route_id = automation_id.clone();
         }
     }
-    // The Basic-auth hash is salted, so the two rows cannot agree on
-    // it; it is the one field whose equality is not the test. Both
-    // planes hashed the same password through the same function, which
-    // is what the response view (no hash) already shows.
-    let salted_hash = automation_route.basic_auth_password_hash.clone();
-    for route in &mut through_dashboard.routes {
-        if route.id == automation_id {
-            assert!(route.basic_auth_password_hash.is_some());
-            route.basic_auth_password_hash = salted_hash.clone();
-        }
-    }
+    // No Basic-auth password rides in the body: an automation token may
+    // not send one (`WITHHELD_ROUTE_FIELDS`), so both rows carry the
+    // username and no hash, and compare with nothing set equal.
     assert_eq!(
         lorica_config::canonical::encode_canonical(&through_automation).expect("encodes"),
         lorica_config::canonical::encode_canonical(&through_dashboard).expect("encodes"),
@@ -12498,10 +12490,14 @@ async fn the_invocation_budget_binds_across_requests_on_this_binding() {
     }
     let over = mcp_call(&state, &bearer, "lorica_logs", serde_json::json!({})).await;
     assert_eq!(over["result"]["isError"], serde_json::json!(true), "{over}");
+    let window = format!(
+        "every {} seconds",
+        lorica_mcp::server::RATE_WINDOW.as_secs()
+    );
     assert!(
         over["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("a minute")),
+            .is_some_and(|text| text.contains(&window)),
         "{over}"
     );
     // Audited as the refusal it is, not as the 200 it travelled in.
@@ -13200,6 +13196,423 @@ async fn every_write_path_previews_under_dry_run_and_writes_nothing() {
                 && row.action == "automation.request.ok"
         ),
         "{request_rows:?}"
+    );
+}
+
+// ---- Pre-merge audit: protection fields move in the safe direction only ----
+
+#[tokio::test]
+async fn a_token_strengthens_a_protection_through_the_plane_and_never_weakens_one() {
+    // The maintainer's decision of 2026-09-30, end to end: the rule runs
+    // in the guard on the stored row, the apply and the preview alike,
+    // and a refusal changes nothing.
+    let f = a_node_with_something_to_write().await;
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "safe.write.example.com",
+            "ip_allowlist": ["10.0.0.0/8"],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    let route_path = format!("/automation/v1/routes/{route_id}");
+
+    for body in [
+        serde_json::json!({ "waf_enabled": true }),
+        serde_json::json!({ "ip_allowlist": ["10.1.0.0/16"] }),
+    ] {
+        let response =
+            automation_call(&f.state, "PUT", &route_path, &f.bearer, Some(body.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK, "{body}");
+    }
+
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+    for (body, field) in [
+        (serde_json::json!({ "waf_enabled": false }), "waf_enabled"),
+        (serde_json::json!({ "ip_allowlist": [] }), "ip_allowlist"),
+        (
+            serde_json::json!({ "ip_allowlist": ["10.0.0.0/8"] }),
+            "ip_allowlist",
+        ),
+    ] {
+        for suffix in ["", "?dry_run=true"] {
+            let response = automation_call(
+                &f.state,
+                "PUT",
+                &format!("{route_path}{suffix}"),
+                &f.bearer,
+                Some(body.clone()),
+            )
+            .await;
+            assert_forbidden_naming(response, field, &format!("{body}{suffix}")).await;
+        }
+    }
+    let response = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "password.write.example.com",
+            "basic_auth_username": "user01",
+            "basic_auth_password": "chosen-by-a-model",
+        })),
+    )
+    .await;
+    assert_forbidden_naming(response, "basic_auth_password", "POST with a password").await;
+    let response = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/backends",
+        &f.bearer,
+        Some(serde_json::json!({
+            "address": "10.0.0.11:8443",
+            "tls_upstream": true,
+            "tls_skip_verify": true,
+        })),
+    )
+    .await;
+    assert_forbidden_naming(response, "tls_skip_verify", "an unverified backend").await;
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/backends/{}", f.backend_id),
+        &f.bearer,
+        Some(serde_json::json!({ "tls_upstream": true, "tls_skip_verify": true })),
+    )
+    .await;
+    assert_forbidden_naming(response, "tls_skip_verify", "verification switched off").await;
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes"),
+        "a refused weakening changed the store"
+    );
+
+    // The management plane is not held to any of it.
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{route_id}"),
+        &f.admin,
+        Some(serde_json::json!({ "waf_enabled": false, "ip_allowlist": [] })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_certificate_bound_anew_is_weighed_against_the_hostname_grant() {
+    // The grant said which routes a token may reach and nothing of
+    // which certificates it may deploy on them: a route inside the
+    // grant could carry a certificate for production names.
+    let f = a_node_with_something_to_write().await;
+    let production = "production-certificate".to_string();
+    {
+        let store = f.state.store.lock().await;
+        let mut certificate = store
+            .get_certificate(&f.certificate_id)
+            .expect("store")
+            .expect("the seeded certificate");
+        certificate.id = production.clone();
+        certificate.domain = "www.example.com".to_string();
+        certificate.fingerprint = "production-fingerprint".to_string();
+        store
+            .create_certificate(&certificate)
+            .expect("a certificate outside the grant lands");
+    }
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({ "hostname": "bind.write.example.com" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("/automation/v1/routes/{route_id}/certificate{suffix}"),
+            &f.bearer,
+            Some(serde_json::json!({ "certificate_id": production })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{suffix}");
+        let refusal = body_json(response).await;
+        let message = refusal["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(&production), "{refusal}");
+        assert!(!message.contains("www.example.com"), "{refusal}");
+    }
+    let response = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "bind-create.write.example.com",
+            "certificate_id": production,
+        })),
+    )
+    .await;
+    assert_forbidden_naming(response, "allowed_hostnames", "a create binding it").await;
+
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{route_id}/certificate"),
+        &f.bearer,
+        Some(serde_json::json!({ "certificate_id": f.certificate_id })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "inside the grant");
+}
+
+// ---- Pre-merge audit: the reads page before they compute ----
+
+#[tokio::test]
+async fn the_route_listing_pages_the_same_rows_it_answered_before_paging_moved_down() {
+    // The grant and the window now apply to the stored rows and only
+    // the window's views are built. The pages, walked end to end, must
+    // be the management listing narrowed by the grant: same rows, same
+    // order, same links, `has_more` false exactly on the last page.
+    let f = a_node_with_something_to_write().await;
+    for name in ["a", "b", "c", "d", "e"] {
+        let created = automation_call(
+            &f.state,
+            "POST",
+            "/automation/v1/routes",
+            &f.bearer,
+            Some(serde_json::json!({
+                "hostname": format!("{name}.write.example.com"),
+                "backend_ids": [f.backend_id],
+            })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED, "{name}");
+    }
+    // One route outside the grant, which the listing must skip.
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &f.admin,
+        Some(serde_json::json!({ "hostname": "www.example.com" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let management = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "GET",
+        "/api/v1/routes",
+        &f.admin,
+        None,
+    )
+    .await;
+    let expected: Vec<(String, serde_json::Value)> = parse_data(management).await["routes"]
+        .as_array()
+        .expect("routes")
+        .iter()
+        .filter(|row| {
+            row["hostname"]
+                .as_str()
+                .is_some_and(|host| host.ends_with(".write.example.com"))
+        })
+        .map(|row| {
+            (
+                row["id"].as_str().expect("id").to_string(),
+                row["backend_ids"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(expected.len(), 5);
+
+    let mut walked = Vec::new();
+    for offset in [0, 2, 4] {
+        let response = automation_call(
+            &f.state,
+            "GET",
+            &format!("/automation/v1/routes?limit=2&offset={offset}"),
+            &f.bearer,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = parse_data(response).await;
+        assert_eq!(page["page"]["offset"], serde_json::json!(offset));
+        assert_eq!(
+            page["page"]["has_more"],
+            serde_json::json!(offset < 4),
+            "offset {offset}"
+        );
+        for row in page["items"].as_array().expect("items") {
+            walked.push((
+                row["id"].as_str().expect("id").to_string(),
+                row["backend_ids"].clone(),
+            ));
+        }
+    }
+    assert_eq!(walked, expected);
+    let past_the_end = automation_call(
+        &f.state,
+        "GET",
+        "/automation/v1/routes?offset=1000000",
+        &f.bearer,
+        None,
+    )
+    .await;
+    let page = parse_data(past_the_end).await;
+    assert_eq!(page["items"], serde_json::json!([]));
+    assert_eq!(page["page"]["has_more"], serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn the_sla_overview_window_is_the_slice_of_the_whole_overview() {
+    // The routes before the window are skipped rather than computed.
+    // Every window, an odd offset included, must be exactly the rows
+    // the whole overview holds at those positions.
+    let f = a_node_with_something_to_write().await;
+    for name in ["a", "b", "c"] {
+        let created = automation_call(
+            &f.state,
+            "POST",
+            "/automation/v1/routes",
+            &f.bearer,
+            Some(serde_json::json!({ "hostname": format!("sla-{name}.write.example.com") })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED, "{name}");
+    }
+    let key = |summary: &lorica_config::models::SlaSummary| {
+        let view = serde_json::to_value(summary).expect("a summary serialises");
+        (view["route_id"].clone(), view["window"].clone())
+    };
+    let whole: Vec<_> = crate::sla::local_sla_overview(&f.state, None)
+        .await
+        .expect("the whole overview")
+        .iter()
+        .map(key)
+        .collect();
+    assert_eq!(whole.len(), 6);
+    for skip in 0..=7 {
+        for take in 1..=4 {
+            let window: Vec<_> = crate::sla::local_sla_overview(
+                &f.state,
+                Some(crate::sla::SlaWindow { skip, take }),
+            )
+            .await
+            .expect("a window")
+            .iter()
+            .map(key)
+            .collect();
+            let slice: Vec<_> = whole.iter().skip(skip).take(take).cloned().collect();
+            assert_eq!(window, slice, "skip {skip} take {take}");
+        }
+    }
+}
+
+// ---- Pre-merge audit: a write lands whole or not at all ----
+
+#[tokio::test]
+async fn a_write_whose_client_hangs_up_still_lands_its_rows_and_its_reload() {
+    // hyper drops the request future when the peer goes away, and a
+    // store closure commits on the blocking pool whether or not anyone
+    // still awaits it. The request is started, dropped while it waits
+    // on the store, and the store is released after: the write must
+    // then land as a unit, the row, the management row, the request
+    // row and the reload signal together.
+    let mut f = a_node_with_something_to_write().await;
+    let (reload_tx, reload_rx) = tokio::sync::watch::channel(0u64);
+    f.state.config_reload_tx = Some(reload_tx);
+    let hostname = "hung-up.write.example.com";
+
+    let held = Arc::clone(&f.state.store).lock_owned().await;
+    let router = crate::automation::build_automation_router(f.state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/automation/v1/routes")
+        .header(http::header::AUTHORIZATION, &f.bearer)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "hostname": hostname, "backend_ids": [f.backend_id] }).to_string(),
+        ))
+        .expect("test setup");
+    let mut in_flight = Box::pin(router.oneshot(request));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut in_flight)
+            .await
+            .is_err(),
+        "the request answered while the store was held"
+    );
+    drop(in_flight);
+    drop(held);
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let stored = loop {
+        let found = {
+            let store = f.state.store.lock().await;
+            store
+                .list_routes()
+                .expect("store")
+                .into_iter()
+                .find(|route| route.hostname == hostname)
+        };
+        if let Some(route) = found {
+            break route;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the write never reached the store once the client had gone"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+
+    // The unit ends after the store commit: wait for its request row,
+    // the last thing it writes, then read everything it owes.
+    loop {
+        let requests = audit_rows_under(&f.state, "automation.request.ok").await;
+        if requests
+            .iter()
+            .any(|row| row.target_id == "POST /automation/v1/routes")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no request row for a write that committed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let created = audit_rows_under(&f.state, "route.create").await;
+    assert!(
+        created.iter().any(|row| row.target_id == stored.id),
+        "no route.create row for a route that is stored: {created:?}"
+    );
+    assert!(
+        *reload_rx.borrow() > 0,
+        "the proxy was never told the configuration changed"
     );
 }
 
@@ -13947,7 +14360,7 @@ async fn a_route_body_cannot_aim_traffic_or_credentials_outside_the_grant() {
         "PUT",
         &format!("/automation/v1/routes/{route_id}"),
         &f.bearer,
-        Some(serde_json::json!({ "waf_enabled": false })),
+        Some(serde_json::json!({ "compression_enabled": true })),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);

@@ -260,15 +260,20 @@ A narrower token than a whole tier (routes only, say) is minted with
 required scopes and the scopes it tolerates is one tier and is served.
 The management API, the plain CLI and the dashboard's Automation tokens
 page mint any scope set at all; it is the server that refuses a token
-spanning two tiers, on both transports, rather than serving both kinds
-of tool.
+spanning two tiers, rather than serving both kinds of tool: the node
+over Streamable HTTP, the `lorica-mcp` process the client launched over
+stdio.
 
 **An OIDC issuer entry cannot carry `settings:write`.** An entry is a
 standing grant to every pipeline job whose claims match, the opposite
 of a token minted for one task, and the node refuses it. It may carry
 the config tier's write scopes: a keyless, short-lived CI credential is
 what OIDC is for. That is a CI pipeline's credential rather than an MCP
-client's, and the threat model records the decision.
+client's, and the threat model records the decision. It is also a
+credential for one message on the MCP endpoint: an ID token's `jti` is
+single-use, so a second POST with the same token is a replay, answered
+401, and an MCP exchange (discover, list, call) is several POSTs. A
+pipeline calls the automation paths themselves.
 
 ## The read tier
 
@@ -406,25 +411,101 @@ the write see one row: a route update, delete or certificate binding
 needs the route's current hostname and every current alias inside the
 hostname grant; a backend update or delete needs the backend's stored
 address inside the CIDR grant; a renewal needs every name the
-certificate carries, `domain` and each SAN, inside the hostname grant;
-and a route or a backend an environment owns is refused unless the
-environment's own ownership rule would let this token reach it. Every
-backend a route write links anew, at the top level or inside
+certificate carries, `domain` and each SAN, inside the hostname grant,
+and so does a certificate a route write binds anew, since otherwise the
+grant said which routes a token may reach and nothing of which
+certificates it may deploy on them; and a route or a backend an
+environment owns is refused unless the environment's own rules would
+let this token reach it: its ownership rule, and for an ID token bound
+to `environment_protected = true` the rule that a job writes only the
+environment it deploys, since a route delete cascades its environment.
+Every backend a route write links anew, at the top level or inside
 `path_rules`, `header_rules` or `traffic_splits`, must point inside the
-CIDR grant and belong to no other pipeline's environment. `forward_auth`,
-`mirror`, `mtls` and `proxy_headers` are refused from an automation
-token outright, in either direction: the first is a URL the CIDR grant
-cannot weigh, to which the proxy forwards every downstream `Cookie` and
-`Authorization` header; the second ships a copy of every request to a
-second set of backends; the third is the route's client-authentication
+CIDR grant and belong to no other pipeline's environment. The fields of
+`WITHHELD_ROUTE_FIELDS` (`lorica-api/src/automation/write.rs`) are
+refused from an automation token outright, in either direction, each
+with the reason beside it there: the Basic-auth password, a credential
+a model would be choosing or relaying, and whose clearing switches the
+route's Basic auth off; `forward_auth`, a URL the CIDR grant cannot
+weigh, to which the proxy forwards every downstream `Cookie` and
+`Authorization` header; `mirror`, which ships a copy of every request
+to a second set of backends; `mtls`, the route's client-authentication
 trust anchor, the CA bundle whose client certificates the route
 accepts, which a model reading attacker text must not be able to
-replace; the fourth is a static header map to the upstream, where a
-credential would go. None of the four is offered by the tools. A
+replace; and `proxy_headers`, a static header map to the upstream,
+where a credential would go. None of them is offered by the tools. A
 config-tier token is bounded by the same two fields an operator reads
 on it, on what it may claim and on what it may reach, and a preview is
 refused exactly where the apply would be, so a token learns nothing
 about a row outside its grant by previewing a change to it.
+
+### Protections move one way
+
+Inside its grant, a token may strengthen a route's access control and
+an upstream's TLS trust and never weaken either (the maintainer's
+decision of 2026-09-30, "safe direction only"). The rule is a property
+of the node, not of the tools: the plane weighs each control in the
+guard that runs inside the store closure, on the row as stored against
+the row about to be written, so a direct automation client meets it
+exactly as a tool call does, and a preview is refused where the apply
+would be, with a `403` naming the field and the rule and echoing no
+value. The dashboard is not bound by it: the other direction is a
+human's. The controls are `ROUTE_PROTECTIONS` and `BACKEND_PROTECTIONS`
+in `lorica-api/src/automation/write.rs`, each with its reason; this
+table restates their rules, and a test renders each row from the
+constant and asserts it is here:
+
+| Control | From an automation token |
+|---|---|
+| `basic_auth_username` | the Basic-auth credential in force is neither cleared nor changed |
+| `ip_allowlist` | added, or narrowed so every entry sits inside one already there; never removed or widened |
+| `ip_denylist` | extended, every entry already there staying covered; never shortened |
+| `geoip` | added, or tightened in the same mode (fewer countries allowed, more denied); never removed or switched to the other mode |
+| `bot_protection`, `bot_protection_disable` | added where none is set; never changed or removed once set |
+| `waf_enabled` | switched on, never off |
+| `waf_mode` | moved to blocking, never back to detection |
+| `rate_limit` | added, or tightened with its capacity and refill never raised and its scope unchanged; never removed |
+| `rate_limit_rps`, `rate_limit_burst` | added, or lowered; never raised or cleared |
+| `auto_ban_threshold` | added, or lowered; never raised or cleared |
+| `tls_skip_verify` | switched off, never on |
+| `tls_upstream` | switched on, never off |
+| `tls_sni` | left unchanged while the upstream certificate is verified |
+
+A create weighs nothing it does not set against the row it would have
+had: every route control above is at its weakest on the row the
+management create stores when the body names none of them, so a route
+create is not bounded by the table, and a backend create is weighed
+against the create's own default, which verifies the upstream
+certificate whenever TLS is on, so a create asking for
+`tls_skip_verify` is refused. The Basic-auth username is not offered
+by the tools at all: where Basic auth is in force it may not change,
+and elsewhere a username without the password a token never sends
+protects nothing.
+
+What is deliberately outside the rule, each for the reason recorded
+beside the constant: the capacity limits (`max_connections`,
+`max_request_body_bytes`, `slowloris_threshold_ms`,
+`waf_body_scan_max_bytes`, the auto-ban duration), which price a
+request rather than decide whether it is admitted; the browser-facing
+hardening (`force_https`, `security_headers`, the CORS lists,
+`response_headers`), which shapes how a browser treats an answer the
+route already admits and is on the list of what not to delegate below;
+the AI-crawler policy, a content policy toward clients that declare
+themselves, which a hostile client does not; and the routing fields,
+where a request goes, bounded by the hostname and CIDR grants.
+
+The rule bounds a write in place, not a sequence of them: a token that
+may delete a route inside its grant may create it again without its
+protections, in two audited rows, `route.delete` and `route.create`.
+A hostname whose protections no model may remove belongs in no
+config-tier grant.
+
+**A backend create is not idempotent.** A route create is refused on
+a hostname already held, and every other write names its resource by
+id, but a backend create that timed out on the client's side may have
+committed: a model that retries it without looking creates a second
+backend. Check `lorica_backends` for the address before retrying a
+create that did not answer.
 
 **The scopes are boundaries too.** A route write that names
 `certificate_id`, the empty string included, needs `certificates:write`
@@ -463,10 +544,11 @@ published schema, and one walks the Rust request struct the handler
 deserialises, from each field the tool offers into every struct it
 nests, because a body field's schema does not spell out what sits
 below it and `mtls.ca_cert_pem` travelled under `mtls` while the schema
-sweep stayed green. A route's Basic-auth password is deliberately not
-offered either: a model would be choosing or relaying a credential, and
-it would cross the model's host in the clear. Set it in the dashboard;
-the tier reads the username alone, as the read tier does.
+sweep stayed green. A route's Basic-auth password is refused by the
+plane from every automation token and offered by no tool: a model would
+be choosing or relaying a credential, and it would cross the model's
+host in the clear. Set it in the dashboard; the tier reads the username
+alone, as the read tier does.
 
 ### Preview before apply
 
@@ -517,7 +599,7 @@ in the audit trail under the token that made it.
 The tier is safe to hand a change that is **one named resource, fully
 described by its arguments, reversible from the trail, and whose blast
 radius is the resource itself**. Adding a backend to a route's pool,
-toggling the WAF or its mode on a route, binding an already-uploaded
+switching the WAF on or to blocking on a route, binding an already-uploaded
 certificate, renewing an ACME certificate, deleting a review route
 whose environment has gone: each is the work of one sentence in the
 dashboard, the preview shows exactly what will move, the audit trail
@@ -582,8 +664,8 @@ accepts, and how far it lets each one move:
 
 | Setting | Tier bound | Reach | Takes effect |
 |---|---|---|---|
-| `access_log_retention` | raise-only, 1..=100000000 | fleet | live |
-| `waf_event_retention` | raise-only, 1..=100000000 | fleet | live |
+| `access_log_retention` | raise-only, 1..=1000000 | fleet | live |
+| `waf_event_retention` | raise-only, 1..=1000000 | fleet | live |
 | `sla_purge_retention_days` | raise-only, 1..=3650 | fleet | live |
 | `cert_warning_days` | 14..=365 | fleet | live |
 | `cert_critical_days` | 3..=365 | fleet | live |
@@ -848,8 +930,11 @@ blank variable reads as unset rather than as an empty value.
 The TOML file takes `endpoint`, `token` and `ca_bundle`, and refuses
 any other key. A malformed file is reported by path and not by the
 parser's message, because that message quotes the offending line and
-the offending line may be the token. The server does not check the
-file's mode: keep it `0600` and owned by the user the client runs as.
+the offending line may be the token. A file carrying `token` must be
+readable by its owner alone: one granting any permission to its group
+or to others is refused at startup with its mode and the fix
+(`chmod 600`). A file naming only the endpoint or the bundle is not
+checked.
 
 The endpoint must be `https://`, must carry no user information and
 must be an origin with no path, query or fragment; each is refused at
@@ -1027,8 +1112,9 @@ the plane.
 Over stdio the window is the process's, since one process serves one
 token. Over Streamable HTTP the tool registry is rebuilt per request
 but the window is not: the node holds one limiter for the process,
-keyed by the token's `public_id`, and a token's window survives every
-request that spends from it. The limiter holds at most
+keyed by the credential (`AutomationPrincipal::budget_key`: a token's
+`public_id`, or an ID token's issuer entry and project), and a
+credential's window survives every request that spends from it. The limiter holds at most
 `MAX_TRACKED_TOKENS` live windows; a window is opened only by a token
 that authenticated, and a token that finds no room while that many are
 live is refused for that call rather than handed somebody else's
@@ -1047,7 +1133,11 @@ plane, a replication round to the fleet, so the plane holds its own.
 Going over is a 429 with `Retry-After` and a message naming the figure.
 A preview is the apply's own request with `?dry_run`, so it spends from
 the same budget; a request the scope gate refuses spends nothing, and a
-read spends nothing.
+read spends nothing. "Per credential" means a static token, or one
+project under an OIDC issuer entry: an entry whose bound claims match
+several projects gives each its own window rather than one they share.
+The environment resource's writes, unbudgeted in 1.8.0, spend from the
+same `RL_ROUTES_CUD` window since 1.9.0.
 
 **Renewals, per certificate.** Neither budget counts what a call
 spends. A certificate renewal spends an ACME order against the CA's
@@ -1091,6 +1181,12 @@ management-side one, `route.create`, `backend.update`,
 a write over the automation listener does and exactly as the
 environment resource's rows are written. A preview lands the request
 row alone, since nothing was written for a management row to describe.
+A write the node committed lands both rows and signals the reload even
+when the client hung up before the answer: the request runs as a task
+the connection does not own, so a store commit, its rows and its reload
+are one unit a disconnect cannot split. A mutation's rows also keep a
+reserved share of the audit queue that the rows of reads and of refused
+requests cannot take, so a flood of those does not shed them.
 
 Over **Streamable HTTP**, both are established. The node routed the
 request to `/automation/v1/mcp` itself, so the path in the row is the

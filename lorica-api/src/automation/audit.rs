@@ -137,7 +137,7 @@ use std::sync::{Arc, OnceLock};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use lorica_config::models::AutomationScope;
 use lorica_mcp::server::Outcome;
 use lorica_mcp::tools;
@@ -162,20 +162,14 @@ const AUTOMATION_TARGET_TYPE: &str = "automation_request";
 /// What `operator_username` says when the request never authenticated.
 const ANONYMOUS_PRINCIPAL: &str = "-";
 
-/// The header a caller declares the transport it is bridging in.
+/// The header a caller declares the transport it is bridging in, and
+/// the one it declares the tool name in.
 ///
 /// Story 11.1 AC #6's "marker identifying the transport as MCP". The
-/// emitter is `lorica-mcp`, which spells it in
-/// `lorica-mcp/src/http.rs`; the two spellings are pinned against each
-/// other by `lorica-api/tests/mcp_asserted_headers.rs`, which reads
-/// that file rather than depending on the crate.
-pub const ASSERTED_TRANSPORT_HEADER: &str = "lorica-asserted-transport";
-
-/// The header a caller declares the tool name in.
-///
-/// See [`ASSERTED_TRANSPORT_HEADER`] for where the other end of this
-/// spelling lives and what pins the two together.
-pub const ASSERTED_TOOL_HEADER: &str = "lorica-asserted-tool";
+/// emitter is `lorica-mcp`, whose spelling this is: `lorica-api`
+/// depends on that crate, so the two ends are one constant rather than
+/// two held equal by a test.
+pub use lorica_mcp::http::{ASSERTED_TOOL_HEADER, ASSERTED_TRANSPORT_HEADER};
 
 /// The most bytes an asserted transport may weigh.
 const ASSERTED_TRANSPORT_MAX_BYTES: usize = 32;
@@ -194,8 +188,10 @@ const ASSERTED_TOOL_MAX_BYTES: usize = tools::TOOL_NAME_MAX_BYTES;
 /// nothing, since a path that long is a scan and not a request.
 const PATH_MAX_BYTES: usize = 2048;
 
-/// The most bytes of a `User-Agent` that reach a row.
-const USER_AGENT_MAX_BYTES: usize = 512;
+/// The most bytes of a `User-Agent` that reach a row, the request row
+/// and every management-side row an automation write records alike
+/// ([`super::environments::audit_context`]).
+pub(super) const USER_AGENT_MAX_BYTES: usize = 512;
 
 /// The reason a 403 carries when the path itself declares no scope.
 ///
@@ -576,7 +572,7 @@ fn mcp_outcome(record: &McpCallRecord) -> (&'static str, Option<String>) {
 }
 
 /// `text` cut to at most `max_bytes` on a char boundary.
-fn bounded(text: &str, max_bytes: usize) -> &str {
+pub(super) fn bounded(text: &str, max_bytes: usize) -> &str {
     let cut = (0..=text.len().min(max_bytes))
         .rev()
         .find(|end| text.is_char_boundary(*end))
@@ -620,7 +616,68 @@ pub async fn audit_automation_request(
     let slot = PrincipalSlot::default();
     req.extensions_mut().insert(slot.clone());
 
-    let response = next.run(req).await;
+    // The handler, this row, the counters, and whatever the handler
+    // does after its store commit (the reload signal, the management
+    // row) run as one task this request awaits but does not own. hyper
+    // drops the request future when the peer goes away, and a store
+    // closure on the blocking pool commits whether or not anyone still
+    // awaits it: on the request future, a committed write whose client
+    // hung up landed with no row, no reload and no count. A task runs
+    // to its end whoever stopped listening, so a request either never
+    // reached the store or lands the whole unit.
+    let unit = tokio::spawn(async move {
+        let response = next.run(req).await;
+        record_request_row(
+            &state,
+            RequestSeen {
+                method,
+                path,
+                is_mcp,
+                filters,
+                claimed,
+                ip,
+                user_agent,
+                slot,
+            },
+            &response,
+        );
+        response
+    });
+    match unit.await {
+        Ok(response) => response,
+        // The panic net inside this layer turns a handler's unwind into
+        // a 500, so a panic here is this layer's own and keeps its
+        // meaning; a cancelled task is the runtime shutting down.
+        Err(failed) if failed.is_panic() => std::panic::resume_unwind(failed.into_panic()),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+/// What the layer read off a request on the way down, for the row it
+/// writes once the response is known.
+struct RequestSeen {
+    method: Method,
+    path: String,
+    is_mcp: bool,
+    filters: String,
+    claimed: String,
+    ip: String,
+    user_agent: String,
+    slot: PrincipalSlot,
+}
+
+/// Count the request and write its row.
+fn record_request_row(state: &AppState, seen: RequestSeen, response: &Response) {
+    let RequestSeen {
+        method,
+        path,
+        is_mcp,
+        filters,
+        claimed,
+        ip,
+        user_agent,
+        slot,
+    } = seen;
 
     // What the MCP handler established, when it ran. Read from the
     // response because this layer is outermost and the request's
@@ -686,17 +743,19 @@ pub async fn audit_automation_request(
     // verb now carries in clear. A hash of one of two dozen known
     // words was never a secret, and a column an operator cannot read
     // is not worth the row it sits in.
-    crate::audit::record(
-        &state,
-        &ctx,
-        &action_for(outcome_word, reason.as_deref()),
-        (AUTOMATION_TARGET_TYPE, &target),
-        None,
-        None,
-    )
-    .await;
-
-    response
+    //
+    // A read, or a request no credential got through, costs its sender
+    // nothing, so its row is the one shed first on a full queue: a
+    // flood of them must not shed the row of a write beside it. A
+    // write an accepted credential sent keeps the mutation reserve.
+    let action = action_for(outcome_word, reason.as_deref());
+    let target = (AUTOMATION_TARGET_TYPE, target.as_str());
+    let accepted = matches!(decision, Some(AuthOutcome::Accepted { .. }));
+    if accepted && method != Method::GET && method != Method::HEAD {
+        crate::audit::record_now(state, &ctx, &action, target);
+    } else {
+        crate::audit::record_request(state, &ctx, &action, target);
+    }
 }
 
 #[cfg(test)]

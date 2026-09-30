@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Story 11.1 AC #10: the stdio binding, over the same core the
-//! Streamable HTTP binding will run.
+//! Streamable HTTP binding runs in `lorica-api`.
 //!
 //! # The framing, read from revision 2026-07-28
 //!
@@ -72,38 +72,22 @@ use crate::AutomationPlane;
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// Why the session ended other than by the client going away.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     /// A read or a write on the standard streams failed.
-    Io(std::io::Error),
+    #[error("the standard streams failed: {0}")]
+    Io(#[from] std::io::Error),
     /// The peer sent more than [`MAX_MESSAGE_BYTES`] without a newline.
     ///
     /// The session ends rather than resynchronising: the stream was
     /// abandoned mid-message, and guessing where the next one starts is
     /// guessing.
+    #[error(
+        "a message ran past {MAX_MESSAGE_BYTES} bytes with no newline. Messages on this \
+         transport are one line each; the session ends here rather than guessing where \
+         the next one starts."
+    )]
     MessageTooLong,
-}
-
-impl core::fmt::Display for SessionError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            SessionError::Io(reason) => write!(f, "the standard streams failed: {reason}"),
-            SessionError::MessageTooLong => write!(
-                f,
-                "a message ran past {MAX_MESSAGE_BYTES} bytes with no newline. Messages on this \
-                 transport are one line each; the session ends here rather than guessing where \
-                 the next one starts."
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SessionError {}
-
-impl From<std::io::Error> for SessionError {
-    fn from(reason: std::io::Error) -> SessionError {
-        SessionError::Io(reason)
-    }
 }
 
 /// Run the session until `input` reaches EOF.

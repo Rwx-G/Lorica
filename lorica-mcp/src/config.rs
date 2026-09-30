@@ -56,6 +56,16 @@
 //! offending line, and the offending line of this file is as likely as
 //! not the one holding the token, so the parse detail is dropped and
 //! the path alone is reported.
+//!
+//! # A file that carries the token is its owner's alone
+//!
+//! A token in a file other local users can read is a token published
+//! to them, exactly as an argument would be. So a file that carries a
+//! `token` key and grants any permission to its group or to others is
+//! refused at startup, naming its mode and the `chmod` that fixes it,
+//! the way `ssh` refuses a private key it is not alone in reading. A
+//! file that names only the endpoint or the bundle carries nothing
+//! secret and may be shared.
 
 use core::fmt;
 use std::path::{Path, PathBuf};
@@ -127,26 +137,66 @@ pub struct ServerConfig {
 /// on stderr and has to fix it. None of them echoes the token, and the
 /// file variants name the path without quoting anything from inside the
 /// file.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
     /// The process was started with command-line arguments.
+    #[error(
+        "lorica-mcp takes no command-line arguments. The endpoint and the token are \
+         read from {ENDPOINT_ENV} and {TOKEN_ENV}, or from the TOML file named by \
+         {CONFIG_ENV}. An argument would put the token in the process table, where \
+         every local user reads it."
+    )]
     ArgumentsRefused,
     /// Neither the environment nor the file named an endpoint.
+    #[error(
+        "no automation endpoint: set {ENDPOINT_ENV} to the listener's origin \
+         (https://host:port), or name a TOML file in {CONFIG_ENV} carrying an \
+         `endpoint` key."
+    )]
     MissingEndpoint,
     /// Neither the environment nor the file named a token.
+    #[error(
+        "no automation token: set {TOKEN_ENV}, or name a TOML file in {CONFIG_ENV} \
+         carrying a `token` key."
+    )]
     MissingToken,
     /// The endpoint is not an `https://` origin.
+    #[error(
+        "the automation endpoint must be https://. The bearer token travels on every \
+         request, and over plaintext it travels to whoever is listening."
+    )]
     EndpointNotHttps,
     /// The endpoint carries a userinfo component, which would mean a
     /// second credential in a place nothing here redacts.
+    #[error(
+        "the automation endpoint must carry no user information before the host. \
+         Lorica authenticates with the bearer token from {TOKEN_ENV} and nothing else."
+    )]
     EndpointCarriesCredentials,
     /// The endpoint has a path, query or fragment: this server appends
     /// its own paths and would build nonsense from a prefix.
+    #[error(
+        "the automation endpoint is an origin (https://host:port) and nothing more. \
+         This server appends the paths it reads; a path, query or fragment here would \
+         be prepended to every one of them."
+    )]
     EndpointIsNotAnOrigin,
     /// The token is empty, or carries a byte that cannot travel in an
     /// HTTP header.
+    #[error(
+        "the automation token is empty or carries a byte an HTTP header cannot. \
+         Check {TOKEN_ENV} for a trailing newline or a shell quoting mistake."
+    )]
     TokenUnusable,
     /// The file named by [`CONFIG_ENV`] could not be read.
+    ///
+    /// The reason is kept as text rather than as the `io::Error`
+    /// itself so the type stays comparable, which every refusal test
+    /// here relies on.
+    #[error(
+        "cannot read the configuration file named by {CONFIG_ENV} ({}): {detail}",
+        path.display()
+    )]
     FileUnreadable {
         /// The path that was named.
         path: PathBuf,
@@ -157,72 +207,38 @@ pub enum ConfigError {
     ///
     /// Carries no parse detail on purpose: a TOML error quotes the line
     /// it failed on, and in this file that line may be the token.
+    #[error(
+        "the configuration file named by {CONFIG_ENV} ({}) is not valid TOML with \
+         optional string keys `endpoint`, `token` and `ca_bundle`. The parse error is \
+         withheld because it would quote the line it failed on, and that line may be \
+         the token.",
+        path.display()
+    )]
     FileMalformed {
         /// The path that was named.
         path: PathBuf,
     },
+    /// The file named by [`CONFIG_ENV`] carries a token and grants a
+    /// permission to its group or to others.
+    #[error(
+        "the configuration file named by {CONFIG_ENV} ({}) carries the token and is open to \
+         other users (mode {mode:04o}): anyone it lets in holds the credential. Make it \
+         readable by its owner alone, `chmod 600 {}`, and replace the token if another user \
+         may already have read it.",
+        path.display(),
+        path.display()
+    )]
+    FileOpenToOthers {
+        /// The path that was named.
+        path: PathBuf,
+        /// The file's permission bits, as `chmod` spells them.
+        mode: u32,
+    },
 }
 
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConfigError::ArgumentsRefused => write!(
-                f,
-                "lorica-mcp takes no command-line arguments. The endpoint and the token are \
-                 read from {ENDPOINT_ENV} and {TOKEN_ENV}, or from the TOML file named by \
-                 {CONFIG_ENV}. An argument would put the token in the process table, where \
-                 every local user reads it."
-            ),
-            ConfigError::MissingEndpoint => write!(
-                f,
-                "no automation endpoint: set {ENDPOINT_ENV} to the listener's origin \
-                 (https://host:port), or name a TOML file in {CONFIG_ENV} carrying an \
-                 `endpoint` key."
-            ),
-            ConfigError::MissingToken => write!(
-                f,
-                "no automation token: set {TOKEN_ENV}, or name a TOML file in {CONFIG_ENV} \
-                 carrying a `token` key."
-            ),
-            ConfigError::EndpointNotHttps => write!(
-                f,
-                "the automation endpoint must be https://. The bearer token travels on every \
-                 request, and over plaintext it travels to whoever is listening."
-            ),
-            ConfigError::EndpointCarriesCredentials => write!(
-                f,
-                "the automation endpoint must carry no user information before the host. \
-                 Lorica authenticates with the bearer token from {TOKEN_ENV} and nothing else."
-            ),
-            ConfigError::EndpointIsNotAnOrigin => write!(
-                f,
-                "the automation endpoint is an origin (https://host:port) and nothing more. \
-                 This server appends the paths it reads; a path, query or fragment here would \
-                 be prepended to every one of them."
-            ),
-            ConfigError::TokenUnusable => write!(
-                f,
-                "the automation token is empty or carries a byte an HTTP header cannot. \
-                 Check {TOKEN_ENV} for a trailing newline or a shell quoting mistake."
-            ),
-            ConfigError::FileUnreadable { path, detail } => write!(
-                f,
-                "cannot read the configuration file named by {CONFIG_ENV} ({}): {detail}",
-                path.display()
-            ),
-            ConfigError::FileMalformed { path } => write!(
-                f,
-                "the configuration file named by {CONFIG_ENV} ({}) is not valid TOML with \
-                 optional string keys `endpoint`, `token` and `ca_bundle`. The parse error is \
-                 withheld because it would quote the line it failed on, and that line may be \
-                 the token.",
-                path.display()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
+/// The permission bits a file carrying the token may not grant: every
+/// bit of the group's and of the others', as `ssh` holds a private key.
+const OPEN_TO_OTHERS: u32 = 0o077;
 
 /// The keys the TOML file may carry, every one optional so the file
 /// can name the endpoint while the environment carries the token. The
@@ -309,18 +325,49 @@ impl ServerConfig {
         // endpoint", which sends an operator to the wrong variable.
         let named = std::env::var(CONFIG_ENV).ok().map(PathBuf::from);
         let contents = match &named {
-            Some(path) => Some(std::fs::read_to_string(path).map_err(|reason| {
-                ConfigError::FileUnreadable {
+            Some(path) => {
+                let unreadable = |reason: std::io::Error| ConfigError::FileUnreadable {
                     path: path.clone(),
                     detail: reason.to_string(),
-                }
-            })?),
+                };
+                let text = std::fs::read_to_string(path).map_err(unreadable)?;
+                let mode = file_mode(path).map_err(unreadable)?;
+                refuse_a_token_open_to_others(path, &text, mode)?;
+                Some(text)
+            }
             None => None,
         };
         let file = named.as_deref().zip(contents.as_deref());
 
         ServerConfig::assemble(&arguments, |name| std::env::var(name).ok(), file)
     }
+}
+
+/// The permission bits of the file at `path`, as `chmod` spells them.
+fn file_mode(path: &Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o7777)
+}
+
+/// Refuse a configuration file that carries a token and is open to
+/// other users; see the module documentation.
+///
+/// Pure, so the rule is tested without a file: `text` is what was read
+/// and `mode` its permission bits. A file that does not parse is let
+/// through to [`ServerConfig::assemble`], which refuses it as malformed
+/// without quoting it.
+fn refuse_a_token_open_to_others(path: &Path, text: &str, mode: u32) -> Result<(), ConfigError> {
+    let carries_token = toml::from_str::<ConfigFile>(text)
+        .ok()
+        .and_then(|file| file.token)
+        .is_some();
+    if carries_token && mode & OPEN_TO_OTHERS != 0 {
+        return Err(ConfigError::FileOpenToOthers {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
 }
 
 /// The endpoint if it is an origin this server may append paths to.
@@ -640,6 +687,63 @@ mod tests {
         )
         .expect("a trailing newline is trimmed, not refused");
         assert_eq!(trimmed.token.reveal(), TOKEN);
+    }
+
+    #[test]
+    fn a_file_carrying_the_token_is_refused_when_anyone_but_its_owner_may_open_it() {
+        let path = Path::new("/etc/lorica/mcp.toml");
+        let with_token = format!("endpoint = \"{ENDPOINT}\"\ntoken = \"{TOKEN}\"\n");
+
+        for owner_only in [0o600, 0o400, 0o700] {
+            refuse_a_token_open_to_others(path, &with_token, owner_only)
+                .unwrap_or_else(|refused| panic!("{owner_only:o}: {refused}"));
+        }
+        // Every bit of the group's and the others', each on its own, as
+        // `ssh` holds a private key: a group-writable file is one
+        // another user can point at their own endpoint.
+        for shift in 0..6 {
+            let mode = 0o600 | (1 << shift);
+            let refused = refuse_a_token_open_to_others(path, &with_token, mode)
+                .expect_err("a token open to others is refused");
+            assert_eq!(
+                refused,
+                ConfigError::FileOpenToOthers {
+                    path: path.to_path_buf(),
+                    mode
+                }
+            );
+            let message = refused.to_string();
+            assert!(message.contains(&format!("{mode:04o}")), "{message}");
+            assert!(
+                message.contains("chmod 600 /etc/lorica/mcp.toml"),
+                "{message}"
+            );
+            assert!(!message.contains(TOKEN), "{message}");
+        }
+
+        // A file naming only the endpoint and the bundle holds nothing
+        // secret and may be shared.
+        let no_token =
+            format!("endpoint = \"{ENDPOINT}\"\nca_bundle = \"/etc/lorica/internal-ca.pem\"\n");
+        refuse_a_token_open_to_others(path, &no_token, 0o644).expect("nothing secret in it");
+        // A file that does not parse is left to `assemble`, which refuses
+        // it as malformed without quoting it.
+        refuse_a_token_open_to_others(path, &format!("token = {TOKEN}\n"), 0o644)
+            .expect("not judged here");
+    }
+
+    #[test]
+    fn the_mode_read_from_disk_is_the_one_chmod_set() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("test setup: temp dir");
+        let path = dir.path().join("mcp.toml");
+        std::fs::write(&path, "").expect("test setup: written");
+        for mode in [0o600, 0o640, 0o644] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("test setup: chmod");
+            assert_eq!(file_mode(&path).expect("a mode"), mode);
+        }
     }
 
     #[test]

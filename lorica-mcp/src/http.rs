@@ -57,7 +57,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 
 use crate::config::ServerConfig;
-use crate::{AutomationPlane, PlaneError, Reason, Verb};
+use crate::{AutomationPlane, PlaneError, Reason, Verb, MAX_ANSWER_BYTES};
 
 /// The header this client declares the tool name in.
 ///
@@ -73,8 +73,8 @@ pub const ASSERTED_TRANSPORT_HEADER: &str = "lorica-asserted-transport";
 /// What [`ASSERTED_TRANSPORT_HEADER`] carries from this binding.
 ///
 /// Every MCP binding's marker starts with `mcp`, and the suffix names
-/// which one: the Streamable HTTP adapter of lot 4 asserts
-/// `mcp-streamable-http`. An operator filtering the trail for anything
+/// which one: the Streamable HTTP binding, `lorica-api`'s
+/// `automation::mcp`, asserts `mcp-streamable-http`. An operator filtering the trail for anything
 /// a model drove matches the prefix; one asking which door it came
 /// through reads the whole word.
 pub const TRANSPORT_MARKER: &str = "mcp-stdio";
@@ -102,65 +102,45 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the connection itself may take to come up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The most body bytes one read may answer with.
-///
-/// The automation plane caps a collection at 256 KiB of row data plus
-/// its envelope, so this ceiling is never reached by the thing it talks
-/// to. It is here for what happens when the endpoint is not that thing:
-/// a captive portal, a proxy error page, anything that answers a
-/// megabyte of HTML. Without a bound, a client that reads until EOF is
-/// a process whose memory is chosen by whoever answered the connection.
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
-
 /// Why an HTTPS read source could not be built.
 ///
 /// Only the TLS trust material can fail here: everything else was
 /// already checked by [`ServerConfig`], which refuses a non-origin, a
 /// plaintext endpoint and a token that cannot travel in a header.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HttpsError {
     /// The file named by [`crate::config::CA_BUNDLE_ENV`] could not be
     /// read.
+    #[error(
+        "cannot read the certificate authority bundle named by {} ({}): {source}",
+        crate::config::CA_BUNDLE_ENV,
+        path.display()
+    )]
     BundleUnreadable {
         /// The path that was named.
         path: std::path::PathBuf,
-        /// The operating system's reason.
-        detail: String,
+        /// The operating system's reason, which names no file content.
+        source: std::io::Error,
     },
     /// The file was read and holds no certificate this client can use.
+    ///
+    /// Carries no parse detail on purpose: it would quote what the
+    /// parser choked on, a line of whatever file the operator named.
+    #[error(
+        "the certificate authority bundle named by {} ({}) holds no PEM certificate. \
+         It is a file of one or more `-----BEGIN CERTIFICATE-----` blocks: the \
+         listener's own certificate when it is self-signed, or the CA that signed it.",
+        crate::config::CA_BUNDLE_ENV,
+        path.display()
+    )]
     BundleNotCertificates {
         /// The path that was named.
         path: std::path::PathBuf,
     },
     /// The HTTP client itself could not be built.
+    #[error("cannot build the HTTPS client: {0}")]
     ClientUnbuildable(String),
 }
-
-impl core::fmt::Display for HttpsError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            HttpsError::BundleUnreadable { path, detail } => write!(
-                f,
-                "cannot read the certificate authority bundle named by {} ({}): {detail}",
-                crate::config::CA_BUNDLE_ENV,
-                path.display()
-            ),
-            HttpsError::BundleNotCertificates { path } => write!(
-                f,
-                "the certificate authority bundle named by {} ({}) holds no PEM certificate. \
-                 It is a file of one or more `-----BEGIN CERTIFICATE-----` blocks: the \
-                 listener's own certificate when it is self-signed, or the CA that signed it.",
-                crate::config::CA_BUNDLE_ENV,
-                path.display()
-            ),
-            HttpsError::ClientUnbuildable(detail) => {
-                write!(f, "cannot build the HTTPS client: {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for HttpsError {}
 
 /// An [`AutomationPlane`] reached over HTTPS: the automation listener,
 /// from a separate process.
@@ -241,9 +221,9 @@ fn trusted_extras(bundle: Option<&Path>) -> Result<Vec<reqwest::Certificate>, Ht
     let Some(path) = bundle else {
         return Ok(Vec::new());
     };
-    let pem = std::fs::read(path).map_err(|reason| HttpsError::BundleUnreadable {
+    let pem = std::fs::read(path).map_err(|source| HttpsError::BundleUnreadable {
         path: path.to_path_buf(),
-        detail: reason.to_string(),
+        source,
     })?;
     let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
         // The parse detail is dropped: it quotes what it choked on, and
@@ -313,25 +293,16 @@ impl AutomationPlane for HttpsPlane {
             .send()
             .await
             .map_err(|reason| PlaneError::Transport(reason.to_string()))?;
-        let status = response.status();
-        let body = bounded_body(response).await?;
-
-        if status.is_success() {
-            Ok(body)
-        } else {
-            Err(PlaneError::Refused {
-                status: status.as_u16(),
-                body,
-            })
-        }
+        let status = response.status().as_u16();
+        PlaneError::answered(status, bounded_body(response).await?)
     }
 }
 
-/// The response body, up to [`MAX_BODY_BYTES`].
+/// The response body, up to [`MAX_ANSWER_BYTES`].
 ///
 /// Read in chunks rather than with `bytes()`, because the ceiling has
 /// to stop the transfer and not merely regret it afterwards.
-async fn bounded_body(mut response: reqwest::Response) -> Result<String, PlaneError> {
+async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, PlaneError> {
     let mut body: Vec<u8> = Vec::new();
     loop {
         let chunk = response
@@ -339,17 +310,16 @@ async fn bounded_body(mut response: reqwest::Response) -> Result<String, PlaneEr
             .await
             .map_err(|reason| PlaneError::Transport(reason.to_string()))?;
         let Some(chunk) = chunk else { break };
-        if body.len() + chunk.len() > MAX_BODY_BYTES {
+        if body.len() + chunk.len() > MAX_ANSWER_BYTES {
             return Err(PlaneError::Transport(format!(
-                "the answer is over {MAX_BODY_BYTES} bytes, which no automation call produces; \
+                "the answer is over {MAX_ANSWER_BYTES} bytes, which no automation call produces; \
                  check that the endpoint is a Lorica automation listener and not something in \
                  front of one"
             )));
         }
         body.extend_from_slice(&chunk);
     }
-    String::from_utf8(body)
-        .map_err(|_| PlaneError::Transport("the answer is not UTF-8".to_string()))
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -469,17 +439,47 @@ mod tests {
     }
 
     #[test]
-    fn this_client_follows_no_redirect_and_speaks_https_alone() {
+    fn this_client_follows_no_redirect() {
         // A 3xx from anything terminating TLS with a trusted
         // certificate could otherwise point the client, bearer and all,
-        // at a plaintext URL on the same host, which is the exact thing
-        // `ServerConfig` refuses in the endpoint. Both settings are
-        // asserted against the source: `reqwest`'s defaults are to
-        // follow ten redirects and to speak either scheme.
+        // somewhere the configuration never named. `reqwest` follows ten
+        // redirects by default. Asserted against the source because
+        // observing it needs a TLS server this crate has no dependency
+        // to build; the plaintext half is observed below.
         let source = include_str!("http.rs");
         let body = source.split("#[cfg(test)]").next().unwrap_or(source);
         assert!(body.contains("redirect(reqwest::redirect::Policy::none())"));
-        assert!(body.contains("https_only(true)"));
+    }
+
+    #[tokio::test]
+    async fn a_plaintext_url_is_refused_before_anything_connects() {
+        // `ServerConfig` refuses an `http://` endpoint; `https_only` is
+        // the same refusal kept for the request itself, so a redirect
+        // or a future call site cannot undo it. Observed rather than
+        // read: a listener on loopback that would receive the bearer
+        // receives no connection at all.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test setup: bind");
+        listener
+            .set_nonblocking(true)
+            .expect("test setup: nonblocking");
+        let port = listener.local_addr().expect("test setup: addr").port();
+        let mut plane = HttpsPlane::new(&config_with(None)).expect("a client builds");
+        plane.endpoint = format!("http://127.0.0.1:{port}");
+
+        let refused = plane
+            .call(
+                Verb::Get,
+                "/automation/v1/whoami",
+                None,
+                Reason::Introspection,
+            )
+            .await
+            .expect_err("a plaintext URL is refused");
+        assert!(matches!(refused, PlaneError::Transport(_)), "{refused:?}");
+        assert!(
+            matches!(listener.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the plaintext listener was connected to"
+        );
     }
 
     #[test]

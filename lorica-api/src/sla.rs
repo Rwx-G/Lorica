@@ -596,29 +596,35 @@ pub async fn clear_route_sla(
 }
 
 /// This node's own 1h and 24h passive summaries, two rows per route,
-/// stopping once `wanted` of them exist.
+/// or only the rows of `window`.
 ///
 /// Split out of [`get_sla_overview`] for the reason given on
 /// [`local_route_sla`]: the automation plane reads the same figures
 /// through the same computation, and `?node=` stays in the handler.
 ///
-/// `wanted` is what makes that split affordable. Every summary is two
+/// `window` is what makes that split affordable. Every summary is two
 /// synchronous SQL passes, and the whole loop runs inside ONE
 /// acquisition of the process-wide config-store mutex, so computing
 /// every route's figures to answer `?limit=1` held that lock against
 /// configuration writes and the replication round for `2R` queries.
 /// `None` asks for all of them and is what the management overview
-/// wants; a paginating caller passes its window and the loop stops one
-/// route past it. The overshoot is deliberate: the caller's `has_more`
-/// is answered by a row existing past the window.
+/// wants. `Some(SlaWindow { skip, take })` is a paginating caller's:
+/// the rows at positions `skip..skip + take` of the full overview and
+/// no other, the routes before `skip` never computed, so neither a deep
+/// offset nor a large one costs a summary it does not answer. A caller
+/// that wants `has_more` asks for one row past its window.
 ///
 /// # Errors
 ///
 /// The store's error text.
 pub(crate) async fn local_sla_overview(
     state: &AppState,
-    wanted: Option<usize>,
+    window: Option<SlaWindow>,
 ) -> Result<Vec<SlaSummary>, ApiError> {
+    let SlaWindow { skip, take } = window.unwrap_or(SlaWindow {
+        skip: 0,
+        take: usize::MAX,
+    });
     // One store acquisition for the whole overview, as before the
     // blocking-pool migration: every per-route summary runs inside a
     // single closure.
@@ -628,26 +634,41 @@ pub(crate) async fn local_sla_overview(
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         let now = Utc::now();
         let from = now - Duration::hours(24);
-
-        let mut overview = Vec::new();
         let from_1h = now - Duration::hours(1);
-        for route in &routes {
-            if wanted.is_some_and(|wanted| overview.len() >= wanted) {
+
+        // Row `2i` is route `i`'s 1h summary and row `2i + 1` its 24h.
+        let mut overview = Vec::new();
+        for (position, route) in routes.iter().enumerate().skip(skip / 2) {
+            let first_row = position * 2;
+            if first_row >= skip && overview.len() < take {
+                overview.push(
+                    store
+                        .compute_sla_summary(&route.id, &from_1h, &now, "1h", "passive")
+                        .map_err(|e| ApiError::Internal(e.to_string()))?,
+                );
+            }
+            if overview.len() >= take {
                 break;
             }
-            let summary_1h = store
-                .compute_sla_summary(&route.id, &from_1h, &now, "1h", "passive")
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            overview.push(summary_1h);
-            let summary_24h = store
-                .compute_sla_summary(&route.id, &from, &now, "24h", "passive")
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            overview.push(summary_24h);
+            overview.push(
+                store
+                    .compute_sla_summary(&route.id, &from, &now, "24h", "passive")
+                    .map_err(|e| ApiError::Internal(e.to_string()))?,
+            );
         }
 
         Ok::<_, ApiError>(overview)
     })
     .await
+}
+
+/// The rows of the overview a paginating caller wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlaWindow {
+    /// How many rows of the full overview come before the window.
+    pub(crate) skip: usize,
+    /// How many rows the window holds at most.
+    pub(crate) take: usize,
 }
 
 /// GET /api/v1/sla/overview - return 1h and 24h passive SLA summaries for every route.

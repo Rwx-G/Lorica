@@ -640,7 +640,10 @@ pub(super) fn caller_may_access(
 /// AC #3: a credential bound to `environment_protected = true` may only
 /// write the environment its job runs for, named by the GitLab slug of
 /// the job's `environment` claim.
-fn ensure_environment_binding(name: &str, principal: &AutomationPrincipal) -> Result<(), ApiError> {
+pub(super) fn ensure_environment_binding(
+    name: &str,
+    principal: &AutomationPrincipal,
+) -> Result<(), ApiError> {
     let Some(slug) = principal.required_environment_slug.as_deref() else {
         return Ok(());
     };
@@ -1267,9 +1270,13 @@ pub(super) fn audit_context(
             .as_ref()
             .map(|ci| ci.0.ip().to_string())
             .unwrap_or_default(),
+        // Bounded as the request row bounds it: the header is the
+        // caller's own text, and every management-side row an
+        // automation write records carries it.
         user_agent: headers
             .get(header::USER_AGENT)
             .and_then(|value| value.to_str().ok())
+            .map(|agent| super::audit::bounded(agent, super::audit::USER_AGENT_MAX_BYTES))
             .unwrap_or_default()
             .to_string(),
     }

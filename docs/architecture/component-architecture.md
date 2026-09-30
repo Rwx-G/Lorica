@@ -63,10 +63,11 @@
 - Automation listener (v1.8.0, opt-in via `--automation-listen`): its own socket and accept loop, a mandatory source-CIDR allowlist enforced at TCP accept before the TLS handshake, pre-authentication budgets shared with the cluster enrollment listener, scoped bearer tokens or GitLab OIDC ID tokens, a per-path scope gate, and its own audit layer. Contract: `lorica-api/openapi-automation.yaml`. The two planes share no credential: a session cookie is never read there
 - Log export sinks (`src/log_sinks/`): syslog RFC 5424 and, under the `otel` feature, OTLP logs, each fed by a bounded drop-and-count queue off the request path. Ships access logs, WAF events, audit entries and captures, per-kind toggles in `GlobalSettings`
 - TLS: the automation listener reuses the management plane's certificate material, so one node presents one identity
+- MCP (v1.9.0): the automation listener mounts `POST /automation/v1/mcp`, the Streamable HTTP binding of the MCP server, which runs `lorica-mcp`'s core in process over the plane's own router; the stdio binding is the `lorica-mcp` binary, a separate process that reaches the same listener over HTTPS
 
 **Dependencies:**
-- **Existing Components:** lorica-core (for listener setup)
-- **New Components:** lorica-config, lorica-dashboard, lorica-notify, lorica-cluster (pre-authentication budgets)
+- **Existing Components:** lorica-core (for listener setup), lorica-tls
+- **New Components:** lorica-config, lorica-dashboard, lorica-notify, lorica-cluster (pre-authentication budgets), lorica-acme, lorica-metrics, lorica-waf, lorica-bench, lorica-mcp (v1.9.0; the edge points this way only, so the `lorica-mcp` binary never links the management crate or SQLite)
 
 **Technology Stack:** Rust, axum, tower, argon2, sysinfo, rustls
 
@@ -197,6 +198,11 @@ graph TB
         CIDR -->|inside| SCOPE{per-path scope gate}
         SCOPE --> AUTOAPI[lorica-api<br>automation router]
         AUTOAPI --> AUDIT[automation audit trail]
+        MCPCLIENT[MCP client, stdio] -->|launches| MCPBIN[lorica-mcp<br>subprocess]
+        MCPBIN -->|HTTPS + bearer token| AUTO
+        MCPHTTP[MCP client, Streamable HTTP] -->|HTTPS + bearer token| AUTO
+        AUTOAPI --> MCPPATH[MCP endpoint, v1.9.0<br>lorica-mcp core in process]
+        MCPPATH -->|in-process calls, same scope gate| AUTOAPI
     end
 
     subgraph "Cluster Plane (v1.7.0, opt-in)"

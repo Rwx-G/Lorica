@@ -307,8 +307,15 @@ impl OidcVerifier {
                 // Only an accepted token consumes its `jti`: a mismatch
                 // on one entry must not turn a later request on another
                 // entry into a replay.
+                // Kept until `exp` plus the skew, not `exp`: the library
+                // accepts a token up to the skew past its `exp`, and an
+                // entry purged at `exp` read every presentation inside
+                // that window as the first.
                 let replay_key = format!("{}|{}", claims.issuer, claims.jti);
-                if !self.replay.remember(&replay_key, claims.expires_at, now) {
+                if !self
+                    .replay
+                    .remember(&replay_key, claims.expires_at + skew(), now)
+                {
                     return Err(RefusalReason::Replayed);
                 }
                 return Ok(VerifiedIdToken {

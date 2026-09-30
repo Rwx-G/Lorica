@@ -66,7 +66,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
-use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
+use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::DecodingKey;
 use tokio::sync::Mutex;
 
@@ -511,6 +511,13 @@ impl JwksCache {
 /// without a `kid`, are left out: the verifier pins RS256, so nothing
 /// else could ever verify a token, and a key nothing can name could
 /// never be looked up.
+///
+/// So is a key the issuer published for something other than RS256
+/// signatures: a `use` present and not `sig` (an encryption key shares
+/// the family and could carry a `kid` a token names), or an `alg`
+/// present and not `RS256`. Both members are optional in RFC 7517, and
+/// a key that states neither is admitted as it always was; a key that
+/// states either is taken at its word.
 fn rsa_keys_by_kid(set: &JwkSet) -> HashMap<String, Arc<DecodingKey>> {
     set.keys
         .iter()
@@ -519,6 +526,21 @@ fn rsa_keys_by_kid(set: &JwkSet) -> HashMap<String, Arc<DecodingKey>> {
             let AlgorithmParameters::RSA(params) = &jwk.algorithm else {
                 return None;
             };
+            if jwk
+                .common
+                .public_key_use
+                .as_ref()
+                .is_some_and(|key_use| *key_use != PublicKeyUse::Signature)
+            {
+                return None;
+            }
+            if jwk
+                .common
+                .key_algorithm
+                .is_some_and(|alg| alg != KeyAlgorithm::RS256)
+            {
+                return None;
+            }
             let key = DecodingKey::from_rsa_components(&params.n, &params.e).ok()?;
             Some((kid, Arc::new(key)))
         })

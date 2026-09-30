@@ -13,7 +13,9 @@
 // limitations under the License.
 
 //! The bounded replay set (Story 10.5 AC #4): every accepted `jti` is
-//! remembered until its `exp`, and a second presentation is refused.
+//! remembered until the last instant the verifier would still accept
+//! its token, `exp` plus the clock skew, and a second presentation is
+//! refused.
 //!
 //! # Why the bound is the point
 //!
@@ -75,22 +77,26 @@ impl ReplaySet {
         }
     }
 
-    /// Remember `key` until `exp`.
+    /// Remember `key` until `until`.
     ///
     /// Returns `true` when the key was not in the set, `false` when it
-    /// was, which is a replay. Entries whose `exp` is at or before
-    /// `now` are purged first, so an expired entry never blocks a key
-    /// (an expired token is refused on `exp` anyway, before this set
-    /// is consulted). When the insert takes the set past its cap, the
-    /// entries with the earliest `exp` are evicted and counted.
-    pub fn remember(&self, key: &str, exp: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    /// was, which is a replay. Entries whose `until` is at or before
+    /// `now` are purged first, so an entry never blocks a key past the
+    /// instant its token stops being accepted. `until` is therefore the
+    /// token's `exp` PLUS the verifier's clock skew, never the bare
+    /// `exp`: the verifier accepts a token up to the skew past its
+    /// `exp`, and an entry purged at `exp` would read every
+    /// presentation inside that window as the first. When the insert
+    /// takes the set past its cap, the entries with the earliest
+    /// `until` are evicted and counted.
+    pub fn remember(&self, key: &str, until: DateTime<Utc>, now: DateTime<Utc>) -> bool {
         let mut inner = self.inner.lock();
         purge_expired(&mut inner, now);
         if inner.by_key.contains_key(key) {
             return false;
         }
-        inner.by_key.insert(key.to_string(), exp);
-        inner.by_exp.insert((exp, key.to_string()));
+        inner.by_key.insert(key.to_string(), until);
+        inner.by_exp.insert((until, key.to_string()));
 
         let mut evicted: u64 = 0;
         while inner.by_key.len() > self.cap {

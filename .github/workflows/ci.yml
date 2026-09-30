@@ -50,6 +50,18 @@ jobs:
       - name: Clippy (binary crate with the otel feature)
         run: cargo clippy -p lorica --all-targets --features otel -- -D warnings
 
+      # lorica-mcp is a subprocess an operator's MCP client launches and
+      # reads no database. lorica-config, and bundled SQLite with it, is a
+      # dev-dependency of it only; this keeps the stdio binary that way.
+      - name: lorica-mcp links neither the management crates nor SQLite
+        run: |
+          linked=$(cargo tree -p lorica-mcp -e normal --prefix none | awk '{print $1}' | sort -u \
+            | grep -xE 'rusqlite|libsqlite3-sys|lorica-config|lorica-api' || true)
+          if [ -n "$linked" ]; then
+            echo "FAIL: lorica-mcp links: $linked"
+            exit 1
+          fi
+
       - name: Cargo audit
         run: |
           cargo install cargo-audit --locked
@@ -442,14 +454,18 @@ jobs:
     needs: build-and-package
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: lorica-deb
-          path: dist/
-      - name: Install and verify
+          path: pkg/
+      # The runner boots systemd, so the service really starts: active,
+      # enabled and recording the certificate it serves, with no repair
+      # warning on a host that never had lorica.
+      - name: Install on a clean host
+        run: sudo bash dist/tests/deb-upgrade.sh clean pkg/*.deb
+      - name: Verify the installed files
         run: |
-          sudo apt-get update
-          sudo dpkg -i dist/*.deb || sudo apt-get install -f -y
           test -x /usr/bin/lorica
           test -x /usr/bin/lorica-mcp
           test -f /lib/systemd/system/lorica.service
@@ -507,6 +523,86 @@ jobs:
           fi
           echo "OK: chown fails soft under the shipped filter (no SIGSYS)"
 
+  # The ownership repair in the postinst only acts on a host upgraded from
+  # a package built before 1.9.0, so it is tested on one: the released
+  # 1.8.0, installed on this runner, whose `runner` account (uid 1001) is
+  # the one those packages recorded as owner. 1.8.0 is pinned because it
+  # is the last affected release; a later one would not exercise the
+  # repair, and the script fails if the precondition does not hold.
+  test-deb-upgrade:
+    name: Test .deb upgrade from 1.8.0
+    needs: build-and-package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: lorica-deb
+          path: pkg/
+      - name: Download the released 1.8.0 .deb
+        run: |
+          curl -fsSL --retry 3 -o lorica_1.8.0_amd64.deb \
+            https://github.com/Rwx-G/Lorica/releases/download/v1.8.0/lorica_1.8.0_amd64.deb
+      - name: Upgrade 1.8.0 on a host with the uid-1001 account
+        run: sudo bash dist/tests/deb-upgrade.sh upgrade lorica_1.8.0_amd64.deb pkg/*.deb
+
+  # 1.8.0's preun stops and disables the service on every upgrade, so the
+  # new package must start it from posttrans. That needs systemd, which a
+  # `container:` job does not boot: Fedora runs here under its own init,
+  # in a privileged container on the runner.
+  test-rpm-upgrade:
+    name: Test .rpm upgrade from 1.8.0
+    needs: build-and-package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: lorica-rpm
+          path: pkg/
+      - name: Download the released 1.8.0 .rpm
+        run: |
+          curl -fsSL --retry 3 -o pkg/lorica-1.8.0-1.x86_64.rpm \
+            https://github.com/Rwx-G/Lorica/releases/download/v1.8.0/lorica-1.8.0-1.x86_64.rpm
+      - name: Boot Fedora under systemd
+        run: |
+          printf '%s\n' \
+            'FROM fedora:latest' \
+            'RUN dnf -y -q install systemd procps-ng openssl ca-certificates && dnf clean all' \
+            'STOPSIGNAL SIGRTMIN+3' \
+            'CMD ["/sbin/init"]' > Dockerfile.systemd
+          docker build -q -t fedora-systemd -f Dockerfile.systemd .
+          docker run -d --name fedora --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
+            -v "$PWD:/w:ro" fedora-systemd
+          for _ in $(seq 1 30); do
+            case "$(docker exec fedora systemctl is-system-running 2>/dev/null)" in
+              running|degraded) exit 0 ;;
+            esac
+            sleep 1
+          done
+          echo "FAIL: systemd did not come up in the container"
+          exit 1
+      - name: Upgrade 1.8.0, then reinstall over itself
+        run: |
+          new=$(ls pkg/lorica-*.rpm | grep -v 'lorica-1\.8\.0-')
+          docker exec fedora bash /w/dist/tests/rpm-upgrade.sh upgrade \
+            /w/pkg/lorica-1.8.0-1.x86_64.rpm "/w/$new"
+      - name: Install on a clean host
+        run: |
+          new=$(ls pkg/lorica-*.rpm | grep -v 'lorica-1\.8\.0-')
+          docker rm -f fedora
+          docker run -d --name fedora --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
+            -v "$PWD:/w:ro" fedora-systemd
+          for _ in $(seq 1 30); do
+            case "$(docker exec fedora systemctl is-system-running 2>/dev/null)" in
+              running|degraded) break ;;
+            esac
+            sleep 1
+          done
+          docker exec fedora bash /w/dist/tests/rpm-upgrade.sh clean "/w/$new"
+
   test-rpm-install:
     name: Test .rpm install
     needs: build-and-package
@@ -541,7 +637,7 @@ jobs:
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [verify-tag, test-deb-install, test-rpm-install]
+    needs: [verify-tag, test-deb-install, test-rpm-install, test-deb-upgrade, test-rpm-upgrade]
     runs-on: ubuntu-latest
     permissions:
       contents: write

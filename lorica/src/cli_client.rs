@@ -30,6 +30,20 @@
 //! neither read nor replace it, and without the matching private key it
 //! cannot present it. A caller who cannot read the file is refused
 //! rather than falling back to trusting whatever answers.
+//!
+//! # A node older than 1.9.0
+//!
+//! Such a node never writes that record, and `lorica upgrade` from the
+//! new binary is exactly the command that meets one still running. When
+//! the record is absent, the CLI pins the certificate a node of that
+//! age serves, chosen the way it chose it: the operator's
+//! `management_cert_pem_path` when the stored settings name both it and
+//! the key, the self-signed `management/cert.pem` otherwise. That is
+//! still one certificate compared byte for byte, read from a file the
+//! port squatter can neither read nor replace, never "whatever
+//! answers". If that certificate cannot be read either, the command is
+//! refused as before. A 1.9.0 node writes the record on its first
+//! start, after which this path is never taken for it again.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -46,6 +60,16 @@ use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
 pub(crate) fn fail(message: impl std::fmt::Display) -> ! {
     eprintln!("{message}");
     std::process::exit(1);
+}
+
+/// The management API URL of `path` (`/api/v1/...`) on `port`.
+///
+/// Loopback and nothing else: the pin below is an identity for the
+/// node's own management listener, which binds `127.0.0.1` alone, so
+/// the host is part of the trust decision rather than something each
+/// command spells.
+pub(crate) fn management_url(port: u16, path: &str) -> String {
+    format!("https://127.0.0.1:{port}{path}")
 }
 
 /// A logged-in client for the loopback management API of the node whose
@@ -90,7 +114,7 @@ async fn open_session(
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
 
-    let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
+    let login_url = management_url(port, "/api/v1/auth/login");
     match client
         .post(&login_url)
         .json(&serde_json::json!({ "username": user, "password": password }))
@@ -138,8 +162,32 @@ impl PinnedLeaf {
     /// on; the password is never sent in that case.
     fn load(data_dir: &Path) -> Result<Self, String> {
         let path: PathBuf = lorica_api::management_tls::served_certificate_path(data_dir);
-        let pem: Vec<u8> = std::fs::read(&path).map_err(|e| unreadable_pin(&path, &e))?;
-        Self::from_pem(path, &pem)
+        match std::fs::read(&path) {
+            Ok(pem) => Self::from_pem(path, &pem),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let neither = |why: String| {
+                    format!(
+                        "{} does not exist: lorica writes it when its management listener \
+                         starts. Is lorica running, and does --data-dir name its data \
+                         directory? A node older than 1.9.0 does not write it, and the \
+                         certificate such a node serves cannot be pinned instead: {why}. The \
+                         password was not sent.",
+                        path.display()
+                    )
+                };
+                let legacy: PathBuf = pre_1_9_served_certificate_path(data_dir).map_err(neither)?;
+                let pem: Vec<u8> = std::fs::read(&legacy)
+                    .map_err(|e| neither(format!("cannot read {}: {e}", legacy.display())))?;
+                eprintln!(
+                    "note: {} does not exist, which is what a node older than 1.9.0 looks like; \
+                     pinning {}, the certificate such a node serves.",
+                    path.display(),
+                    legacy.display()
+                );
+                Self::from_pem(legacy, &pem)
+            }
+            Err(e) => Err(unreadable_pin(&path, &e)),
+        }
     }
 
     fn from_pem(path: PathBuf, pem: &[u8]) -> Result<Self, String> {
@@ -177,13 +225,39 @@ fn unreadable_pin(path: &Path, error: &std::io::Error) -> String {
              permission denied. Run this command as root or as the lorica user. The password \
              was not sent."
         ),
-        std::io::ErrorKind::NotFound => format!(
-            "{path} does not exist: lorica writes it when its management listener starts. \
-             Is lorica running, and does --data-dir name its data directory? The password \
-             was not sent."
-        ),
         _ => format!("Cannot read {path}: {error}. The password was not sent."),
     }
+}
+
+/// The certificate a node older than 1.9.0 serves on its management
+/// port, which writes no served-certificate record: the operator's
+/// `management_cert_pem_path` when the stored settings name both it and
+/// the key, `<data_dir>/management/cert.pem` otherwise. That is the
+/// choice such a node made at startup (Story 8.8 AC #1 and #2).
+///
+/// # Errors
+///
+/// Why the choice cannot be made: the settings live in `lorica.db`, and
+/// guessing without them could pin the wrong certificate. The database
+/// is opened the way the other CLI commands open it; 1.9.0 adds no
+/// migration, so opening a 1.8.0 database changes nothing in it.
+fn pre_1_9_served_certificate_path(data_dir: &Path) -> Result<PathBuf, String> {
+    let database: PathBuf = data_dir.join("lorica.db");
+    if !database.is_file() {
+        return Err(format!("{} does not exist", database.display()));
+    }
+    let settings = lorica_config::ConfigStore::open(&database, None)
+        .and_then(|store| store.get_global_settings())
+        .map_err(|e| format!("cannot read the settings in {}: {e}", database.display()))?;
+    Ok(
+        match (
+            settings.management_cert_pem_path,
+            settings.management_key_pem_path,
+        ) {
+            (Some(cert), Some(_)) => PathBuf::from(cert),
+            _ => data_dir.join("management").join("cert.pem"),
+        },
+    )
 }
 
 impl ServerCertVerifier for PinnedLeaf {
@@ -232,7 +306,10 @@ impl ServerCertVerifier for PinnedLeaf {
 /// body.
 pub(crate) async fn management_data(response: reqwest::Response, what: &str) -> serde_json::Value {
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|e| fail(format!("{what} ({status}): reading the answer failed: {e}")));
     if !status.is_success() {
         fail(format!("{what} failed ({status}): {body}"));
     }
@@ -258,18 +335,22 @@ pub(crate) fn read_admin_password(
     file: Option<&Path>,
     from_stdin: bool,
 ) -> Result<String, String> {
-    read_admin_password_with_env(
+    let mut stdin = std::io::stdin();
+    read_admin_password_from(
         literal,
         file,
-        from_stdin,
+        from_stdin.then_some(&mut stdin as &mut dyn Read),
         std::env::var(ADMIN_PASSWORD_ENV).ok(),
     )
 }
 
-fn read_admin_password_with_env(
+/// [`read_admin_password`] over explicit sources: `stdin` is `Some`
+/// when `--password-stdin` was passed, and `from_env` is the variable's
+/// value.
+fn read_admin_password_from(
     literal: Option<String>,
     file: Option<&Path>,
-    from_stdin: bool,
+    stdin: Option<&mut dyn Read>,
     from_env: Option<String>,
 ) -> Result<String, String> {
     let trimmed = |s: String| s.trim_end_matches(['\r', '\n']).to_string();
@@ -278,9 +359,9 @@ fn read_admin_password_with_env(
             .map(trimmed)
             .map_err(|e| format!("cannot read the password file {}: {e}", path.display()));
     }
-    if from_stdin {
+    if let Some(stdin) = stdin {
         let mut buffer = String::new();
-        std::io::stdin()
+        stdin
             .read_to_string(&mut buffer)
             .map_err(|e| format!("cannot read the password from standard input: {e}"))?;
         return Ok(trimmed(buffer));
@@ -459,36 +540,139 @@ mod tests {
 
     #[test]
     fn password_sources_follow_the_documented_precedence() {
-        let file = std::env::temp_dir().join(format!("lorica-pw-{}", std::process::id()));
-        std::fs::write(&file, "from-file\n").expect("write");
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(file.path(), "from-file\n").expect("write");
         let env = Some("from-env\n".to_string());
+        let stdin = || b"from-stdin\n".as_slice();
         // File beats everything.
         assert_eq!(
-            read_admin_password_with_env(Some("literal".into()), Some(&file), false, env.clone())
-                .expect("file"),
+            read_admin_password_from(
+                Some("literal".into()),
+                Some(file.path()),
+                Some(&mut stdin()),
+                env.clone()
+            )
+            .expect("file"),
             "from-file"
+        );
+        // Standard input beats a literal and the variable.
+        assert_eq!(
+            read_admin_password_from(
+                Some("literal".into()),
+                None,
+                Some(&mut stdin()),
+                env.clone()
+            )
+            .expect("stdin"),
+            "from-stdin"
         );
         // An explicit --password beats the ambient variable.
         assert_eq!(
-            read_admin_password_with_env(Some("literal".into()), None, false, env.clone())
+            read_admin_password_from(Some("literal".into()), None, None, env.clone())
                 .expect("literal"),
             "literal"
         );
         // The variable is the fallback, trimmed.
         assert_eq!(
-            read_admin_password_with_env(None, None, false, env).expect("env"),
+            read_admin_password_from(None, None, None, env).expect("env"),
             "from-env"
         );
         // An empty variable is no source.
-        assert!(read_admin_password_with_env(None, None, false, Some(String::new())).is_err());
-        assert!(read_admin_password_with_env(None, None, false, None).is_err());
-        assert!(read_admin_password_with_env(
-            None,
-            Some(Path::new("/nonexistent/pw")),
-            false,
-            None
-        )
-        .is_err());
-        let _ = std::fs::remove_file(&file);
+        assert!(read_admin_password_from(None, None, None, Some(String::new())).is_err());
+        assert!(read_admin_password_from(None, None, None, None).is_err());
+        assert!(
+            read_admin_password_from(None, Some(Path::new("/nonexistent/pw")), None, None).is_err()
+        );
+    }
+
+    /// A data directory holding what a node older than 1.9.0 leaves:
+    /// its settings database and `management/cert.pem`, no record.
+    /// `override_pem` stores an operator certificate and names it in
+    /// the settings.
+    fn pre_1_9_data_dir(cert_pem: &str, override_pem: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let management = dir.path().join("management");
+        std::fs::create_dir_all(&management).expect("mkdir");
+        std::fs::write(management.join("cert.pem"), cert_pem).expect("write");
+        let store =
+            lorica_config::ConfigStore::open(&dir.path().join("lorica.db"), None).expect("store");
+        if let Some(override_pem) = override_pem {
+            let cert = dir.path().join("operator-cert.pem");
+            std::fs::write(&cert, override_pem).expect("write");
+            let mut settings = store.get_global_settings().expect("settings");
+            settings.management_cert_pem_path = Some(cert.display().to_string());
+            settings.management_key_pem_path =
+                Some(dir.path().join("operator-key.pem").display().to_string());
+            store
+                .update_global_settings(&settings)
+                .expect("store settings");
+        }
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_node_older_than_1_9_is_pinned_on_the_self_signed_certificate_it_serves() {
+        // `lorica upgrade` from the new binary meets a node that never
+        // wrote the record. Its own certificate is accepted...
+        let node = leaf();
+        let dir = pre_1_9_data_dir(&node.0, None);
+        assert!(!lorica_api::management_tls::served_certificate_path(dir.path()).exists());
+        let (port, server) = one_connection_server(node).await;
+        let pin = Arc::new(PinnedLeaf::load(dir.path()).expect("pin"));
+        assert_eq!(pin.path, dir.path().join("management").join("cert.pem"));
+        open_session(pin, port, "admin", PASSWORD)
+            .await
+            .expect("the certificate a 1.8.0 node serves is accepted");
+        assert!(String::from_utf8(server.await.expect("server task"))
+            .expect("utf-8")
+            .contains(PASSWORD));
+
+        // ...and a squatter's is not: the fallback is still one pin.
+        let (port, server) = one_connection_server(leaf()).await;
+        let pin = Arc::new(PinnedLeaf::load(dir.path()).expect("pin"));
+        let refused = open_session(pin, port, "admin", PASSWORD)
+            .await
+            .expect_err("a foreign certificate must be refused");
+        assert!(refused.contains("password was not sent"), "{refused}");
+        assert!(server.await.expect("server task").is_empty());
+    }
+
+    #[test]
+    fn a_node_older_than_1_9_with_an_operator_certificate_is_pinned_on_that_one() {
+        let (self_signed, _) = leaf();
+        let (operator, _) = leaf();
+        let dir = pre_1_9_data_dir(&self_signed, Some(&operator));
+        let pin = PinnedLeaf::load(dir.path()).expect("pin");
+        assert_eq!(pin.path, dir.path().join("operator-cert.pem"));
+        let expected = CertificateDer::from_pem_slice(operator.as_bytes()).expect("cert");
+        assert_eq!(pin.leaf.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn with_no_record_and_no_certificate_a_pre_1_9_node_serves_the_command_is_refused() {
+        // A settings database but no certificate beside it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        lorica_config::ConfigStore::open(&dir.path().join("lorica.db"), None).expect("store");
+        let refused = PinnedLeaf::load(dir.path()).expect_err("nothing to pin");
+        assert!(refused.contains("does not exist"), "{refused}");
+        assert!(refused.contains("cert.pem"), "{refused}");
+        assert!(refused.contains("password was not sent"), "{refused}");
+
+        // An operator certificate the settings name but nobody wrote is
+        // refused rather than replaced by the self-signed one: the node
+        // serves the operator's.
+        let (self_signed, _) = leaf();
+        let dir = pre_1_9_data_dir(&self_signed, Some("placeholder"));
+        std::fs::remove_file(dir.path().join("operator-cert.pem")).expect("remove");
+        let refused = PinnedLeaf::load(dir.path()).expect_err("the operator's is absent");
+        assert!(refused.contains("operator-cert.pem"), "{refused}");
+    }
+
+    #[test]
+    fn every_command_speaks_to_the_loopback_listener() {
+        assert_eq!(
+            management_url(9443, "/api/v1/auth/login"),
+            "https://127.0.0.1:9443/api/v1/auth/login"
+        );
     }
 }

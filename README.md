@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/version-1.8.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-2980-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-2998-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-748-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -712,21 +712,22 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (2980 tests, Lorica-native)
+# Product crates only (2998 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
-           -p lorica-command -p lorica-limits -p lorica-shmem \
+           -p lorica-command -p lorica-shmem \
            -p lorica-challenge -p lorica-geoip -p lorica-acme \
            -p lorica-metrics -p lorica-cluster -p lorica-dashboard \
            -p lorica-mcp \
            --features otel
 
-# Pingora-forked crates (748 tests)
+# Pingora-forked crates (766 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-error -p lorica-tls -p lorica-cache \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
            -p lorica-lb -p lorica-ketama -p lorica-lru \
-           -p lorica-memory-cache -p lorica-header-serde -p TinyUFO
+           -p lorica-memory-cache -p lorica-header-serde -p lorica-limits \
+           -p TinyUFO
 
 # The cluster crate's integration binaries, including the frozen v1.7.0
 # wire corpus (every message's encoding, pinned)

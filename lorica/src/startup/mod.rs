@@ -223,6 +223,15 @@ pub(crate) async fn run_api_server(
         );
     }
 
+    // `start_server` returns only when the listener could not start:
+    // TLS material refused, the served certificate unrecorded, or the
+    // port taken. The process exits rather than serving traffic with no
+    // management plane. A node that kept running would not be restarted
+    // by systemd, and a local process holding the port would keep it,
+    // collecting the password of every dashboard login meant for this
+    // node. Supervisor mode already exits when it cannot bind the port
+    // itself; this covers single-process mode and the failures past the
+    // bind in both.
     if let Err(e) = lorica_api::server::start_server(
         management_port,
         state,
@@ -232,7 +241,12 @@ pub(crate) async fn run_api_server(
     )
     .await
     {
-        error!(error = %e, "API server exited with error");
+        error!(
+            error = %e,
+            port = management_port,
+            "management API failed to start; exiting"
+        );
+        std::process::exit(1);
     }
 }
 

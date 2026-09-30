@@ -1110,7 +1110,7 @@ pub(crate) fn run_unban(data_dir: &str, port: u16, ip: String, user: String, pas
                 .await;
 
         // Unban
-        let unban_url = format!("https://127.0.0.1:{port}/api/v1/bans/{ip}");
+        let unban_url = crate::cli_client::management_url(port, &format!("/api/v1/bans/{ip}"));
         match client.delete(&unban_url).send().await {
             Ok(r) if r.status().is_success() => {
                 println!("IP {ip} unbanned successfully.");
@@ -1193,7 +1193,7 @@ pub(crate) fn run_upgrade(
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
         println!("Uploading {} ({} bytes) for hot upgrade...", binary, binary_bytes.len());
-        let upgrade_url = format!("https://127.0.0.1:{port}/api/v1/system/upgrade");
+        let upgrade_url = crate::cli_client::management_url(port, "/api/v1/system/upgrade");
         match client
             .post(&upgrade_url)
             .header(

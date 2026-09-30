@@ -247,17 +247,9 @@ impl fmt::Display for Tier {
 }
 
 /// A `--tier` value that names no tier.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a tier is one of {}", Tier::ALL.map(Tier::as_str).join(", "))]
 pub struct UnknownTier;
-
-impl fmt::Display for UnknownTier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let names: Vec<&str> = Tier::ALL.into_iter().map(Tier::as_str).collect();
-        write!(f, "a tier is one of {}", names.join(", "))
-    }
-}
-
-impl std::error::Error for UnknownTier {}
 
 impl FromStr for Tier {
     type Err = UnknownTier;
@@ -275,7 +267,10 @@ impl FromStr for Tier {
 /// Carries scope spellings and tier names only. Naming the scopes
 /// discloses nothing: the holder of the token reads the same list from
 /// `whoami`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The `Display` is written by hand below rather than declared in an
+/// attribute: which sentence it is depends on the scopes it carries.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub struct TierError {
     /// The tier the token's highest-reaching scopes would make it, or
     /// `None` when it carries no scope any tier requires.
@@ -357,8 +352,6 @@ impl fmt::Display for TierError {
         }
     }
 }
-
-impl std::error::Error for TierError {}
 
 /// The `--tier` alternatives, as a usage line spells them.
 fn tier_names() -> String {
@@ -629,8 +622,8 @@ mod tests {
     fn every_tool_carries_the_tier_of_the_array_it_comes_from_and_a_scope_that_tier_requires() {
         // For a mutation, `catalogue()` sets the tier FROM the array it
         // walks, so the array check below cannot fail for the config and
-        // admin tools; it pins the nine `READS` literals, which carry
-        // their tier by hand. The scope and kind checks are real for
+        // admin tools; it pins the `READS` literals, which carry their
+        // tier by hand. The scope and kind checks are real for
         // every tool.
         let reads: BTreeSet<&str> = READS.iter().map(|spec| spec.name).collect();
         let config: BTreeSet<&str> = MUTATIONS
@@ -764,6 +757,30 @@ mod tests {
                 );
                 // No scope held, nothing registered.
                 assert!(!tier.registers(spec, &[] as &[&str]));
+            }
+        }
+    }
+
+    #[test]
+    fn a_tier_never_registers_a_tool_it_does_not_serve_even_behind_a_held_scope() {
+        // The `serves` half of the registry rule, observed: every held
+        // set above comes from the tier itself, and for those holding
+        // the scope already implies serving the tool. Here the token
+        // holds exactly the tool's own scope and the tier still says
+        // no, which is what deleting the `serves` check would change.
+        for tier in Tier::ALL {
+            let foreign: Vec<&ToolSpec> = catalogue()
+                .iter()
+                .filter(|spec| !tier.serves(spec))
+                .collect();
+            assert!(!foreign.is_empty(), "the {tier} serves every tool");
+            for spec in foreign {
+                assert!(
+                    !tier.registers(spec, &[spec.scope]),
+                    "the {tier} registers {} behind {}",
+                    spec.name,
+                    spec.scope
+                );
             }
         }
     }

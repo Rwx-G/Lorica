@@ -2141,3 +2141,42 @@ mod oidc {
         );
     }
 }
+
+mod audit_context_bounds {
+    use super::super::audit_context;
+    use crate::audit::ClientConnectInfo;
+    use crate::automation::AutomationPrincipal;
+    use axum::http::{header, HeaderMap, HeaderValue};
+    use lorica_config::models::{AutomationScope, OwnerKind};
+
+    #[test]
+    fn a_management_side_row_keeps_no_more_of_the_user_agent_than_the_request_row() {
+        // The header is the caller's own text. The request row cut it;
+        // every `route.*`, `backend.*` and `settings.update` row an
+        // automation write records kept it whole.
+        let principal = AutomationPrincipal {
+            kind: OwnerKind::StaticToken,
+            principal: "config-tier".to_string(),
+            grant_id: "0123456789abcdef01234567".to_string(),
+            scopes: vec![AutomationScope::RoutesWrite],
+            allowed_hostnames: vec!["*.review.example.com".to_string()],
+            allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
+            max_ttl_seconds: 3_600,
+            pipeline: None,
+            required_environment_slug: None,
+        };
+        let mut headers = HeaderMap::new();
+        let flood = "a".repeat(64 * 1024);
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_bytes(flood.as_bytes()).expect("a header value"),
+        );
+        let ctx = audit_context(&principal, &ClientConnectInfo(None), &headers);
+        assert!(
+            ctx.user_agent.len() <= crate::automation::audit::USER_AGENT_MAX_BYTES,
+            "{} bytes",
+            ctx.user_agent.len()
+        );
+        assert!(!ctx.user_agent.is_empty());
+    }
+}

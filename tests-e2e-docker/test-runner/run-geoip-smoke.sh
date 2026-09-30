@@ -159,7 +159,7 @@ get_geoip_counter() {
         | awk '{print $NF}' \
         | head -1)
     # Counter lines only appear after the first inc, so absence means
-    # "0" — default explicitly rather than letting empty flow into the
+    # "0" - default explicitly rather than letting empty flow into the
     # `-gt` arithmetic comparison below (bash errors on empty operand).
     if [ -z "$val" ]; then
         echo "0"

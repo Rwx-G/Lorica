@@ -530,14 +530,17 @@ pub async fn update_settings(
     Json(body): Json<UpdateSettingsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    let change = update_settings_as(
-        &state,
-        &audit_ctx,
-        body,
-        crate::preview::WriteMode::Apply,
-        SettingsAuditTarget::ChangedKeys,
-        |_, _| Ok(()),
-    )
+    let change = crate::db::run_detached(async move {
+        update_settings_as(
+            &state,
+            &audit_ctx,
+            body,
+            crate::preview::WriteMode::Apply,
+            SettingsAuditTarget::ChangedKeys,
+            |_, _| Ok(()),
+        )
+        .await
+    })
     .await?;
     let mut settings = change.after;
     mask_settings_secrets(&mut settings);

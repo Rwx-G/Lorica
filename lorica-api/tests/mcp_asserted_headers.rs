@@ -23,14 +23,13 @@
 //! the request still succeeds, every gate still passes, and the trail
 //! quietly stops saying which tool a model asked for.
 //!
-//! It used to be pinned by `include_str!` on the emitting source, with
-//! the literals hand-extracted, because neither crate could see the
-//! other. Lot 4 makes `lorica-api` depend on `lorica-mcp` in order to
-//! mount the Streamable HTTP binding in process, so the constants can
-//! now be compared as constants. A comparison that cannot misparse is
-//! worth more than one that reads a file and might.
+//! The header names themselves cannot drift: `lorica-api` depends on
+//! `lorica-mcp` and re-exports its two constants rather than spelling
+//! them again, so they are one definition. What this file pins is what
+//! a shared constant cannot: that the marker the stdio client sends is
+//! a value the plane will record, and that the Streamable HTTP binding
+//! asserts nothing.
 
-use lorica_api::automation::audit::{ASSERTED_TOOL_HEADER, ASSERTED_TRANSPORT_HEADER};
 use lorica_mcp::http::{
     ASSERTED_TOOL_HEADER as EMITTED_TOOL_HEADER,
     ASSERTED_TRANSPORT_HEADER as EMITTED_TRANSPORT_HEADER, TRANSPORT_MARKER,
@@ -46,22 +45,6 @@ use lorica_mcp::http::{
 /// character class itself is not restated: both crates read it from
 /// `lorica_mcp::tools::fits_tool_name_grammar`.
 const ASSERTED_TRANSPORT_MAX_BYTES: usize = 32;
-
-#[test]
-fn the_header_names_the_mcp_server_writes_are_the_ones_this_plane_reads() {
-    assert_eq!(
-        EMITTED_TOOL_HEADER, ASSERTED_TOOL_HEADER,
-        "the tool assertion header drifted: lorica-mcp writes `{EMITTED_TOOL_HEADER}` and \
-         lorica-api reads `{ASSERTED_TOOL_HEADER}`. A rename on either side makes the \
-         automation plane record no assertion at all, and the audit row quietly stops \
-         saying which tool a model asked for."
-    );
-    assert_eq!(
-        EMITTED_TRANSPORT_HEADER, ASSERTED_TRANSPORT_HEADER,
-        "the transport assertion header drifted: lorica-mcp writes \
-         `{EMITTED_TRANSPORT_HEADER}` and lorica-api reads `{ASSERTED_TRANSPORT_HEADER}`."
-    );
-}
 
 #[test]
 fn the_transport_marker_the_mcp_server_asserts_fits_what_this_plane_will_record() {
@@ -118,12 +101,4 @@ fn the_streamable_http_binding_asserts_nothing_and_needs_no_marker_of_its_own() 
     // layer keys the established row on.
     assert!(body.contains("impl AutomationPlane for InProcessPlane"));
     assert!(body.contains("pub struct McpCallRecord"));
-
-    // The row-level half of the same property, which needs no source:
-    // the path is what tells an MCP row from a read row.
-    assert_ne!(
-        lorica_api::automation::MCP_PATH,
-        "/automation/v1/logs",
-        "the MCP endpoint and a read path must be distinguishable in a row"
-    );
 }

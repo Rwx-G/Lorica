@@ -27,6 +27,23 @@ If remote access to the dashboard is needed, use an SSH tunnel:
 ssh -L 9443:localhost:9443 user@lorica-host
 ```
 
+**Check the certificate before accepting a browser warning.** The management
+port is unprivileged, so a local user who binds it while Lorica is stopped or
+restarting presents their own self-signed certificate, and it raises the same
+warning in a browser as the node's own. The CLI pins the certificate the
+listener recorded as served and sends nothing to anything else; a browser has
+no such pin, and a password typed into the impostor's login form is theirs.
+Before accepting the warning, compare the SHA-256 fingerprint the browser
+shows with the one the node recorded:
+
+```bash
+sudo openssl x509 -in /var/lib/lorica/management/served-cert.pem -noout -fingerprint -sha256
+```
+
+A different fingerprint, or a warning appearing on a machine that already
+accepted the node's certificate, means something else answered the port:
+close the tab and find the process holding it (`sudo ss -ltnp 'sport = :9443'`).
+
 ### Proxy Ports
 
 - **HTTP (8080)**: Use for redirect-to-HTTPS only, or for internal-only traffic
@@ -90,9 +107,12 @@ automation plane, and exists only where that plane does. Its three tiers are
 three token shapes: the **read tier** reads logs, WAF events, SLA, cluster
 status and the configuration; the **config tier** changes routes, backends and
 certificate bindings inside a hostname and backend grant; the **admin tier**
-changes the operational settings on the plane's allowlist. The node refuses a
-token whose scopes span two tiers, on both transports. What it cannot refuse
-is how tokens are wired to models, and that is what this section is about:
+changes the operational settings on the plane's allowlist. A token whose
+scopes span two tiers is refused: by the node over Streamable HTTP, and by the
+`lorica-mcp` process the client launched over stdio, since the automation
+plane itself knows scopes, not tiers (a stolen two-tier token calls every path
+it holds on the plane directly). What neither can refuse is how tokens are
+wired to models, and that is what this section is about:
 the text the read tier returns was largely written by whoever is attacking
 the node, and a model that reads it and holds a mutating tool can be steered
 into using it (`docs/security/threat-model.md`, T9).
@@ -160,7 +180,12 @@ one carrying `settings:write`, which the node refuses past its ceiling.
 **Grants as narrow as the change.** A config-tier token's `--hostname` and
 `--backend-cidr` are the real boundary on what a steered model can write:
 name the hostnames and the address range the change touches, not the parent
-zone and not the whole private range. The grants also bound what a config-tier
+zone and not the whole private range. Inside the grant, the node lets a token
+strengthen a route's access control and an upstream's TLS but never weaken
+either (the rule and its fields are in `docs/mcp.md`, "Protections move one
+way"); it does not stop a token deleting a route inside the grant and creating
+it again without its protections, so a hostname whose protections must never
+be removed by a model belongs in no config-tier grant. The grants also bound what a config-tier
 session reads: its route, backend and certificate listings answer only the
 rows inside them, so text another principal wrote elsewhere never reaches the
 model. The read and admin tiers carry no grant at all, and the mint refuses

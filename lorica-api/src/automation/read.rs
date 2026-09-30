@@ -136,9 +136,10 @@ pub const AUTOMATION_READ_MAX_ANSWER_BYTES: usize = 256 * 1024;
 
 /// The most bytes a caller may put in one free-text filter.
 ///
-/// `?search=` becomes five unanchored `LIKE` predicates and a
-/// `COUNT(*)` over the whole retained access log, so its length is a
-/// per-request cost the caller chooses. The management plane takes it
+/// `?search=` becomes five unanchored `LIKE` predicates over the
+/// retained access log (this plane skips the match count the dashboard
+/// pays for, but not the scan), so its length is a per-request cost the
+/// caller chooses. The management plane takes it
 /// from a dashboard field behind a session; this one takes it off-box
 /// behind a token the router gives no per-request budget. Long enough
 /// for a request id, a hostname or a user-agent fragment.
@@ -240,11 +241,24 @@ impl Page {
 
     /// Wrap `rows` in the paginated envelope this surface answers with.
     fn of(self, rows: Vec<Value>) -> Json<Value> {
-        let beyond_the_window = rows.len() > self.offset.saturating_add(self.limit);
+        self.of_window(
+            rows.into_iter()
+                .skip(self.offset)
+                .take(self.limit.saturating_add(1))
+                .collect(),
+        )
+    }
+
+    /// [`Page::of`] for a source that already skipped `offset`: `window`
+    /// holds the rows from `offset` on, one past the window when there
+    /// is one, and is built by a source that computes nothing before
+    /// the window.
+    fn of_window(self, window: Vec<Value>) -> Json<Value> {
+        let beyond_the_window = window.len() > self.limit;
         let mut budget = AUTOMATION_READ_MAX_ANSWER_BYTES;
         let mut short_of_the_window = false;
         let mut items: Vec<Value> = Vec::new();
-        for row in rows.into_iter().skip(self.offset).take(self.limit) {
+        for row in window.into_iter().take(self.limit) {
             let cost = serde_json::to_string(&row).map_or(0, |text| text.len());
             // The first row crosses whatever it weighs. An answer with
             // nothing in it is the one shape a reader takes for "there
@@ -390,8 +404,14 @@ pub async fn list_logs(
         limit: Some(page.scan()),
         ..filters
     };
-    let answer = crate::logs::get_logs(Extension(state), Query(filters)).await?;
-    let mut rows = rows(answer, Some("entries"))?;
+    // The rows alone: this surface answers no total, so the match count
+    // the dashboard's answer carries is never computed.
+    let mut rows = crate::logs::log_rows(&state, filters)
+        .await?
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Internal(format!("automation read: a log row: {e}")))?;
     // Both log sources fetch the NEWEST `scan` rows and hand them back
     // oldest first: the store runs `ORDER BY id DESC LIMIT ?` and then
     // reverses, the in-memory fallback returns the tail of a
@@ -456,7 +476,10 @@ pub async fn waf_stats(Extension(state): Extension<AppState>) -> Result<Json<Val
 /// what it produced: each summary is two synchronous SQL passes under
 /// the process-wide config-store mutex, so computing every route's
 /// figures to answer `?limit=1` held that lock against every
-/// configuration write for no one's benefit.
+/// configuration write for no one's benefit. The routes before the
+/// window are skipped rather than computed, so `offset` costs nothing
+/// either, however deep: an offset past the end answers an empty page
+/// having computed no summary.
 ///
 /// # Errors
 ///
@@ -466,8 +489,12 @@ pub async fn sla_overview(
     Query(page): Query<PageQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let page = page.page();
-    let summaries = crate::sla::local_sla_overview(&state, Some(page.scan())).await?;
-    Ok(page.of(rows(json_data(summaries), None)?))
+    let window = crate::sla::SlaWindow {
+        skip: page.offset,
+        take: page.limit.saturating_add(1),
+    };
+    let summaries = crate::sla::local_sla_overview(&state, Some(window)).await?;
+    Ok(page.of_window(rows(json_data(summaries), None)?))
 }
 
 /// `GET /automation/v1/sla/routes/{id}` (scope `sla:read`).
@@ -543,9 +570,14 @@ pub async fn list_backends(
 /// grants sees the routes whose hostname and every alias are inside its
 /// `allowed_hostnames`, and no other.
 ///
+/// The grant and the window are applied to the stored rows, and only
+/// the window's views are built, masked and serialised: the listing is
+/// two queries under the config lock whatever the route count, and a
+/// page costs its own rows rather than every route's.
+///
 /// # Errors
 ///
-/// Whatever [`crate::routes::list_routes`] answers.
+/// Whatever [`crate::routes::crud::routes_with_links`] answers.
 pub async fn list_routes(
     principal: AutomationPrincipal,
     Extension(state): Extension<AppState>,
@@ -553,15 +585,26 @@ pub async fn list_routes(
     Query(filters): Query<crate::routes::ListRoutesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let page = page.page();
-    let answer = crate::routes::list_routes(Extension(state), Query(filters)).await?;
-    let rows = within_the_grant(&principal, rows(answer, Some("routes"))?, |row| {
-        route_names_granted(
-            &principal,
-            text(row, "hostname"),
-            texts(row, "hostname_aliases"),
-        )
-    });
-    Ok(page.of(masked(rows, redact::route_row)))
+    let bounded = principal.carries_grants();
+    let window = crate::routes::crud::routes_with_links(&state, filters)
+        .await?
+        .into_iter()
+        .filter(|(route, _)| {
+            !bounded
+                || route_names_granted(
+                    &principal,
+                    &route.hostname,
+                    route.hostname_aliases.iter().map(String::as_str),
+                )
+        })
+        .skip(page.offset)
+        .take(page.limit.saturating_add(1))
+        .map(|(route, backend_ids)| {
+            serde_json::to_value(crate::routes::crud::route_to_response(&route, backend_ids))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Internal(format!("automation read: a route view: {e}")))?;
+    Ok(page.of_window(masked(window, redact::route_row)))
 }
 
 /// `GET /automation/v1/certificates` (scope `certificates:read`).
@@ -594,6 +637,14 @@ pub async fn list_certificates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_free_text_argument_the_tools_accept_is_one_the_plane_reads() {
+        // `lorica-mcp` bounds its free-text arguments to spare a round
+        // trip; a bound looser than this surface's would be a value the
+        // tool passes and the plane answers 400.
+        const { assert!(lorica_mcp::tools::FREE_TEXT_MAX_BYTES <= AUTOMATION_READ_MAX_FILTER_BYTES) };
+    }
 
     fn numbered(count: usize) -> Vec<Value> {
         (0..count).map(|n| serde_json::json!({ "n": n })).collect()

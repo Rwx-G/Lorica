@@ -52,17 +52,19 @@ if [ ! -d /var/lib/lorica/exported-certs ]; then
 fi
 chown lorica:lorica /var/lib/lorica/exported-certs
 chmod 750 /var/lib/lorica/exported-certs
-systemctl daemon-reload
-systemctl enable lorica.service
-systemctl restart lorica.service 2>/dev/null || systemctl start lorica.service
 echo ""
 echo "  ================================================"
 echo "  Lorica installed successfully!"
 echo "  "
 echo "  Dashboard: https://127.0.0.1:9443"
-echo "    (TLS with a self-signed cert - accept the browser"
-echo "     warning; listens on localhost only, not reachable"
-echo "     from other machines)"
+echo "    (TLS with a self-signed certificate; listens on"
+echo "     localhost only, not reachable from other machines."
+echo "     Before you log in, check that the fingerprint your"
+echo "     browser shows is the one the node serves:"
+echo "       sudo openssl x509 -noout -fingerprint -sha256 \\"
+echo "         -in /var/lib/lorica/management/served-cert.pem"
+echo "     Another local process can hold the port while"
+echo "     lorica is stopped, and it would receive the password.)"
 echo "  "
 echo "  The initial admin password is written to a 0600 file:"
 echo "    sudo cat /var/lib/lorica/initial-admin-password"
@@ -93,12 +95,39 @@ echo "    --log-level LEVEL    trace|debug|info|warn|error"
 echo "  ================================================"
 echo ""
 
+# On an upgrade, rpm runs the new package's post scriptlet, then the OLD
+# package's preun and postun, then the new package's posttrans. So the
+# service is started in posttrans, the one scriptlet that runs after the
+# old package is gone, and preun stops and disables it only when the
+# package is erased ($1 is the number of versions left installed: 0 on
+# erase, 1 on upgrade). The preun of 1.8.0 and earlier still stops and
+# disables it on the way to this version; posttrans brings it back.
 %preun
-systemctl stop lorica.service 2>/dev/null || true
-systemctl disable lorica.service 2>/dev/null || true
+if [ "$1" -eq 0 ]; then
+    systemctl stop lorica.service 2>/dev/null || true
+    systemctl disable lorica.service 2>/dev/null || true
+fi
 
 %postun
-systemctl daemon-reload
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+fi
+
+# /run/systemd/system exists only while systemd runs. Without it (an image
+# build, a container) the unit is enabled for the first boot and nothing
+# is started. A failed start is reported without failing the transaction,
+# which could not be rolled back from here anyway.
+%posttrans
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable lorica.service
+fi
+if [ -d /run/systemd/system ]; then
+    systemctl restart lorica.service \
+        || echo "lorica: the service did not start; see journalctl -u lorica.service" >&2
+fi
 
 %files
 %license /usr/share/licenses/lorica/LICENSE

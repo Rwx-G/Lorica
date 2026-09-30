@@ -257,7 +257,17 @@ pub async fn create_backend(
     Json(body): Json<CreateBackendRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    create_backend_as(&state, &audit_ctx, body, crate::preview::WriteMode::Apply).await
+    crate::db::run_detached(async move {
+        create_backend_as(
+            &state,
+            &audit_ctx,
+            body,
+            crate::preview::WriteMode::Apply,
+            crate::target::BackendGuard::unbounded(),
+        )
+        .await
+    })
+    .await
 }
 
 /// The whole of [`create_backend`] as `actor`: the validation, the
@@ -267,14 +277,14 @@ pub async fn create_backend(
 /// exactly this with a token as the actor rather than a session; see
 /// `crate::routes::crud::create_route_as` for the rule, and for what
 /// [`crate::preview::WriteMode::Preview`] answers instead of the row.
-/// No target guard: a create names no existing row, and the one thing
-/// it points at, the address, is held to the grant by the automation
-/// handler before this body runs.
+/// `guard` sees the row about to be inserted with no row before it, in
+/// the store closure that inserts it, the preview included.
 pub(crate) async fn create_backend_as(
     state: &AppState,
     actor: &crate::audit::AuditContext,
     body: CreateBackendRequest,
     mode: crate::preview::WriteMode,
+    guard: crate::target::BackendGuard,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     if body.address.is_empty() {
@@ -312,6 +322,20 @@ pub(crate) async fn create_backend_as(
         updated_at: now,
     };
 
+    let backend = db_blocking(&state.store, move |store| {
+        guard.check(
+            store,
+            crate::target::BackendTarget {
+                before: None,
+                after: Some(&backend),
+            },
+        )?;
+        if !mode.previews() {
+            store.create_backend(&backend)?;
+        }
+        Ok::<_, ApiError>(backend)
+    })
+    .await?;
     if mode.previews() {
         return Ok((
             StatusCode::OK,
@@ -322,11 +346,6 @@ pub(crate) async fn create_backend_as(
             ),
         ));
     }
-    let backend = db_blocking(&state.store, move |store| {
-        store.create_backend(&backend)?;
-        Ok::<_, ApiError>(backend)
-    })
-    .await?;
     state.notify_config_changed();
 
     let response = backend_to_response(&backend, 0.0, 0);
@@ -370,14 +389,17 @@ pub async fn update_backend(
     Json(body): Json<UpdateBackendRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    update_backend_as(
-        &state,
-        &audit_ctx,
-        id,
-        body,
-        crate::preview::WriteMode::Apply,
-        crate::target::BackendGuard::unbounded(),
-    )
+    crate::db::run_detached(async move {
+        update_backend_as(
+            &state,
+            &audit_ctx,
+            id,
+            body,
+            crate::preview::WriteMode::Apply,
+            crate::target::BackendGuard::unbounded(),
+        )
+        .await
+    })
     .await
 }
 
@@ -401,7 +423,13 @@ pub(crate) async fn update_backend_as(
         let mut backend = store
             .get_backend(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
-        guard.check(store, &backend)?;
+        guard.check(
+            store,
+            crate::target::BackendTarget {
+                before: Some(&backend),
+                after: None,
+            },
+        )?;
         if let Some(managed_by) = &backend.managed_by {
             return Err(managed_row_conflict(
                 "update",
@@ -453,7 +481,13 @@ pub(crate) async fn update_backend_as(
             backend.h2_upstream = h2;
         }
         backend.updated_at = Utc::now();
-        guard.check(store, &backend)?;
+        guard.check(
+            store,
+            crate::target::BackendTarget {
+                before: Some(&before_backend),
+                after: Some(&backend),
+            },
+        )?;
 
         if mode.previews() {
             return Ok::<_, ApiError>((before_backend, backend));
@@ -502,13 +536,16 @@ pub async fn delete_backend(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    delete_backend_as(
-        &state,
-        &audit_ctx,
-        id,
-        crate::preview::WriteMode::Apply,
-        crate::target::BackendGuard::unbounded(),
-    )
+    crate::db::run_detached(async move {
+        delete_backend_as(
+            &state,
+            &audit_ctx,
+            id,
+            crate::preview::WriteMode::Apply,
+            crate::target::BackendGuard::unbounded(),
+        )
+        .await
+    })
     .await
 }
 
@@ -533,7 +570,13 @@ pub(crate) async fn delete_backend_as(
         let mut backend = store
             .get_backend(&id_db)?
             .ok_or_else(|| ApiError::NotFound(format!("backend {id_db}")))?;
-        guard.check(store, &backend)?;
+        guard.check(
+            store,
+            crate::target::BackendTarget {
+                before: Some(&backend),
+                after: None,
+            },
+        )?;
         // Removing one backend from an environment's set is an edit of
         // that set, which only the pipeline owns. Whole-environment
         // removal goes through the route (its delete cascades) or the

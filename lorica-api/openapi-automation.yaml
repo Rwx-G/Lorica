@@ -756,7 +756,9 @@ paths:
         The address must be an `ip:port` (422): a name cannot be
         checked against `allowed_backend_cidrs`, and every address must
         be inside that grant (403). `managed_by` is refused (422) as it
-        is on the management path.
+        is on the management path. `tls_skip_verify: true` is refused
+        from a token (403): an upstream a token creates verifies its
+        certificate whenever TLS is on.
 
 
         With `?dry_run=true`, the backend it would have created, and
@@ -838,7 +840,10 @@ paths:
         `backend.update` audit row naming the token. A backend an
         environment owns answers 409 naming the environment, exactly as
         there. An `address` in the patch is checked against
-        `allowed_backend_cidrs` as on create.
+        `allowed_backend_cidrs` as on create. Upstream TLS moves one way
+        from a token (403 otherwise): `tls_upstream` on, never off;
+        `tls_skip_verify` off, never on; `tls_sni` unchanged while the
+        upstream certificate is verified.
 
 
         With `?dry_run=true`, the backend before and after the patch,
@@ -938,13 +943,15 @@ paths:
         `allowed_hostnames` (403); a wildcard alias is refused outright,
         because the grant is checked one exact host at a time.
         `managed_by` is refused (422) as it is on the management path.
-        `forward_auth`, `mirror`, `mtls` and `proxy_headers` are refused
-        from a token whatever their value (403): a URL the CIDR grant
-        cannot weigh, a copy of every request to a second set of
-        backends, the route's client-authentication trust anchor, and a
-        static header map to the upstream where a credential would go.
-        `certificate_id` needs `certificates:write` beside
-        `routes:write` (403).
+        `basic_auth_password`, `forward_auth`, `mirror`, `mtls` and
+        `proxy_headers` are refused from a token whatever their value
+        (403): a credential, a URL the CIDR grant cannot weigh, a copy of
+        every request to a second set of backends, the route's
+        client-authentication trust anchor, and a static header map to
+        the upstream where a credential would go. `certificate_id` needs
+        `certificates:write` beside `routes:write`, and a certificate
+        whose `domain` and every SAN are inside `allowed_hostnames`
+        (403).
 
 
         With `?dry_run=true`, which needs `routes:read` (403), the route
@@ -1043,10 +1050,19 @@ paths:
         environment owns answers 409 naming the environment, exactly as
         there. The route named, on its current hostname and aliases, and
         a hostname or an alias in the patch must be inside the token's
-        `allowed_hostnames` (403). `forward_auth`, `mirror`, `mtls` and
-        `proxy_headers` are refused from a token whatever their value
-        (403), and `certificate_id` needs `certificates:write` beside
-        `routes:write` (403).
+        `allowed_hostnames` (403). `basic_auth_password`,
+        `forward_auth`, `mirror`, `mtls` and `proxy_headers` are refused
+        from a token whatever their value (403), and `certificate_id`
+        needs `certificates:write` beside `routes:write`, and a
+        certificate whose `domain` and every SAN are inside
+        `allowed_hostnames` (403). The route's access controls move one
+        way from a token (403 otherwise): the Basic-auth credential in
+        force is neither cleared nor changed, `ip_allowlist` is added or
+        narrowed, `ip_denylist` extended, `geoip` added or tightened in
+        its mode, `bot_protection` never changed once set, the WAF
+        switched on and moved to blocking, and `rate_limit`,
+        `rate_limit_rps`, `rate_limit_burst` and `auto_ban_threshold`
+        added or lowered; `docs/mcp.md` has the rule for each.
 
 
         With `?dry_run=true`, which needs `routes:read` (403), the route
@@ -1138,7 +1154,8 @@ paths:
         naming the token and the same 409 for a route an environment
         owns. Selecting a certificate is naming its id here; the
         listing at `GET /automation/v1/certificates` is where an id
-        comes from.
+        comes from. The certificate's `domain` and every SAN must be
+        inside `allowed_hostnames` (403).
 
 
         The empty string unbinds, and clears `force_https` with it, as
@@ -1837,14 +1854,14 @@ components:
           type: integer
           format: int64
           minimum: 1
-          maximum: 100000000
-          description: Raise-only. 0 (unlimited) is refused.
+          maximum: 1000000
+          description: Raise-only. 0 (unlimited) is refused, and so is anything above ten times the shipped default.
         waf_event_retention:
           type: integer
           format: int64
           minimum: 1
-          maximum: 100000000
-          description: Raise-only. 0 (unlimited) is refused.
+          maximum: 1000000
+          description: Raise-only. 0 (unlimited) is refused, and so is anything above ten times the shipped default.
         sla_purge_retention_days:
           type: integer
           minimum: 1

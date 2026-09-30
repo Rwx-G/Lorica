@@ -1222,8 +1222,15 @@ const NOT_OFFERED_TO_A_MODEL: &[(&str, &str)] = &[
     ),
     (
         "basic_auth_password",
-        "a credential a model would be choosing or relaying, crossing the model's host in \
-         the clear; the route's Basic auth is set in the dashboard by a human",
+        "refused by the plane from an automation token (403): a credential a model would be \
+         choosing or relaying, crossing the model's host in the clear, and clearing it \
+         switches Basic auth off; set in the dashboard by a human",
+    ),
+    (
+        "basic_auth_username",
+        "the Basic-auth credential in force may not change from an automation token (403), \
+         and a username alone, without the password a token never sends, protects nothing; \
+         set in the dashboard by a human",
     ),
     (
         "forward_auth",
@@ -1248,6 +1255,108 @@ const NOT_OFFERED_TO_A_MODEL: &[(&str, &str)] = &[
          upstream is where a credential would go; set in the dashboard by a human",
     ),
 ];
+
+#[test]
+fn every_withheld_route_field_is_one_the_tools_do_not_offer() {
+    // The plane's refusal list and the tools' absence list are two
+    // statements of one decision: a field the plane refuses from every
+    // token and a tool still offered would be an argument that always
+    // fails.
+    let not_offered: BTreeSet<&str> = NOT_OFFERED_TO_A_MODEL
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    for (field, _) in lorica_api::automation::write::WITHHELD_ROUTE_FIELDS {
+        assert!(
+            not_offered.contains(field),
+            "{field} is withheld by the plane and not on NOT_OFFERED_TO_A_MODEL"
+        );
+    }
+}
+
+#[test]
+fn every_protection_the_plane_holds_is_named_by_the_tool_that_reaches_it() {
+    // The direction rule is the plane's (`ROUTE_PROTECTIONS`,
+    // `BACKEND_PROTECTIONS`); the update tool's summary is how a model
+    // learns it before the 403 does. A control added to either list
+    // and offered by the tool without a word in its summary fails here.
+    let not_offered: BTreeSet<&str> = NOT_OFFERED_TO_A_MODEL
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    let summary = |tool: &str| {
+        lorica_mcp::tools::find(tool)
+            .unwrap_or_else(|| panic!("{tool} is in the catalogue"))
+            .summary
+    };
+    let routes = summary("lorica_route_update");
+    for protection in lorica_api::automation::write::ROUTE_PROTECTIONS {
+        for field in protection.fields {
+            if not_offered.contains(field) {
+                continue;
+            }
+            assert!(
+                routes.contains(&format!("`{field}`")),
+                "lorica_route_update does not name `{field}` ({})",
+                protection.rule
+            );
+        }
+    }
+    let backends = summary("lorica_backend_update");
+    for protection in lorica_api::automation::write::BACKEND_PROTECTIONS {
+        for field in protection.fields {
+            assert!(
+                backends.contains(&format!("`{field}`")),
+                "lorica_backend_update does not name `{field}` ({})",
+                protection.rule
+            );
+        }
+    }
+    assert!(
+        summary("lorica_backend_create").contains("`tls_skip_verify`"),
+        "the create refuses an unverified upstream and does not say so"
+    );
+}
+
+#[test]
+fn the_operator_reference_states_every_protection_rule_as_the_plane_holds_it() {
+    // `docs/mcp.md` tabulates the one-way rules an operator reads before
+    // handing a model a config-tier token. Each row is rendered from the
+    // constant, and the table holds nothing else, so a rule reworded or
+    // added on one side alone fails here.
+    let reference: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/mcp.md"));
+    let section = reference
+        .split("### Protections move one way")
+        .nth(1)
+        .and_then(|rest| rest.split("\n#").next())
+        .expect("docs/mcp.md carries the protections section");
+    let documented: BTreeSet<String> = section
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .map(str::to_string)
+        .collect();
+    let route_rows = lorica_api::automation::write::ROUTE_PROTECTIONS
+        .iter()
+        .map(|protection| (protection.fields, protection.rule));
+    let backend_rows = lorica_api::automation::write::BACKEND_PROTECTIONS
+        .iter()
+        .map(|protection| (protection.fields, protection.rule));
+    let expected: BTreeSet<String> = route_rows
+        .chain(backend_rows)
+        .map(|(fields, rule)| {
+            let named: Vec<String> = fields.iter().map(|field| format!("`{field}`")).collect();
+            format!("| {} | {rule} |", named.join(", "))
+        })
+        .collect();
+    assert!(
+        !documented.is_empty(),
+        "the protections table in docs/mcp.md was found and read as empty; the parse went blind"
+    );
+    assert_eq!(
+        documented, expected,
+        "docs/mcp.md's protections table and ROUTE_PROTECTIONS / BACKEND_PROTECTIONS disagree"
+    );
+}
 
 /// The handler each MCP write tool's call reaches, as `(METHOD, path)`
 /// with the id normalised, taken from the tool's own call.

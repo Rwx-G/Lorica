@@ -414,7 +414,8 @@ are answered by a read as much as by a write. The audit layer is the
 outermost one, so a request the bearer gate refuses still lands a row.
 Each row is `automation.request.<outcome>` where the outcome is the
 word derived from the response status (`ok`, `unauthenticated`,
-`forbidden`, or `refused` for any other non-success), with
+`forbidden`, `error` for the node's own fault, a `5xx`, or `refused`
+for any other non-success), with
 `operator_role` set to `automation`, the target `METHOD path`, the
 source address and the user agent. An accepted request names its
 principal as `<name> (<public_id>)` for a static token and
@@ -424,6 +425,17 @@ names `-` and carries the reason in its payload. The environment
 handlers add a second, resource-level row beside it:
 `automation.environment.create`, `.update`, `.delete`, and `.forbidden`
 when the ownership rule refuses a read, an update or a delete.
+
+A request runs as a task the connection does not own: a client that
+hangs up after its write committed still gets the request row, the
+management-side row and the reload signal, so a committed change is
+never missing from the trail or from the running configuration. A
+row about a read, or about a request no credential got through, is the
+one the audit queue sheds first when it fills: a quarter of the queue
+(`AUDIT_QUEUE_RESERVED_FOR_MUTATIONS`) is kept for the rows of writes
+and of the management plane, so a flood of cheap requests cannot push
+out the row of a change. A queue full of those still sheds, counted in
+`lorica_audit_rows_dropped_total`.
 
 ## The environment resource
 
@@ -979,12 +991,16 @@ alias must be inside `allowed_hostnames`, or the update, the delete and
 the certificate binding are refused (403) whatever the body says. A
 backend update that names no address is held to the backend's stored
 address against `allowed_backend_cidrs`, as is the delete. A renewal
-is held to every name the certificate carries, `domain` and each SAN.
-A route or a backend an environment owns is refused unless the
-environment resource's own ownership rule would let the token reach
-that environment; a route whose environment another principal owns is
-therefore not deletable through this door, although the same route is
-deletable by an operator on the management plane. The check runs
+is held to every name the certificate carries, `domain` and each SAN,
+and so is a certificate a route write binds anew. A route or a backend
+an environment owns is refused unless the environment resource's own
+rules would let the token reach that environment: its ownership rule,
+and for an ID token whose entry binds `environment_protected = true`
+the rule that a job writes only the environment it deploys; a route
+whose environment another principal owns, or a sibling environment of
+a bound job's own project, is therefore not deletable through this
+door, although the same route is deletable by an operator on the
+management plane. The check runs
 inside the store closure that performs the write, on the row the write
 reads, so nothing can move between the two, and a refused row is named
 by its id alone: the refusal does not echo a hostname or an address the
@@ -992,17 +1008,31 @@ token was not granted. Every backend a route write links anew, at the
 top level or inside `path_rules`, `header_rules` or `traffic_splits`,
 must point inside the CIDR grant and belong to no other principal's
 environment; a backend the route already carries is not re-weighed by
-a patch that leaves the links alone. `forward_auth`, `mirror`, `mtls`
-and `proxy_headers` are refused (403) when an automation token sends
-them, whatever the value, because the first is a URL the CIDR grant
-cannot weigh and the proxy forwards every downstream `Cookie` and
-`Authorization` header to it, the second ships a copy of every request
-to a second set of backends, the third is the route's
-client-authentication trust anchor, the CA bundle whose client
-certificates the route accepts, and the fourth is a static header map
-to the upstream, where a credential would go. All
-of this holds for `?dry_run=true` as for the apply, so a preview is
-refused exactly where the write would be.
+a patch that leaves the links alone. The fields of
+`WITHHELD_ROUTE_FIELDS` (`lorica-api/src/automation/write.rs`) are
+refused (403) when an automation token sends them, whatever the value,
+each for the reason beside it there: `basic_auth_password`, a
+credential, whose clearing also switches Basic auth off;
+`forward_auth`, a URL the CIDR grant cannot weigh, to which the proxy
+forwards every downstream `Cookie` and `Authorization` header;
+`mirror`, which ships a copy of every request to a second set of
+backends; `mtls`, the route's client-authentication trust anchor, the
+CA bundle whose client certificates the route accepts; and
+`proxy_headers`, a static header map to the upstream, where a
+credential would go. All of this holds for `?dry_run=true` as for the
+apply, so a preview is refused exactly where the write would be.
+
+**Access control and upstream trust move one way.** The controls of
+`ROUTE_PROTECTIONS` and `BACKEND_PROTECTIONS`, beside the withheld list,
+are weighed on the stored row against the row about to be written, in
+the same closure, and an automation token may only strengthen them: the
+Basic-auth credential in force, the IP allow and deny lists, the GeoIP
+filter, bot protection, the WAF switch and mode, the rate limits and
+the auto-ban threshold on a route; upstream TLS, its certificate
+verification and its SNI on a backend, a create included. The other
+direction is a 403 naming the field and the rule. `docs/mcp.md`
+("Protections move one way") holds the rule for each, pinned to the
+constants by a test, and what is deliberately outside it.
 
 **The scopes bound each other.** A route write naming
 `certificate_id`, the empty string included, needs `certificates:write`
@@ -1138,11 +1168,13 @@ number; the dashboard's own row names the keys its write changed,
 without values. A write that changes no stored value writes nothing,
 reloads nothing and lands no row, on either plane.
 
-**A budget per credential.** The plane's writes are budgeted per token
-(per issuer entry for an ID token): 30 settings writes a minute, the
+**A budget per credential.** The plane's writes are budgeted per token,
+and for an ID token per issuer entry and project, so projects sharing
+an entry do not share a window: 30 settings writes a minute, the
 dashboard's own figure for its settings page, and 100 of every other
-write together. Going over is a 429 with `Retry-After`; a request the
-scope gate refuses spends nothing.
+write together, the environment resource's included since 1.9.0.
+Going over is a 429 with `Retry-After`; a request the scope gate
+refuses spends nothing.
 
 **No read, and an answer bounded like the write.** There is no `GET` on
 the path, and the answer to a write, or to its `?dry_run=true`, is the
@@ -1342,7 +1374,11 @@ For every presented ID token, in this order:
    a redirect policy that follows at most three redirects and only to
    the same scheme, host and port, so a compromised or mistyped issuer
    cannot turn the control plane into a probe of its own network. Only
-   RSA keys carrying a `kid` are kept. The set is refreshed every six
+   RSA keys carrying a `kid` are kept, and of those only the ones the
+   issuer published for RS256 signatures: a key whose `use` is present
+   and not `sig`, or whose `alg` is present and not `RS256`, is left
+   out, since an encryption key shares the family and could carry the
+   `kid` a token names. A key that states neither member is kept. The set is refreshed every six
    hours, and on an unknown `kid` at most once per minute per URL
    regardless of how many unknown kids arrive; the cap is on ATTEMPTS,
    so a failing issuer is also asked once a minute and not once per
@@ -1369,7 +1405,10 @@ For every presented ID token, in this order:
 6. `jti` must not have been accepted before. Only an accepted token
    consumes its `jti`, so a mismatch on one entry cannot turn a later
    request on another entry into a replay. Accepted ids are kept, keyed
-   by issuer and `jti`, until their `exp` in a bounded in-memory set of
+   by issuer and `jti`, until their `exp` plus the 60 seconds of leeway
+   step 4 allows, the last instant the token is still accepted (an id
+   kept only until its bare `exp` could be presented again, as new,
+   for the whole leeway), in a bounded in-memory set of
    50 000 entries; an ID token lives for minutes, so reaching the cap
    at all means several hundred accepted tokens per second sustained,
    which is not a CI pipeline. When the set is full the entries expiring

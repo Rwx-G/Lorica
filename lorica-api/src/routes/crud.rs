@@ -3441,7 +3441,7 @@ pub struct UpdateRouteRequest {
     pub managed_by: Option<serde_json::Value>,
 }
 
-fn route_to_response(
+pub(crate) fn route_to_response(
     route: &lorica_config::models::Route,
     backend_ids: Vec<String>,
 ) -> RouteResponse {
@@ -3616,36 +3616,65 @@ pub async fn list_routes(
     Extension(state): Extension<AppState>,
     axum::extract::Query(query): axum::extract::Query<ListRoutesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let responses = db_blocking(&state.store, move |store| {
-        let routes = store.list_routes()?;
-        // Optional `?group=...` filter: trimmed, exact match on
-        // `Route.group_name`. Invalid shapes (non-alphabet chars) return
-        // 400 early rather than silently matching nothing.
-        let group_filter = match query.group.as_deref() {
-            Some(raw) => {
-                let v = validate_group_name(raw)?;
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-            None => None,
-        };
-        let mut responses = Vec::with_capacity(routes.len());
-        for route in &routes {
-            if let Some(ref g) = group_filter {
-                if &route.group_name != g {
-                    continue;
-                }
-            }
-            let backend_ids = store.list_backends_for_route(&route.id)?;
-            responses.push(route_to_response(route, backend_ids));
-        }
-        Ok::<_, ApiError>(responses)
-    })
-    .await?;
+    let responses: Vec<RouteResponse> = routes_with_links(&state, query)
+        .await?
+        .into_iter()
+        .map(|(route, backend_ids)| route_to_response(&route, backend_ids))
+        .collect();
     Ok(json_data(serde_json::json!({ "routes": responses })))
+}
+
+/// Every route `query` selects, in the store's order, each with the ids
+/// of the backends it links, sorted.
+///
+/// Two queries under one store acquisition, whatever the route count:
+/// the links used to be read one route at a time, a statement prepared
+/// and run per route with the process-wide config lock held, which at
+/// ten thousand routes was ten thousand statements per listing. The
+/// views are built by the caller, outside the lock, and the automation
+/// plane builds only the window it answers.
+///
+/// # Errors
+///
+/// `BadRequest` for a `?group=` that is not a group name, then the
+/// store's error.
+pub(crate) async fn routes_with_links(
+    state: &AppState,
+    query: ListRoutesQuery,
+) -> Result<Vec<(lorica_config::models::Route, Vec<String>)>, ApiError> {
+    // Optional `?group=...` filter: trimmed, exact match on
+    // `Route.group_name`. Invalid shapes (non-alphabet chars) return
+    // 400 early rather than silently matching nothing.
+    let group_filter = match query.group.as_deref() {
+        Some(raw) => Some(validate_group_name(raw)?).filter(|v| !v.is_empty()),
+        None => None,
+    };
+    db_blocking(&state.store, move |store| {
+        let routes = store.list_routes()?;
+        let mut links: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for link in store.list_route_backends()? {
+            links
+                .entry(link.route_id)
+                .or_default()
+                .push(link.backend_id);
+        }
+        Ok::<_, ApiError>(
+            routes
+                .into_iter()
+                .filter(|route| {
+                    group_filter
+                        .as_ref()
+                        .is_none_or(|group| &route.group_name == group)
+                })
+                .map(|route| {
+                    let backend_ids = links.remove(&route.id).unwrap_or_default();
+                    (route, backend_ids)
+                })
+                .collect(),
+        )
+    })
+    .await
 }
 
 /// POST /api/v1/routes - create a new route.
@@ -3660,13 +3689,16 @@ pub async fn create_route(
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    create_route_as(
-        &state,
-        &audit_ctx,
-        body,
-        crate::preview::WriteMode::Apply,
-        crate::target::RouteGuard::unbounded(),
-    )
+    crate::db::run_detached(async move {
+        create_route_as(
+            &state,
+            &audit_ctx,
+            body,
+            crate::preview::WriteMode::Apply,
+            crate::target::RouteGuard::unbounded(),
+        )
+        .await
+    })
     .await
 }
 
@@ -4101,14 +4133,17 @@ pub async fn update_route(
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    update_route_as(
-        &state,
-        &audit_ctx,
-        id,
-        body,
-        crate::preview::WriteMode::Apply,
-        crate::target::RouteGuard::unbounded(),
-    )
+    crate::db::run_detached(async move {
+        update_route_as(
+            &state,
+            &audit_ctx,
+            id,
+            body,
+            crate::preview::WriteMode::Apply,
+            crate::target::RouteGuard::unbounded(),
+        )
+        .await
+    })
     .await
 }
 
@@ -4708,13 +4743,16 @@ pub async fn delete_route(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    delete_route_as(
-        &state,
-        &audit_ctx,
-        id,
-        crate::preview::WriteMode::Apply,
-        crate::target::RouteGuard::unbounded(),
-    )
+    crate::db::run_detached(async move {
+        delete_route_as(
+            &state,
+            &audit_ctx,
+            id,
+            crate::preview::WriteMode::Apply,
+            crate::target::RouteGuard::unbounded(),
+        )
+        .await
+    })
     .await
 }
 

@@ -97,23 +97,18 @@ pub(crate) fn run_automation_token_create(
 /// minting through `mint`, apart from the network and the terminal so
 /// the split between the two streams can be asserted.
 ///
+/// `mcp token create` mints through this too, with the request its
+/// tier resolves to, and appends its blast radius to standard error.
+///
 /// # Errors
 ///
 /// The grant rule's refusal, in the flags' words, before `mint` runs.
-fn mint_token(
+pub(crate) fn mint_token(
     request: &TokenMint,
     mint: impl FnOnce(&serde_json::Value) -> serde_json::Value,
 ) -> Result<(String, String), String> {
     grants_refusal(&request.scopes, &request.hostnames, &request.backend_cidrs)?;
-    let body = mint_request_body(
-        &request.name,
-        &request.scopes,
-        &request.hostnames,
-        &request.backend_cidrs,
-        request.max_ttl_seconds,
-        request.lifetime_days,
-    );
-    let data = mint(&body);
+    let data = mint(&mint_request_body(request));
     Ok((
         format!("{}\n", minted_token(&data)),
         format!("{}\n", minted_notice(&data)),
@@ -177,7 +172,7 @@ pub(crate) fn mint(
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = management_session(data_dir, management_port, user, password).await;
-        let url = format!("https://127.0.0.1:{management_port}/api/v1/automation/tokens");
+        let url = crate::cli_client::management_url(management_port, "/api/v1/automation/tokens");
         let response = client
             .post(&url)
             .json(body)
@@ -196,7 +191,7 @@ pub(crate) fn minted_token(data: &serde_json::Value) -> &str {
         .unwrap_or_else(|| fail("automation token mint: no token in the answer"))
 }
 
-/// Turn the command's flags into the mint request body.
+/// Turn a mint request into the body the management API accepts.
 ///
 /// Optional fields are OMITTED rather than sent as null: the API's
 /// `deny_unknown_fields` body takes an absent field as "use the
@@ -204,24 +199,17 @@ pub(crate) fn minted_token(data: &serde_json::Value) -> &str {
 /// mutual exclusion the server refuses. The two grants are sent as
 /// given, empty included: an empty list is the typed absence a token
 /// carrying no grant-bounded scope must send.
-pub(crate) fn mint_request_body(
-    name: &str,
-    scopes: &[String],
-    hostnames: &[String],
-    backend_cidrs: &[String],
-    max_ttl_seconds: Option<u32>,
-    lifetime_days: Option<i64>,
-) -> serde_json::Value {
+pub(crate) fn mint_request_body(request: &TokenMint) -> serde_json::Value {
     let mut body: serde_json::Value = serde_json::json!({
-        "name": name,
-        "scopes": scopes,
-        "allowed_hostnames": hostnames,
-        "allowed_backend_cidrs": backend_cidrs,
+        "name": request.name,
+        "scopes": request.scopes,
+        "allowed_hostnames": request.hostnames,
+        "allowed_backend_cidrs": request.backend_cidrs,
     });
-    if let Some(ttl) = max_ttl_seconds {
+    if let Some(ttl) = request.max_ttl_seconds {
         body["max_ttl_seconds"] = serde_json::json!(ttl);
     }
-    if let Some(days) = lifetime_days {
+    if let Some(days) = request.lifetime_days {
         body["lifetime_days"] = serde_json::json!(days);
     }
     body
@@ -265,14 +253,14 @@ mod tests {
 
     #[test]
     fn the_flags_become_the_body_the_api_accepts() {
-        let body = mint_request_body(
-            "ci",
-            &["environments:write".to_string()],
-            &["app.example.com".to_string()],
-            &["10.0.0.0/8".to_string()],
-            Some(3600),
-            Some(30),
-        );
+        let body = mint_request_body(&TokenMint {
+            name: "ci".to_string(),
+            scopes: vec!["environments:write".to_string()],
+            hostnames: vec!["app.example.com".to_string()],
+            backend_cidrs: vec!["10.0.0.0/8".to_string()],
+            max_ttl_seconds: Some(3600),
+            lifetime_days: Some(30),
+        });
         assert_eq!(body["name"], "ci");
         assert_eq!(body["scopes"], serde_json::json!(["environments:write"]));
         assert_eq!(
@@ -293,7 +281,14 @@ mod tests {
         // model's default" and a null as a value; sending null would
         // refuse the mint or override a default the operator never
         // touched.
-        let body = mint_request_body("ci", &[], &[], &[], None, None);
+        let body = mint_request_body(&TokenMint {
+            name: "ci".to_string(),
+            scopes: Vec::new(),
+            hostnames: Vec::new(),
+            backend_cidrs: Vec::new(),
+            max_ttl_seconds: None,
+            lifetime_days: None,
+        });
         assert!(body.get("max_ttl_seconds").is_none());
         assert!(body.get("lifetime_days").is_none());
         assert_eq!(body["scopes"], serde_json::json!([]));
@@ -362,17 +357,7 @@ mod tests {
         assert_eq!(stdout, format!("{SECRET}\n"));
         assert!(!stderr.contains(SECRET), "{stderr}");
         assert!(stderr.contains("atk_01HZ"), "{stderr}");
-        assert_eq!(
-            sent,
-            Some(mint_request_body(
-                "ci",
-                &request.scopes,
-                &[],
-                &[],
-                None,
-                Some(30)
-            ))
-        );
+        assert_eq!(sent, Some(mint_request_body(&request)));
     }
 
     #[test]

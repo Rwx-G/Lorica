@@ -379,7 +379,7 @@ pub(crate) fn run_cluster_leave(
         rt.block_on(async {
             let client =
                 management_session(Path::new(data_dir), management_port, &user, &password).await;
-            let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/leave");
+            let url = crate::cli_client::management_url(management_port, "/api/v1/cluster/leave");
             let response = client
                 .post(&url)
                 .send()
@@ -559,7 +559,7 @@ pub(crate) fn run_cluster_status(
     };
     runtime().block_on(async {
         let client = management_session(&data_dir, management_port, &user, &password).await;
-        let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/status");
+        let url = crate::cli_client::management_url(management_port, "/api/v1/cluster/status");
         let response = client
             .get(&url)
             .send()
@@ -586,7 +586,7 @@ pub(crate) fn run_cluster_break_glass(
     runtime().block_on(async {
         let client =
             management_session(Path::new(data_dir), management_port, &user, &password).await;
-        let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/break-glass");
+        let url = crate::cli_client::management_url(management_port, "/api/v1/cluster/break-glass");
         let request = if close {
             client.delete(&url)
         } else {
@@ -634,7 +634,7 @@ pub(crate) fn run_cluster_token(
     runtime().block_on(async {
         let client =
             management_session(Path::new(data_dir), management_port, &user, &password).await;
-        let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/tokens");
+        let url = crate::cli_client::management_url(management_port, "/api/v1/cluster/tokens");
         let response = client
             .post(&url)
             .json(&serde_json::json!({

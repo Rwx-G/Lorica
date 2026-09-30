@@ -65,8 +65,21 @@ pub struct RouteTarget<'a> {
     pub backend_ids: Option<&'a [String]>,
 }
 
+/// The rows a backend write reads and would write, as its guard sees
+/// them.
+#[derive(Debug, Clone, Copy)]
+pub struct BackendTarget<'a> {
+    /// The row as stored now; `None` on a create.
+    pub before: Option<&'a Backend>,
+    /// The row as it would be stored; `None` when the write only reads
+    /// the row it names, which is the first look of an update and a
+    /// delete.
+    pub after: Option<&'a Backend>,
+}
+
 type RouteCheck = Arc<dyn Fn(&ConfigStore, RouteTarget<'_>) -> Result<(), ApiError> + Send + Sync>;
-type BackendCheck = Arc<dyn Fn(&ConfigStore, &Backend) -> Result<(), ApiError> + Send + Sync>;
+type BackendCheck =
+    Arc<dyn Fn(&ConfigStore, BackendTarget<'_>) -> Result<(), ApiError> + Send + Sync>;
 type CertificateCheck = Arc<dyn Fn(&Certificate) -> Result<(), ApiError> + Send + Sync>;
 
 /// Who may act on a route row.
@@ -122,20 +135,20 @@ impl BackendGuard {
 
     /// Only the rows `check` accepts are reachable.
     pub fn bounded(
-        check: impl Fn(&ConfigStore, &Backend) -> Result<(), ApiError> + Send + Sync + 'static,
+        check: impl Fn(&ConfigStore, BackendTarget<'_>) -> Result<(), ApiError> + Send + Sync + 'static,
     ) -> Self {
         Self(Some(Arc::new(check)))
     }
 
-    /// Run the check on a row, the one stored or the one about to be,
-    /// inside the store closure that writes it.
+    /// Run the check on the rows a write reads and would write, inside
+    /// the store closure that writes them.
     ///
     /// # Errors
     ///
     /// Whatever the check refuses with, a `Forbidden` for a grant.
-    pub fn check(&self, store: &ConfigStore, backend: &Backend) -> Result<(), ApiError> {
+    pub fn check(&self, store: &ConfigStore, target: BackendTarget<'_>) -> Result<(), ApiError> {
         match &self.0 {
-            Some(check) => check(store, backend),
+            Some(check) => check(store, target),
             None => Ok(()),
         }
     }

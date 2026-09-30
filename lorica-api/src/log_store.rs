@@ -21,6 +21,19 @@ use crate::logs::{LogEntry, LogsQuery};
 /// second of stall before the queue starts shedding.
 pub const AUDIT_QUEUE_CAPACITY: usize = 4096;
 
+/// The slots of the audit queue a sheddable row may never take: a
+/// quarter of it, kept for the rows of mutations.
+///
+/// Every automation request lands a row, the refused and anonymous ones
+/// included, so a flood that needs no credential could fill the whole
+/// queue with rows about itself and shed the row of a write committing
+/// beside it. A sheddable row ([`crate::audit::record_request`]) is
+/// refused once only this reserve is left, and a mutation's row
+/// ([`crate::audit::record`]) still has the reserve to itself: a
+/// quarter of the queue is about a quarter of a second of chain
+/// commits, far more mutations than the write budgets admit in one.
+pub const AUDIT_QUEUE_RESERVED_FOR_MUTATIONS: usize = AUDIT_QUEUE_CAPACITY / 4;
+
 /// One item on the audit write queue.
 enum AuditWrite {
     /// A row to chain and persist.
@@ -389,6 +402,29 @@ impl LogStore {
         }
     }
 
+    /// [`LogStore::enqueue_audit`] for a row that may be shed first: it
+    /// is refused, as a full queue refuses it, once only
+    /// [`AUDIT_QUEUE_RESERVED_FOR_MUTATIONS`] slots are left.
+    ///
+    /// The free-slot reading and the send are two steps, so sheddable
+    /// rows racing each other can each read the same free slot; the
+    /// reserve is a floor they cross by at most one row per concurrent
+    /// caller, not a wall. Never blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the entry unwritten when the reserve is all that is
+    /// left, or when the queue is full or closed.
+    pub fn enqueue_audit_sheddable(
+        &self,
+        entry: Box<crate::audit::NewAuditEntry>,
+    ) -> Result<(), Box<crate::audit::NewAuditEntry>> {
+        if self.audit_tx.capacity() <= AUDIT_QUEUE_RESERVED_FOR_MUTATIONS {
+            return Err(entry);
+        }
+        self.enqueue_audit(entry)
+    }
+
     /// Wait until every audit row enqueued before this call is on disk.
     ///
     /// Unlike [`LogStore::enqueue_audit`] this applies backpressure
@@ -493,9 +529,30 @@ impl LogStore {
         Ok(())
     }
 
-    /// Query entries with filtering. Returns newest first.
-    /// Query log entries with pagination and filters; returns `(rows, total_match_count)`.
+    /// Query log entries with pagination and filters; returns
+    /// `(rows, total_match_count)`, the rows oldest first.
     pub fn query(&self, params: &LogsQuery) -> Result<(Vec<LogEntry>, usize), String> {
+        let (entries, total) = self.query_counting(params, true)?;
+        Ok((entries, total.unwrap_or_default()))
+    }
+
+    /// [`LogStore::query`]'s rows without its match count.
+    ///
+    /// The count is a second pass over every row the filters match, and
+    /// with `search` five unanchored `LIKE`s per retained row, all under
+    /// the connection mutex the access-log writer and the audit drain
+    /// need. A caller that answers no total (the automation plane's
+    /// `/logs`, which pages with `has_more`) has no reason to pay it.
+    pub fn query_rows(&self, params: &LogsQuery) -> Result<Vec<LogEntry>, String> {
+        Ok(self.query_counting(params, false)?.0)
+    }
+
+    /// The rows, and the match count when `with_total`.
+    fn query_counting(
+        &self,
+        params: &LogsQuery,
+        with_total: bool,
+    ) -> Result<(Vec<LogEntry>, Option<usize>), String> {
         let conn = self.conn.lock();
 
         let mut conditions = Vec::new();
@@ -558,12 +615,18 @@ impl LogStore {
             .unwrap_or(200)
             .min(crate::logs::LOGS_QUERY_MAX_ROWS);
 
-        let count_sql = format!("SELECT COUNT(*) FROM access_logs {where_clause}");
-        let refs: Vec<&dyn rusqlite::types::ToSql> =
-            bind_values.iter().map(|b| b.as_ref()).collect();
-        let total: usize =
-            conn.query_row(&count_sql, refs.as_slice(), |row| row.get::<_, i64>(0))
-                .map_err(|e| format!("failed to count access logs: {e}"))? as usize;
+        let total = if with_total {
+            let count_sql = format!("SELECT COUNT(*) FROM access_logs {where_clause}");
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                bind_values.iter().map(|b| b.as_ref()).collect();
+            Some(
+                conn.query_row(&count_sql, refs.as_slice(), |row| row.get::<_, i64>(0))
+                    .map_err(|e| format!("failed to count access logs: {e}"))?
+                    as usize,
+            )
+        } else {
+            None
+        };
 
         let query_sql = format!(
             "SELECT id, timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff, xff_proxy_ip, source, request_id \
@@ -2911,5 +2974,52 @@ mod retention_loss_tests {
             .enforce_retention(1_000, Some(0))
             .expect("retention under the cap");
         assert_eq!(outcome, RetentionOutcome::default());
+    }
+
+    #[test]
+    fn the_mutation_reserve_is_the_quarter_the_documents_say() {
+        assert_eq!(AUDIT_QUEUE_RESERVED_FOR_MUTATIONS * 4, AUDIT_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn the_rows_without_the_count_are_the_rows_with_it() {
+        // `/automation/v1/logs` answers no total, so it reads the rows
+        // alone; they must be the same rows the counted query answers,
+        // filters and limit included.
+        let (store, _dir) = tmp_store();
+        for n in 0..30 {
+            let mut entry = access_entry(n);
+            if n % 3 == 0 {
+                entry.path = format!("/needle/{n}");
+                entry.status = 404;
+            }
+            store.insert(&entry).expect("insert access row");
+        }
+        let query =
+            |search: Option<&str>, status: Option<u16>, limit: usize| crate::logs::LogsQuery {
+                route: None,
+                status,
+                status_min: None,
+                status_max: None,
+                time_from: None,
+                time_to: None,
+                client_ip: None,
+                search: search.map(str::to_string),
+                limit: Some(limit),
+                after_id: None,
+            };
+        for params in [
+            query(None, None, 5),
+            query(Some("needle"), None, 4),
+            query(None, Some(404), 100),
+            query(Some("absent"), None, 10),
+        ] {
+            let (counted, _total) = store.query(&params).expect("counted");
+            let rows = store.query_rows(&params).expect("rows alone");
+            let ids = |entries: &[crate::logs::LogEntry]| {
+                entries.iter().map(|e| e.id).collect::<Vec<_>>()
+            };
+            assert_eq!(ids(&rows), ids(&counted), "{params:?}");
+        }
     }
 }

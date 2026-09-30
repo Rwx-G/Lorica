@@ -134,6 +134,14 @@ pub const DRY_RUN_QUERY: &str = "dry_run=true";
 /// The suffix a preview tool's name carries after its apply tool's.
 pub const PREVIEW_SUFFIX: &str = "_preview";
 
+/// The most bytes a free-text argument may weigh: a filter or a
+/// resource id.
+///
+/// Never looser than the plane's own free-text filter ceiling, which
+/// answers 400 above it, so a value a tool accepts is one the plane
+/// reads; `lorica-api` pins the two against each other.
+pub const FREE_TEXT_MAX_BYTES: usize = 256;
+
 /// What kind of value a parameter takes, and what bounds it.
 ///
 /// Two kinds and no more. Every filter the automation read surface
@@ -143,9 +151,9 @@ pub const PREVIEW_SUFFIX: &str = "_preview";
 pub enum ParamKind {
     /// Free text, bounded in bytes.
     ///
-    /// The plane caps its own free-text filters at 256 bytes and
-    /// answers 400 above that; a bound here spares the round trip and
-    /// is never looser than the plane's.
+    /// The plane caps its own free-text filters and answers 400 above
+    /// the cap; a bound here spares the round trip and is never looser
+    /// than the plane's ([`FREE_TEXT_MAX_BYTES`]).
     Text {
         /// The most bytes this value may weigh.
         max_bytes: usize,
@@ -293,7 +301,8 @@ pub enum Kind {
 /// One tool: what it is called, what it needs, and what it does.
 #[derive(Debug, Clone, Copy)]
 pub struct ToolSpec {
-    /// The MCP tool name. 1 to 128 characters of `[A-Za-z0-9_.-]`,
+    /// The MCP tool name, inside the revision's grammar
+    /// ([`fits_tool_name_grammar`] at [`TOOL_NAME_MAX_BYTES`]),
     /// case-sensitive, unique across the catalogue.
     pub name: &'static str,
     /// A short human label for a client's tool picker.
@@ -859,7 +868,9 @@ pub const READS: &[ToolSpec] = &[
             Param {
                 name: "route",
                 doc: "Only rows for this route hostname.",
-                kind: ParamKind::Text { max_bytes: 256 },
+                kind: ParamKind::Text {
+                    max_bytes: FREE_TEXT_MAX_BYTES,
+                },
             },
             Param {
                 name: "status",
@@ -889,13 +900,17 @@ pub const READS: &[ToolSpec] = &[
             Param {
                 name: "client_ip",
                 doc: "Only rows whose client address starts with this.",
-                kind: ParamKind::Text { max_bytes: 256 },
+                kind: ParamKind::Text {
+                    max_bytes: FREE_TEXT_MAX_BYTES,
+                },
             },
             Param {
                 name: "search",
                 doc: "Only rows matching this text in the method, path, host, backend or \
                       error field.",
-                kind: ParamKind::Text { max_bytes: 256 },
+                kind: ParamKind::Text {
+                    max_bytes: FREE_TEXT_MAX_BYTES,
+                },
             },
             Param {
                 name: "after_id",
@@ -921,7 +936,9 @@ pub const READS: &[ToolSpec] = &[
         filters: &[Param {
             name: "category",
             doc: "Only events from this rule category, such as sql_injection or xss.",
-            kind: ParamKind::Text { max_bytes: 256 },
+            kind: ParamKind::Text {
+                max_bytes: FREE_TEXT_MAX_BYTES,
+            },
         }],
         paginated: true,
         kind: Kind::Read,
@@ -1005,7 +1022,9 @@ pub const READS: &[ToolSpec] = &[
         filters: &[Param {
             name: "group",
             doc: "Only routes in this group.",
-            kind: ParamKind::Text { max_bytes: 256 },
+            kind: ParamKind::Text {
+                max_bytes: FREE_TEXT_MAX_BYTES,
+            },
         }],
         paginated: true,
         kind: Kind::Read,
@@ -1032,42 +1051,48 @@ pub const READS: &[ToolSpec] = &[
 const ROUTE_ID: Param = Param {
     name: "id",
     doc: "The route id, as `lorica_routes` reports it.",
-    kind: ParamKind::Text { max_bytes: 256 },
+    kind: ParamKind::Text {
+        max_bytes: FREE_TEXT_MAX_BYTES,
+    },
 };
 
 /// The one argument naming a backend.
 const BACKEND_ID: Param = Param {
     name: "id",
     doc: "The backend id, as `lorica_backends` reports it.",
-    kind: ParamKind::Text { max_bytes: 256 },
+    kind: ParamKind::Text {
+        max_bytes: FREE_TEXT_MAX_BYTES,
+    },
 };
 
 /// The one argument naming a certificate.
 const CERTIFICATE_ID: Param = Param {
     name: "id",
     doc: "The certificate id, as `lorica_certificates` reports it.",
-    kind: ParamKind::Text { max_bytes: 256 },
+    kind: ParamKind::Text {
+        max_bytes: FREE_TEXT_MAX_BYTES,
+    },
 };
 
 /// The fields of `CreateRouteRequest` this tier offers.
 ///
-/// Six of the struct's fields are absent on purpose, and `lorica-api`'s
-/// pin names each as a decision rather than drift. `managed_by` is
-/// refused by the plane on input (422): offering it would be a field
-/// that always fails. `basic_auth_password` is a credential a model
-/// would be choosing or relaying, and it would cross the model's host
-/// in the clear on its way here; the route's Basic auth is set in the
-/// dashboard, by a human, and this tier reads the username alone as the
-/// read tier does. `forward_auth`, `mirror`, `mtls` and `proxy_headers`
-/// are refused by the plane from an automation token (403): the first is
-/// a URL the CIDR grant cannot weigh, to which the proxy forwards every
-/// downstream Cookie and Authorization header; the second ships a copy
-/// of every request to a second set of backends; the third is the
-/// route's client-authentication trust anchor, the CA bundle whose
-/// client certificates it accepts, and it is not private key material
-/// only by the letter; the fourth is a static header map to the
-/// upstream, where a credential would go. All four are set in the
-/// dashboard, by a human.
+/// The struct's other fields are absent on purpose, and the list of
+/// them, each with its reason, is `NOT_OFFERED_TO_A_MODEL` in
+/// `lorica-api/tests/openapi_contract.rs`, which pins this list against
+/// the struct both ways: a field the plane refuses on input
+/// (`managed_by`), the fields the plane refuses from any automation
+/// token whatever their value (`WITHHELD_ROUTE_FIELDS` in
+/// `lorica-api/src/automation/write.rs`: the Basic-auth password,
+/// forward auth, mirroring, the mTLS trust anchor, the upstream header
+/// map), and the Basic-auth username, which a token may not change
+/// where Basic auth is in force and which protects nothing without the
+/// password a token never sends. All of them are set in the dashboard,
+/// by a human.
+///
+/// Several fields offered here are access-control or trust controls a
+/// token may only strengthen (`ROUTE_PROTECTIONS` beside the withheld
+/// list): the tool's summary names them and the plane refuses the
+/// other direction with a 403, the preview included.
 const ROUTE_CREATE_FIELDS: &[&str] = &[
     "access_log_enabled",
     "add_path_prefix",
@@ -1076,7 +1101,6 @@ const ROUTE_CREATE_FIELDS: &[&str] = &[
     "auto_ban_duration_s",
     "auto_ban_threshold",
     "backend_ids",
-    "basic_auth_username",
     "bot_protection",
     "cache_enabled",
     "cache_max_bytes",
@@ -1147,7 +1171,8 @@ const ROUTE_UPDATE_ONLY_FIELDS: &[&str] = &[
 /// The fields of `UpdateRouteRequest` this tier offers:
 /// [`ROUTE_CREATE_FIELDS`] plus [`ROUTE_UPDATE_ONLY_FIELDS`], sorted,
 /// which a test asserts entry for entry since a `const` slice cannot be
-/// built from the two. The same six are absent, for the same reasons.
+/// built from the two. The same fields are absent, for the same
+/// reasons.
 const ROUTE_UPDATE_FIELDS: &[&str] = &[
     "access_log_enabled",
     "add_path_prefix",
@@ -1157,7 +1182,6 @@ const ROUTE_UPDATE_FIELDS: &[&str] = &[
     "auto_ban_duration_s",
     "auto_ban_threshold",
     "backend_ids",
-    "basic_auth_username",
     "bot_protection",
     "bot_protection_disable",
     "cache_enabled",
@@ -1326,7 +1350,10 @@ const ROUTE_NESTED: &[Nested] = &[
 
 /// The fields of `CreateBackendRequest` and `UpdateBackendRequest`
 /// this tier offers: every one but `managed_by`, refused by the plane
-/// on input.
+/// on input. The upstream TLS fields are offered and only ever
+/// strengthened (`BACKEND_PROTECTIONS` in
+/// `lorica-api/src/automation/write.rs`), which the tool's summary
+/// says.
 const BACKEND_FIELDS: &[&str] = &[
     "address",
     "group_name",
@@ -1360,7 +1387,8 @@ pub const MUTATIONS: &[Mutation] = &[
                   backends by id as `lorica_backends` reports them; every backend linked, here \
                   or inside path_rules, header_rules and traffic_splits, must sit inside the \
                   token's allowed_backend_cidrs. A duplicate hostname and an unknown backend \
-                  id are refused by the store when the change is applied.",
+                  id are refused by the store when the change is applied. A certificate bound \
+                  here must cover only names inside allowed_hostnames.",
         scope: "routes:write",
         verb: Verb::Post,
         path: "/automation/v1/routes",
@@ -1383,8 +1411,16 @@ pub const MUTATIONS: &[Mutation] = &[
                   dashboard's edit form changes them. The route named, on its current \
                   hostname and aliases, and any hostname or alias the patch gives it must be \
                   inside the token's allowed_hostnames; every backend the patch links anew \
-                  must sit inside allowed_backend_cidrs. A route an environment owns is \
-                  refused.",
+                  must sit inside allowed_backend_cidrs, and a certificate it binds anew must \
+                  cover only names inside allowed_hostnames. A route an environment owns is \
+                  refused. Access controls move one way only: `waf_enabled` on, never off; \
+                  `waf_mode` to blocking, never back; `ip_allowlist` added or narrowed, never \
+                  removed or widened; `ip_denylist` extended, never shortened; `geoip` added \
+                  or tightened in its mode; `bot_protection` added where none is set, never \
+                  changed or removed (`bot_protection_disable` included); `rate_limit`, \
+                  `rate_limit_rps`, `rate_limit_burst` and `auto_ban_threshold` added or \
+                  lowered, never raised or cleared. A write in the other direction is refused, \
+                  preview included; it is made in the dashboard.",
         scope: "routes:write",
         verb: Verb::Put,
         path: "/automation/v1/routes",
@@ -1420,9 +1456,9 @@ pub const MUTATIONS: &[Mutation] = &[
         summary: "Bind a stored certificate to one route by id, or unbind it with the empty \
                   string. The route named must be inside the token's allowed_hostnames on its \
                   current hostname and aliases. The certificate must already be on the node, \
-                  as `lorica_certificates` reports it: nothing here uploads, replaces or \
-                  generates one, and no argument takes key material. A route an environment \
-                  owns is refused.",
+                  as `lorica_certificates` reports it, and cover only names inside \
+                  allowed_hostnames: nothing here uploads, replaces or generates one, and no \
+                  argument takes key material. A route an environment owns is refused.",
         scope: "certificates:write",
         verb: Verb::Put,
         path: "/automation/v1/routes",
@@ -1442,7 +1478,8 @@ pub const MUTATIONS: &[Mutation] = &[
         title: "Create a backend",
         summary: "Create a backend, as the dashboard's backend form would. The address must \
                   be an ip:port inside the token's allowed_backend_cidrs; a name cannot be \
-                  checked against a CIDR and is refused.",
+                  checked against a CIDR and is refused. `tls_skip_verify` may not be set: an \
+                  upstream a token creates verifies its certificate whenever TLS is on.",
         scope: "backends:write",
         verb: Verb::Post,
         path: "/automation/v1/backends",
@@ -1463,7 +1500,11 @@ pub const MUTATIONS: &[Mutation] = &[
         title: "Update one backend",
         summary: "Patch one backend by id: only the fields sent change. The backend named, on \
                   its stored address, and any address the patch gives it must be inside the \
-                  token's allowed_backend_cidrs. A backend an environment owns is refused.",
+                  token's allowed_backend_cidrs. A backend an environment owns is refused. Upstream TLS moves one way only: \
+                  `tls_upstream` on, never off; `tls_skip_verify` off, never on, a create \
+                  included; `tls_sni` left unchanged while the upstream certificate is \
+                  verified. A write in the other direction is refused, preview included; it is \
+                  made in the dashboard.",
         scope: "backends:write",
         verb: Verb::Put,
         path: "/automation/v1/backends",
@@ -1574,8 +1615,8 @@ pub const ADMIN_MUTATIONS: &[Mutation] = &[Mutation {
         fields: SETTINGS_FIELDS,
         nested: &[],
         doc: "The settings to change; a field absent leaves its value alone. The bound each \
-              field may be set within: `access_log_retention` raise-only, 1..=100000000; \
-              `waf_event_retention` raise-only, 1..=100000000; `sla_purge_retention_days` \
+              field may be set within: `access_log_retention` raise-only, 1..=1000000; \
+              `waf_event_retention` raise-only, 1..=1000000; `sla_purge_retention_days` \
               raise-only, 1..=3650; `cert_warning_days` 14..=365; `cert_critical_days` \
               3..=365, and below `cert_warning_days`; `waf_ban_threshold` 3..=100; \
               `waf_ban_duration_s` 60..=86400; `default_health_check_interval_s` 5..=60; \
@@ -1881,19 +1922,10 @@ mod tests {
                 "{name} is not sorted and unique"
             );
         }
-        for absent in [
-            "forward_auth",
-            "mirror",
-            "mtls",
-            "proxy_headers",
-            "basic_auth_password",
-            "managed_by",
-        ] {
-            assert!(
-                !ROUTE_CREATE_FIELDS.contains(&absent) && !ROUTE_UPDATE_FIELDS.contains(&absent),
-                "{absent} is offered"
-            );
-        }
+        // Which fields are absent, and why, is pinned against the
+        // request structs in `lorica-api/tests/openapi_contract.rs`
+        // (`NOT_OFFERED_TO_A_MODEL`); a second list here would be a
+        // transcription of it.
     }
 
     #[test]
@@ -2416,9 +2448,8 @@ mod tests {
         // Story 11.2 AC #6 on this crate's own schemas: no property
         // name at any depth reads as key material, and none as a
         // credential a model would be choosing. `basic_auth_password`
-        // is the one field of a management body this tier declines to
-        // offer, which is why it is spelled out here rather than only
-        // matched.
+        // is spelled out as well as matched: it is the credential field
+        // of a management body the plane refuses from any token.
         let mut swept = 0usize;
         for spec in catalogue() {
             let mut names = Vec::new();

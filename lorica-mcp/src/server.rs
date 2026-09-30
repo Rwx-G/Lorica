@@ -144,53 +144,29 @@ pub struct Identity {
 }
 
 /// Why the server could not work out what it is.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StartupError {
     /// `whoami` could not be reached, or refused.
     ///
     /// A refusal here means the token is not live: `whoami` is the one
     /// path the plane lets any live token reach, whatever it carries.
-    Introspection(PlaneError),
+    #[error("cannot read {WHOAMI_PATH} to find out what this token may do: {0}")]
+    Introspection(#[source] PlaneError),
     /// `whoami` answered something that is not a whoami answer.
+    #[error(
+        "{WHOAMI_PATH} answered something with no string `data.public_id` and no \
+         array of strings at `data.scopes`. Check that the endpoint is a Lorica \
+         automation listener and not something in front of one."
+    )]
     Unreadable,
     /// The token's scopes span two tiers, or name no tier at all.
     ///
     /// A configuration fault and not an unreachable plane: the token
-    /// was read, and it is the wrong token for one process.
-    Tier(TierError),
-}
-
-impl core::fmt::Display for StartupError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            StartupError::Introspection(reason) => write!(
-                f,
-                "cannot read {WHOAMI_PATH} to find out what this token may do: {reason}"
-            ),
-            StartupError::Unreadable => write!(
-                f,
-                "{WHOAMI_PATH} answered something with no string `data.public_id` and no \
-                 array of strings at `data.scopes`. Check that the endpoint is a Lorica \
-                 automation listener and not something in front of one."
-            ),
-            // Only the stdio binding introspects, and it runs on a
-            // static token, so the static token's remedy is the one to
-            // name.
-            StartupError::Tier(refused) => {
-                write!(f, "{refused} {}", refused.remedy_for_static_token())
-            }
-        }
-    }
-}
-
-impl std::error::Error for StartupError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            StartupError::Introspection(reason) => Some(reason),
-            StartupError::Unreadable => None,
-            StartupError::Tier(refused) => Some(refused),
-        }
-    }
+    /// was read, and it is the wrong token for one process. Only the
+    /// stdio binding introspects, and it runs on a static token, so the
+    /// static token's remedy is the one the message names.
+    #[error("{0} {remedy}", remedy = .0.remedy_for_static_token())]
+    Tier(#[source] TierError),
 }
 
 /// A fixed window of tool invocations.
@@ -256,7 +232,8 @@ impl InvocationLimiter {
     }
 
     /// How many tokens currently hold a window.
-    pub fn tracked(&self) -> usize {
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
         self.windows
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -660,10 +637,11 @@ impl McpServer {
                     id,
                     untrusted::execution_error(
                         &format!(
-                            "This server runs at most {RATE_BUDGET} tool calls a minute per \
-                             token and this one is over that. Wait before calling again, and \
-                             narrow a read with its filters rather than paging through \
-                             everything."
+                            "This server runs at most {RATE_BUDGET} tool calls every {} seconds \
+                             per token and this one is over that. Wait before calling again, \
+                             and narrow a read with its filters rather than paging through \
+                             everything.",
+                            RATE_WINDOW.as_secs()
                         ),
                         None,
                     ),
@@ -1573,7 +1551,10 @@ mod tests {
         assert_eq!(over["result"]["isError"], json!(true));
         assert!(over["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("a minute")));
+            .is_some_and(|text| text.contains(&format!(
+                "{RATE_BUDGET} tool calls every {} seconds",
+                RATE_WINDOW.as_secs()
+            ))));
         // And the read never happened: one whoami plus the calls that
         // fitted in the budget.
         assert_eq!(plane.asked_for().len(), 1 + RATE_BUDGET as usize);

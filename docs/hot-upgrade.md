@@ -57,6 +57,18 @@ but no live swap happens: the API response's `handoff` field reports
    `worker_drain_timeout_s` (default 30s), records the drain histogram,
    and exits 0. The new process owns the unit from that point.
 
+**From 1.8.0 to 1.9.0.** The CLI pins the certificate the node records
+at `<data-dir>/management/served-cert.pem`. A node older than 1.9.0
+writes no such record; the 1.9.0 CLI then pins the certificate that
+node serves (`management_cert_pem_path` when both override paths are
+set, `<data-dir>/management/cert.pem` otherwise) and says so on
+stderr, so a 1.8.0 node can be hot-upgraded with the new binary. Run
+it as root or as `lorica`: it reads that certificate and the settings
+in `lorica.db`. If neither can be read the command refuses and sends
+nothing; there is deliberately no fallback that skips the pin, which
+would reopen the path by which a local user holding the port received
+the password.
+
 ## Signature model
 
 - **Algorithm:** Ed25519, detached signature over the raw binary bytes.

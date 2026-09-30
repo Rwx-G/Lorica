@@ -182,18 +182,45 @@ impl fmt::Display for Verb {
 /// distinction only survives if the seam keeps the status. The same
 /// holds for a validator's refusal of a write: the message is the
 /// plane's, verbatim, and the status says which kind of refusal it was.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PlaneError {
     /// The request never produced an answer: no connection, a broken
     /// stream, a body that did not arrive.
+    #[error("automation call failed: {0}")]
     Transport(String),
     /// The automation plane answered, and refused.
+    #[error("automation call refused with {status}: {}", quoted(body))]
     Refused {
         /// The HTTP status it answered with.
         status: u16,
         /// Its response body, verbatim.
         body: String,
     },
+}
+
+impl PlaneError {
+    /// The answer to one call, from the status and the body bytes the
+    /// plane sent: the body as text on a success, [`PlaneError::Refused`]
+    /// with that status otherwise.
+    ///
+    /// Both bindings end a call here, so the rule that a refusal keeps
+    /// the status the plane chose (the model stops on it rather than
+    /// retrying) is written once.
+    ///
+    /// # Errors
+    ///
+    /// [`PlaneError::Transport`] when the body is not UTF-8, which no
+    /// automation answer is; [`PlaneError::Refused`] for a status
+    /// outside `2xx`.
+    pub fn answered(status: u16, body: Vec<u8>) -> Result<String, PlaneError> {
+        let body = String::from_utf8(body)
+            .map_err(|_| PlaneError::Transport("the answer is not UTF-8".to_string()))?;
+        if (200..300).contains(&status) {
+            Ok(body)
+        } else {
+            Err(PlaneError::Refused { status, body })
+        }
+    }
 }
 
 /// The most bytes of a refusal body [`PlaneError`]'s `Display` quotes.
@@ -204,31 +231,29 @@ pub enum PlaneError {
 /// otherwise land whole in the client's MCP log at startup.
 pub const DISPLAYED_BODY_MAX_BYTES: usize = 512;
 
-impl fmt::Display for PlaneError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PlaneError::Transport(detail) => write!(f, "automation call failed: {detail}"),
-            PlaneError::Refused { status, body } => {
-                let cut = (0..=body.len().min(DISPLAYED_BODY_MAX_BYTES))
-                    .rev()
-                    .find(|end| body.is_char_boundary(*end))
-                    .unwrap_or(0);
-                if cut < body.len() {
-                    write!(
-                        f,
-                        "automation call refused with {status}: {} [and {} more bytes]",
-                        &body[..cut],
-                        body.len() - cut
-                    )
-                } else {
-                    write!(f, "automation call refused with {status}: {body}")
-                }
-            }
-        }
+/// The most body bytes one call may answer with, on either binding.
+///
+/// The automation plane caps a collection at 256 KiB of row data plus
+/// its envelope, so this ceiling is never reached by the thing it talks
+/// to. It is here for what happens when the endpoint is not that thing:
+/// a captive portal, a proxy error page, anything that answers a
+/// megabyte of HTML. Without a bound, a client that reads until EOF is
+/// a process whose memory is chosen by whoever answered the connection.
+pub const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+
+/// `body` as a refusal quotes it: whole up to
+/// [`DISPLAYED_BODY_MAX_BYTES`], cut on a character boundary beyond.
+fn quoted(body: &str) -> String {
+    let cut = (0..=body.len().min(DISPLAYED_BODY_MAX_BYTES))
+        .rev()
+        .find(|end| body.is_char_boundary(*end))
+        .unwrap_or(0);
+    if cut < body.len() {
+        format!("{} [and {} more bytes]", &body[..cut], body.len() - cut)
+    } else {
+        body.to_string()
     }
 }
-
-impl std::error::Error for PlaneError {}
 
 /// What one call across the seam is on behalf of.
 ///
@@ -350,22 +375,27 @@ mod tests {
             .await
     }
 
-    #[test]
-    fn one_tool_body_serves_a_source_that_owns_no_transport() {
-        // The assertion is the compile. Polling the future would need a
-        // runtime, and a crate that declares no dependency has none to
-        // reach for; what matters here is that a body written once type
-        // checks against an implementation holding no client at all.
-        let _unpolled = a_tool_body(&InProcess);
+    #[tokio::test]
+    async fn one_tool_body_serves_a_source_that_owns_no_transport() {
+        // A body written once runs against an implementation holding no
+        // client at all, and what it asked for is what reached it.
+        let answer = a_tool_body(&InProcess)
+            .await
+            .expect("an in-process source answers");
+        let answer: Value = serde_json::from_str(&answer).expect("JSON");
+        assert_eq!(answer["data"]["verb"], "GET");
+        assert_eq!(answer["data"]["path"], "/automation/v1/logs?limit=1");
+        assert_eq!(answer["data"]["body"], Value::Null);
     }
 
     #[test]
     fn a_verb_spells_itself_the_way_the_request_line_does() {
         // The four the plane mounts, and no way to spell a fifth: the
-        // in-process binding parses `as_str` back into an `http::Method`
-        // and the stdio client into a `reqwest::Method`, so a spelling
-        // that drifted would refuse every call rather than reach an
-        // undeclared verb.
+        // in-process binding parses `as_str` back into an `http::Method`,
+        // so a spelling that drifted would refuse every call there rather
+        // than reach an undeclared verb. The stdio client maps each
+        // variant to a `reqwest::Method` by `match` and does not read
+        // the spelling.
         assert_eq!(Verb::Get.as_str(), "GET");
         assert_eq!(Verb::Post.as_str(), "POST");
         assert_eq!(Verb::Put.as_str(), "PUT");
@@ -413,6 +443,42 @@ mod tests {
             body: "é".repeat(DISPLAYED_BODY_MAX_BYTES),
         };
         assert!(accented.to_string().contains("more bytes"));
+        // A body under the bound is quoted whole, with no suffix.
+        let short = PlaneError::Refused {
+            status: 404,
+            body: "not found".to_string(),
+        };
+        assert_eq!(
+            short.to_string(),
+            "automation call refused with 404: not found"
+        );
+    }
+
+    #[test]
+    fn an_answer_is_text_on_success_and_keeps_its_status_otherwise() {
+        assert_eq!(
+            PlaneError::answered(200, b"{\"data\":[]}".to_vec()).expect("a 200 answers"),
+            "{\"data\":[]}"
+        );
+        assert_eq!(
+            PlaneError::answered(204, Vec::new()).expect("any 2xx answers"),
+            ""
+        );
+        for status in [199, 300, 403, 422, 500] {
+            match PlaneError::answered(status, b"refused".to_vec()) {
+                Err(PlaneError::Refused { status: kept, body }) => {
+                    assert_eq!(kept, status);
+                    assert_eq!(body, "refused");
+                }
+                other => panic!("{status}: {other:?}"),
+            }
+        }
+        // Bytes that are not text are the transport's fault, whatever
+        // the status: no automation answer is anything but JSON.
+        assert!(matches!(
+            PlaneError::answered(200, vec![0xff, 0xfe]),
+            Err(PlaneError::Transport(reason)) if reason == "the answer is not UTF-8"
+        ));
     }
 
     #[test]

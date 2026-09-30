@@ -3,10 +3,10 @@
 ## Threat Model
 
 The threat model lives in [docs/security/threat-model.md](security/threat-model.md):
-assets, trust boundaries, and the threat categories T1 to T8 with one
+assets, trust boundaries, and the threat categories T1 to T9 with one
 mitigation table each (network, application, management API, data at rest,
 supply chain, cluster plane, operational, automation plane and request
-capture), followed by the residual risks. It is one document rather than a
+capture, and the management MCP server), followed by the residual risks. It is one document rather than a
 summary here and a copy there, because the copy that used to sit in this
 section stopped being true two releases before anyone noticed.
 
@@ -326,7 +326,16 @@ the operator's, at `<data-dir>/management/served-cert.pem`, and every
 CLI command that logs in pins that exact leaf and sends nothing, the
 password included, to a peer that presents anything else. The CLI must
 therefore run as root or as the `lorica` user, who can read the
-`0700` directory.
+`0700` directory. The pin is the CLI's alone: a browser that accepts a
+certificate warning on the dashboard is outside what it protects, since
+a squatter's self-signed certificate raises the same warning as the
+node's own. Compare the fingerprint of `served-cert.pem` with the one
+the browser shows before accepting it (the hardening guide gives the
+command). When `management_cert_pem_path` names an operator pair, the
+pin is only as unique as that pair's key: a certificate whose key also
+lives on other machines, a wildcard or fleet-wide one, lets any holder
+of that key present the pinned leaf, so give the management listener a
+pair of its own.
 
 **`/metrics` authentication (on by default since v1.7.0).** The
 endpoint exposes the full backend topology and certificate inventory,

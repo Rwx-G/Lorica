@@ -65,8 +65,8 @@ pub enum ScopeRequirement {
     /// tool and each tool has its own scope, so the endpoint is reached
     /// by any live token and every `tools/call` is authorized against
     /// the presented token's scopes, in the same matrix, by the tool
-    /// registry [`lorica_mcp::server::McpServer::over`] builds for that
-    /// one request. `tests/mcp_catalogue_scopes.rs` pins the scope each
+    /// registry [`lorica_mcp::server::McpServer::sharing`] builds for
+    /// that one request, over the process-wide invocation limiter. `tests/mcp_catalogue_scopes.rs` pins the scope each
     /// tool names against the scope this matrix puts on the path it
     /// reads.
     ///
@@ -424,41 +424,29 @@ pub async fn authorize_scope(req: Request, next: Next) -> Result<Response, ApiEr
 /// operator reads the same string in the error, in the audit row and
 /// in the token.
 ///
-/// The vocabulary is owned by the serde renames on `AutomationScope`.
-/// This match restates it once, for the messages an operator reads
-/// here and in [`super::audit`], and the test below walks
-/// [`AutomationScope::ALL`] to assert it agrees with serde, so a
-/// variant added to the enum stops this file compiling and a variant
-/// spelled differently here fails that test. The other restatements are
-/// named in the comment above the enum.
+/// [`AutomationScope::as_str`], the one spelling table, which a test
+/// walking [`AutomationScope::ALL`] holds to the serde renames; this
+/// name stays because every refusal and audit call site in the plane
+/// reads it.
 pub(super) fn scope_str(scope: AutomationScope) -> &'static str {
-    match scope {
-        AutomationScope::EnvironmentsWrite => "environments:write",
-        AutomationScope::EnvironmentsRead => "environments:read",
-        AutomationScope::RoutesRead => "routes:read",
-        AutomationScope::CertificatesRead => "certificates:read",
-        AutomationScope::LogsRead => "logs:read",
-        AutomationScope::WafRead => "waf:read",
-        AutomationScope::SlaRead => "sla:read",
-        AutomationScope::ClusterRead => "cluster:read",
-        AutomationScope::BackendsRead => "backends:read",
-        AutomationScope::RoutesWrite => "routes:write",
-        AutomationScope::BackendsWrite => "backends:write",
-        AutomationScope::CertificatesWrite => "certificates:write",
-        AutomationScope::SettingsWrite => "settings:write",
-    }
+    scope.as_str()
 }
 
 /// Every path of the read surface beside the scope it sits behind, as a
 /// request a test can actually send.
 ///
-/// Test-only, and deliberately spelled out rather than read back from
+/// Test-only, and spelled out rather than read back from
 /// [`read_declaration`]: a list derived from the code under test agrees
-/// with that code whatever it says. It is the ONE statement of the
-/// surface, walked by this module's matrix tests and by the AC #5
-/// secret sweep in `crate::tests` alike, so a path added to the matrix
-/// and forgotten in either place fails in the other rather than
-/// shrinking a sweep in silence.
+/// with that code whatever it says, and each entry is a request with a
+/// concrete id, which a template is not. It is walked by this module's
+/// matrix tests and by the AC #5 secret sweep and the field-name pin in
+/// `crate::tests`. What keeps it complete is not this comment:
+/// `every_read_the_plane_mounts_is_on_the_read_surface` walks every
+/// path the router mounts (every path literal `router.rs` holds), asks the
+/// matrix what each declares for `GET`, and fails naming any path
+/// declared behind a read scope that this list does not carry, so a
+/// read added to the router and the matrix cannot reach a model
+/// outside the sweeps.
 #[cfg(test)]
 pub(crate) const READ_SURFACE: &[(&str, AutomationScope)] = &[
     ("/automation/v1/logs", AutomationScope::LogsRead),
@@ -920,6 +908,76 @@ mod tests {
         );
     }
 
+    /// Every path literal `router.rs` mounts, read off its source: the
+    /// one place both surface tests enumerate the plane from, rather
+    /// than a list typed beside it. The OpenAPI contract gate reads the
+    /// same `.route(` calls and pins them to the document, so a path
+    /// mounted any other way fails there first.
+    fn mounted_paths() -> std::collections::BTreeSet<&'static str> {
+        let router = include_str!("router.rs");
+        let opening = "\"/automation/v1/";
+        router
+            .match_indices(opening)
+            .map(|(at, _)| {
+                let literal = &router[at + 1..];
+                &literal[..literal.find('"').expect("a terminated literal")]
+            })
+            .collect()
+    }
+
+    /// A mounted path with each `{parameter}` replaced by an id, as a
+    /// request would carry it.
+    fn concrete(path: &str) -> String {
+        path.split('/')
+            .map(|segment| {
+                if segment.starts_with('{') {
+                    "x-1"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<&str>>()
+            .join("/")
+    }
+
+    #[test]
+    fn every_read_the_plane_mounts_is_on_the_read_surface() {
+        // The read twin of the test below. Every path the router mounts
+        // is asked of the matrix for `GET`, and whatever it declares
+        // behind a read scope is on `READ_SURFACE`, so the secret sweep
+        // and the field-name pin, which walk that list, cannot be
+        // shorter than the reads the plane serves. The environment
+        // resource has its own tests above.
+        let mut reads = std::collections::BTreeSet::new();
+        for path in mounted_paths() {
+            let concrete = concrete(path);
+            let Some(ScopeRequirement::Scope(scope)) = required_scope(&Method::GET, &concrete)
+            else {
+                continue;
+            };
+            if scope_str(scope).ends_with(":write") || scope == AutomationScope::EnvironmentsRead {
+                continue;
+            }
+            reads.insert(path);
+            let listed = READ_SURFACE.iter().any(|(surface_path, listed)| {
+                *listed == scope
+                    && path_template(&Method::GET, surface_path)
+                        == path_template(&Method::GET, &concrete)
+            });
+            assert!(
+                listed,
+                "GET {path} is declared behind {} and is not on READ_SURFACE, so no secret sweep \
+                 walks it",
+                scope_str(scope)
+            );
+        }
+        assert_eq!(
+            reads.len(),
+            READ_SURFACE.len(),
+            "READ_SURFACE and the mounted reads differ in size"
+        );
+    }
+
     #[test]
     fn every_write_the_plane_mounts_is_on_the_write_surface() {
         // The inverse of the tests above, which start from
@@ -929,25 +987,11 @@ mod tests {
         // sweeps walk cannot be shorter than the writes the plane
         // serves. The environment resource predates the list and has
         // its own tests above.
-        let router = include_str!("router.rs");
-        let opening = "\"/automation/v1/";
         let mut mounted = 0usize;
         let mut writes = 0usize;
-        for (at, _) in router.match_indices(opening) {
-            let literal = &router[at + 1..];
-            let path = &literal[..literal.find('"').expect("a terminated literal")];
+        for path in mounted_paths() {
             mounted += 1;
-            let concrete: String = path
-                .split('/')
-                .map(|segment| {
-                    if segment.starts_with('{') {
-                        "x-1"
-                    } else {
-                        segment
-                    }
-                })
-                .collect::<Vec<&str>>()
-                .join("/");
+            let concrete = concrete(path);
             for method in [
                 Method::GET,
                 Method::POST,

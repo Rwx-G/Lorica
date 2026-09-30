@@ -66,10 +66,12 @@
 //! between them. A route's current hostname and every current alias,
 //! and after a patch its new ones, must be inside the hostname grant; a
 //! backend's stored address, and a new one, inside the CIDR grant; a
-//! certificate's `domain` and every SAN inside the hostname grant; and
-//! a route or a backend an environment owns is reachable only when the
-//! environment resource's own ownership rule would let this token
-//! reach that environment. Every backend a route write links anew, at
+//! certificate's `domain` and every SAN inside the hostname grant, for
+//! a renewal and for a certificate a route write binds anew; and a
+//! route or a backend an environment owns is reachable only when the
+//! environment resource's own rules, its ownership rule and the
+//! `environment_protected` binding, would let this token reach that
+//! environment. Every backend a route write links anew, at
 //! the top level or inside `path_rules`, `header_rules` or
 //! `traffic_splits`, must point inside the CIDR grant and belong to no
 //! other principal's environment. A refusal names the row by its id
@@ -77,14 +79,24 @@
 //! grant reads no production hostname off the answer, and a preview is
 //! refused exactly where the apply would be.
 //!
-//! Four route fields are refused from a token outright, whatever their
-//! value: `forward_auth`, whose address is a URL the CIDR grant cannot
-//! weigh and to which the proxy forwards every downstream `Cookie` and
-//! `Authorization` header; `mirror`, which ships a copy of every
-//! request to a second set of backends; `mtls`, the route's
-//! client-authentication trust anchor; and `proxy_headers`, a static
-//! header map to the upstream, where a credential would go. The config
-//! tier's tools offer none of them.
+//! The fields of [`WITHHELD_ROUTE_FIELDS`] are refused from a token
+//! outright, whatever their value, each for the reason beside it there;
+//! the config tier's tools offer none of them.
+//!
+//! # Protections move one way
+//!
+//! Inside the grant, the access-control and trust controls of
+//! [`ROUTE_PROTECTIONS`] and [`BACKEND_PROTECTIONS`] may only be
+//! strengthened by a token (the maintainer's decision of 2026-09-30,
+//! "safe direction only"). The guards weigh each on the row as stored
+//! against the row about to be written, inside the same store closure,
+//! so the direction is the store's and never a caller's account of it,
+//! and the preview is refused where the apply would be. A route create
+//! is not weighed, since every one of those controls is at its weakest
+//! on the row the management create stores when the body names none of
+//! them; a backend create is weighed against the create's own default,
+//! which verifies the upstream whenever TLS is on. The dashboard is not
+//! bound by any of it.
 //!
 //! # The scopes bound each other
 //!
@@ -180,7 +192,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::auth::AutomationPrincipal;
-use super::environments::{audit_context, caller_may_access, ensure_backend_address_granted};
+use super::environments::{
+    audit_context, caller_may_access, ensure_backend_address_granted, ensure_environment_binding,
+};
 use super::redact;
 use super::scope::scope_str;
 use crate::audit::ClientConnectInfo;
@@ -270,7 +284,7 @@ pub struct AdminSetting {
 
 impl AdminSetting {
     /// The bound as the docs, the tool description and a refusal spell
-    /// it: `14..=365`, or `raise-only, 1..=100000000`.
+    /// it: `14..=365`, or `raise-only, 1..=1000000`.
     pub fn bound_text(&self) -> String {
         match self.direction {
             Direction::Either => format!("{}..={}", self.min, self.max),
@@ -300,6 +314,19 @@ impl AdminSetting {
         None
     }
 }
+
+/// The highest row retention the admin tier may raise either persistent
+/// buffer to: ten times the shipped default of 100000 rows.
+///
+/// A raise-only retention is safe only up to a size a human chose the
+/// disk for. An access-log row weighs about 500 bytes once its four
+/// indexes are counted, so the ceiling is about half a gigabyte per
+/// table: ten times the history the node ships with, and not the size
+/// that fills a disk. The previous ceiling of one hundred million rows
+/// was about fifty gigabytes per table, a disk-exhaustion value one
+/// write away. A retention beyond it is a disk decision, made in the
+/// dashboard. A test pins the ceiling to the default it derives from.
+pub const RETENTION_TIER_CEILING_ROWS: i64 = 1_000_000;
 
 /// Every setting `PUT /automation/v1/settings` accepts: the admin tier's
 /// whole surface (Story 11.3 AC #1), decided by exclusion, each with
@@ -348,9 +375,11 @@ pub const SETTINGS_ALLOWLIST: &[AdminSetting] = &[
     AdminSetting {
         name: "access_log_retention",
         why: "retention of the persistent access-log buffer; raised, it keeps more history, \
-              and 0 (unlimited) is refused because the table then grows until the disk fills",
+              and 0 (unlimited) is refused because the table then grows until the disk fills; \
+              no higher than RETENTION_TIER_CEILING_ROWS, about half a gigabyte of rows, for \
+              the same reason",
         min: 1,
-        max: 100_000_000,
+        max: RETENTION_TIER_CEILING_ROWS,
         direction: Direction::RaiseOnly,
         reach: Reach::Fleet,
         takes_effect: TakesEffect::Live,
@@ -358,9 +387,10 @@ pub const SETTINGS_ALLOWLIST: &[AdminSetting] = &[
     AdminSetting {
         name: "waf_event_retention",
         why: "retention of the persistent WAF-event buffer, the data plane's security trail; \
-              raised, it keeps more of it, and 0 (unlimited) is refused",
+              raised, it keeps more of it, and 0 (unlimited) is refused; no higher than \
+              RETENTION_TIER_CEILING_ROWS, for the disk's sake",
         min: 1,
-        max: 100_000_000,
+        max: RETENTION_TIER_CEILING_ROWS,
         direction: Direction::RaiseOnly,
         reach: Reach::Fleet,
         takes_effect: TakesEffect::Live,
@@ -508,61 +538,415 @@ fn ensure_hostnames_granted(
     Ok(())
 }
 
-/// The four route fields a token may not send at all, whatever the
-/// value, a clearing one included.
+/// The route fields a token may not send at all, whatever the value, a
+/// clearing one included, each with the reason the refusal gives.
 ///
-/// `forward_auth.address` is any absolute URL: the CIDR grant cannot
-/// weigh it, and the proxy forwards every downstream `Cookie` and
-/// `Authorization` header to it, so a model-authored body could send
-/// every visitor's session off-site or make the proxy call a metadata
-/// address per request. `mirror` ships a copy of every request,
-/// credentials included, to a second set of backends. `mtls` is the
-/// route's client-authentication trust anchor: the CA bundle whose
-/// client certificates the route accepts, so a model reading attacker
-/// text that could replace it would let every client certificate the
-/// attacker mints through. `proxy_headers` is a static header map sent
-/// to the upstream on every request, which is where a credential would
-/// go, so a model must neither choose one nor clear one (the
-/// maintainer's decision, 2026-09-23). None is the tier's in either
-/// direction; all four are set in the dashboard, by a human, and the
-/// tools do not offer them.
-fn refuse_unbounded_reach(
-    forward_auth: bool,
-    mirror: bool,
-    mtls: bool,
-    proxy_headers: bool,
-) -> Result<(), ApiError> {
-    if forward_auth {
-        return Err(ApiError::Forbidden(
-            "forward_auth is not accepted from an automation token: its address is a URL \
-             allowed_backend_cidrs cannot weigh, and the proxy forwards every downstream Cookie \
-             and Authorization header to it; set it in the dashboard"
-                .to_string(),
-        ));
+/// None is the tier's in either direction: each is set in the
+/// dashboard, by a human, and the config tier's tools offer none of
+/// them. The plane refuses them from any automation token, whether it
+/// calls a tool or the path.
+pub const WITHHELD_ROUTE_FIELDS: &[(&str, &str)] = &[
+    (
+        "basic_auth_password",
+        "it is the route's Basic-auth credential, which a model would be choosing or relaying \
+         in the clear, and clearing it switches the route's Basic auth off",
+    ),
+    (
+        "forward_auth",
+        "its address is a URL allowed_backend_cidrs cannot weigh, and the proxy forwards every \
+         downstream Cookie and Authorization header to it",
+    ),
+    (
+        "mirror",
+        "it ships a copy of every request to a second set of backends",
+    ),
+    (
+        "mtls",
+        "it is the route's client-authentication trust anchor, the CA whose client certificates \
+         the route accepts",
+    ),
+    (
+        "proxy_headers",
+        "a static header map to the upstream is where a credential would go",
+    ),
+];
+
+/// A route write body, asked which of [`WITHHELD_ROUTE_FIELDS`] it
+/// carries.
+///
+/// `None` for a name the body has no field for: a name added to the
+/// table and not here is a refusal of the whole write rather than a
+/// field that silently passes, and the test that walks the table
+/// against both bodies turns it red first.
+trait WithheldFields {
+    /// Whether the body sends the field named `field`.
+    fn sends(&self, field: &str) -> Option<bool>;
+}
+
+impl WithheldFields for CreateRouteRequest {
+    fn sends(&self, field: &str) -> Option<bool> {
+        match field {
+            "basic_auth_password" => Some(self.basic_auth_password.is_some()),
+            "forward_auth" => Some(self.forward_auth.is_some()),
+            "mirror" => Some(self.mirror.is_some()),
+            "mtls" => Some(self.mtls.is_some()),
+            "proxy_headers" => Some(self.proxy_headers.is_some()),
+            _ => None,
+        }
     }
-    if mirror {
-        return Err(ApiError::Forbidden(
-            "mirror is not accepted from an automation token: it ships a copy of every request \
-             to a second set of backends; set it in the dashboard"
-                .to_string(),
-        ));
+}
+
+impl WithheldFields for UpdateRouteRequest {
+    fn sends(&self, field: &str) -> Option<bool> {
+        match field {
+            "basic_auth_password" => Some(self.basic_auth_password.is_some()),
+            "forward_auth" => Some(self.forward_auth.is_some()),
+            "mirror" => Some(self.mirror.is_some()),
+            "mtls" => Some(self.mtls.is_some()),
+            "proxy_headers" => Some(self.proxy_headers.is_some()),
+            _ => None,
+        }
     }
-    if mtls {
-        return Err(ApiError::Forbidden(
-            "mtls is not accepted from an automation token: it is the route's \
-             client-authentication trust anchor, the CA whose client certificates the route \
-             accepts; set it in the dashboard"
-                .to_string(),
-        ));
-    }
-    if proxy_headers {
-        return Err(ApiError::Forbidden(
-            "proxy_headers is not accepted from an automation token: a static header map to \
-             the upstream is where a credential would go; set it in the dashboard"
-                .to_string(),
-        ));
+}
+
+/// The first of [`WITHHELD_ROUTE_FIELDS`] the body sends, refused with
+/// a 403 naming it and its reason.
+fn refuse_withheld(body: &impl WithheldFields) -> Result<(), ApiError> {
+    for (field, why) in WITHHELD_ROUTE_FIELDS {
+        match body.sends(field) {
+            Some(false) => {}
+            Some(true) => {
+                return Err(ApiError::Forbidden(format!(
+                    "{field} is not accepted from an automation token: {why}; set it in the \
+                     dashboard"
+                )))
+            }
+            None => {
+                return Err(ApiError::Internal(format!(
+                    "{field} is withheld from automation tokens and the route body has no such \
+                     field"
+                )))
+            }
+        }
     }
     Ok(())
+}
+
+/// One access-control or trust field of a stored row that an
+/// automation token may move only toward stronger (the maintainer's
+/// decision of 2026-09-30, "safe direction only").
+///
+/// The rule runs in the guard, inside the store closure, on the row as
+/// stored and the row as it would be written, so the direction is
+/// weighed against what the store holds under the lock that writes it
+/// and never against what a caller says the row was. A preview is
+/// refused exactly where the apply would be.
+#[derive(Clone, Copy)]
+pub struct Protection<T: 'static> {
+    /// The fields the rule weighs, as the request bodies spell them.
+    pub fields: &'static [&'static str],
+    /// The safe direction, in the words a refusal and the docs use.
+    pub rule: &'static str,
+    /// Why the other direction is the dashboard's and not a token's.
+    pub why: &'static str,
+    /// Whether `after` is weaker than `before` on this control.
+    pub weakened: fn(&T, &T) -> bool,
+}
+
+impl<T> std::fmt::Debug for Protection<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Protection")
+            .field("fields", &self.fields)
+            .field("rule", &self.rule)
+            .finish()
+    }
+}
+
+/// Every route control an automation token may only strengthen.
+///
+/// A route create is not weighed: each of these is at its weakest on
+/// the row the management create stores when the body names none of
+/// them, so nothing a create sets weakens anything. What is NOT here,
+/// and why, is recorded next to the rule in `docs/mcp.md`: the capacity
+/// limits (they price a request, they do not decide whether it is
+/// admitted), the browser-facing hardening (`force_https`,
+/// `security_headers`, the CORS lists and `response_headers`, which
+/// shape how a browser treats an answer the route already admits), the
+/// AI-crawler policy (a content policy toward clients that declare
+/// themselves, which a hostile client does not), and the routing fields
+/// (where a request goes, bounded by the hostname and CIDR grants).
+pub const ROUTE_PROTECTIONS: &[Protection<Route>] = &[
+    Protection {
+        fields: &["basic_auth_username"],
+        rule: "the Basic-auth credential in force is neither cleared nor changed",
+        why: "clearing the username switches the route's Basic auth off, and renaming it \
+              changes a credential whose password a token never sees",
+        weakened: basic_auth_weakened,
+    },
+    Protection {
+        fields: &["ip_allowlist"],
+        rule: "added, or narrowed so every entry sits inside one already there; never removed \
+               or widened",
+        why: "an empty allowlist admits every address",
+        weakened: allowlist_weakened,
+    },
+    Protection {
+        fields: &["ip_denylist"],
+        rule: "extended, every entry already there staying covered; never shortened",
+        why: "an entry removed admits the addresses it refused",
+        weakened: denylist_weakened,
+    },
+    Protection {
+        fields: &["geoip"],
+        rule: "added, or tightened in the same mode (fewer countries allowed, more denied); \
+               never removed or switched to the other mode",
+        why: "the country filter decides who reaches the route at all",
+        weakened: geoip_weakened,
+    },
+    Protection {
+        fields: &["bot_protection", "bot_protection_disable"],
+        rule: "added where none is set; never changed or removed once set",
+        why: "its bypass lists and its mode decide which clients skip the challenge, and no \
+              ordering of them is safe to move automatically",
+        weakened: bot_protection_weakened,
+    },
+    Protection {
+        fields: &["waf_enabled"],
+        rule: "switched on, never off",
+        why: "the WAF is the route's request filter",
+        weakened: waf_switched_off,
+    },
+    Protection {
+        fields: &["waf_mode"],
+        rule: "moved to blocking, never back to detection",
+        why: "detection lets every request the WAF flags through",
+        weakened: waf_mode_weakened,
+    },
+    Protection {
+        fields: &["rate_limit"],
+        rule: "added, or tightened with its capacity and refill never raised and its scope \
+               unchanged; never removed",
+        why: "the token bucket is the route's defence against a flood",
+        weakened: rate_limit_weakened,
+    },
+    Protection {
+        fields: &["rate_limit_rps", "rate_limit_burst"],
+        rule: "added, or lowered; never raised or cleared",
+        why: "the per-client rate is the route's defence against a flood",
+        weakened: legacy_rate_weakened,
+    },
+    Protection {
+        fields: &["auto_ban_threshold"],
+        rule: "added, or lowered; never raised or cleared",
+        why: "the threshold is how many blocks earn an automatic ban, and cleared it bans no one",
+        weakened: auto_ban_weakened,
+    },
+];
+
+/// Every backend control an automation token may only strengthen.
+///
+/// A create is weighed against the backend the management create
+/// stores when the body names none of these, which is plain HTTP,
+/// verified whenever TLS is turned on: so a create may not ask for an
+/// unverified upstream either.
+pub const BACKEND_PROTECTIONS: &[Protection<Backend>] = &[
+    Protection {
+        fields: &["tls_skip_verify"],
+        rule: "switched off, never on",
+        why: "on, the upstream leg accepts any certificate, so anyone on the path reads and \
+              rewrites it",
+        weakened: verification_switched_off,
+    },
+    Protection {
+        fields: &["tls_upstream"],
+        rule: "switched on, never off",
+        why: "off, the upstream leg is plain text",
+        weakened: upstream_tls_switched_off,
+    },
+    Protection {
+        fields: &["tls_sni"],
+        rule: "left unchanged while the upstream certificate is verified",
+        why: "it is the name the upstream certificate is verified against, so changing it with \
+              the address inside the grant hands the leg to whoever holds a certificate for the \
+              new name",
+        weakened: verified_name_changed,
+    },
+];
+
+/// The first rule of `protections` that `after` breaks against
+/// `before`, refused with a 403 naming the field and the rule and
+/// echoing neither value.
+fn ensure_not_weakened<T>(
+    protections: &[Protection<T>],
+    kind: &str,
+    id: &str,
+    before: &T,
+    after: &T,
+) -> Result<(), ApiError> {
+    for protection in protections {
+        if (protection.weakened)(before, after) {
+            return Err(ApiError::Forbidden(format!(
+                "{} on {kind} `{id}` may only be strengthened by an automation token: {}, \
+                 because {}; weaken it in the dashboard",
+                protection.fields.join(" / "),
+                protection.rule,
+                protection.why
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn basic_auth_weakened(before: &Route, after: &Route) -> bool {
+    let in_force =
+        before.basic_auth_username.is_some() && before.basic_auth_password_hash.is_some();
+    in_force
+        && (before.basic_auth_username != after.basic_auth_username
+            || before.basic_auth_password_hash != after.basic_auth_password_hash)
+}
+
+/// An allowlist or denylist entry as the proxy compiles it: a CIDR, or
+/// a bare address as its host network. `None` for what the proxy skips.
+fn listed_network(entry: &str) -> Option<ipnet::IpNet> {
+    let entry = entry.trim();
+    entry.parse::<ipnet::IpNet>().ok().or_else(|| {
+        entry
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(ipnet::IpNet::from)
+    })
+}
+
+/// Whether some network of `within` contains `net`.
+fn covered(net: &ipnet::IpNet, within: &[String]) -> bool {
+    within
+        .iter()
+        .filter_map(|entry| listed_network(entry))
+        .any(|outer| outer.contains(net))
+}
+
+/// An allowlist admits every address when empty and otherwise only
+/// what its parsed entries cover; an entry the proxy cannot parse
+/// admits nothing. Narrowed means every parsed entry after sits inside
+/// a parsed entry before.
+fn allowlist_weakened(before: &Route, after: &Route) -> bool {
+    if before.ip_allowlist.is_empty() {
+        return false;
+    }
+    after.ip_allowlist.is_empty()
+        || after
+            .ip_allowlist
+            .iter()
+            .filter_map(|entry| listed_network(entry))
+            .any(|net| !covered(&net, &before.ip_allowlist))
+}
+
+/// A denylist refuses what its parsed entries cover. Extended means
+/// every parsed entry before is covered by a parsed entry after.
+fn denylist_weakened(before: &Route, after: &Route) -> bool {
+    before
+        .ip_denylist
+        .iter()
+        .filter_map(|entry| listed_network(entry))
+        .any(|net| !covered(&net, &after.ip_denylist))
+}
+
+fn geoip_weakened(before: &Route, after: &Route) -> bool {
+    use lorica_config::models::GeoIpMode;
+    let Some(stored) = &before.geoip else {
+        return false;
+    };
+    let Some(patched) = &after.geoip else {
+        return true;
+    };
+    let listed = |countries: &[String], country: &str| {
+        countries.iter().any(|c| c.eq_ignore_ascii_case(country))
+    };
+    if stored.mode != patched.mode {
+        return true;
+    }
+    match stored.mode {
+        GeoIpMode::Allowlist => patched
+            .countries
+            .iter()
+            .any(|country| !listed(&stored.countries, country)),
+        GeoIpMode::Denylist => stored
+            .countries
+            .iter()
+            .any(|country| !listed(&patched.countries, country)),
+    }
+}
+
+fn bot_protection_weakened(before: &Route, after: &Route) -> bool {
+    before.bot_protection.is_some() && before.bot_protection != after.bot_protection
+}
+
+fn waf_switched_off(before: &Route, after: &Route) -> bool {
+    before.waf_enabled && !after.waf_enabled
+}
+
+fn waf_mode_weakened(before: &Route, after: &Route) -> bool {
+    use lorica_config::models::WafMode;
+    before.waf_mode == WafMode::Blocking && after.waf_mode != WafMode::Blocking
+}
+
+fn rate_limit_weakened(before: &Route, after: &Route) -> bool {
+    let Some(stored) = &before.rate_limit else {
+        return false;
+    };
+    let Some(patched) = &after.rate_limit else {
+        return true;
+    };
+    patched.capacity > stored.capacity
+        || patched.refill_per_sec > stored.refill_per_sec
+        || patched.scope != stored.scope
+}
+
+/// The legacy pair as the bucket the proxy builds from it, so a burst
+/// raised alone reads as the capacity it raises.
+fn legacy_rate_weakened(before: &Route, after: &Route) -> bool {
+    use lorica_config::models::RateLimit;
+    let Some(stored_rps) = before.rate_limit_rps else {
+        return false;
+    };
+    let Some(patched_rps) = after.rate_limit_rps else {
+        return true;
+    };
+    let stored = RateLimit::from_legacy(stored_rps, before.rate_limit_burst);
+    let patched = RateLimit::from_legacy(patched_rps, after.rate_limit_burst);
+    patched.capacity > stored.capacity || patched.refill_per_sec > stored.refill_per_sec
+}
+
+fn auto_ban_weakened(before: &Route, after: &Route) -> bool {
+    match (before.auto_ban_threshold, after.auto_ban_threshold) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(stored), Some(patched)) => patched > stored,
+    }
+}
+
+fn verification_switched_off(before: &Backend, after: &Backend) -> bool {
+    !before.tls_skip_verify && after.tls_skip_verify
+}
+
+fn upstream_tls_switched_off(before: &Backend, after: &Backend) -> bool {
+    before.tls_upstream && !after.tls_upstream
+}
+
+fn verified_name_changed(before: &Backend, after: &Backend) -> bool {
+    before.tls_upstream && !before.tls_skip_verify && before.tls_sni != after.tls_sni
+}
+
+/// The backend the management create would store with none of
+/// [`BACKEND_PROTECTIONS`]'s fields named: what a create is weighed
+/// against.
+fn as_created_by_default(requested: &Backend) -> Backend {
+    Backend {
+        tls_upstream: false,
+        tls_skip_verify: false,
+        tls_sni: None,
+        ..requested.clone()
+    }
 }
 
 /// A route write naming `certificate_id`, the empty string included,
@@ -605,10 +989,11 @@ fn ensure_preview_readable(
 }
 
 /// A row an environment owns is reachable exactly when the environment
-/// is, by the environment resource's own rule: a route delete that
-/// would cascade an environment is refused where the environment's
-/// delete would be. A mark whose environment row is gone owns nothing
-/// and refuses nothing; the hostname or address rule still applies.
+/// is, by the environment resource's own rules, the ownership rule and
+/// the `environment_protected` binding: a route delete that would
+/// cascade an environment is refused where the environment's delete
+/// would be. A mark whose environment row is gone owns nothing and
+/// refuses nothing; the hostname or address rule still applies.
 fn ensure_environment_granted(
     store: &ConfigStore,
     principal: &AutomationPrincipal,
@@ -619,12 +1004,25 @@ fn ensure_environment_granted(
     let Some(owned) = store.get_automation_environment(environment)? else {
         return Ok(());
     };
-    if caller_may_access(&owned, &principal.as_owner()) {
-        return Ok(());
+    if !caller_may_access(&owned, &principal.as_owner()) {
+        return Err(ApiError::Forbidden(format!(
+            "{kind} `{id}` belongs to an environment this token does not own"
+        )));
     }
-    Err(ApiError::Forbidden(format!(
-        "{kind} `{id}` belongs to an environment this token does not own"
-    )))
+    // An ID token bound to `environment_protected = true` writes the one
+    // environment its job deploys, on the environment resource and here
+    // alike: a route delete cascades its environment, so without this a
+    // job reached every other environment of its own project through
+    // the route path.
+    if principal.required_environment_slug.is_some()
+        && ensure_environment_binding(environment, principal).is_err()
+    {
+        return Err(ApiError::Forbidden(format!(
+            "{kind} `{id}` belongs to an environment other than the one this job deploys, and \
+             this credential is bound to environment_protected=true"
+        )));
+    }
+    Ok(())
 }
 
 /// The rule a stored route is held to before a token may act on it:
@@ -790,17 +1188,74 @@ fn route_guard(principal: &AutomationPrincipal) -> RouteGuard {
                 Some(&after.hostname),
                 Some(&after.hostname_aliases),
             )?;
+            ensure_new_certificate_granted(store, &principal, target.before, after)?;
+        }
+        if let (Some(before), Some(after)) = (target.before, target.after) {
+            ensure_not_weakened(ROUTE_PROTECTIONS, "route", &before.id, before, after)?;
         }
         ensure_new_links_granted(store, &principal, target)
     })
 }
 
+/// A certificate a route write binds anew, weighed as a renewal would
+/// weigh it: every name it covers, `domain` and each SAN, inside the
+/// hostname grant. Without this the grant said which routes a token
+/// may reach and nothing of which certificates it may deploy on them.
+///
+/// A binding the route already carries is not re-weighed, and an id
+/// naming no row reaches nothing: the store refuses it on apply. The
+/// refusal names the certificate by id and none of its names.
+fn ensure_new_certificate_granted(
+    store: &ConfigStore,
+    principal: &AutomationPrincipal,
+    before: Option<&Route>,
+    after: &Route,
+) -> Result<(), ApiError> {
+    let Some(id) = after.certificate_id.as_deref().filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    if before.and_then(|route| route.certificate_id.as_deref()) == Some(id) {
+        return Ok(());
+    }
+    let Some(certificate) = store.get_certificate(id)? else {
+        return Ok(());
+    };
+    if !certificate_names_granted(
+        principal,
+        &certificate.domain,
+        certificate.san_domains.iter().map(String::as_str),
+    ) {
+        return Err(ApiError::Forbidden(format!(
+            "certificate `{id}` covers a name outside this token's allowed_hostnames"
+        )));
+    }
+    Ok(())
+}
+
 /// The token's grant as the guard a backend write runs inside its
-/// store closure, on the row as stored and on the row as it would be.
+/// store closure, on the row as stored and on the row as it would be,
+/// and the direction each of [`BACKEND_PROTECTIONS`] may move between
+/// them, a create weighed against the backend the management create
+/// stores by default.
 fn backend_guard(principal: &AutomationPrincipal) -> BackendGuard {
     let principal = principal.clone();
-    BackendGuard::bounded(move |store, backend| {
-        ensure_backend_row_granted(store, &principal, backend)
+    BackendGuard::bounded(move |store, target| {
+        if let Some(before) = target.before {
+            ensure_backend_row_granted(store, &principal, before)?;
+        }
+        if let Some(after) = target.after {
+            ensure_backend_row_granted(store, &principal, after)?;
+            let created;
+            let before = match target.before {
+                Some(before) => before,
+                None => {
+                    created = as_created_by_default(after);
+                    &created
+                }
+            };
+            ensure_not_weakened(BACKEND_PROTECTIONS, "backend", &after.id, before, after)?;
+        }
+        Ok(())
     })
 }
 
@@ -834,9 +1289,10 @@ fn certificate_guard(principal: &AutomationPrincipal) -> CertificateGuard {
 /// audit row, naming the token. The hostname and every alias must be
 /// inside the token's `allowed_hostnames` (403), every backend the body
 /// links must sit inside its `allowed_backend_cidrs` and belong to no
-/// other principal's environment (403), `forward_auth`, `mirror`, `mtls`
-/// and `proxy_headers` are refused (403), and `certificate_id` needs
-/// `certificates:write` (403). With `?dry_run=true`, which needs
+/// other principal's environment (403), the fields of
+/// [`WITHHELD_ROUTE_FIELDS`] are refused (403), and `certificate_id`
+/// needs `certificates:write` and a certificate whose every name is
+/// inside the hostname grant (403). With `?dry_run=true`, which needs
 /// `routes:read` (403), the route it would have created, and nothing
 /// created.
 ///
@@ -854,12 +1310,7 @@ pub async fn create_route(
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::RoutesRead)?;
-    refuse_unbounded_reach(
-        body.forward_auth.is_some(),
-        body.mirror.is_some(),
-        body.mtls.is_some(),
-        body.proxy_headers.is_some(),
-    )?;
+    refuse_withheld(&body)?;
     ensure_certificate_binding_granted(&principal, body.certificate_id.as_deref())?;
     ensure_hostnames_granted(
         &principal,
@@ -888,8 +1339,10 @@ pub async fn create_route(
 /// hostname or an alias the patch names must be inside the grant too,
 /// every backend the patch links anew must sit inside
 /// `allowed_backend_cidrs` and belong to no other principal's
-/// environment, `forward_auth`, `mirror`, `mtls` and `proxy_headers` are
-/// refused, and `certificate_id` needs `certificates:write` (403 each). With
+/// environment, the fields of [`WITHHELD_ROUTE_FIELDS`] are refused, a
+/// control of [`ROUTE_PROTECTIONS`] may only be strengthened, and
+/// `certificate_id` needs `certificates:write` and a certificate whose
+/// every name is inside the hostname grant (403 each). With
 /// `?dry_run=true`, which needs `routes:read` (403), the route before
 /// and after the patch, and nothing changed.
 ///
@@ -908,12 +1361,7 @@ pub async fn update_route(
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::RoutesRead)?;
-    refuse_unbounded_reach(
-        body.forward_auth.is_some(),
-        body.mirror.is_some(),
-        body.mtls.is_some(),
-        body.proxy_headers.is_some(),
-    )?;
+    refuse_withheld(&body)?;
     ensure_certificate_binding_granted(&principal, body.certificate_id.as_deref())?;
     ensure_hostnames_granted(
         &principal,
@@ -976,9 +1424,11 @@ pub async fn delete_route(
 /// `PUT /api/v1/routes/{id}` would make, through the same function:
 /// the managed-row refusal (409) holds, and the empty string unbinds.
 /// The route named must be inside the token's `allowed_hostnames` on
-/// its current hostname and every current alias (403). Selecting a
-/// certificate is naming its id here; what the id names entered the
-/// node through the management API. With `?dry_run=true`, which needs
+/// its current hostname and every current alias (403), and so must
+/// every name the certificate covers, its `domain` and each SAN (403).
+/// Selecting a certificate is naming its id here; what the id names
+/// entered the node through the management API. With `?dry_run=true`,
+/// which needs
 /// `routes:read` since it answers the route (403), the route before
 /// and after the binding, and nothing bound.
 ///
@@ -1018,9 +1468,11 @@ pub async fn bind_certificate(
 /// The management backend create, as the token. The address must be an
 /// `ip:port` (422, since a name cannot be checked against a CIDR
 /// grant) inside the token's `allowed_backend_cidrs` (403), the same
-/// rule the environment resource applies to its backends. With
-/// `?dry_run=true`, which needs `backends:read` (403), the backend it
-/// would have created, and nothing created.
+/// rule the environment resource applies to its backends, and an
+/// unverified upstream (`tls_skip_verify`) is refused (403), the create
+/// weighed against [`BACKEND_PROTECTIONS`] from the management create's
+/// default. With `?dry_run=true`, which needs `backends:read` (403), the
+/// backend it would have created, and nothing created.
 ///
 /// # Errors
 ///
@@ -1037,8 +1489,14 @@ pub async fn create_backend(
     ensure_preview_readable(&principal, dry_run.mode(), AutomationScope::BackendsRead)?;
     ensure_backend_address_granted(&principal, "address", &body.address)?;
     let actor = audit_context(&principal, &connect_info, &headers);
-    let (status, answer) =
-        crate::backends::create_backend_as(&state, &actor, body, WriteMode::from(dry_run)).await?;
+    let (status, answer) = crate::backends::create_backend_as(
+        &state,
+        &actor,
+        body,
+        WriteMode::from(dry_run),
+        backend_guard(&principal),
+    )
+    .await?;
     Ok((status, redact::write_answer(answer, redact::backend_row)))
 }
 
@@ -1048,7 +1506,8 @@ pub async fn create_backend(
 /// refusal (409) included. The backend named must sit inside the
 /// token's `allowed_backend_cidrs` on its stored address and belong to
 /// no other principal's environment (403); an address the patch names
-/// is checked against the grant exactly as on create. With
+/// is checked against the grant exactly as on create, and a control of
+/// [`BACKEND_PROTECTIONS`] may only be strengthened (403). With
 /// `?dry_run=true`, which needs `backends:read` (403), the backend
 /// before and after the patch, and nothing changed.
 ///
@@ -1441,22 +1900,416 @@ mod tests {
     }
 
     #[test]
-    fn forward_auth_mirror_mtls_and_proxy_headers_are_refused_from_a_token_whatever_the_value() {
-        refuse_unbounded_reach(false, false, false, false).expect("no such field");
-        for (forward_auth, mirror, mtls, proxy_headers, field) in [
-            (true, false, false, false, "forward_auth"),
-            (false, true, false, false, "mirror"),
-            (false, false, true, false, "mtls"),
-            (false, false, false, true, "proxy_headers"),
-            (true, true, true, true, "forward_auth"),
-        ] {
-            match refuse_unbounded_reach(forward_auth, mirror, mtls, proxy_headers)
-                .expect_err(field)
-            {
-                ApiError::Forbidden(message) => assert!(message.starts_with(field), "{message}"),
-                other => panic!("{other:?}"),
+    fn every_withheld_field_is_refused_from_a_token_whatever_the_value() {
+        // Each entry of the table is sent alone, in a body read the way
+        // the handler reads it, on the create and on the update: the
+        // table is the one statement of what is withheld, and a name it
+        // gains with no field behind it turns this red rather than
+        // passing silently.
+        let empty: CreateRouteRequest =
+            serde_json::from_value(serde_json::json!({ "hostname": "a.review.example.com" }))
+                .expect("a minimal create");
+        refuse_withheld(&empty).expect("nothing withheld is sent");
+        refuse_withheld(&UpdateRouteRequest::default()).expect("nothing withheld is sent");
+        for (field, _) in WITHHELD_ROUTE_FIELDS {
+            assert!(empty.sends(field).is_some(), "{field}: no create field");
+            assert!(
+                UpdateRouteRequest::default().sends(field).is_some(),
+                "{field}: no update field"
+            );
+            let value = match *field {
+                "basic_auth_password" => serde_json::json!(""),
+                "proxy_headers" => serde_json::json!({}),
+                "forward_auth" => serde_json::json!({ "address": "" }),
+                "mirror" => serde_json::json!({ "backend_ids": [] }),
+                "mtls" => serde_json::json!({ "ca_cert_pem": "" }),
+                other => panic!("{other}: give this test a clearing value for it"),
+            };
+            let create: CreateRouteRequest = serde_json::from_value(serde_json::json!({
+                "hostname": "a.review.example.com",
+                *field: value.clone(),
+            }))
+            .unwrap_or_else(|e| panic!("{field}: {e}"));
+            let update: UpdateRouteRequest =
+                serde_json::from_value(serde_json::json!({ *field: value }))
+                    .unwrap_or_else(|e| panic!("{field}: {e}"));
+            for refused in [refuse_withheld(&create), refuse_withheld(&update)] {
+                match refused.expect_err(field) {
+                    ApiError::Forbidden(message) => {
+                        assert!(message.starts_with(field), "{message}")
+                    }
+                    other => panic!("{other:?}"),
+                }
             }
         }
+    }
+
+    /// A stored route with every protection at its create default.
+    fn stored_route() -> Route {
+        serde_json::from_value(serde_json::json!({
+            "id": "r-1",
+            "hostname": "pr-42.review.example.com",
+            "path_prefix": "/",
+            "load_balancing": "round_robin",
+            "waf_enabled": false,
+            "waf_mode": "detection",
+            "enabled": true,
+            "created_at": "2026-09-30T00:00:00Z",
+            "updated_at": "2026-09-30T00:00:00Z",
+        }))
+        .expect("a minimal route")
+    }
+
+    /// Whether the guard's direction rules accept `after` over `before`.
+    fn route_move(before: &Route, after: &Route) -> Result<(), ApiError> {
+        ensure_not_weakened(ROUTE_PROTECTIONS, "route", &before.id, before, after)
+    }
+
+    /// The route `edit` makes of the stored row `base`.
+    fn edited(base: &Route, edit: impl FnOnce(&mut Route)) -> Route {
+        let mut route = base.clone();
+        edit(&mut route);
+        route
+    }
+
+    /// `strong` over `weak` is accepted, `weak` over `strong` refused
+    /// naming `field` and echoing no value of either.
+    fn only_strengthens(weak: &Route, strong: &Route, field: &str) {
+        route_move(weak, strong).unwrap_or_else(|e| panic!("{field} strengthened: {e:?}"));
+        route_move(strong, strong).unwrap_or_else(|e| panic!("{field} unchanged: {e:?}"));
+        match route_move(strong, weak).expect_err(field) {
+            ApiError::Forbidden(message) => {
+                assert!(message.starts_with(field), "{message}");
+                assert!(message.contains("dashboard"), "{message}");
+                assert!(!message.contains("192.0.2"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_route_protection_moves_toward_stronger_and_never_back() {
+        let base = stored_route();
+        let with = |edit: fn(&mut Route)| edited(&base, edit);
+
+        only_strengthens(
+            &base,
+            &with(|r| {
+                r.basic_auth_username = Some("ops".into());
+                r.basic_auth_password_hash = Some("$argon2id$stored".into());
+            }),
+            "basic_auth_username",
+        );
+        let protected = with(|r| {
+            r.basic_auth_username = Some("ops".into());
+            r.basic_auth_password_hash = Some("$argon2id$stored".into());
+        });
+        route_move(
+            &protected,
+            &edited(&protected, |r| r.basic_auth_username = Some("guest".into())),
+        )
+        .expect_err("a renamed credential");
+        // A username with no password stored is not a credential in
+        // force: setting or clearing it weakens nothing.
+        let inert = with(|r| r.basic_auth_username = Some("ops".into()));
+        route_move(&inert, &base).expect("no Basic auth was in force");
+
+        only_strengthens(
+            &with(|r| r.ip_allowlist = vec!["10.0.0.0/8".into()]),
+            &with(|r| r.ip_allowlist = vec!["10.1.0.0/16".into(), "10.2.0.7".into()]),
+            "ip_allowlist",
+        );
+        only_strengthens(
+            &base,
+            &with(|r| r.ip_allowlist = vec!["192.0.2.0/24".into()]),
+            "ip_allowlist",
+        );
+        route_move(
+            &with(|r| r.ip_allowlist = vec!["10.0.0.0/8".into()]),
+            &with(|r| r.ip_allowlist = vec!["10.0.0.0/8".into(), "192.0.2.0/24".into()]),
+        )
+        .expect_err("an allowlist widened");
+
+        only_strengthens(
+            &with(|r| r.ip_denylist = vec!["192.0.2.10".into()]),
+            &with(|r| r.ip_denylist = vec!["192.0.2.0/24".into(), "198.51.100.0/24".into()]),
+            "ip_denylist",
+        );
+
+        only_strengthens(
+            &with(|r| {
+                r.geoip = Some(lorica_config::models::GeoIpConfig {
+                    mode: lorica_config::models::GeoIpMode::Allowlist,
+                    countries: vec!["FR".into(), "DE".into()],
+                })
+            }),
+            &with(|r| {
+                r.geoip = Some(lorica_config::models::GeoIpConfig {
+                    mode: lorica_config::models::GeoIpMode::Allowlist,
+                    countries: vec!["FR".into()],
+                })
+            }),
+            "geoip",
+        );
+        only_strengthens(
+            &base,
+            &with(|r| {
+                r.geoip = Some(lorica_config::models::GeoIpConfig {
+                    mode: lorica_config::models::GeoIpMode::Denylist,
+                    countries: vec!["XX".into()],
+                })
+            }),
+            "geoip",
+        );
+        route_move(
+            &with(|r| {
+                r.geoip = Some(lorica_config::models::GeoIpConfig {
+                    mode: lorica_config::models::GeoIpMode::Denylist,
+                    countries: vec!["XX".into()],
+                })
+            }),
+            &with(|r| {
+                r.geoip = Some(lorica_config::models::GeoIpConfig {
+                    mode: lorica_config::models::GeoIpMode::Allowlist,
+                    countries: vec!["FR".into()],
+                })
+            }),
+        )
+        .expect_err("a mode switched");
+
+        let challenged = with(|r| {
+            r.bot_protection = serde_json::from_value(serde_json::json!({ "mode": "cookie" }))
+                .expect("a bot-protection config");
+        });
+        only_strengthens(&base, &challenged, "bot_protection");
+        let bypassed = edited(&challenged, |r| {
+            if let Some(config) = r.bot_protection.as_mut() {
+                config.bypass.ip_cidrs.push("0.0.0.0/0".into());
+            }
+        });
+        route_move(&challenged, &bypassed).expect_err("a bypass added");
+
+        only_strengthens(&base, &with(|r| r.waf_enabled = true), "waf_enabled");
+        only_strengthens(
+            &base,
+            &with(|r| r.waf_mode = lorica_config::models::WafMode::Blocking),
+            "waf_mode",
+        );
+
+        let bucket = |capacity: u32, refill_per_sec: u32| lorica_config::models::RateLimit {
+            capacity,
+            refill_per_sec,
+            scope: lorica_config::models::RateLimitScope::PerIp,
+        };
+        only_strengthens(
+            &edited(&base, |r| r.rate_limit = Some(bucket(100, 10))),
+            &edited(&base, |r| r.rate_limit = Some(bucket(50, 5))),
+            "rate_limit",
+        );
+        only_strengthens(
+            &base,
+            &edited(&base, |r| r.rate_limit = Some(bucket(100, 10))),
+            "rate_limit",
+        );
+
+        only_strengthens(
+            &with(|r| r.rate_limit_rps = Some(100)),
+            &with(|r| r.rate_limit_rps = Some(10)),
+            "rate_limit_rps",
+        );
+        route_move(
+            &with(|r| r.rate_limit_rps = Some(10)),
+            &with(|r| {
+                r.rate_limit_rps = Some(10);
+                r.rate_limit_burst = Some(1_000);
+            }),
+        )
+        .expect_err("a burst raised alone raises the capacity");
+        only_strengthens(
+            &base,
+            &with(|r| r.rate_limit_rps = Some(10)),
+            "rate_limit_rps",
+        );
+
+        only_strengthens(
+            &with(|r| r.auto_ban_threshold = Some(50)),
+            &with(|r| r.auto_ban_threshold = Some(5)),
+            "auto_ban_threshold",
+        );
+        only_strengthens(
+            &base,
+            &with(|r| r.auto_ban_threshold = Some(5)),
+            "auto_ban_threshold",
+        );
+    }
+
+    #[test]
+    fn a_route_field_outside_the_protections_moves_either_way() {
+        // The rules bound the controls they name and nothing else: a
+        // model still turns maintenance on and off, moves a timeout
+        // both ways and edits the routing.
+        let base = stored_route();
+        let moved = edited(&base, |r| {
+            r.maintenance_mode = true;
+            r.read_timeout_s = 5;
+            r.enabled = false;
+            r.redirect_to = Some("https://pr-43.review.example.com".into());
+        });
+        route_move(&base, &moved).expect("either way");
+        route_move(&moved, &base).expect("either way");
+    }
+
+    /// A stored backend inside the grant, plain HTTP.
+    fn stored_backend() -> Backend {
+        Backend {
+            id: "b-1".to_string(),
+            address: "10.0.0.10:8443".to_string(),
+            name: String::new(),
+            group_name: String::new(),
+            weight: 1,
+            health_status: lorica_config::models::HealthStatus::Unknown,
+            health_check_enabled: false,
+            health_check_interval_s: 10,
+            health_check_path: None,
+            lifecycle_state: lorica_config::models::LifecycleState::Normal,
+            active_connections: 0,
+            tls_upstream: false,
+            tls_skip_verify: false,
+            tls_sni: None,
+            h2_upstream: false,
+            managed_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_backend_trust_setting_moves_toward_stronger_and_never_back() {
+        let store = ConfigStore::open_in_memory().expect("store");
+        let guard = backend_guard(&principal());
+        let check = |before: Option<&Backend>, after: &Backend| {
+            guard.check(
+                &store,
+                crate::target::BackendTarget {
+                    before,
+                    after: Some(after),
+                },
+            )
+        };
+        let refused_naming = |result: Result<(), ApiError>, field: &str| match result {
+            Err(ApiError::Forbidden(message)) => assert!(message.starts_with(field), "{message}"),
+            other => panic!("{field}: {other:?}"),
+        };
+        let plain = stored_backend();
+        let verified = Backend {
+            tls_upstream: true,
+            tls_sni: Some("api.review.example.com".into()),
+            ..stored_backend()
+        };
+        let unverified = Backend {
+            tls_skip_verify: true,
+            ..verified.clone()
+        };
+
+        check(Some(&plain), &verified).expect("TLS turned on, verified");
+        check(Some(&unverified), &verified).expect("verification turned on");
+        refused_naming(check(Some(&verified), &unverified), "tls_skip_verify");
+        refused_naming(check(Some(&verified), &plain), "tls_upstream");
+        refused_naming(
+            check(
+                Some(&verified),
+                &Backend {
+                    tls_sni: Some("elsewhere.example.net".into()),
+                    ..verified.clone()
+                },
+            ),
+            "tls_sni",
+        );
+        check(
+            Some(&unverified),
+            &Backend {
+                tls_sni: Some("elsewhere.example.net".into()),
+                ..unverified.clone()
+            },
+        )
+        .expect("an unverified leg verifies no name, so its SNI moves freely");
+
+        // A create is weighed against the management create's default,
+        // which verifies whenever TLS is on.
+        check(None, &verified).expect("a verified create");
+        check(None, &plain).expect("a plain create");
+        refused_naming(check(None, &unverified), "tls_skip_verify");
+
+        // The management plane is not bounded by any of it.
+        crate::target::BackendGuard::unbounded()
+            .check(
+                &store,
+                crate::target::BackendTarget {
+                    before: Some(&verified),
+                    after: Some(&unverified),
+                },
+            )
+            .expect("an operator moves it either way");
+    }
+
+    #[test]
+    fn a_bound_job_reaches_only_its_own_environment_through_the_route_path() {
+        // `environment_protected = true` binds a job to the environment
+        // it deploys. A route delete cascades its environment, so the
+        // route path is held to the same binding as the environment
+        // path: the job's own environment is reachable, a sibling of
+        // the same project is not.
+        use lorica_config::models::{
+            AutomationEnvironment, CertificateMode, EnvironmentOwner, OwnerKind,
+        };
+        let store = ConfigStore::open_in_memory().expect("store");
+        let now = chrono::Utc::now();
+        for (name, route_id) in [("review-mr-42", "r-42"), ("review-mr-43", "r-43")] {
+            let mut route = stored_route();
+            route.id = route_id.to_string();
+            route.hostname = format!("{name}.review.example.com");
+            store.create_route(&route).expect("the route lands");
+            store
+                .upsert_automation_environment(&AutomationEnvironment {
+                    name: name.to_string(),
+                    route_id: route_id.to_string(),
+                    owner: EnvironmentOwner {
+                        kind: OwnerKind::OidcProject,
+                        principal: "acme/web".to_string(),
+                    },
+                    certificate_mode: CertificateMode::Auto,
+                    labels: std::collections::BTreeMap::new(),
+                    expires_at: now + chrono::Duration::hours(1),
+                    created_at: now,
+                    updated_at: now,
+                    last_pipeline: None,
+                    pipeline: None,
+                })
+                .expect("the environment lands");
+        }
+        let job = AutomationPrincipal {
+            kind: OwnerKind::OidcProject,
+            principal: "acme/web".to_string(),
+            required_environment_slug: Some("review-mr-42".to_string()),
+            ..principal()
+        };
+        ensure_environment_granted(&store, &job, "review-mr-42", "route", "r-42")
+            .expect("the job's own environment");
+        match ensure_environment_granted(&store, &job, "review-mr-43", "route", "r-43")
+            .expect_err("a sibling environment of the same project")
+        {
+            ApiError::Forbidden(message) => {
+                assert!(message.contains("r-43"), "{message}");
+                assert!(message.contains("environment_protected"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let unbound = AutomationPrincipal {
+            required_environment_slug: None,
+            ..job
+        };
+        ensure_environment_granted(&store, &unbound, "review-mr-43", "route", "r-43")
+            .expect("an unbound credential of the owner reaches every environment it owns");
     }
 
     #[test]
@@ -1559,7 +2412,13 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         let refused = backend_guard(&any_v6)
-            .check(&store, &stored)
+            .check(
+                &store,
+                crate::target::BackendTarget {
+                    before: Some(&stored),
+                    after: None,
+                },
+            )
             .expect_err("the stored row is weighed the same way");
         assert!(matches!(refused, ApiError::Forbidden(_)), "{refused:?}");
     }
@@ -1652,7 +2511,13 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         let refused = backend_guard(&empty)
-            .check(&store, &stored)
+            .check(
+                &store,
+                crate::target::BackendTarget {
+                    before: Some(&stored),
+                    after: None,
+                },
+            )
             .expect_err("a stored backend is outside an empty grant");
         assert!(matches!(refused, ApiError::Forbidden(_)), "{refused:?}");
     }
@@ -1797,6 +2662,24 @@ mod tests {
                     setting.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_retention_ceiling_is_ten_times_the_shipped_default() {
+        let defaults = lorica_config::models::GlobalSettings::default();
+        for shipped in [defaults.access_log_retention, defaults.waf_event_retention] {
+            assert_eq!(RETENTION_TIER_CEILING_ROWS, shipped * 10);
+        }
+        for name in ["access_log_retention", "waf_event_retention"] {
+            let setting = admin_setting(name).expect("allowlisted");
+            assert_eq!(setting.max, RETENTION_TIER_CEILING_ROWS, "{name}");
+            assert!(
+                setting
+                    .refusal(1_000, RETENTION_TIER_CEILING_ROWS + 1)
+                    .is_some(),
+                "{name} above the ceiling"
+            );
         }
     }
 

@@ -184,9 +184,27 @@ fn record_served_certificate(data_dir: &Path, cert_pem: &str) -> Result<(), Mana
     Ok(())
 }
 
+/// Serialises [`load_or_generate_self_signed`] across the process.
+///
+/// The management listener and the automation listener both load the
+/// pair, and at first boot or at rotation both found it missing, each
+/// generated its own, and their two plain writes interleaved into cert
+/// A beside key B on disk. Each listener served its in-memory pair, so
+/// that boot was fine; the next one reused the mismatched files, which
+/// no TLS stack accepts, and the management API failed on every start
+/// until someone deleted them. One generator at a time means the second
+/// caller reads the pair the first one wrote.
+static SELF_SIGNED_PAIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Reuse the persisted self-signed leaf, or (re)generate it when it is
-/// missing, unparseable, or within [`ROTATE_WITHIN_DAYS`] of expiry.
+/// missing, unparseable, within [`ROTATE_WITHIN_DAYS`] of expiry, or not
+/// the certificate of the persisted key.
 fn load_or_generate_self_signed(data_dir: &Path) -> Result<(String, String), ManagementTlsError> {
+    // A poisoned lock only means another caller panicked mid-write, and
+    // the mismatch check below is what repairs a half-written pair.
+    let _one_generator = SELF_SIGNED_PAIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir: PathBuf = data_dir.join("management");
     let cert_path: PathBuf = dir.join("cert.pem");
     let key_path: PathBuf = dir.join("key.pem");
@@ -195,7 +213,7 @@ fn load_or_generate_self_signed(data_dir: &Path) -> Result<(String, String), Man
         std::fs::read_to_string(&cert_path),
         std::fs::read_to_string(&key_path),
     ) {
-        if !needs_rotation(&cert_pem) {
+        if !needs_rotation(&cert_pem) && pair_matches(&cert_pem, &key_pem) {
             info!(
                 path = %cert_path.display(),
                 "management API reusing persisted self-signed certificate"
@@ -215,6 +233,24 @@ fn load_or_generate_self_signed(data_dir: &Path) -> Result<(String, String), Man
         "management API generated a new self-signed certificate"
     );
     Ok((cert_pem, key_pem))
+}
+
+/// Whether `cert_pem` is the certificate of `key_pem`: its public key is
+/// the key's. `false` for either half that does not parse, so a pair a
+/// crash or a race left half-written is regenerated rather than served.
+fn pair_matches(cert_pem: &str, key_pem: &str) -> bool {
+    use rcgen::PublicKeyData;
+    let Ok(key) = rcgen::KeyPair::from_pem(key_pem) else {
+        return false;
+    };
+    x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
+        .ok()
+        .and_then(|(_, pem)| {
+            pem.parse_x509()
+                .ok()
+                .map(|cert| cert.public_key().raw == key.subject_public_key_info().as_slice())
+        })
+        .unwrap_or(false)
 }
 
 /// `true` when the persisted certificate should be regenerated: it does
@@ -417,6 +453,49 @@ mod tests {
     #[test]
     fn garbage_pem_is_flagged_for_rotation() {
         assert!(needs_rotation("not a certificate"));
+    }
+
+    #[test]
+    fn two_listeners_loading_at_once_share_one_persisted_pair() {
+        // The management and the automation listener both load the pair
+        // at first boot; interleaved, they left cert A beside key B.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let loaders: Vec<_> = (0..8)
+            .map(|_| {
+                let data_dir = dir.path().to_path_buf();
+                std::thread::spawn(move || load_or_generate_self_signed(&data_dir))
+            })
+            .collect();
+        let pairs: Vec<(String, String)> = loaders
+            .into_iter()
+            .map(|loader| loader.join().expect("a loader").expect("a pair"))
+            .collect();
+        assert!(pairs.windows(2).all(|two| two[0] == two[1]), "one pair");
+        let management = dir.path().join("management");
+        let cert = std::fs::read_to_string(management.join("cert.pem")).expect("cert");
+        let key = std::fs::read_to_string(management.join("key.pem")).expect("key");
+        assert!(pair_matches(&cert, &key), "the persisted pair matches");
+        assert_eq!((cert, key), pairs[0].clone());
+    }
+
+    #[test]
+    fn a_persisted_certificate_beside_another_key_is_regenerated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_a, _) = generate_self_signed(SELF_SIGNED_VALIDITY_DAYS).expect("A");
+        let (_, key_b) = generate_self_signed(SELF_SIGNED_VALIDITY_DAYS).expect("B");
+        assert!(!pair_matches(&cert_a, &key_b));
+        let management = dir.path().join("management");
+        persist_self_signed(
+            &management,
+            &management.join("cert.pem"),
+            &management.join("key.pem"),
+            &cert_a,
+            &key_b,
+        )
+        .expect("the mismatched pair lands");
+        let (cert, key) = load_or_generate_self_signed(dir.path()).expect("a pair");
+        assert_ne!(cert, cert_a, "the mismatched certificate was reused");
+        assert!(pair_matches(&cert, &key));
     }
 
     #[test]

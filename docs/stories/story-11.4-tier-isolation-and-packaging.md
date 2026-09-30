@@ -666,6 +666,23 @@ ownership is kept outside the repository for the maintainer to publish.
   `docs/architecture/component-architecture.md`, `CHANGELOG.md`,
   `README.md`. The skill copy of the bump checklist listed under Lot A is
   git-ignored and local to the clone.
+- Backlog #90: `lorica/src/cli_client.rs` (new),
+  `lorica-api/src/management_tls.rs`, `lorica-api/src/server.rs`,
+  `docs/security.md`, `tests-e2e-docker/docker-compose.yml`.
+- Pre-merge audit fixes, automation plane (2026-09-30):
+  `lorica-api/src/automation/{write,read,audit,auth,environments,mcp,router,scope}.rs`,
+  `lorica-api/src/automation/environments/tests.rs`,
+  `lorica-api/src/automation/oidc/{mod,replay,jwks,tests,test_support}.rs`,
+  `lorica-api/src/{target,db,audit,log_store,logs,sla,backends,settings,management_tls,tests}.rs`,
+  `lorica-api/src/routes/crud.rs`, `lorica-api/src/acme/renewal.rs`,
+  `lorica-api/tests/{openapi_contract,mcp_asserted_headers,automation_scope_fixture}.rs`,
+  `lorica-api/openapi-automation.yaml`,
+  `lorica-config/src/models/automation_token.rs`, `lorica-mcp/src/tools.rs`,
+  `docs/mcp.md`, `docs/automation.md`, `docs/security.md`,
+  `docs/security/threat-model.md`, `docs/security/hardening-guide.md`,
+  `docs/installation.md`, `docs/hot-upgrade.md`, `docs/backlog.md`,
+  `docs/architecture/{source-tree,component-architecture,api-design-and-integration}.md`,
+  `CHANGELOG.md`, `README.md`.
 
 ## Change Log
 
@@ -712,3 +729,28 @@ ownership is kept outside the repository for the maintainer to publish.
   password to a peer presenting another one; a caller who cannot read
   the record is refused. The `mcp` e2e smoke mounts the node's data
   directory read-only so its real minting commands keep running.
+- 2026-09-30: Pre-merge audit fixes, automation plane (six audits over
+  the release branch). Safe direction only on the config tier (the
+  maintainer's decision of the day): `ROUTE_PROTECTIONS` and
+  `BACKEND_PROTECTIONS` in `automation/write.rs`, weighed in the guard
+  on the stored row against the row to be written, previews included;
+  `basic_auth_password` joins the withheld route fields, declared once
+  as `WITHHELD_ROUTE_FIELDS` with their reasons; the Basic-auth username
+  leaves the tools. A certificate a route write binds anew is weighed
+  against the hostname grant; the `environment_protected` binding holds
+  on the route path. Each automation request, its audit row and the
+  post-commit tail of the write it carries run as a task the connection
+  does not own, and the dashboard's shared write bodies the same way; a
+  quarter of the audit queue is kept from read and refused rows. The
+  OIDC replay set keeps an id until `exp` plus the leeway, and JWKS keys
+  published for another use or algorithm are left out; an ID token never
+  carries `settings:write`. Write and MCP budgets are keyed per issuer
+  entry and project. The retention ceiling of the admin tier is ten
+  times the shipped default. The route listing reads its links in one
+  query and pages before building views, the SLA overview skips the
+  routes before its window, and the log read skips the match count.
+  `READ_SURFACE` is held to the router by a test. The self-signed pair
+  is generated once per process and a mismatched pair regenerated.
+  `[Unreleased]` rewritten as the release's final state. Deferred items
+  are backlog #91 to #95. The CLI, packaging and CI findings were fixed
+  in a separate pass.

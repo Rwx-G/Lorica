@@ -102,33 +102,37 @@ fn mint_tier(
     mint: impl FnOnce(&serde_json::Value) -> serde_json::Value,
 ) -> Result<(String, String), String> {
     let tier = request.tier;
-    let scopes = scopes_of(tier);
-    cli_automation::grants_refusal(&scopes, &request.hostnames, &request.backend_cidrs)?;
     let lifetime_days = request
         .lifetime_days
         .unwrap_or_else(|| tier.default_lifetime_days());
-    let name = request.name.clone().unwrap_or_else(|| default_name(tier));
-    let body = cli_automation::mint_request_body(
-        &name,
-        &scopes,
+    let (stdout, mut stderr) = cli_automation::mint_token(&minted_as(request), mint)?;
+    stderr.push_str(&blast_radius(
+        tier,
         &request.hostnames,
         &request.backend_cidrs,
-        None,
-        Some(lifetime_days),
-    );
-    let data = mint(&body);
-    let stdout = format!("{}\n", cli_automation::minted_token(&data));
-    let stderr = format!(
-        "{}\n{}\n",
-        cli_automation::minted_notice(&data),
-        blast_radius(
-            tier,
-            &request.hostnames,
-            &request.backend_cidrs,
-            lifetime_days
-        )
-    );
+        lifetime_days,
+    ));
+    stderr.push('\n');
     Ok((stdout, stderr))
+}
+
+/// The `automation token create` request a tier mint is: the tier's
+/// scopes, its default label and lifetime where none was named, and
+/// never a per-request TTL.
+fn minted_as(request: &TierMint) -> cli_automation::TokenMint {
+    let tier = request.tier;
+    cli_automation::TokenMint {
+        name: request.name.clone().unwrap_or_else(|| default_name(tier)),
+        scopes: scopes_of(tier),
+        hostnames: request.hostnames.clone(),
+        backend_cidrs: request.backend_cidrs.clone(),
+        max_ttl_seconds: None,
+        lifetime_days: Some(
+            request
+                .lifetime_days
+                .unwrap_or_else(|| tier.default_lifetime_days()),
+        ),
+    }
 }
 
 /// The label a token gets when `--name` is not given.
@@ -268,14 +272,14 @@ mod tests {
             let sent = RefCell::new(None);
             mint_tier(&request, minting(&sent)).expect("the grants fit the tier");
             let body = sent.into_inner().expect("the mint ran");
-            let expected = cli_automation::mint_request_body(
-                &default_name(tier),
-                &scopes_of(tier),
-                &request.hostnames,
-                &request.backend_cidrs,
-                None,
-                Some(tier.default_lifetime_days()),
-            );
+            let expected = cli_automation::mint_request_body(&cli_automation::TokenMint {
+                name: default_name(tier),
+                scopes: scopes_of(tier),
+                hostnames: request.hostnames.clone(),
+                backend_cidrs: request.backend_cidrs.clone(),
+                max_ttl_seconds: None,
+                lifetime_days: Some(tier.default_lifetime_days()),
+            });
             assert_eq!(body, expected, "{tier}");
             assert!(body.get("max_ttl_seconds").is_none());
         }

@@ -248,10 +248,13 @@ fn plane_routes() -> Router {
 /// rather than per address: a model in a retry loop or a leaked token
 /// spends its own window and nobody else's. The settings write keeps
 /// the dashboard's own figure for it; every other write shares the
-/// figure the dashboard gives route writes. The MCP endpoint is not a
-/// write here: its tool calls come back through [`in_process_router`],
-/// where this same budget weighs each write they make, beside the
-/// endpoint's own invocation budget.
+/// figure the dashboard gives route writes. "Credential" is
+/// [`AutomationPrincipal::budget_key`]: a static token, or one project
+/// under an OIDC issuer entry, never the whole entry. The environment
+/// resource's writes are budgeted here too, since 1.9.0. The MCP
+/// endpoint is not a write here: its tool calls come back through
+/// [`in_process_router`], where this same budget weighs each write they
+/// make, beside the endpoint's own invocation budget.
 fn write_budget(method: &http::Method, path: &str) -> Option<(&'static str, u32)> {
     if *method == http::Method::GET || *method == http::Method::HEAD {
         return None;
@@ -281,7 +284,7 @@ async fn budget_writes(
         .automation_writes
         .check_bucket(
             bucket,
-            &principal.grant_id,
+            &principal.budget_key(),
             limit,
             crate::server::RL_WINDOW_S,
         )

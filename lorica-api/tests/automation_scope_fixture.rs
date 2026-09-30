@@ -2,7 +2,7 @@
 //! scope vocabulary.
 //!
 //! Every other restatement of that vocabulary is pinned inside one
-//! language: `scope_str`, `scope_wire_name` and the published audit
+//! language: `AutomationScope::as_str` and the published audit
 //! reasons are each walked against `AutomationScope::ALL` by a Rust
 //! test, and `AutomationTokensTab` derives its create form from the
 //! generated file this test reads. The edge between the two languages

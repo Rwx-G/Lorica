@@ -1,8 +1,10 @@
 # Installation
 
-Lorica ships as a single static binary plus a hardened systemd unit. The
-`.deb` (Debian/Ubuntu) and `.rpm` (Fedora/RHEL) packages install the
-binary at `/usr/bin/lorica`, the unit at
+Lorica ships as a binary plus a hardened systemd unit. The `.deb`
+(Debian/Ubuntu) and `.rpm` (Fedora/RHEL) packages install the binary at
+`/usr/bin/lorica` and, since v1.9.0, the management MCP server at
+`/usr/bin/lorica-mcp`, which no unit starts: an MCP client launches it
+over stdio for one session (`docs/mcp.md`). They install the unit at
 `/lib/systemd/system/lorica.service` (`.rpm`:
 `/usr/lib/systemd/system/lorica.service`), create a dedicated unprivileged
 `lorica` user, and own the data directory `/var/lib/lorica`.
@@ -66,6 +68,16 @@ configuration store is open, the log level saved in Settings replaces
 it in every Lorica process, the supervisor and each worker, and a
 change saved there applies without a restart. `RUST_LOG`, when set,
 takes precedence over both and is never replaced.
+
+## Upgrading a .deb from 1.8.0 or earlier
+
+Every .deb up to 1.8.0 recorded the CI build account as the owner of
+its files. Upgrading on a host where that left files owned by another
+account resets them to root and leaves Lorica stopped, listing what
+it repaired. Run `dpkg --verify lorica`, inspect the listed
+directories and `/etc/systemd/system`, then
+`systemctl daemon-reload && systemctl enable --now lorica`. On a host
+where nothing needed repairing the upgrade restarts Lorica as usual.
 
 ## systemd unit
 

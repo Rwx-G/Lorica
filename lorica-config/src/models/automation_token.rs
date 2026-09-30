@@ -137,9 +137,10 @@ fn default_max_ttl_seconds() -> u32 {
 /// ```
 // The serde renames below are this vocabulary's source of truth. The
 // surfaces named here carry the same strings and none of them is
-// maintained from memory: `scope_str` (`lorica-api/src/automation/scope.rs`,
-// the string an operator reads in a 403 and in an audit row) is
-// asserted against these renames by a test that walks `ALL`;
+// maintained from memory: `AutomationScope::as_str` below (the string
+// an operator reads in a 403 and in an audit row, which
+// `lorica-api`'s `scope_str` returns) is asserted against these
+// renames by a test that walks `ALL`;
 // `AUTOMATION_AUDIT_REASONS` publishes them as refusal reasons under
 // the same walk; the two OpenAPI documents restate the enum and are
 // read by `lorica-api/tests/openapi_contract.rs`; and
@@ -199,8 +200,8 @@ impl AutomationScope {
     /// Every variant, in declaration order.
     ///
     /// The one place anything that has to walk the vocabulary reads it
-    /// from, so that the surfaces restating the spellings (the two
-    /// `scope_str` / `scope_wire_name` matches, the published audit
+    /// from, so that the surfaces restating the spellings (the
+    /// [`AutomationScope::as_str`] match, the published audit
     /// reasons, the dashboard's generated fixture) are each checked
     /// against the enum instead of against somebody's memory of it. A
     /// variant added above and not here fails

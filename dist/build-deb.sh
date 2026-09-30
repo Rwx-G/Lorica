@@ -110,8 +110,17 @@ fi
 # (/usr/share/doc/lorica, and /lib/systemd/system on a host where lorica
 # created it). Every path this package ships outside its data directory
 # belongs to root, so any other owner found here is that defect. Only the
-# offending entries are touched, which keeps this a no-op on a clean host.
-dpkg-query -L lorica | while IFS= read -r path; do
+# offending entries are touched, which keeps this a no-op on a clean host,
+# and each one is printed below.
+#
+# The file list is read first and on its own: /bin/sh has no pipefail, so
+# a failing dpkg-query piped into the loop would read as nothing to repair.
+package_paths=$(dpkg-query -L lorica) || {
+    echo "lorica: cannot list the package's files (dpkg-query -L lorica)," \
+        "so their ownership cannot be checked" >&2
+    exit 1
+}
+repaired=$(printf '%s\n' "$package_paths" | while IFS= read -r path; do
     case "$path" in
         /var/lib/lorica|/var/lib/lorica/*) continue ;;
     esac
@@ -123,7 +132,8 @@ dpkg-query -L lorica | while IFS= read -r path; do
     elif [ -f "$path" ] && [ ! -L "$path" ]; then
         chmod go-w "$path"
     fi
-done
+    printf '%s\n' "$path"
+done)
 
 # Set permissions
 chown -R lorica:lorica /var/lib/lorica
@@ -142,6 +152,38 @@ fi
 chown lorica:lorica /var/lib/lorica/exported-certs
 chmod 750 /var/lib/lorica/exported-certs
 
+# A repaired host is left stopped. While those paths belonged to another
+# account, that account could change them or plant entries beside them
+# that no package lists: a unit, a lorica.service.d drop-in, a generator.
+# A daemon-reload or a restart here would load and run them as root before
+# the operator could look. The previous package's prerm already stopped
+# the service, so it stays stopped until the operator starts it.
+if [ -n "$repaired" ]; then
+    echo ""
+    echo "  ================================================"
+    echo "  WARNING: lorica was NOT started."
+    echo "  "
+    echo "  This upgrade reset to root the owner of these paths,"
+    echo "  which a package built before 1.9.0 had left owned by"
+    echo "  the account that built it:"
+    printf '%s\n' "$repaired" | sed 's/^/    /'
+    echo "  "
+    echo "  Until now that account could change them, and add"
+    echo "  files beside them that no package lists. Before"
+    echo "  starting the service:"
+    echo "    1. sudo dpkg --verify lorica"
+    echo "       (no output: the packaged files are as shipped)"
+    echo "    2. look in the directories above, and in"
+    echo "       /etc/systemd/system, for units, drop-ins or"
+    echo "       generators you did not create"
+    echo "    3. then start it:"
+    echo "       sudo systemctl daemon-reload"
+    echo "       sudo systemctl enable --now lorica.service"
+    echo "  ================================================"
+    echo ""
+    exit 0
+fi
+
 # Enable and (re)start service
 systemctl daemon-reload
 systemctl enable lorica.service
@@ -152,9 +194,14 @@ echo "  ================================================"
 echo "  Lorica installed successfully!"
 echo "  "
 echo "  Dashboard: https://127.0.0.1:9443"
-echo "    (TLS with a self-signed cert - accept the browser"
-echo "     warning; listens on localhost only, not reachable"
-echo "     from other machines)"
+echo "    (TLS with a self-signed certificate; listens on"
+echo "     localhost only, not reachable from other machines."
+echo "     Before you log in, check that the fingerprint your"
+echo "     browser shows is the one the node serves:"
+echo "       sudo openssl x509 -noout -fingerprint -sha256 \\"
+echo "         -in /var/lib/lorica/management/served-cert.pem"
+echo "     Another local process can hold the port while"
+echo "     lorica is stopped, and it would receive the password.)"
 echo "  "
 echo "  The initial admin password is written to a 0600 file:"
 echo "    sudo cat /var/lib/lorica/initial-admin-password"
@@ -192,12 +239,16 @@ echo ""
 EOF
 chmod 755 "$PKG_DIR/DEBIAN/postinst"
 
-# Pre-removal script
+# Pre-removal script. Stopped on every path out of this version, disabled
+# only when the package is removed: an upgrade leaves the operator's
+# enablement to the next version's postinst.
 cat > "$PKG_DIR/DEBIAN/prerm" << 'EOF'
 #!/bin/sh
 set -e
 systemctl stop lorica.service 2>/dev/null || true
-systemctl disable lorica.service 2>/dev/null || true
+if [ "$1" = "remove" ]; then
+    systemctl disable lorica.service 2>/dev/null || true
+fi
 EOF
 chmod 755 "$PKG_DIR/DEBIAN/prerm"
 

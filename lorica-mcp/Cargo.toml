@@ -54,6 +54,11 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-native-roots",
     "rustls-tls-webpki-roots",
 ] }
+# The error types' `Display` and `source` (maintainer decision,
+# 2026-09-30), at the version every other product crate pins. A
+# proc-macro: it generates the impls the crate used to write by hand
+# and adds nothing to the stdio binary at runtime.
+thiserror = "2"
 
 [dev-dependencies]
 # Test-only, and deliberately not a runtime dependency: the scope

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Story 11.1 AC #9: the Streamable HTTP binding of the MCP read tier,
-//! as ONE path on the Story 10.3 automation listener.
+//! Story 11.1 AC #9: the Streamable HTTP binding of the MCP server, every
+//! tier, as ONE path on the Story 10.3 automation listener.
 //!
 //! # Why it lives here and not in `lorica-mcp`
 //!
@@ -22,8 +22,8 @@
 //! plane, not a second port and not a second listener. It is a path on
 //! the listener that already owns the TLS, the mandatory source-CIDR
 //! allowlist, the connection caps, the per-IP limiter and the
-//! per-request audit, and everything below inherits all six by being
-//! mounted inside [`super::router::build_automation_router`].
+//! per-request audit, and everything below inherits all of them by
+//! being mounted inside [`super::router::build_automation_router`].
 //!
 //! The protocol itself is not here. [`lorica_mcp::server::McpServer`] is
 //! the shared core AC #10 asks for, the same one the stdio binary runs;
@@ -356,7 +356,10 @@ fn named_call(request: &jsonrpc::Request) -> (Option<String>, Vec<&'static str>)
 /// with nowhere safe to go in an answer a model reads.
 fn identity_of(principal: &AutomationPrincipal) -> Identity {
     Identity {
-        public_id: principal.grant_id.clone(),
+        // The key the invocation budget counts under: the token's
+        // `public_id`, or for an ID token its entry and its project,
+        // so one project under a shared entry spends only its own.
+        public_id: principal.budget_key(),
         scopes: principal
             .scopes
             .iter()
@@ -464,7 +467,7 @@ fn examine(headers: &HeaderMap, body: &[u8]) -> Result<jsonrpc::Request, Refusal
     let id = request.id.clone().unwrap_or(Value::Null);
 
     let version = match mirrored(headers, PROTOCOL_VERSION_HEADER) {
-        Err(()) => return Err(unreadable(&id, PROTOCOL_VERSION_HEADER)),
+        Err(why) => return Err(unreadable(&id, PROTOCOL_VERSION_HEADER, why)),
         Ok(None) => {
             return Err(Refusal::header_mismatch(
                 &id,
@@ -497,7 +500,7 @@ fn examine(headers: &HeaderMap, body: &[u8]) -> Result<jsonrpc::Request, Refusal
     }
 
     match mirrored(headers, METHOD_HEADER) {
-        Err(()) => return Err(unreadable(&id, METHOD_HEADER)),
+        Err(why) => return Err(unreadable(&id, METHOD_HEADER, why)),
         Ok(None) => {
             return Err(Refusal::header_mismatch(
                 &id,
@@ -515,7 +518,7 @@ fn examine(headers: &HeaderMap, body: &[u8]) -> Result<jsonrpc::Request, Refusal
     }
 
     let named = match mirrored(headers, NAME_HEADER) {
-        Err(()) => return Err(unreadable(&id, NAME_HEADER)),
+        Err(why) => return Err(unreadable(&id, NAME_HEADER, why)),
         Ok(named) => named,
     };
     let in_body = request.params.get("name").and_then(Value::as_str);
@@ -562,14 +565,39 @@ fn examine(headers: &HeaderMap, body: &[u8]) -> Result<jsonrpc::Request, Refusal
 }
 
 /// The refusal for a header value this server cannot compare to a body.
-fn unreadable(id: &Value, header: &str) -> Refusal {
+fn unreadable(id: &Value, header: &str, why: Unreadable) -> Refusal {
     Refusal::header_mismatch(
         id,
         &format!(
-            "`{header}` carries characters this server cannot read as text, so it cannot be \
-             compared to the body"
+            "`{header}` {}, so it cannot be compared to the body",
+            why.describe()
         ),
     )
+}
+
+/// Why a mirrored header could not be read, so a client developer is
+/// told which of the three it was rather than one sentence for all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Unreadable {
+    /// The value is not visible ASCII text.
+    NotText,
+    /// A Base64 sentinel whose payload is not Base64.
+    NotBase64,
+    /// A Base64 sentinel whose payload decodes to bytes that are not
+    /// UTF-8.
+    NotUtf8,
+}
+
+impl Unreadable {
+    /// The clause a refusal says, in the node's own words and none of
+    /// the caller's.
+    fn describe(self) -> &'static str {
+        match self {
+            Unreadable::NotText => "carries characters this server cannot read as text",
+            Unreadable::NotBase64 => "is a Base64 sentinel whose payload is not Base64",
+            Unreadable::NotUtf8 => "is a Base64 sentinel whose payload is not UTF-8",
+        }
+    }
 }
 
 /// One header value, Base64-sentinel decoded, or `None` when absent.
@@ -587,13 +615,13 @@ fn unreadable(id: &Value, header: &str) -> Refusal {
 ///
 /// # Errors
 ///
-/// `()` for a value that is not readable text, or a sentinel whose
-/// payload is not Base64 of UTF-8.
-pub(super) fn mirrored(headers: &HeaderMap, name: &str) -> Result<Option<String>, ()> {
+/// [`Unreadable`] for a value that is not readable text, or a sentinel
+/// whose payload is not Base64 of UTF-8.
+pub(super) fn mirrored(headers: &HeaderMap, name: &str) -> Result<Option<String>, Unreadable> {
     let Some(raw) = headers.get(name) else {
         return Ok(None);
     };
-    let text = raw.to_str().map_err(|_| ())?;
+    let text = raw.to_str().map_err(|_| Unreadable::NotText)?;
     let Some(encoded) = text
         .strip_prefix(SENTINEL_PREFIX)
         .and_then(|rest| rest.strip_suffix(SENTINEL_SUFFIX))
@@ -602,8 +630,10 @@ pub(super) fn mirrored(headers: &HeaderMap, name: &str) -> Result<Option<String>
     };
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(|_| ())?;
-    String::from_utf8(bytes).map(Some).map_err(|_| ())
+        .map_err(|_| Unreadable::NotBase64)?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| Unreadable::NotUtf8)
 }
 
 /// The [`AutomationPlane`] the in-process binding runs: the plane's own
@@ -1036,6 +1066,40 @@ mod tests {
             &call,
         )
         .expect("an encoded version that decodes to ours passes");
+    }
+
+    #[test]
+    fn an_unreadable_header_says_which_of_the_three_it_was() {
+        let mut headers = headers_of(&[(METHOD_HEADER, "=?base64?!!!!?=")]);
+        assert_eq!(
+            mirrored(&headers, METHOD_HEADER),
+            Err(Unreadable::NotBase64)
+        );
+        let not_utf8 = format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe])
+        );
+        headers = headers_of(&[(METHOD_HEADER, not_utf8.as_str())]);
+        assert_eq!(mirrored(&headers, METHOD_HEADER), Err(Unreadable::NotUtf8));
+        headers.insert(
+            http::HeaderName::from_static(METHOD_HEADER),
+            http::HeaderValue::from_bytes(&[0xff, 0xfe]).expect("test setup: a raw value"),
+        );
+        assert_eq!(mirrored(&headers, METHOD_HEADER), Err(Unreadable::NotText));
+        for why in [
+            Unreadable::NotText,
+            Unreadable::NotBase64,
+            Unreadable::NotUtf8,
+        ] {
+            let refusal = unreadable(&json!(1), METHOD_HEADER, why);
+            let message = refusal
+                .body
+                .as_ref()
+                .and_then(|body| body["error"]["message"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            assert!(message.contains(why.describe()), "{message}");
+        }
     }
 
     #[test]
