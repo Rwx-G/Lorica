@@ -585,6 +585,21 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
         docker compose --profile cluster run --rm automation-smoke || EXIT_CODE=$?
     fi
 
+    # ---- MCP phase (Story 11.2 IV3, backlog #91) ----
+    # A config-tier route write through `lorica-mcp` on the control
+    # plane, minted by the real `lorica mcp token create`, and both
+    # followers converging on the created then the changed route.
+    if [ "$EXIT_CODE" = "0" ]; then
+        echo ""
+        echo "=== Lorica E2E Tests (cluster mcp phase) ==="
+        echo ""
+
+        if ! docker compose --profile cluster run --rm cluster-mcp-smoke; then
+            EXIT_CODE=1
+            dump_node_log lorica-cp
+        fi
+    fi
+
     # ---- Revocation, last: it is terminal for a node, so everything
     # that needs a live follower has already run.
     if [ "$EXIT_CODE" = "0" ]; then

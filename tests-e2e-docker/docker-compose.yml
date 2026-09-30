@@ -1395,6 +1395,36 @@ services:
       - e2e
       - automation-outside
 
+  # The MCP phase (Story 11.2 IV3, backlog #91): a config-tier write
+  # through `lorica-mcp` on the control plane, and the followers
+  # converging on it. From the LORICA image and in the control plane's
+  # network namespace, for the reasons the `mcp-smoke` service gives:
+  # the runner image cannot execute `lorica` and `lorica-mcp`, and the
+  # CLI mints through 127.0.0.1 only. The control plane's data volume is
+  # mounted read-only at the CLI's default --data-dir, so the mint pins
+  # the certificate the node recorded as served (backlog #90).
+  cluster-mcp-smoke:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["cluster"]
+    entrypoint: ["bash", "/tests/run-cluster-mcp-smoke.sh"]
+    network_mode: "service:lorica-cp"
+    depends_on:
+      - lorica-cp
+      - lorica-edge-a
+      - lorica-edge-b
+    volumes:
+      - shared-cluster:/shared:ro
+      - lorica-cp-data:/var/lib/lorica:ro
+      - ./test-runner/helpers.sh:/tests/helpers.sh:ro
+      - ./test-runner/mcp-helpers.sh:/tests/mcp-helpers.sh:ro
+      - ./test-runner/run-cluster-mcp-smoke.sh:/tests/run-cluster-mcp-smoke.sh:ro
+    environment:
+      - SHARED_DIR=/shared
+      - EDGE_A_API=https://lorica-edge-a:9443
+      - EDGE_B_API=https://lorica-edge-b:9443
+
   cluster-smoke:
     build:
       context: ./test-runner
@@ -1465,6 +1495,7 @@ services:
       # 0700 management/ directory is readable here as it is on a host.
       - lorica-mcp-data:/var/lib/lorica:ro
       - ./test-runner/helpers.sh:/tests/helpers.sh:ro
+      - ./test-runner/mcp-helpers.sh:/tests/mcp-helpers.sh:ro
       - ./test-runner/run-mcp-smoke.sh:/tests/run-mcp-smoke.sh:ro
     environment:
       - SHARED_DIR=/shared
