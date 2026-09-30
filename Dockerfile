@@ -1,5 +1,9 @@
 # Production multi-stage Dockerfile for Lorica.
-# Produces a minimal Debian-slim image with the lorica binary.
+# Produces a minimal Debian-slim image with the lorica and lorica-mcp
+# binaries. Only lorica runs: lorica-mcp is there for an operator's MCP
+# client to launch per session, e.g. `docker exec -i lorica lorica-mcp`
+# with LORICA_MCP_ENDPOINT and LORICA_MCP_TOKEN passed by `-e`, so the
+# server and the image it drives never drift apart in version.
 #
 # Build:
 #   docker build -t lorica .
@@ -64,7 +68,7 @@ COPY tinyufo/ tinyufo/
 COPY --from=frontend /app/lorica-dashboard/frontend/dist/ lorica-dashboard/frontend/dist/
 ENV SKIP_FRONTEND_BUILD=1
 
-RUN cargo build --release --bin lorica
+RUN cargo build --release --bin lorica --bin lorica-mcp
 
 # Stage 3: Minimal runtime image
 FROM debian:bookworm-slim
@@ -76,6 +80,7 @@ RUN apt-get update && \
     chown lorica:lorica /var/lib/lorica
 
 COPY --from=builder /app/target/release/lorica /usr/bin/lorica
+COPY --from=builder /app/target/release/lorica-mcp /usr/bin/lorica-mcp
 
 USER lorica
 VOLUME /var/lib/lorica

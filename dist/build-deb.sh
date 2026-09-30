@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Build a .deb package for Lorica.
-# Usage: bash dist/build-deb.sh [binary_path]
+# Usage: bash dist/build-deb.sh [binary_path] [mcp_binary_path]
 #   binary_path defaults to ./lorica (current directory)
+#   mcp_binary_path defaults to lorica-mcp next to binary_path, which is
+#   where `cargo build --release -p lorica -p lorica-mcp` leaves both
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BINARY="${1:-./lorica}"
+MCP_BINARY="${2:-$(dirname "$BINARY")/lorica-mcp}"
 VERSION=$(grep '^version' lorica/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/' | tr -d '\r')
 ARCH="amd64"
 PKG_NAME="lorica_${VERSION}_${ARCH}"
@@ -31,8 +34,14 @@ mkdir -p "$PKG_DIR/var/lib/lorica"
 cp "$BINARY" "$PKG_DIR/usr/bin/lorica"
 chmod 755 "$PKG_DIR/usr/bin/lorica"
 
+# The MCP server (Story 11.4). Installed, never started by the package:
+# the operator's MCP client launches it. See the note in lorica.service.
+cp "$MCP_BINARY" "$PKG_DIR/usr/bin/lorica-mcp"
+chmod 755 "$PKG_DIR/usr/bin/lorica-mcp"
+
 # Copy systemd service
 cp dist/lorica.service "$PKG_DIR/lib/systemd/system/"
+chmod 644 "$PKG_DIR/lib/systemd/system/lorica.service"
 
 # Copy LICENSE and NOTICE (Apache-2.0 section 4(d) compliance)
 cp LICENSE "$PKG_DIR/usr/share/doc/lorica/"
@@ -78,6 +87,8 @@ Description: Modern reverse proxy with built-in dashboard
  A dashboard-first reverse proxy built in Rust. Single binary,
  embedded web UI, no config files. HTTP/HTTPS proxying, WAF,
  health checks, certificate management, Prometheus metrics.
+ Also ships lorica-mcp, the MCP server an operator's MCP client
+ launches; no service starts it.
 Homepage: https://github.com/Rwx-G/Lorica
 Depends: ca-certificates
 EOF
@@ -91,6 +102,28 @@ set -e
 if ! id -u lorica >/dev/null 2>&1; then
     useradd -r -s /bin/false -d /var/lib/lorica lorica
 fi
+
+# Repair hosts that installed a package built before 1.9.0. Those recorded
+# the CI builder's account (runner, uid 1001) as the owner of every entry,
+# and an upgrade does not fix all of it: dpkg rewrites the owner of each
+# file it replaces, but keeps the owner of a directory that already exists
+# (/usr/share/doc/lorica, and /lib/systemd/system on a host where lorica
+# created it). Every path this package ships outside its data directory
+# belongs to root, so any other owner found here is that defect. Only the
+# offending entries are touched, which keeps this a no-op on a clean host.
+dpkg-query -L lorica | while IFS= read -r path; do
+    case "$path" in
+        /var/lib/lorica|/var/lib/lorica/*) continue ;;
+    esac
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    [ "$(stat -c %u:%g "$path")" = "0:0" ] && continue
+    chown -h root:root "$path"
+    if [ -d "$path" ] && [ ! -L "$path" ]; then
+        chmod 755 "$path"
+    elif [ -f "$path" ] && [ ! -L "$path" ]; then
+        chmod go-w "$path"
+    fi
+done
 
 # Set permissions
 chown -R lorica:lorica /var/lib/lorica
@@ -185,8 +218,15 @@ chmod 755 "$PKG_DIR/DEBIAN/postrm"
 #   systemctl edit lorica
 # This creates /etc/systemd/system/lorica.service.d/override.conf
 
-# Build the package
-dpkg-deb --build "$PKG_DIR"
+# Modes are set here rather than inherited from the builder's umask.
+find "$PKG_DIR" -type d -exec chmod 755 {} +
+chmod 644 "$PKG_DIR/DEBIAN/control"
+
+# Build the package. --root-owner-group records every entry as root:root
+# whatever account runs this: CI builds as the unprivileged `runner` user,
+# and without it dpkg-deb wrote that account into the package, which dpkg
+# then applied on install (the advisory fixed in 1.9.0).
+dpkg-deb --root-owner-group --build "$PKG_DIR"
 
 echo "Package built: dist/${PKG_NAME}.deb"
 ls -lh "dist/${PKG_NAME}.deb"

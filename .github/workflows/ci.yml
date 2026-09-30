@@ -44,8 +44,8 @@ jobs:
       - name: Clippy (product crates)
         run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings
 
-      - name: Clippy (tests and benches of the API and cluster crates)
-        run: cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings
+      - name: Clippy (tests and benches of the API, cluster and MCP crates)
+        run: cargo clippy -p lorica-api -p lorica-cluster -p lorica-mcp --all-targets -- -D warnings
 
       - name: Clippy (binary crate with the otel feature)
         run: cargo clippy -p lorica --all-targets --features otel -- -D warnings
@@ -205,6 +205,14 @@ jobs:
         env:
           SKIP_FRONTEND_BUILD: ""
 
+      # The binary crate, in its own step because the feature applies to it
+      # alone. Clippy compiled these tests for releases before 1.9.0 and
+      # nothing ran them.
+      - name: Run Rust unit tests (binary crate with the otel feature)
+        run: cargo test -p lorica --features otel
+        env:
+          SKIP_FRONTEND_BUILD: ""
+
       - name: Run Rust unit tests (forked crates)
         run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
         env:
@@ -253,7 +261,7 @@ jobs:
             -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify \
             -p lorica-bench -p lorica-command -p lorica-metrics -p lorica-acme \
             -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker \
-            -p lorica-mcp \
+            -p lorica-mcp -p lorica \
             -p lorica-cluster -p lorica-tls \
             -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \
             -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
@@ -315,33 +323,54 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build release binary
-        run: cargo build --release -p lorica
+      # `-p lorica` alone links lorica-mcp as a library and never builds
+      # its binary, which both packages ship (Story 11.4).
+      - name: Build release binaries
+        run: cargo build --release -p lorica -p lorica-mcp
 
-      - name: Verify binary
+      - name: Verify binaries
         run: |
-          file target/release/lorica
+          file target/release/lorica target/release/lorica-mcp
           target/release/lorica --version
+          # lorica-mcp has no --version. With no configuration it must
+          # refuse with EX_CONFIG (78), which proves it links and runs.
+          rc=0
+          target/release/lorica-mcp < /dev/null || rc=$?
+          if [ "$rc" -ne 78 ]; then
+            echo "FAIL: lorica-mcp exited $rc, expected 78"
+            exit 1
+          fi
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:
           name: lorica-linux-x86_64
-          path: target/release/lorica
+          path: |
+            target/release/lorica
+            target/release/lorica-mcp
           retention-days: 30
 
       # Package .deb (same job, no artifact download needed)
       - name: Build .deb package
         run: |
-          chmod +x target/release/lorica
-          bash dist/build-deb.sh ./target/release/lorica
+          chmod +x target/release/lorica target/release/lorica-mcp
+          bash dist/build-deb.sh ./target/release/lorica ./target/release/lorica-mcp
 
       - name: Verify .deb package
         run: |
+          # Every entry must be root/root. This job runs as the unprivileged
+          # runner user, and every .deb before 1.9.0 recorded that account
+          # as the owner, which dpkg applied on install.
           for deb in dist/*.deb; do
             echo "--- $deb ---"
             dpkg-deb --info "$deb"
             dpkg-deb --contents "$deb"
+            not_root=$(dpkg-deb --contents "$deb" | awk '$2 != "root/root"')
+            if [ -n "$not_root" ]; then
+              echo "FAIL: entries not owned by root/root in $deb:"
+              echo "$not_root"
+              exit 1
+            fi
           done
 
       - name: Upload .deb artifact
@@ -357,15 +386,22 @@ jobs:
 
       - name: Build .rpm package
         run: |
-          chmod +x target/release/lorica
-          bash dist/build-rpm.sh ./target/release/lorica
+          chmod +x target/release/lorica target/release/lorica-mcp
+          bash dist/build-rpm.sh ./target/release/lorica ./target/release/lorica-mcp
 
       - name: Verify .rpm package
         run: |
           for rpm in dist/*.rpm; do
             echo "--- $rpm ---"
             rpm -qpi "$rpm"
-            rpm -qpl "$rpm"
+            rpm -qplv "$rpm"
+            # Everything but the data directory belongs to root.
+            not_root=$(rpm -qplv "$rpm" | awk '$3"/"$4 != "root/root" && $9 !~ /^\/var\/lib\/lorica(\/|$)/')
+            if [ -n "$not_root" ]; then
+              echo "FAIL: entries not owned by root/root in $rpm:"
+              echo "$not_root"
+              exit 1
+            fi
           done
 
       - name: Import GPG key
@@ -415,8 +451,24 @@ jobs:
           sudo apt-get update
           sudo dpkg -i dist/*.deb || sudo apt-get install -f -y
           test -x /usr/bin/lorica
+          test -x /usr/bin/lorica-mcp
           test -f /lib/systemd/system/lorica.service
+          for path in /usr/bin/lorica /usr/bin/lorica-mcp \
+                      /lib/systemd/system/lorica.service /usr/share/doc/lorica; do
+            owner=$(stat -c %u:%g "$path")
+            if [ "$owner" != "0:0" ]; then
+              echo "FAIL: $path is owned by $owner, expected 0:0"
+              exit 1
+            fi
+          done
           lorica --version
+          # Installed, never started: the unit must not launch the MCP
+          # server (Story 11.4). `if`, not `!`: bash -e ignores a negated
+          # command, so `! grep` could never fail the step.
+          if grep -q '^Exec.*lorica-mcp' /lib/systemd/system/lorica.service; then
+            echo "FAIL: the shipped unit starts lorica-mcp"
+            exit 1
+          fi
           echo ".deb installation verified OK"
       - name: systemd unit - hardening lint
         run: |
@@ -469,8 +521,21 @@ jobs:
         run: |
           rpm -ivh dist/*.rpm
           test -x /usr/bin/lorica
+          test -x /usr/bin/lorica-mcp
           test -f /usr/lib/systemd/system/lorica.service
+          for path in /usr/bin/lorica /usr/bin/lorica-mcp \
+                      /usr/lib/systemd/system/lorica.service; do
+            owner=$(stat -c %u:%g "$path")
+            if [ "$owner" != "0:0" ]; then
+              echo "FAIL: $path is owned by $owner, expected 0:0"
+              exit 1
+            fi
+          done
           lorica --version
+          if grep -q '^Exec.*lorica-mcp' /usr/lib/systemd/system/lorica.service; then
+            echo "FAIL: the shipped unit starts lorica-mcp"
+            exit 1
+          fi
           echo ".rpm installation verified OK"
 
   release:

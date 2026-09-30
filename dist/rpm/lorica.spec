@@ -12,6 +12,8 @@ Requires:       ca-certificates
 A dashboard-first reverse proxy built in Rust. Single binary,
 embedded web UI, no config files. HTTP/HTTPS proxying, WAF,
 health checks, certificate management, Prometheus metrics.
+Also ships lorica-mcp, the MCP server an operator's MCP client
+launches; no service starts it.
 
 %install
 mkdir -p %{buildroot}/usr/bin
@@ -27,6 +29,9 @@ mkdir -p %{buildroot}/var/lib/lorica/exported-certs
 # See docs/hot-upgrade.md.
 
 install -m 755 %{_sourcedir}/lorica %{buildroot}/usr/bin/lorica
+# The MCP server (Story 11.4). Installed, never started by the package:
+# the operator's MCP client launches it. See the note in lorica.service.
+install -m 755 %{_sourcedir}/lorica-mcp %{buildroot}/usr/bin/lorica-mcp
 install -m 644 %{_sourcedir}/dist/lorica.service %{buildroot}/usr/lib/systemd/system/lorica.service
 
 # LICENSE and NOTICE (Apache-2.0 section 4(d) compliance)
@@ -99,6 +104,7 @@ systemctl daemon-reload
 %license /usr/share/licenses/lorica/LICENSE
 %license /usr/share/licenses/lorica/NOTICE
 %attr(755, root, root) /usr/bin/lorica
+%attr(755, root, root) /usr/bin/lorica-mcp
 %attr(644, root, root) /usr/lib/systemd/system/lorica.service
 %dir %attr(750, lorica, lorica) /var/lib/lorica
 %dir %attr(750, lorica, lorica) /var/lib/lorica/exported-certs

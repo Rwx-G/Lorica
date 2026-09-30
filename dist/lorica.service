@@ -1,3 +1,10 @@
+# The packages also install /usr/bin/lorica-mcp, and no unit starts it.
+# That omission is deliberate, not an oversight: an MCP server is
+# launched over stdio by the operator's MCP client, for the length of
+# that client's session, with the token the operator hands it. A
+# long-running service holding an automation token would be exactly the
+# ambient credential the MCP design refuses. Do not add a lorica-mcp
+# unit or an ExecStartPost here. See docs/mcp.md.
 [Unit]
 Description=Lorica Reverse Proxy
 Documentation=https://github.com/Rwx-G/Lorica

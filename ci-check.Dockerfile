@@ -29,19 +29,26 @@ RUN echo "===== LINT: Build frontend =====" \
     && npm run build
 
 RUN echo "===== LINT: Clippy (product crates) =====" \
-    && cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings
+    && cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings \
+    && cargo clippy -p lorica-api -p lorica-cluster -p lorica-mcp --all-targets -- -D warnings \
+    && cargo clippy -p lorica --all-targets --features otel -- -D warnings
 
 RUN echo "===== LINT: cargo fmt check =====" \
-    && cargo fmt -- --check || echo "fmt check: some files not formatted (non-blocking)"
+    && cargo fmt --all -- --check
 
 # ===== JOB 2: TEST =====
 RUN echo "===== TEST: Rust unit tests (product crates) =====" \
     && cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp
 
-RUN echo "===== TEST: Rust unit tests (forked + binary crates) =====" \
+# Blocking, like the CI step it mirrors. It used to sit in the step below,
+# whose failures are ignored.
+RUN echo "===== TEST: Rust unit tests (binary crate with the otel feature) =====" \
+    && cargo test -p lorica --features otel
+
+RUN echo "===== TEST: Rust unit tests (forked crates) =====" \
     && cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \
        -p lorica-tls -p lorica-command -p lorica-worker -p lorica-lb \
-       -p lorica -p lorica-cache -p lorica-lru -p lorica-memory-cache \
+       -p lorica-cache -p lorica-lru -p lorica-memory-cache \
        -p lorica-limits -p lorica-ketama -p lorica-timeout -p lorica-pool \
        -p lorica-header-serde -p lorica-runtime -p TinyUFO \
     || echo "Some forked crate tests failed (expected - network/TLS tests need host environment)"
@@ -50,12 +57,15 @@ RUN echo "===== TEST: Frontend tests =====" \
     && cd lorica-dashboard/frontend && npx vitest run
 
 # ===== JOB 3: BUILD =====
-RUN echo "===== BUILD: Release binary =====" \
-    && cargo build --release -p lorica
+RUN echo "===== BUILD: Release binaries =====" \
+    && cargo build --release -p lorica -p lorica-mcp
 
-RUN echo "===== BUILD: Verify binary =====" \
-    && file target/release/lorica \
-    && target/release/lorica --version
+# lorica-mcp has no --version. With no configuration it must refuse
+# with EX_CONFIG (78), which proves it links and runs.
+RUN echo "===== BUILD: Verify binaries =====" \
+    && file target/release/lorica target/release/lorica-mcp \
+    && target/release/lorica --version \
+    && { rc=0; target/release/lorica-mcp < /dev/null || rc=$?; test "$rc" -eq 78; }
 
 RUN echo "" \
     && echo "============================================" \
