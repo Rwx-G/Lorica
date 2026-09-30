@@ -58,7 +58,7 @@ An operator can lift the response bounds; the stream then carries a permanent "u
 
 TLS-terminated and TLS-originating streams therefore drain, and the documentation says so.
 
-**D9 - Stream mutations stay on the management plane.** Opening a port is a perimeter change. The `SettingsWrite` scope's own definition (`automation_token.rs`) says the automation plane never touches "a listener", and a stream is a listener; an automation token has no axis that could confine a listen address or port (`allowed_hostnames` means nothing for a stream). So:
+**D9 - Stream mutations stay on the management plane.** Opening a port is a perimeter change. The `SettingsWrite` scope's own definition (`lorica-automation-policy/src/scope.rs`) says the automation plane never touches "a listener", and a stream is a listener; an automation token has no axis that could confine a listen address or port (`allowed_hostnames` means nothing for a stream). So:
 - the automation API gets `streams:read` only, and the MCP server gets stream tools in the read tier only;
 - creating, changing and deleting a stream happens through the management API, from the dashboard or an operator session;
 - the settings that open a hole (lifting UDP bounds, PROXY-accept trusted CIDRs, local backends, send/expect payloads) are refused on every automation and MCP surface, including on `backends:write`, which may pick a named health-check template but never write a payload.

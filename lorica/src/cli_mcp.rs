@@ -42,16 +42,17 @@
 //! # The blast radius is derived when it is printed
 //!
 //! [`blast_radius`] reads the tier table, the tool catalogue through
-//! [`Tier::registers`] (the rule the server builds its registry with)
-//! and, for the admin tier, the automation plane's settings allowlist,
-//! at the moment it prints. A scope moved between tiers, a tool added,
+//! [`TierTools::registers`] (the rule the server builds its registry
+//! with) and, for the admin tier, the settings allowlist the automation
+//! plane enforces, at the moment it prints. A scope moved between tiers, a tool added,
 //! or a setting added to the allowlist moves the printed text with it.
 
 use std::path::Path;
 
-use lorica_api::automation::write::SETTINGS_ALLOWLIST;
+use lorica_automation_policy::SETTINGS_ALLOWLIST;
+use lorica_mcp::tier::joined;
 use lorica_mcp::tools::{self, ToolSpec};
-use lorica_mcp::Tier;
+use lorica_mcp::{Tier, TierTools};
 
 use crate::cli_automation;
 use crate::cli_client::fail;
@@ -143,8 +144,8 @@ fn default_name(tier: Tier) -> String {
 /// The scopes `tier` mints, as the wire spells them.
 fn scopes_of(tier: Tier) -> Vec<String> {
     tier.minted_scopes()
-        .into_iter()
-        .map(str::to_string)
+        .iter()
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -163,7 +164,7 @@ fn blast_radius(
     let mut text = format!(
         "What this {tier} token can do through lorica-mcp.\n  Scopes: {}\n  Lifetime: {lifetime_days} \
          days (this tier's default is {})\n  Tools:\n",
-        minted.join(", "),
+        joined(&minted),
         tier.default_lifetime_days()
     );
     for spec in &reachable {
@@ -236,8 +237,7 @@ mod tests {
     fn granted(tier: Tier) -> TierMint {
         let bounded = tier
             .minted_scopes()
-            .iter()
-            .filter_map(|scope| AutomationScope::from_wire(scope))
+            .into_iter()
             .any(AutomationScope::is_grant_bounded);
         if bounded {
             asked(tier, &["*.app.example.com"], &["10.0.0.0/8"])
@@ -361,11 +361,7 @@ mod tests {
                 public_id: "0123456789abcdef01234567".to_string(),
                 name: default_name(tier),
                 secret_hmac: String::new(),
-                scopes: tier
-                    .minted_scopes()
-                    .iter()
-                    .map(|scope| AutomationScope::from_wire(scope).expect("a known scope"))
-                    .collect(),
+                scopes: tier.minted_scopes(),
                 allowed_hostnames: request.hostnames.clone(),
                 allowed_backend_cidrs: request.backend_cidrs.clone(),
                 max_ttl_seconds: AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS,
@@ -390,7 +386,7 @@ mod tests {
             // stored token against, so its shape is pinned here.
             assert!(
                 text.lines()
-                    .any(|line| line == format!("  Scopes: {}", minted.join(", "))),
+                    .any(|line| line == format!("  Scopes: {}", joined(&minted))),
                 "{tier}\n{text}"
             );
             assert!(

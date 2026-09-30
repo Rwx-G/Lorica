@@ -41,12 +41,10 @@
 //! should have it, nothing fails, and an operator concludes the feature
 //! does not work.
 //!
-//! So: one assertion per catalogue entry, both spellings resolved
-//! through `AutomationScope` rather than compared as strings, and the
-//! verb and the path taken from the tool itself rather than typed again
-//! here.
-
-use std::collections::BTreeSet;
+//! So: one assertion per catalogue entry, both sides typed as
+//! `AutomationScope` (the catalogue has declared its scopes as the enum
+//! since the policy crate made that possible), and the verb and the
+//! path taken from the tool itself rather than typed again here.
 
 use lorica_api::automation::{required_scope, ScopeRequirement};
 use lorica_config::models::AutomationScope;
@@ -85,12 +83,6 @@ fn method_of(verb: Verb) -> http::Method {
         .unwrap_or_else(|_| panic!("{verb} is not an HTTP method"))
 }
 
-/// The `AutomationScope` a wire spelling names.
-fn scope_of(spelled: &str) -> AutomationScope {
-    serde_json::from_str::<AutomationScope>(&format!("\"{spelled}\""))
-        .unwrap_or_else(|_| panic!("`{spelled}` is not an AutomationScope spelling"))
-}
-
 /// How the enum spells itself, which is the one authority on the word.
 fn wire_name(scope: AutomationScope) -> String {
     serde_json::to_value(scope)
@@ -120,7 +112,7 @@ fn every_mcp_tool_names_the_scope_its_verb_and_path_sit_behind() {
     let mut wrong: Vec<String> = Vec::new();
     for spec in catalogue() {
         let (method, path) = call_of(spec);
-        let declared = ScopeRequirement::Scope(scope_of(spec.scope));
+        let declared = ScopeRequirement::Scope(spec.scope);
         let enforced = required_scope(&method, &path);
         if enforced != Some(declared) {
             wrong.push(format!(
@@ -198,7 +190,7 @@ fn every_write_tool_and_its_preview_sit_behind_one_write_scope_on_one_verb_and_g
         writes += 1;
         let (method, path) = call_of(spec);
         assert_ne!(method, http::Method::GET, "{}", spec.name);
-        let declared = scope_of(spec.scope);
+        let declared = spec.scope;
         assert!(wire_name(declared).ends_with(":write"), "{}", spec.name);
 
         let counterpart = lorica_mcp::tools::find(write.counterpart)
@@ -261,51 +253,6 @@ fn the_mcp_endpoint_itself_is_reached_by_any_live_token() {
     for spec in catalogue() {
         let (_, path) = call_of(spec);
         assert_ne!(path, lorica_api::automation::MCP_PATH, "{}", spec.name);
-    }
-}
-
-#[test]
-fn the_scopes_the_catalogue_uses_are_every_scope_but_the_environment_ones() {
-    // The complement, stated once and deliberately: a scope added to the
-    // token model either gets a tool or is named here as one that does
-    // not. `lorica-mcp` asserts the same thing from its own side with
-    // its own copy of the spellings; this asserts it from the side that
-    // holds the enum, so the two cannot both be wrong in the same way.
-    // Compared as the enum's own spellings and not as the catalogue's
-    // strings: `scope_of` resolves each tool's word through
-    // `AutomationScope` first, so a word this enum does not know has
-    // already failed by the time the sets are built.
-    let named: BTreeSet<String> = catalogue()
-        .iter()
-        .map(|spec| wire_name(scope_of(spec.scope)))
-        .collect();
-    let declared: BTreeSet<String> = AutomationScope::ALL
-        .iter()
-        .copied()
-        .map(wire_name)
-        .collect();
-    let outside: BTreeSet<String> = declared.difference(&named).cloned().collect();
-    assert_eq!(
-        outside,
-        BTreeSet::from([
-            // Story 10.4's environment resource is a pipeline's surface
-            // and not an operator's; neither tier names it.
-            "environments:read".to_string(),
-            "environments:write".to_string(),
-        ]),
-        "a scope moved: either give it a tool or add it to this complement, \
-         deliberately"
-    );
-    // And the split between the tiers is the split in the vocabulary:
-    // every read tool names a read scope, every write tool a write one.
-    for spec in catalogue() {
-        let spelled = wire_name(scope_of(spec.scope));
-        assert_eq!(
-            spelled.ends_with(":write"),
-            spec.write().is_some(),
-            "{} declares {spelled}",
-            spec.name
-        );
     }
 }
 

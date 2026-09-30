@@ -1925,9 +1925,9 @@ fn the_settings_patch_is_documented_and_offered_as_exactly_the_allowlist() {
     assert!(
         drift.is_empty(),
         "\nThe admin tier's settings allowlist and a surface restating it disagree.\n{drift}\n\
-         SETTINGS_ALLOWLIST in lorica-api/src/automation/write.rs is the control, each entry with \
-         its reason. Change it there first, by a decision, then SETTINGS_FIELDS in \
-         lorica-mcp/src/tools.rs and the SettingsPatch schema in openapi-automation.yaml.\n"
+         SETTINGS_ALLOWLIST in lorica-automation-policy/src/settings.rs is the control, each entry with \
+         its reason. Change it there first, by a decision, then the SettingsPatch schema in \
+         openapi-automation.yaml; the MCP tool is built from the constant.\n"
     );
 }
 

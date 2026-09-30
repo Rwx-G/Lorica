@@ -172,9 +172,9 @@
 //! Each key the allowlist names carries a bound and a direction, the
 //! safe way to move it, and a value outside either is refused with a
 //! 422 on the document the write is about to store, under the store
-//! lock. The plane is the control and the MCP tool's schema, which
-//! restates the same keys and bounds and is pinned against this
-//! constant by `tests/openapi_contract.rs`, is the affordance: a token
+//! lock. The plane is the control and the MCP tool's schema, built
+//! from the same constant in `lorica-automation-policy`, is the
+//! affordance: a token
 //! holding `settings:write` reaches the same keys whether it calls the
 //! tool or the path. A preview and an apply answer the allowlisted part
 //! of the document and nothing else, so the scope that writes those
@@ -186,6 +186,10 @@ use std::collections::BTreeSet;
 use axum::extract::{Extension, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
+use lorica_automation_policy::admin_setting;
+use lorica_automation_policy::protections::{
+    backend as backend_rule, route as route_rule, ProtectionRule,
+};
 use lorica_config::models::{AutomationScope, Backend, ManagedBy, Route};
 use lorica_config::ConfigStore;
 use serde::Deserialize;
@@ -206,275 +210,13 @@ use crate::server::AppState;
 use crate::settings::{SettingsAuditTarget, UpdateSettingsRequest};
 use crate::target::{BackendGuard, CertificateGuard, RouteGuard, RouteTarget};
 
-/// Which way the admin tier may move a setting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    /// Anywhere inside the bound.
-    Either,
-    /// Up from the stored value, never below it, and inside the bound:
-    /// a retention lowered destroys rows that setting it back does not
-    /// bring back.
-    RaiseOnly,
-}
-
-/// How far a setting's effect reaches when it is written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reach {
-    /// Fleet policy (`CanonicalGlobalSettings`): on a control plane it
-    /// replicates to every follower.
-    Fleet,
-    /// This node only.
-    Node,
-}
-
-impl Reach {
-    /// How an operator reads it, in `docs/mcp.md`'s settings table and
-    /// in the blast radius `lorica mcp token create --tier admin` prints.
-    pub fn describe(self) -> &'static str {
-        match self {
-            Reach::Fleet => "fleet",
-            Reach::Node => "this node",
-        }
-    }
-}
-
-/// When a stored value starts to act.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TakesEffect {
-    /// On the next reload or the next run of the loop that reads it,
-    /// without a restart.
-    Live,
-    /// At the next restart of the process that reads it.
-    Restart,
-}
-
-impl TakesEffect {
-    /// How an operator reads it, in the same two places as
-    /// [`Reach::describe`].
-    pub fn describe(self) -> &'static str {
-        match self {
-            TakesEffect::Live => "live",
-            TakesEffect::Restart => "at restart",
-        }
-    }
-}
-
-/// One global setting the admin tier may change, why it may, and how
-/// far it may move it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdminSetting {
-    /// The key, as `GlobalSettings` and `UpdateSettingsRequest` spell it.
-    pub name: &'static str,
-    /// Why a model driving the admin tier may change it: what makes it
-    /// operational, and why a value inside its bound is undone from the
-    /// dashboard without having taken anything down.
-    pub why: &'static str,
-    /// The lowest value this tier may set, inclusive. The dashboard's
-    /// own validator still runs after this one and may be narrower.
-    pub min: i64,
-    /// The highest value this tier may set, inclusive.
-    pub max: i64,
-    /// Which way inside `min..=max` this tier may move it.
-    pub direction: Direction,
-    /// Where a write lands.
-    pub reach: Reach,
-    /// When a write acts.
-    pub takes_effect: TakesEffect,
-}
-
-impl AdminSetting {
-    /// The bound as the docs, the tool description and a refusal spell
-    /// it: `14..=365`, or `raise-only, 1..=1000000`.
-    pub fn bound_text(&self) -> String {
-        match self.direction {
-            Direction::Either => format!("{}..={}", self.min, self.max),
-            Direction::RaiseOnly => format!("raise-only, {}..={}", self.min, self.max),
-        }
-    }
-
-    /// Why `after` is not a value this tier may store when `before` is
-    /// stored, or `None` when it may.
-    pub fn refusal(&self, before: i64, after: i64) -> Option<String> {
-        if !(self.min..=self.max).contains(&after) {
-            return Some(format!(
-                "{}: {after} is outside what an automation token may set ({}); set it in the \
-                 dashboard",
-                self.name,
-                self.bound_text()
-            ));
-        }
-        if self.direction == Direction::RaiseOnly && after < before {
-            return Some(format!(
-                "{}: {after} is below the stored {before}, and an automation token may only \
-                 raise it ({}); lower it in the dashboard",
-                self.name,
-                self.bound_text()
-            ));
-        }
-        None
-    }
-}
-
-/// The highest row retention the admin tier may raise either persistent
-/// buffer to: ten times the shipped default of 100000 rows.
-///
-/// A raise-only retention is safe only up to a size a human chose the
-/// disk for. An access-log row weighs about 500 bytes once its four
-/// indexes are counted, so the ceiling is about half a gigabyte per
-/// table: ten times the history the node ships with, and not the size
-/// that fills a disk. The previous ceiling of one hundred million rows
-/// was about fifty gigabytes per table, a disk-exhaustion value one
-/// write away. A retention beyond it is a disk decision, made in the
-/// dashboard. A test pins the ceiling to the default it derives from.
-pub const RETENTION_TIER_CEILING_ROWS: i64 = 1_000_000;
-
-/// Every setting `PUT /automation/v1/settings` accepts: the admin tier's
-/// whole surface (Story 11.3 AC #1), decided by exclusion, each with
-/// the bound and the direction this tier may move it in.
-///
-/// The one statement of it. The plane refuses any other key with a 403
-/// before a validator runs, and a value outside its entry's bound with
-/// a 422 naming the key and the bound, on the document it is about to
-/// write. The MCP tool restates the names and the bounds, the
-/// `SettingsPatch` schema the names and the bounds, `docs/mcp.md` the
-/// whole row; tests pin each against this constant.
-///
-/// A key is here only when a model reading attacker-authored text can
-/// move it in a direction that harms nothing: every entry has a safe
-/// direction, a bound, and a dashboard field that undoes it (AC #3).
-///
-/// What is NOT here is the decision, and its reasons are in the story
-/// (`docs/stories/story-11.3-admin-tier.md`) and in `docs/mcp.md`, by
-/// family: anything that can lock the operator out of the management
-/// plane (its port, its TLS pair, the connection and automation
-/// allowlists, the trusted proxies); credentials and trust anchors
-/// (the bot HMAC secret, the scrape token and its switch, the upgrade
-/// signing key, the certificate export family); identity policy;
-/// data-plane capacity and mirroring concurrency, which are reversible
-/// and not harmless; the telemetry and log-sink destinations, since a
-/// redirect is not visibly wrong; `audit_log_retention_days`, because
-/// retention protecting the audit of this tier is not this tier's to
-/// shorten; and the probe and load-test budgets the dashboard has no
-/// write path for, so a value set here could not be undone there
-/// (AC #3), which `docs/backlog.md` records.
-///
-/// Taken out on 2026-09-28, each for a reason the first list missed:
-/// `flood_threshold_rps`, because either direction harms (lowered it
-/// makes every per-IP bucket answer 429, at 0 it switches the flood
-/// defence off); `flood_strict_rps` and `header_timeout_s`, because the
-/// dashboard has no field for them, so a value set here could not be
-/// undone there (`docs/backlog.md` #89); `sla_purge_enabled`, because
-/// off means unbounded growth; `sla_purge_schedule`, because the only
-/// direction it moves is purges more often; and `log_level`, because it
-/// has no safe direction: raised it floods the disk and writes request
-/// detail into the logs, lowered it blinds the investigation.
-///
-/// Every later request to add an entry will be reasonable on its own
-/// terms. An entry arrives with its reason and its bound or not at all.
-pub const SETTINGS_ALLOWLIST: &[AdminSetting] = &[
-    AdminSetting {
-        name: "access_log_retention",
-        why: "retention of the persistent access-log buffer; raised, it keeps more history, \
-              and 0 (unlimited) is refused because the table then grows until the disk fills; \
-              no higher than RETENTION_TIER_CEILING_ROWS, about half a gigabyte of rows, for \
-              the same reason",
-        min: 1,
-        max: RETENTION_TIER_CEILING_ROWS,
-        direction: Direction::RaiseOnly,
-        reach: Reach::Fleet,
-        takes_effect: TakesEffect::Live,
-    },
-    AdminSetting {
-        name: "waf_event_retention",
-        why: "retention of the persistent WAF-event buffer, the data plane's security trail; \
-              raised, it keeps more of it, and 0 (unlimited) is refused; no higher than \
-              RETENTION_TIER_CEILING_ROWS, for the disk's sake",
-        min: 1,
-        max: RETENTION_TIER_CEILING_ROWS,
-        direction: Direction::RaiseOnly,
-        reach: Reach::Fleet,
-        takes_effect: TakesEffect::Live,
-    },
-    AdminSetting {
-        name: "sla_purge_retention_days",
-        why: "how long SLA buckets are kept; raised, it keeps more history and purges nothing \
-              sooner",
-        min: 1,
-        max: 3650,
-        direction: Direction::RaiseOnly,
-        reach: Reach::Fleet,
-        takes_effect: TakesEffect::Live,
-    },
-    AdminSetting {
-        name: "cert_warning_days",
-        why: "when a certificate expiry raises a warning; an alert threshold, no traffic \
-              effect, and no lower than two weeks so an expiry cannot be hidden",
-        min: 14,
-        max: 365,
-        direction: Direction::Either,
-        reach: Reach::Fleet,
-        takes_effect: TakesEffect::Live,
-    },
-    AdminSetting {
-        name: "cert_critical_days",
-        why: "when a certificate expiry raises a critical alert; an alert threshold, no \
-              traffic effect, and no lower than three days",
-        min: 3,
-        max: 365,
-        direction: Direction::Either,
-        reach: Reach::Fleet,
-        takes_effect: TakesEffect::Live,
-    },
-    AdminSetting {
-        name: "waf_ban_threshold",
-        why: "how many WAF blocks earn an automatic ban; a protection threshold, never so \
-              low that one false positive bans a shared address and never so high that \
-              auto-ban is off in practice",
-        min: 3,
-        max: 100,
-        direction: Direction::Either,
-        reach: Reach::Fleet,
-        takes_effect: TakesEffect::Live,
-    },
-    AdminSetting {
-        name: "waf_ban_duration_s",
-        why: "how long an automatic WAF ban lasts; a ban keeps the duration it was issued \
-              with, so a day at most, and never so short that a ban does nothing",
-        min: 60,
-        max: 86_400,
-        direction: Direction::Either,
-        reach: Reach::Fleet,
-        takes_effect: TakesEffect::Live,
-    },
-    AdminSetting {
-        name: "default_health_check_interval_s",
-        why: "the fallback health-check interval; a probe budget read on every cycle, bounded \
-              far below the dashboard's own ceiling because a dead backend keeps its traffic \
-              for three probes of whatever interval is set",
-        min: 5,
-        max: 60,
-        direction: Direction::Either,
-        reach: Reach::Fleet,
-        takes_effect: TakesEffect::Live,
-    },
-    AdminSetting {
-        name: "health_max_concurrent_probes",
-        why: "the cap on concurrent health probes; a probe budget, never so low that a few \
-              unreachable backends starve the probes of every other",
-        min: 16,
-        max: 512,
-        direction: Direction::Either,
-        reach: Reach::Fleet,
-        takes_effect: TakesEffect::Live,
-    },
-];
-
-/// The entry of [`SETTINGS_ALLOWLIST`] named `key`.
-fn admin_setting(key: &str) -> Option<&'static AdminSetting> {
-    SETTINGS_ALLOWLIST
-        .iter()
-        .find(|setting| setting.name == key)
-}
+// The admin tier's surface is the automation policy's, declared in
+// `lorica-automation-policy` so `lorica-mcp` builds its tool from the
+// same statement; re-exported so this module's path to it, which the
+// CLI and the tests read, is unchanged.
+pub use lorica_automation_policy::settings::{
+    AdminSetting, Direction, Reach, TakesEffect, RETENTION_TIER_CEILING_ROWS, SETTINGS_ALLOWLIST,
+};
 
 /// Whether `key` is one of [`SETTINGS_ALLOWLIST`]'s names.
 fn is_allowlisted_setting(key: &str) -> bool {
@@ -538,38 +280,9 @@ fn ensure_hostnames_granted(
     Ok(())
 }
 
-/// The route fields a token may not send at all, whatever the value, a
-/// clearing one included, each with the reason the refusal gives.
-///
-/// None is the tier's in either direction: each is set in the
-/// dashboard, by a human, and the config tier's tools offer none of
-/// them. The plane refuses them from any automation token, whether it
-/// calls a tool or the path.
-pub const WITHHELD_ROUTE_FIELDS: &[(&str, &str)] = &[
-    (
-        "basic_auth_password",
-        "it is the route's Basic-auth credential, which a model would be choosing or relaying \
-         in the clear, and clearing it switches the route's Basic auth off",
-    ),
-    (
-        "forward_auth",
-        "its address is a URL allowed_backend_cidrs cannot weigh, and the proxy forwards every \
-         downstream Cookie and Authorization header to it",
-    ),
-    (
-        "mirror",
-        "it ships a copy of every request to a second set of backends",
-    ),
-    (
-        "mtls",
-        "it is the route's client-authentication trust anchor, the CA whose client certificates \
-         the route accepts",
-    ),
-    (
-        "proxy_headers",
-        "a static header map to the upstream is where a credential would go",
-    ),
-];
+// The route fields no token may send, with the reason each refusal
+// gives, are declared in `lorica-automation-policy`.
+pub use lorica_automation_policy::protections::WITHHELD_ROUTE_FIELDS;
 
 /// A route write body, asked which of [`WITHHELD_ROUTE_FIELDS`] it
 /// carries.
@@ -634,7 +347,9 @@ fn refuse_withheld(body: &impl WithheldFields) -> Result<(), ApiError> {
 
 /// One access-control or trust field of a stored row that an
 /// automation token may move only toward stronger (the maintainer's
-/// decision of 2026-09-30, "safe direction only").
+/// decision of 2026-09-30, "safe direction only"): a
+/// [`ProtectionRule`] of `lorica-automation-policy`, paired with the
+/// predicate that weighs it on this crate's row types.
 ///
 /// The rule runs in the guard, inside the store closure, on the row as
 /// stored and the row as it would be written, so the direction is
@@ -653,6 +368,18 @@ pub struct Protection<T: 'static> {
     pub weakened: fn(&T, &T) -> bool,
 }
 
+impl<T> Protection<T> {
+    /// `policy`, weighed by `weakened`.
+    const fn weighing(policy: ProtectionRule, weakened: fn(&T, &T) -> bool) -> Protection<T> {
+        Protection {
+            fields: policy.fields,
+            rule: policy.rule,
+            why: policy.why,
+            weakened,
+        }
+    }
+}
+
 impl<T> std::fmt::Debug for Protection<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Protection")
@@ -662,115 +389,30 @@ impl<T> std::fmt::Debug for Protection<T> {
     }
 }
 
-/// Every route control an automation token may only strengthen.
-///
-/// A route create is not weighed: each of these is at its weakest on
-/// the row the management create stores when the body names none of
-/// them, so nothing a create sets weakens anything. What is NOT here,
-/// and why, is recorded next to the rule in `docs/mcp.md`: the capacity
-/// limits (they price a request, they do not decide whether it is
-/// admitted), the browser-facing hardening (`force_https`,
-/// `security_headers`, the CORS lists and `response_headers`, which
-/// shape how a browser treats an answer the route already admits), the
-/// AI-crawler policy (a content policy toward clients that declare
-/// themselves, which a hostile client does not), and the routing fields
-/// (where a request goes, bounded by the hostname and CIDR grants).
+/// Every route control an automation token may only strengthen:
+/// `ROUTE_PROTECTION_RULES`, in its order, each with its predicate. A
+/// test holds this list to that one, so a rule declared there without a
+/// predicate here is a red gate rather than a control nobody weighs.
 pub const ROUTE_PROTECTIONS: &[Protection<Route>] = &[
-    Protection {
-        fields: &["basic_auth_username"],
-        rule: "the Basic-auth credential in force is neither cleared nor changed",
-        why: "clearing the username switches the route's Basic auth off, and renaming it \
-              changes a credential whose password a token never sees",
-        weakened: basic_auth_weakened,
-    },
-    Protection {
-        fields: &["ip_allowlist"],
-        rule: "added, or narrowed so every entry sits inside one already there; never removed \
-               or widened",
-        why: "an empty allowlist admits every address",
-        weakened: allowlist_weakened,
-    },
-    Protection {
-        fields: &["ip_denylist"],
-        rule: "extended, every entry already there staying covered; never shortened",
-        why: "an entry removed admits the addresses it refused",
-        weakened: denylist_weakened,
-    },
-    Protection {
-        fields: &["geoip"],
-        rule: "added, or tightened in the same mode (fewer countries allowed, more denied); \
-               never removed or switched to the other mode",
-        why: "the country filter decides who reaches the route at all",
-        weakened: geoip_weakened,
-    },
-    Protection {
-        fields: &["bot_protection", "bot_protection_disable"],
-        rule: "added where none is set; never changed or removed once set",
-        why: "its bypass lists and its mode decide which clients skip the challenge, and no \
-              ordering of them is safe to move automatically",
-        weakened: bot_protection_weakened,
-    },
-    Protection {
-        fields: &["waf_enabled"],
-        rule: "switched on, never off",
-        why: "the WAF is the route's request filter",
-        weakened: waf_switched_off,
-    },
-    Protection {
-        fields: &["waf_mode"],
-        rule: "moved to blocking, never back to detection",
-        why: "detection lets every request the WAF flags through",
-        weakened: waf_mode_weakened,
-    },
-    Protection {
-        fields: &["rate_limit"],
-        rule: "added, or tightened with its capacity and refill never raised and its scope \
-               unchanged; never removed",
-        why: "the token bucket is the route's defence against a flood",
-        weakened: rate_limit_weakened,
-    },
-    Protection {
-        fields: &["rate_limit_rps", "rate_limit_burst"],
-        rule: "added, or lowered; never raised or cleared",
-        why: "the per-client rate is the route's defence against a flood",
-        weakened: legacy_rate_weakened,
-    },
-    Protection {
-        fields: &["auto_ban_threshold"],
-        rule: "added, or lowered; never raised or cleared",
-        why: "the threshold is how many blocks earn an automatic ban, and cleared it bans no one",
-        weakened: auto_ban_weakened,
-    },
+    Protection::weighing(route_rule::BASIC_AUTH, basic_auth_weakened),
+    Protection::weighing(route_rule::IP_ALLOWLIST, allowlist_weakened),
+    Protection::weighing(route_rule::IP_DENYLIST, denylist_weakened),
+    Protection::weighing(route_rule::GEOIP, geoip_weakened),
+    Protection::weighing(route_rule::BOT_PROTECTION, bot_protection_weakened),
+    Protection::weighing(route_rule::WAF_ENABLED, waf_switched_off),
+    Protection::weighing(route_rule::WAF_MODE, waf_mode_weakened),
+    Protection::weighing(route_rule::RATE_LIMIT, rate_limit_weakened),
+    Protection::weighing(route_rule::LEGACY_RATE_LIMIT, legacy_rate_weakened),
+    Protection::weighing(route_rule::AUTO_BAN_THRESHOLD, auto_ban_weakened),
 ];
 
-/// Every backend control an automation token may only strengthen.
-///
-/// A create is weighed against the backend the management create
-/// stores when the body names none of these, which is plain HTTP,
-/// verified whenever TLS is turned on: so a create may not ask for an
-/// unverified upstream either.
+/// Every backend control an automation token may only strengthen:
+/// `BACKEND_PROTECTION_RULES`, each with its predicate, held to that
+/// list by the same test.
 pub const BACKEND_PROTECTIONS: &[Protection<Backend>] = &[
-    Protection {
-        fields: &["tls_skip_verify"],
-        rule: "switched off, never on",
-        why: "on, the upstream leg accepts any certificate, so anyone on the path reads and \
-              rewrites it",
-        weakened: verification_switched_off,
-    },
-    Protection {
-        fields: &["tls_upstream"],
-        rule: "switched on, never off",
-        why: "off, the upstream leg is plain text",
-        weakened: upstream_tls_switched_off,
-    },
-    Protection {
-        fields: &["tls_sni"],
-        rule: "left unchanged while the upstream certificate is verified",
-        why: "it is the name the upstream certificate is verified against, so changing it with \
-              the address inside the grant hands the leg to whoever holds a certificate for the \
-              new name",
-        weakened: verified_name_changed,
-    },
+    Protection::weighing(backend_rule::TLS_SKIP_VERIFY, verification_switched_off),
+    Protection::weighing(backend_rule::TLS_UPSTREAM, upstream_tls_switched_off),
+    Protection::weighing(backend_rule::TLS_SNI, verified_name_changed),
 ];
 
 /// The first rule of `protections` that `after` breaks against
@@ -1787,7 +1429,28 @@ pub async fn update_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lorica_automation_policy::{BACKEND_PROTECTION_RULES, ROUTE_PROTECTION_RULES};
     use lorica_config::models::{AutomationScope, OwnerKind};
+
+    #[test]
+    fn every_protection_rule_is_weighed_here_once_in_its_order() {
+        // The rules are the policy crate's and the predicates are this
+        // module's; the pairing is the one thing written twice, so it is
+        // held to the rule lists entry by entry. A rule added there and
+        // not paired here, or paired twice, turns this red.
+        fn stated<T>(protections: &[Protection<T>]) -> Vec<ProtectionRule> {
+            protections
+                .iter()
+                .map(|protection| ProtectionRule {
+                    fields: protection.fields,
+                    rule: protection.rule,
+                    why: protection.why,
+                })
+                .collect()
+        }
+        assert_eq!(stated(ROUTE_PROTECTIONS), ROUTE_PROTECTION_RULES);
+        assert_eq!(stated(BACKEND_PROTECTIONS), BACKEND_PROTECTION_RULES);
+    }
 
     /// A principal granted `*.review.example.com` and `10.0.0.0/8`.
     fn principal() -> AutomationPrincipal {

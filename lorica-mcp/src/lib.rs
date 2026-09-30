@@ -90,14 +90,15 @@
 //! from it. AC #6 is the field vocabulary each [`tools::Body`] declares,
 //! pinned in `lorica-api`'s tests against the handler that reads it.
 //!
-//! Story 11.3: AC #1 is [`tools::ADMIN_MUTATIONS`], whose settings body
-//! restates the automation plane's allowlist and is pinned against it
-//! in `lorica-api`'s tests; the plane is what enforces it. AC #2 and
+//! Story 11.3: AC #1 is [`tools::admin_mutations`], whose settings body
+//! is built from the allowlist in `lorica-automation-policy`, the one
+//! the automation plane enforces. AC #2 and
 //! IV2 hold by absence: no tool here names an identity or a cluster
 //! membership operation, which `tools` asserts.
 //!
-//! Story 11.4: AC #1 is [`tier`], the one table naming what each tier
-//! requires and tolerates, and [`server::McpServer::sharing`], the
+//! Story 11.4: AC #1 is the tier table in `lorica-automation-policy`,
+//! re-exported with what it means for this catalogue by [`tier`], and
+//! [`server::McpServer::sharing`], the
 //! constructor both bindings build through, which refuses a token whose
 //! scopes span two tiers. AC #3's minting command lives in the `lorica`
 //! binary and reads the same table.
@@ -119,7 +120,7 @@ pub mod untrusted;
 pub use config::{ConfigError, ServerConfig};
 pub use http::HttpsPlane;
 pub use server::{Identity, McpServer, StartupError};
-pub use tier::{Tier, TierError};
+pub use tier::{Tier, TierError, TierTools};
 pub use tools::ToolSpec;
 
 /// The MCP specification revision this crate implements.

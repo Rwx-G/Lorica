@@ -94,8 +94,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use lorica_automation_policy::AutomationScope;
+
 use crate::jsonrpc::{self, code, Request};
-use crate::tier::{self, Tier, TierError};
+use crate::tier::{self, joined, Tier, TierError, TierTools};
 use crate::tools::{self, ToolSpec};
 use crate::untrusted;
 use crate::{AutomationPlane, PlaneError, Reason, Verb, MCP_PROTOCOL_REVISION};
@@ -414,10 +416,16 @@ impl McpServer {
     /// scopes and what it tolerates, and nothing a second tier owns.
     pub fn startup_notice(&self) -> String {
         let tier = self.tier;
-        let lacking = |scopes: Vec<&'static str>| -> Vec<&'static str> {
+        let lacking = |scopes: Vec<AutomationScope>| -> Vec<AutomationScope> {
             scopes
                 .into_iter()
-                .filter(|scope| !self.identity.scopes.iter().any(|held| held == scope))
+                .filter(|scope| {
+                    !self
+                        .identity
+                        .scopes
+                        .iter()
+                        .any(|held| held == scope.as_str())
+                })
                 .collect()
         };
         if self.registered.is_empty() {
@@ -427,7 +435,7 @@ impl McpServer {
                  carrying those, with `lorica mcp token create --tier {}`.",
                 self.identity.public_id,
                 self.identity.scopes.join(", "),
-                tier.tool_scopes().join(", "),
+                joined(&tier.tool_scopes()),
                 tier.as_str(),
             );
         }
@@ -449,15 +457,15 @@ impl McpServer {
         if !missing_tools.is_empty() {
             notice.push_str(&format!(
                 " Not registered for want of a scope: {}.",
-                missing_tools.join(", ")
+                joined(&missing_tools)
             ));
         }
         if !missing_tolerated.is_empty() {
             notice.push_str(&format!(
                 " The {tier} also allows {}, which its tools need to find the ids they act \
                  on and to preview a change; this token lacks {}.",
-                tier.tolerates().join(", "),
-                missing_tolerated.join(", "),
+                joined(tier.tolerates()),
+                joined(&missing_tolerated),
             ));
         }
         notice
@@ -756,8 +764,8 @@ mod tests {
     }
 
     impl Plane {
-        fn carrying(scopes: &[&str]) -> Plane {
-            let scopes: Vec<String> = scopes.iter().map(|s| (*s).to_string()).collect();
+        fn carrying<S: ToString>(scopes: &[S]) -> Plane {
+            let scopes: Vec<String> = scopes.iter().map(ToString::to_string).collect();
             Plane {
                 whoami: json!({
                     "data": { "name": "mcp-read", "public_id": "0123456789abcdef01234567",
@@ -883,7 +891,7 @@ mod tests {
         assert!(notice.contains("environments:write"), "{notice}");
         assert!(notice.contains("--tier config"), "{notice}");
         for scope in Tier::Config.tool_scopes() {
-            assert!(notice.contains(scope), "{notice}");
+            assert!(notice.contains(scope.as_str()), "{notice}");
         }
         // Another tier's scopes are not advice this token should take.
         assert!(!notice.contains("logs:read"), "{notice}");
@@ -952,7 +960,7 @@ mod tests {
         assert!(notice.contains("lorica_route_create_preview"), "{notice}");
         assert!(notice.contains("backends:write"), "{notice}");
         for tolerated in Tier::Config.tolerates() {
-            assert!(notice.contains(tolerated), "{notice}");
+            assert!(notice.contains(tolerated.as_str()), "{notice}");
         }
         assert!(!notice.contains("logs:read"), "{notice}");
 
@@ -1000,7 +1008,10 @@ mod tests {
                     "{name}"
                 );
                 let message = refused["error"]["message"].as_str().unwrap_or_default();
-                assert!(message.contains(mutation.scope), "{name}: {refused}");
+                assert!(
+                    message.contains(mutation.scope.as_str()),
+                    "{name}: {refused}"
+                );
                 // The tier answer, not the scope answer: adding the
                 // scope would make this token span two tiers, so
                 // "needs the scope" is advice it could never follow.
@@ -1086,7 +1097,8 @@ mod tests {
         );
         for spec in server.tools() {
             assert!(
-                spec.scope == "routes:write" || spec.scope == "routes:read",
+                spec.scope == AutomationScope::RoutesWrite
+                    || spec.scope == AutomationScope::RoutesRead,
                 "{}",
                 spec.name
             );

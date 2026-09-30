@@ -4,10 +4,16 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { auth } from '../../lib/auth';
 import { clusterStatus } from '../../lib/cluster';
 import { api, type AutomationTokenResponse } from '../../lib/api';
-import AutomationTokensTab, { ALL_SCOPES, carriesGrants } from './AutomationTokensTab.svelte';
+import AutomationTokensTab, {
+  ALL_SCOPES,
+  carriesGrants,
+  readMcpTier,
+} from './AutomationTokensTab.svelte';
 import {
   AUTOMATION_SCOPE_WIRE_STRINGS,
   GRANT_BOUNDED_SCOPES,
+  MCP_TIER_VECTORS,
+  type McpTierVector,
 } from './automation-scopes.generated';
 
 const FULL_TOKEN = '0123456789abcdef01234567.SGVsbG9Xb3JsZFNlY3JldFZhbHVlSGVyZTEyMzQ1Ng';
@@ -232,6 +238,88 @@ describe('AutomationTokensTab grants', () => {
     for (const scope of AUTOMATION_SCOPE_WIRE_STRINGS) {
       expect(carriesGrants([scope])).toBe(GRANT_BOUNDED_SCOPES.includes(scope));
     }
+  });
+});
+
+describe('AutomationTokensTab MCP tier', () => {
+  // `readMcpTier` is a second implementation of the policy crate's
+  // `resolve`. The vectors are rendered from that function by
+  // `lorica-api/tests/automation_scope_fixture.rs`; replaying every one
+  // of them here is what holds the two to one rule.
+  it('reads every vector the policy crate rendered exactly as lorica-mcp does', () => {
+    expect(MCP_TIER_VECTORS.length).toBeGreaterThan(0);
+    for (const vector of MCP_TIER_VECTORS) {
+      expect(readMcpTier(vector.scopes), vector.scopes.join(', ')).toEqual({
+        tier: vector.tier,
+        anchoring: [...vector.anchoring],
+        offending: [...vector.offending],
+      });
+    }
+  });
+
+  /** A vector the form can reproduce by ticking its scopes. */
+  function vectorWhere(matches: (vector: McpTierVector) => boolean): McpTierVector {
+    const found = MCP_TIER_VECTORS.find(matches);
+    if (found === undefined) throw new Error('test setup: no such vector');
+    return found;
+  }
+
+  async function openFormWith(scopes: readonly string[]) {
+    vi.spyOn(api, 'listAutomationTokens').mockResolvedValue({ data: { tokens: [] } });
+    const create = vi.spyOn(api, 'createAutomationToken').mockResolvedValue({
+      data: { ...token(), token: FULL_TOKEN },
+    });
+    render(AutomationTokensTab, { props: props() });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Create Token' })).toBeInTheDocument(),
+    );
+    await fireEvent.click(screen.getByRole('button', { name: 'Create Token' }));
+    await fireEvent.input(screen.getByLabelText(/^Name/), { target: { value: 'mcp' } });
+    for (const box of screen.getAllByRole('checkbox')) {
+      if ((box as HTMLInputElement).checked) await fireEvent.click(box);
+    }
+    for (const scope of scopes) {
+      await fireEvent.click(screen.getByRole('checkbox', { name: scope }));
+    }
+    return create;
+  }
+
+  it('names the tier a one-tier selection makes', async () => {
+    const one = vectorWhere(
+      (vector) => vector.scopes.length === 1 && vector.tier === 'admin',
+    );
+    await openFormWith(one.scopes);
+    expect(screen.getByTestId('mcp-tier-hint')).toHaveTextContent('MCP tier: admin');
+    expect(screen.queryByTestId('mcp-tier-warning')).not.toBeInTheDocument();
+  });
+
+  it('warns, naming the offending scopes, when the selection spans two tiers, and still mints', async () => {
+    const spanning = vectorWhere(
+      (vector) => vector.scopes.length === 2 && vector.offending.length > 0,
+    );
+    const create = await openFormWith(spanning.scopes);
+
+    const warning = screen.getByTestId('mcp-tier-warning');
+    expect(warning).toHaveTextContent(`the ${spanning.tier} tier`);
+    for (const scope of spanning.offending) {
+      expect(warning).toHaveTextContent(scope);
+    }
+    expect(warning).toHaveTextContent('cannot start lorica-mcp');
+    expect(screen.queryByTestId('mcp-tier-hint')).not.toBeInTheDocument();
+
+    // A warning and not a block: the automation plane serves such a
+    // token, so the form still sends it.
+    const createButton = screen.getByRole('button', { name: 'Create' });
+    expect(createButton).not.toBeDisabled();
+    await fireEvent.click(createButton);
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0].scopes).toEqual([...spanning.scopes]);
+  });
+
+  it('says nothing about a tier while no scope is selected', async () => {
+    await openFormWith([]);
+    expect(screen.queryByTestId('mcp-tier-hint')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('mcp-tier-warning')).not.toBeInTheDocument();
   });
 });
 

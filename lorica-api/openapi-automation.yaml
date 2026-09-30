@@ -1884,7 +1884,7 @@ components:
         function after the tier's bound; a field absent leaves the
         stored value alone. A key not listed here is refused (403) with
         the key named, before any value is read: the list is
-        `SETTINGS_ALLOWLIST` in `lorica-api/src/automation/write.rs`,
+        `SETTINGS_ALLOWLIST` in `lorica-automation-policy/src/settings.rs`,
         where each entry carries the reason it is in and its bound, and
         `tests/openapi_contract.rs` pins this schema, bounds included,
         against it.

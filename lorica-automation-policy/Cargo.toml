@@ -1,0 +1,26 @@
+[package]
+name = "lorica-automation-policy"
+version = "1.8.0"
+authors = ["Rwx-G"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "The automation plane's policy as data: scope vocabulary, MCP tiers, the admin settings allowlist and the one-way protections"
+
+# Pure data and pure functions, and nothing else. Every crate that has
+# to know what a scope, a tier or an allowlisted setting is depends on
+# this one: `lorica-config` for the token model, `lorica-api` for the
+# plane that enforces it, `lorica-mcp` for the tools that describe it
+# and `lorica` for the minting command. `lorica-mcp` is the reason the
+# list below is one line long: its stdio binary must not link SQLite,
+# and CI checks its normal dependency graph for `rusqlite`,
+# `lorica-config` and `lorica-api`. A dependency added here lands in
+# that graph.
+[dependencies]
+# The scope enum is the token model's wire vocabulary; its serde
+# renames are the spellings a stored token and every answer carry.
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+# The tests read a scope back the way the wire spells it.
+serde_json = "1.0"

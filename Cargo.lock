@@ -2943,6 +2943,7 @@ dependencies = [
  "itoa",
  "log",
  "lorica-api",
+ "lorica-automation-policy",
  "lorica-bench",
  "lorica-cache",
  "lorica-challenge",
@@ -3033,6 +3034,7 @@ dependencies = [
  "itoa",
  "jsonwebtoken",
  "lorica-acme",
+ "lorica-automation-policy",
  "lorica-bench",
  "lorica-cache",
  "lorica-cluster",
@@ -3069,6 +3071,14 @@ dependencies = [
  "tracing",
  "uuid",
  "x509-parser 0.18.1",
+]
+
+[[package]]
+name = "lorica-automation-policy"
+version = "1.8.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3180,6 +3190,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "ipnet",
+ "lorica-automation-policy",
  "ring",
  "rusqlite",
  "serde",
@@ -3368,7 +3379,7 @@ dependencies = [
 name = "lorica-mcp"
 version = "1.8.0"
 dependencies = [
- "lorica-config",
+ "lorica-automation-policy",
  "percent-encoding",
  "rcgen",
  "reqwest 0.12.28",

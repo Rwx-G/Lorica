@@ -556,10 +556,7 @@ fn mcp_outcome(record: &McpCallRecord) -> (&'static str, Option<String>) {
                 .tool
                 .as_deref()
                 .and_then(tools::find)
-                .and_then(|spec| {
-                    serde_json::from_str::<AutomationScope>(&format!("\"{}\"", spec.scope)).ok()
-                })
-                .map_or(UNKNOWN_TOOL, scope_str);
+                .map_or(UNKNOWN_TOOL, |spec| scope_str(spec.scope));
             ("forbidden", Some(needed.to_string()))
         }
         Outcome::InvalidParams => ("refused", Some(INVALID_PARAMS.to_string())),

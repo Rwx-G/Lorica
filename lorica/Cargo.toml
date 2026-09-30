@@ -45,6 +45,9 @@ lorica-api = { version = "1.8.0", path = "../lorica-api" }
 # catalogue from here, so the scopes it mints and the blast radius it
 # prints are the ones the MCP server enforces rather than a copy.
 lorica-mcp = { version = "1.8.0", path = "../lorica-mcp" }
+# The settings allowlist the admin tier's blast radius prints, read
+# from the one statement the plane enforces.
+lorica-automation-policy = { version = "1.8.0", path = "../lorica-automation-policy" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 lorica-worker = { version = "1.8.0", path = "../lorica-worker" }

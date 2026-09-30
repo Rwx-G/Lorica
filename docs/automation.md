@@ -1046,7 +1046,7 @@ top level or inside `path_rules`, `header_rules` or `traffic_splits`,
 must point inside the CIDR grant and belong to no other principal's
 environment; a backend the route already carries is not re-weighed by
 a patch that leaves the links alone. The fields of
-`WITHHELD_ROUTE_FIELDS` (`lorica-api/src/automation/write.rs`) are
+`WITHHELD_ROUTE_FIELDS` (`lorica-automation-policy/src/protections.rs`) are
 refused (403) when an automation token sends them, whatever the value,
 each for the reason beside it there: `basic_auth_password`, a
 credential, whose clearing also switches Basic auth off;
@@ -1077,7 +1077,7 @@ value is stored as sent. The dashboard reads the values and is not
 subject to any of this.
 
 **Access control and upstream trust move one way.** The controls of
-`ROUTE_PROTECTIONS` and `BACKEND_PROTECTIONS`, beside the withheld list,
+`ROUTE_PROTECTION_RULES` and `BACKEND_PROTECTION_RULES`, beside the withheld list,
 are weighed on the stored row against the row about to be written, in
 the same closure, and an automation token may only strengthen them: the
 Basic-auth credential in force, the IP allow and deny lists, the GeoIP
@@ -1194,7 +1194,7 @@ the MCP admin tier is built on:
 
 **The allowlist binds here, on the plane.** The body is read as a JSON
 object, and a key outside `SETTINGS_ALLOWLIST`
-(`lorica-api/src/automation/write.rs`, each entry with its reason) is
+(`lorica-automation-policy/src/settings.rs`, each entry with its reason) is
 refused with a 403 naming the key, before any value is read and before
 any validator runs. That holds for every caller: the MCP tool, a direct
 client with the same token, a token carrying every scope there is. The

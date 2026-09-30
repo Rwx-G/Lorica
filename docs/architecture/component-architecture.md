@@ -2,14 +2,17 @@
 
 > **Baseline note.** This is the v1.0 planning decomposition (the
 > "Phase 2 / Phase 3" markers are the original roadmap phasing). The
-> workspace has since grown to 32 members; components added after this
+> workspace has since grown to 33 members; components added after this
 > blueprint and not described below include `lorica-acme` (pure ACME
 > core: DNS challengers + instant-acme driver), `lorica-metrics` (shared
 > Prometheus registry + cross-worker counter aggregation),
 > `lorica-cluster` (the v1.7.0 cluster plane: fleet CA, join tokens,
 > enrollment and operational listeners, roster, two-phase replication),
 > `lorica-geoip`, `lorica-challenge`, `lorica-shmem`, `lorica-cache`, and
-> `lorica-mcp` (the v1.9.0 management MCP server).
+> `lorica-mcp` (the v1.9.0 management MCP server) and
+> `lorica-automation-policy` (the automation plane's scope vocabulary,
+> MCP tier table, settings allowlist and protection rules as data, read
+> by `lorica-config`, `lorica-api`, `lorica-mcp` and `lorica`).
 > See [FORK.md](../../FORK.md) and the README architecture table for the
 > current crate roster, which is authoritative over the count above.
 
@@ -31,7 +34,7 @@
 
 **Dependencies:**
 - **Existing Components:** lorica-core, lorica-proxy, lorica-runtime, lorica-tls, lorica-lb
-- **New Components:** lorica-config, lorica-api, lorica-dashboard, lorica-worker (Phase 2), lorica-command (Phase 2), lorica-cluster (v1.7.0, opt-in), lorica-mcp (v1.9.0: the tier table and tool catalogue `lorica mcp token create` reads; the `lorica-mcp` binary itself is a separate process the MCP client launches)
+- **New Components:** lorica-config, lorica-api, lorica-dashboard, lorica-worker (Phase 2), lorica-command (Phase 2), lorica-cluster (v1.7.0, opt-in), lorica-mcp (v1.9.0: the tool catalogue `lorica mcp token create` reads; the `lorica-mcp` binary itself is a separate process the MCP client launches), lorica-automation-policy (v1.9.0: the tier table and the settings allowlist the same command prints)
 
 **Technology Stack:** Rust, clap, tracing
 
@@ -48,7 +51,7 @@
 
 **Dependencies:**
 - **Existing Components:** None (standalone)
-- **New Components:** None
+- **New Components:** lorica-automation-policy (v1.9.0: the automation scope vocabulary and the tier table the token model validates against)
 
 **Technology Stack:** Rust, rusqlite, serde, toml
 
@@ -67,7 +70,7 @@
 
 **Dependencies:**
 - **Existing Components:** lorica-core (for listener setup), lorica-tls
-- **New Components:** lorica-config, lorica-dashboard, lorica-notify, lorica-cluster (pre-authentication budgets), lorica-acme, lorica-metrics, lorica-waf, lorica-bench, lorica-mcp (v1.9.0; the edge points this way only, so the `lorica-mcp` binary never links the management crate or SQLite)
+- **New Components:** lorica-config, lorica-dashboard, lorica-notify, lorica-cluster (pre-authentication budgets), lorica-acme, lorica-metrics, lorica-waf, lorica-bench, lorica-mcp (v1.9.0; the edge points this way only, so the `lorica-mcp` binary never links the management crate or SQLite), lorica-automation-policy (v1.9.0; the settings allowlist and protection rules the plane enforces, which `lorica-mcp` reads from the same crate)
 
 **Technology Stack:** Rust, axum, tower, argon2, sysinfo, rustls
 

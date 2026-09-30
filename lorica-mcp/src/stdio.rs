@@ -277,10 +277,10 @@ mod tests {
         }
     }
 
-    fn server_carrying(scopes: &[&str]) -> McpServer {
+    fn server_carrying<S: ToString>(scopes: &[S]) -> McpServer {
         McpServer::over(Identity {
             public_id: "0123456789abcdef01234567".to_string(),
-            scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+            scopes: scopes.iter().map(ToString::to_string).collect(),
         })
         .expect("a token of one tier")
     }
@@ -445,7 +445,10 @@ mod tests {
         for tool in listed {
             let name = tool["name"].as_str().expect("a tool has a name");
             let spec = crate::tools::find(name).expect("a listed tool is in the catalogue");
-            assert!(spec.scope.ends_with(":read"), "{name} is not a read");
+            assert!(
+                spec.scope.as_str().ends_with(":read"),
+                "{name} is not a read"
+            );
             assert!(spec.verb().is_read(), "{name} is not a GET");
             assert!(spec.path.starts_with("/automation/v1/"), "{name}");
         }

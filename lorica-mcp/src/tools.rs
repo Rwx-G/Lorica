@@ -44,7 +44,7 @@
 //! Story 11.2 AC #3 asks every mutating tool for a preview counterpart
 //! taking the same arguments. That is not a convention a second tool
 //! follows: a [`Mutation`] is declared once in [`MUTATIONS`] or
-//! [`ADMIN_MUTATIONS`] and [`catalogue`] builds both tools from it, the
+//! [`admin_mutations`] and [`catalogue`] builds both tools from it, the
 //! apply and the preview,
 //! so their arguments cannot differ and a mutation cannot ship without
 //! its preview. The preview is the same call with [`DRY_RUN_QUERY`]
@@ -78,6 +78,7 @@
 
 use std::sync::OnceLock;
 
+use lorica_automation_policy::{AutomationScope, SETTINGS_ALLOWLIST, SETTINGS_ALLOWLIST_NAMES};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::{json, Map, Value};
 
@@ -233,7 +234,7 @@ that did not fit. The ceiling is the server's and no argument raises it.";
 /// request struct behind the path, both ways, so a field the management
 /// model grows reaches a model by a decision and a field it drops is a
 /// red gate rather than a silent 422. The admin tier's settings body is
-/// pinned the same way against the plane's `SETTINGS_ALLOWLIST`, which
+/// built from `SETTINGS_ALLOWLIST` in `lorica-automation-policy`, which
 /// is what bounds that path rather than a struct. Values are never
 /// examined here:
 /// every field check is the plane's (Story 11.2 AC #5).
@@ -320,9 +321,8 @@ pub struct ToolSpec {
     /// [`ToolSpec::description`], so none of them can be forgotten
     /// here.
     pub summary: &'static str,
-    /// The automation scope a token needs to reach it, spelled the way
-    /// `AutomationScope` serialises.
-    pub scope: &'static str,
+    /// The automation scope a token needs to reach it.
+    pub scope: AutomationScope,
     /// The automation path it calls, or the collection its resource
     /// hangs under.
     pub path: &'static str,
@@ -335,11 +335,11 @@ pub struct ToolSpec {
     pub paginated: bool,
     /// A read, or a mutation applied or previewed.
     pub kind: Kind,
-    /// The tier this tool belongs to, which is the array it is
-    /// declared in: [`READS`], [`MUTATIONS`] or [`ADMIN_MUTATIONS`].
-    /// [`catalogue`] sets it for a mutation's pair from the array the
+    /// The tier this tool belongs to, which is the list it is
+    /// declared in: [`READS`], [`MUTATIONS`] or [`admin_mutations`].
+    /// [`catalogue`] sets it for a mutation's pair from the list the
     /// mutation comes from, and a test pins every tool against its
-    /// array, so membership is data and never a name matched later.
+    /// list, so membership is data and never a name matched later.
     pub tier: Tier,
 }
 
@@ -359,7 +359,7 @@ pub struct Mutation {
     /// What the change is, in the author's own words.
     pub summary: &'static str,
     /// The write scope both tools sit behind.
-    pub scope: &'static str,
+    pub scope: AutomationScope,
     /// The verb the plane mounts the mutation under.
     pub verb: Verb,
     /// The collection path, or the path of the create.
@@ -868,7 +868,7 @@ pub const READS: &[ToolSpec] = &[
                   filters: each window then reads only its own rows, however deep. `offset` \
                   also walks back, for a few windows; `after_id` bounds the other end for a \
                   log that is still growing.",
-        scope: "logs:read",
+        scope: AutomationScope::LogsRead,
         path: "/automation/v1/logs",
         resource: None,
         filters: &[
@@ -946,7 +946,7 @@ pub const READS: &[ToolSpec] = &[
         title: "WAF events",
         summary: "Read recent WAF matches, newest first: what rule fired, on which request, \
                   and the value that matched it.",
-        scope: "waf:read",
+        scope: AutomationScope::WafRead,
         path: "/automation/v1/waf/events",
         resource: None,
         filters: &[Param {
@@ -967,7 +967,7 @@ pub const READS: &[ToolSpec] = &[
                   last 24 hours, how many rules are loaded, and the count per rule category. \
                   The counters may be a few seconds old: the node recomputes them at most \
                   once per short window.",
-        scope: "waf:read",
+        scope: AutomationScope::WafRead,
         path: "/automation/v1/waf/stats",
         resource: None,
         filters: &[],
@@ -980,7 +980,7 @@ pub const READS: &[ToolSpec] = &[
         title: "SLA overview",
         summary: "Read the passive 1 hour and 24 hour availability and latency windows for \
                   every route this node holds.",
-        scope: "sla:read",
+        scope: AutomationScope::SlaRead,
         path: "/automation/v1/sla/overview",
         resource: None,
         filters: &[],
@@ -993,7 +993,7 @@ pub const READS: &[ToolSpec] = &[
         title: "SLA for one route",
         summary: "Read one route's passive availability and latency windows over 1 hour, 24 \
                   hours, 7 days and 30 days.",
-        scope: "sla:read",
+        scope: AutomationScope::SlaRead,
         path: "/automation/v1/sla/routes",
         resource: Some(ROUTE_ID),
         filters: &[],
@@ -1008,7 +1008,7 @@ pub const READS: &[ToolSpec] = &[
                   hash, and on a control plane a one-line entry per fleet member. The fleet \
                   roster, which names each follower's address and the hostnames whose \
                   private keys it holds, is deliberately not reachable from this tier.",
-        scope: "cluster:read",
+        scope: AutomationScope::ClusterRead,
         path: "/automation/v1/cluster/status",
         resource: None,
         filters: &[],
@@ -1021,7 +1021,7 @@ pub const READS: &[ToolSpec] = &[
         title: "Backends",
         summary: "Read every configured backend with its health, its open connection count \
                   and its live EWMA score.",
-        scope: "backends:read",
+        scope: AutomationScope::BackendsRead,
         path: "/automation/v1/backends",
         resource: None,
         filters: &[],
@@ -1037,7 +1037,7 @@ pub const READS: &[ToolSpec] = &[
                   value of every header rule and of every static upstream header reads as \
                   `[redacted]`, and a route an environment owns names that environment only \
                   to a token that may look the environment up.",
-        scope: "routes:read",
+        scope: AutomationScope::RoutesRead,
         path: "/automation/v1/routes",
         resource: None,
         filters: &[Param {
@@ -1058,7 +1058,7 @@ pub const READS: &[ToolSpec] = &[
                   issuer, validity window and ACME settings. No PEM body of any kind and no \
                   key material: the endpoint that returns the public certificate is not \
                   mounted on this plane.",
-        scope: "certificates:read",
+        scope: AutomationScope::CertificatesRead,
         path: "/automation/v1/certificates",
         resource: None,
         filters: &[],
@@ -1103,7 +1103,7 @@ const CERTIFICATE_ID: Param = Param {
 /// the struct both ways: a field the plane refuses on input
 /// (`managed_by`), the fields the plane refuses from any automation
 /// token whatever their value (`WITHHELD_ROUTE_FIELDS` in
-/// `lorica-api/src/automation/write.rs`: the Basic-auth password,
+/// `lorica-automation-policy`: the Basic-auth password,
 /// forward auth, mirroring, the mTLS trust anchor, the upstream header
 /// map), and the Basic-auth username, which a token may not change
 /// where Basic auth is in force and which protects nothing without the
@@ -1111,9 +1111,9 @@ const CERTIFICATE_ID: Param = Param {
 /// by a human.
 ///
 /// Several fields offered here are access-control or trust controls a
-/// token may only strengthen (`ROUTE_PROTECTIONS` beside the withheld
-/// list): the tool's summary names them and the plane refuses the
-/// other direction with a 403, the preview included.
+/// token may only strengthen (`ROUTE_PROTECTION_RULES` beside the
+/// withheld list): the tool's summary names them and the plane refuses
+/// the other direction with a 403, the preview included.
 const ROUTE_CREATE_FIELDS: &[&str] = &[
     "access_log_enabled",
     "add_path_prefix",
@@ -1372,9 +1372,8 @@ const ROUTE_NESTED: &[Nested] = &[
 /// The fields of `CreateBackendRequest` and `UpdateBackendRequest`
 /// this tier offers: every one but `managed_by`, refused by the plane
 /// on input. The upstream TLS fields are offered and only ever
-/// strengthened (`BACKEND_PROTECTIONS` in
-/// `lorica-api/src/automation/write.rs`), which the tool's summary
-/// says.
+/// strengthened (`BACKEND_PROTECTION_RULES` in
+/// `lorica-automation-policy`), which the tool's summary says.
 const BACKEND_FIELDS: &[&str] = &[
     "address",
     "group_name",
@@ -1410,7 +1409,7 @@ pub const MUTATIONS: &[Mutation] = &[
                   token's allowed_backend_cidrs. A duplicate hostname and an unknown backend \
                   id are refused by the store when the change is applied. A certificate bound \
                   here must cover only names inside allowed_hostnames.",
-        scope: "routes:write",
+        scope: AutomationScope::RoutesWrite,
         verb: Verb::Post,
         path: "/automation/v1/routes",
         resource: None,
@@ -1446,7 +1445,7 @@ pub const MUTATIONS: &[Mutation] = &[
                   keeps the value stored for the rule at the same position with the same \
                   header_name and match_type, and is refused where no such rule is stored, so \
                   a rule added, moved or retyped carries its value.",
-        scope: "routes:write",
+        scope: AutomationScope::RoutesWrite,
         verb: Verb::Put,
         path: "/automation/v1/routes",
         resource: Some(ROUTE_ID),
@@ -1467,7 +1466,7 @@ pub const MUTATIONS: &[Mutation] = &[
                   allowed_hostnames on its current hostname and aliases. A route an \
                   environment owns takes the environment with it, as the dashboard's delete \
                   does, and is refused unless the environment is this token's own.",
-        scope: "routes:write",
+        scope: AutomationScope::RoutesWrite,
         verb: Verb::Delete,
         path: "/automation/v1/routes",
         resource: Some(ROUTE_ID),
@@ -1484,7 +1483,7 @@ pub const MUTATIONS: &[Mutation] = &[
                   as `lorica_certificates` reports it, and cover only names inside \
                   allowed_hostnames: nothing here uploads, replaces or generates one, and no \
                   argument takes key material. A route an environment owns is refused.",
-        scope: "certificates:write",
+        scope: AutomationScope::CertificatesWrite,
         verb: Verb::Put,
         path: "/automation/v1/routes",
         resource: Some(ROUTE_ID),
@@ -1505,7 +1504,7 @@ pub const MUTATIONS: &[Mutation] = &[
                   be an ip:port inside the token's allowed_backend_cidrs; a name cannot be \
                   checked against a CIDR and is refused. `tls_skip_verify` may not be set: an \
                   upstream a token creates verifies its certificate whenever TLS is on.",
-        scope: "backends:write",
+        scope: AutomationScope::BackendsWrite,
         verb: Verb::Post,
         path: "/automation/v1/backends",
         resource: None,
@@ -1530,7 +1529,7 @@ pub const MUTATIONS: &[Mutation] = &[
                   included; `tls_sni` left unchanged while the upstream certificate is \
                   verified. A write in the other direction is refused, preview included; it is \
                   made in the dashboard.",
-        scope: "backends:write",
+        scope: AutomationScope::BackendsWrite,
         verb: Verb::Put,
         path: "/automation/v1/backends",
         resource: Some(BACKEND_ID),
@@ -1552,7 +1551,7 @@ pub const MUTATIONS: &[Mutation] = &[
                   connections are gone or after a minute. The backend named must be inside \
                   the token's allowed_backend_cidrs on its stored address. A backend an \
                   environment owns is refused.",
-        scope: "backends:write",
+        scope: AutomationScope::BackendsWrite,
         verb: Verb::Delete,
         path: "/automation/v1/backends",
         resource: Some(BACKEND_ID),
@@ -1568,7 +1567,7 @@ pub const MUTATIONS: &[Mutation] = &[
                   Every name the certificate carries must be inside the token's \
                   allowed_hostnames. A certificate that was uploaded rather than issued is \
                   refused, and nothing here takes its replacement.",
-        scope: "certificates:write",
+        scope: AutomationScope::CertificatesWrite,
         verb: Verb::Post,
         path: "/automation/v1/certificates",
         resource: Some(CERTIFICATE_ID),
@@ -1577,34 +1576,35 @@ pub const MUTATIONS: &[Mutation] = &[
     },
 ];
 
-/// The global settings the admin tier's tool offers, sorted.
-///
-/// A restatement, and a deliberate one: this crate cannot read
-/// `SETTINGS_ALLOWLIST` in `lorica-api` (the dependency runs the other
-/// way, so a stdio subprocess does not carry the management crate), and
-/// that constant, with the reason beside each entry, is the control.
-/// The automation plane refuses any other key with a 403 whoever calls
-/// it. `lorica-api/tests/openapi_contract.rs` pins this list against the
-/// constant both ways, so an entry added on either side alone is a red
-/// gate rather than a key one surface offers and the other refuses; and
-/// `lorica-api/tests/admin_tier.rs` pins the bound each key's entry
-/// carries against the one the tool's body states, and the fleet and
-/// restart claims of its summary against the entries' reach and
-/// takes-effect.
-const SETTINGS_FIELDS: &[&str] = &[
-    "access_log_retention",
-    "cert_critical_days",
-    "cert_warning_days",
-    "default_health_check_interval_s",
-    "health_max_concurrent_probes",
-    "sla_purge_retention_days",
-    "waf_ban_duration_s",
-    "waf_ban_threshold",
-    "waf_event_retention",
-];
+/// The settings body's doc, with the bound of every key the plane
+/// accepts, rendered from `SETTINGS_ALLOWLIST` so the tool states the
+/// bounds the plane enforces and no others.
+fn settings_body_doc() -> &'static str {
+    static DOC: OnceLock<String> = OnceLock::new();
+    DOC.get_or_init(|| {
+        let bounds: Vec<String> = SETTINGS_ALLOWLIST
+            .iter()
+            .map(|setting| match setting.validator_also {
+                Some(also) => format!("`{}` {}, and {also}", setting.name, setting.bound_text()),
+                None => format!("`{}` {}", setting.name, setting.bound_text()),
+            })
+            .collect();
+        format!(
+            "The settings to change; a field absent leaves its value alone. The bound each field \
+             may be set within: {}.",
+            bounds.join("; ")
+        )
+    })
+}
 
 /// The mutations of the admin tier (Story 11.3): one, the operational
 /// global settings, declared once like the config tier's.
+///
+/// Built once for the process rather than declared as a constant,
+/// because the body's vocabulary and the bounds its doc states are the
+/// allowlist's, read from `lorica-automation-policy`: the plane refuses
+/// any other key with a 403 whoever calls it, and a key or a bound
+/// added there reaches this tool with nothing to edit here.
 ///
 /// The tier is defined by what it refuses, and the refusals are not a
 /// tool here that says no: there is no tool for users, roles, the
@@ -1612,42 +1612,41 @@ const SETTINGS_FIELDS: &[&str] = &[
 /// revocation or break-glass, and the automation plane declares no path
 /// for any of them, so nothing an injected instruction names can reach
 /// one. `lorica-api/tests/admin_tier.rs` asserts both halves.
-pub const ADMIN_MUTATIONS: &[Mutation] = &[Mutation {
-    apply: "lorica_settings_update",
-    preview: "lorica_settings_update_preview",
-    title: "Change operational settings",
-    summary: "Change operational global settings, as the dashboard's settings page would, \
-              through the management API's own validators: log and WAF-event retention, SLA \
-              retention, certificate expiry alert thresholds, the WAF auto-ban threshold and \
-              duration, and the health-check interval and probe budget. Each field is bounded, \
-              and the retentions may only be raised; the node refuses a value outside its \
-              bound, naming the field and the bound, and refuses any key the schema does not \
-              list, whoever sends it. On a cluster's control plane every one of these is fleet \
-              policy, replicated to every follower. Each takes effect without a restart. \
-              Users, roles, automation and cluster credentials, the management listener, the \
-              connection and automation allowlists, the node's trust anchors, the log level \
-              and the data plane's capacity limits are not reachable from here: they are \
-              changed in the dashboard, by a human. The answer is the listed fields and no \
-              other part of the settings document.",
-    scope: "settings:write",
-    verb: Verb::Put,
-    path: "/automation/v1/settings",
-    resource: None,
-    action: None,
-    body: Some(Body {
-        argument: "settings",
-        schema: "SettingsPatch",
-        fields: SETTINGS_FIELDS,
-        nested: &[],
-        doc: "The settings to change; a field absent leaves its value alone. The bound each \
-              field may be set within: `access_log_retention` raise-only, 1..=1000000; \
-              `waf_event_retention` raise-only, 1..=1000000; `sla_purge_retention_days` \
-              raise-only, 1..=3650; `cert_warning_days` 14..=365; `cert_critical_days` \
-              3..=365, and below `cert_warning_days`; `waf_ban_threshold` 3..=100; \
-              `waf_ban_duration_s` 60..=86400; `default_health_check_interval_s` 5..=60; \
-              `health_max_concurrent_probes` 16..=512.",
-    }),
-}];
+pub fn admin_mutations() -> &'static [Mutation] {
+    static ADMIN_MUTATIONS: OnceLock<Vec<Mutation>> = OnceLock::new();
+    ADMIN_MUTATIONS.get_or_init(|| {
+        vec![Mutation {
+            apply: "lorica_settings_update",
+            preview: "lorica_settings_update_preview",
+            title: "Change operational settings",
+            summary: "Change operational global settings, as the dashboard's settings page would, \
+                      through the management API's own validators: log and WAF-event retention, SLA \
+                      retention, certificate expiry alert thresholds, the WAF auto-ban threshold and \
+                      duration, and the health-check interval and probe budget. Each field is bounded, \
+                      and the retentions may only be raised; the node refuses a value outside its \
+                      bound, naming the field and the bound, and refuses any key the schema does not \
+                      list, whoever sends it. On a cluster's control plane every one of these is fleet \
+                      policy, replicated to every follower. Each takes effect without a restart. \
+                      Users, roles, automation and cluster credentials, the management listener, the \
+                      connection and automation allowlists, the node's trust anchors, the log level \
+                      and the data plane's capacity limits are not reachable from here: they are \
+                      changed in the dashboard, by a human. The answer is the listed fields and no \
+                      other part of the settings document.",
+            scope: AutomationScope::SettingsWrite,
+            verb: Verb::Put,
+            path: "/automation/v1/settings",
+            resource: None,
+            action: None,
+            body: Some(Body {
+                argument: "settings",
+                schema: "SettingsPatch",
+                fields: &SETTINGS_ALLOWLIST_NAMES,
+                nested: &[],
+                doc: settings_body_doc(),
+            }),
+        }]
+    })
+}
 
 /// The published field names that carry a credential-shaped word and
 /// are not a credential, for the two sweeps that read this crate's
@@ -1663,7 +1662,7 @@ pub(crate) const NAMED_FOR_A_LIFETIME_NOT_A_CREDENTIAL: &[&str] = &["cookie_ttl_
 /// preview.
 ///
 /// Built once for the process from [`READS`], [`MUTATIONS`] and
-/// [`ADMIN_MUTATIONS`], each tool carrying the [`Tier`] of the array it
+/// [`admin_mutations`], each tool carrying the [`Tier`] of the list it
 /// came from. A token's registry is a filter over this list by the
 /// token's one tier and its scopes (`McpServer::sharing`, reading
 /// [`crate::tier::TIERS`]): a read scope registers a read tool and
@@ -1673,7 +1672,7 @@ pub fn catalogue() -> &'static [ToolSpec] {
     static CATALOGUE: OnceLock<Vec<ToolSpec>> = OnceLock::new();
     CATALOGUE.get_or_init(|| {
         let mut all: Vec<ToolSpec> = READS.to_vec();
-        for (tier, mutations) in [(Tier::Config, MUTATIONS), (Tier::Admin, ADMIN_MUTATIONS)] {
+        for (tier, mutations) in [(Tier::Config, MUTATIONS), (Tier::Admin, admin_mutations())] {
             for mutation in mutations {
                 all.push(mutation.tool(false, tier));
                 all.push(mutation.tool(true, tier));
@@ -1869,52 +1868,52 @@ mod tests {
     }
 
     #[test]
-    fn every_scope_the_catalogue_names_is_one_the_token_model_declares() {
-        // The one cross-crate guard. This crate names its scopes as
-        // plain strings, because taking `lorica-config` as a runtime
-        // dependency would put bundled SQLite in the dependency graph
-        // of a stdio subprocess that reads no database. A spelling that
-        // drifts would not fail to compile; it would register no tool
-        // and say nothing, which is the failure
-        // `.claude/rules/derived-not-transcribed.md` is about.
-        use lorica_config::models::AutomationScope;
-
-        let named: BTreeSet<String> = catalogue()
-            .iter()
-            .map(|spec| spec.scope.to_string())
-            .collect();
+    fn every_scope_but_the_environment_pair_has_a_tool() {
+        // A scope added to the enum should not quietly stay without a
+        // tool. Which tier it belongs to is the policy crate's question,
+        // walked there; this one is whether any tool sits behind it.
+        // What stays toolless is named here as the deliberate
+        // complement: the two environment scopes are Story 10.4's
+        // resource, which is a pipeline's surface and not an operator's.
+        let named: BTreeSet<&str> = catalogue().iter().map(|spec| spec.scope.as_str()).collect();
         assert!(!named.is_empty(), "the catalogue is empty");
-        for scope in &named {
-            serde_json::from_str::<AutomationScope>(&format!("\"{scope}\""))
-                .unwrap_or_else(|_| panic!("{scope} is not an AutomationScope spelling"));
-        }
-
-        // And the other direction, so a scope added to the enum does
-        // not quietly stay without a tool. Which tier it belongs to is
-        // `tier.rs`'s question, walked there; this one is whether any
-        // tool sits behind it. What stays toolless is
-        // named here as the deliberate complement: the two environment
-        // scopes are Story 10.4's resource, which is a pipeline's
-        // surface and not an operator's.
-        let declared: BTreeSet<String> = AutomationScope::ALL
+        let outside: BTreeSet<&str> = AutomationScope::ALL
             .iter()
-            .map(|scope| {
-                serde_json::to_value(scope)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_string))
-                    .expect("a scope serialises to a string")
-            })
+            .map(|scope| scope.as_str())
+            .filter(|scope| !named.contains(scope))
             .collect();
-        let outside: BTreeSet<String> = declared.difference(&named).cloned().collect();
         assert_eq!(
             outside,
             BTreeSet::from([
-                "environments:read".to_string(),
-                "environments:write".to_string(),
+                AutomationScope::EnvironmentsRead.as_str(),
+                AutomationScope::EnvironmentsWrite.as_str(),
             ]),
             "a scope moved: either give it a tool or add it to the complement here, \
              deliberately"
         );
+    }
+
+    #[test]
+    fn the_settings_body_offers_the_allowlist_and_states_each_bound_the_plane_enforces() {
+        // Built from the allowlist rather than pinned against it, so
+        // this checks the rendering: every key, in the body and in the
+        // doc, with its bound and the validator's extra rule beside it.
+        let admin: Vec<&ToolSpec> = catalogue()
+            .iter()
+            .filter(|spec| spec.tier == Tier::Admin)
+            .collect();
+        assert!(!admin.is_empty());
+        for spec in admin {
+            let body = spec.body().expect("the admin tool carries the settings");
+            assert_eq!(body.fields, SETTINGS_ALLOWLIST_NAMES.as_slice());
+            for setting in SETTINGS_ALLOWLIST {
+                let mut stated = format!("`{}` {}", setting.name, setting.bound_text());
+                if let Some(also) = setting.validator_also {
+                    stated.push_str(&format!(", and {also}"));
+                }
+                assert!(body.doc.contains(&stated), "{}: {stated}", spec.name);
+            }
+        }
     }
 
     #[test]
@@ -1938,7 +1937,7 @@ mod tests {
             ("ROUTE_UPDATE_ONLY_FIELDS", ROUTE_UPDATE_ONLY_FIELDS),
             ("ROUTE_UPDATE_FIELDS", ROUTE_UPDATE_FIELDS),
             ("BACKEND_FIELDS", BACKEND_FIELDS),
-            ("SETTINGS_FIELDS", SETTINGS_FIELDS),
+            ("SETTINGS_ALLOWLIST_NAMES", &SETTINGS_ALLOWLIST_NAMES),
         ] {
             let sorted: BTreeSet<&str> = list.iter().copied().collect();
             assert_eq!(
@@ -1961,7 +1960,12 @@ mod tests {
         // calls the settings path and no other.
         for spec in catalogue() {
             let admin = spec.tier == Tier::Admin;
-            assert_eq!(spec.scope == "settings:write", admin, "{}", spec.name);
+            assert_eq!(
+                spec.scope == AutomationScope::SettingsWrite,
+                admin,
+                "{}",
+                spec.name
+            );
             if admin {
                 assert_eq!(spec.path, "/automation/v1/settings", "{}", spec.name);
                 assert_eq!(spec.verb(), Verb::Put, "{}", spec.name);
@@ -2245,20 +2249,20 @@ mod tests {
                 Kind::Read => {
                     reads += 1;
                     assert!(spec.verb().is_read(), "{}", spec.name);
-                    assert!(spec.scope.ends_with(":read"), "{}", spec.name);
+                    assert!(spec.scope.as_str().ends_with(":read"), "{}", spec.name);
                     assert!(built.body.is_none(), "{}", spec.name);
                 }
                 Kind::Write(write) => {
                     writes += 1;
                     assert!(!write.verb.is_read(), "{}", spec.name);
-                    assert!(spec.scope.ends_with(":write"), "{}", spec.name);
+                    assert!(spec.scope.as_str().ends_with(":write"), "{}", spec.name);
                     assert!(!spec.paginated, "{}", spec.name);
                     assert!(spec.filters.is_empty(), "{}", spec.name);
                 }
             }
         }
         assert_eq!(reads, READS.len());
-        assert_eq!(writes, 2 * (MUTATIONS.len() + ADMIN_MUTATIONS.len()));
+        assert_eq!(writes, 2 * (MUTATIONS.len() + admin_mutations().len()));
     }
 
     #[test]
@@ -2269,8 +2273,8 @@ mod tests {
         // the preview sending the dry-run flag and nothing else
         // different, and the apply sending nothing of the kind.
         assert!(!MUTATIONS.is_empty());
-        assert!(!ADMIN_MUTATIONS.is_empty());
-        for mutation in MUTATIONS.iter().chain(ADMIN_MUTATIONS) {
+        assert!(!admin_mutations().is_empty());
+        for mutation in MUTATIONS.iter().chain(admin_mutations()) {
             assert_eq!(
                 mutation.preview,
                 format!("{}{PREVIEW_SUFFIX}", mutation.apply),

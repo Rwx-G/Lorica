@@ -8,6 +8,9 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "Configuration state and persistence for Lorica reverse proxy"
 
 [dependencies]
+# The automation scope vocabulary and the MCP tier table the token
+# model and the OIDC issuer entry validate against.
+lorica-automation-policy = { version = "1.8.0", path = "../lorica-automation-policy" }
 base64 = "0.23"
 ipnet = "2"
 ring = "0.17"

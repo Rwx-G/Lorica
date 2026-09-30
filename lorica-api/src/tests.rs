@@ -13,6 +13,7 @@ use crate::middleware::rate_limit::RateLimiter;
 use crate::server::{build_router, AppState, Mode};
 use crate::system::SystemCache;
 use crate::workers::WorkerMetrics;
+use lorica_mcp::TierTools as _;
 
 // Real PEM fixtures shared with `lorica-tls`. Since v1.5.3 every
 // cert-storing endpoint validates `cert_pem`/`key_pem` with the same
@@ -10298,11 +10299,7 @@ async fn a_node_with_something_to_write() -> WriteFixture {
     let mcp_token = mint_automation(
         &state,
         WRITE_TOKEN_NAME,
-        lorica_mcp::Tier::Config
-            .minted_scopes()
-            .into_iter()
-            .map(scope_named)
-            .collect(),
+        lorica_mcp::Tier::Config.minted_scopes(),
         &["*.write.example.com"],
         chrono::Utc::now() + chrono::Duration::days(30),
         None,
@@ -11851,12 +11848,6 @@ async fn mcp_call(
     body_json(response).await
 }
 
-/// The token model's scope for a spelling `lorica-mcp` names.
-fn scope_named(spelled: &str) -> lorica_config::models::AutomationScope {
-    serde_json::from_str(&format!("\"{spelled}\""))
-        .unwrap_or_else(|_| panic!("test setup: {spelled} is not an AutomationScope spelling"))
-}
-
 /// One token per MCP tier on the node the read surface seeds, each
 /// carrying every scope its tier mints: between them they register the
 /// whole catalogue, which no single token may any more (Story 11.4 AC
@@ -11872,7 +11863,7 @@ async fn a_node_and_a_token_per_tier() -> (AppState, Vec<(lorica_mcp::Tier, Stri
         let token = mint_automation(
             &state,
             &format!("mcp-{}", tier.as_str()),
-            tier.minted_scopes().into_iter().map(scope_named).collect(),
+            tier.minted_scopes(),
             &["read.example.com", "*.read.example.com"],
             chrono::Utc::now() + chrono::Duration::days(30),
             None,
@@ -16404,7 +16395,7 @@ async fn an_admin_tier_token_lists_the_settings_tools_and_nothing_else() {
     offered.sort_unstable();
     let mut behind_the_scope: Vec<String> = lorica_mcp::tools::catalogue()
         .iter()
-        .filter(|spec| spec.scope == "settings:write")
+        .filter(|spec| spec.scope == lorica_config::models::AutomationScope::SettingsWrite)
         .map(|spec| spec.name.to_string())
         .collect();
     behind_the_scope.sort_unstable();
@@ -16555,11 +16546,7 @@ async fn a_granted_principal_lists_only_the_rows_inside_its_grant_and_an_ungrant
     let other = mint_automation(
         &f.state,
         "another-pipeline",
-        lorica_mcp::Tier::Config
-            .minted_scopes()
-            .into_iter()
-            .map(scope_named)
-            .collect(),
+        lorica_mcp::Tier::Config.minted_scopes(),
         &["*.other.example.com"],
         chrono::Utc::now() + chrono::Duration::days(30),
         None,
@@ -16658,11 +16645,7 @@ async fn a_granted_principal_lists_only_the_rows_inside_its_grant_and_an_ungrant
     let reader = mint_automation(
         &f.state,
         "reader",
-        lorica_mcp::Tier::Read
-            .minted_scopes()
-            .into_iter()
-            .map(scope_named)
-            .collect(),
+        lorica_mcp::Tier::Read.minted_scopes(),
         &[],
         chrono::Utc::now() + chrono::Duration::days(30),
         None,

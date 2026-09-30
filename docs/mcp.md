@@ -69,7 +69,7 @@ operator reads hostile text through.
 
 **One process serves one tier, and the server enforces it.** Which
 scopes make a token which tier is one table, `TIERS` in
-`lorica-mcp/src/tier.rs`: for each tier the scopes it requires and the
+`lorica-automation-policy/src/tier.rs`: for each tier the scopes it requires and the
 scopes of another tier it tolerates because its own tools need them.
 Every automation scope is required by exactly one tier, which a test
 derives from the token model's enum. The read tier tolerates no write
@@ -262,7 +262,12 @@ The management API, the plain CLI and the dashboard's Automation tokens
 page mint any scope set at all; it is the server that refuses a token
 spanning two tiers, rather than serving both kinds of tool: the node
 over Streamable HTTP, the `lorica-mcp` process the client launched over
-stdio.
+stdio. The dashboard's mint form says so before the token exists: it
+names the tier the selected scopes make and, for a set spanning two,
+warns with the scopes that tier does not allow, without refusing the
+mint, since the automation plane serves such a token. It reads the same
+table, and its reading is replayed against answers rendered from the
+node's own `resolve`.
 
 **An OIDC issuer entry cannot carry `settings:write`.** An entry is a
 standing grant to every pipeline job whose claims match, the opposite
@@ -434,7 +439,7 @@ environment it deploys, since a route delete cascades its environment.
 Every backend a route write links anew, at the top level or inside
 `path_rules`, `header_rules` or `traffic_splits`, must point inside the
 CIDR grant and belong to no other pipeline's environment. The fields of
-`WITHHELD_ROUTE_FIELDS` (`lorica-api/src/automation/write.rs`) are
+`WITHHELD_ROUTE_FIELDS` (`lorica-automation-policy/src/protections.rs`) are
 refused from an automation token outright, in either direction, each
 with the reason beside it there: the Basic-auth password, a credential
 a model would be choosing or relaying, and whose clearing switches the
@@ -462,10 +467,11 @@ the row about to be written, so a direct automation client meets it
 exactly as a tool call does, and a preview is refused where the apply
 would be, with a `403` naming the field and the rule and echoing no
 value. The dashboard is not bound by it: the other direction is a
-human's. The controls are `ROUTE_PROTECTIONS` and `BACKEND_PROTECTIONS`
-in `lorica-api/src/automation/write.rs`, each with its reason; this
-table restates their rules, and a test renders each row from the
-constant and asserts it is here:
+human's. The controls are `ROUTE_PROTECTION_RULES` and
+`BACKEND_PROTECTION_RULES` in `lorica-automation-policy/src/protections.rs`,
+each with its reason, weighed by the predicates `lorica-api` pairs them
+with; this table restates their rules, and a test renders each row from
+the constant and asserts it is here:
 
 | Control | From an automation token |
 |---|---|
@@ -687,9 +693,10 @@ accepts, and how far it lets each one move:
 | `health_max_concurrent_probes` | 16..=512 | fleet | live |
 
 The list is `SETTINGS_ALLOWLIST` in
-`lorica-api/src/automation/write.rs`, where each entry carries the
+`lorica-automation-policy/src/settings.rs`, where each entry carries the
 reason it is in, its bound, its direction, its reach and when it acts.
-This table, the tool's description and `inputSchema`, and the
+The node enforces it and the tool's `inputSchema` and the bounds its
+description states are built from it. This table and the
 `SettingsPatch` schema in `openapi-automation.yaml` restate it, and a
 test pins each of them against the constant, so none of them can
 drift from what the node enforces.

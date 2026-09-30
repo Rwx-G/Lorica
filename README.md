@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/version-1.8.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3012-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3023-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-748-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -352,7 +352,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 ## Architecture
 
-Lorica is a Rust workspace with 32 crates: 16 forked from Cloudflare Pingora and 16 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
+Lorica is a Rust workspace with 33 crates: 16 forked from Cloudflare Pingora and 17 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
 
 | Crate | Purpose |
 |-------|---------|
@@ -374,6 +374,7 @@ Lorica is a Rust workspace with 32 crates: 16 forked from Cloudflare Pingora and
 | `lorica-geoip` | GeoIP / ASN lookups (MaxMind-format databases) for country and network policy |
 | `lorica-challenge` | Bot challenges: proof-of-work, image captcha (vendored renderer), cookie issuance |
 | `lorica-mcp` | Management MCP server (v1.9.0): a scope-gated tool surface over the automation plane, spoken over stdio or over a path on the automation listener |
+| `lorica-automation-policy` | The automation plane's policy as data (v1.9.0): the scope vocabulary, the MCP tier table, the admin settings allowlist and the one-way route and backend protections, with `serde` as its only dependency so `lorica-mcp` reads it without linking SQLite |
 | `lorica-lb` | Load balancing (Round Robin, Peak EWMA, Hash, Random, Least Conn) |
 | `lorica-cache` | HTTP response cache, LRU eviction |
 | `lorica-limits` | Rate estimator + per-route `LocalBucket` / `AuthoritativeBucket` token-bucket primitives (lock-free CAS, 100 ms cross-worker sync) |
@@ -712,13 +713,13 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (3012 tests, Lorica-native)
+# Product crates only (3023 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-shmem \
            -p lorica-challenge -p lorica-geoip -p lorica-acme \
            -p lorica-metrics -p lorica-cluster -p lorica-dashboard \
-           -p lorica-mcp \
+           -p lorica-mcp -p lorica-automation-policy \
            --features otel
 
 # Pingora-forked crates (766 tests)
@@ -733,7 +734,7 @@ cargo test -p lorica-core -p lorica-proxy -p lorica-http \
 # wire corpus (every message's encoding, pinned)
 cargo test -p lorica-cluster --tests
 
-# Frontend (506 Vitest cases across 25 files) and its gates
+# Frontend (510 Vitest cases across 25 files) and its gates
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 

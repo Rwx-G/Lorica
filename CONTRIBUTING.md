@@ -29,7 +29,7 @@ The Svelte frontend is compiled automatically during `cargo build` via `build.rs
 cargo test
 
 # Product crate tests only
-cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp
+cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-automation-policy
 
 # Frontend tests (Vitest)
 cd lorica-dashboard/frontend && npx vitest run
@@ -69,10 +69,10 @@ export it locally too.
 ```bash
 export RUSTFLAGS="-D warnings"
 cargo fmt --all -- --check
-cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings
-cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings
+cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-automation-policy -- -D warnings
+cargo clippy -p lorica-api -p lorica-cluster -p lorica-mcp -p lorica-automation-policy --all-targets -- -D warnings
 cargo clippy -p lorica --all-targets --features otel -- -D warnings
-cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-command
+cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-automation-policy -p lorica-command
 cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
 cargo audit
 ```
@@ -93,7 +93,7 @@ If your change adds a feature, fixes a bug, or changes behavior, update `CHANGEL
 
 ## Architecture
 
-Lorica is a Rust workspace with 32 crates. See [FORK.md](FORK.md) for the Pingora fork lineage and [README.md](README.md) for the architecture overview.
+Lorica is a Rust workspace with 33 crates. See [FORK.md](FORK.md) for the Pingora fork lineage and [README.md](README.md) for the architecture overview.
 
 ### Key Directories
 

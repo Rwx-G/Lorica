@@ -1,5 +1,5 @@
 //! The one guard on the Rust-to-TypeScript edge of the automation
-//! scope vocabulary.
+//! scope vocabulary, and of the MCP tier table the mint form reads.
 //!
 //! Every other restatement of that vocabulary is pinned inside one
 //! language: `AutomationScope::as_str` and the published audit
@@ -18,9 +18,20 @@
 //! two sets are diffed in both directions, and the failure names what
 //! to do. Nothing is auto-written: a generator someone has to remember
 //! to rerun is a delayed transcription, not a guard.
+//!
+//! The tier section is held tighter, because the dashboard does more
+//! with it than list it: the mint form resolves a scope set to a tier
+//! the way `lorica_automation_policy::resolve` does, in TypeScript. Two
+//! implementations of one rule share a vector set, so this test renders
+//! the whole section, the table and what `resolve` answers for every
+//! scope set up to two scopes wide and for each tier's allowed set,
+//! and compares it with the committed bytes. The frontend suite replays
+//! the vectors through its own implementation, so a rule changed on
+//! either side alone turns one of the two suites red.
 
 use std::collections::BTreeSet;
 
+use lorica_automation_policy::{resolve, Tier, TIERS};
 use lorica_config::models::AutomationScope;
 
 /// The generated file, relative to this crate's manifest.
@@ -221,5 +232,156 @@ fn a_commented_out_entry_is_not_counted_as_present() {
     assert_eq!(
         ordered_scopes_in_fixture(&commented, EXPORT),
         vec!["cluster:read".to_string()]
+    );
+}
+
+/// Where the rendered tier section opens and closes in the fixture.
+const TIER_SECTION_BEGIN: &str = "// BEGIN MCP TIERS";
+const TIER_SECTION_END: &str = "// END MCP TIERS";
+
+/// `scopes` as a TypeScript array literal of single-quoted strings.
+fn typescript_list<S: AsRef<str>>(scopes: &[S]) -> String {
+    let quoted: Vec<String> = scopes
+        .iter()
+        .map(|scope| format!("'{}'", scope.as_ref()))
+        .collect();
+    format!("[{}]", quoted.join(", "))
+}
+
+/// Every scope set the vectors cover: none, each scope alone, each
+/// pair in `AutomationScope::ALL` order, and each tier's allowed set.
+fn vector_scope_sets() -> Vec<Vec<AutomationScope>> {
+    let all = AutomationScope::ALL;
+    let mut sets: Vec<Vec<AutomationScope>> = vec![Vec::new()];
+    sets.extend(all.iter().map(|scope| vec![*scope]));
+    for (at, first) in all.iter().enumerate() {
+        for second in &all[at + 1..] {
+            sets.push(vec![*first, *second]);
+        }
+    }
+    sets.extend(TIERS.iter().map(|definition| {
+        definition
+            .requires
+            .iter()
+            .chain(definition.tolerates)
+            .copied()
+            .collect()
+    }));
+    sets
+}
+
+/// The fixture's tier section as it must read, rendered from the
+/// policy crate.
+fn rendered_tier_section() -> String {
+    let mut out = String::new();
+    out.push_str(TIER_SECTION_BEGIN);
+    out.push_str(
+        ": rendered from lorica-automation-policy by\n\
+         // lorica-api/tests/automation_scope_fixture.rs, which prints the section as it\n\
+         // must read when the committed one differs. Replace it with that; never edit\n\
+         // it by hand.\n\n",
+    );
+    let names: Vec<String> = Tier::ALL
+        .iter()
+        .map(|tier| format!("'{}'", tier.as_str()))
+        .collect();
+    out.push_str("/** An MCP tier, in increasing order of reach (`Tier::ALL`). */\n");
+    out.push_str(&format!("export type McpTier = {};\n\n", names.join(" | ")));
+    out.push_str(
+        "/**\n * One row of `TIERS`: the scopes that make a token this tier, and the\n \
+         * scopes of another tier its tools need and so allow beside its own.\n */\n\
+         export interface McpTierDefinition {\n  readonly tier: McpTier;\n  \
+         readonly requires: readonly AutomationScope[];\n  \
+         readonly tolerates: readonly AutomationScope[];\n}\n\n",
+    );
+    out.push_str("/** The tier partition, in increasing order of reach. */\n");
+    out.push_str("export const MCP_TIERS: readonly McpTierDefinition[] = [\n");
+    for definition in TIERS {
+        out.push_str(&format!(
+            "  {{\n    tier: '{}',\n    requires: {},\n    tolerates: {},\n  }},\n",
+            definition.tier.as_str(),
+            typescript_list(definition.requires),
+            typescript_list(definition.tolerates),
+        ));
+    }
+    out.push_str("];\n\n");
+    out.push_str(
+        "/**\n * What `resolve` answers for one scope set: the tier its highest-reaching\n \
+         * scopes make it (`null` for none), the scopes that name that tier, and the\n \
+         * scopes that tier does not allow. A set with no offending scope is one tier\n \
+         * and starts lorica-mcp; any other is refused there.\n */\n\
+         export interface McpTierVector {\n  readonly scopes: readonly AutomationScope[];\n  \
+         readonly tier: McpTier | null;\n  readonly anchoring: readonly AutomationScope[];\n  \
+         readonly offending: readonly AutomationScope[];\n}\n\n",
+    );
+    out.push_str("export const MCP_TIER_VECTORS: readonly McpTierVector[] = [\n");
+    for set in vector_scope_sets() {
+        let spelled: Vec<String> = set.iter().map(|scope| scope.as_str().to_string()).collect();
+        let (tier, anchoring, offending) = match resolve(&spelled) {
+            Ok(tier) => (
+                Some(tier),
+                spelled
+                    .iter()
+                    .filter(|scope| Tier::of_scope(scope) == Some(tier))
+                    .cloned()
+                    .collect(),
+                Vec::new(),
+            ),
+            Err(refused) => (refused.tier, refused.anchoring, refused.offending),
+        };
+        out.push_str(&format!(
+            "  {{ scopes: {}, tier: {}, anchoring: {}, offending: {} }},\n",
+            typescript_list(&spelled),
+            tier.map_or("null".to_string(), |tier| format!("'{}'", tier.as_str())),
+            typescript_list(&anchoring),
+            typescript_list(&offending),
+        ));
+    }
+    out.push_str("];\n");
+    out.push_str(TIER_SECTION_END);
+    out
+}
+
+#[test]
+fn the_dashboard_fixture_carries_the_tier_table_and_vectors_rendered_from_the_policy() {
+    let rendered = rendered_tier_section();
+    let committed: Option<&str> = GENERATED_FIXTURE
+        .split_once(TIER_SECTION_BEGIN)
+        .and_then(|(_, rest)| rest.split_once(TIER_SECTION_END))
+        .map(|(inside, _)| inside);
+    let expected_inside = rendered
+        .strip_prefix(TIER_SECTION_BEGIN)
+        .and_then(|rest| rest.strip_suffix(TIER_SECTION_END))
+        .expect("the rendering opens and closes with the markers");
+    assert!(
+        committed == Some(expected_inside),
+        "\nThe MCP tier section of {FIXTURE_PATH} is not what lorica-automation-policy \
+         renders. Replace everything from `{TIER_SECTION_BEGIN}` to `{TIER_SECTION_END}` \
+         (the markers included) with this, byte for byte:\n\n{rendered}\n"
+    );
+}
+
+#[test]
+fn the_tier_vectors_cover_every_scope_and_every_tier() {
+    // A vector set that stopped exercising a scope or a tier would still
+    // compare equal to its own rendering; this is what keeps it wide.
+    let sets = vector_scope_sets();
+    for scope in AutomationScope::ALL {
+        assert!(sets.contains(&vec![*scope]), "{scope} alone");
+    }
+    let rendered = rendered_tier_section();
+    for tier in Tier::ALL {
+        assert!(
+            rendered.contains(&format!("tier: '{}', anchoring", tier.as_str())),
+            "no vector resolves to the {tier}"
+        );
+    }
+    assert!(
+        rendered.contains("tier: null"),
+        "no vector resolves to no tier"
+    );
+    assert!(
+        rendered.contains("offending: ['"),
+        "no vector spans two tiers"
     );
 }

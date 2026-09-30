@@ -42,21 +42,24 @@ jobs:
 
       # Same four gates as the local Docker recipe (see CONTRIBUTING.md).
       - name: Clippy (product crates)
-        run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -- -D warnings
+        run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-automation-policy -- -D warnings
 
-      - name: Clippy (tests and benches of the API, cluster and MCP crates)
-        run: cargo clippy -p lorica-api -p lorica-cluster -p lorica-mcp --all-targets -- -D warnings
+      - name: Clippy (tests and benches of the API, cluster, MCP and policy crates)
+        run: cargo clippy -p lorica-api -p lorica-cluster -p lorica-mcp -p lorica-automation-policy --all-targets -- -D warnings
 
       - name: Clippy (binary crate with the otel feature)
         run: cargo clippy -p lorica --all-targets --features otel -- -D warnings
 
       # lorica-mcp is a subprocess an operator's MCP client launches and
-      # reads no database. lorica-config, and bundled SQLite with it, is a
-      # dev-dependency of it only; this keeps the stdio binary that way.
+      # reads no database. The one first-party crate it may link is
+      # lorica-automation-policy, pure data with serde as its only
+      # dependency; any other lorica-* crate (lorica-config and its
+      # bundled SQLite, lorica-api) or SQLite itself fails this step.
       - name: lorica-mcp links neither the management crates nor SQLite
         run: |
           linked=$(cargo tree -p lorica-mcp -e normal --prefix none | awk '{print $1}' | sort -u \
-            | grep -xE 'rusqlite|libsqlite3-sys|lorica-config|lorica-api' || true)
+            | grep -xE 'rusqlite|libsqlite3-sys|lorica-.*' \
+            | grep -vxE 'lorica-mcp|lorica-automation-policy' || true)
           if [ -n "$linked" ]; then
             echo "FAIL: lorica-mcp links: $linked"
             exit 1
@@ -213,7 +216,7 @@ jobs:
           npm run build
 
       - name: Run Rust unit tests (product crates)
-        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-tls -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-mcp
+        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-tls -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-mcp -p lorica-automation-policy
         env:
           SKIP_FRONTEND_BUILD: ""
 
@@ -273,7 +276,7 @@ jobs:
             -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify \
             -p lorica-bench -p lorica-command -p lorica-metrics -p lorica-acme \
             -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker \
-            -p lorica-mcp -p lorica \
+            -p lorica-mcp -p lorica-automation-policy -p lorica \
             -p lorica-cluster -p lorica-tls \
             -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \
             -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde

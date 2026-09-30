@@ -26,6 +26,12 @@ path = "src/main.rs"
 # MCP SDK: the protocol is hand-rolled, so there is no protocol crate in
 # this list and there is not meant to be one.
 [dependencies]
+# The scope vocabulary, the tier table and the settings allowlist, read
+# from the one statement of them rather than restated here. Pure data
+# with `serde` as its only dependency: `lorica-config` and `lorica-api`
+# stay out of this graph, which is what keeps bundled SQLite out of a
+# stdio subprocess that reads no database, and CI checks it.
+lorica-automation-policy = { version = "1.8.0", path = "../lorica-automation-policy" }
 # The JSON-RPC envelope, the tool schemas and every answer that crosses
 # the seam are JSON. `serde` derive is here for the config file alone.
 serde = { version = "1.0", features = ["derive"] }
@@ -61,16 +67,6 @@ reqwest = { version = "0.12", default-features = false, features = [
 thiserror = "2"
 
 [dev-dependencies]
-# Test-only, and deliberately not a runtime dependency: the scope
-# vocabulary belongs to `AutomationScope` and this crate names its
-# spellings as plain strings, in the tool catalogue and in the tier
-# table. Tests parse every one of them back into the enum
-# (`src/tools.rs` for the catalogue, `src/tier.rs` for the table), so a
-# rename there turns this crate red instead of silently unregistering a
-# tool or leaving a scope in no tier. Taking it as a
-# runtime dependency would put `rusqlite`, bundled SQLite and all, in
-# the dependency graph of a stdio subprocess that reads no database.
-lorica-config = { path = "../lorica-config" }
 # The CA-bundle tests trust a real certificate rather than a committed
 # fixture, which would expire and fail the suite on a date nobody
 # chose.

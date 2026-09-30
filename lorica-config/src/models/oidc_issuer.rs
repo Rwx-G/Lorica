@@ -60,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use super::automation_token::{validate_automation_grants, AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP};
 use super::hostname_pattern::matches_one_label;
 use super::AutomationScope;
+use lorica_automation_policy::Tier;
 
 /// The closed set of claims an entry may bind. Anything else is refused
 /// at validation: a claim GitLab does not put in the token can never
@@ -293,13 +294,18 @@ impl OidcIssuer {
         // An issuer entry is the opposite, a standing grant to every
         // pipeline job whose claims match, so one poisoned merge
         // request would hold node-wide settings for as long as the
-        // entry stands, with no token to revoke.
-        if self.scopes.contains(&AutomationScope::SettingsWrite) {
-            return Err(
-                "oidc issuer entry may not grant settings:write; the admin tier is a static \
-                 token minted for one task with a short lifetime and revoked after it"
-                    .to_string(),
-            );
+        // entry stands, with no token to revoke. Read off the tier
+        // table, so a scope joining the admin tier is refused here the
+        // day it joins.
+        if let Some(admin) = self
+            .scopes
+            .iter()
+            .find(|scope| Tier::requiring(**scope) == Some(Tier::Admin))
+        {
+            return Err(format!(
+                "oidc issuer entry may not grant {admin}; the admin tier is a static token \
+                 minted for one task with a short lifetime and revoked after it"
+            ));
         }
         validate_automation_grants(
             "oidc issuer entry",
@@ -510,13 +516,23 @@ mod tests {
     fn an_entry_granting_the_admin_tier_is_refused_and_every_other_scope_is_not() {
         // Story 11.3: the admin tier is a short-lived static token, never
         // a standing grant to every matching pipeline job.
-        let mut issuer = valid_issuer();
-        issuer.scopes.push(AutomationScope::SettingsWrite);
-        let refused = issuer.validate().expect_err("settings:write on an issuer");
-        assert!(refused.contains("settings:write"), "{refused}");
-        assert!(refused.contains("static token"), "{refused}");
+        let admin = Tier::Admin.requires();
+        assert!(!admin.is_empty());
+        for scope in admin {
+            let mut issuer = valid_issuer();
+            issuer.scopes.push(*scope);
+            let refused = issuer
+                .validate()
+                .expect_err("an admin-tier scope on an issuer");
+            assert!(refused.contains(scope.as_str()), "{refused}");
+            assert!(refused.contains("static token"), "{refused}");
+            assert!(
+                !refused.contains("  "),
+                "a line continuation was lost: {refused}"
+            );
+        }
         for scope in AutomationScope::ALL {
-            if *scope == AutomationScope::SettingsWrite {
+            if admin.contains(scope) {
                 continue;
             }
             // The config tier's write scopes stay open to an entry on

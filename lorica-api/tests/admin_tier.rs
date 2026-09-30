@@ -210,7 +210,7 @@ fn iv1_the_admin_tiers_tools_change_exactly_the_allowlist() {
     // is a mutation or its preview on the settings path.
     let behind_the_scope: BTreeSet<&str> = catalogue()
         .iter()
-        .filter(|spec| spec.scope == wire(AutomationScope::SettingsWrite))
+        .filter(|spec| spec.scope == AutomationScope::SettingsWrite)
         .map(|spec| spec.name)
         .collect();
     let names: BTreeSet<&str> = registered.iter().map(|spec| spec.name).collect();
@@ -294,12 +294,13 @@ fn the_operator_reference_lists_exactly_the_allowlist_with_its_bounds() {
 
 #[test]
 fn the_admin_tool_states_each_bound_where_its_writes_land_and_when_they_act() {
-    // The tool's description is what a model reads before it calls. It
-    // is prose in a crate that cannot read the allowlist, so each claim
-    // it makes is pinned against the entries here.
+    // The tool's description is what a model reads before it calls. Its
+    // bounds are rendered from the allowlist; its summary's reach and
+    // restart claims are prose, so each is pinned against the entries
+    // here.
     let tools: Vec<&ToolSpec> = catalogue()
         .iter()
-        .filter(|spec| spec.scope == wire(AutomationScope::SettingsWrite))
+        .filter(|spec| spec.scope == AutomationScope::SettingsWrite)
         .collect();
     assert!(!tools.is_empty(), "no tool behind settings:write");
     let every_fleet = SETTINGS_ALLOWLIST

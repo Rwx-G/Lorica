@@ -3,6 +3,8 @@
   import {
     AUTOMATION_SCOPE_WIRE_STRINGS,
     GRANT_BOUNDED_SCOPES,
+    MCP_TIERS,
+    type McpTier,
   } from './automation-scopes.generated';
 
   /**
@@ -37,6 +39,46 @@
    */
   export function carriesGrants(scopes: readonly AutomationScope[]): boolean {
     return scopes.some((scope) => GRANT_BOUNDED_SCOPES.includes(scope));
+  }
+
+  /** What `readMcpTier` answers: the shape of an `McpTierVector`. */
+  export interface McpTierReading {
+    tier: McpTier | null;
+    anchoring: AutomationScope[];
+    offending: AutomationScope[];
+  }
+
+  /**
+   * The MCP tier a token carrying `scopes` would be, read the way
+   * `lorica-mcp` reads it before it starts: the highest-reaching tier
+   * whose required set the scopes touch, the scopes that name it, and
+   * the scopes that tier does not allow. Any offending scope means the
+   * token spans two tiers and `lorica-mcp` refuses it.
+   *
+   * A second implementation of `resolve` in `lorica-automation-policy`,
+   * which is why it reads nothing but `MCP_TIERS` and why the test
+   * beside this file replays every `MCP_TIER_VECTORS` entry through it:
+   * the vectors are rendered from the Rust side, so the two cannot
+   * disagree without one suite going red.
+   *
+   * Exported for the test beside this file and for no other reason.
+   */
+  export function readMcpTier(scopes: readonly AutomationScope[]): McpTierReading {
+    const reach = (scope: AutomationScope): number =>
+      MCP_TIERS.findIndex((definition) => definition.requires.includes(scope));
+    const highest = Math.max(-1, ...scopes.map(reach));
+    if (highest < 0) {
+      return { tier: null, anchoring: [], offending: [...scopes] };
+    }
+    const definition = MCP_TIERS[highest];
+    return {
+      tier: definition.tier,
+      anchoring: scopes.filter((scope) => definition.requires.includes(scope)),
+      offending: scopes.filter(
+        (scope) =>
+          !definition.requires.includes(scope) && !definition.tolerates.includes(scope),
+      ),
+    };
   }
 </script>
 
@@ -86,6 +128,7 @@
   let formMaxTtlSeconds = $state('');
   let formError = $state('');
   let saving = $state(false);
+  let formTier = $derived(readMcpTier(formScopes));
 
   /**
    * The full token, held only between the mint answer and the moment
@@ -330,6 +373,25 @@
         {/each}
       </fieldset>
 
+      <!--
+        A hint and never a block: the automation plane accepts a token
+        spanning two tiers, and only lorica-mcp refuses one.
+      -->
+      {#if formTier.tier !== null && formTier.offending.length === 0}
+        <p class="settings-hint" data-testid="mcp-tier-hint">
+          MCP tier: <strong>{formTier.tier}</strong>. lorica-mcp serves a token carrying
+          these scopes as its {formTier.tier} tier.
+        </p>
+      {:else if formTier.tier !== null}
+        <p class="tier-warning" role="status" data-testid="mcp-tier-warning">
+          These scopes span more than one MCP tier: {formTier.anchoring.join(', ')}
+          {formTier.anchoring.length === 1 ? 'makes' : 'make'} it the {formTier.tier} tier,
+          which does not allow {formTier.offending.join(', ')}. The automation plane
+          accepts this token, but it cannot start lorica-mcp; mint one token per tier
+          to use it there.
+        </p>
+      {/if}
+
       {#if carriesGrants(formScopes)}
         <div class="settings-form-row">
           <label for="automation-token-hostnames">
@@ -502,6 +564,12 @@
     padding: 0;
     font-size: 0.8125rem;
     color: var(--color-text-muted);
+  }
+
+  .tier-warning {
+    color: var(--color-orange);
+    font-size: 0.8125rem;
+    line-height: 1.5;
   }
 
   .warning {
