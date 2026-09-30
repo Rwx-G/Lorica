@@ -47,6 +47,8 @@
 //! at the moment it prints. A scope moved between tiers, a tool added,
 //! or a setting added to the allowlist moves the printed text with it.
 
+use std::path::Path;
+
 use lorica_api::automation::write::SETTINGS_ALLOWLIST;
 use lorica_mcp::tools::{self, ToolSpec};
 use lorica_mcp::Tier;
@@ -72,13 +74,14 @@ pub(crate) struct TierMint {
 /// API, print it once on standard output, and print what it can do on
 /// standard error.
 pub(crate) fn run_mcp_token_create(
+    data_dir: &Path,
     management_port: u16,
     request: &TierMint,
     user: &str,
     password: &str,
 ) {
     let (stdout, stderr) = mint_tier(request, |body| {
-        cli_automation::mint(management_port, body, user, password)
+        cli_automation::mint(data_dir, management_port, body, user, password)
     })
     .unwrap_or_else(|refused| fail(refused));
     // The only thing on stdout.

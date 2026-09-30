@@ -112,7 +112,8 @@ tracing-opentelemetry = { version = "0.33", optional = true, default-features = 
 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+# `io-util` for the fake management server in `cli_client`'s tests.
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "io-util"] }
 # Serial-test barrier for the global VERDICT_CACHE state in
 # `lorica::bot` (v1.5.0 backlog #16). The three tests that mutate
 # the process-wide `DashMap` + `Mutex<VecDeque>` carry

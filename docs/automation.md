@@ -206,7 +206,15 @@ lorica automation token create \
 
 The command goes through the local management API like
 `lorica cluster token` does, because the mint is a SuperAdmin operation
-on a running node and not a database edit. **Standard output carries
+on a running node and not a database edit. Before the password leaves,
+the command verifies that the listener on the management port presents
+the exact certificate the node records as served
+(`<data-dir>/management/served-cert.pem`, rewritten at each start, the
+operator's `management_cert_pem_path` included), and refuses otherwise:
+the port is unprivileged, and a local process holding it during a
+restart must not receive the password. Run it as root or as the
+`lorica` user, who can read that file, with `--data-dir` when the node's
+data directory is not `/var/lib/lorica`. **Standard output carries
 the token and nothing else**: no banner, no confirmation, no trailing
 advice, so a redirect into a file and a pipe into a secret store both
 store exactly the credential. The one line naming the `public_id` and

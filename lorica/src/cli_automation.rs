@@ -54,7 +54,9 @@ use lorica_config::models::{
     validate_automation_grants, AutomationScope, AUTOMATION_TOKEN_SUBJECT,
 };
 
-use crate::cli_client::{fail, management_client, management_data, management_login};
+use std::path::Path;
+
+use crate::cli_client::{fail, management_data, management_session};
 
 /// What `lorica automation token create` was asked to mint, one field
 /// per flag.
@@ -76,13 +78,16 @@ pub(crate) struct TokenMint {
 /// Mint a scoped automation token and print it once on standard
 /// output.
 pub(crate) fn run_automation_token_create(
+    data_dir: &Path,
     management_port: u16,
     request: &TokenMint,
     user: &str,
     password: &str,
 ) {
-    let (stdout, stderr) = mint_token(request, |body| mint(management_port, body, user, password))
-        .unwrap_or_else(|refused| fail(refused));
+    let (stdout, stderr) = mint_token(request, |body| {
+        mint(data_dir, management_port, body, user, password)
+    })
+    .unwrap_or_else(|refused| fail(refused));
     // The only thing on stdout.
     print!("{stdout}");
     eprint!("{stderr}");
@@ -163,6 +168,7 @@ pub(crate) fn grants_refusal(
 /// The one route the CLI mints through: `automation token create` and
 /// `mcp token create` both call it.
 pub(crate) fn mint(
+    data_dir: &Path,
     management_port: u16,
     body: &serde_json::Value,
     user: &str,
@@ -170,8 +176,7 @@ pub(crate) fn mint(
 ) -> serde_json::Value {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
-        let client = management_client();
-        management_login(&client, management_port, user, password).await;
+        let client = management_session(data_dir, management_port, user, password).await;
         let url = format!("https://127.0.0.1:{management_port}/api/v1/automation/tokens");
         let response = client
             .post(&url)

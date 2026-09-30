@@ -171,6 +171,18 @@ credential, validated by the same model and audited as the same
 `--password-file` (mode 0600), `--password-stdin` or
 `LORICA_ADMIN_PASSWORD`, as for every management CLI command.
 
+Like every management CLI command, it sends the password only to a
+listener presenting the certificate the node records as served,
+`<data-dir>/management/served-cert.pem`, which the management listener
+rewrites each time it starts. The management port is unprivileged, so
+this is what keeps a local process that took the port while Lorica was
+restarting from receiving the password. The file is in the node's
+`0700` directory: run the command as root or as the `lorica` user (the
+container examples below run as `lorica`), and pass `--data-dir` when
+the node does not use `/var/lib/lorica`. A peer presenting another
+certificate is refused with the password unsent, and there is no switch
+that skips the check.
+
 The scopes it mints are the tier's tools' scopes and the scopes the
 tier tolerates. The config tier therefore carries the read scopes of the
 rows its previews answer and its tools find ids through: a config token

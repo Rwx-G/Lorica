@@ -706,3 +706,9 @@ ownership is kept outside the repository for the maintainer to publish.
   landed, full Docker e2e suite green with zero failures, product tests
   2975. The CLI password finding (backlog #90) is pre-existing and is
   fixed in its own change in this cycle. Status to Done.
+- 2026-09-30: Backlog #90, surfaced by this story's security audit: the
+  management CLI pins the certificate the management listener records
+  as served (`<data-dir>/management/served-cert.pem`) and sends no
+  password to a peer presenting another one; a caller who cannot read
+  the record is refused. The `mcp` e2e smoke mounts the node's data
+  directory read-only so its real minting commands keep running.

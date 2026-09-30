@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use tracing::info;
@@ -1102,11 +1102,12 @@ pub(crate) fn run_rotate_key(data_dir: &str, new_key_file: &str) {
 
 /// Implementation of the `unban` subcommand: logs into the management
 /// API on `port` and removes `ip` from the auto-ban list.
-pub(crate) fn run_unban(port: u16, ip: String, user: String, password: String) {
+pub(crate) fn run_unban(data_dir: &str, port: u16, ip: String, user: String, password: String) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        let client = crate::cli_client::management_client();
-        crate::cli_client::management_login(&client, port, &user, &password).await;
+        let client =
+            crate::cli_client::management_session(Path::new(data_dir), port, &user, &password)
+                .await;
 
         // Unban
         let unban_url = format!("https://127.0.0.1:{port}/api/v1/bans/{ip}");
@@ -1138,6 +1139,7 @@ pub(crate) fn run_unban(port: u16, ip: String, user: String, password: String) {
 /// are the shared `cli_client` ones (one loopback trust decision, one
 /// login contract for every CLI command).
 pub(crate) fn run_upgrade(
+    data_dir: &str,
     port: u16,
     binary: String,
     signature: Option<String>,
@@ -1164,8 +1166,9 @@ pub(crate) fn run_upgrade(
         };
 
         // Login (the upgrade endpoint is behind require_auth).
-        let client = crate::cli_client::management_client();
-        crate::cli_client::management_login(&client, port, &user, &password).await;
+        let client =
+            crate::cli_client::management_session(Path::new(data_dir), port, &user, &password)
+                .await;
 
         // Hand-rolled multipart/form-data body: `binary` (raw bytes) +
         // `signature` (hex text), matching the axum Multipart extractor.

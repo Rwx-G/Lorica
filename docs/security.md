@@ -317,9 +317,16 @@ round-trip through a fronting reverse proxy instead of being silently
 dropped. Operators who terminate TLS at Lorica with their own
 certificate set `management_cert_pem_path` + `management_key_pem_path`;
 when both point at readable files the self-signed material is ignored.
-Clients reach the API over `https://`; the bundled `lorica` CLI uses
-`https://127.0.0.1` and accepts the self-signed certificate, since the
-target is always loopback (no MITM surface to defend).
+Clients reach the API over `https://`. The bundled `lorica` CLI uses
+`https://127.0.0.1` and does not take loopback as proof of identity:
+the management port is unprivileged, so any local user can bind it
+while Lorica is stopped or restarting. Each time the management
+listener starts it records the certificate it serves, self-signed or
+the operator's, at `<data-dir>/management/served-cert.pem`, and every
+CLI command that logs in pins that exact leaf and sends nothing, the
+password included, to a peer that presents anything else. The CLI must
+therefore run as root or as the `lorica` user, who can read the
+`0700` directory.
 
 **`/metrics` authentication (on by default since v1.7.0).** The
 endpoint exposes the full backend topology and certificate inventory,

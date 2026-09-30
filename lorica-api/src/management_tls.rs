@@ -29,6 +29,14 @@
 //!   and `management_key_pem_path` point at readable files, that
 //!   certificate and key are loaded verbatim and no self-signed material
 //!   is generated or rotated.
+//!
+//! Either way, the management listener records the certificate it
+//! serves at [`served_certificate_path`] before it binds (backlog #90).
+//! The management CLI pins that file and sends no credential to a peer
+//! presenting anything else. Neither `cert.pem` nor the override
+//! setting can stand in for it: the override is read at startup only,
+//! and the self-signed file can be regenerated beside it by the
+//! automation listener, so only the listener knows what it serves.
 
 use std::path::{Path, PathBuf};
 
@@ -89,7 +97,40 @@ pub(crate) fn build_management_server_config(
     cert_override: Option<&str>,
     key_override: Option<&str>,
 ) -> Result<ServerConfig, ManagementTlsError> {
-    let (cert_pem, key_pem): (String, String) = match (cert_override, key_override) {
+    let (cert_pem, key_pem) = management_pem(data_dir, cert_override, key_override)?;
+    server_config_from_pem(&cert_pem, &key_pem)
+}
+
+/// [`build_management_server_config`] for the management listener
+/// itself: once the pair is accepted by rustls, the certificate is
+/// recorded at [`served_certificate_path`] for the CLI to pin.
+pub(crate) fn build_and_record_management_server_config(
+    data_dir: &Path,
+    cert_override: Option<&str>,
+    key_override: Option<&str>,
+) -> Result<ServerConfig, ManagementTlsError> {
+    let (cert_pem, key_pem) = management_pem(data_dir, cert_override, key_override)?;
+    let config = server_config_from_pem(&cert_pem, &key_pem)?;
+    record_served_certificate(data_dir, &cert_pem)?;
+    Ok(config)
+}
+
+/// Where the management listener records the certificate it serves:
+/// `<data_dir>/management/served-cert.pem`, in the directory the node
+/// keeps at `0700`, so only the node's own user (and root) can read it
+/// and nobody else can replace it.
+pub fn served_certificate_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("management").join("served-cert.pem")
+}
+
+/// The PEM pair the management plane serves: the operator override
+/// when both paths are set, the self-signed leaf otherwise.
+fn management_pem(
+    data_dir: &Path,
+    cert_override: Option<&str>,
+    key_override: Option<&str>,
+) -> Result<(String, String), ManagementTlsError> {
+    let pair: (String, String) = match (cert_override, key_override) {
         (Some(cert_path), Some(key_path)) => {
             info!(
                 cert = cert_path,
@@ -112,8 +153,35 @@ pub(crate) fn build_management_server_config(
         }
         _ => load_or_generate_self_signed(data_dir)?,
     };
+    Ok(pair)
+}
 
-    server_config_from_pem(&cert_pem, &key_pem)
+/// Write `cert_pem` to [`served_certificate_path`], creating the
+/// `management/` directory at `0700` when the override path left it
+/// absent. The file is written beside its final name and renamed over
+/// it, so a CLI reading it concurrently sees the old certificate or the
+/// new one, never half of either.
+fn record_served_certificate(data_dir: &Path, cert_pem: &str) -> Result<(), ManagementTlsError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let path: PathBuf = served_certificate_path(data_dir);
+    let dir: PathBuf = data_dir.join("management");
+    let persist_err = |path: &Path, source: std::io::Error| ManagementTlsError::Persist {
+        path: path.display().to_string(),
+        source,
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| persist_err(&dir, e))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| persist_err(&dir, e))?;
+    let staged: PathBuf = dir.join("served-cert.pem.tmp");
+    std::fs::write(&staged, cert_pem).map_err(|e| persist_err(&staged, e))?;
+    std::fs::rename(&staged, &path).map_err(|e| persist_err(&path, e))?;
+    info!(path = %path.display(), "management API recorded the certificate it serves");
+    Ok(())
 }
 
 /// Reuse the persisted self-signed leaf, or (re)generate it when it is
@@ -388,6 +456,62 @@ mod tests {
             cert_before, cert_after,
             "valid leaf must not be regenerated"
         );
+    }
+
+    #[test]
+    fn the_listener_records_the_certificate_it_serves() {
+        install_ring();
+        let dir = tempfile::tempdir().expect("tempdir");
+        build_and_record_management_server_config(dir.path(), None, None).expect("self-signed");
+        let served = std::fs::read_to_string(served_certificate_path(dir.path())).expect("pin");
+        let persisted =
+            std::fs::read_to_string(dir.path().join("management").join("cert.pem")).expect("cert");
+        assert_eq!(served, persisted);
+
+        // The override wins, and the record follows it rather than the
+        // self-signed file still sitting beside it.
+        let (cert_pem, key_pem) = generate_self_signed(SELF_SIGNED_VALIDITY_DAYS).expect("gen");
+        let cert_path = dir.path().join("operator-cert.pem");
+        let key_path = dir.path().join("operator-key.pem");
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        build_and_record_management_server_config(
+            dir.path(),
+            Some(cert_path.to_str().unwrap()),
+            Some(key_path.to_str().unwrap()),
+        )
+        .expect("override");
+        let served = std::fs::read_to_string(served_certificate_path(dir.path())).expect("pin");
+        assert_eq!(served, cert_pem);
+        assert_ne!(served, persisted);
+    }
+
+    #[test]
+    fn the_record_lives_in_a_directory_only_the_node_can_enter() {
+        use std::os::unix::fs::PermissionsExt;
+        install_ring();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem) = generate_self_signed(SELF_SIGNED_VALIDITY_DAYS).expect("gen");
+        let cert_path = dir.path().join("operator-cert.pem");
+        let key_path = dir.path().join("operator-key.pem");
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        // The override path generates no self-signed material, so the
+        // record is what creates `management/`, and it must create it
+        // as closed as the self-signed path does.
+        build_and_record_management_server_config(
+            dir.path(),
+            Some(cert_path.to_str().unwrap()),
+            Some(key_path.to_str().unwrap()),
+        )
+        .expect("override");
+        let mode = std::fs::metadata(dir.path().join("management"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        assert!(!dir.path().join("management").join("key.pem").exists());
     }
 
     #[test]

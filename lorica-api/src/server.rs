@@ -1369,7 +1369,9 @@ pub fn build_router(
 /// The management listener terminates TLS with either the operator's
 /// certificate (`management_cert_pem_path` + `management_key_pem_path`,
 /// AC #2) or the auto-generated self-signed leaf under
-/// `<data_dir>/management/`. Serving is a manual accept loop: axum 0.7
+/// `<data_dir>/management/`, and records the one it serves at
+/// [`crate::management_tls::served_certificate_path`] for the CLI to pin
+/// (backlog #90). Serving is a manual accept loop: axum 0.7
 /// `Router` -> `hyper-util` auto (h1/h2, with upgrades for the dashboard
 /// websockets) over a `tokio-rustls` acceptor, replacing the previous
 /// plaintext `axum::serve`.
@@ -1411,7 +1413,7 @@ pub async fn start_server(
         }
     };
 
-    let server_config = crate::management_tls::build_management_server_config(
+    let server_config = crate::management_tls::build_and_record_management_server_config(
         &data_dir,
         cert_override.as_deref(),
         key_override.as_deref(),

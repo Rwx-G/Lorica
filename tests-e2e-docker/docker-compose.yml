@@ -1458,6 +1458,12 @@ services:
       - lorica-mcp
     volumes:
       - shared-mcp:/shared:ro
+      # The node's data directory, read-only, at the CLI's default
+      # --data-dir: the minting commands pin the certificate the node
+      # records there as served and send no password without it
+      # (backlog #90). Same image, same lorica user, so the node's
+      # 0700 management/ directory is readable here as it is on a host.
+      - lorica-mcp-data:/var/lib/lorica:ro
       - ./test-runner/helpers.sh:/tests/helpers.sh:ro
       - ./test-runner/run-mcp-smoke.sh:/tests/run-mcp-smoke.sh:ro
     environment:
