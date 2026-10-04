@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Lorica API
   description: REST API for Lorica reverse proxy management
-  version: "1.8.0"
+  version: "1.9.0"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -502,6 +502,89 @@ paths:
                   type: boolean
                   default: true
                   description: Ship traffic capture records on the OTLP logs lane.
+                flood_strict_rps:
+                  type: integer
+                  description: >-
+                    Per-IP admission rate while the proxy is in flood mode
+                    (Story 8.10). `0` = auto, half of `flood_threshold_rps`.
+                    While both are set it must be below the threshold. Bounds:
+                    `GET /api/v1/settings/schema`.
+                header_timeout_s:
+                  type: integer
+                  description: >-
+                    Seconds an HTTP/1.1 client has to send its whole request
+                    header, from its first byte, before it is answered 408
+                    and disconnected, on every route (Story 8.10). Default
+                    10; there is no `0`, because a route's slowloris
+                    threshold is judged only once the header is complete
+                    and cannot cut one still arriving. Bounds:
+                    `GET /api/v1/settings/schema`.
+                downstream_idle_timeout_s:
+                  type: integer
+                  description: >-
+                    Seconds a downstream connection may sit idle before it is
+                    closed: an HTTP/1.1 keepalive connection waiting for its
+                    next request, an HTTP/2 connection with no stream in
+                    flight. A response in progress and an upgraded
+                    (WebSocket) connection are not idle. Default 75; there is
+                    no `0`. Applies to connections and keepalive waits that
+                    start after the save. Bounds:
+                    `GET /api/v1/settings/schema`.
+                max_active_probes:
+                  type: integer
+                  description: >-
+                    Synthetic probes that run at once; enabled probes past it do
+                    not run (backlog #89). Bounds: `GET /api/v1/settings/schema`.
+                loadtest_max_concurrency:
+                  type: integer
+                  description: >-
+                    Load-test concurrency above which a run asks for
+                    confirmation (backlog #89). Bounds:
+                    `GET /api/v1/settings/schema`.
+                loadtest_max_duration_s:
+                  type: integer
+                  description: >-
+                    Load-test duration, in seconds, above which a run asks for
+                    confirmation (backlog #89). Bounds:
+                    `GET /api/v1/settings/schema`.
+                loadtest_max_rps:
+                  type: integer
+                  description: >-
+                    Load-test request rate above which a run asks for
+                    confirmation (backlog #89). Bounds:
+                    `GET /api/v1/settings/schema`.
+                audit_log_retention_days:
+                  type: integer
+                  description: >-
+                    Days of audit-log history kept (Story 8.9). `0` keeps it
+                    forever. Bounds: `GET /api/v1/settings/schema`.
+                connection_limits_per_ip:
+                  type: integer
+                  description: >-
+                    Simultaneous connections allowed from one source IP, per
+                    worker process (Story 8.9). `0` lifts the cap; `null` or an
+                    absent field leaves it as stored. Bounds:
+                    `GET /api/v1/settings/schema`.
+                bot_stash_max_entries:
+                  type: integer
+                  description: >-
+                    Global cap on pending bot challenges (Story 8.9). Bounds:
+                    `GET /api/v1/settings/schema`.
+                bot_stash_per_prefix_max:
+                  type: integer
+                  description: >-
+                    Per source-prefix cap on pending bot challenges (Story 8.9).
+                    Bounds: `GET /api/v1/settings/schema`.
+                mirror_max_concurrent_per_route:
+                  type: integer
+                  description: >-
+                    Cap on in-flight mirror sub-requests per route (Story 8.9).
+                    Bounds: `GET /api/v1/settings/schema`.
+                mirror_max_concurrent_global:
+                  type: integer
+                  description: >-
+                    Cap on in-flight mirror sub-requests across every route
+                    (Story 8.9). Bounds: `GET /api/v1/settings/schema`.
                 waf_body_scan_max_inflight_bytes:
                   type: integer
                   format: int64
@@ -5843,22 +5926,39 @@ components:
     AutomationScope:
       type: string
       description: >-
-        What an automation token may do. The enum is closed and these four are
-        the whole surface for 1.8.0; an unknown string is refused rather than
-        dropped, so a token written against a newer Lorica fails loudly instead
-        of silently losing a grant.
+        What an automation token may do. The enum is closed and the list below
+        is the whole surface; an unknown string is refused rather than dropped,
+        so a token written against a newer Lorica fails loudly instead of
+        silently losing a grant. The five read grants after `certificates:read`
+        arrived with the management MCP server and are what its read tier is
+        built on; the three write grants after `backends:read` arrived with its
+        config tier and reach the automation plane's write surface
+        (`openapi-automation.yaml`), bounded by the token's hostname and
+        backend grants. `settings:write` arrived with its admin tier and
+        reaches the operational global settings that tier's allowlist
+        names, and nothing else. None of them uploads key material, and
+        none reaches a user, a token or a cluster member.
       enum:
         - environments:write
         - environments:read
         - routes:read
         - certificates:read
+        - logs:read
+        - waf:read
+        - sla:read
+        - cluster:read
+        - backends:read
+        - routes:write
+        - backends:write
+        - certificates:write
+        - settings:write
 
     AutomationTokenRequest:
       type: object
       description: >-
         Body for minting an automation token. Unknown fields are refused, which
         is what makes the server-owned facts server-owned rather than ignored.
-      required: [name, scopes, allowed_hostnames]
+      required: [name, scopes]
       properties:
         name:
           type: string
@@ -5871,15 +5971,21 @@ components:
         allowed_hostnames:
           type: array
           description: >-
-            At least one. An exact name (`api.example.com`) or a single leading
-            wildcard (`*.preview.example.com`), read with TLS wildcard semantics:
-            one label. A bare `*` is refused.
+            Required, at least one, when a scope the grants bound is carried
+            (the set `AutomationScope::is_grant_bounded` decides, described in
+            docs/automation.md); refused, empty or omitted, otherwise, since no
+            path such a token reaches reads it. An exact name
+            (`api.example.com`) or a single leading wildcard
+            (`*.preview.example.com`), read with TLS wildcard semantics: one
+            label. A bare `*` is refused. An empty list admits no host.
           items:
             type: string
         allowed_backend_cidrs:
           type: array
-          description: "CIDRs (or bare addresses) this token may point a hostname at. At least one: there is no node-wide default backend policy, and an empty list would be read as every address."
-          minItems: 1
+          description: >-
+            CIDRs (or bare addresses) this token may point a hostname at. Same
+            rule as `allowed_hostnames`. An empty list admits no address: there
+            is no node-wide default backend policy to fall back on.
           items:
             type: string
         max_ttl_seconds:
@@ -5891,7 +5997,7 @@ components:
           description: Absolute instant the token stops being accepted. Mutually exclusive with `lifetime_days`.
         lifetime_days:
           type: integer
-          description: Lifetime from now, in days. Mutually exclusive with `expires_at`. Defaults to 365 when neither is sent.
+          description: Lifetime from now, in days. Mutually exclusive with `expires_at`. Defaults to 365 when neither is sent. A token carrying `settings:write` may live at most 7 days, the default included, and is refused with a 422 naming the ceiling past it.
 
     AutomationToken:
       type: object
@@ -5945,7 +6051,7 @@ components:
         Body for registering an OIDC issuer entry. Unknown fields are refused,
         which is what makes the server-owned facts server-owned rather than
         ignored.
-      required: [issuer, audience, allowed_hostnames, scopes]
+      required: [issuer, audience, scopes]
       properties:
         issuer:
           type: string
@@ -5977,13 +6083,17 @@ components:
             the two `_protected` claims take exactly `true` or `false`.
         allowed_hostnames:
           type: array
-          description: At least one; the same one-label wildcard rule as a static token.
+          description: >-
+            The static token's rule: required, at least one, when a scope is
+            bounded by the grants, refused otherwise; the same one-label
+            wildcard rule. An empty list admits no host.
           items:
             type: string
         allowed_backend_cidrs:
           type: array
-          description: "CIDRs a token from this entry may point a hostname at. At least one: there is no node-wide default backend policy, and an empty list would be read as every address."
-          minItems: 1
+          description: >-
+            CIDRs a token from this entry may point a hostname at, under the
+            same rule. An empty list admits no address.
           items:
             type: string
         max_ttl_seconds:

@@ -1,25 +1,85 @@
 <script lang="ts" module>
   import type { AutomationScope } from '../../lib/api';
+  import {
+    AUTOMATION_SCOPE_WIRE_STRINGS,
+    GRANT_BOUNDED_SCOPES,
+    MCP_TIERS,
+    type McpTier,
+  } from './automation-scopes.generated';
 
   /**
-   * The closed scope enum, in the order the create form offers it:
-   * the reads first, because a token that only reads is the one an
-   * operator should reach for by default.
+   * What the create form offers, derived from the wire vocabulary
+   * rather than restated: a scope added to the Rust enum reaches this
+   * form through `automation-scopes.generated.ts` with nothing to
+   * remember here.
    *
-   * These strings are the wire spelling, owned by Rust: the
-   * `#[serde(rename = "...")]` attributes on `AutomationScope` in
-   * `lorica-config/src/models/automation_token.rs` and `scope_str` in
-   * `lorica-api/src/automation/scope.rs`. Nothing generates this
-   * client, so `automation-scopes.fixture.ts` beside this file pins
-   * the set and the test fails if a rename lands on one side only.
-   * Exported for that test and for no other reason.
+   * The label is the wire string itself, because a second vocabulary
+   * in the UI is a second thing an operator has to map back to what a
+   * 403 says. The order puts the writes last, so the reads an operator
+   * should reach for by default come first; `sort` is stable, so the
+   * reads keep the generated file's order.
+   *
+   * Exported for the test beside this file and for no other reason.
    */
   export const ALL_SCOPES: { value: AutomationScope; label: string }[] = [
-    { value: 'environments:read', label: 'environments:read' },
-    { value: 'routes:read', label: 'routes:read' },
-    { value: 'certificates:read', label: 'certificates:read' },
-    { value: 'environments:write', label: 'environments:write' },
-  ];
+    ...AUTOMATION_SCOPE_WIRE_STRINGS,
+  ]
+    .sort((a, b) => Number(a.endsWith(':write')) - Number(b.endsWith(':write')))
+    .map((value) => ({ value, label: value }));
+
+  /**
+   * Whether a token carrying `scopes` has hostname and backend grants
+   * at all. The node requires both when one of these scopes is carried
+   * and refuses both when none is (typed absence), so a token without
+   * one has no blast radius to show and the form has nothing to ask.
+   * The set is `GRANT_BOUNDED_SCOPES`, which a Rust test pins against
+   * the enum.
+   *
+   * Exported for the test beside this file and for no other reason.
+   */
+  export function carriesGrants(scopes: readonly AutomationScope[]): boolean {
+    return scopes.some((scope) => GRANT_BOUNDED_SCOPES.includes(scope));
+  }
+
+  /** What `readMcpTier` answers: the shape of an `McpTierVector`. */
+  export interface McpTierReading {
+    tier: McpTier | null;
+    anchoring: AutomationScope[];
+    offending: AutomationScope[];
+  }
+
+  /**
+   * The MCP tier a token carrying `scopes` would be, read the way
+   * `lorica-mcp` reads it before it starts: the highest-reaching tier
+   * whose required set the scopes touch, the scopes that name it, and
+   * the scopes that tier does not allow. Any offending scope means the
+   * token spans two tiers and `lorica-mcp` refuses it.
+   *
+   * A second implementation of `resolve` in `lorica-automation-policy`,
+   * which is why it reads nothing but `MCP_TIERS` and why the test
+   * beside this file replays every `MCP_TIER_VECTORS` entry through it:
+   * the vectors are rendered from the Rust side, so the two cannot
+   * disagree without one suite going red.
+   *
+   * Exported for the test beside this file and for no other reason.
+   */
+  export function readMcpTier(scopes: readonly AutomationScope[]): McpTierReading {
+    const reach = (scope: AutomationScope): number =>
+      MCP_TIERS.findIndex((definition) => definition.requires.includes(scope));
+    const highest = Math.max(-1, ...scopes.map(reach));
+    if (highest < 0) {
+      return { tier: null, anchoring: [], offending: [...scopes] };
+    }
+    const definition = MCP_TIERS[highest];
+    return {
+      tier: definition.tier,
+      anchoring: scopes.filter((scope) => definition.requires.includes(scope)),
+      offending: scopes.filter(
+        (scope) =>
+          !definition.requires.includes(scope) && !definition.tolerates.includes(scope),
+      ),
+    };
+  }
 </script>
 
 <script lang="ts">
@@ -68,6 +128,7 @@
   let formMaxTtlSeconds = $state('');
   let formError = $state('');
   let saving = $state(false);
+  let formTier = $derived(readMcpTier(formScopes));
 
   /**
    * The full token, held only between the mint answer and the moment
@@ -110,14 +171,19 @@
     // Omitted fields are omitted, never sent as null: the API takes an
     // absent field as "use the model's default", and the model owns
     // every cap. The form restates none of them, so a refusal here is
-    // the server's message verbatim.
+    // the server's message verbatim. The grants are sent only when a
+    // scope they bound is selected: text typed before the operator
+    // unticked the last such scope is not a grant the token can carry.
+    const grants = carriesGrants(formScopes)
+      ? {
+          allowed_hostnames: lines(formHostnames),
+          allowed_backend_cidrs: lines(formBackendCidrs),
+        }
+      : {};
     const res = await api.createAutomationToken({
       name: formName.trim(),
       scopes: formScopes,
-      allowed_hostnames: lines(formHostnames),
-      ...(lines(formBackendCidrs).length > 0
-        ? { allowed_backend_cidrs: lines(formBackendCidrs) }
-        : {}),
+      ...grants,
       ...(lifetime !== '' ? { lifetime_days: Number(lifetime) } : {}),
       ...(maxTtl !== '' ? { max_ttl_seconds: Number(maxTtl) } : {}),
     });
@@ -225,9 +291,18 @@
                   {/each}
                 </td>
                 <td class="wrap-cell">
-                  {#each token.allowed_hostnames as hostname (hostname)}
-                    <code>{hostname}</code>
-                  {/each}
+                  {#if carriesGrants(token.scopes)}
+                    {#each token.allowed_hostnames as hostname (hostname)}
+                      <code>{hostname}</code>
+                    {/each}
+                  {:else}
+                    <!--
+                      A row minted before typed absence may still store
+                      grants; no path this token reaches reads them, so
+                      they are not its blast radius and are not shown.
+                    -->
+                    <span class="text-muted">not applicable</span>
+                  {/if}
                 </td>
                 <td class="text-muted">{when(token.expires_at)}</td>
                 <td class="text-muted">{when(token.last_used_at)}</td>
@@ -298,38 +373,67 @@
         {/each}
       </fieldset>
 
-      <div class="settings-form-row">
-        <label for="automation-token-hostnames">
-          Allowed hostnames <span class="settings-required">*</span>
-        </label>
-        <textarea
-          id="automation-token-hostnames"
-          rows="3"
-          bind:value={formHostnames}
-          placeholder="api.example.com&#10;*.preview.example.com"
-          autocomplete="off"
-          spellcheck="false"
-        ></textarea>
-        <span class="settings-hint">
-          One per line. An exact name, or a single leading <code>*.</code> wildcard
-          covering one label, the way a certificate wildcard reads.
-        </span>
-      </div>
+      <!--
+        A hint and never a block: the automation plane accepts a token
+        spanning two tiers, and only lorica-mcp refuses one.
+      -->
+      {#if formTier.tier !== null && formTier.offending.length === 0}
+        <p class="settings-hint" data-testid="mcp-tier-hint">
+          MCP tier: <strong>{formTier.tier}</strong>. lorica-mcp serves a token carrying
+          these scopes as its {formTier.tier} tier.
+        </p>
+      {:else if formTier.tier !== null}
+        <p class="tier-warning" role="status" data-testid="mcp-tier-warning">
+          These scopes span more than one MCP tier: {formTier.anchoring.join(', ')}
+          {formTier.anchoring.length === 1 ? 'makes' : 'make'} it the {formTier.tier} tier,
+          which does not allow {formTier.offending.join(', ')}. The automation plane
+          accepts this token, but it cannot start lorica-mcp; mint one token per tier
+          to use it there.
+        </p>
+      {/if}
 
-      <div class="settings-form-row">
-        <label for="automation-token-cidrs">Allowed backend CIDRs</label>
-        <textarea
-          id="automation-token-cidrs"
-          rows="2"
-          bind:value={formBackendCidrs}
-          placeholder="10.0.0.0/8"
-          autocomplete="off"
-          spellcheck="false"
-        ></textarea>
-        <span class="settings-hint">
-          One per line. Leave empty to apply the node's default backend policy.
-        </span>
-      </div>
+      {#if carriesGrants(formScopes)}
+        <div class="settings-form-row">
+          <label for="automation-token-hostnames">
+            Allowed hostnames <span class="settings-required">*</span>
+          </label>
+          <textarea
+            id="automation-token-hostnames"
+            rows="3"
+            bind:value={formHostnames}
+            placeholder="api.example.com&#10;*.preview.example.com"
+            autocomplete="off"
+            spellcheck="false"
+          ></textarea>
+          <span class="settings-hint">
+            One per line. An exact name, or a single leading <code>*.</code> wildcard
+            covering one label, the way a certificate wildcard reads.
+          </span>
+        </div>
+
+        <div class="settings-form-row">
+          <label for="automation-token-cidrs">
+            Allowed backend CIDRs <span class="settings-required">*</span>
+          </label>
+          <textarea
+            id="automation-token-cidrs"
+            rows="2"
+            bind:value={formBackendCidrs}
+            placeholder="10.0.0.0/8"
+            autocomplete="off"
+            spellcheck="false"
+          ></textarea>
+          <span class="settings-hint">
+            One per line. An empty list admits no address: there is no node-wide
+            default to fall back on.
+          </span>
+        </div>
+      {:else}
+        <p class="settings-hint">
+          Hostname and backend grants: not applicable. None of the selected scopes
+          reaches a path that reads them, so the token carries none.
+        </p>
+      {/if}
 
       <div class="settings-form-row">
         <label for="automation-token-lifetime">Lifetime (days)</label>
@@ -460,6 +564,12 @@
     padding: 0;
     font-size: 0.8125rem;
     color: var(--color-text-muted);
+  }
+
+  .tier-warning {
+    color: var(--color-orange);
+    font-size: 0.8125rem;
+    line-height: 1.5;
   }
 
   .warning {

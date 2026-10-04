@@ -42,6 +42,16 @@
 //! - [`router`] - the router and the `whoami` endpoint.
 //! - [`environments`] - the environment resource (Story 10.4): the
 //!   handlers, the one-transaction write, and the reaper's sweep.
+//! - [`read`] - the read surface (Story 11.1): logs, WAF, SLA, cluster
+//!   status, backends, routes and certificate metadata, each a wrapper
+//!   over the management handler that already answers it.
+//! - [`write`] - the write surface (Story 11.2): routes, backends and
+//!   certificate bindings, each the management handler's own body run
+//!   with the token as the actor, bounded by the token's grants.
+//! - [`mcp`] - the MCP Streamable HTTP binding (Story 11.1 AC #9): one
+//!   `POST` path over the shared `lorica-mcp` core, running each tool's
+//!   call through the plane's own router in process, scope gate
+//!   included, rather than over a socket of its own.
 //! - [`oidc`] - the GitLab ID-token verifier (Story 10.5): the pinned
 //!   algorithm, the JWKS cache and the bounded replay set.
 //!
@@ -65,17 +75,26 @@
 //! [`required_scope`] enforces.
 //!
 //! Each document has its own drift gate in `tests/openapi_contract.rs`:
-//! the management one scans `src/server.rs`, the automation one scans
-//! [`router`] and additionally checks that every documented scope is
-//! the scope the gate actually applies.
+//! the management one scans `src/server.rs`, the automation one reads
+//! [`route_table`], the table both automation routers are built from,
+//! and additionally checks that every documented scope is the scope the
+//! gate actually applies.
 
 pub mod audit;
 pub mod auth;
 pub mod environments;
 pub mod listener;
+pub mod mcp;
 pub mod oidc;
+pub mod read;
+pub mod redact;
 pub mod router;
 pub mod scope;
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
+mod tests;
+pub mod write;
 
 pub use auth::{
     AutomationPrincipal, AUTOMATION_BEARER_MAX_BYTES, AUTOMATION_LAST_USED_WRITE_INTERVAL,
@@ -87,6 +106,11 @@ pub use environments::{
     ENVIRONMENT_EXPIRED_ACTION,
 };
 pub use listener::{start_automation_server, AutomationListenerConfig, AutomationListenerError};
+pub use lorica_mcp::server::InvocationLimiter;
+pub use mcp::{InProcessPlane, MCP_PATH};
 pub use oidc::{OidcVerifier, RefusalReason, OIDC_REPLAY_SET_CAP};
-pub use router::build_automation_router;
-pub use scope::required_scope;
+pub use read::{
+    AUTOMATION_READ_DEFAULT_ROWS, AUTOMATION_READ_MAX_ANSWER_BYTES, AUTOMATION_READ_MAX_ROWS,
+};
+pub use router::{build_automation_router, route_table, AutomationRoute, AUTOMATION_BODY_CAP};
+pub use scope::{path_template, required_scope, ScopeRequirement};

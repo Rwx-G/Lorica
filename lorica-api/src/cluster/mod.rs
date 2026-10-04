@@ -431,12 +431,19 @@ fn selected_hostnames(
         .collect()
 }
 
-/// GET /api/v1/cluster/nodes - the fleet roster (Viewer+).
-pub async fn list_nodes(
-    Extension(state): Extension<AppState>,
-    Extension(session): Extension<Session>,
-) -> Result<impl IntoResponse, ApiError> {
-    let control = control_plane(&state)?;
+/// The fleet roster as `role` is allowed to see it.
+///
+/// Split out of [`list_nodes`] so the automation plane's read surface
+/// (Story 11.1) walks the same store passes and the same
+/// [`node_responses`] view builder. `role` is what decides the
+/// Operator-only host telemetry, and it is the caller's business to say
+/// which one stands in for a credential that has none.
+///
+/// # Errors
+///
+/// `Conflict` off a control plane, or the store's error.
+pub(crate) async fn roster(state: &AppState, role: Role) -> Result<Vec<NodeResponse>, ApiError> {
+    let control = control_plane(state)?;
     let (nodes, selected, certificates) = db_blocking(&state.store, |store| {
         let nodes = store
             .list_cluster_nodes()
@@ -452,22 +459,28 @@ pub async fn list_nodes(
         Ok::<_, ApiError>((nodes, selected, certificates))
     })
     .await?;
-    Ok(json_data(node_responses(
+    Ok(node_responses(
         &control,
         nodes,
         &selected,
         &certificates,
-        session.role,
-    )))
+        role,
+    ))
 }
 
-/// GET /api/v1/cluster/nodes/{id} - one node (Viewer+).
-pub async fn get_node(
-    Extension(state): Extension<AppState>,
-    Extension(session): Extension<Session>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
-    let control = control_plane(&state)?;
+/// One node of the roster as `role` is allowed to see it. See
+/// [`roster`].
+///
+/// # Errors
+///
+/// `Conflict` off a control plane, `NotFound` for an id the roster does
+/// not hold, or the store's error.
+pub(crate) async fn one_node(
+    state: &AppState,
+    role: Role,
+    id: String,
+) -> Result<NodeResponse, ApiError> {
+    let control = control_plane(state)?;
     let (node, selected, certificates) = db_blocking(&state.store, move |store| {
         let node = store
             .get_cluster_node(&id)
@@ -478,9 +491,25 @@ pub async fn get_node(
         Ok::<_, ApiError>((node, selected, certificates))
     })
     .await?;
-    let mut responses =
-        node_responses(&control, vec![node], &selected, &certificates, session.role);
-    Ok(json_data(responses.remove(0)))
+    let mut responses = node_responses(&control, vec![node], &selected, &certificates, role);
+    Ok(responses.remove(0))
+}
+
+/// GET /api/v1/cluster/nodes - the fleet roster (Viewer+).
+pub async fn list_nodes(
+    Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(json_data(roster(&state, session.role).await?))
+}
+
+/// GET /api/v1/cluster/nodes/{id} - one node (Viewer+).
+pub async fn get_node(
+    Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(json_data(one_node(&state, session.role, id).await?))
 }
 
 /// POST /api/v1/cluster/nodes/{id}/activate - `Pending` -> `Active`
@@ -670,9 +699,14 @@ pub struct ClusterStatusResponse {
 }
 
 /// GET /api/v1/cluster/status (Viewer+).
+///
+/// The concrete `Json` return type rather than `impl IntoResponse`: the
+/// automation plane's read surface (Story 11.1) serves this same answer
+/// under `cluster:read` by calling this function, and an opaque return
+/// type cannot be passed through.
 pub async fn get_status(
     Extension(state): Extension<AppState>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let build_version = env!("CARGO_PKG_VERSION").to_string();
     // A control plane reports the version it OWNS, generation and
     // hash from the same object; a follower and a standalone node

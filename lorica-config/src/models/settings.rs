@@ -142,14 +142,28 @@ pub struct GlobalSettings {
     /// enforcement time. Only consulted when `flood_threshold_rps > 0`.
     #[serde(default)]
     pub flood_strict_rps: u32,
-    /// Maximum time (seconds) the proxy waits for a client to finish
-    /// sending its request headers before the header phase is treated as
-    /// a slowloris attempt and the request is answered with 408. Applies
-    /// globally across every route as a floor on top of the per-route
-    /// `slowloris_threshold_ms`. Default 10. `0` disables the global
-    /// floor (per-route thresholds still apply).
+    /// Maximum time (seconds) an HTTP/1.1 client may take to send a whole
+    /// request header, from its first byte to the end of the header
+    /// block. Enforced while the header is read: past it the client is
+    /// answered 408 and the connection is closed, on every route, as a
+    /// floor under the per-route `slowloris_threshold_ms`. The wait before
+    /// the first byte is bounded by `downstream_idle_timeout_s`, not by
+    /// this. Default 10, bounded 1 to [`MAX_HEADER_TIMEOUT_S`]. Never 0:
+    /// there is no "off" value, because the per-route
+    /// `slowloris_threshold_ms` is judged only once a header is complete
+    /// and cannot cut one that is still arriving.
     #[serde(default = "default_header_timeout_s")]
     pub header_timeout_s: u32,
+    /// How long (seconds) a downstream connection may sit idle before
+    /// the proxy closes it: an HTTP/1.1 keepalive connection waiting
+    /// for its next request, or an HTTP/2 connection with no stream in
+    /// flight. Bounds the sockets and tasks idle clients can hold.
+    /// Default 75, nginx's `keepalive_timeout`. Never 0: there is no
+    /// "no limit" value. A response in progress (long poll, event
+    /// stream) and an upgraded connection (WebSocket) are not idle and
+    /// are not cut by it.
+    #[serde(default = "default_downstream_idle_timeout_s")]
+    pub downstream_idle_timeout_s: u32,
     /// Number of WAF blocks before an IP is auto-banned. 0 = disabled (default 5).
     #[serde(default = "default_waf_ban_threshold")]
     pub waf_ban_threshold: i32,
@@ -558,8 +572,28 @@ fn default_metrics_require_auth() -> bool {
     true
 }
 
+/// The shipped [`GlobalSettings::header_timeout_s`]. Also what the proxy
+/// falls back to when a stored value of 0 arrives by a path the API
+/// validator does not guard (an import, a replicated blob), so 0 never
+/// reads as "no bound".
+pub const DEFAULT_HEADER_TIMEOUT_S: u32 = 10;
+
+/// The largest [`GlobalSettings::header_timeout_s`] the API accepts, and
+/// the value a larger one from an import or a replicated blob is read as.
+pub const MAX_HEADER_TIMEOUT_S: u32 = 3600;
+
 fn default_header_timeout_s() -> u32 {
-    10
+    DEFAULT_HEADER_TIMEOUT_S
+}
+
+/// The shipped [`GlobalSettings::downstream_idle_timeout_s`], nginx's
+/// `keepalive_timeout`. Also what the proxy falls back to when a stored
+/// value of 0 arrives by a path the API validator does not guard (an
+/// import, a replicated blob), so 0 never reads as "no limit".
+pub const DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S: u32 = 75;
+
+fn default_downstream_idle_timeout_s() -> u32 {
+    DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S
 }
 
 fn default_waf_ban_threshold() -> i32 {
@@ -762,6 +796,7 @@ impl Default for GlobalSettings {
             flood_threshold_rps: 0,
             flood_strict_rps: 0,
             header_timeout_s: default_header_timeout_s(),
+            downstream_idle_timeout_s: default_downstream_idle_timeout_s(),
             waf_ban_threshold: default_waf_ban_threshold(),
             waf_ban_duration_s: default_waf_ban_duration_s(),
             custom_security_presets: Vec::new(),

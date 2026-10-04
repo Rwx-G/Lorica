@@ -21,6 +21,19 @@ use crate::logs::{LogEntry, LogsQuery};
 /// second of stall before the queue starts shedding.
 pub const AUDIT_QUEUE_CAPACITY: usize = 4096;
 
+/// The slots of the audit queue a sheddable row may never take: a
+/// quarter of it, kept for the rows of mutations.
+///
+/// Every automation request lands a row, the refused and anonymous ones
+/// included, so a flood that needs no credential could fill the whole
+/// queue with rows about itself and shed the row of a write committing
+/// beside it. A sheddable row ([`crate::audit::record_request`]) is
+/// refused once only this reserve is left, and a mutation's row
+/// ([`crate::audit::record`]) still has the reserve to itself: a
+/// quarter of the queue is about a quarter of a second of chain
+/// commits, far more mutations than the write budgets admit in one.
+pub const AUDIT_QUEUE_RESERVED_FOR_MUTATIONS: usize = AUDIT_QUEUE_CAPACITY / 4;
+
 /// One item on the audit write queue.
 enum AuditWrite {
     /// A row to chain and persist.
@@ -129,6 +142,14 @@ pub struct LogStore {
     /// `LogStore` closes it, which is how the consumer thread learns
     /// to drain and exit.
     audit_tx: tokio::sync::mpsc::Sender<AuditWrite>,
+    /// The last [`LogStore::waf_event_stats`] and when it was computed,
+    /// read by [`LogStore::waf_event_stats_within`]. One entry whatever
+    /// the traffic: the per-category list holds one row per rule
+    /// category the table has ever recorded.
+    waf_stats_cache: Mutex<Option<(std::time::Instant, WafEventStats)>>,
+    /// Moved by every write that empties `waf_events`, so a computation
+    /// that raced one is not cached over the emptied table.
+    waf_stats_generation: std::sync::atomic::AtomicU64,
 }
 
 impl LogStore {
@@ -304,7 +325,12 @@ impl LogStore {
         let conn = Arc::new(Mutex::new(conn));
         let (audit_tx, audit_rx) = tokio::sync::mpsc::channel(AUDIT_QUEUE_CAPACITY);
         Self::spawn_audit_writer(Arc::clone(&conn), audit_rx);
-        Ok(Self { conn, audit_tx })
+        Ok(Self {
+            conn,
+            audit_tx,
+            waf_stats_cache: Mutex::new(None),
+            waf_stats_generation: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// Spawn the single consumer that owns audit chain writes.
@@ -387,6 +413,29 @@ impl LogStore {
                 AuditWrite::Barrier(_) => Ok(()),
             },
         }
+    }
+
+    /// [`LogStore::enqueue_audit`] for a row that may be shed first: it
+    /// is refused, as a full queue refuses it, once only
+    /// [`AUDIT_QUEUE_RESERVED_FOR_MUTATIONS`] slots are left.
+    ///
+    /// The free-slot reading and the send are two steps, so sheddable
+    /// rows racing each other can each read the same free slot; the
+    /// reserve is a floor they cross by at most one row per concurrent
+    /// caller, not a wall. Never blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the entry unwritten when the reserve is all that is
+    /// left, or when the queue is full or closed.
+    pub fn enqueue_audit_sheddable(
+        &self,
+        entry: Box<crate::audit::NewAuditEntry>,
+    ) -> Result<(), Box<crate::audit::NewAuditEntry>> {
+        if self.audit_tx.capacity() <= AUDIT_QUEUE_RESERVED_FOR_MUTATIONS {
+            return Err(entry);
+        }
+        self.enqueue_audit(entry)
     }
 
     /// Wait until every audit row enqueued before this call is on disk.
@@ -493,17 +542,38 @@ impl LogStore {
         Ok(())
     }
 
-    /// Query entries with filtering. Returns newest first.
-    /// Query log entries with pagination and filters; returns `(rows, total_match_count)`.
+    /// Query log entries with pagination and filters; returns
+    /// `(rows, total_match_count)`, the rows oldest first.
     pub fn query(&self, params: &LogsQuery) -> Result<(Vec<LogEntry>, usize), String> {
+        let (entries, total) = self.query_counting(params, true)?;
+        Ok((entries, total.unwrap_or_default()))
+    }
+
+    /// [`LogStore::query`]'s rows without its match count.
+    ///
+    /// The count is a second pass over every row the filters match, and
+    /// with `search` five unanchored `LIKE`s per retained row, all under
+    /// the connection mutex the access-log writer and the audit drain
+    /// need. A caller that answers no total (the automation plane's
+    /// `/logs`, which pages with `has_more`) has no reason to pay it.
+    pub fn query_rows(&self, params: &LogsQuery) -> Result<Vec<LogEntry>, String> {
+        Ok(self.query_counting(params, false)?.0)
+    }
+
+    /// The rows, and the match count when `with_total`.
+    fn query_counting(
+        &self,
+        params: &LogsQuery,
+        with_total: bool,
+    ) -> Result<(Vec<LogEntry>, Option<usize>), String> {
         let conn = self.conn.lock();
 
         let mut conditions = Vec::new();
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
         if let Some(ref route) = params.route {
-            conditions.push("host LIKE ?".to_string());
-            bind_values.push(Box::new(format!("%{route}%")));
+            conditions.push(format!("host LIKE ? {LIKE_ESCAPE}"));
+            bind_values.push(Box::new(format!("%{}%", like_operand(route))));
         }
         if let Some(status) = params.status {
             conditions.push("status = ?".to_string());
@@ -529,16 +599,21 @@ impl LogStore {
             conditions.push("id > ?".to_string());
             bind_values.push(Box::new(after_id as i64));
         }
+        if let Some(before_id) = params.before_id {
+            conditions.push("id < ?".to_string());
+            bind_values.push(Box::new(i64::try_from(before_id).unwrap_or(i64::MAX)));
+        }
         if let Some(ref ip) = params.client_ip {
-            conditions.push("client_ip LIKE ?".to_string());
-            bind_values.push(Box::new(format!("{ip}%")));
+            conditions.push(format!("client_ip LIKE ? {LIKE_ESCAPE}"));
+            bind_values.push(Box::new(format!("{}%", like_operand(ip))));
         }
         if let Some(ref search) = params.search {
-            let pattern = format!("%{search}%");
-            conditions.push(
-                "(method LIKE ? OR path LIKE ? OR host LIKE ? OR backend LIKE ? OR error LIKE ?)"
-                    .to_string(),
-            );
+            let pattern = format!("%{}%", like_operand(search));
+            conditions.push(format!(
+                "(method LIKE ? {LIKE_ESCAPE} OR path LIKE ? {LIKE_ESCAPE} \
+                 OR host LIKE ? {LIKE_ESCAPE} OR backend LIKE ? {LIKE_ESCAPE} \
+                 OR error LIKE ? {LIKE_ESCAPE})"
+            ));
             bind_values.push(Box::new(pattern.clone()));
             bind_values.push(Box::new(pattern.clone()));
             bind_values.push(Box::new(pattern.clone()));
@@ -552,14 +627,23 @@ impl LogStore {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        let limit = params.limit.unwrap_or(200).min(10_000);
+        let limit = params
+            .limit
+            .unwrap_or(200)
+            .min(crate::logs::LOGS_QUERY_MAX_ROWS);
 
-        let count_sql = format!("SELECT COUNT(*) FROM access_logs {where_clause}");
-        let refs: Vec<&dyn rusqlite::types::ToSql> =
-            bind_values.iter().map(|b| b.as_ref()).collect();
-        let total: usize =
-            conn.query_row(&count_sql, refs.as_slice(), |row| row.get::<_, i64>(0))
-                .map_err(|e| format!("failed to count access logs: {e}"))? as usize;
+        let total = if with_total {
+            let count_sql = format!("SELECT COUNT(*) FROM access_logs {where_clause}");
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                bind_values.iter().map(|b| b.as_ref()).collect();
+            Some(
+                conn.query_row(&count_sql, refs.as_slice(), |row| row.get::<_, i64>(0))
+                    .map_err(|e| format!("failed to count access logs: {e}"))?
+                    as usize,
+            )
+        } else {
+            None
+        };
 
         let query_sql = format!(
             "SELECT id, timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff, xff_proxy_ip, source, request_id \
@@ -615,8 +699,8 @@ impl LogStore {
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
         if let Some(ref route) = params.route {
-            conditions.push("host LIKE ?".to_string());
-            bind_values.push(Box::new(format!("%{route}%")));
+            conditions.push(format!("host LIKE ? {LIKE_ESCAPE}"));
+            bind_values.push(Box::new(format!("%{}%", like_operand(route))));
         }
         if let Some(status) = params.status {
             conditions.push("status = ?".to_string());
@@ -639,11 +723,12 @@ impl LogStore {
             bind_values.push(Box::new(time_to.clone()));
         }
         if let Some(ref search) = params.search {
-            let pattern = format!("%{search}%");
-            conditions.push(
-                "(method LIKE ? OR path LIKE ? OR host LIKE ? OR backend LIKE ? OR error LIKE ?)"
-                    .to_string(),
-            );
+            let pattern = format!("%{}%", like_operand(search));
+            conditions.push(format!(
+                "(method LIKE ? {LIKE_ESCAPE} OR path LIKE ? {LIKE_ESCAPE} \
+                 OR host LIKE ? {LIKE_ESCAPE} OR backend LIKE ? {LIKE_ESCAPE} \
+                 OR error LIKE ? {LIKE_ESCAPE})"
+            ));
             bind_values.push(Box::new(pattern.clone()));
             bind_values.push(Box::new(pattern.clone()));
             bind_values.push(Box::new(pattern.clone()));
@@ -950,12 +1035,46 @@ impl LogStore {
         Ok((total as u64, total_24h as u64, by_category))
     }
 
-    /// Clear all WAF events.
+    /// [`LogStore::waf_event_stats`], answered from the last
+    /// computation while it is younger than `max_age`.
+    ///
+    /// The aggregates are two `COUNT(*)` passes and a `GROUP BY` over
+    /// the whole retained table under the connection mutex the access
+    /// log writer and the audit drain share, and a caller polling them
+    /// (a model asking the automation plane in a loop) paid that per
+    /// call. Within `max_age` the answer is the one already computed:
+    /// counters that are up to `max_age` old, and a table scanned at
+    /// most once per `max_age` whoever asks. A clear drops the cached
+    /// answer, so an emptied table never reads as its old counts.
+    pub fn waf_event_stats_within(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<WafEventStats, String> {
+        use std::sync::atomic::Ordering;
+        if let Some((computed_at, stats)) = self.waf_stats_cache.lock().as_ref() {
+            if computed_at.elapsed() < max_age {
+                return Ok(stats.clone());
+            }
+        }
+        let generation = self.waf_stats_generation.load(Ordering::Acquire);
+        let computed_at = std::time::Instant::now();
+        let stats = self.waf_event_stats()?;
+        let mut cache = self.waf_stats_cache.lock();
+        if self.waf_stats_generation.load(Ordering::Acquire) == generation {
+            *cache = Some((computed_at, stats.clone()));
+        }
+        Ok(stats)
+    }
+
     /// Remove every persisted WAF event row.
     pub fn clear_waf_events(&self) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM waf_events", [])
             .map_err(|e| format!("failed to clear WAF events: {e}"))?;
+        drop(conn);
+        self.waf_stats_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        *self.waf_stats_cache.lock() = None;
         Ok(())
     }
 
@@ -2026,6 +2145,27 @@ impl LogStore {
     }
 }
 
+/// The escape declaration every `LIKE` predicate built from caller text
+/// carries.
+///
+/// SQLite has no default escape character, so a pattern containing a
+/// backslash means nothing without this clause; it is part of the
+/// predicate, not a decoration on it.
+const LIKE_ESCAPE: &str = r"ESCAPE '\'";
+
+/// `text` as a `LIKE` operand that matches itself and nothing else.
+///
+/// `%` and `_` are wildcards inside a `LIKE` pattern and every filter
+/// below interpolates caller text into one. Unescaped, a search for
+/// `%` matches every row while reading as a narrow filter, which is a
+/// result an operator or a model draws a conclusion from. The
+/// backslash goes first, or it would escape the escapes added after it.
+fn like_operand(text: &str) -> String {
+    text.replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_")
+}
+
 /// Helper to re-box a ToSql value for a second bind pass.
 /// We only store String and i64 values, so this covers all cases.
 fn copy_to_sql(val: &dyn rusqlite::types::ToSql) -> Box<dyn rusqlite::types::ToSql> {
@@ -2111,6 +2251,40 @@ mod waf_stats_tests {
         // XSS first (3 > 1).
         assert_eq!(by_cat[0].1, 3);
         assert_eq!(by_cat[1].1, 1);
+    }
+
+    #[test]
+    fn cached_waf_stats_are_reused_within_their_age_and_dropped_by_a_clear() {
+        let (store, _dir) = tmp_store();
+        let an_hour = std::time::Duration::from_secs(3600);
+        store
+            .insert_waf_event(&mk_event(1, lorica_waf::RuleCategory::Xss))
+            .expect("insert");
+        assert_eq!(store.waf_event_stats_within(an_hour).expect("stats").0, 1);
+
+        // A row recorded inside the window does not move the cached
+        // answer: the table is not scanned again.
+        store
+            .insert_waf_event(&mk_event(2, lorica_waf::RuleCategory::SqlInjection))
+            .expect("insert");
+        let cached = store.waf_event_stats_within(an_hour).expect("stats");
+        assert_eq!(cached.0, 1);
+        assert_eq!(cached.2.len(), 1);
+
+        // An answer older than the age asked for is recomputed, and is
+        // what the uncached aggregate says.
+        let fresh = store
+            .waf_event_stats_within(std::time::Duration::ZERO)
+            .expect("stats");
+        assert_eq!(fresh, store.waf_event_stats().expect("stats"));
+        assert_eq!(fresh.0, 2);
+
+        // A clear never reads as the counts it emptied.
+        store.clear_waf_events().expect("clear");
+        assert_eq!(
+            store.waf_event_stats_within(an_hour).expect("stats"),
+            (0, 0, Vec::new())
+        );
     }
 
     #[test]
@@ -2885,5 +3059,53 @@ mod retention_loss_tests {
             .enforce_retention(1_000, Some(0))
             .expect("retention under the cap");
         assert_eq!(outcome, RetentionOutcome::default());
+    }
+
+    #[test]
+    fn the_mutation_reserve_is_the_quarter_the_documents_say() {
+        assert_eq!(AUDIT_QUEUE_RESERVED_FOR_MUTATIONS * 4, AUDIT_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn the_rows_without_the_count_are_the_rows_with_it() {
+        // `/automation/v1/logs` answers no total, so it reads the rows
+        // alone; they must be the same rows the counted query answers,
+        // filters and limit included.
+        let (store, _dir) = tmp_store();
+        for n in 0..30 {
+            let mut entry = access_entry(n);
+            if n % 3 == 0 {
+                entry.path = format!("/needle/{n}");
+                entry.status = 404;
+            }
+            store.insert(&entry).expect("insert access row");
+        }
+        let query =
+            |search: Option<&str>, status: Option<u16>, limit: usize| crate::logs::LogsQuery {
+                route: None,
+                status,
+                status_min: None,
+                status_max: None,
+                time_from: None,
+                time_to: None,
+                client_ip: None,
+                search: search.map(str::to_string),
+                limit: Some(limit),
+                after_id: None,
+                before_id: None,
+            };
+        for params in [
+            query(None, None, 5),
+            query(Some("needle"), None, 4),
+            query(None, Some(404), 100),
+            query(Some("absent"), None, 10),
+        ] {
+            let (counted, _total) = store.query(&params).expect("counted");
+            let rows = store.query_rows(&params).expect("rows alone");
+            let ids = |entries: &[crate::logs::LogEntry]| {
+                entries.iter().map(|e| e.id).collect::<Vec<_>>()
+            };
+            assert_eq!(ids(&rows), ids(&counted), "{params:?}");
+        }
     }
 }

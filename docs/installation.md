@@ -1,8 +1,10 @@
 # Installation
 
-Lorica ships as a single static binary plus a hardened systemd unit. The
-`.deb` (Debian/Ubuntu) and `.rpm` (Fedora/RHEL) packages install the
-binary at `/usr/bin/lorica`, the unit at
+Lorica ships as a binary plus a hardened systemd unit. The `.deb`
+(Debian/Ubuntu) and `.rpm` (Fedora/RHEL) packages install the binary at
+`/usr/bin/lorica` and, since v1.9.0, the management MCP server at
+`/usr/bin/lorica-mcp`, which no unit starts: an MCP client launches it
+over stdio for one session (`docs/mcp.md`). They install the unit at
 `/lib/systemd/system/lorica.service` (`.rpm`:
 `/usr/lib/systemd/system/lorica.service`), create a dedicated unprivileged
 `lorica` user, and own the data directory `/var/lib/lorica`.
@@ -17,7 +19,13 @@ sudo dpkg -i lorica_<version>_amd64.deb
 sudo rpm -i lorica-<version>-1.x86_64.rpm
 ```
 
-The post-install hook enables and starts the service. Lorica listens on
+On a first install the post-install hook enables and starts the service.
+An upgrade keeps the state you left it in: it never enables the
+service, and restarts it only if it was running. The one hop it cannot
+read is from a `.deb` of 1.8.0 or earlier, whose removal script
+stopped and disabled the service without recording anything: that
+upgrade leaves it stopped and says so, and `sudo systemctl enable --now
+lorica.service` brings it back. Lorica listens on
 8080 (HTTP proxy), 8443 (HTTPS proxy), and 9443 (dashboard, localhost
 only). The initial admin password is written to
 `/var/lib/lorica/initial-admin-password` (mode 0600).
@@ -60,6 +68,22 @@ ExecStart=/usr/bin/lorica --data-dir /var/lib/lorica \
 ```bash
 sudo systemctl restart lorica
 ```
+
+`--log-level` sets the level the process starts with. Once the
+configuration store is open, the log level saved in Settings replaces
+it in every Lorica process, the supervisor and each worker, and a
+change saved there applies without a restart. `RUST_LOG`, when set,
+takes precedence over both and is never replaced.
+
+## Upgrading a .deb from 1.8.0 or earlier
+
+Every .deb up to 1.8.0 recorded the CI build account as the owner of
+its files. Upgrading on a host where that left files owned by another
+account resets them to root and leaves Lorica stopped, listing what
+it repaired. Run `dpkg --verify lorica`, inspect the listed
+directories and `/etc/systemd/system`, then
+`systemctl daemon-reload && systemctl enable --now lorica`. On a host
+where nothing needed repairing the upgrade restarts Lorica as usual.
 
 ## systemd unit
 

@@ -262,6 +262,24 @@ pub struct AppState {
     /// process. Issuer entries are read from the store per request,
     /// so this holds no trust configuration of its own.
     pub oidc: Arc<crate::automation::OidcVerifier>,
+    /// The MCP tool-invocation windows of the Streamable HTTP binding
+    /// (Story 11.1 AC #9), one per token, for the process. The binding
+    /// builds its protocol core per request, so the budget the MCP
+    /// revision requires has to be held here, where a token's window
+    /// outlives the request that opened it.
+    pub mcp_invocations: Arc<crate::automation::InvocationLimiter>,
+    /// What the two certificate-renewal paths, the background loop and
+    /// the manual endpoint, know about each certificate between calls
+    /// (Story 11.2): which ids have an ACME order open and which the CA
+    /// has put on a rate-limit cooldown. One ledger for the process,
+    /// because a token's renewals are budgeted per certificate against
+    /// what the loop and the other callers are doing to that same id.
+    pub renewals: Arc<crate::acme::RenewalLedger>,
+    /// The automation plane's write budget, one window per credential
+    /// and kind of write (Story 11.3). The plane mounts none of the
+    /// management routes' rate-limit layers, so it holds its own, for
+    /// the process, where a credential's window outlives a request.
+    pub automation_writes: crate::middleware::rate_limit::RateLimiter,
 }
 
 impl AppState {
@@ -1335,9 +1353,16 @@ pub fn build_router(
         // anything larger than this global default and without a per-
         // route override is rejected with 413 Payload Too Large.
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MiB
-        .layer(axum::Extension(state))
+        .layer(axum::Extension(state.clone()))
         .layer(axum::Extension(session_store))
         .layer(axum::Extension(rate_limiter))
+        // Every request that is not a read runs, from the session check
+        // to its audit row, as one unit a client hanging up cannot cut
+        // (`crate::db::detach_mutations`), inside the request span.
+        .layer(middleware::from_fn_with_state(
+            state,
+            crate::db::detach_mutations,
+        ))
         // Outermost: every API request runs inside an `api_request`
         // tracing span so `lorica::audit` events correlate with the
         // request in OTel (Story 8.9 AC #4).
@@ -1351,7 +1376,9 @@ pub fn build_router(
 /// The management listener terminates TLS with either the operator's
 /// certificate (`management_cert_pem_path` + `management_key_pem_path`,
 /// AC #2) or the auto-generated self-signed leaf under
-/// `<data_dir>/management/`. Serving is a manual accept loop: axum 0.7
+/// `<data_dir>/management/`, and records the one it serves at
+/// [`crate::management_tls::served_certificate_path`] for the CLI to pin
+/// (backlog #90). Serving is a manual accept loop: axum 0.7
 /// `Router` -> `hyper-util` auto (h1/h2, with upgrades for the dashboard
 /// websockets) over a `tokio-rustls` acceptor, replacing the previous
 /// plaintext `axum::serve`.
@@ -1393,7 +1420,7 @@ pub async fn start_server(
         }
     };
 
-    let server_config = crate::management_tls::build_management_server_config(
+    let server_config = crate::management_tls::build_and_record_management_server_config(
         &data_dir,
         cert_override.as_deref(),
         key_override.as_deref(),

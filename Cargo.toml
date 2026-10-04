@@ -32,6 +32,8 @@ members = [
     "lorica-bench",
     "lorica-geoip",
     "lorica-challenge",
+    "lorica-mcp",
+    "lorica-automation-policy",
 ]
 
 exclude = ["fuzz"]

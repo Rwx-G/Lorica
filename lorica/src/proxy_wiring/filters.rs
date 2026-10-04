@@ -321,6 +321,23 @@ impl LoricaProxy {
     }
 }
 
+/// The slowloris threshold in milliseconds: the smallest strictly-positive
+/// of the route's `slowloris_threshold_ms` and the global
+/// `header_timeout_s`, `0` when both are off.
+///
+/// Computed in `u64`: `header_timeout_s` is bounded by the API but not by
+/// an import or a replicated blob, and the `i32` product this replaced
+/// wrapped negative past `i32::MAX` and refused every request.
+fn effective_slowloris_ms(route_threshold_ms: i32, header_timeout_s: u32) -> u64 {
+    let route_ms = u64::try_from(route_threshold_ms).unwrap_or(0);
+    let global_ms = u64::from(header_timeout_s) * 1000;
+    match (route_ms, global_ms) {
+        (0, g) => g,
+        (r, 0) => r,
+        (r, g) => r.min(g),
+    }
+}
+
 /// `Retry-After` advised on an AI-bot 403 (both the verified-Deny
 /// and the spoofed-Deny arms). 24 h - an AI training crawler has no
 /// business retrying the same denied route faster than once a day.
@@ -2044,14 +2061,24 @@ impl LoricaProxy {
         Ok(None)
     }
 
-    /// Stage: slowloris detection. Triggers when the time from connection
-    /// start to `request_filter` exceeds the effective header-phase
-    /// threshold (the client is likely sending headers very slowly). The
-    /// threshold is the smallest positive of the per-route
+    /// Stage: slowloris detection. Triggers when the request header took
+    /// longer to arrive, from its first byte to the end of the header
+    /// block, than the effective threshold (the client sent its header very
+    /// slowly). The threshold is the smallest positive of the per-route
     /// `slowloris_threshold_ms` and the global `header_timeout_s` floor
-    /// (Story 8.10 AC #1), so the global setting protects every route,
-    /// including routes that leave `slowloris_threshold_ms` at 0.
-    /// Terminal: 408.
+    /// (Story 8.10 AC #1).
+    ///
+    /// The global floor is enforced earlier, inside the header read
+    /// (`downstream_header_timeout`), which cuts the client before the
+    /// header completes; it is repeated here only so a reload that lowered
+    /// it between the read and this stage still applies. The per-route
+    /// threshold cannot be known before the Host header is parsed, so it is
+    /// judged here, after the fact: the header phase is over, but the
+    /// request never reaches the backend and the event is logged. HTTP/2
+    /// streams carry no header duration and are not judged.
+    /// Terminal: 408, and the connection is closed (RFC 9110 section
+    /// 15.5.9), so a client refused as slow cannot send its next header on
+    /// the same socket.
     pub(super) async fn check_slowloris(
         &self,
         session: &mut Session,
@@ -2060,17 +2087,14 @@ impl LoricaProxy {
         check_ip: Option<&str>,
         header_timeout_s: u32,
     ) -> Result<Option<bool>> {
-        let route_ms = entry.route.slowloris_threshold_ms.max(0);
-        let global_ms = (header_timeout_s as i32).saturating_mul(1000);
-        // Smallest strictly-positive threshold wins; 0 means "disabled"
-        // for that layer.
-        let slowloris_ms = match (route_ms, global_ms) {
-            (0, g) => g,
-            (r, 0) => r,
-            (r, g) => r.min(g),
-        };
-        if slowloris_ms > 0 {
-            let elapsed_ms = ctx.start_time.elapsed().as_millis() as i32;
+        let slowloris_ms =
+            effective_slowloris_ms(entry.route.slowloris_threshold_ms, header_timeout_s);
+        let header_read = session
+            .as_downstream()
+            .header_read_duration()
+            .filter(|_| slowloris_ms > 0);
+        if let Some(header_read) = header_read {
+            let elapsed_ms = u64::try_from(header_read.as_millis()).unwrap_or(u64::MAX);
             if elapsed_ms > slowloris_ms {
                 let client_ip_str = check_ip.unwrap_or("-");
                 warn!(
@@ -2081,6 +2105,7 @@ impl LoricaProxy {
                     "slowloris detected - slow request headers"
                 );
                 ctx.block_reason = Some("slowloris detected".to_string());
+                session.set_keepalive(None);
                 return self
                     .write_error_response(
                         session,
@@ -2446,6 +2471,20 @@ mod tests {
     use super::*;
     use ipnet::IpNet;
     use regex::Regex;
+
+    #[test]
+    fn the_slowloris_threshold_never_wraps_on_an_unvalidated_header_timeout() {
+        // Past i32::MAX seconds the former i32 product went negative and
+        // every request took a 408.
+        assert_eq!(
+            effective_slowloris_ms(0, u32::MAX),
+            u64::from(u32::MAX) * 1000
+        );
+        assert_eq!(effective_slowloris_ms(300, u32::MAX), 300);
+        assert_eq!(effective_slowloris_ms(0, 10), 10_000);
+        assert_eq!(effective_slowloris_ms(5_000, 10), 5_000);
+        assert_eq!(effective_slowloris_ms(-1, 0), 0, "both layers off");
+    }
 
     /// The three data-plane address lists (trusted proxies, WAF
     /// whitelist, per-route allow/deny) used to carry three copies of

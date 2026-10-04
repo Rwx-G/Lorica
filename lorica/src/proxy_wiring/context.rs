@@ -19,6 +19,7 @@ use lorica_config::models::{Backend, Route};
 
 use super::{
     CompiledRewriteRule, MirrorBodyState, MirrorPending, ResponseRewriteState, RouteEntry,
+    WafBodyHold,
 };
 
 /// Per-request context carried through the proxy pipeline.
@@ -135,6 +136,10 @@ pub struct RequestCtx {
     /// rather than on every subsequent chunk. Has no effect in
     /// Blocking mode (the request is rejected with 413 instead).
     pub waf_body_truncated: bool,
+    /// Whether this request's body is held back from the upstream until
+    /// the WAF has ruled on it, and what the upstream is owed once it
+    /// has. See [`WafBodyHold`].
+    pub waf_body_hold: WafBodyHold,
     /// Backend ID for sticky session cookie injection (set in upstream_peer).
     pub sticky_backend_id: Option<String>,
     /// Headers harvested from a successful forward-auth response, to be
@@ -219,8 +224,9 @@ pub struct RequestCtx {
     /// ids and the budget reservation.
     ///
     /// Separate from `waf_body_buffer` on purpose: the WAF reads the
-    /// request body while the request is still being forwarded and has
-    /// no use for it afterwards, while a capture is only decided once
+    /// request body before the verdict and has no use for it afterwards
+    /// (in Blocking mode the buffer becomes the body handed to the
+    /// upstream, see `waf_body_hold`), while a capture is only decided once
     /// the response is known. The two buffers have different caps,
     /// different lifetimes, and different contents (the WAF skips a
     /// body it cannot parse).

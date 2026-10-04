@@ -76,6 +76,9 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
         oidc: crate::automation::oidc::test_support::verifier_without_issuer(),
+        mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
+        renewals: Arc::new(crate::acme::RenewalLedger::new()),
+        automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
     };
     let session_store = SessionStore::new(store).await;
     (state, session_store, RateLimiter::new())
@@ -256,6 +259,76 @@ async fn mint(
             .expect("mint answers with the public id")
             .to_string(),
     )
+}
+
+// ---- A mint lands whole or not at all ----
+
+#[tokio::test]
+async fn a_mint_whose_client_hangs_up_still_lands_its_token_and_its_audit_row() {
+    // Architecture audit: cancellation safety covered the four handler
+    // families someone wrapped by hand, and a token mint committed on
+    // the blocking pool while its audit row waited on the request
+    // future hyper drops. The management router now runs every
+    // mutation as one detached unit.
+    let (mut state, sessions, limiter) = test_state().await;
+    let logs = tempfile::tempdir().expect("test setup: temp dir");
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(logs.path()).expect("test setup: log store"),
+    ));
+    let admin = super_admin(&state, &sessions, &limiter).await;
+
+    let held = Arc::clone(&state.store).lock_owned().await;
+    let router = build_router(state.clone(), sessions.clone(), limiter.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(TOKENS_PATH)
+        .header("Cookie", &admin)
+        .header("Content-Type", "application/json")
+        .body(Body::from(create_body().to_string()))
+        .expect("test setup: request builds");
+    let mut in_flight = Box::pin(router.oneshot(request));
+    // Polled until its unit exists on the state's tracker, and no
+    // further: the store is held, so the unit waits inside.
+    while state.task_tracker.is_empty() {
+        tokio::select! {
+            biased;
+            _ = &mut in_flight => panic!("the mint answered while the store was held"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+    // The client hangs up, then the store comes free.
+    drop(in_flight);
+    drop(held);
+    state.task_tracker.close();
+    state.task_tracker.wait().await;
+
+    let stored = {
+        let store = state.store.lock().await;
+        store
+            .list_automation_tokens()
+            .expect("test setup: tokens list")
+    };
+    assert_eq!(
+        stored.len(),
+        1,
+        "the mint committed once the client had gone"
+    );
+    let log_store = state.log_store.clone().expect("test setup: log store");
+    log_store
+        .flush_audit()
+        .await
+        .expect("the audit writer drains");
+    let (rows, _) = log_store
+        .query_audit(&crate::audit::AuditQuery {
+            action_prefix: Some("automation.token.create".to_string()),
+            limit: 10,
+            ..crate::audit::AuditQuery::default()
+        })
+        .expect("the audit query runs");
+    assert!(
+        rows.iter().any(|row| row.target_id == stored[0].public_id),
+        "no audit row for a token that is stored: {rows:?}"
+    );
 }
 
 // ---- Mint and verify agree ----
@@ -648,6 +721,109 @@ async fn an_invalid_request_is_refused_by_the_models_validator_with_the_field_na
             message.contains(expected_word),
             "the refusal for {field} must name it; got {message:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_token_carrying_no_bounded_scope_is_minted_without_grants_and_refused_with_them() {
+    // Typed absence through the mint route: the two grant fields may be
+    // omitted, which is what a read or an admin token sends, and the
+    // stored row answers them as empty lists. Sending one anyway is the
+    // model's 422, naming the field.
+    let (state, sessions, limiter) = test_state().await;
+    let admin = super_admin(&state, &sessions, &limiter).await;
+
+    let response = management(
+        &state,
+        &sessions,
+        &limiter,
+        "POST",
+        TOKENS_PATH,
+        &admin,
+        Some(serde_json::json!({ "name": "mcp read", "scopes": ["logs:read", "waf:read"] })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let data = body_json(response).await["data"].clone();
+    assert_eq!(data["allowed_hostnames"], serde_json::json!([]));
+    assert_eq!(data["allowed_backend_cidrs"], serde_json::json!([]));
+
+    for field in ["allowed_hostnames", "allowed_backend_cidrs"] {
+        let mut body = serde_json::json!({ "name": "mcp admin", "scopes": ["settings:write"] });
+        body[field] = serde_json::json!(["10.0.0.0/8"]);
+        let response = management(
+            &state,
+            &sessions,
+            &limiter,
+            "POST",
+            TOKENS_PATH,
+            &admin,
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{field}"
+        );
+        let message = body_json(response).await["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(message.contains(field), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn a_settings_write_token_is_minted_only_within_the_lifetime_ceiling() {
+    // The ceiling is the model's, so the mint route every surface uses
+    // (dashboard, both CLI commands) is bounded by it: at the ceiling is
+    // a 201, past it a 422 naming it, and no lifetime at all is past it
+    // too, since the node's default lifetime is longer.
+    use lorica_config::models::AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS;
+    let (state, sessions, limiter) = test_state().await;
+    let admin = super_admin(&state, &sessions, &limiter).await;
+    let admin_body = |lifetime_days: Option<i64>| {
+        let mut body = serde_json::json!({ "name": "mcp admin", "scopes": ["settings:write"] });
+        if let Some(days) = lifetime_days {
+            body["lifetime_days"] = serde_json::json!(days);
+        }
+        body
+    };
+    for (lifetime_days, expected) in [
+        (
+            Some(AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS),
+            StatusCode::CREATED,
+        ),
+        (
+            Some(AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS + 1),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (None, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let response = management(
+            &state,
+            &sessions,
+            &limiter,
+            "POST",
+            TOKENS_PATH,
+            &admin,
+            Some(admin_body(lifetime_days)),
+        )
+        .await;
+        assert_eq!(response.status(), expected, "{lifetime_days:?}");
+        if expected == StatusCode::UNPROCESSABLE_ENTITY {
+            let message = body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                message.contains(&format!(
+                    "{AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS} days"
+                )),
+                "the refusal names the ceiling: {message}"
+            );
+        }
     }
 }
 

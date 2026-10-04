@@ -221,6 +221,34 @@ pub fn bucket_from_wire(r: SlaBucketRow) -> Result<SlaBucket, String> {
     })
 }
 
+/// This node's own passive SLA summaries for one route, every standard
+/// window (1h, 24h, 7d, 30d).
+///
+/// Split out of [`get_route_sla`] so the automation plane's read
+/// surface (Story 11.1) computes the figures the same way rather than a
+/// second way. `?node=` stays in the handler: proxying a read to a
+/// follower needs a management session to carry the operator floor, and
+/// an automation credential has no role to check.
+///
+/// # Errors
+///
+/// `NotFound` when this node holds no such route, or the store's error.
+pub(crate) async fn local_route_sla(
+    state: &AppState,
+    route_id: String,
+) -> Result<Vec<SlaSummary>, ApiError> {
+    db_blocking(&state.store, move |store| {
+        // Verify route exists
+        store
+            .get_route(&route_id)?
+            .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
+
+        lorica_bench::results::compute_all_windows(store, &route_id, "passive")
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await
+}
+
 /// GET /api/v1/sla/routes/:id - return passive SLA summaries for all standard windows (1h, 24h, 7d, 30d).
 /// With `?node=`, the same for one follower (Story 9.7 AC #5).
 pub async fn get_route_sla(
@@ -239,18 +267,7 @@ pub async fn get_route_sla(
         let summaries: Vec<SlaSummary> = ack.summaries.into_iter().map(summary_from_wire).collect();
         return Ok(json_data(summaries));
     }
-    let summaries = db_blocking(&state.store, move |store| {
-        // Verify route exists
-        store
-            .get_route(&route_id)?
-            .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
-
-        lorica_bench::results::compute_all_windows(store, &route_id, "passive")
-            .map_err(|e| ApiError::Internal(e.to_string()))
-    })
-    .await?;
-
-    Ok(json_data(summaries))
+    Ok(json_data(local_route_sla(&state, route_id).await?))
 }
 
 /// Query parameters for bucket queries: `?from=&to=&source=passive|active&node=`.
@@ -578,6 +595,82 @@ pub async fn clear_route_sla(
     })))
 }
 
+/// This node's own 1h and 24h passive summaries, two rows per route,
+/// or only the rows of `window`.
+///
+/// Split out of [`get_sla_overview`] for the reason given on
+/// [`local_route_sla`]: the automation plane reads the same figures
+/// through the same computation, and `?node=` stays in the handler.
+///
+/// `window` is what makes that split affordable. Every summary is two
+/// synchronous SQL passes, and the whole loop runs inside ONE
+/// acquisition of the process-wide config-store mutex, so computing
+/// every route's figures to answer `?limit=1` held that lock against
+/// configuration writes and the replication round for `2R` queries.
+/// `None` asks for all of them and is what the management overview
+/// wants. `Some(SlaWindow { skip, take })` is a paginating caller's:
+/// the rows at positions `skip..skip + take` of the full overview and
+/// no other, the routes before `skip` never computed, so neither a deep
+/// offset nor a large one costs a summary it does not answer. A caller
+/// that wants `has_more` asks for one row past its window.
+///
+/// # Errors
+///
+/// The store's error text.
+pub(crate) async fn local_sla_overview(
+    state: &AppState,
+    window: Option<SlaWindow>,
+) -> Result<Vec<SlaSummary>, ApiError> {
+    let SlaWindow { skip, take } = window.unwrap_or(SlaWindow {
+        skip: 0,
+        take: usize::MAX,
+    });
+    // One store acquisition for the whole overview, as before the
+    // blocking-pool migration: every per-route summary runs inside a
+    // single closure.
+    db_blocking(&state.store, move |store| {
+        let routes = store
+            .list_routes()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let now = Utc::now();
+        let from = now - Duration::hours(24);
+        let from_1h = now - Duration::hours(1);
+
+        // Row `2i` is route `i`'s 1h summary and row `2i + 1` its 24h.
+        let mut overview = Vec::new();
+        for (position, route) in routes.iter().enumerate().skip(skip / 2) {
+            let first_row = position * 2;
+            if first_row >= skip && overview.len() < take {
+                overview.push(
+                    store
+                        .compute_sla_summary(&route.id, &from_1h, &now, "1h", "passive")
+                        .map_err(|e| ApiError::Internal(e.to_string()))?,
+                );
+            }
+            if overview.len() >= take {
+                break;
+            }
+            overview.push(
+                store
+                    .compute_sla_summary(&route.id, &from, &now, "24h", "passive")
+                    .map_err(|e| ApiError::Internal(e.to_string()))?,
+            );
+        }
+
+        Ok::<_, ApiError>(overview)
+    })
+    .await
+}
+
+/// The rows of the overview a paginating caller wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlaWindow {
+    /// How many rows of the full overview come before the window.
+    pub(crate) skip: usize,
+    /// How many rows the window holds at most.
+    pub(crate) take: usize,
+}
+
 /// GET /api/v1/sla/overview - return 1h and 24h passive SLA summaries for every route.
 /// With `?node=`, one follower's overview (Story 9.7 AC #5).
 pub async fn get_sla_overview(
@@ -594,32 +687,5 @@ pub async fn get_sla_overview(
         let summaries: Vec<SlaSummary> = ack.summaries.into_iter().map(summary_from_wire).collect();
         return Ok(json_data(summaries));
     }
-    // One store acquisition for the whole overview, as before the
-    // blocking-pool migration: every per-route summary runs inside a
-    // single closure.
-    let overview = db_blocking(&state.store, move |store| {
-        let routes = store
-            .list_routes()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let now = Utc::now();
-        let from = now - Duration::hours(24);
-
-        let mut overview = Vec::new();
-        let from_1h = now - Duration::hours(1);
-        for route in &routes {
-            let summary_1h = store
-                .compute_sla_summary(&route.id, &from_1h, &now, "1h", "passive")
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            overview.push(summary_1h);
-            let summary_24h = store
-                .compute_sla_summary(&route.id, &from, &now, "24h", "passive")
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            overview.push(summary_24h);
-        }
-
-        Ok::<_, ApiError>(overview)
-    })
-    .await?;
-
-    Ok(json_data(overview))
+    Ok(json_data(local_sla_overview(&state, None).await?))
 }

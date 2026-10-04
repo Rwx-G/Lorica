@@ -44,6 +44,9 @@
     cert_critical_days: 7,
     max_global_connections: 0,
     flood_threshold_rps: 0,
+    flood_strict_rps: 0,
+    header_timeout_s: 10,
+    downstream_idle_timeout_s: 75,
     waf_ban_threshold: 5,
     waf_ban_duration_s: 3600,
     waf_body_scan_max_inflight_bytes: 268435456,
@@ -52,6 +55,10 @@
     sla_purge_enabled: false,
     sla_purge_retention_days: 90,
     sla_purge_schedule: 'first_of_month',
+    max_active_probes: 50,
+    loadtest_max_concurrency: 100,
+    loadtest_max_duration_s: 60,
+    loadtest_max_rps: 1000,
     trusted_proxies: '',
     waf_whitelist_ips: '',
     connection_deny_cidrs: '',
@@ -90,8 +97,8 @@
     otlp_logs_capture_enabled: true,
     // Defense-in-depth data-plane bounds (Story 8.9).
     // connection_limits_per_ip is held as a string so an empty
-    // input maps to "no cap" (null), same pattern as the cert
-    // export uid / gid below.
+    // input maps to "no cap" (sent as 0), the way the cert export
+    // uid / gid below are held.
     audit_log_retention_days: 90,
     connection_limits_per_ip: '',
     bot_stash_max_entries: 10000,
@@ -354,11 +361,10 @@
       syslog_tls_client_key_pem: settingsForm.syslog_tls_client_key_pem.trim(),
       syslog_extra_sd: settingsForm.syslog_extra_sd.trim(),
       otlp_logs_auth_header: settingsForm.otlp_logs_auth_header.trim(),
-      // Per-IP connection cap: empty input or 0 means "no cap" (null).
+      // Per-IP connection cap: an empty input means "no cap", which the
+      // request spells 0 (a null would read as "leave it as stored").
       connection_limits_per_ip:
-        connection_limits_per_ip.trim() === '' || Number(connection_limits_per_ip.trim()) === 0
-          ? null
-          : Number(connection_limits_per_ip.trim()),
+        connection_limits_per_ip.trim() === '' ? 0 : Number(connection_limits_per_ip.trim()),
       // Cert export: the enable flag + directory always ride, and
       // uid / gid / modes are only sent when the operator supplied
       // a valid value (empty input => leave backend unchanged).
@@ -479,6 +485,7 @@
 
     <NetworkTab
       bind:settingsForm
+      schema={settingsSchema}
       expanded={expandedSections.network}
       toggleSection={() => toggleSection('network')}
       {settingsSaving}

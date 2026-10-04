@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use lorica_config::models::{Backend, Certificate, Route};
+use lorica_config::route_selection::{self, HostIndex};
 use tracing::warn;
 
 use super::{compile_rewrite_rule, CompiledRewriteRule};
@@ -192,10 +193,11 @@ pub struct MtlsEnforcer {
 /// This struct is atomically swapped via `ArcSwap` when the API triggers a reload.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyConfig {
-    /// Routes indexed by hostname for fast matching.
-    /// Each hostname maps to a list of routes sorted by path_prefix length (longest first).
+    /// Routes indexed by exact hostname and alias, the catch-all `_`
+    /// included, each list longest `path_prefix` first.
     pub routes_by_host: HashMap<String, Vec<Arc<RouteEntry>>>,
-    /// Wildcard routes (*.example.com) checked when exact lookup fails.
+    /// Wildcard routes (*.example.com) checked when exact lookup fails,
+    /// the most specific pattern first.
     pub wildcard_routes: Vec<(String, Vec<Arc<RouteEntry>>)>,
     /// Merged security header presets (builtin + custom).
     /// Custom presets override builtins when names collide.
@@ -210,8 +212,16 @@ pub struct ProxyConfig {
     /// 0.5x factor). Only consulted when `flood_threshold_rps > 0`.
     pub flood_strict_rps: u32,
     /// Story 8.10 AC #1. Global header-phase read timeout (seconds) used
-    /// as a slowloris floor across every route. `0` = disabled.
+    /// as a slowloris floor across every route, read by
+    /// `ProxyHttp::downstream_header_timeout` before every HTTP/1.x
+    /// request and enforced inside the header read. `0` = disabled.
     pub header_timeout_s: u32,
+    /// Backlog #82. Downstream idle timeout (seconds), read by
+    /// `ProxyHttp::downstream_idle_timeout` for every new connection and
+    /// every HTTP/1.1 keepalive reuse. `0` only in a snapshot no store
+    /// built (`ProxyConfig::default()`), and means the server's
+    /// built-in behaviour.
+    pub downstream_idle_timeout_s: u32,
     /// WAF auto-ban: ban IP after this many WAF blocks. 0 = disabled.
     pub waf_ban_threshold: u32,
     /// Duration of WAF-triggered bans in seconds.
@@ -258,6 +268,7 @@ pub struct ProxyConfigGlobals {
     pub flood_threshold_rps: u32,
     pub flood_strict_rps: u32,
     pub header_timeout_s: u32,
+    pub downstream_idle_timeout_s: u32,
     pub waf_ban_threshold: u32,
     pub waf_ban_duration_s: u32,
     pub trusted_proxy_cidrs: Vec<String>,
@@ -292,7 +303,9 @@ impl Default for ProxyConfigGlobals {
     /// permit via `route_mirror_semaphore`'s `.max(1)`, starving every
     /// shadow backend after the first. Keeping `default()` production-
     /// faithful stops that footgun from biting config built in tests
-    /// and fallbacks. Every other field keeps its zero/empty default.
+    /// and fallbacks. The WAF scan budget and the downstream idle timeout
+    /// seed to their production defaults for the same reason; every other
+    /// field keeps its zero/empty default.
     fn default() -> Self {
         Self {
             custom_security_presets: Vec::new(),
@@ -300,6 +313,7 @@ impl Default for ProxyConfigGlobals {
             flood_threshold_rps: 0,
             flood_strict_rps: 0,
             header_timeout_s: 0,
+            downstream_idle_timeout_s: lorica_config::models::DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S,
             waf_ban_threshold: 0,
             waf_ban_duration_s: 0,
             trusted_proxy_cidrs: Vec::new(),
@@ -340,6 +354,7 @@ impl ProxyConfig {
             flood_threshold_rps,
             flood_strict_rps,
             header_timeout_s,
+            downstream_idle_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs,
@@ -379,7 +394,7 @@ impl ProxyConfig {
                 .push(backend_id);
         }
 
-        let mut routes_by_host: HashMap<String, Vec<Arc<RouteEntry>>> = HashMap::new();
+        let mut entries: Vec<Arc<RouteEntry>> = Vec::new();
 
         for route in routes {
             if !route.enabled {
@@ -584,40 +599,16 @@ impl ProxyConfig {
                 ip_denylist_nets: super::filters::compile_ip_patterns(&route.ip_denylist),
             });
 
-            routes_by_host
-                .entry(route.hostname.clone())
-                .or_default()
-                .push(Arc::clone(&entry));
-
-            // Index hostname aliases so they resolve to the same route entry
-            for alias in &route.hostname_aliases {
-                routes_by_host
-                    .entry(alias.clone())
-                    .or_default()
-                    .push(Arc::clone(&entry));
-            }
+            entries.push(entry);
         }
 
-        // Separate wildcard hostnames (*.example.com) from exact ones
-        let mut wildcard_routes: Vec<(String, Vec<Arc<RouteEntry>>)> = Vec::new();
-        let wildcard_keys: Vec<String> = routes_by_host
-            .keys()
-            .filter(|k| k.starts_with("*."))
-            .cloned()
-            .collect();
-        for key in wildcard_keys {
-            if let Some(entries) = routes_by_host.remove(&key) {
-                wildcard_routes.push((key, entries));
-            }
-        }
-
-        // Sort each host's routes by path_prefix length descending (longest prefix match first)
-        for entries in routes_by_host.values_mut() {
-            entries.sort_by_key(|e| std::cmp::Reverse(e.route.path_prefix.len()));
-        }
-        for (_, entries) in &mut wildcard_routes {
-            entries.sort_by_key(|e| std::cmp::Reverse(e.route.path_prefix.len()));
-        }
+        // Indexed under the hostname and every alias, wildcards apart,
+        // by the selection the automation plane also weighs a token's
+        // route against.
+        let HostIndex {
+            exact: routes_by_host,
+            wildcards: wildcard_routes,
+        } = HostIndex::new(entries, |entry| entry.route.as_ref());
 
         // Merge security presets: start with builtins, let custom override by name
         let mut presets = lorica_config::models::builtin_security_presets();
@@ -667,6 +658,7 @@ impl ProxyConfig {
             flood_threshold_rps,
             flood_strict_rps,
             header_timeout_s,
+            downstream_idle_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxies,
@@ -681,43 +673,18 @@ impl ProxyConfig {
         }
     }
 
-    /// Find a matching route entry for a given host and path.
-    /// Exact hostname match takes precedence over wildcard.
+    /// The route entry that serves `host` and `path`: an exact name
+    /// first, then the most specific wildcard, then the catch-all `_`,
+    /// the longest matching `path_prefix` at each level
+    /// ([`lorica_config::route_selection`]).
     pub fn find_route<'a>(&'a self, host: &str, path: &str) -> Option<&'a Arc<RouteEntry>> {
-        // 1. Exact hostname match (O(1))
-        if let Some(entries) = self.routes_by_host.get(host) {
-            if let Some(entry) = entries
-                .iter()
-                .find(|e| path.starts_with(&e.route.path_prefix))
-            {
-                return Some(entry);
-            }
-        }
-
-        // 2. Wildcard match (*.example.com matches foo.example.com)
-        for (pattern, entries) in &self.wildcard_routes {
-            let suffix = &pattern[1..]; // "*.example.com" -> ".example.com"
-            if host.ends_with(suffix) && host.len() > suffix.len() {
-                if let Some(entry) = entries
-                    .iter()
-                    .find(|e| path.starts_with(&e.route.path_prefix))
-                {
-                    return Some(entry);
-                }
-            }
-        }
-
-        // 3. Catch-all hostname "_" (last resort)
-        if let Some(entries) = self.routes_by_host.get("_") {
-            if let Some(entry) = entries
-                .iter()
-                .find(|e| path.starts_with(&e.route.path_prefix))
-            {
-                return Some(entry);
-            }
-        }
-
-        None
+        route_selection::select(
+            &self.routes_by_host,
+            &self.wildcard_routes,
+            host,
+            path,
+            |entry| entry.route.as_ref(),
+        )
     }
 }
 

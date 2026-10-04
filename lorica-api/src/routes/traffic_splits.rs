@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ApiError;
 
 /// Canary traffic split assigning a percent of traffic to a backend pool.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct TrafficSplitRequest {
     /// Human-readable split label (shown in dashboards).
     #[serde(default)]

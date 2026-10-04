@@ -133,6 +133,21 @@ pub fn handle() -> &'static MergedCrawlersHandle {
     HANDLE.get_or_init(|| MergedCrawlersHandle::new(build_merged(&[])))
 }
 
+/// Held by every test in this crate's unit-test binary that writes
+/// [`handle`], directly or through a reload commit.
+///
+/// The handle is one per process and the test harness runs tests on
+/// parallel threads, so a test that rebuilds the registry from its own
+/// store and then reads it back raced any other test whose reload
+/// rebuilt it from a store without that row in between.
+/// `ai_bot_reload_tests::rebuild_from_store_swaps_global_handle` failed
+/// that way whenever `cert_reload_commit_tests` committed a reload
+/// (`handle_config_reload_commit` calls
+/// `reload::apply_per_process_reload_state`, which rebuilds it) between
+/// its rebuild and its read.
+#[cfg(test)]
+pub(crate) static TEST_HANDLE_WRITERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn merged_from_builtin(verification: &Verification) -> MergedVerification {
     match verification {
         Verification::Rdns(suffixes) => {

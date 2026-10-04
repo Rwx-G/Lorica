@@ -684,8 +684,12 @@ pub struct Route {
     /// unlimited.
     #[serde(default)]
     pub max_connections: Option<u32>,
-    /// Slow-HTTP mitigation : close a connection that has not
-    /// finished its request headers within this many milliseconds.
+    /// Slow-HTTP mitigation: a request whose header took longer than
+    /// this many milliseconds to arrive, from its first byte to the end
+    /// of the header block, is answered 408 and never reaches a backend.
+    /// The route is only known once the header is complete, so this is
+    /// judged then; the global `header_timeout_s` is what cuts a header
+    /// that never completes. HTTP/1.x only. `0` disables it.
     #[serde(default = "default_slowloris_threshold_ms")]
     pub slowloris_threshold_ms: i32,
     /// Number of abusive requests over a sliding window before the

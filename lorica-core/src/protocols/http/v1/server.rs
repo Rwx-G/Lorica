@@ -28,7 +28,7 @@ use once_cell::sync::Lazy;
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use regex::bytes::Regex;
 use std::any::Any;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
@@ -66,6 +66,10 @@ pub struct HttpSession {
     keepalive_timeout: KeepaliveStatus,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
+    /// Lorica: bound on the whole request header, from its first byte.
+    header_timeout: Option<Duration>,
+    /// Lorica: how long the last request header took, first byte to complete.
+    header_read_duration: Option<Duration>,
     /// How long to wait to make downstream session reusable, if body needs to be drained.
     total_drain_timeout: Option<Duration>,
     /// A copy of the response that is already written to the client
@@ -122,6 +126,8 @@ impl HttpSession {
             request_header: None,
             read_timeout: Some(Duration::from_secs(60)),
             write_timeout: None,
+            header_timeout: None,
+            header_read_duration: None,
             total_drain_timeout: None,
             body_bytes_sent: 0,
             body_bytes_read: 0,
@@ -144,8 +150,14 @@ impl HttpSession {
         const MAX_ERR_BUF_LEN: usize = 2048;
 
         self.buf.clear();
+        self.header_read_duration = None;
         let mut buf = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
         let mut already_read: usize = 0;
+        // Lorica: the per-read timeouts below bound each gap between bytes,
+        // so a client trickling its header could hold the read forever.
+        // The header timeout bounds the whole header from its first byte;
+        // the wait before that byte belongs to the keepalive timeout.
+        let mut header_started: Option<Instant> = None;
         loop {
             if already_read > MAX_HEADER_SIZE {
                 /* NOTE: this check only blocks second read. The first large read is allowed
@@ -157,8 +169,17 @@ impl HttpSession {
                 );
             }
 
+            let header_remaining = header_started
+                .zip(self.header_timeout)
+                .map(|(started, limit)| limit.saturating_sub(started.elapsed()));
+            let read_event = self.underlying_stream.read_buf(&mut buf);
+            let read_event = async move {
+                match header_remaining {
+                    Some(remaining) => timeout(remaining, read_event).await.ok(),
+                    None => Some(read_event.await),
+                }
+            };
             let read_result = {
-                let read_event = self.underlying_stream.read_buf(&mut buf);
                 match self.keepalive_timeout {
                     KeepaliveStatus::Timeout(d) => match timeout(d, read_event).await {
                         Ok(res) => res,
@@ -182,6 +203,14 @@ impl HttpSession {
                         None => read_event.await,
                     },
                 }
+            };
+            let Some(read_result) = read_result else {
+                let limit = self.header_timeout.unwrap_or_default();
+                debug!("request header timeout {limit:?} reached after {already_read} bytes");
+                return Error::e_explain(
+                    ReadTimedout,
+                    format!("request header not complete within {limit:?}"),
+                );
             };
             let n = match read_result {
                 Ok(n_read) => {
@@ -212,6 +241,7 @@ impl HttpSession {
                 }
             };
             already_read += n;
+            header_started.get_or_insert_with(Instant::now);
 
             // Use loop as GOTO to retry escaped request buffer, not a real loop
             loop {
@@ -282,6 +312,7 @@ impl HttpSession {
 
                         self.buf = buf;
                         self.request_header = Some(request_header);
+                        self.header_read_duration = header_started.map(|started| started.elapsed());
 
                         self.body_reader.reinit();
                         self.response_written = None;
@@ -1019,6 +1050,22 @@ impl HttpSession {
     /// Gets the downstream read timeout.
     pub fn get_read_timeout(&self) -> Option<Duration> {
         self.read_timeout
+    }
+
+    /// Bounds the whole request header, from the first byte received for it
+    /// to the end of the header block. Past it, [`Self::read_request()`]
+    /// fails with `ReadTimedout`. The per-read keepalive and read timeouts
+    /// keep bounding each gap between bytes, and the wait before the first
+    /// byte. `None` (the default) leaves the header bounded per gap only.
+    pub fn set_header_timeout(&mut self, timeout: Option<Duration>) {
+        self.header_timeout = timeout;
+    }
+
+    /// How long the last request header took to arrive, from its first byte
+    /// to the end of the header block. `None` until [`Self::read_request()`]
+    /// has read a complete header.
+    pub fn header_read_duration(&self) -> Option<Duration> {
+        self.header_read_duration
     }
 
     /// Sets the downstream write timeout. This will trigger if we're unable
@@ -3086,5 +3133,89 @@ Transfer-Encoding: chunked\r\n\
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         let err = http_stream.read_request().await.unwrap_err();
         assert!(err.to_string().contains("Transfer-Encoding"));
+    }
+}
+
+// Lorica: the request-header timeout bounds the whole header, not each
+// gap between its bytes. Real time, short windows: the read path uses the
+// fast timer wheel, which a paused tokio clock does not drive.
+#[cfg(test)]
+mod test_header_timeout {
+    use super::*;
+    use tokio_test::io::Builder;
+
+    const FOREVER: Duration = Duration::from_secs(600);
+    const GAP: Duration = Duration::from_millis(150);
+
+    /// A header sent in pieces `GAP` apart, each gap far inside the
+    /// keepalive timeout. `complete` decides whether it ever ends.
+    fn trickled_header(complete: bool) -> Box<tokio_test::io::Mock> {
+        let mut builder = Builder::new();
+        builder
+            .read(b"GET / HTTP/1.1\r\n")
+            .wait(GAP)
+            .read(b"Host: a.example\r\n")
+            .wait(GAP)
+            .read(b"X-One: 1\r\n")
+            .wait(GAP)
+            .read(b"X-Two: 2\r\n");
+        if complete {
+            builder.read(b"\r\n");
+        } else {
+            builder.wait(FOREVER);
+        }
+        Box::new(builder.build())
+    }
+
+    fn session(stream: Box<tokio_test::io::Mock>, header_timeout: Option<Duration>) -> HttpSession {
+        let mut session = HttpSession::new(stream);
+        session.set_keepalive(Some(60));
+        session.set_header_timeout(header_timeout);
+        session
+    }
+
+    #[tokio::test]
+    async fn a_trickled_header_is_cut_once_the_header_timeout_elapses() {
+        // Past the last piece (at 3 * GAP), so every piece is read and the
+        // header is cut while it waits, unfinished, for more.
+        let limit = Duration::from_millis(500);
+        let mut session = session(trickled_header(false), Some(limit));
+        let started = Instant::now();
+        let res = tokio::time::timeout(Duration::from_secs(5), session.read_request())
+            .await
+            .expect("the header timeout never fired");
+        let elapsed = started.elapsed();
+        assert_eq!(res.unwrap_err().etype(), &ReadTimedout);
+        assert!(elapsed >= limit, "cut before the timeout: {elapsed:?}");
+        assert!(elapsed < 3 * GAP + limit, "cut late: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_header_inside_the_timeout_is_read_and_timed() {
+        let mut session = session(trickled_header(true), Some(Duration::from_secs(2)));
+        assert!(session.read_request().await.unwrap().is_some());
+        let took = session.header_read_duration().expect("a header was read");
+        assert!(took >= 3 * GAP, "the duration missed the gaps: {took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn the_wait_before_the_first_byte_is_not_part_of_the_header() {
+        let stream = Builder::new()
+            .wait(Duration::from_millis(400))
+            .read(b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n")
+            .build();
+        let mut session = session(Box::new(stream), Some(Duration::from_millis(200)));
+        assert!(session.read_request().await.unwrap().is_some());
+        let took = session.header_read_duration().expect("a header was read");
+        assert!(took < Duration::from_millis(200), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn without_a_header_timeout_only_the_gaps_are_bounded() {
+        // Nothing bounds the header as a whole: the built-in behaviour.
+        let mut session = session(trickled_header(true), None);
+        assert!(session.read_request().await.unwrap().is_some());
+        assert!(session.header_read_duration().unwrap() >= 3 * GAP);
     }
 }

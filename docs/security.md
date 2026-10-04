@@ -3,10 +3,10 @@
 ## Threat Model
 
 The threat model lives in [docs/security/threat-model.md](security/threat-model.md):
-assets, trust boundaries, and the threat categories T1 to T8 with one
+assets, trust boundaries, and the threat categories T1 to T9 with one
 mitigation table each (network, application, management API, data at rest,
 supply chain, cluster plane, operational, automation plane and request
-capture), followed by the residual risks. It is one document rather than a
+capture, and the management MCP server), followed by the residual risks. It is one document rather than a
 summary here and a copy there, because the copy that used to sit in this
 section stopped being true two releases before anyone noticed.
 
@@ -259,6 +259,19 @@ not valid UTF-8, so it was already passing uninspected before this
 change. Decompressing before inspection needs a decompression-bomb
 budget of its own and is backlog, not shipped.
 
+**What the backend sees (v1.9.0).** In Blocking mode an inspectable
+body is held: Lorica reads it to its end, at most the scan window,
+scans it, and only then opens the backend connection and sends it. A
+refused body costs the backend nothing, not a byte and not a
+connection, and its mirror copy is not sent either; a clean body
+arrives byte for byte. A client sending `Expect: 100-continue` gets its
+`100 Continue` from Lorica, and the upstream request carries no
+`Expect`. The cost is latency: the backend connect and the body write
+no longer overlap with the client's upload. Detection mode and bodies
+the WAF does not inspect stream as before. If the node-wide scan budget
+refuses a body mid-read, the bytes read so far are forwarded and the
+rest streams unscanned, the fail-open path the budget always had.
+
 **The caps and how they interact.** Two ceilings apply to a request
 body, and only one of them moved:
 
@@ -317,9 +330,25 @@ round-trip through a fronting reverse proxy instead of being silently
 dropped. Operators who terminate TLS at Lorica with their own
 certificate set `management_cert_pem_path` + `management_key_pem_path`;
 when both point at readable files the self-signed material is ignored.
-Clients reach the API over `https://`; the bundled `lorica` CLI uses
-`https://127.0.0.1` and accepts the self-signed certificate, since the
-target is always loopback (no MITM surface to defend).
+Clients reach the API over `https://`. The bundled `lorica` CLI uses
+`https://127.0.0.1` and does not take loopback as proof of identity:
+the management port is unprivileged, so any local user can bind it
+while Lorica is stopped or restarting. Each time the management
+listener starts it records the certificate it serves, self-signed or
+the operator's, at `<data-dir>/management/served-cert.pem`, and every
+CLI command that logs in pins that exact leaf and sends nothing, the
+password included, to a peer that presents anything else. The CLI must
+therefore run as root or as the `lorica` user, who can read the
+`0700` directory. The pin is the CLI's alone: a browser that accepts a
+certificate warning on the dashboard is outside what it protects, since
+a squatter's self-signed certificate raises the same warning as the
+node's own. Compare the fingerprint of `served-cert.pem` with the one
+the browser shows before accepting it (the hardening guide gives the
+command). When `management_cert_pem_path` names an operator pair, the
+pin is only as unique as that pair's key: a certificate whose key also
+lives on other machines, a wildcard or fleet-wide one, lets any holder
+of that key present the pinned leaf, so give the management listener a
+pair of its own.
 
 **`/metrics` authentication (on by default since v1.7.0).** The
 endpoint exposes the full backend topology and certificate inventory,

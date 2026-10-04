@@ -253,11 +253,20 @@ impl AutomationPrincipal {
                 .map(gitlab_environment_slug)
                 .unwrap_or_default()
         });
+        // `settings:write` is refused on an issuer entry at registration,
+        // and refused again here: no import, replication or migration
+        // that one day writes issuer rows without that check can hand
+        // every pipeline an entry matches a standing admin grant.
+        let scopes = issuer
+            .scopes
+            .into_iter()
+            .filter(|scope| *scope != AutomationScope::SettingsWrite)
+            .collect();
         Self {
             kind: OwnerKind::OidcProject,
             principal: claims.project_path,
             grant_id: issuer.id,
-            scopes: issuer.scopes,
+            scopes,
             allowed_hostnames: issuer.allowed_hostnames,
             allowed_backend_cidrs: issuer.allowed_backend_cidrs,
             max_ttl_seconds: issuer.max_ttl_seconds,
@@ -275,6 +284,21 @@ impl AutomationPrincipal {
     /// issuer entry's id.
     pub fn grant_id(&self) -> &str {
         &self.grant_id
+    }
+
+    /// The key this principal's budgets are counted under: the write
+    /// budget and the MCP invocation budget.
+    ///
+    /// A static token is its own key. An ID token is its issuer entry
+    /// AND its project: an entry whose bound claims match several
+    /// projects (`project_path = "acme/*"`) would otherwise put every
+    /// job of every one of them in one window, so one busy project
+    /// starved every other of its writes.
+    pub fn budget_key(&self) -> String {
+        match self.kind {
+            OwnerKind::StaticToken => self.grant_id.clone(),
+            OwnerKind::OidcProject => format!("{}|{}", self.grant_id, self.principal),
+        }
     }
 
     /// The principal as the owner an environment row records.
@@ -308,6 +332,18 @@ impl AutomationPrincipal {
         self.allowed_hostnames
             .iter()
             .any(|pattern| lorica_config::models::matches_one_label(pattern, hostname))
+    }
+
+    /// Whether this principal's grants mean anything: it carries a scope
+    /// a hostname or backend grant bounds.
+    ///
+    /// Typed absence makes the grants empty on every other credential,
+    /// except a row minted before that rule, which kept the grants the
+    /// old rule forced on it and which no path it reaches reads. Keying
+    /// on the scope rather than on the lists is what keeps such a row
+    /// behaving as it always has.
+    pub fn carries_grants(&self) -> bool {
+        self.scopes.iter().any(|scope| scope.is_grant_bounded())
     }
 }
 
@@ -616,5 +652,68 @@ mod tests {
         assert!(principal.allows_hostname("mr-1.review.example.com"));
         assert!(principal.pipeline.is_none());
         assert!(principal.required_environment_slug.is_none());
+        assert_eq!(principal.budget_key(), "0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn an_id_token_never_carries_settings_write_whatever_its_entry_holds() {
+        let now = Utc::now();
+        let verified = VerifiedIdToken {
+            issuer: OidcIssuer {
+                id: "issuer-1".to_string(),
+                issuer: "https://gitlab.example.com".to_string(),
+                audience: "lorica".to_string(),
+                jwks_url: "https://gitlab.example.com/oauth/discovery/keys".to_string(),
+                ca_pem: None,
+                bound_claims: std::collections::BTreeMap::new(),
+                allowed_hostnames: vec!["*.review.example.com".to_string()],
+                allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
+                max_ttl_seconds: 600,
+                // A row no registration check passed: what an import or
+                // a hand repair could store.
+                scopes: vec![
+                    AutomationScope::EnvironmentsWrite,
+                    AutomationScope::SettingsWrite,
+                ],
+                created_by: "admin".to_string(),
+                created_at: now,
+            },
+            claims: super::super::oidc::IdTokenClaims {
+                issuer: "https://gitlab.example.com".to_string(),
+                subject: None,
+                jti: "jti-1".to_string(),
+                expires_at: now + chrono::Duration::minutes(5),
+                project_path: "acme/web".to_string(),
+                environment: None,
+                pipeline: PipelineIdentity {
+                    project_path: "acme/web".to_string(),
+                    git_ref: None,
+                    pipeline_id: None,
+                    job_id: None,
+                    user_login: None,
+                },
+                bound: std::collections::BTreeMap::new(),
+            },
+        };
+        let principal = AutomationPrincipal::from_id_token(verified);
+        assert_eq!(principal.scopes, vec![AutomationScope::EnvironmentsWrite]);
+    }
+
+    #[test]
+    fn two_projects_under_one_issuer_entry_spend_two_budgets() {
+        let job = |project: &str| AutomationPrincipal {
+            kind: OwnerKind::OidcProject,
+            principal: project.to_string(),
+            grant_id: "issuer-1".to_string(),
+            scopes: vec![AutomationScope::EnvironmentsWrite],
+            allowed_hostnames: vec!["*.review.example.com".to_string()],
+            allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
+            max_ttl_seconds: 600,
+            pipeline: None,
+            required_environment_slug: None,
+        };
+        assert_ne!(job("acme/web").budget_key(), job("acme/api").budget_key());
+        assert_eq!(job("acme/web").budget_key(), job("acme/web").budget_key());
+        assert!(job("acme/web").budget_key().starts_with("issuer-1"));
     }
 }

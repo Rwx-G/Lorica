@@ -191,17 +191,60 @@ async fn get_ewma_score_async(state: &crate::server::AppState, addr: &str) -> f6
     0.0
 }
 
+/// Every worker's EWMA scores and connection counts, merged once.
+///
+/// The per-backend lookups above each rebuild one of these maps from
+/// every worker's own map, so a listing of `B` backends used to run the
+/// merge `2B` times over the same data, behind `2B` sequential
+/// acquisitions of the worker-metrics lock. Built once and read `B`
+/// times instead. Empty in single-process mode, where the direct
+/// counters answer and no merge is needed.
+struct MergedWorkerMetrics {
+    ewma: std::collections::HashMap<String, f64>,
+    connections: std::collections::HashMap<String, u64>,
+}
+
+impl MergedWorkerMetrics {
+    async fn collect(state: &AppState) -> Self {
+        match state.aggregated_metrics() {
+            Some(agg) => Self {
+                ewma: agg.merged_ewma_scores().await,
+                connections: agg.merged_backend_connections().await,
+            },
+            None => Self {
+                ewma: std::collections::HashMap::new(),
+                connections: std::collections::HashMap::new(),
+            },
+        }
+    }
+}
+
 /// GET /api/v1/backends - list every backend with its live EWMA score and active connection count.
 pub async fn list_backends(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let backends = db_blocking(&state.store, move |store| store.list_backends()).await?;
-    let mut responses = Vec::with_capacity(backends.len());
-    for b in &backends {
-        let score = get_ewma_score_async(&state, &b.address).await;
-        let conns = get_backend_connections_async(&state, &b.address).await;
-        responses.push(backend_to_response(b, score, conns));
-    }
+    let merged = MergedWorkerMetrics::collect(&state).await;
+    let responses: Vec<BackendResponse> = backends
+        .iter()
+        .map(|b| {
+            // Same precedence as the single-backend lookups: the direct
+            // counters when this process owns them, the supervisor's
+            // merged view otherwise, zero when neither knows the
+            // address.
+            let score = state
+                .ewma_scores()
+                .and_then(|scores| scores.get(&b.address).map(|s| *s))
+                .or_else(|| merged.ewma.get(&b.address).copied())
+                .unwrap_or(0.0);
+            let conns = state
+                .backend_connections()
+                .map(|bc| bc.get(&b.address) as i32)
+                .or_else(|| merged.connections.get(&b.address).map(|c| *c as i32))
+                .unwrap_or(0);
+            backend_to_response(b, score, conns)
+        })
+        .collect();
     Ok(json_data(serde_json::json!({ "backends": responses })))
 }
 
@@ -212,6 +255,33 @@ pub async fn create_backend(
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
     Json(body): Json<CreateBackendRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    create_backend_as(
+        &state,
+        &audit_ctx,
+        body,
+        crate::preview::WriteMode::Apply,
+        crate::target::BackendGuard::unbounded(),
+    )
+    .await
+}
+
+/// The whole of [`create_backend`] as `actor`: the validation, the
+/// row, the reload signal and the `backend.create` audit row.
+///
+/// Split from the handler so the automation plane (Story 11.2) can run
+/// exactly this with a token as the actor rather than a session; see
+/// `crate::routes::crud::create_route_as` for the rule, and for what
+/// [`crate::preview::WriteMode::Preview`] answers instead of the row.
+/// `guard` sees the row about to be inserted with no row before it, in
+/// the store closure that inserts it, the preview included.
+pub(crate) async fn create_backend_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    body: CreateBackendRequest,
+    mode: crate::preview::WriteMode,
+    guard: crate::target::BackendGuard,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     if body.address.is_empty() {
@@ -250,18 +320,38 @@ pub async fn create_backend(
     };
 
     let backend = db_blocking(&state.store, move |store| {
-        store.create_backend(&backend)?;
+        let mut backend = backend;
+        guard.restore_withheld(None, &mut backend)?;
+        guard.check(
+            store,
+            crate::target::BackendTarget {
+                before: None,
+                after: Some(&backend),
+            },
+        )?;
+        if !mode.previews() {
+            store.create_backend(&backend)?;
+        }
         Ok::<_, ApiError>(backend)
     })
     .await?;
+    if mode.previews() {
+        return Ok((
+            StatusCode::OK,
+            crate::preview::previewed(
+                "create",
+                None,
+                serde_json::to_value(backend_to_response(&backend, 0.0, 0)).ok(),
+            ),
+        ));
+    }
     state.notify_config_changed();
 
     let response = backend_to_response(&backend, 0.0, 0);
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let after = serde_json::to_value(&response).ok();
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "backend.create",
         ("backend", &backend.id),
         None,
@@ -297,11 +387,45 @@ pub async fn update_backend(
     Path(id): Path<String>,
     Json(body): Json<UpdateBackendRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    update_backend_as(
+        &state,
+        &audit_ctx,
+        id,
+        body,
+        crate::preview::WriteMode::Apply,
+        crate::target::BackendGuard::unbounded(),
+    )
+    .await
+}
+
+/// The whole of [`update_backend`] as `actor`; see
+/// [`create_backend_as`] for why the split exists and what `guard` is.
+/// The managed-row refusal (409) runs here, so it holds on every plane
+/// that reaches this function. The guard runs under the lock on the
+/// row as read, before that refusal so a caller outside the grant
+/// learns nothing from it, and again on the row as it would be
+/// written.
+pub(crate) async fn update_backend_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    id: String,
+    body: UpdateBackendRequest,
+    mode: crate::preview::WriteMode,
+    guard: crate::target::BackendGuard,
+) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
     let (before_backend, backend) = db_blocking(&state.store, move |store| {
         let mut backend = store
             .get_backend(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        guard.check(
+            store,
+            crate::target::BackendTarget {
+                before: Some(&backend),
+                after: None,
+            },
+        )?;
         if let Some(managed_by) = &backend.managed_by {
             return Err(managed_row_conflict(
                 "update",
@@ -353,21 +477,38 @@ pub async fn update_backend(
             backend.h2_upstream = h2;
         }
         backend.updated_at = Utc::now();
+        guard.restore_withheld(Some(&before_backend), &mut backend)?;
+        guard.check(
+            store,
+            crate::target::BackendTarget {
+                before: Some(&before_backend),
+                after: Some(&backend),
+            },
+        )?;
 
+        if mode.previews() {
+            return Ok::<_, ApiError>((before_backend, backend));
+        }
         store.update_backend(&backend)?;
         Ok::<_, ApiError>((before_backend, backend))
     })
     .await?;
+    if mode.previews() {
+        return Ok(crate::preview::previewed(
+            "update",
+            serde_json::to_value(backend_to_response(&before_backend, 0.0, 0)).ok(),
+            serde_json::to_value(backend_to_response(&backend, 0.0, 0)).ok(),
+        ));
+    }
     state.notify_config_changed();
-    let score = get_ewma_score_async(&state, &backend.address).await;
-    let conns = get_backend_connections_async(&state, &backend.address).await;
+    let score = get_ewma_score_async(state, &backend.address).await;
+    let conns = get_backend_connections_async(state, &backend.address).await;
 
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let before = serde_json::to_value(&before_backend).ok();
     let after = serde_json::to_value(&backend).ok();
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "backend.update",
         ("backend", &backend.id),
         before.as_ref(),
@@ -391,11 +532,45 @@ pub async fn delete_backend(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    delete_backend_as(
+        &state,
+        &audit_ctx,
+        id,
+        crate::preview::WriteMode::Apply,
+        crate::target::BackendGuard::unbounded(),
+    )
+    .await
+}
+
+/// The whole of [`delete_backend`] as `actor`, the drain included; see
+/// [`create_backend_as`] for why the split exists and what `guard` is.
+/// The guard runs under the lock on the row as read.
+///
+/// In [`crate::preview::WriteMode::Preview`] it answers what the apply
+/// would do to the row, and does neither: for a backend in normal
+/// service, the row marked closing, since the apply drains it and the
+/// row stays until the drain ends; for one already closing or closed,
+/// no `after`, since the apply removes it at once.
+pub(crate) async fn delete_backend_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    id: String,
+    mode: crate::preview::WriteMode,
+    guard: crate::target::BackendGuard,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let id_db = id.clone();
     let (backend, force_deleted) = db_blocking(&state.store, move |store| {
         let mut backend = store
             .get_backend(&id_db)?
             .ok_or_else(|| ApiError::NotFound(format!("backend {id_db}")))?;
+        guard.check(
+            store,
+            crate::target::BackendTarget {
+                before: Some(&backend),
+                after: None,
+            },
+        )?;
         // Removing one backend from an environment's set is an edit of
         // that set, which only the pipeline owns. Whole-environment
         // removal goes through the route (its delete cascades) or the
@@ -408,9 +583,14 @@ pub async fn delete_backend(
                 "Delete the environment, or update it through the pipeline, instead.",
             ));
         }
-
-        // If already closing/closed, force delete immediately
-        if backend.lifecycle_state != lorica_config::models::LifecycleState::Normal {
+        // A backend already closing or closed goes at once; one in
+        // normal service is marked closing and drained first.
+        let force_deleted =
+            backend.lifecycle_state != lorica_config::models::LifecycleState::Normal;
+        if mode.previews() {
+            return Ok((backend, force_deleted));
+        }
+        if force_deleted {
             store.delete_backend(&id_db)?;
             return Ok((backend, true));
         }
@@ -422,13 +602,24 @@ pub async fn delete_backend(
         Ok::<_, ApiError>((backend, false))
     })
     .await?;
+    if mode.previews() {
+        let after = (!force_deleted).then(|| {
+            let mut closing = backend.clone();
+            closing.lifecycle_state = lorica_config::models::LifecycleState::Closing;
+            serde_json::to_value(backend_to_response(&closing, 0.0, 0)).ok()
+        });
+        return Ok(crate::preview::previewed(
+            "delete",
+            serde_json::to_value(backend_to_response(&backend, 0.0, 0)).ok(),
+            after.flatten(),
+        ));
+    }
     state.notify_config_changed();
 
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let before = serde_json::to_value(&backend).ok();
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "backend.delete",
         ("backend", &backend.id),
         before.as_ref(),

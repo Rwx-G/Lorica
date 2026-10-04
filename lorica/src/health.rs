@@ -93,10 +93,27 @@ impl ProbeResult {
     }
 }
 
+/// The pause before the next health-loop cycle: the stored
+/// `default_health_check_interval_s`, re-read every cycle so a change
+/// acts from the next one without a restart, or `fallback` when the
+/// store cannot be read. Never below five seconds.
+async fn next_interval(store: &Mutex<ConfigStore>, fallback: u64) -> Duration {
+    let stored = store
+        .lock()
+        .await
+        .get_global_settings()
+        .map(|settings| u64::try_from(settings.default_health_check_interval_s).unwrap_or(fallback))
+        .unwrap_or(fallback);
+    Duration::from_secs(stored.max(5))
+}
+
 /// Run TCP health checks and backend drain monitoring in a loop.
 ///
 /// - Health checks: probe each backend, update status (Healthy/Degraded/Down)
 /// - Drain checks: transition Closing backends to Closed when connections reach 0 or timeout expires
+///
+/// `default_interval_s` is the pause used when the store cannot be
+/// read; otherwise every cycle waits the interval stored at its start.
 pub async fn health_check_loop(
     store: Arc<Mutex<ConfigStore>>,
     proxy_config: Arc<ArcSwap<ProxyConfig>>,
@@ -105,7 +122,6 @@ pub async fn health_check_loop(
     alert_sender: Option<lorica_notify::AlertSender>,
     config_reload_tx: Option<tokio::sync::broadcast::Sender<u64>>,
 ) {
-    let interval = Duration::from_secs(default_interval_s.max(5));
     // Track when each backend entered Closing state for drain timeout
     let mut drain_start: HashMap<String, Instant> = HashMap::new();
     // Track an in-progress health-status flip per backend (candidate status +
@@ -114,7 +130,7 @@ pub async fn health_check_loop(
     let mut pending_health: HashMap<String, (HealthStatus, u32)> = HashMap::new();
 
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(next_interval(&store, default_interval_s).await).await;
 
         let backends = {
             let store = store.lock().await;
@@ -450,6 +466,26 @@ mod tests {
             HealthStatus::Degraded
         );
         assert_eq!(ProbeResult::Down.to_health_status(), HealthStatus::Down);
+    }
+
+    #[tokio::test]
+    async fn the_interval_is_read_from_the_store_every_cycle_and_never_below_five_seconds() {
+        let store = Mutex::new(ConfigStore::open_in_memory().expect("in-memory store"));
+        let mut settings = store.lock().await.get_global_settings().expect("settings");
+        settings.default_health_check_interval_s = 30;
+        store
+            .lock()
+            .await
+            .update_global_settings(&settings)
+            .expect("stored");
+        assert_eq!(next_interval(&store, 10).await, Duration::from_secs(30));
+        settings.default_health_check_interval_s = 1;
+        store
+            .lock()
+            .await
+            .update_global_settings(&settings)
+            .expect("stored");
+        assert_eq!(next_interval(&store, 10).await, Duration::from_secs(5));
     }
 
     #[tokio::test]

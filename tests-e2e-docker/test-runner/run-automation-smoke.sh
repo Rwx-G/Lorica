@@ -884,8 +884,23 @@ auto_call GET /automation/v1/whoami "$(fixture_mint "{\"claims\":{\"iat\":$((NOW
 [ "$AUTO_CODE" = "401" ] && ok "an expired token is 401" || fail "an expired token answered $AUTO_CODE"
 assert_unauth_reason "expired" "the expiry is named in the audit row"
 
-TAMPERED="${ID_TOKEN%?}A"
-[ "$TAMPERED" = "$ID_TOKEN" ] && TAMPERED="${ID_TOKEN%?}B"
+# Damage the FIRST character of the signature, never the last one.
+# An RS256 signature is 256 bytes, which base64url-encodes to 342
+# characters: 2052 bits of alphabet for 2048 bits of payload. The last
+# character therefore carries two significant bits and four padding
+# bits that must be zero, so its only legal values are A, Q, g and w.
+# Substituting `A` there is canonical and lands on `bad_signature` as
+# intended, but a signature already ending in `A` took the `B` branch,
+# whose padding bits are not zero: the decoder rejected the segment as
+# malformed before any verification happened, and the audit reason was
+# `malformed`. One signature in four ends in `A`, so this assertion
+# failed a quarter of the time. The first character carries six
+# significant bits, so any substitution there stays canonical.
+SIG_TAIL="${ID_TOKEN##*.}"
+case "$SIG_TAIL" in
+    A*) TAMPERED="${ID_TOKEN%.*}.B${SIG_TAIL#?}" ;;
+    *)  TAMPERED="${ID_TOKEN%.*}.A${SIG_TAIL#?}" ;;
+esac
 auto_call GET /automation/v1/whoami "$TAMPERED"
 [ "$AUTO_CODE" = "401" ] && ok "a token with a damaged signature is 401" || fail "a damaged signature answered $AUTO_CODE"
 assert_unauth_reason "bad_signature" "the bad signature is named in the audit row"

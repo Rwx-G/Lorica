@@ -922,6 +922,12 @@ export interface GlobalSettingsResponse {
   cert_critical_days: number;
   max_global_connections: number;
   flood_threshold_rps: number;
+  // Per-IP admission rate in flood mode; 0 = auto (half the threshold).
+  flood_strict_rps: number;
+  // Global header-phase read timeout (s), 1 to 3600; never 0.
+  header_timeout_s: number;
+  // Downstream idle timeout (s), HTTP/1.1 keepalive and HTTP/2. Default 75; never 0.
+  downstream_idle_timeout_s: number;
   waf_ban_threshold: number;
   waf_ban_duration_s: number;
   // Process-wide ceiling on the bytes the WAF holds in body-scan
@@ -932,6 +938,12 @@ export interface GlobalSettingsResponse {
   sla_purge_enabled: boolean;
   sla_purge_retention_days: number;
   sla_purge_schedule: string;
+  // Synthetic probe cap and the load-test ceilings above which a run
+  // asks for confirmation (backlog #89).
+  max_active_probes: number;
+  loadtest_max_concurrency: number;
+  loadtest_max_duration_s: number;
+  loadtest_max_rps: number;
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies: string[];
   waf_whitelist_ips: string[];
@@ -1000,6 +1012,9 @@ export interface UpdateSettingsRequest {
   cert_critical_days?: number;
   max_global_connections?: number;
   flood_threshold_rps?: number;
+  flood_strict_rps?: number;
+  header_timeout_s?: number;
+  downstream_idle_timeout_s?: number;
   waf_ban_threshold?: number;
   waf_ban_duration_s?: number;
   waf_body_scan_max_inflight_bytes?: number;
@@ -1008,6 +1023,10 @@ export interface UpdateSettingsRequest {
   sla_purge_enabled?: boolean;
   sla_purge_retention_days?: number;
   sla_purge_schedule?: string;
+  max_active_probes?: number;
+  loadtest_max_concurrency?: number;
+  loadtest_max_duration_s?: number;
+  loadtest_max_rps?: number;
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies?: string[];
   waf_whitelist_ips?: string[];
@@ -1028,9 +1047,10 @@ export interface UpdateSettingsRequest {
   cert_export_group_gid?: number | null;
   cert_export_file_mode?: number;
   cert_export_dir_mode?: number;
-  // Defense-in-depth data-plane bounds (Story 8.9).
+  // Defense-in-depth data-plane bounds (Story 8.9). The per-IP cap is
+  // lifted by 0; a null leaves it as stored.
   audit_log_retention_days?: number;
-  connection_limits_per_ip?: number | null;
+  connection_limits_per_ip?: number;
   bot_stash_max_entries?: number;
   bot_stash_per_prefix_max?: number;
   mirror_max_concurrent_per_route?: number;
@@ -1997,12 +2017,31 @@ export const api = {
     request<AutomationTokenResponse>('DELETE', `/automation/tokens/${encodeURIComponent(publicId)}`),
 };
 
-/** The closed scope enum an automation token carries (Story 10.3). */
+/**
+ * The closed scope enum an automation token carries (Story 10.3, widened
+ * by the read tier of the management MCP server).
+ *
+ * Owned by `AutomationScope` in Rust. This union is not the guard: the
+ * guard is that `automation-scopes.generated.ts` is typed as an array of
+ * this union AND diffed against the Rust enum by
+ * `lorica-api/tests/automation_scope_fixture.rs`, so a scope missing
+ * here makes that file fail `npm run check` and a scope missing there
+ * fails `cargo test`.
+ */
 export type AutomationScope =
   | 'environments:write'
   | 'environments:read'
   | 'routes:read'
-  | 'certificates:read';
+  | 'certificates:read'
+  | 'logs:read'
+  | 'waf:read'
+  | 'sla:read'
+  | 'cluster:read'
+  | 'backends:read'
+  | 'routes:write'
+  | 'backends:write'
+  | 'certificates:write'
+  | 'settings:write';
 
 /**
  * One automation token as the API renders it. There is no field for
@@ -2022,11 +2061,15 @@ export interface AutomationTokenResponse {
   revoked_at: string | null;
 }
 
-/** Body of `POST /api/v1/automation/tokens`. */
+/**
+ * Body of `POST /api/v1/automation/tokens`. The two grants are sent when
+ * a scope in `GRANT_BOUNDED_SCOPES` is, and omitted otherwise: the node
+ * requires them in the first case and refuses them in the second.
+ */
 export interface CreateAutomationTokenRequest {
   name: string;
   scopes: AutomationScope[];
-  allowed_hostnames: string[];
+  allowed_hostnames?: string[];
   allowed_backend_cidrs?: string[];
   max_ttl_seconds?: number;
   /** Mutually exclusive with `expires_at`, which the UI does not send. */

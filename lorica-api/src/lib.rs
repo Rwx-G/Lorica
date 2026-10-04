@@ -1,6 +1,10 @@
 #![deny(clippy::all)]
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
+// `settings::settings_schema` is one `serde_json::json!` literal, one
+// entry per setting, and the macro recurses once per token tree: past
+// the default limit of 128 adding a setting stops the crate compiling.
+#![recursion_limit = "256"]
 
 //! REST management API for the Lorica reverse proxy.
 //!
@@ -42,6 +46,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod oidc_issuers;
 pub mod password_policy;
+pub mod preview;
 pub mod probes;
 pub mod routes;
 /// Axum router + shared `AppState` construction.
@@ -50,6 +55,7 @@ pub mod settings;
 pub mod sla;
 pub mod status;
 pub mod system;
+pub mod target;
 /// Hot binary-upgrade verification + staging (Story 8.4).
 pub mod upgrade;
 pub mod users;

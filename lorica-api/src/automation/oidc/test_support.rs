@@ -199,6 +199,16 @@ impl MockIssuer {
         })
     }
 
+    /// An issuer publishing `jwks` exactly as given, for a test that
+    /// shapes a key's members itself.
+    pub(crate) fn serving_jwks(jwks: Vec<serde_json::Value>) -> Arc<Self> {
+        Arc::new(Self {
+            keys: Mutex::new(jwks),
+            fetches: AtomicUsize::new(0),
+            failing: AtomicBool::new(false),
+        })
+    }
+
     /// Replace the published key set.
     pub(crate) fn rotate_to(&self, keys: &[&TestKey]) {
         *self.keys.lock() = keys.iter().map(|key| key.jwk()).collect();

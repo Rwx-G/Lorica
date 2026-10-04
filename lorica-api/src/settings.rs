@@ -23,16 +23,33 @@ use crate::server::AppState;
 const HEALTH_MAX_CONCURRENT_PROBES_MIN: i32 = 1;
 const HEALTH_MAX_CONCURRENT_PROBES_MAX: i32 = 512;
 const DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN: i32 = 1;
+// The dashboard's own form cap. Above it a stored value slept the
+// health loop, which also completes drains, for as long as it said:
+// `i32::MAX` stopped failover for decades.
+const DEFAULT_HEALTH_CHECK_INTERVAL_S_MAX: i32 = 3600;
 const CERT_WARNING_DAYS_MIN: i32 = 1;
 const CERT_CRITICAL_DAYS_MIN: i32 = 1;
 const MAX_GLOBAL_CONNECTIONS_MIN: i32 = 0;
 const FLOOD_THRESHOLD_RPS_MIN: i32 = 0;
 const FLOOD_STRICT_RPS_MIN: u32 = 0;
 const FLOOD_STRICT_RPS_MAX: u32 = 10_000_000;
-const HEADER_TIMEOUT_S_MIN: u32 = 0;
-const HEADER_TIMEOUT_S_MAX: u32 = 3600;
+// No 0, for the reason `downstream_idle_timeout_s` has none: with the
+// global bound off, a client trickling its header is cut by nothing, since
+// the per-route threshold is judged only once the header is complete.
+const HEADER_TIMEOUT_S_MIN: u32 = 1;
+const HEADER_TIMEOUT_S_MAX: u32 = lorica_config::models::MAX_HEADER_TIMEOUT_S;
+// Backlog #82. No 0: an idle connection the proxy never closes is the
+// defect the setting exists to remove, so "no limit" is not a value.
+// The ceiling matches the header timeout's: past an hour an idle
+// keepalive saves no handshake anyone notices.
+const DOWNSTREAM_IDLE_TIMEOUT_S_MIN: u32 = 1;
+const DOWNSTREAM_IDLE_TIMEOUT_S_MAX: u32 = 3600;
 const WAF_BAN_THRESHOLD_MIN: i32 = 0;
 const WAF_BAN_DURATION_S_MIN: i32 = 0;
+// Thirty days. Each ban copies the duration when it is issued, so
+// reverting the setting shortens no ban already standing: without a
+// ceiling one WAF false positive banned an address for 68 years.
+const WAF_BAN_DURATION_S_MAX: i32 = 2_592_000;
 const ACCESS_LOG_RETENTION_MIN: i64 = 0;
 const WAF_EVENT_RETENTION_MIN: i64 = 0;
 // Story 10.6 AC #7. The budget is a byte ceiling over every in-flight
@@ -47,6 +64,33 @@ const WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN: u64 = 1_048_576;
 const WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX: u64 = 17_179_869_184;
 const SLA_PURGE_RETENTION_DAYS_MIN: i32 = 1;
 const SLA_PURGE_RETENTION_DAYS_MAX: i32 = 3650;
+// Backlog #89. The probe cap bounds how many synthetic probes run at
+// once; below 1 every probe would silently stop. The load-test ceilings
+// are not hard limits: a run above one asks for confirmation, so the
+// bounds only keep the numbers meaningful (a day-long run, a million
+// requests a second).
+const MAX_ACTIVE_PROBES_MIN: i32 = 1;
+const MAX_ACTIVE_PROBES_MAX: i32 = 10_000;
+const LOADTEST_MAX_CONCURRENCY_MIN: i32 = 1;
+const LOADTEST_MAX_CONCURRENCY_MAX: i32 = 10_000;
+const LOADTEST_MAX_DURATION_S_MIN: i32 = 1;
+const LOADTEST_MAX_DURATION_S_MAX: i32 = 86_400;
+const LOADTEST_MAX_RPS_MIN: i32 = 1;
+const LOADTEST_MAX_RPS_MAX: i32 = 1_000_000;
+// Story 8.9's defense-in-depth bounds. The dashboard's Network tab has
+// shown them since 1.6.0 while no request field carried them, so a save
+// there changed nothing. `0` keeps the audit trail forever and lifts the
+// per-IP connection cap; the stash and mirror caps have no "off".
+const AUDIT_LOG_RETENTION_DAYS_MIN: u32 = 0;
+const AUDIT_LOG_RETENTION_DAYS_MAX: u32 = 3650;
+const CONNECTION_LIMITS_PER_IP_MIN: u32 = 0;
+const CONNECTION_LIMITS_PER_IP_MAX: u32 = 1_000_000;
+const BOT_STASH_MAX_ENTRIES_MIN: u32 = 1;
+const BOT_STASH_MAX_ENTRIES_MAX: u32 = 10_000_000;
+const BOT_STASH_PER_PREFIX_MAX_MIN: u32 = 1;
+const BOT_STASH_PER_PREFIX_MAX_MAX: u32 = 1_000_000;
+const MIRROR_MAX_CONCURRENT_MIN: u32 = 1;
+const MIRROR_MAX_CONCURRENT_MAX: u32 = 1_000_000;
 const OTLP_SAMPLING_RATIO_MIN: f64 = 0.0;
 const OTLP_SAMPLING_RATIO_MAX: f64 = 1.0;
 const CERT_EXPORT_MODE_MAX: u32 = 0o777;
@@ -93,6 +137,7 @@ pub fn settings_schema() -> serde_json::Value {
         "default_health_check_interval_s": {
             "type": "integer",
             "min": DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN,
+            "max": DEFAULT_HEALTH_CHECK_INTERVAL_S_MAX,
             "default": d.default_health_check_interval_s,
         },
         "health_max_concurrent_probes": {
@@ -133,6 +178,72 @@ pub fn settings_schema() -> serde_json::Value {
             "max": HEADER_TIMEOUT_S_MAX,
             "default": d.header_timeout_s,
         },
+        "downstream_idle_timeout_s": {
+            "type": "integer",
+            "min": DOWNSTREAM_IDLE_TIMEOUT_S_MIN,
+            "max": DOWNSTREAM_IDLE_TIMEOUT_S_MAX,
+            "default": d.downstream_idle_timeout_s,
+        },
+        "max_active_probes": {
+            "type": "integer",
+            "min": MAX_ACTIVE_PROBES_MIN,
+            "max": MAX_ACTIVE_PROBES_MAX,
+            "default": d.max_active_probes,
+        },
+        "loadtest_max_concurrency": {
+            "type": "integer",
+            "min": LOADTEST_MAX_CONCURRENCY_MIN,
+            "max": LOADTEST_MAX_CONCURRENCY_MAX,
+            "default": d.loadtest_max_concurrency,
+        },
+        "loadtest_max_duration_s": {
+            "type": "integer",
+            "min": LOADTEST_MAX_DURATION_S_MIN,
+            "max": LOADTEST_MAX_DURATION_S_MAX,
+            "default": d.loadtest_max_duration_s,
+        },
+        "loadtest_max_rps": {
+            "type": "integer",
+            "min": LOADTEST_MAX_RPS_MIN,
+            "max": LOADTEST_MAX_RPS_MAX,
+            "default": d.loadtest_max_rps,
+        },
+        "audit_log_retention_days": {
+            "type": "integer",
+            "min": AUDIT_LOG_RETENTION_DAYS_MIN,
+            "max": AUDIT_LOG_RETENTION_DAYS_MAX,
+            "default": d.audit_log_retention_days,
+        },
+        "connection_limits_per_ip": {
+            "type": "integer",
+            "min": CONNECTION_LIMITS_PER_IP_MIN,
+            "max": CONNECTION_LIMITS_PER_IP_MAX,
+            "default": d.connection_limits_per_ip.unwrap_or(0),
+        },
+        "bot_stash_max_entries": {
+            "type": "integer",
+            "min": BOT_STASH_MAX_ENTRIES_MIN,
+            "max": BOT_STASH_MAX_ENTRIES_MAX,
+            "default": d.bot_stash_max_entries,
+        },
+        "bot_stash_per_prefix_max": {
+            "type": "integer",
+            "min": BOT_STASH_PER_PREFIX_MAX_MIN,
+            "max": BOT_STASH_PER_PREFIX_MAX_MAX,
+            "default": d.bot_stash_per_prefix_max,
+        },
+        "mirror_max_concurrent_per_route": {
+            "type": "integer",
+            "min": MIRROR_MAX_CONCURRENT_MIN,
+            "max": MIRROR_MAX_CONCURRENT_MAX,
+            "default": d.mirror_max_concurrent_per_route,
+        },
+        "mirror_max_concurrent_global": {
+            "type": "integer",
+            "min": MIRROR_MAX_CONCURRENT_MIN,
+            "max": MIRROR_MAX_CONCURRENT_MAX,
+            "default": d.mirror_max_concurrent_global,
+        },
         "waf_ban_threshold": {
             "type": "integer",
             "min": WAF_BAN_THRESHOLD_MIN,
@@ -141,6 +252,7 @@ pub fn settings_schema() -> serde_json::Value {
         "waf_ban_duration_s": {
             "type": "integer",
             "min": WAF_BAN_DURATION_S_MIN,
+            "max": WAF_BAN_DURATION_S_MAX,
             "default": d.waf_ban_duration_s,
         },
         "access_log_retention": {
@@ -302,7 +414,7 @@ fn withhold_sink_topology(settings: &mut lorica_config::models::GlobalSettings) 
 ///
 /// `bot_hmac_secret_hex` keeps its three-state contract (v1.5.1 audit
 /// H-1): empty = never initialised, sentinel = set but withheld.
-fn mask_settings_secrets(settings: &mut lorica_config::models::GlobalSettings) {
+pub(crate) fn mask_settings_secrets(settings: &mut lorica_config::models::GlobalSettings) {
     settings.bot_hmac_secret_hex = if settings.bot_hmac_secret_hex.is_empty() {
         String::new()
     } else {
@@ -356,6 +468,34 @@ pub struct UpdateSettingsRequest {
     pub flood_strict_rps: Option<u32>,
     /// Global header-phase read timeout in seconds (Story 8.10 AC #1).
     pub header_timeout_s: Option<u32>,
+    /// Downstream idle timeout in seconds, HTTP/1.1 keepalive and
+    /// HTTP/2 (backlog #82).
+    pub downstream_idle_timeout_s: Option<u32>,
+    /// Cap on concurrent synthetic probes (backlog #89).
+    pub max_active_probes: Option<i32>,
+    /// Load-test concurrency above which a run asks for confirmation
+    /// (backlog #89).
+    pub loadtest_max_concurrency: Option<i32>,
+    /// Load-test duration (s) above which a run asks for confirmation
+    /// (backlog #89).
+    pub loadtest_max_duration_s: Option<i32>,
+    /// Load-test request rate above which a run asks for confirmation
+    /// (backlog #89).
+    pub loadtest_max_rps: Option<i32>,
+    /// Days of audit-log history kept (Story 8.9 AC #9). `0` keeps it
+    /// forever.
+    pub audit_log_retention_days: Option<u32>,
+    /// Simultaneous connections allowed from one source IP, per worker
+    /// (Story 8.9 AC #5). `0` lifts the cap; absent leaves it as stored.
+    pub connection_limits_per_ip: Option<u32>,
+    /// Global cap on pending bot challenges (Story 8.9 AC #6).
+    pub bot_stash_max_entries: Option<u32>,
+    /// Per-prefix cap on pending bot challenges (Story 8.9 AC #6).
+    pub bot_stash_per_prefix_max: Option<u32>,
+    /// Per-route cap on in-flight mirror sub-requests (Story 8.9 AC #7).
+    pub mirror_max_concurrent_per_route: Option<u32>,
+    /// Global cap on in-flight mirror sub-requests (Story 8.9 AC #7).
+    pub mirror_max_concurrent_global: Option<u32>,
     /// Number of WAF blocks before auto-ban.
     pub waf_ban_threshold: Option<i32>,
     /// WAF auto-ban duration (s).
@@ -509,11 +649,9 @@ pub struct UpdateSettingsRequest {
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
 ///
-/// Field application order matters: it matches the historical inline
-/// sequence so any future cross-field validation keeps seeing earlier
-/// assignments. Bound inconsistencies inherited from that inline era
-/// are kept on purpose (normalising them is a behaviour change) and
-/// flagged with `// NOTE: bound drift` comments for the next audit.
+/// The whole of the write is [`update_settings_as`], with the session
+/// as the actor; this wrapper answers the stored row with its secrets
+/// masked.
 pub async fn update_settings(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
@@ -521,16 +659,114 @@ pub async fn update_settings(
     Extension(session): Extension<Session>,
     Json(body): Json<UpdateSettingsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // The management router runs this request as one unit a hung-up
+    // client cannot split (`db::detach_mutations`), so the commit, the
+    // reload signal and the audit row land together.
+    let change = update_settings_as(
+        &state,
+        &audit_ctx,
+        body,
+        crate::preview::WriteMode::Apply,
+        SettingsAuditTarget::ChangedKeys,
+        |_, _| Ok(()),
+    )
+    .await?;
+    let mut settings = change.after;
+    mask_settings_secrets(&mut settings);
+    Ok(json_data(settings))
+}
+
+/// The settings document before a write and after it, unmasked: each
+/// caller decides what of it to answer. After a preview, `after` is
+/// the document as the write would have stored it.
+pub(crate) struct SettingsChange {
+    /// The document as it was read under the store lock.
+    pub(crate) before: lorica_config::models::GlobalSettings,
+    /// The document with the patch applied and validated.
+    pub(crate) after: lorica_config::models::GlobalSettings,
+}
+
+/// What the `settings.update` audit row names as its target id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsAuditTarget {
+    /// The keys whose stored value the write changed, sorted and
+    /// comma-separated, names only: the payload itself is only ever
+    /// hashed, and the dashboard's write reaches secrets, so a value
+    /// never reaches the row.
+    ChangedKeys,
+    /// `key:old->new` for each key whose stored value the write
+    /// changed, sorted and comma-separated (Story 11.3). Only for a
+    /// caller that can change nothing but non-secret scalars, which the
+    /// admin tier's allowlist guarantees: without the values the row
+    /// says a retention moved and not whether it moved to 1 or to ten
+    /// million.
+    ChangedValues,
+}
+
+/// The whole of [`update_settings`] as `actor`, split out so the
+/// automation plane's admin tier (Story 11.3) runs the dashboard's own
+/// validators, reload signal and audit row rather than a second copy of
+/// them, the way the route and backend writes were split in Story 11.2.
+///
+/// Field application order matters: it matches the historical inline
+/// sequence so any future cross-field validation keeps seeing earlier
+/// assignments. Bound inconsistencies inherited from that inline era
+/// are kept on purpose (normalising them is a behaviour change) and
+/// flagged with `// NOTE: bound drift` comments for the next audit.
+///
+/// `caller_bounds` sees the stored document and the patched one, under
+/// the store lock, before the cross-field checks: a caller narrower
+/// than the dashboard (the admin tier) refuses there what it may not
+/// set, on the document it is about to write, so nothing can move
+/// between its check and the write. The dashboard passes a check that
+/// accepts everything.
+///
+/// The syslog TLS connector is built only when the patch names a
+/// `syslog_*` field. A write that touches none leaves the sink as
+/// stored, so it is not refused over sink material it did not send,
+/// and the refusal does not describe that material to it.
+///
+/// A write that changes no stored value writes nothing: no store
+/// write, no reload signal, no audit row, and the document answered
+/// as it stands.
+///
+/// In [`crate::preview::WriteMode::Preview`] every validator runs,
+/// the caller's bounds, the cross-field checks and the syslog TLS build
+/// included, and the function stops before the store, the reload
+/// signal, the cleartext warning and the audit row.
+pub(crate) async fn update_settings_as(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    body: UpdateSettingsRequest,
+    mode: crate::preview::WriteMode,
+    audit_target: SettingsAuditTarget,
+    caller_bounds: impl FnOnce(
+            &lorica_config::models::GlobalSettings,
+            &lorica_config::models::GlobalSettings,
+        ) -> Result<(), ApiError>
+        + Send
+        + 'static,
+) -> Result<SettingsChange, ApiError> {
     // Audit payload = the PATCH body (secret-free by construction),
     // never the resulting GlobalSettings row (carries
     // `bot_hmac_secret_hex`). Serialized before the closure consumes
     // the body; recorded only after the mutation succeeds.
     let audit_after = serde_json::to_value(&body).ok();
+    let touches_syslog = audit_after
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|patch| {
+            patch
+                .iter()
+                .any(|(key, value)| key.starts_with("syslog_") && !value.is_null())
+        });
     // The whole get -> validate/assign -> update sequence is sync and
     // runs in one closure on the blocking pool; the store mutex hold
     // window is unchanged.
-    let settings = db_blocking(&state.store, move |store| {
+    let (before, settings, changed) = db_blocking(&state.store, move |store| {
         let mut settings = store.get_global_settings()?;
+        let before = settings.clone();
 
         // NOTE: bound drift - no validation; port 0 is accepted.
         apply_plain(body.management_port, &mut settings.management_port);
@@ -540,13 +776,13 @@ pub async fn update_settings(
             &LOG_LEVEL_CHOICES,
             "log_level",
         )?;
-        // NOTE: bound drift - lower bound only, no upper cap unlike
-        // health_max_concurrent_probes.
-        apply_min_i32(
+        apply_ranged_i32(
             body.default_health_check_interval_s,
             &mut settings.default_health_check_interval_s,
-            DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN,
-            "default_health_check_interval_s",
+            DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN..=DEFAULT_HEALTH_CHECK_INTERVAL_S_MAX,
+            &format!(
+                "default_health_check_interval_s must be in {DEFAULT_HEALTH_CHECK_INTERVAL_S_MIN}..={DEFAULT_HEALTH_CHECK_INTERVAL_S_MAX}"
+            ),
         )?;
         apply_ranged_i32(
             body.health_max_concurrent_probes,
@@ -556,8 +792,8 @@ pub async fn update_settings(
                 "health_max_concurrent_probes must be in {HEALTH_MAX_CONCURRENT_PROBES_MIN}..={HEALTH_MAX_CONCURRENT_PROBES_MAX}"
             ),
         )?;
-        // NOTE: bound drift - cert thresholds have no upper bound and
-        // no warning > critical cross-check.
+        // NOTE: bound drift - cert thresholds have no upper bound. The
+        // warning > critical rule is `validate_cross_fields`'.
         apply_min_i32(
             body.cert_warning_days,
             &mut settings.cert_warning_days,
@@ -590,12 +826,82 @@ pub async fn update_settings(
             FLOOD_STRICT_RPS_MIN..=FLOOD_STRICT_RPS_MAX,
             &format!("flood_strict_rps must be in {FLOOD_STRICT_RPS_MIN}..={FLOOD_STRICT_RPS_MAX}"),
         )?;
-        // Story 8.10 AC #1. `0` disables the global header-phase floor.
+        // Story 8.10 AC #1.
         apply_ranged_u32(
             body.header_timeout_s,
             &mut settings.header_timeout_s,
             HEADER_TIMEOUT_S_MIN..=HEADER_TIMEOUT_S_MAX,
             &format!("header_timeout_s must be in {HEADER_TIMEOUT_S_MIN}..={HEADER_TIMEOUT_S_MAX}"),
+        )?;
+        apply_ranged(
+            body.downstream_idle_timeout_s,
+            &mut settings.downstream_idle_timeout_s,
+            DOWNSTREAM_IDLE_TIMEOUT_S_MIN..=DOWNSTREAM_IDLE_TIMEOUT_S_MAX,
+            "downstream_idle_timeout_s",
+        )?;
+        apply_ranged(
+            body.max_active_probes,
+            &mut settings.max_active_probes,
+            MAX_ACTIVE_PROBES_MIN..=MAX_ACTIVE_PROBES_MAX,
+            "max_active_probes",
+        )?;
+        apply_ranged(
+            body.loadtest_max_concurrency,
+            &mut settings.loadtest_max_concurrency,
+            LOADTEST_MAX_CONCURRENCY_MIN..=LOADTEST_MAX_CONCURRENCY_MAX,
+            "loadtest_max_concurrency",
+        )?;
+        apply_ranged(
+            body.loadtest_max_duration_s,
+            &mut settings.loadtest_max_duration_s,
+            LOADTEST_MAX_DURATION_S_MIN..=LOADTEST_MAX_DURATION_S_MAX,
+            "loadtest_max_duration_s",
+        )?;
+        apply_ranged(
+            body.loadtest_max_rps,
+            &mut settings.loadtest_max_rps,
+            LOADTEST_MAX_RPS_MIN..=LOADTEST_MAX_RPS_MAX,
+            "loadtest_max_rps",
+        )?;
+        apply_ranged(
+            body.audit_log_retention_days,
+            &mut settings.audit_log_retention_days,
+            AUDIT_LOG_RETENTION_DAYS_MIN..=AUDIT_LOG_RETENTION_DAYS_MAX,
+            "audit_log_retention_days",
+        )?;
+        // The stored form of "no cap" is `None`; the request spells it
+        // `0`, because a JSON `null` reads as an absent field.
+        let mut per_ip_limit: u32 = settings.connection_limits_per_ip.unwrap_or(0);
+        apply_ranged(
+            body.connection_limits_per_ip,
+            &mut per_ip_limit,
+            CONNECTION_LIMITS_PER_IP_MIN..=CONNECTION_LIMITS_PER_IP_MAX,
+            "connection_limits_per_ip",
+        )?;
+        settings.connection_limits_per_ip = (per_ip_limit > 0).then_some(per_ip_limit);
+        apply_ranged(
+            body.bot_stash_max_entries,
+            &mut settings.bot_stash_max_entries,
+            BOT_STASH_MAX_ENTRIES_MIN..=BOT_STASH_MAX_ENTRIES_MAX,
+            "bot_stash_max_entries",
+        )?;
+        apply_ranged(
+            body.bot_stash_per_prefix_max,
+            &mut settings.bot_stash_per_prefix_max,
+            BOT_STASH_PER_PREFIX_MAX_MIN..=BOT_STASH_PER_PREFIX_MAX_MAX,
+            "bot_stash_per_prefix_max",
+        )?;
+        apply_ranged(
+            body.mirror_max_concurrent_per_route,
+            &mut settings.mirror_max_concurrent_per_route,
+            MIRROR_MAX_CONCURRENT_MIN..=MIRROR_MAX_CONCURRENT_MAX,
+            "mirror_max_concurrent_per_route",
+        )?;
+        apply_ranged(
+            body.mirror_max_concurrent_global,
+            &mut settings.mirror_max_concurrent_global,
+            MIRROR_MAX_CONCURRENT_MIN..=MIRROR_MAX_CONCURRENT_MAX,
+            "mirror_max_concurrent_global",
         )?;
         apply_min_i32(
             body.waf_ban_threshold,
@@ -605,11 +911,13 @@ pub async fn update_settings(
         )?;
         // NOTE: bound drift - 0 accepted (zero-duration ban), while the
         // interval fields above require >= 1.
-        apply_min_i32(
+        apply_ranged_i32(
             body.waf_ban_duration_s,
             &mut settings.waf_ban_duration_s,
-            WAF_BAN_DURATION_S_MIN,
-            "waf_ban_duration_s",
+            WAF_BAN_DURATION_S_MIN..=WAF_BAN_DURATION_S_MAX,
+            &format!(
+                "waf_ban_duration_s must be in {WAF_BAN_DURATION_S_MIN}..={WAF_BAN_DURATION_S_MAX} (30 days)"
+            ),
         )?;
         apply_min_i64(
             body.access_log_retention,
@@ -626,13 +934,11 @@ pub async fn update_settings(
         // Story 10.6 AC #7. Not a secret and not masked: the budget is
         // a capacity figure an operator has to be able to read back to
         // reason about the `skipped_budget` scan outcome.
-        apply_ranged_u64(
+        apply_ranged(
             body.waf_body_scan_max_inflight_bytes,
             &mut settings.waf_body_scan_max_inflight_bytes,
             WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN..=WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX,
-            &format!(
-                "waf_body_scan_max_inflight_bytes must be in {WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN}..={WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX}"
-            ),
+            "waf_body_scan_max_inflight_bytes",
         )?;
         apply_plain(body.sla_purge_enabled, &mut settings.sla_purge_enabled);
         apply_ranged_i32(
@@ -827,6 +1133,7 @@ pub async fn update_settings(
             &mut settings.otlp_logs_capture_enabled,
         );
 
+        caller_bounds(&before, &settings)?;
         // Cross-field invariants (backlog #48). Per-field bounds are applied
         // above; these reject a partial update that inverts a related pair
         // (e.g. cert warning <= critical) on the merged result.
@@ -837,15 +1144,26 @@ pub async fn update_settings(
         // exact connector the sink will use, so a bad pasted PEM is a
         // 400 here instead of a permanently dead sink discovered one
         // warn-line later.
-        let sinks = crate::log_sinks::LogSinksConfig::from_settings(&settings, false);
-        if let Some(syslog_cfg) = &sinks.syslog {
-            crate::log_sinks::syslog::validate_tls_config(syslog_cfg)
-                .map_err(ApiError::BadRequest)?;
+        if touches_syslog {
+            let sinks = crate::log_sinks::LogSinksConfig::from_settings(&settings, false);
+            if let Some(syslog_cfg) = &sinks.syslog {
+                crate::log_sinks::syslog::validate_tls_config(syslog_cfg)
+                    .map_err(ApiError::BadRequest)?;
+            }
         }
-        store.update_global_settings(&settings)?;
-        Ok::<_, ApiError>(settings)
+        let changed = changed_keys(&before, &settings);
+        if !mode.previews() && !changed.is_empty() {
+            store.update_global_settings(&settings)?;
+        }
+        Ok::<_, ApiError>((before, settings, changed))
     })
     .await?;
+    if mode.previews() || changed.is_empty() {
+        return Ok(SettingsChange {
+            before,
+            after: settings,
+        });
+    }
     state.notify_config_changed();
 
     // Story 9.8 QA (CWE-319 advisory): the exported records carry the
@@ -861,20 +1179,55 @@ pub async fn update_settings(
         );
     }
 
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let target_id = match audit_target {
+        SettingsAuditTarget::ChangedKeys => changed.join(","),
+        SettingsAuditTarget::ChangedValues => changed_values(&before, &settings, &changed),
+    };
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        actor,
         "settings.update",
-        ("settings", ""),
+        ("settings", &target_id),
         None,
         audit_after.as_ref(),
     )
     .await;
 
-    let mut settings = settings;
-    mask_settings_secrets(&mut settings);
-    Ok(json_data(settings))
+    Ok(SettingsChange {
+        before,
+        after: settings,
+    })
+}
+
+/// The top-level keys whose value differs between two settings
+/// documents, sorted. Names only: a value never reaches a row.
+pub(crate) fn changed_keys(
+    before: &lorica_config::models::GlobalSettings,
+    after: &lorica_config::models::GlobalSettings,
+) -> Vec<String> {
+    let before = serde_json::to_value(before).unwrap_or_default();
+    let after = serde_json::to_value(after).unwrap_or_default();
+    let mut keys: Vec<String> = crate::preview::changes_between(&before, &after)
+        .as_object()
+        .map(|changes| changes.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    keys
+}
+
+/// `key:old->new` for each of `keys`, comma-separated, each value as
+/// the document serialises it.
+fn changed_values(
+    before: &lorica_config::models::GlobalSettings,
+    after: &lorica_config::models::GlobalSettings,
+    keys: &[String],
+) -> String {
+    let before = serde_json::to_value(before).unwrap_or_default();
+    let after = serde_json::to_value(after).unwrap_or_default();
+    keys.iter()
+        .map(|key| format!("{key}:{}->{}", before[key], after[key]))
+        .collect::<Vec<String>>()
+        .join(",")
 }
 
 // ---- update_settings field-application helpers ----
@@ -964,25 +1317,28 @@ fn apply_ranged_u32(
     Ok(())
 }
 
-/// `u64` variant of [`apply_ranged_i32`] for byte-denominated budgets
-/// (`waf_body_scan_max_inflight_bytes`), which are `u64` on
-/// `GlobalSettings` because a byte count has no business being signed.
+/// Assign a numeric field when present, refusing a value outside
+/// `range` with `422 "<label> must be in <min>..=<max>"`.
 ///
-/// It answers `422`, not the `400` its `i32` and `u32` siblings
-/// answer. The rule on [`ApiError::Unprocessable`] decides it: a cap
-/// over its documented limit is a request the server understood and
-/// refuses on its merits. The siblings predate that rule and are in
-/// the set the doc comment explicitly leaves unswept, so they are not
-/// changed here; new fields use the rule.
-fn apply_ranged_u64(
-    value: Option<u64>,
-    target: &mut u64,
-    range: std::ops::RangeInclusive<u64>,
-    error_msg: &str,
+/// It answers `422`, not the `400` [`apply_ranged_i32`] and
+/// [`apply_ranged_u32`] answer. The rule on [`ApiError::Unprocessable`]
+/// decides it: a cap over its documented limit is a request the server
+/// understood and refuses on its merits. Those two predate that rule
+/// and are in the set the doc comment explicitly leaves unswept, so
+/// they are not changed here; new fields use this one.
+fn apply_ranged<T: PartialOrd + Copy + std::fmt::Display>(
+    value: Option<T>,
+    target: &mut T,
+    range: std::ops::RangeInclusive<T>,
+    label: &str,
 ) -> Result<(), ApiError> {
     if let Some(v) = value {
         if !range.contains(&v) {
-            return Err(ApiError::Unprocessable(error_msg.to_string()));
+            return Err(ApiError::Unprocessable(format!(
+                "{label} must be in {}..={}",
+                range.start(),
+                range.end()
+            )));
         }
         *target = v;
     }
@@ -2026,4 +2382,162 @@ pub async fn delete_preference(
     Ok(json_data(
         serde_json::json!({"message": "preference deleted"}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use crate::tests::{parse_data, send, setup_admin_and_login, test_state};
+
+    /// The settings the dashboard's form writes since backlog #89 and
+    /// the Story 8.9 bounds its Network tab showed and never sent, plus
+    /// the downstream idle timeout (backlog #82), new in 1.9.0.
+    const FORM_WRITTEN_SINCE_1_9: [&str; 11] = [
+        "max_active_probes",
+        "loadtest_max_concurrency",
+        "loadtest_max_duration_s",
+        "loadtest_max_rps",
+        "audit_log_retention_days",
+        "connection_limits_per_ip",
+        "bot_stash_max_entries",
+        "bot_stash_per_prefix_max",
+        "mirror_max_concurrent_per_route",
+        "mirror_max_concurrent_global",
+        "downstream_idle_timeout_s",
+    ];
+
+    #[tokio::test]
+    async fn each_setting_is_written_inside_the_bounds_the_schema_publishes_and_refused_past_them()
+    {
+        let schema = super::settings_schema();
+        for field in FORM_WRITTEN_SINCE_1_9 {
+            // A node per field: the settings writes of one session share
+            // a rate budget the whole sweep would exhaust.
+            let (state, sessions, limiter) = test_state().await;
+            let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+            let min = schema[field]["min"].as_i64().expect("a published min");
+            let max = schema[field]["max"].as_i64().expect("a published max");
+            assert!(min < max, "{field}");
+            for value in [min, max, min + 1] {
+                let body = serde_json::json!({ field: value });
+                let answer = send(
+                    &state,
+                    &sessions,
+                    &limiter,
+                    "PUT",
+                    "/api/v1/settings",
+                    &admin,
+                    Some(body),
+                )
+                .await;
+                assert_eq!(answer.status(), StatusCode::OK, "{field}={value}");
+                let stored = parse_data(answer).await[field].clone();
+                let expected = if field == "connection_limits_per_ip" && value == 0 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(value)
+                };
+                assert_eq!(stored, expected, "{field}={value}");
+            }
+            let mut refused = vec![max + 1];
+            if min > 0 {
+                refused.push(min - 1);
+            }
+            for value in refused {
+                let answer = send(
+                    &state,
+                    &sessions,
+                    &limiter,
+                    "PUT",
+                    "/api/v1/settings",
+                    &admin,
+                    Some(serde_json::json!({ field: value })),
+                )
+                .await;
+                assert_eq!(
+                    answer.status(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{field}={value}"
+                );
+                let message = String::from_utf8(
+                    axum::body::to_bytes(answer.into_body(), usize::MAX)
+                        .await
+                        .expect("body")
+                        .to_vec(),
+                )
+                .expect("utf-8");
+                assert!(message.contains(field), "{message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_per_ip_connection_cap_is_lifted_by_zero_and_left_alone_when_absent() {
+        let (state, sessions, limiter) = test_state().await;
+        let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+        let put = |body: serde_json::Value| {
+            send(
+                &state,
+                &sessions,
+                &limiter,
+                "PUT",
+                "/api/v1/settings",
+                &admin,
+                Some(body),
+            )
+        };
+        let set =
+            parse_data(put(serde_json::json!({ "connection_limits_per_ip": 25 })).await).await;
+        assert_eq!(set["connection_limits_per_ip"], 25);
+        // A save that does not name it, and one that sends `null`, keep it.
+        let other = parse_data(put(serde_json::json!({ "max_active_probes": 7 })).await).await;
+        assert_eq!(other["connection_limits_per_ip"], 25);
+        let null =
+            parse_data(put(serde_json::json!({ "connection_limits_per_ip": null })).await).await;
+        assert_eq!(null["connection_limits_per_ip"], 25);
+        let lifted =
+            parse_data(put(serde_json::json!({ "connection_limits_per_ip": 0 })).await).await;
+        assert!(lifted["connection_limits_per_ip"].is_null(), "{lifted}");
+    }
+
+    #[tokio::test]
+    async fn the_document_the_dashboard_reads_is_written_back_with_its_changes() {
+        // The dashboard sends back the whole document it read, edited.
+        // Every one of these settings must take the edit rather than be
+        // dropped as an unknown key, which is what the Network tab's
+        // fields were from 1.6.0 to 1.9.0.
+        let (state, sessions, limiter) = test_state().await;
+        let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+        let read = send(
+            &state,
+            &sessions,
+            &limiter,
+            "GET",
+            "/api/v1/settings",
+            &admin,
+            None,
+        )
+        .await;
+        let mut document = parse_data(read).await;
+        let schema = super::settings_schema();
+        for field in FORM_WRITTEN_SINCE_1_9 {
+            document[field] = schema[field]["max"].clone();
+        }
+        let written = send(
+            &state,
+            &sessions,
+            &limiter,
+            "PUT",
+            "/api/v1/settings",
+            &admin,
+            Some(document),
+        )
+        .await;
+        assert_eq!(written.status(), StatusCode::OK);
+        let stored = parse_data(written).await;
+        for field in FORM_WRITTEN_SINCE_1_9 {
+            assert_eq!(stored[field], schema[field]["max"], "{field}");
+        }
+    }
 }

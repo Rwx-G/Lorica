@@ -4,8 +4,17 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { auth } from '../../lib/auth';
 import { clusterStatus } from '../../lib/cluster';
 import { api, type AutomationTokenResponse } from '../../lib/api';
-import AutomationTokensTab, { ALL_SCOPES } from './AutomationTokensTab.svelte';
-import { AUTOMATION_SCOPE_WIRE_STRINGS } from './automation-scopes.fixture';
+import AutomationTokensTab, {
+  ALL_SCOPES,
+  carriesGrants,
+  readMcpTier,
+} from './AutomationTokensTab.svelte';
+import {
+  AUTOMATION_SCOPE_WIRE_STRINGS,
+  GRANT_BOUNDED_SCOPES,
+  MCP_TIER_VECTORS,
+  type McpTierVector,
+} from './automation-scopes.generated';
 
 const FULL_TOKEN = '0123456789abcdef01234567.SGVsbG9Xb3JsZFNlY3JldFZhbHVlSGVyZTEyMzQ1Ng';
 
@@ -42,20 +51,34 @@ afterEach(() => {
 });
 
 describe('AutomationTokensTab scope spelling', () => {
-  // The four strings are Rust's: the serde renames on
-  // `AutomationScope` and `scope_str`. Nothing generates this client,
-  // so this is the only thing standing between a rename on the server
-  // and a create form that mints tokens the node refuses. The fixture
-  // carries the wire spelling; the component restates it.
-  it('offers exactly the scopes the wire fixture names', () => {
-    const offered = ALL_SCOPES.map((scope) => scope.value).sort();
-    expect(offered).toEqual([...AUTOMATION_SCOPE_WIRE_STRINGS]);
+  // The wire strings are Rust's, and `automation-scopes.generated.ts`
+  // is what `lorica-api/tests/automation_scope_fixture.rs` pins them
+  // against. What is left to check on this side is that the form
+  // actually renders one control per scope: `ALL_SCOPES` is derived
+  // from the generated list, so the way this breaks is a template that
+  // drops entries, not a list that disagrees.
+  it('renders one checkbox per wire scope, labelled with the wire string', async () => {
+    vi.spyOn(api, 'listAutomationTokens').mockResolvedValue({ data: { tokens: [] } });
+    render(AutomationTokensTab, { props: props() });
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Create Token' })).toBeInTheDocument(),
+    );
+    await fireEvent.click(screen.getByRole('button', { name: 'Create Token' }));
+
+    for (const wire of AUTOMATION_SCOPE_WIRE_STRINGS) {
+      expect(screen.getByRole('checkbox', { name: wire })).toBeInTheDocument();
+    }
+    expect(screen.getAllByRole('checkbox')).toHaveLength(AUTOMATION_SCOPE_WIRE_STRINGS.length);
   });
 
-  it('labels every scope with its own wire string, so the UI is not a second vocabulary', () => {
-    for (const scope of ALL_SCOPES) {
-      expect(scope.label).toBe(scope.value);
-    }
+  it('offers the reads before the writes, so the narrower token is the default reach', () => {
+    const firstWrite = ALL_SCOPES.findIndex((scope) => scope.value.endsWith(':write'));
+    const lastRead = ALL_SCOPES.map((scope) => scope.value).reduce(
+      (last, value, index) => (value.endsWith(':write') ? last : index),
+      -1,
+    );
+    expect(firstWrite).toBeGreaterThan(lastRead);
   });
 });
 
@@ -73,6 +96,28 @@ describe('AutomationTokensTab listing', () => {
     // A token nobody has presented is the one to retire, so "never"
     // has to be rendered rather than left blank.
     expect(screen.getByText('never')).toBeInTheDocument();
+  });
+
+  it('renders the grants of a token that carries no bounded scope as not applicable', async () => {
+    // Typed absence: no path a read or settings token reaches consults
+    // a grant. A row minted before the rule may still store one, and
+    // it is not that token's blast radius, so it is not shown.
+    vi.spyOn(api, 'listAutomationTokens').mockResolvedValue({
+      data: {
+        tokens: [
+          token({
+            name: 'mcp read',
+            scopes: ['logs:read', 'waf:read'],
+            allowed_hostnames: ['*.legacy.example.com'],
+          }),
+        ],
+      },
+    });
+    render(AutomationTokensTab, { props: props() });
+
+    await waitFor(() => expect(screen.getByText('mcp read')).toBeInTheDocument());
+    expect(screen.getByText('not applicable')).toBeInTheDocument();
+    expect(screen.queryByText('*.legacy.example.com')).not.toBeInTheDocument();
   });
 
   it('badges a revoked token and offers no revoke action on it', async () => {
@@ -99,6 +144,7 @@ describe('AutomationTokensTab create-once display', () => {
     );
     await fireEvent.click(screen.getByRole('button', { name: 'Create Token' }));
     await fireEvent.input(screen.getByLabelText(/^Name/), { target: { value: 'ci pipeline' } });
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'environments:write' }));
     await fireEvent.input(screen.getByLabelText(/^Allowed hostnames/), {
       target: { value: '*.preview.example.com' },
     });
@@ -138,6 +184,142 @@ describe('AutomationTokensTab create-once display', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(FULL_TOKEN));
     expect(screen.getByRole('button', { name: 'Copied' })).toBeInTheDocument();
+  });
+});
+
+describe('AutomationTokensTab grants', () => {
+  async function openForm() {
+    vi.spyOn(api, 'listAutomationTokens').mockResolvedValue({ data: { tokens: [] } });
+    const create = vi.spyOn(api, 'createAutomationToken').mockResolvedValue({
+      data: { ...token(), token: FULL_TOKEN },
+    });
+    render(AutomationTokensTab, { props: props() });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Create Token' })).toBeInTheDocument(),
+    );
+    await fireEvent.click(screen.getByRole('button', { name: 'Create Token' }));
+    await fireEvent.input(screen.getByLabelText(/^Name/), { target: { value: 'mcp' } });
+    return create;
+  }
+
+  it('asks for no grant while no selected scope is bounded, and sends none', async () => {
+    const create = await openForm();
+    expect(screen.queryByLabelText(/^Allowed hostnames/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Allowed backend CIDRs/)).not.toBeInTheDocument();
+    expect(screen.getByText(/not applicable/)).toBeInTheDocument();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    const body = create.mock.calls[0][0];
+    expect(body).not.toHaveProperty('allowed_hostnames');
+    expect(body).not.toHaveProperty('allowed_backend_cidrs');
+  });
+
+  it('asks for both grants once a bounded scope is selected, and sends them', async () => {
+    const create = await openForm();
+    for (const bounded of GRANT_BOUNDED_SCOPES) {
+      expect(carriesGrants([bounded])).toBe(true);
+    }
+    await fireEvent.click(screen.getByRole('checkbox', { name: GRANT_BOUNDED_SCOPES[0] }));
+    await fireEvent.input(screen.getByLabelText(/^Allowed hostnames/), {
+      target: { value: 'app.example.com' },
+    });
+    await fireEvent.input(screen.getByLabelText(/^Allowed backend CIDRs/), {
+      target: { value: '10.0.0.0/8' },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    const body = create.mock.calls[0][0];
+    expect(body.allowed_hostnames).toEqual(['app.example.com']);
+    expect(body.allowed_backend_cidrs).toEqual(['10.0.0.0/8']);
+  });
+
+  it('treats every scope outside the bounded set as carrying no grant', () => {
+    for (const scope of AUTOMATION_SCOPE_WIRE_STRINGS) {
+      expect(carriesGrants([scope])).toBe(GRANT_BOUNDED_SCOPES.includes(scope));
+    }
+  });
+});
+
+describe('AutomationTokensTab MCP tier', () => {
+  // `readMcpTier` is a second implementation of the policy crate's
+  // `resolve`. The vectors are rendered from that function by
+  // `lorica-api/tests/automation_scope_fixture.rs`; replaying every one
+  // of them here is what holds the two to one rule.
+  it('reads every vector the policy crate rendered exactly as lorica-mcp does', () => {
+    expect(MCP_TIER_VECTORS.length).toBeGreaterThan(0);
+    for (const vector of MCP_TIER_VECTORS) {
+      expect(readMcpTier(vector.scopes), vector.scopes.join(', ')).toEqual({
+        tier: vector.tier,
+        anchoring: [...vector.anchoring],
+        offending: [...vector.offending],
+      });
+    }
+  });
+
+  /** A vector the form can reproduce by ticking its scopes. */
+  function vectorWhere(matches: (vector: McpTierVector) => boolean): McpTierVector {
+    const found = MCP_TIER_VECTORS.find(matches);
+    if (found === undefined) throw new Error('test setup: no such vector');
+    return found;
+  }
+
+  async function openFormWith(scopes: readonly string[]) {
+    vi.spyOn(api, 'listAutomationTokens').mockResolvedValue({ data: { tokens: [] } });
+    const create = vi.spyOn(api, 'createAutomationToken').mockResolvedValue({
+      data: { ...token(), token: FULL_TOKEN },
+    });
+    render(AutomationTokensTab, { props: props() });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Create Token' })).toBeInTheDocument(),
+    );
+    await fireEvent.click(screen.getByRole('button', { name: 'Create Token' }));
+    await fireEvent.input(screen.getByLabelText(/^Name/), { target: { value: 'mcp' } });
+    for (const box of screen.getAllByRole('checkbox')) {
+      if ((box as HTMLInputElement).checked) await fireEvent.click(box);
+    }
+    for (const scope of scopes) {
+      await fireEvent.click(screen.getByRole('checkbox', { name: scope }));
+    }
+    return create;
+  }
+
+  it('names the tier a one-tier selection makes', async () => {
+    const one = vectorWhere(
+      (vector) => vector.scopes.length === 1 && vector.tier === 'admin',
+    );
+    await openFormWith(one.scopes);
+    expect(screen.getByTestId('mcp-tier-hint')).toHaveTextContent('MCP tier: admin');
+    expect(screen.queryByTestId('mcp-tier-warning')).not.toBeInTheDocument();
+  });
+
+  it('warns, naming the offending scopes, when the selection spans two tiers, and still mints', async () => {
+    const spanning = vectorWhere(
+      (vector) => vector.scopes.length === 2 && vector.offending.length > 0,
+    );
+    const create = await openFormWith(spanning.scopes);
+
+    const warning = screen.getByTestId('mcp-tier-warning');
+    expect(warning).toHaveTextContent(`the ${spanning.tier} tier`);
+    for (const scope of spanning.offending) {
+      expect(warning).toHaveTextContent(scope);
+    }
+    expect(warning).toHaveTextContent('cannot start lorica-mcp');
+    expect(screen.queryByTestId('mcp-tier-hint')).not.toBeInTheDocument();
+
+    // A warning and not a block: the automation plane serves such a
+    // token, so the form still sends it.
+    const createButton = screen.getByRole('button', { name: 'Create' });
+    expect(createButton).not.toBeDisabled();
+    await fireEvent.click(createButton);
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0].scopes).toEqual([...spanning.scopes]);
+  });
+
+  it('says nothing about a tier while no scope is selected', async () => {
+    await openFormWith([]);
+    expect(screen.queryByTestId('mcp-tier-hint')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('mcp-tier-warning')).not.toBeInTheDocument();
   });
 });
 

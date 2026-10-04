@@ -73,6 +73,51 @@ impl ConfigStore {
         Ok(certs)
     }
 
+    /// Every certificate, ordered by domain, with `key_pem` left EMPTY
+    /// on every row: the private key is neither read nor decrypted.
+    ///
+    /// For the listing views, which never carry a key and used to
+    /// decrypt every one under the config lock only to drop it. A row
+    /// from here must not reach anything that serves TLS, exports a
+    /// bundle or writes the row back, since each of those would act on
+    /// an empty key; [`ConfigStore::list_certificates`] is theirs.
+    pub fn list_certificates_without_private_keys(&self) -> Result<Vec<Certificate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, domain, san_domains, fingerprint, cert_pem,
+             issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
+             acme_method, acme_dns_provider_id
+             FROM certificates ORDER BY domain",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((|| -> Result<Certificate> {
+                let san_json: String = row.get(2)?;
+                let san_domains: Vec<String> = serde_json::from_str(&san_json)
+                    .map_err(|e| ConfigError::Corrupt(format!("invalid san_domains JSON: {e}")))?;
+                Ok(Certificate {
+                    id: row.get(0)?,
+                    domain: row.get(1)?,
+                    san_domains,
+                    fingerprint: row.get(3)?,
+                    cert_pem: row.get(4)?,
+                    key_pem: String::new(),
+                    issuer: row.get(5)?,
+                    not_before: parse_datetime(&row.get::<_, String>(6)?)?,
+                    not_after: parse_datetime(&row.get::<_, String>(7)?)?,
+                    is_acme: row.get(8)?,
+                    acme_auto_renew: row.get(9)?,
+                    created_at: parse_datetime(&row.get::<_, String>(10)?)?,
+                    acme_method: row.get(11)?,
+                    acme_dns_provider_id: row.get(12)?,
+                })
+            })())
+        })?;
+        let mut certs = Vec::new();
+        for r in rows {
+            certs.push(r??);
+        }
+        Ok(certs)
+    }
+
     /// Update an existing certificate. Re-encrypts `key_pem` at rest.
     pub fn update_certificate(&self, cert: &Certificate) -> Result<()> {
         let san_json = serde_json::to_string(&cert.san_domains)

@@ -271,6 +271,39 @@ mod tests {
     }
 
     #[test]
+    fn a_row_minted_before_typed_absence_still_loads_and_a_new_row_with_none_does_too() {
+        // The migration decision of 2026-09-30: the grant rule is a mint
+        // rule, and a stored row is never re-validated on load. A read
+        // token minted before the rule carries grants no path it reaches
+        // consults, so it keeps working exactly as it did; a read token
+        // minted after it carries none, and the two empty lists survive
+        // the JSON columns as empty, not as absent.
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        let mut legacy = token("0123456789abcdef01234567");
+        legacy.scopes = vec![AutomationScope::LogsRead];
+        assert!(legacy.validate().is_err(), "the mint rule refuses it today");
+        store
+            .create_automation_token(&legacy)
+            .expect("test setup: token insert");
+        let mut current = token("fedcba9876543210fedcba98");
+        current.scopes = vec![AutomationScope::LogsRead];
+        current.allowed_hostnames.clear();
+        current.allowed_backend_cidrs.clear();
+        assert_eq!(current.validate(), Ok(()));
+        store
+            .create_automation_token(&current)
+            .expect("test setup: token insert");
+
+        for written in [legacy, current] {
+            let read = store
+                .get_automation_token(&written.public_id)
+                .expect("test setup: token read")
+                .expect("the token exists");
+            assert_eq!(read, written);
+        }
+    }
+
+    #[test]
     fn an_unknown_public_id_reads_as_none() {
         let store = ConfigStore::open_in_memory().expect("test setup: store opens");
         assert!(store

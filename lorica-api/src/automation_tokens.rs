@@ -79,12 +79,13 @@ use crate::server::AppState;
 /// `secret_hmac`, `created_at`, `created_by`, `last_used_at`,
 /// `revoked_at`) are refused on input rather than quietly ignored.
 ///
-/// The two omissible fields fall back to the model's own defaults:
-/// `max_ttl_seconds` to [`AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS`]
-/// and the expiry to [`AUTOMATION_TOKEN_DEFAULT_LIFETIME_DAYS`] from
-/// now. `allowed_backend_cidrs` has no default: there is no node-wide
-/// backend policy to fall back on, and an empty list would be read as
-/// every address, so the model refuses one.
+/// `max_ttl_seconds` falls back to
+/// [`AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS`] and the expiry to
+/// [`AUTOMATION_TOKEN_DEFAULT_LIFETIME_DAYS`] from now. The two grant
+/// fields may be omitted, and an omitted one is an empty list: that is
+/// what a token carrying no grant-bounded scope sends, and the model
+/// refuses an empty grant on a token that carries one, since there is
+/// no node-wide backend policy to fall back on.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAutomationTokenRequest {
@@ -92,9 +93,11 @@ pub struct CreateAutomationTokenRequest {
     pub name: String,
     /// What this token may do. At least one; the model says so.
     pub scopes: Vec<AutomationScope>,
-    /// Hostname patterns this token may claim.
+    /// Hostname patterns this token may claim. At least one when a
+    /// scope is grant-bounded, none otherwise; the model says so.
+    #[serde(default)]
     pub allowed_hostnames: Vec<String>,
-    /// CIDRs this token may point a hostname at. At least one.
+    /// CIDRs this token may point a hostname at, under the same rule.
     #[serde(default)]
     pub allowed_backend_cidrs: Vec<String>,
     /// Ceiling on the lifetime any environment this token creates may

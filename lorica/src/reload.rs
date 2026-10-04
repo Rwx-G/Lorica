@@ -160,9 +160,9 @@ pub async fn rebuild_merged_crawlers(store: &Arc<Mutex<ConfigStore>>) {
 }
 
 /// Re-apply the full per-process reload state from the current store:
-/// the four resolver hooks (OTel exporter, GeoIP / ASN updater task
-/// lifecycle, bot HMAC secret) AND the merged AI-crawler registry
-/// rebuild. Idempotent ; each step dedups internally so calling this
+/// the log filter, the four resolver hooks (OTel exporter, GeoIP / ASN
+/// updater task lifecycle, bot HMAC secret) AND the merged AI-crawler
+/// registry rebuild. Idempotent ; each step dedups internally so calling this
 /// on every reload is cheap when nothing changed.
 ///
 /// This is THE single bundle every reload path must invoke. The
@@ -183,6 +183,7 @@ pub async fn rebuild_merged_crawlers(store: &Arc<Mutex<ConfigStore>>) {
 /// fallback-from-two-phase reload left GeoIP / OTel / ASN / bot-secret
 /// state frozen even though the proxy config swap completed).
 pub async fn apply_per_process_reload_state(store: &Arc<Mutex<ConfigStore>>) {
+    apply_log_level_from_store(store).await;
     apply_otel_settings_from_store(store).await;
     apply_geoip_settings_from_store(store).await;
     apply_asn_settings_from_store(store).await;
@@ -223,6 +224,102 @@ async fn apply_automation_allowlist_from_store(store: &Arc<Mutex<ConfigStore>>) 
         }
     };
     lorica_api::automation::listener::reload_automation_source_policy(&allowed_cidrs);
+}
+
+/// Replaces this process's log filter with one built from a level
+/// name. Returns why it did not, when it did not.
+pub type LogFilterReload = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// This process's [`LogFilterReload`], registered once by the binary
+/// when it installs the subscriber. Empty in tests and in any process
+/// that installed no reloadable filter, where the stored level is not
+/// applied.
+pub static LOG_FILTER_RELOAD: std::sync::OnceLock<LogFilterReload> = std::sync::OnceLock::new();
+
+/// The filter layer to install at the root of the subscriber, and the
+/// function that replaces it later.
+///
+/// `pinned_by_env` is whether `RUST_LOG` built `initial`. An operator
+/// who set it wrote directives, per target, that a level name cannot
+/// express, so the stored level does not replace them: the returned
+/// function refuses, and says why.
+pub fn reloadable_log_filter(
+    initial: tracing_subscriber::EnvFilter,
+    pinned_by_env: bool,
+) -> (
+    tracing_subscriber::reload::Layer<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>,
+    LogFilterReload,
+) {
+    let (layer, handle) = tracing_subscriber::reload::Layer::new(initial);
+    let reload: LogFilterReload = Box::new(move |level: &str| {
+        if pinned_by_env {
+            return Err(
+                "RUST_LOG is set and pins this process's log filter; unset it for the stored \
+                 log level to apply"
+                    .to_string(),
+            );
+        }
+        let filter = tracing_subscriber::EnvFilter::try_new(level)
+            .map_err(|refused| format!("{level:?} is not a log filter: {refused}"))?;
+        handle
+            .reload(filter)
+            .map_err(|refused| format!("the log filter could not be replaced: {refused}"))
+    });
+    (layer, reload)
+}
+
+/// Apply `stored` through `reload` when it is not what `last_applied`
+/// holds, and remember it either way so a refusal is logged once per
+/// change rather than on every reload. `None` when there was nothing
+/// to apply.
+fn apply_log_level(
+    stored: &str,
+    last_applied: &mut Option<String>,
+    reload: &dyn Fn(&str) -> Result<(), String>,
+) -> Option<Result<(), String>> {
+    if last_applied.as_deref() == Some(stored) {
+        return None;
+    }
+    *last_applied = Some(stored.to_string());
+    Some(reload(stored))
+}
+
+/// Apply `GlobalSettings.log_level` to this process's log filter.
+///
+/// Part of the reload bundle, so it runs in every process that logs,
+/// the supervisor, each worker and the single-process node, at boot
+/// once the store is open and on every reload after it: a level saved
+/// in the dashboard takes effect without a restart. The `--log-level`
+/// flag governs the lines written before the store is read, and
+/// `RUST_LOG`, when set, governs throughout (see
+/// [`reloadable_log_filter`]).
+async fn apply_log_level_from_store(store: &Arc<Mutex<ConfigStore>>) {
+    static LAST_APPLIED: std::sync::OnceLock<parking_lot::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    let Some(reload) = LOG_FILTER_RELOAD.get() else {
+        return;
+    };
+    let stored = {
+        let guard = store.lock().await;
+        match guard.get_global_settings() {
+            Ok(settings) => settings.log_level,
+            Err(e) => {
+                warn!(error = %e, "could not read the stored log level; the current filter stays");
+                return;
+            }
+        }
+    };
+    let slot = LAST_APPLIED.get_or_init(|| parking_lot::Mutex::new(None));
+    let outcome = apply_log_level(&stored, &mut slot.lock(), reload.as_ref());
+    match outcome {
+        None => {}
+        Some(Ok(())) => info!(log_level = %stored, "log level applied from the stored settings"),
+        Some(Err(refused)) => warn!(
+            log_level = %stored,
+            reason = %refused,
+            "the stored log level is not applied"
+        ),
+    }
 }
 
 /// Supervisor-only alias for [`apply_per_process_reload_state`].
@@ -940,7 +1037,20 @@ async fn build_proxy_config_inner(
         .map(|s| s.flood_threshold_rps.max(0) as u32)
         .unwrap_or(0);
     let flood_strict_rps = settings.as_ref().map(|s| s.flood_strict_rps).unwrap_or(0);
-    let header_timeout_s = settings.as_ref().map(|s| s.header_timeout_s).unwrap_or(10);
+    // The API bounds it to 1..=3600; an import or a replicated blob is not
+    // checked against that bound. 0 must not reach the proxy as "no bound",
+    // and a value past the ceiling is read as the ceiling.
+    let header_timeout_s = match settings.as_ref().map(|s| s.header_timeout_s) {
+        None | Some(0) => lorica_config::models::DEFAULT_HEADER_TIMEOUT_S,
+        Some(seconds) => seconds.min(lorica_config::models::MAX_HEADER_TIMEOUT_S),
+    };
+    // The API refuses 0; an import or a replicated blob is not checked
+    // against that bound, and 0 must not reach the proxy as "no limit".
+    let downstream_idle_timeout_s = settings
+        .as_ref()
+        .map(|s| s.downstream_idle_timeout_s)
+        .filter(|s| *s > 0)
+        .unwrap_or(lorica_config::models::DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S);
     let waf_ban_threshold = settings
         .as_ref()
         .map(|s| s.waf_ban_threshold.max(0) as u32)
@@ -1008,6 +1118,7 @@ async fn build_proxy_config_inner(
             flood_threshold_rps,
             flood_strict_rps,
             header_timeout_s,
+            downstream_idle_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs: trusted_proxies,
@@ -1254,6 +1365,57 @@ pub async fn reload_cert_resolver(
             lorica_api::metrics::inc_cert_resolver_reload("fail");
             warn!(error = %e, "failed to reload TLS certificate resolver");
         }
+    }
+}
+
+#[cfg(test)]
+mod log_level_tests {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::{apply_log_level, reloadable_log_filter};
+
+    #[test]
+    fn a_stored_level_replaces_the_filter_the_process_started_with() {
+        let (layer, reload) =
+            reloadable_log_filter(tracing_subscriber::EnvFilter::new("info"), false);
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(tracing::Level::DEBUG));
+            reload("debug").expect("a level name is a filter");
+            assert!(tracing::enabled!(tracing::Level::DEBUG));
+            reload("warn").expect("a level name is a filter");
+            assert!(!tracing::enabled!(tracing::Level::INFO));
+        });
+    }
+
+    #[test]
+    fn a_filter_rust_log_built_is_not_replaced() {
+        let (_layer, reload) =
+            reloadable_log_filter(tracing_subscriber::EnvFilter::new("lorica=trace"), true);
+        let refused = reload("info").expect_err("RUST_LOG pins the filter");
+        assert!(refused.contains("RUST_LOG"), "{refused}");
+    }
+
+    #[test]
+    fn a_level_is_applied_once_per_change_and_a_refusal_is_not_retried() {
+        let applied = std::cell::RefCell::new(Vec::new());
+        let reload = |level: &str| {
+            applied.borrow_mut().push(level.to_string());
+            Ok(())
+        };
+        let mut last = None;
+        assert_eq!(apply_log_level("info", &mut last, &reload), Some(Ok(())));
+        assert_eq!(apply_log_level("info", &mut last, &reload), None);
+        assert_eq!(apply_log_level("debug", &mut last, &reload), Some(Ok(())));
+        assert_eq!(*applied.borrow(), vec!["info", "debug"]);
+
+        let refuse = |_: &str| Err("pinned".to_string());
+        let mut last = None;
+        assert!(matches!(
+            apply_log_level("debug", &mut last, &refuse),
+            Some(Err(_))
+        ));
+        assert_eq!(apply_log_level("debug", &mut last, &refuse), None);
     }
 }
 
@@ -1646,6 +1808,97 @@ mod environment_certificate_tests {
                 .iter()
                 .any(|environment| environment.contains("pr-42")),
             "a WARN must name the environment; warned: {warned:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod downstream_idle_timeout_tests {
+    //! Backlog #82 and the header timeout, through the real snapshot build.
+
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use lorica_config::models::{
+        GlobalSettings, DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S, DEFAULT_HEADER_TIMEOUT_S,
+        MAX_HEADER_TIMEOUT_S,
+    };
+    use lorica_config::ConfigStore;
+    use tokio::sync::Mutex;
+
+    use super::build_proxy_config;
+    use crate::proxy_wiring::ProxyConfig;
+
+    async fn snapshot_with(edit: impl FnOnce(&mut GlobalSettings)) -> ProxyConfig {
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        let mut settings = store.get_global_settings().expect("test setup: settings");
+        edit(&mut settings);
+        store
+            .update_global_settings(&settings)
+            .expect("test setup: settings write");
+        let store = Arc::new(Mutex::new(store));
+        let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+        build_proxy_config(&store, &proxy_config, None)
+            .await
+            .expect("the snapshot builds")
+            .config
+    }
+
+    async fn snapshot_with_stored(seconds: u32) -> u32 {
+        snapshot_with(|s| s.downstream_idle_timeout_s = seconds)
+            .await
+            .downstream_idle_timeout_s
+    }
+
+    async fn header_timeout_with_stored(seconds: u32) -> u32 {
+        snapshot_with(|s| s.header_timeout_s = seconds)
+            .await
+            .header_timeout_s
+    }
+
+    #[tokio::test]
+    async fn a_stored_header_timeout_reaches_the_snapshot() {
+        assert_eq!(header_timeout_with_stored(15).await, 15);
+    }
+
+    #[tokio::test]
+    async fn a_stored_zero_header_timeout_reads_as_the_default_and_never_as_no_bound() {
+        assert_eq!(
+            header_timeout_with_stored(0).await,
+            DEFAULT_HEADER_TIMEOUT_S
+        );
+    }
+
+    #[tokio::test]
+    async fn a_header_timeout_past_the_ceiling_reads_as_the_ceiling() {
+        assert_eq!(
+            header_timeout_with_stored(u32::MAX).await,
+            MAX_HEADER_TIMEOUT_S
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stored_timeout_reaches_the_snapshot() {
+        assert_eq!(snapshot_with_stored(30).await, 30);
+    }
+
+    #[tokio::test]
+    async fn a_stored_zero_reads_as_the_default_and_never_as_no_limit() {
+        assert_eq!(
+            snapshot_with_stored(0).await,
+            DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_store_ships_the_default() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        assert_eq!(
+            store
+                .get_global_settings()
+                .expect("settings")
+                .downstream_idle_timeout_s,
+            DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S
         );
     }
 }

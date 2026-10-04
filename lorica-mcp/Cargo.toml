@@ -1,0 +1,74 @@
+[package]
+name = "lorica-mcp"
+version = "1.9.0"
+authors = ["Rwx-G"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "Management MCP server for Lorica: a tiered, scope-gated tool surface over the automation plane"
+
+# A library and a binary. The library is the shared core AC #10 asks
+# for: `lorica-api` mounts the Streamable HTTP binding in process and
+# depends on this crate for it, so a binary-only crate would leave that
+# adapter nothing to mount. The binary is the stdio binding and the only
+# thing here that ever touches a file descriptor.
+[lib]
+name = "lorica_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lorica-mcp"
+path = "src/main.rs"
+
+# Every crate below is already a workspace dependency at the version its
+# siblings pin, so nothing here is a new dependency in the sense the
+# project forbids without approval. Story 11.1 decision D5 rules out an
+# MCP SDK: the protocol is hand-rolled, so there is no protocol crate in
+# this list and there is not meant to be one.
+[dependencies]
+# The scope vocabulary, the tier table and the settings allowlist, read
+# from the one statement of them rather than restated here. Pure data
+# with `serde` as its only dependency: `lorica-config` and `lorica-api`
+# stay out of this graph, which is what keeps bundled SQLite out of a
+# stdio subprocess that reads no database, and CI checks it.
+lorica-automation-policy = { version = "1.9.0", path = "../lorica-automation-policy" }
+# The JSON-RPC envelope, the tool schemas and every answer that crosses
+# the seam are JSON. `serde` derive is here for the config file alone.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# The config file is TOML because Lorica's own configuration is TOML;
+# an operator editing one is not learning a second format for the other.
+toml = "1"
+# A tool builds a query string from arguments a model chose. Encoding
+# them is what keeps a value inside the parameter it was given for, and
+# a route id inside its own path segment.
+percent-encoding = "2.1"
+# The stdio binding: the standard streams, and the reactor `reqwest`
+# runs on. `rt` and `macros` only, no `rt-multi-thread`: this process
+# answers one message at a time by design, so a thread pool would be
+# threads asleep in a subprocess an operator's editor launched.
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt"] }
+# The client for the automation listener. `rustls-tls-native-roots`
+# sits beside the webpki bundle for the same reason it does in
+# `lorica-api`: with both on, the root store is seeded from the public
+# roots AND from the platform store, which is where a distribution's CA
+# bundle and anything `SSL_CERT_FILE` points at land. The listener's
+# default certificate is self-signed on top of that, so
+# `LORICA_MCP_CA_BUNDLE` adds what an operator names. There is
+# deliberately no feature and no option here that skips verification.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-native-roots",
+    "rustls-tls-webpki-roots",
+] }
+# The error types' `Display` and `source` (maintainer decision,
+# 2026-09-30), at the version every other product crate pins. A
+# proc-macro: it generates the impls the crate used to write by hand
+# and adds nothing to the stdio binary at runtime.
+thiserror = "2"
+
+[dev-dependencies]
+# The CA-bundle tests trust a real certificate rather than a committed
+# fixture, which would expire and fail the suite on a date nobody
+# chose.
+rcgen = "0.14"
+tempfile = "3"

@@ -3,13 +3,47 @@
 //! Settings are stored as a key/value table; the typed `GlobalSettings`
 //! struct is projected from/to that table here.
 
-use rusqlite::params;
+use std::path::Path;
+use std::time::Duration;
+
+use rusqlite::{params, Connection, OpenFlags};
 
 use super::ConfigStore;
 use crate::error::{ConfigError, Result};
 use crate::models::*;
 
 impl ConfigStore {
+    /// Read the global settings of the database at `path` without
+    /// opening it for writing.
+    ///
+    /// For a caller that inspects a database another process owns, such
+    /// as the CLI reading a running node's settings as root: the file
+    /// is opened read-only, a symbolic link at `path` is refused rather
+    /// than followed, no pragma that writes is set and no migration
+    /// runs, so the schema stays the one the running node knows,
+    /// whatever version this binary is. Encrypted values are returned
+    /// as stored, as [`ConfigStore::open`] without a key returns them.
+    ///
+    /// # Errors
+    ///
+    /// The database cannot be opened read-only (absent, a symbolic
+    /// link, not SQLite) or holds no readable settings table.
+    pub fn read_global_settings_read_only(path: &Path) -> Result<GlobalSettings> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.execute_batch("PRAGMA query_only=ON;")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let reader = Self {
+            conn,
+            encryption_key: None,
+        };
+        reader.get_global_settings()
+    }
+
     /// Read all global settings from the key-value table.
     pub fn get_global_settings(&self) -> Result<GlobalSettings> {
         let mut stmt = self
@@ -73,7 +107,16 @@ impl ConfigStore {
                     settings.flood_strict_rps = value.parse().unwrap_or(0);
                 }
                 "header_timeout_s" => {
-                    settings.header_timeout_s = value.parse().unwrap_or(10);
+                    settings.header_timeout_s = value
+                        .parse()
+                        .unwrap_or(crate::models::DEFAULT_HEADER_TIMEOUT_S);
+                }
+                "downstream_idle_timeout_s" => {
+                    settings.downstream_idle_timeout_s = value.parse().map_err(|e| {
+                        ConfigError::Corrupt(format!(
+                            "stored downstream_idle_timeout_s {value:?} is not a number: {e}"
+                        ))
+                    })?;
                 }
                 "waf_ban_threshold" => {
                     settings.waf_ban_threshold = value.parse().map_err(|e| {
@@ -412,6 +455,10 @@ impl ConfigStore {
             params![settings.header_timeout_s.to_string()],
         )?;
         self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('downstream_idle_timeout_s', ?1)",
+            params![settings.downstream_idle_timeout_s.to_string()],
+        )?;
+        self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_ban_threshold', ?1)",
             params![settings.waf_ban_threshold.to_string()],
         )?;
@@ -736,5 +783,74 @@ impl ConfigStore {
             params![settings.waf_body_scan_max_inflight_bytes.to_string()],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+
+    /// A database holding nothing but a settings table, the way a node
+    /// whose schema predates this binary's migrations looks to it.
+    fn bare_settings_database(dir: &Path, cert_path: &str) -> std::path::PathBuf {
+        let path = dir.join("lorica.db");
+        let conn = Connection::open(&path).expect("create");
+        conn.execute_batch(
+            "CREATE TABLE global_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .expect("table");
+        conn.execute(
+            "INSERT INTO global_settings (key, value) VALUES ('management_cert_pem_path', ?1)",
+            params![cert_path],
+        )
+        .expect("row");
+        path
+    }
+
+    fn table_names(path: &Path) -> Vec<String> {
+        let conn = Connection::open(path).expect("open");
+        let mut statement = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .expect("prepare");
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query");
+        rows.collect::<std::result::Result<Vec<String>, _>>()
+            .expect("rows")
+    }
+
+    #[test]
+    fn the_settings_are_read_and_nothing_is_migrated_or_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = bare_settings_database(dir.path(), "/etc/lorica/management.pem");
+        let bytes_before = std::fs::read(&path).expect("read");
+
+        let settings = ConfigStore::read_global_settings_read_only(&path).expect("settings");
+        assert_eq!(
+            settings.management_cert_pem_path.as_deref(),
+            Some("/etc/lorica/management.pem")
+        );
+        // `ConfigStore::open` would have created `schema_migrations` and
+        // every table after it, and switched the file to WAL.
+        assert_eq!(table_names(&path), vec!["global_settings".to_string()]);
+        assert_eq!(std::fs::read(&path).expect("read"), bytes_before);
+    }
+
+    #[test]
+    fn a_missing_database_is_not_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lorica.db");
+        ConfigStore::read_global_settings_read_only(&path).expect_err("absent");
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_is_refused_rather_than_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = bare_settings_database(dir.path(), "/etc/lorica/management.pem");
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        ConfigStore::read_global_settings_read_only(&link).expect_err("a link is refused");
     }
 }

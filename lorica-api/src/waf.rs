@@ -24,6 +24,14 @@ use crate::middleware::auth::Session;
 use crate::server::AppState;
 use lorica_waf::WafEvent;
 
+/// The deepest one WAF-event read reaches, whatever `?limit=` asks for.
+///
+/// Public for the same reason as [`crate::logs::LOGS_QUERY_MAX_ROWS`]:
+/// a surface paging over this source cannot reach a row past it, and
+/// [`crate::automation::read`] refuses such an offset with a 400 naming
+/// the depth rather than answering an empty page.
+pub const WAF_EVENTS_MAX_ROWS: usize = 500;
+
 /// Query parameters for the WAF events endpoint.
 #[derive(Debug, Deserialize)]
 pub struct WafEventsQuery {
@@ -60,7 +68,7 @@ pub async fn get_waf_events(
     Extension(state): Extension<AppState>,
     Query(params): Query<WafEventsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let limit = params.limit.unwrap_or(50).min(500);
+    let limit = params.limit.unwrap_or(50).min(WAF_EVENTS_MAX_ROWS);
     let rule_count = state.waf_rule_count.unwrap_or(0);
 
     // Read from persistent store if available, fall back to in-memory buffer.
@@ -108,6 +116,22 @@ pub async fn get_waf_events(
 pub async fn get_waf_stats(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    waf_stats(&state, None).await
+}
+
+/// The answer [`get_waf_stats`] gives, with the persistent aggregates
+/// reused while younger than `max_age` when one is given
+/// ([`crate::log_store::LogStore::waf_event_stats_within`]) and
+/// recomputed on every call otherwise, which is the dashboard's case.
+///
+/// # Errors
+///
+/// `Internal` when the blocking task could not be joined; a query
+/// error answers empty counters, as it always has.
+pub(crate) async fn waf_stats(
+    state: &AppState,
+    max_age: Option<std::time::Duration>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let rule_count = state.waf_rule_count.unwrap_or(0);
 
     // Read from persistent store if available, fall back to in-memory buffer
@@ -118,7 +142,13 @@ pub async fn get_waf_stats(
         // The query Result is passed through untouched so a query
         // error still falls back to empty stats below; only a join
         // failure is a hard error, as before.
-        let stats = log_db_blocking(store, move |s| Ok(s.waf_event_stats())).await?;
+        let stats = log_db_blocking(store, move |s| {
+            Ok(match max_age {
+                Some(max_age) => s.waf_event_stats_within(max_age),
+                None => s.waf_event_stats(),
+            })
+        })
+        .await?;
         match stats {
             Ok((total, total_24h, cats)) => {
                 let by_cat = cats

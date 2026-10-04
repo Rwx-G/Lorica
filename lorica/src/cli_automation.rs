@@ -41,81 +41,175 @@
 //! The server side is symmetric: `automation_tokens.rs` logs and
 //! audits the `public_id` only, so nothing on either end of this
 //! command writes the secret anywhere but the operator's terminal.
+//!
+//! # One minting route
+//!
+//! [`mint`] is the only place the CLI creates a token, and
+//! `lorica mcp token create --tier` (`cli_mcp.rs`) goes through it with
+//! a body built by [`mint_request_body`], so a token minted for an MCP
+//! tier is the same credential, through the same request, under the
+//! same audit row, as one minted here.
 
-use crate::cli_client::{fail, management_client, management_data, management_login};
+use lorica_config::models::{
+    validate_automation_grants, AutomationScope, AUTOMATION_TOKEN_SUBJECT,
+};
+
+use std::path::Path;
+
+use crate::cli_client::{fail, management_data, management_session};
+
+/// What `lorica automation token create` was asked to mint, one field
+/// per flag.
+pub(crate) struct TokenMint {
+    /// `--name`.
+    pub(crate) name: String,
+    /// Every `--scope`, as typed.
+    pub(crate) scopes: Vec<String>,
+    /// Every `--hostname`.
+    pub(crate) hostnames: Vec<String>,
+    /// Every `--backend-cidr`.
+    pub(crate) backend_cidrs: Vec<String>,
+    /// `--max-ttl-seconds`.
+    pub(crate) max_ttl_seconds: Option<u32>,
+    /// `--lifetime-days`.
+    pub(crate) lifetime_days: Option<i64>,
+}
 
 /// Mint a scoped automation token and print it once on standard
 /// output.
-#[allow(clippy::too_many_arguments)] // One parameter per CLI flag; grouping
-                                     // them into a struct would put the
-                                     // clap definition and its use out of
-                                     // step for no reader's benefit.
 pub(crate) fn run_automation_token_create(
+    data_dir: &Path,
     management_port: u16,
-    name: String,
-    scopes: Vec<String>,
-    hostnames: Vec<String>,
-    backend_cidrs: Vec<String>,
-    max_ttl_seconds: Option<u32>,
-    lifetime_days: Option<i64>,
-    user: String,
-    password: String,
+    request: &TokenMint,
+    user: &str,
+    password: &str,
 ) {
+    let (stdout, stderr) = mint_token(request, |body| {
+        mint(data_dir, management_port, body, user, password)
+    })
+    .unwrap_or_else(|refused| fail(refused));
+    // The only thing on stdout.
+    print!("{stdout}");
+    eprint!("{stderr}");
+}
+
+/// What the command prints on standard output and on standard error,
+/// minting through `mint`, apart from the network and the terminal so
+/// the split between the two streams can be asserted.
+///
+/// `mcp token create` mints through this too, with the request its
+/// tier resolves to, and appends its blast radius to standard error.
+///
+/// # Errors
+///
+/// The grant rule's refusal, in the flags' words, before `mint` runs.
+pub(crate) fn mint_token(
+    request: &TokenMint,
+    mint: impl FnOnce(&serde_json::Value) -> serde_json::Value,
+) -> Result<(String, String), String> {
+    grants_refusal(&request.scopes, &request.hostnames, &request.backend_cidrs)?;
+    let data = mint(&mint_request_body(request));
+    Ok((
+        format!("{}\n", minted_token(&data)),
+        format!("{}\n", minted_notice(&data)),
+    ))
+}
+
+/// The scopes `spellings` name, or `None` when one is a spelling this
+/// build does not know.
+pub(crate) fn known_scopes(spellings: &[String]) -> Option<Vec<AutomationScope>> {
+    spellings
+        .iter()
+        .map(|spelling| AutomationScope::from_wire(spelling))
+        .collect()
+}
+
+/// The model's own grant rule, run before the round trip, and answered
+/// in the words of the flags an operator typed.
+///
+/// Typed absence: the grants are required when a scope they bound is
+/// carried and refused when none is. The node applies the same function
+/// on the mint, so this only spares a login; a scope spelling the model
+/// does not know is left for the node to refuse by name. Both
+/// `automation token create` and `mcp token create --tier` answer a
+/// grant mistake through this one function, so the two commands, which
+/// are one route, answer it alike.
+///
+/// # Errors
+///
+/// The model's refusal, with its field names read as the flags.
+pub(crate) fn grants_refusal(
+    scopes: &[String],
+    hostnames: &[String],
+    backend_cidrs: &[String],
+) -> Result<(), String> {
+    match known_scopes(scopes) {
+        Some(parsed) => {
+            validate_automation_grants(AUTOMATION_TOKEN_SUBJECT, &parsed, hostnames, backend_cidrs)
+                .map_err(|refused| {
+                    refused
+                        .replace("allowed_hostnames", "--hostname")
+                        .replace("allowed_backend_cidrs", "--backend-cidr")
+                })
+        }
+        None => Ok(()),
+    }
+}
+
+/// Log in on the local management API, send one mint request, and
+/// answer the mint's `data`, exiting with the node's words on any
+/// refusal.
+///
+/// The one route the CLI mints through: `automation token create` and
+/// `mcp token create` both call it.
+pub(crate) fn mint(
+    data_dir: &Path,
+    management_port: u16,
+    body: &serde_json::Value,
+    user: &str,
+    password: &str,
+) -> serde_json::Value {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
-        let client = management_client();
-        management_login(&client, management_port, &user, &password).await;
-        let url = format!("https://127.0.0.1:{management_port}/api/v1/automation/tokens");
-        let body = mint_request_body(
-            &name,
-            &scopes,
-            &hostnames,
-            &backend_cidrs,
-            max_ttl_seconds,
-            lifetime_days,
-        );
+        let client = management_session(data_dir, management_port, user, password).await;
+        let url = crate::cli_client::management_url(management_port, "/api/v1/automation/tokens");
         let response = client
             .post(&url)
-            .json(&body)
+            .json(body)
             .send()
             .await
             .unwrap_or_else(|e| fail(format!("automation token request failed: {e}")));
-        let data = management_data(response, "automation token mint").await;
-        let token = data
-            .get("token")
-            .and_then(|value| value.as_str())
-            .unwrap_or_else(|| fail("automation token mint: no token in the answer"));
-
-        // The only thing on stdout.
-        println!("{token}");
-        eprintln!("{}", minted_notice(&data));
-    });
+        management_data(response, "automation token mint").await
+    })
 }
 
-/// Turn the command's flags into the mint request body.
+/// The full token a mint answered, or exit: the mint already happened,
+/// and an answer without the token is one nobody can use.
+pub(crate) fn minted_token(data: &serde_json::Value) -> &str {
+    data.get("token")
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| fail("automation token mint: no token in the answer"))
+}
+
+/// Turn a mint request into the body the management API accepts.
 ///
 /// Optional fields are OMITTED rather than sent as null: the API's
 /// `deny_unknown_fields` body takes an absent field as "use the
 /// model's default", and `expires_at` against `lifetime_days` is a
-/// mutual exclusion the server refuses.
-fn mint_request_body(
-    name: &str,
-    scopes: &[String],
-    hostnames: &[String],
-    backend_cidrs: &[String],
-    max_ttl_seconds: Option<u32>,
-    lifetime_days: Option<i64>,
-) -> serde_json::Value {
+/// mutual exclusion the server refuses. The two grants are sent as
+/// given, empty included: an empty list is the typed absence a token
+/// carrying no grant-bounded scope must send.
+pub(crate) fn mint_request_body(request: &TokenMint) -> serde_json::Value {
     let mut body: serde_json::Value = serde_json::json!({
-        "name": name,
-        "scopes": scopes,
-        "allowed_hostnames": hostnames,
-        "allowed_backend_cidrs": backend_cidrs,
+        "name": request.name,
+        "scopes": request.scopes,
+        "allowed_hostnames": request.hostnames,
+        "allowed_backend_cidrs": request.backend_cidrs,
     });
-    if let Some(ttl) = max_ttl_seconds {
+    if let Some(ttl) = request.max_ttl_seconds {
         body["max_ttl_seconds"] = serde_json::json!(ttl);
     }
-    if let Some(days) = lifetime_days {
+    if let Some(days) = request.lifetime_days {
         body["lifetime_days"] = serde_json::json!(days);
     }
     body
@@ -129,7 +223,7 @@ fn mint_request_body(
 /// able to keep the two apart. A field the answer did not carry
 /// prints as `?` rather than failing the mint that already happened;
 /// the token is on stdout either way and cannot be minted twice.
-fn minted_notice(data: &serde_json::Value) -> String {
+pub(crate) fn minted_notice(data: &serde_json::Value) -> String {
     let field = |name: &str| -> String {
         data.get(name)
             .and_then(|value| value.as_str())
@@ -159,14 +253,14 @@ mod tests {
 
     #[test]
     fn the_flags_become_the_body_the_api_accepts() {
-        let body = mint_request_body(
-            "ci",
-            &["environments:write".to_string()],
-            &["app.example.com".to_string()],
-            &["10.0.0.0/8".to_string()],
-            Some(3600),
-            Some(30),
-        );
+        let body = mint_request_body(&TokenMint {
+            name: "ci".to_string(),
+            scopes: vec!["environments:write".to_string()],
+            hostnames: vec!["app.example.com".to_string()],
+            backend_cidrs: vec!["10.0.0.0/8".to_string()],
+            max_ttl_seconds: Some(3600),
+            lifetime_days: Some(30),
+        });
         assert_eq!(body["name"], "ci");
         assert_eq!(body["scopes"], serde_json::json!(["environments:write"]));
         assert_eq!(
@@ -187,10 +281,36 @@ mod tests {
         // model's default" and a null as a value; sending null would
         // refuse the mint or override a default the operator never
         // touched.
-        let body = mint_request_body("ci", &[], &[], &[], None, None);
+        let body = mint_request_body(&TokenMint {
+            name: "ci".to_string(),
+            scopes: Vec::new(),
+            hostnames: Vec::new(),
+            backend_cidrs: Vec::new(),
+            max_ttl_seconds: None,
+            lifetime_days: None,
+        });
         assert!(body.get("max_ttl_seconds").is_none());
         assert!(body.get("lifetime_days").is_none());
         assert_eq!(body["scopes"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn the_grant_rule_is_the_models_and_an_unknown_scope_is_left_to_the_node() {
+        let read = ["logs:read".to_string()];
+        let write = ["routes:write".to_string()];
+        let host = ["app.example.com".to_string()];
+        let cidr = ["10.0.0.0/8".to_string()];
+        assert_eq!(grants_refusal(&read, &[], &[]), Ok(()));
+        assert!(grants_refusal(&read, &host, &[]).is_err());
+        assert!(grants_refusal(&read, &[], &cidr).is_err());
+        assert_eq!(grants_refusal(&write, &host, &cidr), Ok(()));
+        assert!(grants_refusal(&write, &host, &[]).is_err());
+        assert!(grants_refusal(&write, &[], &cidr).is_err());
+        assert_eq!(
+            grants_refusal(&["dns:write".to_string()], &host, &cidr),
+            Ok(()),
+            "the node names a scope it does not know; this does not guess"
+        );
     }
 
     #[test]
@@ -216,22 +336,45 @@ mod tests {
 
     #[test]
     fn stdout_carries_the_token_and_nothing_else() {
-        // The split this command exists to guarantee:
-        // `... > /run/secret` must store exactly the credential, with
-        // no banner, no newline of advice, no trailing confirmation.
-        // stdout is `println!("{token}")`, so what a redirect captures
-        // is the token plus one newline.
-        let data = answer();
-        let token: &str = data
-            .get("token")
-            .and_then(|value| value.as_str())
-            .expect("the answer carries a token");
-        let stdout = format!("{token}\n");
+        // The split this command exists to guarantee, on what the
+        // command itself produces: `... > /run/secret` must store
+        // exactly the credential, with no banner, no newline of advice,
+        // no trailing confirmation.
+        let request = TokenMint {
+            name: "ci".to_string(),
+            scopes: vec!["logs:read".to_string()],
+            hostnames: Vec::new(),
+            backend_cidrs: Vec::new(),
+            max_ttl_seconds: None,
+            lifetime_days: Some(30),
+        };
+        let mut sent = None;
+        let (stdout, stderr) = mint_token(&request, |body| {
+            sent = Some(body.clone());
+            answer()
+        })
+        .expect("a read token takes no grant");
         assert_eq!(stdout, format!("{SECRET}\n"));
-        assert_eq!(stdout.trim_end_matches('\n'), SECRET);
+        assert!(!stderr.contains(SECRET), "{stderr}");
+        assert!(stderr.contains("atk_01HZ"), "{stderr}");
+        assert_eq!(sent, Some(mint_request_body(&request)));
+    }
 
-        let stderr = format!("{}\n", minted_notice(&data));
-        assert!(!stderr.contains(SECRET));
-        assert!(!stdout.contains("minted automation token"));
+    #[test]
+    fn a_grant_mistake_is_answered_in_the_flags_words_before_anything_is_sent() {
+        let request = TokenMint {
+            name: "ci".to_string(),
+            scopes: vec!["logs:read".to_string()],
+            hostnames: vec!["app.example.com".to_string()],
+            backend_cidrs: Vec::new(),
+            max_ttl_seconds: None,
+            lifetime_days: None,
+        };
+        let refused = mint_token(&request, |_| {
+            panic!("a refused grant must not reach the node")
+        })
+        .expect_err("a read token takes no grant");
+        assert!(refused.contains("--hostname"), "{refused}");
+        assert!(!refused.contains("allowed_"), "{refused}");
     }
 }

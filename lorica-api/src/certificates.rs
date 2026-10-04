@@ -113,7 +113,7 @@ pub struct CertificateDetailResponse {
     pub acme_method: Option<String>,
 }
 
-fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateResponse {
+pub(crate) fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateResponse {
     CertificateResponse {
         id: c.id.clone(),
         domain: c.domain.clone(),
@@ -282,7 +282,10 @@ fn compute_fingerprint_from_pem(cert_pem: &str) -> String {
 pub async fn list_certificates(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let certs = db_blocking(&state.store, move |store| store.list_certificates()).await?;
+    let certs = db_blocking(&state.store, move |store| {
+        store.list_certificates_without_private_keys()
+    })
+    .await?;
     let responses: Vec<_> = certs.iter().map(cert_to_response).collect();
     Ok(json_data(serde_json::json!({ "certificates": responses })))
 }

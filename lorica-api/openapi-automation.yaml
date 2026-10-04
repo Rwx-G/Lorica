@@ -19,11 +19,13 @@ info:
 
 
     Authorization is by scope, never by role. Every path below declares
-    the scope it requires. A path that declares no scope is reachable by
-    no token, including a token carrying every scope in the enum:
-    refusing outright is what keeps a path added without a declaration
-    from silently inheriting the widest grant.
-  version: "1.8.0"
+    what it requires in `x-required-scope`: either a scope, or the
+    sentinel `any-live-token` for a path that discloses nothing the
+    caller did not already present. A path that declares nothing is
+    reachable by no token, including a token carrying every scope in the
+    enum: refusing outright is what keeps a path added without a
+    declaration from silently inheriting the widest grant.
+  version: "1.9.0"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -49,6 +51,97 @@ tags:
       What the presented token is. Reaches nothing else, so it is the
       call an automation makes to check that its credential is still
       live and still carries the scopes it expects.
+  - name: Reads
+    description: >-
+      What this node is seeing and what it is currently configured with
+      (Story 11.1): access-log rows, WAF events and counters, passive
+      SLA, cluster and node status, backends, routes, and certificate
+      metadata. Each family sits behind its own scope, so a credential
+      is given the one view it needs and not the rest.
+
+
+      Every one of these answers is the management API's own, served
+      here through the same handler and the same view builder rather
+      than computed a second way. Two surfaces that compute one answer
+      independently drift, and on a read surface the drift is a field
+      one of them stopped stripping.
+
+
+      Every collection is paginated and the ceiling is the server's:
+      `limit` is clamped to 200 rows whatever the caller asks for, and
+      there is no parameter that raises it. The intended caller is a
+      language model reading on an operator's behalf, and a model that
+      asks for everything must not be able to pull the access log into
+      a context window.
+
+
+      Nothing here mutates, and the scope gate declares these paths for
+      `GET` alone, so a verb the router does not mount inherits no
+      grant from a rule written about a read.
+  - name: Writes
+    description: >-
+      The write surface (Story 11.2): routes, backends and certificate
+      bindings, each behind its own write scope (`routes:write`,
+      `backends:write`, `certificates:write`). This is the reversal of
+      Story 10.3's decision that the automation surface is the
+      environment resource and never the management API behind a
+      different door, taken for the MCP config tier and recorded in the
+      Epic 10 PRD beside the decision it reverses.
+
+
+      Every path here runs the management API's own handler with the
+      token as the actor: the same validators the dashboard runs, the
+      same defaults, the same managed-row refusal and the same audit row
+      (`route.create`, `backend.update`, ...) naming the token under the
+      role `automation`, beside the `automation.request.ok` row every
+      request on this plane lands. A refusal names the field the way the
+      management path names it, and the row written is the row the
+      dashboard would have written. Nothing here reimplements a field
+      check, which is what keeps the two surfaces from drifting.
+
+
+      What this plane adds is the token's own grant, before the handler
+      runs and before anything is written: every hostname a route write
+      claims, aliases included, must be inside the token's
+      `allowed_hostnames` (403, and a wildcard is refused outright), and
+      every address a backend write points at must be an `ip:port` (422,
+      since a name cannot be checked against a CIDR) inside its
+      `allowed_backend_cidrs` (403). They are the two grants the
+      environment resource already applies, through the same functions.
+
+
+      One named resource per call, by id. No pattern, no selector, no
+      bulk. And no key material anywhere: no path on this listener
+      accepts a PEM body, a private key or a certificate upload. A
+      certificate is bound to a route and renewed here; it enters the
+      node through the management API, by a human.
+  - name: Admin
+    description: >-
+      The admin tier (Story 11.3): one path, `PUT /automation/v1/settings`,
+      behind `settings:write`, changing only the operational global
+      settings the `SettingsPatch` schema lists (log, WAF-event and SLA
+      retention, certificate expiry alert thresholds, the WAF auto-ban
+      threshold and duration, the health-check interval and probe
+      budget), each inside the bound the schema publishes, and the
+      retentions only upwards. The node enforces both: a key outside the
+      list is refused with a 403 naming it, before any value is read,
+      and a value outside its bound or lowering a retention with a 422
+      naming the key and the bound.
+
+
+      On a cluster's control plane every one of these settings is fleet
+      policy, replicated to every follower, so the tier changes the
+      fleet and not one node.
+
+
+      The tier is defined by what it refuses, and the refusal is at the
+      scope gate rather than in a handler: no path on this listener
+      reaches users, roles, the automation tokens, the cluster's nodes
+      or enrolment tokens, revocation, `leave` or break-glass, for any
+      verb and any token, so there is nothing for a caller to name.
+      Every setting this path changes is also changed by the
+      dashboard's settings page, so a human who has lost their MCP
+      client undoes it there.
   - name: Environments
     description: >-
       The environment resource (Story 10.4): a route, its backends, a
@@ -70,6 +163,20 @@ tags:
       principal, and its owner and its labels are still its owner's: a
       `PUT` by anybody else rewrites the route, the backends and the
       lifetime and leaves both untouched.
+  - name: MCP
+    description: >-
+      The Model Context Protocol read tier (Story 11.1), Streamable HTTP
+      binding. One `POST` path over the same core the `lorica-mcp` stdio
+      server runs, reaching the read family above in process rather than
+      over a socket of its own.
+
+
+      It is the one path on this plane whose `x-required-scope` is
+      `any-live-token` for a reason other than disclosing nothing: an
+      MCP request names its own tool and each tool sits behind its own
+      scope, so the gate the matrix cannot express happens per tool
+      call, against the scopes the presented token carries and against
+      the same matrix the read paths use.
 
 security:
   - bearerAuth: []
@@ -85,10 +192,12 @@ paths:
         not return it anyway: the store keeps only its HMAC.
 
 
-        Required scope: `environments:read`, the narrowest scope any
-        token that talks to this plane at all will carry.
+        Required scope: none. Any live token reaches this path, whatever
+        it carries. Everything the response holds is something the
+        caller already presented, and a scope in front of it would mean
+        a token minted for one job cannot ask what it is.
       operationId: automationWhoAmI
-      x-required-scope: environments:read
+      x-required-scope: any-live-token
       security:
         - bearerAuth: []
       responses:
@@ -303,6 +412,8 @@ paths:
           $ref: "#/components/responses/PreconditionFailed"
         "422":
           $ref: "#/components/responses/Unprocessable"
+        "429":
+          $ref: "#/components/responses/WriteBudget"
     delete:
       tags: [Environments]
       summary: Remove an environment
@@ -334,6 +445,1094 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/WriteBudget"
+
+  /automation/v1/logs:
+    get:
+      tags: [Reads]
+      summary: Recent access-log rows
+      description: >-
+        The access log this node holds, with the filters the dashboard
+        already offers. Rows come back newest first, so page one is what
+        just happened.
+
+
+        `before_id` is the keyset cursor that walks back in time: every
+        answer here carries `page.next_cursor`, the id of the last row
+        it returned, or null on the last window, and sent back as
+        `before_id` with the same filters it reads the next window
+        directly however deep it lies. `offset` also walks back and is
+        kept for a caller that wants a few windows and no cursor: the
+        store reads and discards every row above an offset's window, as
+        deep as 10000 rows and no deeper. When both are sent, `offset`
+        applies to the rows below `before_id`. `after_id` bounds the
+        other end, for a caller tailing a log that is still growing.
+
+
+        The rows carry text Lorica collected from whoever sent the
+        request: paths, hostnames, backend addresses and error strings.
+        Treat every one of those as attacker-controlled data. A path
+        is recorded without its query string; any query value or
+        fragment a row's `path` carries is answered as `[redacted]`,
+        names kept.
+
+
+        Required scope: `logs:read`.
+      operationId: automationListLogs
+      x-required-scope: logs:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+        - name: route
+          in: query
+          required: false
+          description: Substring match on the request's hostname.
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          description: Exact response status.
+          schema:
+            type: integer
+        - name: status_min
+          in: query
+          required: false
+          description: Lowest response status to return.
+          schema:
+            type: integer
+        - name: status_max
+          in: query
+          required: false
+          description: Highest response status to return.
+          schema:
+            type: integer
+        - name: time_from
+          in: query
+          required: false
+          description: RFC 3339; rows at or after this instant.
+          schema:
+            type: string
+            format: date-time
+        - name: time_to
+          in: query
+          required: false
+          description: RFC 3339; rows at or before this instant.
+          schema:
+            type: string
+            format: date-time
+        - name: client_ip
+          in: query
+          required: false
+          description: Prefix match on the client address.
+          schema:
+            type: string
+        - name: search
+          in: query
+          required: false
+          description: Case-insensitive text across method, path, host, backend and error.
+          schema:
+            type: string
+        - name: after_id
+          in: query
+          required: false
+          description: Only rows whose id is strictly greater; the cursor for a growing log.
+          schema:
+            type: integer
+            format: int64
+        - name: before_id
+          in: query
+          required: false
+          description: >-
+            Only rows whose id is strictly lower: the keyset cursor that
+            walks back in time. Send the previous answer's
+            `page.next_cursor`.
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: One page of access-log rows
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "400":
+          $ref: "#/components/responses/BeyondTheWindow"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/waf/events:
+    get:
+      tags: [Reads]
+      summary: Recent WAF events
+      description: >-
+        What the WAF matched, newest first, optionally narrowed to one
+        rule category.
+
+
+        A matched payload is the exact text an attacker sent. It
+        crosses unchanged, in the field the WAF recorded it in, and the
+        node does not summarise it, quote it or interpret it.
+
+
+        Required scope: `waf:read`.
+      operationId: automationListWafEvents
+      x-required-scope: waf:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+        - name: category
+          in: query
+          required: false
+          description: One rule category, for example `sql_injection` or `xss`.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One page of WAF events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "400":
+          $ref: "#/components/responses/BeyondTheWindow"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/waf/stats:
+    get:
+      tags: [Reads]
+      summary: WAF counters
+      description: >-
+        Total events, events in the last 24 hours, the loaded rule
+        count and the count per category, the counters up to five
+        seconds old: they count the whole retained table under the log
+        store's one connection, so the plane computes them at most once
+        per five seconds however often it is asked, and a clear of the
+        WAF events drops them at once. The dashboard's own counters are
+        computed per call.
+
+
+        Not paginated, because it is not a row set: the only array it
+        carries is the count per rule category, a fixed vocabulary of
+        rule families rather than something that grows with traffic.
+
+
+        Required scope: `waf:read`.
+      operationId: automationWafStats
+      x-required-scope: waf:read
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The WAF summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    description: >-
+                      The object `GET /api/v1/waf/stats` returns on the
+                      management API, unchanged.
+                    additionalProperties: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/sla/overview:
+    get:
+      tags: [Reads]
+      summary: Passive SLA for every route
+      description: >-
+        Two rows per route, the 1h and the 24h passive window.
+
+
+        The management API accepts `?node=` here to read one follower's
+        figures over the cluster plane; this surface does not. Proxying
+        that read carries an operator floor, and an automation
+        credential has scopes and no role to weigh against it.
+
+
+        Required scope: `sla:read`.
+      operationId: automationSlaOverview
+      x-required-scope: sla:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: One page of SLA summaries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/sla/routes/{id}:
+    get:
+      tags: [Reads]
+      summary: Passive SLA for one route
+      description: >-
+        One route's passive summaries over every standard window (1h,
+        24h, 7d, 30d).
+
+
+        Required scope: `sla:read`.
+      operationId: automationRouteSla
+      x-required-scope: sla:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: One page of SLA summaries for the route
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: This node holds no route with that id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /automation/v1/cluster/status:
+    get:
+      tags: [Reads]
+      summary: This node's cluster status
+      description: >-
+        The node's role (`standalone`, `control_plane` or `follower`),
+        its build version, the configuration generation and hash it has
+        applied, and on a control plane a one-line entry per fleet
+        member.
+
+
+        The fleet ROSTER (`GET /api/v1/cluster/nodes` on the management
+        API) is deliberately not on this plane. It is the one cluster
+        read the management API gates at `Operator` rather than
+        `Viewer`, because it discloses each follower's source address
+        and the hostnames whose certificate private keys it holds; an
+        automation credential carries scopes and no role, so serving it
+        here would stand a role above where the management matrix put
+        that answer. This path is `Viewer` on both planes.
+
+
+        Required scope: `cluster:read`.
+      operationId: automationClusterStatus
+      x-required-scope: cluster:read
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The cluster status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    description: >-
+                      The object `GET /api/v1/cluster/status` returns on
+                      the management API, unchanged.
+                    additionalProperties: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/backends:
+    post:
+      tags: [Writes]
+      summary: Create a backend
+      description: >-
+        `POST /api/v1/backends` on the management API, run as the token:
+        the same body, the same validators, the same 201 with the same
+        view, and a `backend.create` audit row naming the token.
+
+
+        The address must be an `ip:port` (422): a name cannot be
+        checked against `allowed_backend_cidrs`, and every address must
+        be inside that grant (403). `managed_by` is refused (422) as it
+        is on the management path. `tls_skip_verify: true` is refused
+        from a token (403): an upstream a token creates verifies its
+        certificate whenever TLS is on.
+
+
+        With `?dry_run=true`, the backend it would have created, and
+        nothing created (200): see `DryRun`.
+
+
+        Required scope: `backends:write`.
+      operationId: automationCreateBackend
+      x-required-scope: backends:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/DryRun"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagementBackendCreate"
+      responses:
+        "201":
+          description: Created; the backend as `GET /api/v1/backends/{id}` reports it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ManagementRefusal"
+        "429":
+          $ref: "#/components/responses/WriteBudget"
+    get:
+      tags: [Reads]
+      summary: The configured backends
+      description: >-
+        Every backend with its address, weight, health status,
+        lifecycle state, live connection count and EWMA latency score:
+        the view the dashboard's backend table reads, with the query
+        values of `health_check_path` withheld (`[redacted]`). A backend
+        an environment owns carries `managed_by`; the environment's name
+        in it is `[redacted]` unless `GET
+        /automation/v1/environments/{name}` would answer this credential
+        for that name.
+
+
+        For a credential carrying a scope a grant bounds, only the
+        backends whose address is inside its `allowed_backend_cidrs`,
+        and the window pages over those.
+
+
+        Required scope: `backends:read`.
+      operationId: automationListBackends
+      x-required-scope: backends:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: One page of backends
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/backends/{id}:
+    put:
+      tags: [Writes]
+      summary: Update one backend
+      description: >-
+        `PUT /api/v1/backends/{id}` on the management API, run as the
+        token: a patch of the fields sent and nothing else, with a
+        `backend.update` audit row naming the token. A backend an
+        environment owns answers 409 naming the environment, exactly as
+        there. An `address` in the patch is checked against
+        `allowed_backend_cidrs` as on create. Upstream TLS moves one way
+        from a token (403 otherwise): `tls_upstream` on, never off;
+        `tls_skip_verify` off, never on; `tls_sni` unchanged while the
+        upstream certificate is verified.
+
+
+        With `?dry_run=true`, the backend before and after the patch,
+        and nothing changed: see `DryRun`.
+
+
+        Required scope: `backends:write`.
+      operationId: automationUpdateBackend
+      x-required-scope: backends:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagementBackendUpdate"
+      responses:
+        "200":
+          description: Updated; the backend as the management path reports it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "409":
+          $ref: "#/components/responses/ManagedRow"
+        "422":
+          $ref: "#/components/responses/ManagementRefusal"
+        "429":
+          $ref: "#/components/responses/WriteBudget"
+    delete:
+      tags: [Writes]
+      summary: Delete one backend
+      description: >-
+        `DELETE /api/v1/backends/{id}` on the management API, run as the
+        token: the graceful drain (the row leaves once its connections
+        are gone or after 60 s), and a `backend.delete` audit row naming
+        the token. A backend an environment owns answers 409: removing
+        one member of an environment's set is an edit of that set,
+        which only the pipeline owns.
+
+
+        With `?dry_run=true`, the backend that would drain, and no
+        drain started: see `DryRun`.
+
+
+        Required scope: `backends:write`.
+      operationId: automationDeleteBackend
+      x-required-scope: backends:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
+      responses:
+        "200":
+          description: Draining, or deleted at once when it was already draining.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "409":
+          $ref: "#/components/responses/ManagedRow"
+        "429":
+          $ref: "#/components/responses/WriteBudget"
+
+  /automation/v1/routes:
+    post:
+      tags: [Writes]
+      summary: Create a route
+      description: >-
+        `POST /api/v1/routes` on the management API, run as the token:
+        the same body, the same validators, the same defaults, the same
+        201 with the same view, and a `route.create` audit row naming
+        the token. The route created is, field for field, the route the
+        dashboard would have created from the same body.
+
+
+        The hostname and every alias must be inside the token's
+        `allowed_hostnames` (403); a wildcard alias is refused outright,
+        because the grant is checked one exact host at a time.
+        `managed_by` is refused (422) as it is on the management path.
+        `basic_auth_password`, `forward_auth`, `mirror`, `mtls` and
+        `proxy_headers` are refused from a token whatever their value
+        (403): a credential, a URL the CIDR grant cannot weigh, a copy of
+        every request to a second set of backends, the route's
+        client-authentication trust anchor, and a static header map to
+        the upstream where a credential would go. `certificate_id` needs
+        `certificates:write` beside `routes:write`, and a certificate
+        whose `domain` and every SAN are inside `allowed_hostnames`
+        (403).
+
+
+        With `?dry_run=true`, which needs `routes:read` (403), the route
+        it would have created, and nothing created (200): see `DryRun`.
+
+
+        Required scope: `routes:write`.
+      operationId: automationCreateRoute
+      x-required-scope: routes:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/DryRun"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagementRouteCreate"
+      responses:
+        "201":
+          description: Created; the route as `GET /api/v1/routes/{id}` reports it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/ManagementRefusal"
+        "422":
+          $ref: "#/components/responses/ManagementRefusal"
+        "429":
+          $ref: "#/components/responses/WriteBudget"
+    get:
+      tags: [Reads]
+      summary: The configured routes
+      description: >-
+        Every route with its linked backend ids, optionally narrowed to
+        one `group_name`.
+
+
+        The view is the management API's own, so what it withholds it
+        withholds here: a route's Basic-auth username is present and
+        its password hash is not, because the hash never leaves the
+        store. This plane also withholds what that view carries for the
+        dashboard and a credential can ride in: each `proxy_headers`
+        value, name kept, each `header_rules[].value`, and the userinfo
+        and query values of `forward_auth.address`, replaced by
+        `[redacted]`. A route an environment owns carries `managed_by`;
+        the environment's name in it is `[redacted]` unless `GET
+        /automation/v1/environments/{name}` would answer this credential
+        for that name.
+
+
+        For a credential carrying a scope a grant bounds, only the
+        routes whose hostname and every alias are inside its
+        `allowed_hostnames`, and the window pages over those.
+
+
+        Required scope: `routes:read`.
+      operationId: automationListRoutes
+      x-required-scope: routes:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+        - name: group
+          in: query
+          required: false
+          description: Only routes whose `group_name` is exactly this value.
+          schema:
+            type: string
+            example: prod
+      responses:
+        "200":
+          description: One page of routes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/routes/{id}:
+    put:
+      tags: [Writes]
+      summary: Update one route
+      description: >-
+        `PUT /api/v1/routes/{id}` on the management API, run as the
+        token: a patch of the fields sent and nothing else, with a
+        `route.update` audit row naming the token. A route an
+        environment owns answers 409 naming the environment, exactly as
+        there. The route named, on its current hostname and aliases, and
+        a hostname or an alias in the patch must be inside the token's
+        `allowed_hostnames` (403). `basic_auth_password`,
+        `forward_auth`, `mirror`, `mtls` and `proxy_headers` are refused
+        from a token whatever their value (403), and `certificate_id`
+        needs `certificates:write` beside `routes:write`, and a
+        certificate whose `domain` and every SAN are inside
+        `allowed_hostnames` (403). The route's access controls move one
+        way from a token (403 otherwise): the Basic-auth credential in
+        force is neither cleared nor changed, `ip_allowlist` is added or
+        narrowed, `ip_denylist` extended, `geoip` added or tightened in
+        its mode, `bot_protection` never changed once set, the WAF
+        switched on and moved to blocking, and `rate_limit`,
+        `rate_limit_rps`, `rate_limit_burst` and `auto_ban_threshold`
+        added or lowered; `docs/mcp.md` has the rule for each.
+
+
+        `header_rules` replaces the whole list, and this plane answers
+        each rule's `value` as `[redacted]`: a rule sent with exactly
+        that value keeps the value stored for the rule at the same
+        position with the same `header_name` (case aside) and
+        `match_type`, and a marker no stored rule answers to is a 400
+        naming the rule's position. The marker is never stored.
+
+
+        With `?dry_run=true`, which needs `routes:read` (403), the route
+        before and after the patch, and nothing changed: see `DryRun`.
+
+
+        Required scope: `routes:write`.
+      operationId: automationUpdateRoute
+      x-required-scope: routes:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagementRouteUpdate"
+      responses:
+        "200":
+          description: Updated; the route as the management path reports it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "409":
+          $ref: "#/components/responses/ManagedRow"
+        "422":
+          $ref: "#/components/responses/ManagementRefusal"
+        "429":
+          $ref: "#/components/responses/WriteBudget"
+    delete:
+      tags: [Writes]
+      summary: Delete one route
+      description: >-
+        `DELETE /api/v1/routes/{id}` on the management API, run as the
+        token, with a `route.delete` audit row naming the token. A route
+        an environment owns is deletable there and therefore here, and
+        takes the environment with it; the audit row names the
+        environment.
+
+
+        With `?dry_run=true`, the route that would go, its environment
+        named when one owns it, and nothing deleted: see `DryRun`.
+
+
+        Required scope: `routes:write`.
+      operationId: automationDeleteRoute
+      x-required-scope: routes:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "429":
+          $ref: "#/components/responses/WriteBudget"
+
+  /automation/v1/routes/{id}/certificate:
+    put:
+      tags: [Writes]
+      summary: Bind a certificate to one route
+      description: >-
+        Binds a stored certificate to a route: the one-field patch
+        `PUT /api/v1/routes/{id}` would make with `certificate_id`,
+        through the same handler, with the same `route.update` audit row
+        naming the token and the same 409 for a route an environment
+        owns. Selecting a certificate is naming its id here; the
+        listing at `GET /automation/v1/certificates` is where an id
+        comes from. The certificate's `domain` and every SAN must be
+        inside `allowed_hostnames` (403).
+
+
+        The empty string unbinds, and clears `force_https` with it, as
+        the management path reads that value. The body takes the id and
+        nothing else: a field that is not `certificate_id`, a PEM field
+        included, is a 422. Key material does not cross this listener.
+
+
+        With `?dry_run=true`, the route before and after the binding,
+        and nothing bound: see `DryRun`.
+
+
+        Required scope: `certificates:write`.
+      operationId: automationBindCertificate
+      x-required-scope: certificates:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BindCertificateRequest"
+      responses:
+        "200":
+          description: Bound; the route as the management path reports it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "409":
+          $ref: "#/components/responses/ManagedRow"
+        "422":
+          $ref: "#/components/responses/ManagementRefusal"
+        "429":
+          $ref: "#/components/responses/WriteBudget"
+
+  /automation/v1/certificates:
+    get:
+      tags: [Reads]
+      summary: Certificate metadata
+      description: >-
+        Domain, SAN names, SHA-256 fingerprint, issuer, validity window
+        and ACME settings, per stored certificate.
+
+
+        Metadata only. No PEM body of any kind crosses this path, and
+        key material crosses no path on this listener at all: the
+        single-certificate endpoint, which does return the public
+        certificate PEM, is deliberately not mounted here.
+
+
+        For a credential carrying a scope a grant bounds, only the
+        certificates whose domain and every SAN are inside its
+        `allowed_hostnames`, and the window pages over those.
+
+
+        Required scope: `certificates:read`.
+      operationId: automationListCertificates
+      x-required-scope: certificates:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: One page of certificate metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/certificates/{id}/renew:
+    post:
+      tags: [Writes]
+      summary: Renew one ACME certificate
+      description: >-
+        `POST /api/v1/certificates/{id}/renew` on the management API,
+        run as the token: an ACME order for a row the node already
+        holds, renewed in place under the same id so every route bound
+        to it keeps serving, with a `certificate.renew` audit row naming
+        the token. A certificate that was uploaded rather than issued
+        answers 400 exactly as there, because there is nothing to renew
+        it against, and no path on this listener takes the replacement.
+
+
+        No body. Nothing about the certificate is an argument, its key
+        least of all.
+
+
+        A token renews one certificate at a time and not twice in a
+        row: 409 while an order for this certificate is open, on any
+        path; 429 with a `Retry-After` when the certificate was issued
+        less than 48 hours ago, read off its own `not_before`; 429 while
+        the background renewal loop holds it in a CA rate-limit
+        cooldown. Each order spends the CA's per-name budget and rotates
+        the node's bot-protection HMAC, and the per-token call budget
+        counts calls, not orders. An operator's session on the
+        management path is bounded by none of it.
+
+
+        With `?dry_run=true`, which needs `certificates:read` (403), the
+        metadata of the certificate that would be renewed, after the
+        ACME-only refusal and the budget, and no order made: see
+        `DryRun`.
+
+
+        Required scope: `certificates:write`.
+      operationId: automationRenewCertificate
+      x-required-scope: certificates:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/DryRun"
+      responses:
+        "200":
+          description: Renewed in place.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ManagementRefusal"
+        "409":
+          description: A renewal of this certificate is in flight, on this path, the management path or the background loop. One order per certificate at a time.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: The certificate was issued less than 48 hours ago, or the CA's rate limit refused an order for it and the cooldown has not ended, or this credential has spent its write window (see `WriteBudget`). `Retry-After` carries the seconds to wait; the message says which of the three it is, and names the certificate for the first two.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Seconds until a renewal of this certificate is accepted again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: The ACME order failed; the message says why, and the stored certificate is untouched.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /automation/v1/settings:
+    put:
+      tags: [Admin]
+      summary: Change operational settings
+      description: >-
+        `PUT /api/v1/settings` on the management API, run as the token
+        and bounded by the admin tier's allowlist: a key outside
+        `SettingsPatch` is refused (403) with the key named, before any
+        value is read or validated, and a value outside the bound
+        `SettingsPatch` publishes for its key, or lowering a retention
+        below its stored value, is refused (422) with the key and the
+        bound named. The keys it accepts then go through the dashboard's
+        own validators, trigger the same reload, and land a
+        `settings.update` audit row naming the token whose target lists
+        each key the write changed as `key:old->new`. A write that
+        changes no stored value writes nothing, reloads nothing and
+        lands no row.
+
+
+        The answer is the allowlisted part of the settings document
+        after the write, and nothing else of it: the scope that writes
+        these keys reads back these keys. There is no `GET` on this
+        path; the settings document is not readable on this plane.
+
+
+        With `?dry_run=true`, the same part before and after the patch,
+        and nothing written. The dry run needs no scope beside
+        `settings:write`, because it shows only what that scope may
+        write: see `DryRun`.
+
+
+        Required scope: `settings:write`.
+      operationId: automationUpdateSettings
+      x-required-scope: settings:write
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/DryRun"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SettingsPatch"
+      responses:
+        "200":
+          description: Updated; the allowlisted settings as they now stand.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagementAnswer"
+        "400":
+          $ref: "#/components/responses/ManagementRefusal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          description: >-
+            A value outside the bound `SettingsPatch` publishes for its
+            key, a retention lowered below its stored value, or a value
+            of the wrong type. The message names the key and, for a
+            bound, the bound. Nothing was written.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/WriteBudget"
+
+  /automation/v1/mcp:
+    post:
+      tags: [MCP]
+      summary: One Model Context Protocol message
+      description: >-
+        The Streamable HTTP binding of the Lorica MCP read tier, as one
+        path on this listener rather than a port of its own: an operator
+        who has not enabled the automation listener gains no MCP
+        surface.
+
+
+        This implements MCP revision **2026-07-28** and no other era.
+        There is no `initialize` handshake in that revision: every
+        request carries its own metadata under `params._meta`, and the
+        discovery call that replaced the handshake is `server/discover`.
+        The methods answered are `server/discover`, `tools/list` and
+        `tools/call`, plus the notification `notifications/cancelled`.
+        Anything else is a `404`, which is unusual for a JSON-RPC server
+        and deliberate: it is how a client tells a server on this
+        revision from one on the era its method belonged to.
+
+
+        Required scope: none at the path. That is not a wider grant, it
+        is the statement that this path's gate is elsewhere: an MCP
+        request names its own tool and each tool has its own scope, so
+        the endpoint is reached by any live token and every `tools/call`
+        is authorized against the presented token's scopes. A tool the
+        token cannot reach is absent from that request's `tools/list`
+        and unknown to its `tools/call`, which the specification permits
+        explicitly, since credentials are per-request input and not
+        connection state.
+
+
+        One process serves one MCP tier, and this path builds one
+        server per request: a token whose scopes span two tiers (a read
+        scope the config tier does not tolerate beside a config write,
+        for instance) is refused with a `403` naming the offending
+        scopes, before any tool is listed or called. The stdio binary
+        refuses the same token at startup, through the same check.
+
+
+        Every POST carries `MCP-Protocol-Version`, `Mcp-Method` mirrored
+        from the body's `method`, and, on a `tools/call`, `Mcp-Name`
+        mirrored from `params.name`. Each is VALIDATED against the body
+        rather than trusted, because Lorica is exactly the kind of
+        intermediary that rule exists to protect. A header value may
+        arrive Base64-sentinel encoded as `=?base64?...?=` and is
+        decoded before it is compared.
+
+
+        The `Origin` header is refused whatever it names. The
+        specification's one MUST on this transport is against DNS
+        rebinding, and the usual same-host check is what rebinding
+        defeats; this plane serves no browser, so a present `Origin`
+        means a page is driving the endpoint.
+
+
+        Revision 2026-07-28 removed protocol-level sessions, the
+        standalone `GET` stream and `Last-Event-ID` resumability. `GET`
+        and `DELETE` on this path answer `405`. An `Mcp-Session-Id` is
+        ignored and never echoed, and a `Last-Event-ID` is ignored.
+      operationId: automationMcp
+      x-required-scope: any-live-token
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/McpProtocolVersion"
+        - $ref: "#/components/parameters/McpMethod"
+        - $ref: "#/components/parameters/McpName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonRpcMessage"
+      responses:
+        "200":
+          description: >-
+            One JSON-RPC response object. The revision also permits an
+            SSE stream here; this binding answers in one object, because
+            every method it implements answers in one message.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonRpcAnswer"
+        "202":
+          description: >-
+            The message was a notification and there is nothing to
+            answer. No body. This revision defines no client-to-server
+            notification over HTTP, so this is transport mechanics
+            rather than a path with a purpose.
+        "400":
+          $ref: "#/components/responses/McpBadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/McpForbidden"
+        "404":
+          $ref: "#/components/responses/McpMethodNotFound"
 
 components:
   parameters:
@@ -349,6 +1548,151 @@ components:
       schema:
         type: string
         example: pr-42
+
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      description: The resource id, as the matching listing reports it.
+      schema:
+        type: string
+
+    PageLimit:
+      name: limit
+      in: query
+      required: false
+      description: >-
+        Rows wanted. Clamped to 200 server-side, and there is no
+        parameter that raises that: the ceiling exists so a caller
+        asking for everything cannot pull a table into a context
+        window. Absent means 50; 0 means 1.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+
+    PageOffset:
+      name: offset
+      in: query
+      required: false
+      description: >-
+        Rows to skip before the window starts. Advance it by the
+        answer's `returned`, never by `limit`: the two differ when the
+        byte ceiling ended an answer early, and advancing by `limit`
+        would step over the rows that did not fit.
+
+
+        On a listing the node holds in full (routes, backends,
+        certificates, SLA) an offset past the end is an empty window and
+        not an error, because the listing really held nothing there. On
+        the two reads whose source clamps its own row budget (`/logs` at
+        10000 rows, `/waf/events` at 500) an offset that clamp cannot
+        honour is a `400` naming the deepest window this limit can
+        reach. It is not an empty page: past the clamp the answer would
+        read `{"items": [], "has_more": false}` while the table still
+        held thousands of rows, and that is the one failure a pager
+        reports as "there was nothing". Narrow such a read with its
+        filters rather than paging past the clamp.
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+
+    DryRun:
+      name: dry_run
+      in: query
+      required: false
+      description: >-
+        `true` runs the write's own validators, computes the change it
+        would make against the configuration as it stands, and writes
+        nothing: no row, no reload signal, no management audit row. The
+        request row is written as for any request, with `?dry_run`
+        beside the verb. The answer is `200` with
+        `{"data": {"dry_run": true, "operation": "create" | "update" |
+        "delete" | "renew", "before": <view or null>, "after": <view or
+        null>, "changes": {<field>: {"from", "to"}} or null}}`: a
+        create's `after` is the row it would insert, less the id and the
+        clock the apply would mint; an update's `before` and `after` are
+        the views either side of the patch, with `changes` naming the
+        fields that differ; a delete's and a renewal's `before` is the
+        row that would go or be renewed. What only the store refuses (a
+        duplicate hostname, a backend id that names nothing) is refused
+        by the apply and not by the dry run. The token's grants are
+        checked first either way (403), so a dry run never shows a change
+        the apply would refuse on the grant. A dry run answers the full
+        row it would change, so it needs the read scope of that row
+        beside the write scope: `routes:read` for a route or a
+        certificate binding, `backends:read` for a backend,
+        `certificates:read` for a renewal (403 naming the scope). The
+        settings write is the exception, and it is one by construction:
+        its dry run answers only the allowlisted settings that
+        `settings:write` itself writes, so it needs no scope beside it.
+
+
+        The query is strict: a key that is not `dry_run` is a 400, so
+        `?dryrun=true` or `?dry-run=true` typed by hand is refused rather
+        than applied. `dry_run` itself takes `true` or `false` and
+        nothing else.
+
+
+        This is the preview the MCP config tier's `*_preview` tools call
+        (Story 11.2 AC #3). It is an affordance and not a control: the
+        protocol offers no way to make a client call it first.
+      schema:
+        type: boolean
+        default: false
+
+    McpProtocolVersion:
+      name: MCP-Protocol-Version
+      in: header
+      required: true
+      description: >-
+        The MCP revision this request is written against. Required on
+        every POST to the MCP endpoint. It must equal the
+        `io.modelcontextprotocol/protocolVersion` field under the body's
+        `_meta` when the body names one, and it must be a revision this
+        server implements: a mismatch is `-32020`, an unimplemented
+        revision is a `400` naming the versions that are supported.
+      schema:
+        type: string
+        example: "2026-07-28"
+
+    McpMethod:
+      name: Mcp-Method
+      in: header
+      required: true
+      description: >-
+        The body's `method`, mirrored. Validated rather than trusted:
+        an intermediary routing on the header while the body asks for
+        something else is the failure this rule exists for.
+
+
+        The value may be Base64-sentinel encoded as `=?base64?...?=`,
+        and is decoded before it is compared. A server that compared
+        the raw header instead would accept any mismatch wearing a
+        sentinel, which makes the check optional for anyone who read
+        the specification.
+      schema:
+        type: string
+        example: tools/call
+
+    McpName:
+      name: Mcp-Name
+      in: header
+      required: false
+      description: >-
+        The body's `params.name`, mirrored. Required on a `tools/call`
+        and refused on anything else, since nothing else has a
+        counterpart for it to equal. Same Base64 sentinel and same
+        decode-before-compare rule as `Mcp-Method`.
+
+
+        It is also what the audit row records as the tool the caller
+        said this request was for, inside the `asserted[...]` clause.
+      schema:
+        type: string
+        example: lorica_logs
 
   securitySchemes:
     bearerAuth:
@@ -422,6 +1766,7 @@ components:
           description: Everything this credential may do.
           items:
             $ref: "#/components/schemas/AutomationScope"
+          example: ["environments:read", "routes:read"]
         pipeline:
           $ref: "#/components/schemas/PipelineIdentity"
 
@@ -447,16 +1792,162 @@ components:
         user_login:
           type: string
           nullable: true
-          example: ["environments:read", "routes:read"]
+          example: user01
 
     AutomationScope:
       type: string
-      description: One grant on the automation plane.
+      description: >-
+        One grant on the automation plane. The three write grants after
+        `backends:read` arrived with the MCP config tier (Story 11.2)
+        and reach the write surface above; `settings:write` arrived with
+        the admin tier (Story 11.3) and reaches the allowlisted settings
+        and nothing else; the environment grants reach the environment
+        resource and nothing else.
       enum:
         - environments:write
         - environments:read
         - routes:read
         - certificates:read
+        - logs:read
+        - waf:read
+        - sla:read
+        - cluster:read
+        - backends:read
+        - routes:write
+        - backends:write
+        - certificates:write
+        - settings:write
+
+    ManagementRouteCreate:
+      type: object
+      description: >-
+        The body `POST /api/v1/routes` accepts on the management API,
+        unchanged: `CreateRouteRequest` in `openapi.yaml`. It is not
+        restated here, where a second copy would drift; the field names
+        this path accepts are pinned in Rust against the struct the
+        handler deserialises by `tests/openapi_contract.rs`, so a field
+        the management model grows reaches this plane by a decision and
+        not by default. `managed_by` is refused (422) as it is there.
+      additionalProperties: true
+
+    ManagementRouteUpdate:
+      type: object
+      description: >-
+        The body `PUT /api/v1/routes/{id}` accepts on the management
+        API, unchanged: `UpdateRouteRequest` in `openapi.yaml`. Every
+        field optional; a field absent leaves the route's value alone.
+        Pinned the same way as `ManagementRouteCreate`.
+      additionalProperties: true
+
+    ManagementBackendCreate:
+      type: object
+      description: >-
+        The body `POST /api/v1/backends` accepts on the management API,
+        unchanged: `CreateBackendRequest` in `openapi.yaml`, pinned the
+        same way as `ManagementRouteCreate`. On this plane `address`
+        must be an `ip:port` inside the token's `allowed_backend_cidrs`.
+      additionalProperties: true
+
+    ManagementBackendUpdate:
+      type: object
+      description: >-
+        The body `PUT /api/v1/backends/{id}` accepts on the management
+        API, unchanged: `UpdateBackendRequest` in `openapi.yaml`, pinned
+        the same way as `ManagementRouteCreate`.
+      additionalProperties: true
+
+    BindCertificateRequest:
+      type: object
+      description: >-
+        The one field a certificate binding takes. Unknown fields are
+        refused (422): there is no field here that could carry a
+        certificate body or a key, and one that arrives is an error
+        rather than something ignored.
+      required: [certificate_id]
+      additionalProperties: false
+      properties:
+        certificate_id:
+          type: string
+          description: >-
+            A stored certificate's id, as `GET /automation/v1/certificates`
+            reports it. The empty string unbinds.
+          example: 6f1c2b7e-3a44-4d0e-9a2b-1f5c8d7e9a01
+
+    SettingsPatch:
+      type: object
+      description: >-
+        The global settings the admin tier may change, and no other,
+        each within the bound its `minimum` and `maximum` publish; the
+        three retentions may also only be raised from their stored
+        value. Each field means what it means on `PUT /api/v1/settings`
+        in `openapi.yaml`, is optional, and is validated by the same
+        function after the tier's bound; a field absent leaves the
+        stored value alone. A key not listed here is refused (403) with
+        the key named, before any value is read: the list is
+        `SETTINGS_ALLOWLIST` in `lorica-automation-policy/src/settings.rs`,
+        where each entry carries the reason it is in and its bound, and
+        `tests/openapi_contract.rs` pins this schema, bounds included,
+        against it.
+      additionalProperties: false
+      properties:
+        access_log_retention:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1000000
+          description: Raise-only. 0 (unlimited) is refused, and so is anything above ten times the shipped default.
+        waf_event_retention:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1000000
+          description: Raise-only. 0 (unlimited) is refused, and so is anything above ten times the shipped default.
+        sla_purge_retention_days:
+          type: integer
+          minimum: 1
+          maximum: 3650
+          description: Raise-only.
+        cert_warning_days:
+          type: integer
+          minimum: 14
+          maximum: 365
+        cert_critical_days:
+          type: integer
+          minimum: 3
+          maximum: 365
+          description: Below `cert_warning_days`, as on the dashboard.
+        waf_ban_threshold:
+          type: integer
+          minimum: 3
+          maximum: 100
+        waf_ban_duration_s:
+          type: integer
+          minimum: 60
+          maximum: 86400
+        default_health_check_interval_s:
+          type: integer
+          minimum: 5
+          maximum: 60
+        health_max_concurrent_probes:
+          type: integer
+          minimum: 16
+          maximum: 512
+
+    ManagementAnswer:
+      type: object
+      description: >-
+        The object the wrapped management path answers, passed through
+        untouched under `data`: a route as `RouteResponse`, a backend as
+        `BackendResponse`, or the renewal's `{renewed, old_cert_id,
+        new_cert_id, domain}`, each documented in `openapi.yaml` against
+        the management path rather than restated here. None of them
+        carries key material or a credential; the route view withholds
+        the Basic-auth hash there and therefore here.
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: true
 
     EnvironmentRequest:
       type: object
@@ -532,7 +2023,7 @@ components:
 
     EnvironmentWriteResponse:
       type: object
-      required: [name, url, route_id, backend_ids, certificate_id, certificate_not_after, expires_at, applied_generation]
+      required: [name, url, route_id, backend_ids, certificate_id, certificate_not_after, expires_at, protections_inherited_from, applied_generation]
       properties:
         name:
           type: string
@@ -555,6 +2046,17 @@ components:
         expires_at:
           type: string
           format: date-time
+        protections_inherited_from:
+          type: array
+          items:
+            type: string
+          description: >-
+            The ids of the routes that served this hostname before the
+            environment took it (a wildcard or the catch-all) whose
+            protections the environment's route inherited, because its
+            own profile was weaker on at least one of them. Empty when
+            it displaced no protected route. The inherited values are
+            not answered.
         applied_generation:
           type: integer
           format: int64
@@ -628,6 +2130,72 @@ components:
         pipeline:
           $ref: "#/components/schemas/PipelineIdentity"
 
+    PagedAnswer:
+      type: object
+      description: >-
+        One window over a collection. The items are the management
+        API's own records, serialised by the management API's own view
+        builder and passed through untouched, which is what keeps the
+        two surfaces from describing one record two ways. Their fields
+        are therefore documented in `openapi.yaml`, against the
+        management path each read wraps, rather than restated here
+        where a second copy would drift.
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [items, page]
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+            page:
+              $ref: "#/components/schemas/PageInfo"
+
+    PageInfo:
+      type: object
+      description: >-
+        What this answer's window was. No total: the sources behind
+        this surface count differently (the log store counts every
+        match, the WAF buffer counts what it returned, a store listing
+        counts rows), and one field meaning three things is worse than
+        no field. Every source is asked for one row past the window, and
+        a window the source cannot fill is refused rather than answered
+        short, so `has_more` is exact on every window this surface
+        answers at all.
+      required: [limit, offset, returned, has_more]
+      properties:
+        limit:
+          type: integer
+          description: The window size after the server-side ceiling.
+          example: 50
+        offset:
+          type: integer
+          example: 0
+        returned:
+          type: integer
+          description: >-
+            How many items this answer carries, and what a pager
+            advances `offset` by. Short of `limit` with `has_more` true
+            means the answer stopped on the byte ceiling: rows are
+            dropped whole rather than truncated, because a field that
+            arrives mangled is worse than a page that arrives short.
+          example: 50
+        has_more:
+          type: boolean
+          description: Whether a row exists past this window.
+        next_cursor:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            On `/logs` alone, and always there: what to send as
+            `before_id` for the next window, the id of the last row this
+            answer returned, or null when `has_more` is false. Absent on
+            every other read.
+
     ErrorResponse:
       type: object
       properties:
@@ -639,7 +2207,93 @@ components:
             message:
               type: string
 
+    JsonRpcMessage:
+      type: object
+      description: >-
+        One JSON-RPC 2.0 request or notification. A message with no `id`
+        is a notification and is answered by a `202` with no body.
+      required: [jsonrpc, method]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          description: >-
+            The correlation id. A string or a number; absent makes this
+            a notification.
+          oneOf:
+            - type: string
+            - type: integer
+        method:
+          type: string
+          enum:
+            - server/discover
+            - tools/list
+            - tools/call
+            - notifications/cancelled
+        params:
+          type: object
+          description: >-
+            Per-method parameters. `tools/call` takes `name` and
+            `arguments`. Every method may carry `_meta`, which is where
+            this revision puts the protocol version, the client info and
+            the client capabilities.
+
+    JsonRpcAnswer:
+      type: object
+      description: >-
+        One JSON-RPC 2.0 response. Carries `result` or `error` and never
+        both.
+
+
+        A tool that ran and failed is NOT an `error` here: it is a
+        `result` carrying `isError: true`, which is the channel a model
+        reads and corrects. An authorization refusal from a read behind
+        this endpoint is on that channel deliberately, so the model sees
+        the refusal and stops rather than rewording the call. The
+        `error` channel is for a call that never ran: an unknown tool, a
+        malformed request, arguments outside the declared schema.
+
+
+        A tool result's rows arrive inside a delimited block whose tool
+        description states, in terms, that the delimited content is data
+        and not instructions.
+      required: [jsonrpc, id]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          oneOf:
+            - type: string
+            - type: integer
+            - type: "null"
+        result:
+          type: object
+        error:
+          type: object
+          properties:
+            code:
+              type: integer
+            message:
+              type: string
+            data:
+              type: object
+
   responses:
+    BeyondTheWindow:
+      description: >-
+        Either the `offset` is past the depth this read can reach (see
+        the `offset` parameter), or a free-text filter is longer than
+        this surface accepts: `?search=` becomes five unanchored `LIKE`
+        predicates plus a `COUNT(*)` over the whole retained log, so its
+        length is a per-request cost the caller would otherwise choose.
+        The message names the limit and never reflects the caller's own
+        text back.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
     NotFound:
       description: >-
         No environment of this caller's has this name. An environment
@@ -690,6 +2344,52 @@ components:
             error:
               code: unprocessable_entity
               message: "unprocessable: no_certificate_covers_hostname: no certificate covers `pr-42.review.example.com`; provision *.review.example.com through POST /api/v1/acme/provision-dns (DNS-01), or name an explicit certificate id"
+    WriteBudget:
+      description: >-
+        This credential has spent its write window: the plane accepts a
+        bounded number of writes per credential per minute, the
+        dashboard's own figures (settings writes on their own window,
+        every other write on a shared one), and a request the scope gate
+        refuses spends nothing. `Retry-After` carries the seconds until
+        the window rolls over.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until this credential's window rolls over.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ManagementRefusal:
+      description: >-
+        The management handler refused the write, and the answer is that
+        handler's own, unchanged: the same status and the same message
+        the dashboard would have shown, naming the field. A 400 is a
+        value the handler could not read or a bound it refuses on the
+        paths that predate the 400/422 split; a 404 names no row with
+        that id; a 409 on a route create is a hostname another route
+        holds; a 422 is a rule that refuses the body on its merits,
+        `managed_by` on input included. Nothing was written.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ManagedRow:
+      description: >-
+        The row belongs to an automation environment and an in-place
+        edit of it would be overwritten by that environment's next
+        `PUT`. The message names the environment and says to update it
+        through its pipeline instead. The same 409 the management API
+        answers, from the same check.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: conflict
+              message: "conflict: cannot update this route: it is managed by the automation API for environment `pr-42`. Update the environment through the pipeline instead."
     Unauthorized:
       description: >-
         The credential was not accepted. Missing, malformed, unknown,
@@ -747,3 +2447,70 @@ components:
             error:
               code: forbidden
               message: this token does not carry the environments:read scope
+
+    McpBadRequest:
+      description: >-
+        The transport refused the POST before the protocol core saw it.
+
+
+        Code `-32020` `HeaderMismatch` for a mirrored header that does
+        not equal its body counterpart, a required one missing, or a
+        value carrying characters that cannot be read as text and
+        therefore cannot be compared. A different code, with
+        `error.data.name` set to `UnsupportedProtocolVersionError` and
+        `error.data.supportedVersions` listing what this server speaks,
+        for a revision it does not implement. `-32700` for a body that
+        is not JSON and `-32600` for JSON that is not a JSON-RPC
+        message.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/JsonRpcAnswer"
+          example:
+            jsonrpc: "2.0"
+            id: 4
+            error:
+              code: -32020
+              message: "`mcp-name` does not equal the body's `params.name`"
+
+    McpForbidden:
+      description: >-
+        Either of two refusals, each a JSON-RPC error.
+
+
+        An `Origin` header was present. This endpoint serves no browser
+        origin, so every one is refused: the specification's one MUST on
+        this transport is against DNS rebinding, and a present `Origin`
+        on a machine-facing API behind a bearer token means a page is
+        driving it. The body carries no `id`: the request was not read
+        far enough to have one, and inventing one would answer a
+        correlation nobody made.
+
+
+        Or the presented token's scopes span two MCP tiers, so no server
+        is built for it. The body carries the request's `id` and a
+        message naming the scopes that put the token in two tiers; the
+        audit row reads `automation.request.forbidden:spans_tiers`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/JsonRpcAnswer"
+
+    McpMethodNotFound:
+      description: >-
+        The method is not one this server implements. A `404` and not a
+        `-32601` inside a `200`, which is unusual for a JSON-RPC server
+        and is how a client tells a server on revision 2026-07-28 from
+        one on the era the method belonged to: `initialize` answers this.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/JsonRpcAnswer"
+          example:
+            jsonrpc: "2.0"
+            id: 1
+            error:
+              code: -32601
+              message: >-
+                this server implements server/discover, tools/list and
+                tools/call, and accepts notifications/cancelled

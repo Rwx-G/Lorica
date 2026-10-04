@@ -80,6 +80,12 @@ pub mod time {
 pub mod prelude {
     pub use lorica_core::prelude::*;
     pub use lorica_http::prelude::*;
+    // Unconditional on purpose, and the reason it must stay that way is
+    // the bug this line replaced: the prelude also carried a second,
+    // `time`-gated re-export of the same crate, so `--all-features`
+    // glob-imported `lorica_timeout` twice into one module and refused
+    // to build. Re-gating this one behind `time` would narrow the
+    // prelude every default build already relies on.
     pub use lorica_timeout::*;
 
     #[cfg(feature = "lb")]
@@ -89,8 +95,4 @@ pub mod prelude {
     #[cfg(feature = "proxy")]
     #[cfg_attr(docsrs, doc(cfg(feature = "proxy")))]
     pub use lorica_proxy::prelude::*;
-
-    #[cfg(feature = "time")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "time")))]
-    pub use lorica_timeout::*;
 }

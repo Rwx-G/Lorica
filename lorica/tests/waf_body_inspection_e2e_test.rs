@@ -15,7 +15,7 @@
 //! True HTTP end-to-end for content-type-aware WAF body inspection.
 //!
 //! Stands up a real `LoricaProxy` with the WAF in Blocking mode in
-//! front of an origin that counts the body bytes it actually receives,
+//! front of an origin that records the body bytes it actually receives,
 //! and asserts the contract Story 10.6 AC #1 to #4 states:
 //!
 //! 1. A body the engine cannot parse (`application/octet-stream`) is
@@ -38,6 +38,22 @@
 //!    for the route that sets it and for no other, and a body past the
 //!    widened window is still rejected. The oversize semantics of AC
 //!    #6 are the same ones, measured against the effective cap.
+//! 8. The Blocking-mode hold: a body the engine scans is read in full
+//!    before the upstream is dialled. A refused one, whatever refused
+//!    it and whatever its framing, never reaches the origin, not even
+//!    as a connection; a clean one arrives byte for byte; a client
+//!    that sent `Expect: 100-continue` is answered by the proxy.
+//!    Detection mode still streams.
+//! 9. The hold is bounded: a body that stops arriving is answered 408
+//!    after `downstream_idle_timeout_s`, one that has not arrived whole
+//!    after the route's `read_timeout_s` likewise, the connection is
+//!    closed and the origin never sees it; and a held body takes no slot
+//!    of the route's `max_connections`.
+//!
+//! "The origin never saw it" is asserted with a probe rather than a
+//! wait (`assert_origin_untouched`), so no assertion here depends on
+//! timing, except the bounds of item 9, which are timeouts and are
+//! asserted with wide margins.
 //!
 //! The node-wide in-flight budget (AC #7) is exercised in
 //! `waf_body_scan_budget_e2e_test.rs`, which needs a process to itself
@@ -52,7 +68,7 @@ use common::reserve_port;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -60,27 +76,75 @@ use lorica::proxy_wiring::{LoricaProxy, ProxyConfig, ProxyConfigGlobals};
 use lorica_config::models::*;
 use lorica_core::server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 const SCAN_WINDOW: usize = 1_048_576;
 const ROUTE_BODY_LIMIT: u64 = 8 * 1_048_576;
+/// Size of the chunks the raw client frames a chunked body into.
+const CLIENT_CHUNK: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
-// Origin that counts the body bytes it receives, de-chunking when needed.
+// Origin that records the body bytes it receives, de-chunking when needed.
 // ---------------------------------------------------------------------------
 
-async fn spawn_body_counting_origin() -> (SocketAddr, Arc<AtomicU64>) {
+/// What one upstream connection carried, reported once the origin has
+/// stopped reading it.
+struct UpstreamRequest {
+    /// Request line and headers, lowercased.
+    head: String,
+    /// Payload bytes, whichever framing the proxy chose. Only whole
+    /// chunks count, so a body cut off mid-chunk reports the bytes that
+    /// actually arrived rather than the size its last header promised.
+    body: Vec<u8>,
+    /// The body ended on its own framing: the terminating chunk, or the
+    /// last byte of the advertised `Content-Length`. An origin only acts
+    /// on a request that completes; one cut off mid-body is discarded.
+    complete: bool,
+}
+
+impl std::fmt::Debug for UpstreamRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamRequest")
+            .field("request_line", &self.head.lines().next().unwrap_or(""))
+            .field("body_len", &self.body.len())
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+/// The test's view of the origin.
+struct Upstream {
+    /// Payload bytes received across every connection.
+    received: Arc<AtomicU64>,
+    /// Connections the origin accepted, counted at `accept`.
+    accepted: Arc<AtomicU64>,
+    requests: mpsc::UnboundedReceiver<UpstreamRequest>,
+    /// One message per connection, as soon as its first payload bytes
+    /// arrive, before the body is over.
+    body_started: mpsc::UnboundedReceiver<()>,
+}
+
+async fn spawn_origin() -> (SocketAddr, Upstream) {
     let received = Arc::new(AtomicU64::new(0));
-    let received_c = Arc::clone(&received);
+    let accepted = Arc::new(AtomicU64::new(0));
+    let (requests_tx, requests) = mpsc::unbounded_channel();
+    let (started_tx, body_started) = mpsc::unbounded_channel();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let received_c = Arc::clone(&received);
+    let accepted_c = Arc::clone(&accepted);
     tokio::spawn(async move {
         loop {
             let (mut stream, _) = match listener.accept().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
+            accepted_c.fetch_add(1, Ordering::SeqCst);
             let received = Arc::clone(&received_c);
+            let requests_tx = requests_tx.clone();
+            let started_tx = started_tx.clone();
             tokio::spawn(async move {
                 let mut buf: Vec<u8> = Vec::new();
                 let mut scratch = [0u8; 16384];
@@ -95,53 +159,84 @@ async fn spawn_body_counting_origin() -> (SocketAddr, Arc<AtomicU64>) {
                         break pos + 4;
                     }
                 };
-                let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
                 let body_so_far = buf.split_off(header_end);
 
-                let counted = if headers.contains("transfer-encoding: chunked") {
-                    read_chunked_body(&mut stream, body_so_far).await
+                let request = if head.contains("transfer-encoding: chunked") {
+                    read_chunked_body(&mut stream, head, body_so_far, &started_tx).await
                 } else {
-                    let want = headers
+                    let want = head
                         .split("content-length:")
                         .nth(1)
                         .and_then(|rest| rest.split("\r\n").next())
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .unwrap_or(0);
-                    read_sized_body(&mut stream, body_so_far, want).await
+                    read_sized_body(&mut stream, head, body_so_far, want, &started_tx).await
                 };
 
-                received.fetch_add(counted as u64, Ordering::SeqCst);
+                received.fetch_add(request.body.len() as u64, Ordering::SeqCst);
+                let complete = request.complete;
+                let _ = requests_tx.send(request);
+                if !complete {
+                    return;
+                }
                 let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                 let _ = stream.write_all(resp.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
         }
     });
-    (addr, received)
+    (
+        addr,
+        Upstream {
+            received,
+            accepted,
+            requests,
+            body_started,
+        },
+    )
 }
 
 async fn read_sized_body(
     stream: &mut tokio::net::TcpStream,
+    head: String,
     already: Vec<u8>,
     want: usize,
-) -> usize {
-    let mut have = already.len();
+    started: &mpsc::UnboundedSender<()>,
+) -> UpstreamRequest {
+    let mut body = already;
+    let mut announced = false;
     let mut scratch = [0u8; 16384];
-    while have < want {
+    loop {
+        if !announced && !body.is_empty() {
+            announced = true;
+            let _ = started.send(());
+        }
+        if body.len() >= want {
+            break;
+        }
         match stream.read(&mut scratch).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => have += n,
+            Ok(n) => body.extend_from_slice(&scratch[..n]),
         }
     }
-    have
+    let complete = body.len() >= want;
+    UpstreamRequest {
+        head,
+        body,
+        complete,
+    }
 }
 
-/// Counts payload bytes only, so the assertion compares like for like
-/// with what the client sent whichever framing the proxy chose.
-async fn read_chunked_body(stream: &mut tokio::net::TcpStream, already: Vec<u8>) -> usize {
+async fn read_chunked_body(
+    stream: &mut tokio::net::TcpStream,
+    head: String,
+    already: Vec<u8>,
+    started: &mpsc::UnboundedSender<()>,
+) -> UpstreamRequest {
     let mut buf = already;
     let mut scratch = [0u8; 16384];
-    let mut payload = 0usize;
+    let mut body = Vec::new();
     let mut cursor = 0usize;
     loop {
         // One chunk header per iteration: `<hex size>\r\n`.
@@ -150,7 +245,13 @@ async fn read_chunked_body(stream: &mut tokio::net::TcpStream, already: Vec<u8>)
                 break cursor + pos;
             }
             match stream.read(&mut scratch).await {
-                Ok(0) | Err(_) => return payload,
+                Ok(0) | Err(_) => {
+                    return UpstreamRequest {
+                        head,
+                        body,
+                        complete: false,
+                    }
+                }
                 Ok(n) => buf.extend_from_slice(&scratch[..n]),
             }
         };
@@ -158,25 +259,125 @@ async fn read_chunked_body(stream: &mut tokio::net::TcpStream, already: Vec<u8>)
         let size = usize::from_str_radix(size_hex.trim().split(';').next().unwrap_or("0"), 16)
             .unwrap_or(0);
         if size == 0 {
-            return payload;
+            return UpstreamRequest {
+                head,
+                body,
+                complete: true,
+            };
         }
-        payload += size;
-        // Skip the chunk body and its trailing CRLF.
-        let chunk_end = line_end + 2 + size + 2;
+        // The chunk body and its trailing CRLF.
+        let data_start = line_end + 2;
+        let chunk_end = data_start + size + 2;
         while buf.len() < chunk_end {
             match stream.read(&mut scratch).await {
-                Ok(0) | Err(_) => return payload,
+                Ok(0) | Err(_) => {
+                    return UpstreamRequest {
+                        head,
+                        body,
+                        complete: false,
+                    }
+                }
                 Ok(n) => buf.extend_from_slice(&scratch[..n]),
             }
         }
+        if body.is_empty() {
+            let _ = started.send(());
+        }
+        body.extend_from_slice(&buf[data_start..data_start + size]);
         cursor = chunk_end;
     }
+}
+
+/// The next request the origin finished reading, however it ended.
+///
+/// This is the synchronisation point the byte counter cannot give: the
+/// origin reports a request only once it has stopped reading it, so an
+/// assertion made after this returns no longer races the proxy's
+/// upstream leg. The timeout bounds a hang, it is not a wait for a
+/// condition to settle.
+async fn next_upstream_request(
+    requests: &mut mpsc::UnboundedReceiver<UpstreamRequest>,
+) -> UpstreamRequest {
+    tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the origin never finished reading an upstream request")
+        .expect("the origin stopped accepting connections")
+}
+
+fn probe_request(port: u16) -> Vec<u8> {
+    format!("GET /probe HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+        .into_bytes()
+}
+
+/// Asserts the origin never saw the request the proxy just refused:
+/// not a byte, not even a connection.
+///
+/// A probe sent after the refusal's response reaches the origin on a
+/// connection of its own. The origin accepts connections one at a time
+/// in arrival order, and any connection the proxy opened for the
+/// refused request was opened before that response was written, so by
+/// the time the origin has read the probe it has accepted that
+/// connection too. Nothing here waits for anything to settle.
+async fn assert_origin_untouched(port: u16, upstream: &mut Upstream) {
+    let status = send_request(port, probe_request(port)).await;
+    assert_eq!(status, 200, "the probe must be proxied");
+    let seen = next_upstream_request(&mut upstream.requests).await;
+    assert!(
+        seen.head.starts_with("get /probe "),
+        "the first request the origin read must be the probe, not the refused one: {seen:?}"
+    );
+    assert_eq!(
+        upstream.accepted.load(Ordering::SeqCst),
+        1,
+        "the refused request must never have been dialled upstream"
+    );
+    assert_eq!(
+        upstream.received.load(Ordering::SeqCst),
+        0,
+        "the origin must hold zero bytes of the refused body"
+    );
+}
+
+/// Asserts the origin received exactly `body`, complete, on one request.
+async fn assert_arrived_whole(upstream: &mut Upstream, body: &[u8]) {
+    let seen = next_upstream_request(&mut upstream.requests).await;
+    assert!(seen.complete, "the body must complete upstream: {seen:?}");
+    assert_eq!(
+        seen.body.len(),
+        body.len(),
+        "the upstream must receive every byte: {seen:?}"
+    );
+    assert!(
+        seen.body == body,
+        "the upstream must receive the body byte for byte"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Raw client: reqwest has no `stream` feature here, and the chunked
 // cases need exact control over the framing.
 // ---------------------------------------------------------------------------
+
+/// Reads one response header block and returns its status code, `0` on
+/// a closed or silent connection. Bytes past the block stay in `buf`.
+async fn read_status(rd: &mut OwnedReadHalf, buf: &mut Vec<u8>) -> u16 {
+    let mut scratch = [0u8; 4096];
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let block: Vec<u8> = buf.drain(..end + 4).collect();
+            let line = String::from_utf8_lossy(&block);
+            return line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse::<u16>().ok())
+                .unwrap_or(0);
+        }
+        match tokio::time::timeout(Duration::from_secs(10), rd.read(&mut scratch)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return 0,
+            Ok(Ok(n)) => buf.extend_from_slice(&scratch[..n]),
+        }
+    }
+}
 
 /// Sends a request and returns the response status code.
 ///
@@ -198,23 +399,7 @@ async fn send_request(port: u16, request: Vec<u8>) -> u16 {
         let _ = wr.flush().await;
         std::future::pending::<()>().await;
     });
-
-    let mut buf = Vec::new();
-    let mut scratch = [0u8; 4096];
-    let status = loop {
-        match tokio::time::timeout(Duration::from_secs(10), rd.read(&mut scratch)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break 0u16,
-            Ok(Ok(n)) => buf.extend_from_slice(&scratch[..n]),
-        }
-        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-            let line = String::from_utf8_lossy(&buf[..pos]).to_string();
-            break line
-                .split_whitespace()
-                .nth(1)
-                .and_then(|c| c.parse::<u16>().ok())
-                .unwrap_or(0);
-        }
-    };
+    let status = read_status(&mut rd, &mut Vec::new()).await;
     writer.abort();
     status
 }
@@ -424,20 +609,34 @@ fn test_backend(id: &str, addr: SocketAddr) -> Backend {
     }
 }
 
-async fn harness(mode: WafMode) -> (ProxyHarness, Arc<AtomicU64>) {
-    let (origin, received) = spawn_body_counting_origin().await;
-    let route = waf_route(mode);
-    let backends = vec![test_backend("b-primary", origin)];
-    let links = vec![("r-waf-body".into(), "b-primary".into())];
+/// Every route given, all linked to one origin.
+async fn harness_with_routes(routes: Vec<Route>) -> (ProxyHarness, Upstream) {
+    harness_with_globals(routes, ProxyConfigGlobals::default()).await
+}
+
+/// [`harness_with_routes`] with the given global settings.
+async fn harness_with_globals(
+    routes: Vec<Route>,
+    globals: ProxyConfigGlobals,
+) -> (ProxyHarness, Upstream) {
+    let (origin, upstream) = spawn_origin().await;
+    let links = routes
+        .iter()
+        .map(|r| (r.id.clone(), "b-primary".to_string()))
+        .collect();
     let config = ProxyConfig::from_store(
-        vec![route],
-        backends,
+        routes,
+        vec![test_backend("b-primary", origin)],
         vec![],
         links,
-        ProxyConfigGlobals::default(),
+        globals,
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
-    (harness, received)
+    (harness, upstream)
+}
+
+async fn harness(mode: WafMode) -> (ProxyHarness, Upstream) {
+    harness_with_routes(vec![waf_route(mode)]).await
 }
 
 /// Bytes the widened route admits, well past what its scan cap does, so
@@ -475,22 +674,21 @@ fn wide_scan_route(mode: WafMode) -> Route {
     }
 }
 
-async fn harness_with_wide_route(mode: WafMode) -> (ProxyHarness, Arc<AtomicU64>) {
-    let (origin, received) = spawn_body_counting_origin().await;
-    let backends = vec![test_backend("b-primary", origin)];
-    let links = vec![
-        ("r-waf-body".into(), "b-primary".into()),
-        ("r-waf-body-wide".into(), "b-primary".into()),
-    ];
-    let config = ProxyConfig::from_store(
-        vec![waf_route(mode.clone()), wide_scan_route(mode)],
-        backends,
-        vec![],
-        links,
-        ProxyConfigGlobals::default(),
-    );
-    let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
-    (harness, received)
+async fn harness_with_wide_route(mode: WafMode) -> (ProxyHarness, Upstream) {
+    harness_with_routes(vec![waf_route(mode.clone()), wide_scan_route(mode)]).await
+}
+
+/// A route whose `max_request_body_bytes` sits under the scan window,
+/// so a chunked body is refused by the route limit before the window.
+const SMALL_ROUTE_BODY_LIMIT: u64 = 256 * 1024;
+
+fn small_limit_route(mode: WafMode) -> Route {
+    Route {
+        id: "r-waf-body-small".into(),
+        path_prefix: "/small".into(),
+        max_request_body_bytes: Some(SMALL_ROUTE_BODY_LIMIT),
+        ..waf_route(mode)
+    }
 }
 
 fn sized_request_to(port: u16, path: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
@@ -503,17 +701,31 @@ fn sized_request_to(port: u16, path: &str, content_type: &str, body: &[u8]) -> V
     req
 }
 
-fn chunked_request_to(port: u16, path: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
-    let mut req = format!(
+fn chunked_head(port: u16, path: &str, content_type: &str) -> Vec<u8> {
+    format!(
         "PUT {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
     )
-    .into_bytes();
-    for chunk in body.chunks(64 * 1024) {
-        req.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
-        req.extend_from_slice(chunk);
-        req.extend_from_slice(b"\r\n");
+    .into_bytes()
+}
+
+/// `body` framed as `CLIENT_CHUNK`-sized chunks, without the
+/// terminating chunk.
+fn chunk_frames(body: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(body.len() + 64);
+    for chunk in body.chunks(CLIENT_CHUNK) {
+        framed.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        framed.extend_from_slice(chunk);
+        framed.extend_from_slice(b"\r\n");
     }
-    req.extend_from_slice(b"0\r\n\r\n");
+    framed
+}
+
+const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
+
+fn chunked_request_to(port: u16, path: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut req = chunked_head(port, path, content_type);
+    req.extend_from_slice(&chunk_frames(body));
+    req.extend_from_slice(LAST_CHUNK);
     req
 }
 
@@ -530,6 +742,21 @@ fn sqli_json() -> Vec<u8> {
     br#"{"q":"1' UNION SELECT password FROM users--"}"#.to_vec()
 }
 
+/// A clean inspectable body of `len` bytes in which every position
+/// differs from its neighbours, so a dropped, duplicated or reordered
+/// run of bytes changes the content and not just the length. Lowercase
+/// hex digits and spaces only, which no WAF rule matches.
+fn patterned_text(len: usize) -> Vec<u8> {
+    let mut body = Vec::with_capacity(len + 9);
+    let mut counter = 0u32;
+    while body.len() < len {
+        body.extend_from_slice(format!("{counter:08x} ").as_bytes());
+        counter += 1;
+    }
+    body.truncate(len);
+    body
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -539,7 +766,7 @@ async fn binary_upload_past_the_scan_window_reaches_the_upstream_whole() {
     // The Nextcloud shape: a large PUT the engine cannot parse, on a
     // WAF-Blocking route. Before content-type gating this was a 413
     // for a scan that would have returned Pass on the first byte.
-    let (harness, received) = harness(WafMode::Blocking).await;
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
     let body = vec![0xABu8; 2 * SCAN_WINDOW];
 
     let status = send_request(
@@ -549,18 +776,14 @@ async fn binary_upload_past_the_scan_window_reaches_the_upstream_whole() {
     .await;
 
     assert_eq!(status, 200, "binary upload must pass a WAF-Blocking route");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        body.len() as u64,
-        "the upstream must receive every byte"
-    );
+    assert_arrived_whole(&mut upstream, &body).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_upload_past_the_route_limit_is_still_rejected() {
     // `max_request_body_bytes` is the only ceiling left once the WAF
     // stops bounding this body. It must still bite.
-    let (harness, received) = harness(WafMode::Blocking).await;
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
     let body = vec![0xABu8; (ROUTE_BODY_LIMIT + 4096) as usize];
 
     let status = send_request(
@@ -570,16 +793,12 @@ async fn binary_upload_past_the_route_limit_is_still_rejected() {
     .await;
 
     assert_eq!(status, 413, "route body limit must still apply");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
-    );
+    assert_origin_untouched(harness.port, &mut upstream).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn json_past_the_scan_window_is_still_rejected() {
-    let (harness, received) = harness(WafMode::Blocking).await;
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
     let body = vec![b'a'; SCAN_WINDOW + 4096];
 
     let status = send_request(
@@ -589,16 +808,14 @@ async fn json_past_the_scan_window_is_still_rejected() {
     .await;
 
     assert_eq!(status, 413, "an inspectable body keeps the scan window");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
-    );
+    assert_origin_untouched(harness.port, &mut upstream).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_payload_in_an_inspectable_body_is_still_blocked() {
-    let (harness, received) = harness(WafMode::Blocking).await;
+    // The body is read and scanned before the upstream is dialled, so a
+    // block leaves the origin with nothing at all.
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
 
     let status = send_request(
         harness.port,
@@ -611,11 +828,7 @@ async fn a_payload_in_an_inspectable_body_is_still_blocked() {
     .await;
 
     assert_eq!(status, 403, "the body scan must still fire");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
-    );
+    assert_origin_untouched(harness.port, &mut upstream).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -624,7 +837,7 @@ async fn the_padding_bypass_stays_closed() {
     // payload. The prefix is text, so the body is inspectable, so the
     // cap applies and the request is rejected before the upstream
     // sees a byte.
-    let (harness, received) = harness(WafMode::Blocking).await;
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
     let mut body = vec![b'a'; SCAN_WINDOW];
     body.extend_from_slice(&sqli_json());
 
@@ -635,11 +848,7 @@ async fn the_padding_bypass_stays_closed() {
     .await;
 
     assert_eq!(status, 413, "padding past the window must not slip through");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
-    );
+    assert_origin_untouched(harness.port, &mut upstream).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -647,7 +856,7 @@ async fn a_payload_declared_as_binary_is_not_inspected() {
     // The residual risk of trusting the declared type, asserted so it
     // is a documented behaviour and not a surprise: `docs/security.md`
     // says exactly this.
-    let (harness, received) = harness(WafMode::Blocking).await;
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
     let body = sqli_json();
 
     let status = send_request(
@@ -657,14 +866,14 @@ async fn a_payload_declared_as_binary_is_not_inspected() {
     .await;
 
     assert_eq!(status, 200, "a spoofed content type skips inspection");
-    assert_eq!(received.load(Ordering::SeqCst), body.len() as u64);
+    assert_arrived_whole(&mut upstream, &body).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chunked_binary_upload_past_the_scan_window_reaches_the_upstream_whole() {
     // No Content-Length, so the verdict is taken in
     // `request_body_filter` rather than on the advertised header.
-    let (harness, received) = harness(WafMode::Blocking).await;
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
     let body = vec![0xABu8; 2 * SCAN_WINDOW];
 
     let status = send_request(
@@ -674,16 +883,16 @@ async fn chunked_binary_upload_past_the_scan_window_reaches_the_upstream_whole()
     .await;
 
     assert_eq!(status, 200, "chunked binary upload must pass");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        body.len() as u64,
-        "the upstream must receive every byte"
-    );
+    assert_arrived_whole(&mut upstream, &body).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chunked_json_past_the_scan_window_is_still_rejected() {
-    let (harness, received) = harness(WafMode::Blocking).await;
+    // No Content-Length, so the window is crossed mid-body. The body is
+    // held until the verdict rather than forwarded as it arrives, so
+    // the unscanned first window never leaves the proxy: the origin is
+    // not even dialled.
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
     let body = vec![b'a'; SCAN_WINDOW + 4096];
 
     let status = send_request(
@@ -693,11 +902,200 @@ async fn chunked_json_past_the_scan_window_is_still_rejected() {
     .await;
 
     assert_eq!(status, 413, "chunked inspectable body keeps the window");
+    assert_origin_untouched(harness.port, &mut upstream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_payload_in_a_chunked_body_never_reaches_upstream() {
+    // The end-of-stream half of the same contract. The verdict needs the
+    // terminating chunk; until it arrives every chunk before it is held,
+    // so a 403 leaves nothing behind upstream.
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
+
+    let status = send_request(
+        harness.port,
+        chunked_request(harness.port, "application/json", &sqli_json()),
+    )
+    .await;
+
+    assert_eq!(status, 403, "the body scan must fire on a chunked body");
+    assert_origin_untouched(harness.port, &mut upstream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_payload_at_the_end_of_a_long_chunked_body_never_reaches_upstream() {
+    // Many chunks, the payload in the last ones, on the route whose
+    // window admits the whole body: every chunk ahead of the payload is
+    // clean and would have been forwarded by a streaming proxy.
+    let (harness, mut upstream) = harness_with_wide_route(WafMode::Blocking).await;
+    let body = padded_json(OVER_DEFAULT_UNDER_WIDE, PAYLOAD_OFFSET);
+
+    let status = send_request(
+        harness.port,
+        chunked_request_to(harness.port, "/wide/upload", "application/json", &body),
+    )
+    .await;
+
+    assert_eq!(status, 403, "the payload past the default window is found");
+    assert_origin_untouched(harness.port, &mut upstream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunked_json_past_the_route_limit_never_reaches_upstream() {
+    // The third refusal a held body can meet: `max_request_body_bytes`
+    // under the scan window, crossed mid-body on a chunked request.
+    let (harness, mut upstream) = harness_with_routes(vec![
+        waf_route(WafMode::Blocking),
+        small_limit_route(WafMode::Blocking),
+    ])
+    .await;
+    let body = patterned_text(2 * SMALL_ROUTE_BODY_LIMIT as usize);
+
+    let status = send_request(
+        harness.port,
+        chunked_request_to(harness.port, "/small/upload", "application/json", &body),
+    )
+    .await;
+
+    assert_eq!(status, 413, "the route limit bites before the window");
+    assert_origin_untouched(harness.port, &mut upstream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_body_of_the_scan_window_arrives_whole() {
+    // The largest body the default window admits, held, scanned and
+    // then forwarded in one piece: nothing lost, nothing reordered.
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
+    let body = patterned_text(SCAN_WINDOW);
+
+    let status = send_request(
+        harness.port,
+        sized_request(harness.port, "application/json", &body),
+    )
+    .await;
+
+    assert_eq!(status, 200, "a clean body at the window is admitted");
+    assert_arrived_whole(&mut upstream, &body).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_chunked_body_of_the_scan_window_arrives_whole() {
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
+    let body = patterned_text(SCAN_WINDOW);
+
+    let status = send_request(
+        harness.port,
+        chunked_request(harness.port, "application/json", &body),
+    )
+    .await;
+
     assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
+        status, 200,
+        "a clean chunked body at the window is admitted"
     );
+    assert_arrived_whole(&mut upstream, &body).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_body_past_the_default_window_arrives_whole_where_the_route_allows_it() {
+    // Larger than the default window, under the route's widened one,
+    // with both framings: the hold is bounded by the route's window,
+    // not by the default.
+    let (harness, mut upstream) = harness_with_wide_route(WafMode::Blocking).await;
+    let body = patterned_text(OVER_DEFAULT_UNDER_WIDE);
+
+    let sized = send_request(
+        harness.port,
+        sized_request_to(harness.port, "/wide/upload", "application/json", &body),
+    )
+    .await;
+    assert_eq!(sized, 200, "Content-Length body under the widened window");
+    assert_arrived_whole(&mut upstream, &body).await;
+
+    let chunked = send_request(
+        harness.port,
+        chunked_request_to(harness.port, "/wide/upload", "application/json", &body),
+    )
+    .await;
+    assert_eq!(chunked, 200, "chunked body under the widened window");
+    assert_arrived_whole(&mut upstream, &body).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expect_continue_is_answered_by_the_proxy_while_the_body_is_held() {
+    // The client waits for `100 Continue` before it sends the body. The
+    // upstream that would normally give it is not dialled until the body
+    // has been scanned, and this origin never sends one anyway, so the
+    // go-ahead has to come from the proxy. The upstream request then
+    // carries the body and no `Expect` of its own.
+    let (harness, mut upstream) = harness(WafMode::Blocking).await;
+    let body = patterned_text(256 * 1024);
+
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", harness.port))
+        .await
+        .unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+    let head = format!(
+        "PUT /upload HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        harness.port,
+        body.len()
+    );
+    wr.write_all(head.as_bytes()).await.unwrap();
+
+    let mut buf = Vec::new();
+    assert_eq!(
+        read_status(&mut rd, &mut buf).await,
+        100,
+        "the proxy must give the go-ahead itself"
+    );
+    // Nothing has been dialled while the body is outstanding: the probe
+    // is the first and only request the origin has seen.
+    let probe = send_request(harness.port, probe_request(harness.port)).await;
+    assert_eq!(probe, 200);
+    let seen = next_upstream_request(&mut upstream.requests).await;
+    assert!(seen.head.starts_with("get /probe "), "{seen:?}");
+    assert_eq!(upstream.accepted.load(Ordering::SeqCst), 1);
+
+    wr.write_all(&body).await.unwrap();
+    assert_eq!(read_status(&mut rd, &mut buf).await, 200);
+    let seen = next_upstream_request(&mut upstream.requests).await;
+    assert!(seen.complete, "{seen:?}");
+    assert!(seen.body == body, "the body arrives byte for byte");
+    assert!(
+        !seen.head.contains("\r\nexpect:"),
+        "the upstream is not asked for a go-ahead of its own"
+    );
+    drop(wr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detection_mode_streams_the_body_as_it_arrives() {
+    // Detection never refuses a body, so it has nothing to hold it for.
+    // The client sends the first chunk and stops: the origin must have
+    // it before the client sends the rest.
+    let (harness, mut upstream) = harness(WafMode::Detection).await;
+    let body = patterned_text(4 * CLIENT_CHUNK);
+    let (first, rest) = body.split_at(CLIENT_CHUNK);
+
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", harness.port))
+        .await
+        .unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+    let mut opening = chunked_head(harness.port, "/upload", "application/json");
+    opening.extend_from_slice(&chunk_frames(first));
+    wr.write_all(&opening).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), upstream.body_started.recv())
+        .await
+        .expect("Detection mode must forward the body before it ends")
+        .expect("the origin stopped accepting connections");
+
+    let mut closing = chunk_frames(rest);
+    closing.extend_from_slice(LAST_CHUNK);
+    wr.write_all(&closing).await.unwrap();
+    assert_eq!(read_status(&mut rd, &mut Vec::new()).await, 200);
+    assert_arrived_whole(&mut upstream, &body).await;
+    drop(wr);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -708,7 +1106,7 @@ async fn detection_mode_scans_the_prefix_and_forwards_the_whole_body() {
     // prefix, one `BodyTruncated` event is emitted, and every byte
     // still reaches the upstream. The payload sits at the front so it
     // falls inside the prefix that is actually scanned.
-    let (harness, received) = harness(WafMode::Detection).await;
+    let (harness, mut upstream) = harness(WafMode::Detection).await;
     let mut body = sqli_json();
     body.resize(SCAN_WINDOW + 4096, b'a');
 
@@ -719,11 +1117,7 @@ async fn detection_mode_scans_the_prefix_and_forwards_the_whole_body() {
     .await;
 
     assert_eq!(status, 200, "Detection never rejects on the window");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        body.len() as u64,
-        "the body past the window still goes upstream untouched"
-    );
+    assert_arrived_whole(&mut upstream, &body).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -733,7 +1127,7 @@ async fn detection_mode_forwards_a_binary_upload_unchanged() {
     // `BodyTruncated` event and proceeds), so what this asserts is
     // that the new branch did not change Detection's outcome. The
     // discriminating assertions are the Blocking ones above.
-    let (harness, received) = harness(WafMode::Detection).await;
+    let (harness, mut upstream) = harness(WafMode::Detection).await;
     let body = vec![0xABu8; 2 * SCAN_WINDOW];
 
     let status = send_request(
@@ -743,7 +1137,53 @@ async fn detection_mode_forwards_a_binary_upload_unchanged() {
     .await;
 
     assert_eq!(status, 200);
-    assert_eq!(received.load(Ordering::SeqCst), body.len() as u64);
+    assert_arrived_whole(&mut upstream, &body).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocked_body_is_not_mirrored_either() {
+    // The shadow backend of a mirrored route is an upstream too. The
+    // mirror fires once the body is complete, and it must fire after
+    // the verdict, not before it. The probe GET is mirrored as soon as
+    // its headers pass, so it is the first request a shadow that never
+    // saw the blocked body reads.
+    let (primary, mut upstream) = spawn_origin().await;
+    let (shadow, mut shadow_upstream) = spawn_origin().await;
+    let route = Route {
+        mirror: Some(MirrorConfig {
+            backend_ids: vec!["b-shadow".into()],
+            sample_percent: 100,
+            timeout_ms: 3_000,
+            max_body_bytes: 1_048_576,
+        }),
+        ..waf_route(WafMode::Blocking)
+    };
+    let config = ProxyConfig::from_store(
+        vec![route],
+        vec![
+            test_backend("b-primary", primary),
+            test_backend("b-shadow", shadow),
+        ],
+        vec![],
+        vec![("r-waf-body".into(), "b-primary".into())],
+        ProxyConfigGlobals::default(),
+    );
+    let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
+
+    let status = send_request(
+        harness.port,
+        sized_request(harness.port, "application/json", &sqli_json()),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_origin_untouched(harness.port, &mut upstream).await;
+
+    let seen = next_upstream_request(&mut shadow_upstream.requests).await;
+    assert!(
+        seen.head.starts_with("get /probe "),
+        "the shadow must never read the blocked body: {seen:?}"
+    );
+    assert_eq!(shadow_upstream.received.load(Ordering::SeqCst), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +1196,7 @@ async fn a_raised_scan_window_catches_a_payload_the_default_would_have_missed() 
     // the 1 MiB default this body is rejected without ever being
     // scanned; under the route's 2 MiB window the scan runs the whole
     // way and the payload is found, which is the point of the setting.
-    let (harness, received) = harness_with_wide_route(WafMode::Blocking).await;
+    let (harness, mut upstream) = harness_with_wide_route(WafMode::Blocking).await;
     let body = padded_json(OVER_DEFAULT_UNDER_WIDE, PAYLOAD_OFFSET);
 
     let status = send_request(
@@ -766,11 +1206,7 @@ async fn a_raised_scan_window_catches_a_payload_the_default_would_have_missed() 
     .await;
 
     assert_eq!(status, 403, "the widened window must scan to the payload");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
-    );
+    assert_origin_untouched(harness.port, &mut upstream).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -778,7 +1214,7 @@ async fn a_body_past_the_raised_window_is_still_rejected() {
     // IV2, second half: the route raised the window, it did not remove
     // it. 3 MiB is past the 2 MiB window and well under the route's 16
     // MiB body limit, so a 413 here is the scan window talking.
-    let (harness, received) = harness_with_wide_route(WafMode::Blocking).await;
+    let (harness, mut upstream) = harness_with_wide_route(WafMode::Blocking).await;
     let body = vec![b'a'; OVER_WIDE];
 
     let status = send_request(
@@ -788,11 +1224,7 @@ async fn a_body_past_the_raised_window_is_still_rejected() {
     .await;
 
     assert_eq!(status, 413, "the raised window is still a window");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
-    );
+    assert_origin_untouched(harness.port, &mut upstream).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -800,7 +1232,7 @@ async fn the_sibling_route_keeps_the_default_window_for_the_same_body() {
     // IV2, third half, and the one that proves the cap is per route
     // rather than global: the same body, the same node, the same
     // configuration snapshot, the route that did not raise its window.
-    let (harness, received) = harness_with_wide_route(WafMode::Blocking).await;
+    let (harness, mut upstream) = harness_with_wide_route(WafMode::Blocking).await;
     let body = padded_json(OVER_DEFAULT_UNDER_WIDE, PAYLOAD_OFFSET);
 
     let status = send_request(
@@ -810,11 +1242,7 @@ async fn the_sibling_route_keeps_the_default_window_for_the_same_body() {
     .await;
 
     assert_eq!(status, 413, "the default route keeps the 1 MiB window");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
-    );
+    assert_origin_untouched(harness.port, &mut upstream).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -824,8 +1252,8 @@ async fn the_padding_bypass_stays_closed_at_the_raised_window() {
     // on a route whose window is 2 MiB. The padding no longer pushes
     // the body out of the window, so the answer is a scan that finds
     // the payload rather than a 413 that never looked. Either way the
-    // request does not reach the upstream, which is what H-2 requires.
-    let (harness, received) = harness_with_wide_route(WafMode::Blocking).await;
+    // upstream never sees the request, which is what H-2 requires.
+    let (harness, mut upstream) = harness_with_wide_route(WafMode::Blocking).await;
     let body = padded_json(SCAN_WINDOW + sqli_json().len(), SCAN_WINDOW);
 
     let status = send_request(
@@ -835,11 +1263,7 @@ async fn the_padding_bypass_stays_closed_at_the_raised_window() {
     .await;
 
     assert_eq!(status, 403, "padding inside the window is scanned through");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
-    );
+    assert_origin_untouched(harness.port, &mut upstream).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -848,24 +1272,9 @@ async fn chunked_parity_for_the_raised_window() {
     // from the cached field inside `request_body_filter` rather than
     // from the advertised header, and the route's value has to be the
     // one that bites. 3 MiB is past the route's 2 MiB window and well
-    // under its 16 MiB body limit.
-    //
-    // The scanned-and-blocked half of the pair is asserted on the
-    // Content-Length path instead
-    // (`a_raised_scan_window_catches_a_payload_the_default_would_have_missed`):
-    // a 403 decided at end of stream races the upstream's own response
-    // for the downstream socket, because a chunked body is forwarded
-    // as it arrives. The window check here is the part that is
-    // specific to the streaming path, and it is decided mid-body.
-    //
-    // There is no byte assertion here, and it is worth saying why
-    // rather than leaving the next reader to wonder: a chunked body is
-    // forwarded as it arrives, so the bytes ahead of the window have
-    // already left for the upstream when the window is crossed. What
-    // the 413 guarantees is that the rest does not follow, which is
-    // the audit H-2 stance. The byte-level claim belongs to the
-    // Content-Length cases, where nothing is forwarded at all.
-    let (harness, _origin_bytes) = harness_with_wide_route(WafMode::Blocking).await;
+    // under its 16 MiB body limit. The 2 MiB ahead of the window are
+    // held, never forwarded, so the origin is not dialled.
+    let (harness, mut upstream) = harness_with_wide_route(WafMode::Blocking).await;
 
     let oversize = send_request(
         harness.port,
@@ -879,4 +1288,197 @@ async fn chunked_parity_for_the_raised_window() {
     .await;
 
     assert_eq!(oversize, 413, "chunked body past the raised window");
+    assert_origin_untouched(harness.port, &mut upstream).await;
+}
+
+// ---------------------------------------------------------------------------
+// The bounds of the hold (item 9).
+// ---------------------------------------------------------------------------
+
+/// A Blocking route whose upstream `read_timeout_s`, the total bound of
+/// the hold, is `read_timeout_s`, behind a node whose
+/// `downstream_idle_timeout_s`, the bound of each read, is `idle_s`.
+async fn bounded_hold_harness(
+    read_timeout_s: i32,
+    idle_s: u32,
+    max_connections: Option<u32>,
+) -> (ProxyHarness, Upstream) {
+    let route = Route {
+        read_timeout_s,
+        max_connections,
+        ..waf_route(WafMode::Blocking)
+    };
+    harness_with_globals(
+        vec![route],
+        ProxyConfigGlobals {
+            downstream_idle_timeout_s: idle_s,
+            ..ProxyConfigGlobals::default()
+        },
+    )
+    .await
+}
+
+/// Reads until the proxy closes, returning everything it sent and how
+/// long after `started` the close came.
+async fn read_until_closed(rd: &mut OwnedReadHalf, started: Instant) -> (String, Duration) {
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(10), rd.read(&mut scratch))
+            .await
+            .expect("the proxy held the connection past 10 s")
+            .unwrap_or(0);
+        if n == 0 {
+            return (
+                String::from_utf8_lossy(&buf).to_lowercase(),
+                started.elapsed(),
+            );
+        }
+        buf.extend_from_slice(&scratch[..n]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_body_that_stops_arriving_is_answered_408_and_closed() {
+    // A tenth of the declared body, then nothing: only the 1 s gap bound
+    // can end the read, the route's 30 s total is far away.
+    let (harness, mut upstream) = bounded_hold_harness(30, 1, None).await;
+    let body = patterned_text(1000);
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", harness.port))
+        .await
+        .unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+    let mut opening = format!(
+        "PUT /upload HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        harness.port,
+        body.len()
+    )
+    .into_bytes();
+    opening.extend_from_slice(&body[..100]);
+    let started = Instant::now();
+    wr.write_all(&opening).await.unwrap();
+
+    let (response, closed_after) = read_until_closed(&mut rd, started).await;
+    assert!(response.starts_with("http/1.1 408"), "{response:?}");
+    assert!(
+        response.contains("\r\nconnection: close\r\n"),
+        "{response:?}"
+    );
+    assert!(
+        closed_after >= Duration::from_millis(900),
+        "cut before the gap bound: {closed_after:?}"
+    );
+    assert!(
+        closed_after < Duration::from_secs(5),
+        "cut late: {closed_after:?}"
+    );
+    drop(wr);
+    assert_origin_untouched(harness.port, &mut upstream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_body_slower_than_the_route_read_timeout_is_answered_408_and_closed() {
+    // Small chunks 200 ms apart, each far inside the 30 s gap bound, then
+    // silence well before the cut, so no write races the close: only the
+    // route's 1 s total can end the read.
+    let (harness, mut upstream) = bounded_hold_harness(1, 30, None).await;
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", harness.port))
+        .await
+        .unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+    let started = Instant::now();
+    wr.write_all(&chunked_head(harness.port, "/upload", "application/json"))
+        .await
+        .unwrap();
+    let trickle = tokio::spawn(async move {
+        for _ in 0..3 {
+            wr.write_all(&chunk_frames(b"0123456789")).await?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        std::future::pending::<()>().await;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let (response, closed_after) = read_until_closed(&mut rd, started).await;
+    trickle.abort();
+    assert!(response.starts_with("http/1.1 408"), "{response:?}");
+    assert!(
+        closed_after >= Duration::from_millis(900),
+        "cut before the total bound: {closed_after:?}"
+    );
+    assert!(
+        closed_after < Duration::from_secs(5),
+        "cut late: {closed_after:?}"
+    );
+    assert_origin_untouched(harness.port, &mut upstream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_body_takes_no_route_connection_slot() {
+    // The route admits one request at a time. A client holding its body
+    // back must not be that request: the proxy's own `100 Continue` says
+    // the request has reached the hold, past every other stage, and a
+    // second request is still proxied while the first waits there.
+    let (harness, mut upstream) = bounded_hold_harness(30, 30, Some(1)).await;
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", harness.port))
+        .await
+        .unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+    let head = format!(
+        "PUT /upload HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        harness.port
+    );
+    wr.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    assert_eq!(read_status(&mut rd, &mut buf).await, 100);
+
+    let probe = send_request(harness.port, probe_request(harness.port)).await;
+    assert_eq!(probe, 200, "the held request took the route's only slot");
+    let seen = next_upstream_request(&mut upstream.requests).await;
+    assert!(seen.head.starts_with("get /probe "), "{seen:?}");
+    drop(wr);
+}
+
+// ---------------------------------------------------------------------------
+// Latency of the hold, measured on demand.
+// ---------------------------------------------------------------------------
+
+/// Median time from the first byte sent to the status line received,
+/// over `rounds` clean Content-Length bodies of `body.len()` bytes.
+async fn median_round_trip(port: u16, body: &[u8], rounds: usize) -> Duration {
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let request = sized_request(port, "application/json", body);
+        let started = Instant::now();
+        let status = send_request(port, request).await;
+        samples.push(started.elapsed());
+        assert_eq!(status, 200);
+    }
+    samples.sort();
+    samples[rounds / 2]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "timing probe, not a gate: run with --ignored --nocapture"]
+async fn hold_latency_for_a_clean_body_of_the_default_window() {
+    // Blocking holds the body until the scan has passed, Detection
+    // streams it; both scan the same bytes at the end of the body. The
+    // difference between the two medians is what the hold costs: the
+    // upstream dial and the write of the held body, no longer
+    // overlapped with the client's upload.
+    const ROUNDS: usize = 31;
+    let body = patterned_text(SCAN_WINDOW);
+    let (blocking, _upstream_b) = harness(WafMode::Blocking).await;
+    let (detection, _upstream_d) = harness(WafMode::Detection).await;
+
+    // One unmeasured round each, so first-request setup is not sampled.
+    median_round_trip(blocking.port, &body, 1).await;
+    median_round_trip(detection.port, &body, 1).await;
+
+    let held = median_round_trip(blocking.port, &body, ROUNDS).await;
+    let streamed = median_round_trip(detection.port, &body, ROUNDS).await;
+    eprintln!(
+        "clean {SCAN_WINDOW}-byte body, median of {ROUNDS}: Blocking (held) {held:?}, Detection (streamed) {streamed:?}, difference {:?}",
+        held.saturating_sub(streamed)
+    );
 }

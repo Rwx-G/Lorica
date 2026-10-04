@@ -23,3 +23,4 @@
 - [Epic 9: Multi-Node Cluster and Log Export (v1.7.0)](./epic-9-v1.7.0.md)
 - [Epic 10: Conditional Request Capture and CI Automation API (v1.8.0)](./epic-10-v1.8.0.md)
 - [Epic 11: Management MCP Server with Tiered Access (v1.9.0)](./epic-11-v1.9.0.md)
+- [Epic 12: TCP and UDP Stream Proxying (v1.10.0 and v1.11.0)](./epic-12-v1.10.0.md)

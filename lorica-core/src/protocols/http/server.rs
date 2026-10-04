@@ -341,13 +341,35 @@ impl Session {
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
     ///
-    /// This is a noop for h2.
+    /// For h2 it bounds each request body read (Lorica: upstream ignores it
+    /// for h2, whose body reads then wait without bound).
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         match self {
             Self::H1(s) => s.set_read_timeout(timeout),
-            Self::H2(_) => {}
+            Self::H2(s) => s.set_read_timeout(timeout),
             Self::Subrequest(s) => s.set_read_timeout(timeout),
             Self::Custom(c) => c.set_read_timeout(timeout),
+        }
+    }
+
+    /// Bounds the whole HTTP/1.x request header, from its first byte to the
+    /// end of the header block. See [`SessionV1::set_header_timeout`].
+    ///
+    /// This is a noop for h2, subrequest and custom sessions: an h2 stream
+    /// only reaches the application once its header block is complete.
+    pub fn set_header_timeout(&mut self, timeout: Option<Duration>) {
+        if let Self::H1(s) = self {
+            s.set_header_timeout(timeout);
+        }
+    }
+
+    /// How long the HTTP/1.x request header took to arrive, from its first
+    /// byte to the end of the header block. `None` for h2, subrequest and
+    /// custom sessions, and before a header was read.
+    pub fn header_read_duration(&self) -> Option<Duration> {
+        match self {
+            Self::H1(s) => s.header_read_duration(),
+            _ => None,
         }
     }
 
@@ -355,7 +377,7 @@ impl Session {
     pub fn get_read_timeout(&self) -> Option<Duration> {
         match self {
             Self::H1(s) => s.get_read_timeout(),
-            Self::H2(_) => None,
+            Self::H2(s) => s.get_read_timeout(),
             Self::Subrequest(s) => s.get_read_timeout(),
             Self::Custom(s) => s.get_read_timeout(),
         }

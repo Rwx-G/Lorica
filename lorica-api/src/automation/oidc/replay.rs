@@ -13,7 +13,9 @@
 // limitations under the License.
 
 //! The bounded replay set (Story 10.5 AC #4): every accepted `jti` is
-//! remembered until its `exp`, and a second presentation is refused.
+//! remembered until the last instant the verifier would still accept
+//! its token, `exp` plus the clock skew, and a second presentation is
+//! refused.
 //!
 //! # Why the bound is the point
 //!
@@ -27,6 +29,12 @@
 //! in `lorica_automation_oidc_replay_evictions_total`: a silent
 //! eviction would turn a full set into a replay window, and a counter
 //! that moves is the alert.
+//!
+//! A token whose own expiry is the earliest of a full set would be the
+//! entry evicted the moment it was remembered, so it is refused rather
+//! than admitted unremembered ([`Remembered::NoRoom`]): that is a token
+//! the set cannot protect from its replay, and failing closed on it
+//! costs a pipeline one retry under a load no pipeline produces.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -49,6 +57,18 @@ pub const OIDC_REPLAY_SET_CAP: usize = 50_000;
 struct Inner {
     by_key: HashMap<String, DateTime<Utc>>,
     by_exp: BTreeSet<(DateTime<Utc>, String)>,
+}
+
+/// What [`ReplaySet::remember`] made of a token id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remembered {
+    /// Not seen before, and now remembered until its expiry.
+    Fresh,
+    /// Already remembered and not yet expired: a replay.
+    Replay,
+    /// The set is full and this id expires first, so remembering it
+    /// would evict it at once and leave its replay open.
+    NoRoom,
 }
 
 /// A bounded set of accepted token ids, each kept until its expiry.
@@ -75,22 +95,28 @@ impl ReplaySet {
         }
     }
 
-    /// Remember `key` until `exp`.
+    /// Remember `key` until `until`.
     ///
-    /// Returns `true` when the key was not in the set, `false` when it
-    /// was, which is a replay. Entries whose `exp` is at or before
-    /// `now` are purged first, so an expired entry never blocks a key
-    /// (an expired token is refused on `exp` anyway, before this set
-    /// is consulted). When the insert takes the set past its cap, the
-    /// entries with the earliest `exp` are evicted and counted.
-    pub fn remember(&self, key: &str, exp: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    /// [`Remembered::Fresh`] when the key was not in the set,
+    /// [`Remembered::Replay`] when it was, and [`Remembered::NoRoom`]
+    /// when the set is full and `key` would be the entry its own insert
+    /// evicts, which leaves the set as it was. Entries whose `until` is at or before
+    /// `now` are purged first, so an entry never blocks a key past the
+    /// instant its token stops being accepted. `until` is therefore the
+    /// token's `exp` PLUS the verifier's clock skew, never the bare
+    /// `exp`: the verifier accepts a token up to the skew past its
+    /// `exp`, and an entry purged at `exp` would read every
+    /// presentation inside that window as the first. When the insert
+    /// takes the set past its cap, the entries with the earliest
+    /// `until` are evicted and counted.
+    pub fn remember(&self, key: &str, until: DateTime<Utc>, now: DateTime<Utc>) -> Remembered {
         let mut inner = self.inner.lock();
         purge_expired(&mut inner, now);
         if inner.by_key.contains_key(key) {
-            return false;
+            return Remembered::Replay;
         }
-        inner.by_key.insert(key.to_string(), exp);
-        inner.by_exp.insert((exp, key.to_string()));
+        inner.by_key.insert(key.to_string(), until);
+        inner.by_exp.insert((until, key.to_string()));
 
         let mut evicted: u64 = 0;
         while inner.by_key.len() > self.cap {
@@ -98,6 +124,9 @@ impl ReplaySet {
                 break;
             };
             inner.by_key.remove(&oldest.1);
+            if oldest.1 == key {
+                return Remembered::NoRoom;
+            }
             evicted += 1;
         }
         if evicted > 0 {
@@ -109,7 +138,7 @@ impl ReplaySet {
                  until their expiry"
             );
         }
-        true
+        Remembered::Fresh
     }
 
     /// How many ids the set currently holds, expired ones included
@@ -152,18 +181,19 @@ mod tests {
     #[test]
     fn a_second_presentation_before_expiry_is_a_replay() {
         let set = ReplaySet::default();
-        assert!(set.remember("iss|a", at(300), at(0)));
-        assert!(!set.remember("iss|a", at(300), at(1)));
-        assert!(set.remember("iss|b", at(300), at(1)));
+        assert_eq!(set.remember("iss|a", at(300), at(0)), Remembered::Fresh);
+        assert_eq!(set.remember("iss|a", at(300), at(1)), Remembered::Replay);
+        assert_eq!(set.remember("iss|b", at(300), at(1)), Remembered::Fresh);
     }
 
     #[test]
     fn an_expired_entry_no_longer_blocks_its_key() {
         let set = ReplaySet::default();
-        assert!(set.remember("iss|a", at(300), at(0)));
-        assert!(!set.remember("iss|a", at(300), at(299)));
-        assert!(
+        assert_eq!(set.remember("iss|a", at(300), at(0)), Remembered::Fresh);
+        assert_eq!(set.remember("iss|a", at(300), at(299)), Remembered::Replay);
+        assert_eq!(
             set.remember("iss|a", at(600), at(300)),
+            Remembered::Fresh,
             "at exactly exp the entry is purged"
         );
         assert_eq!(set.len(), 1);
@@ -174,17 +204,24 @@ mod tests {
         let before =
             crate::metrics::gathered_counter("lorica_automation_oidc_replay_evictions_total", &[]);
         let set = ReplaySet::with_cap(3);
-        assert!(set.remember("iss|late", at(900), at(0)));
-        assert!(set.remember("iss|early", at(100), at(0)));
-        assert!(set.remember("iss|middle", at(500), at(0)));
+        assert_eq!(set.remember("iss|late", at(900), at(0)), Remembered::Fresh);
+        assert_eq!(set.remember("iss|early", at(100), at(0)), Remembered::Fresh);
+        assert_eq!(
+            set.remember("iss|middle", at(500), at(0)),
+            Remembered::Fresh
+        );
         assert_eq!(set.len(), 3);
 
-        assert!(set.remember("iss|fourth", at(700), at(0)));
+        assert_eq!(
+            set.remember("iss|fourth", at(700), at(0)),
+            Remembered::Fresh
+        );
         assert_eq!(set.len(), 3, "the cap holds");
         // The evicted id is the one expiring first, and its replay is
-        // now possible: that is the window the counter reports.
-        assert!(set.remember("iss|early", at(100), at(0)));
-        assert!(!set.remember("iss|late", at(900), at(0)));
+        // now possible for any presentation that outlives the earliest
+        // entry left: that is the window the counter reports.
+        assert_eq!(set.remember("iss|early", at(600), at(0)), Remembered::Fresh);
+        assert_eq!(set.remember("iss|late", at(900), at(0)), Remembered::Replay);
         assert_eq!(
             crate::metrics::gathered_counter("lorica_automation_oidc_replay_evictions_total", &[])
                 - before,
@@ -193,15 +230,39 @@ mod tests {
     }
 
     #[test]
+    fn a_full_set_refuses_the_id_it_would_evict_first_and_keeps_every_other() {
+        // Security audit Info: at the cap, the insert went in and the
+        // earliest expiry was popped after, which could be the id just
+        // admitted, so that token was accepted and never remembered.
+        let set = ReplaySet::with_cap(2);
+        assert_eq!(set.remember("iss|a", at(500), at(0)), Remembered::Fresh);
+        assert_eq!(set.remember("iss|b", at(600), at(0)), Remembered::Fresh);
+        let before =
+            crate::metrics::gathered_counter("lorica_automation_oidc_replay_evictions_total", &[]);
+        assert_eq!(set.remember("iss|c", at(100), at(0)), Remembered::NoRoom);
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.remember("iss|a", at(500), at(1)), Remembered::Replay);
+        assert_eq!(set.remember("iss|b", at(600), at(1)), Remembered::Replay);
+        assert_eq!(
+            crate::metrics::gathered_counter("lorica_automation_oidc_replay_evictions_total", &[]),
+            before,
+            "a refused id evicts nothing"
+        );
+        // Not remembered, so it is not a replay later either: once
+        // there is room, the same id is fresh.
+        assert_eq!(set.remember("iss|c", at(1_000), at(550)), Remembered::Fresh);
+    }
+
+    #[test]
     fn purging_runs_before_the_cap_is_measured() {
         let set = ReplaySet::with_cap(2);
-        assert!(set.remember("iss|a", at(10), at(0)));
-        assert!(set.remember("iss|b", at(20), at(0)));
+        assert_eq!(set.remember("iss|a", at(10), at(0)), Remembered::Fresh);
+        assert_eq!(set.remember("iss|b", at(20), at(0)), Remembered::Fresh);
         // Both have expired by now: the insert purges them instead of
         // evicting anything, and the counter does not move.
         let before =
             crate::metrics::gathered_counter("lorica_automation_oidc_replay_evictions_total", &[]);
-        assert!(set.remember("iss|c", at(100), at(30)));
+        assert_eq!(set.remember("iss|c", at(100), at(30)), Remembered::Fresh);
         assert_eq!(set.len(), 1);
         assert_eq!(
             crate::metrics::gathered_counter("lorica_automation_oidc_replay_evictions_total", &[]),

@@ -57,6 +57,27 @@ but no live swap happens: the API response's `handoff` field reports
    `worker_drain_timeout_s` (default 30s), records the drain histogram,
    and exits 0. The new process owns the unit from that point.
 
+**From 1.8.0 to 1.9.0.** The CLI pins the certificate the node records
+at `<data-dir>/management/served-cert.pem`. A node older than 1.9.0
+writes no such record; the 1.9.0 CLI then pins the certificate that
+node serves (`management_cert_pem_path` when both override paths are
+set, `<data-dir>/management/cert.pem` otherwise) and says so on
+stderr, so a 1.8.0 node can be hot-upgraded with the new binary. Run
+it as root or as `lorica`: it reads that certificate and the settings
+in `lorica.db`. If neither can be read the command refuses and sends
+nothing; there is deliberately no fallback that skips the pin, which
+would reopen the path by which a local user holding the port received
+the password.
+
+The CLI opens that older node's `lorica.db` read-only and runs no
+migration in it, whatever version the CLI is: the schema stays the one
+the running node knows. It refuses a `lorica.db` or a certificate under
+the data directory that is a symbolic link, and a `lorica.db` the data
+directory's owner does not own. An operator certificate may sit behind
+links (an ACME client's `live/` tree); it is resolved, and pinned only
+if the file it resolves to belongs to root or to `lorica` and its group
+and others cannot write it.
+
 ## Signature model
 
 - **Algorithm:** Ed25519, detached signature over the raw binary bytes.
@@ -102,6 +123,15 @@ forked, the upgrade rolls back with zero impact:
 
 A drain that overruns its window (stragglers force-killed) records the
 `drain_timeout` outcome but is still a completed upgrade, not a rollback.
+
+After a rollback from 1.9.0 to an older binary, or a package downgrade,
+`<data-dir>/management/served-cert.pem` stays behind, and the older
+node never updates it. If that node then serves another certificate (a
+rotation, or a 1.9.0 start that regenerated the self-signed pair before
+it was rolled back), the CLI refuses it as it refuses a stranger on the
+port: the failure is closed, and the message blames another process.
+Delete `served-cert.pem` in that case; the CLI then pins what the older
+node serves, as above. A token minted by 1.9.0 is unreadable by 1.8.0.
 
 ## Metrics to watch
 

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Build an .rpm package for Lorica.
-# Usage: bash dist/build-rpm.sh [binary_path]
+# Usage: bash dist/build-rpm.sh [binary_path] [mcp_binary_path]
 #   binary_path defaults to ./lorica (current directory)
+#   mcp_binary_path defaults to lorica-mcp next to binary_path, which is
+#   where `cargo build --release -p lorica -p lorica-mcp` leaves both
 #   Requires: rpm-build
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BINARY="${1:-./lorica}"
+MCP_BINARY="${2:-$(dirname "$BINARY")/lorica-mcp}"
 VERSION=$(grep '^Version:' dist/rpm/lorica.spec | awk '{print $2}' | tr -d '\r')
 RPMTOP="dist/.rpmbuild"
 
@@ -25,6 +28,7 @@ mkdir -p "$RPMTOP"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
 # Copy binary and service file to SOURCES
 cp "$BINARY" "$RPMTOP/SOURCES/lorica"
+cp "$MCP_BINARY" "$RPMTOP/SOURCES/lorica-mcp"
 mkdir -p "$RPMTOP/SOURCES/dist"
 cp dist/lorica.service "$RPMTOP/SOURCES/dist/lorica.service"
 

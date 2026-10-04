@@ -16,15 +16,17 @@
 # for.
 #
 # The automation listener refuses to open while `automation_allowed_cidrs`
-# is empty, and the setting lives in the store, so the first boot walks
-# the path an operator walks: start without the flag, set the allowlist
-# on the management API, stop, start with the flag. The allowlist is the
-# /24 of the e2e network (read off backend1, which sits on that network
-# and nowhere else), so every runner on it is inside; the control plane
-# also joins a second compose network on which nothing is allowlisted,
-# which is where the smoke's "outside" connection comes from. Once per
-# data volume, like the CA: a `docker compose restart` finds the marker
-# and starts straight away.
+# is empty; the first boot seeds it through seed-automation-allowlist.sh,
+# the helper entrypoint-mcp.sh sources too. The allowlist is the /24 of
+# the e2e network (read off backend1, which sits on that network and
+# nowhere else), so every runner on it is inside, plus 127.0.0.1/32 for
+# the cluster MCP phase (backlog #91): it shares this node's network
+# namespace to mint with the real `lorica mcp token create`, and the
+# listener's certificate names 127.0.0.1, not the e2e address. The
+# control plane also joins a second compose network on which nothing is
+# allowlisted, which is where the smoke's "outside" connection comes
+# from. Once per data volume, like the CA: a `docker compose restart`
+# finds the marker and starts straight away.
 #
 # The bootstrap password is written to /shared so the smoke runner and
 # the followers can read it without a docker socket.
@@ -40,6 +42,10 @@ mkdir -p /shared
 DATA_DIR=/var/lib/lorica
 LOGFILE=/shared/cp.log
 : > "$LOGFILE"
+
+# A marker left by an earlier start on the same volume would tell a
+# follower the API answers before this start has bound it.
+rm -f /shared/cp_ready
 
 say() { echo "$*" | tee -a "$LOGFILE"; }
 
@@ -84,69 +90,24 @@ fi
 # listener with a verified certificate.
 socat TCP-LISTEN:9443,fork,reuseaddr TCP:127.0.0.1:19443 &
 
-# The automation allowlist (Story 10.3), seeded once. The login body
-# and the cookie go through 0600 files, never argv, for the reason the
-# follower entrypoint gives.
-ALLOWLIST_MARKER="$DATA_DIR/.e2e-automation-allowlist"
-if [ -f "$ALLOWLIST_MARKER" ]; then
-    say "automation_allowed_cidrs already seeded; starting with the automation listener (restart)"
-else
-    say "seeding automation_allowed_cidrs through the management API (first boot)"
-    lorica --data-dir "$DATA_DIR" --management-port 19443 \
-        --cluster-listen "0.0.0.0:9444" \
-        --cluster-listen-any \
-        --cluster-enrollment-listen "0.0.0.0:9445" \
-        --cluster-advertise "lorica-cp" >> "$LOGFILE" 2>&1 &
-    SEED_PID=$!
-
-    for i in $(seq 1 60); do
-        [ -f "$DATA_DIR/initial-admin-password" ] && break
-        sleep 1
-    done
-    for i in $(seq 1 60); do
-        curl -sk -o /dev/null https://127.0.0.1:19443/api/v1/status && break
-        sleep 1
-    done
-
-    BACKEND1_IP=$(getent hosts backend1 | awk '{print $1}' | head -1)
-    if [ -z "$BACKEND1_IP" ]; then
-        say "backend1 does not resolve; cannot derive the automation allowlist"
-        exit 1
+# The automation allowlist (Story 10.3), seeded once. The e2e /24 comes
+# first: it is the one the automation smoke reads back from /shared.
+automation_allowed_cidrs() {
+    backend1_ip=$(getent hosts backend1 | awk '{print $1}' | head -1)
+    if [ -z "$backend1_ip" ]; then
+        say "backend1 does not resolve; cannot derive the automation allowlist" >&2
+        return 1
     fi
-    ALLOW_CIDR=$(echo "$BACKEND1_IP" | awk -F. '{print $1"."$2"."$3".0/24"}')
-
-    SEED_OK=0
-    (
-        umask 077
-        LOGIN_BODY=/tmp/seed_login.json
-        COOKIE=/tmp/seed_cookie
-        printf '{"username":"admin","password":"%s"}' \
-            "$(cat "$DATA_DIR/initial-admin-password")" > "$LOGIN_BODY"
-        curl -sk -c "$COOKIE" -X POST "https://127.0.0.1:19443/api/v1/auth/login" \
-            -H 'Content-Type: application/json' --data "@$LOGIN_BODY" > /dev/null
-        rm -f "$LOGIN_BODY"
-        SET_OUT=$(curl -sk -b "$COOKIE" -X PUT "https://127.0.0.1:19443/api/v1/settings" \
-            -H 'Content-Type: application/json' \
-            -d "{\"automation_allowed_cidrs\":[\"$ALLOW_CIDR\"]}")
-        rm -f "$COOKIE"
-        echo "$SET_OUT" | grep -q "$ALLOW_CIDR"
-    ) && SEED_OK=1
-
-    kill "$SEED_PID" 2>/dev/null || true
-    for i in $(seq 1 30); do
-        kill -0 "$SEED_PID" 2>/dev/null || break
-        sleep 1
-    done
-    kill -KILL "$SEED_PID" 2>/dev/null || true
-    wait "$SEED_PID" 2>/dev/null || true
-
-    if [ "$SEED_OK" != "1" ]; then
-        say "seeding automation_allowed_cidrs failed"
-        exit 1
-    fi
-    echo "$ALLOW_CIDR" > /shared/automation_allowed_cidr
-    touch "$ALLOWLIST_MARKER"
-    say "automation_allowed_cidrs = $ALLOW_CIDR"
+    echo "$(echo "$backend1_ip" | awk -F. '{print $1"."$2"."$3".0/24"}') 127.0.0.1/32"
+}
+. /seed-automation-allowlist.sh
+seed_automation_allowlist \
+    --cluster-listen "0.0.0.0:9444" \
+    --cluster-listen-any \
+    --cluster-enrollment-listen "0.0.0.0:9445" \
+    --cluster-advertise "lorica-cp" || exit 1
+if [ -n "$SEEDED_CIDRS" ]; then
+    echo "${SEEDED_CIDRS%% *}" > /shared/automation_allowed_cidr
 fi
 
 lorica --data-dir "$DATA_DIR" --management-port 19443 \
@@ -170,8 +131,29 @@ if [ ! -f /shared/cp_admin_password ]; then
     exit 1
 fi
 
+# The password file is not a readiness signal on its own: lorica writes
+# it right after opening the store, and binds the management API only
+# at the end of startup. A follower that saw the marker in that window
+# reached socat with nothing listening behind it, failed its login and
+# exited, so the fleet never formed until compose restarted it. Wait
+# for the API to answer through the socat port the followers dial: any
+# HTTP status counts, a 401 included, as in the runners' wait_for_api.
+for i in $(seq 1 60); do
+    code=$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:9443/api/v1/status" 2>/dev/null || true)
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+        break
+    fi
+    code=""
+    sleep 1
+done
+
+if [ -z "$code" ]; then
+    say "the control plane's management API never answered"
+    exit 1
+fi
+
 # The marker the followers wait on: written last, so its presence means
-# the password file is already readable.
+# the password file is already readable and the management API answers.
 echo ready > /shared/cp_ready
 say "control plane ready"
 

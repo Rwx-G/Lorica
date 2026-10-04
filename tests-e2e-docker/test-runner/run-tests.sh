@@ -190,6 +190,21 @@ if [ -n "$SESSION" ]; then
         -H "Content-Type: application/json" -d '{"flood_threshold_rps":100,"flood_strict_rps":0}'
     api_put "/api/v1/settings" '{"flood_threshold_rps":0,"flood_strict_rps":0}' >/dev/null
 
+    # Downstream idle timeout (backlog #82): bounded on both sides, and
+    # there is no 0 ("no limit"). The close itself is asserted by
+    # lorica/tests/downstream_idle_timeout_e2e_test.rs over a socket.
+    assert_json "$SETTINGS" ".data.downstream_idle_timeout_s" "75" "Default downstream idle timeout is 75 s"
+    assert_status PUT "$API/api/v1/settings" 422 "downstream_idle_timeout_s=0 rejected" \
+        -H "Content-Type: application/json" -d '{"downstream_idle_timeout_s":0}'
+    assert_status PUT "$API/api/v1/settings" 422 "downstream_idle_timeout_s above 3600 rejected" \
+        -H "Content-Type: application/json" -d '{"downstream_idle_timeout_s":3601}'
+    # The header timeout has no "off" value either.
+    assert_status PUT "$API/api/v1/settings" 400 "header_timeout_s=0 rejected" \
+        -H "Content-Type: application/json" -d '{"header_timeout_s":0}'
+    IDLE=$(api_put "/api/v1/settings" '{"downstream_idle_timeout_s":30}')
+    assert_json "$IDLE" ".data.downstream_idle_timeout_s" "30" "Downstream idle timeout updated to 30"
+    api_put "/api/v1/settings" '{"downstream_idle_timeout_s":75}' >/dev/null
+
 # =============================================================================
 # 4. API - BACKENDS CRUD
 # =============================================================================

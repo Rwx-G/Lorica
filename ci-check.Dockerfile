@@ -22,42 +22,60 @@ RUN rustup component add clippy rustfmt
 WORKDIR /app
 COPY . .
 
+# What this runs of .github/workflows/ci.yml, and what it does not.
+#
+# Run: the frontend build, check and lint of the Lint job; every
+# `run: cargo fmt|clippy|test` line of the workflow, read from it rather
+# than copied here, in the workflow's order and with the RUSTFLAGS its
+# toolchain action exports; the frontend tests; the release build and
+# the binary check of Build & Package.
+#
+# Not run: Semgrep, cargo audit, the lorica-mcp dependency check, the
+# seccomp regression probes (they need systemd-run), coverage, the Docker
+# e2e suite, the packages and their install and upgrade jobs (they need a
+# host booted with systemd; dist/tests holds the scripts), the tag
+# signature check and the release.
+#
+# The crate lists used to be copied into this file. The copy drifted: six
+# of the fourteen product crates were tested here, `lorica` not at all,
+# and two product crates sat in a forked-crate step whose failures were
+# ignored, while this file said it mirrored CI.
+
 # ===== JOB 1: LINT =====
-RUN echo "===== LINT: Build frontend =====" \
+RUN echo "===== LINT: Build, check and lint the frontend =====" \
     && cd lorica-dashboard/frontend \
     && npm ci \
-    && npm run build
+    && npm run build \
+    && npm run check \
+    && npm run lint
 
-RUN echo "===== LINT: Clippy (product crates) =====" \
-    && cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings
+# The frontend is built above, so the crates embedding it skip the rebuild,
+# as they do in CI, where every cargo step sets SKIP_FRONTEND_BUILD.
+ENV SKIP_FRONTEND_BUILD=1 RUSTFLAGS="-D warnings"
 
-RUN echo "===== LINT: cargo fmt check =====" \
-    && cargo fmt -- --check || echo "fmt check: some files not formatted (non-blocking)"
-
-# ===== JOB 2: TEST =====
-RUN echo "===== TEST: Rust unit tests (product crates) =====" \
-    && cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench
-
-RUN echo "===== TEST: Rust unit tests (forked + binary crates) =====" \
-    && cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \
-       -p lorica-tls -p lorica-command -p lorica-worker -p lorica-lb \
-       -p lorica -p lorica-cache -p lorica-lru -p lorica-memory-cache \
-       -p lorica-limits -p lorica-ketama -p lorica-timeout -p lorica-pool \
-       -p lorica-header-serde -p lorica-runtime -p TinyUFO \
-    || echo "Some forked crate tests failed (expected - network/TLS tests need host environment)"
+# ===== JOBS 1 and 2: every cargo gate the workflow runs =====
+RUN grep -E '^\s+run: cargo (fmt|clippy|test)' .github/workflows/ci.yml \
+        | sed -E 's/^\s+run: //' | tr -d '\r' > /tmp/ci-cargo-gates \
+    && test -s /tmp/ci-cargo-gates \
+    && while read -r gate; do \
+           echo "===== CI: $gate =====" && sh -c "$gate" || exit 1; \
+       done < /tmp/ci-cargo-gates
 
 RUN echo "===== TEST: Frontend tests =====" \
     && cd lorica-dashboard/frontend && npx vitest run
 
 # ===== JOB 3: BUILD =====
-RUN echo "===== BUILD: Release binary =====" \
-    && cargo build --release -p lorica
+RUN echo "===== BUILD: Release binaries =====" \
+    && cargo build --release -p lorica -p lorica-mcp
 
-RUN echo "===== BUILD: Verify binary =====" \
-    && file target/release/lorica \
-    && target/release/lorica --version
+# lorica-mcp has no --version. With no configuration it must refuse
+# with EX_CONFIG (78), which proves it links and runs.
+RUN echo "===== BUILD: Verify binaries =====" \
+    && file target/release/lorica target/release/lorica-mcp \
+    && target/release/lorica --version \
+    && { rc=0; target/release/lorica-mcp < /dev/null || rc=$?; test "$rc" -eq 78; }
 
 RUN echo "" \
     && echo "============================================" \
-    && echo "  ALL CI CHECKS PASSED" \
+    && echo "  THE CI CHECKS LISTED AT THE TOP PASSED" \
     && echo "============================================"

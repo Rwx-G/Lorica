@@ -3,14 +3,16 @@
 > **Baseline note.** The endpoint list below is the v1.0 planning subset
 > and predates the RBAC, ACME, AI-crawler, audit-log, hot-upgrade,
 > cluster, and automation routes. There are now **two** authoritative,
-> always-current contracts, and both are enforced against the live axum
+> always-current contracts, and both are enforced against the axum
 > route tables by `lorica-api/tests/openapi_contract.rs`:
 >
 > - `lorica-api/openapi.yaml` - the management plane, scanned against
 >   `src/server.rs`.
-> - `lorica-api/openapi-automation.yaml` - the automation plane, scanned
->   against `src/automation/router.rs`. The test additionally checks that
->   the scope each operation documents is the scope the gate applies.
+> - `lorica-api/openapi-automation.yaml` - the automation plane, held
+>   against `route_table()` in `src/automation/router.rs`, the declared
+>   table both automation routers are built from. The test additionally
+>   checks that the scope each operation documents is the scope the gate
+>   applies.
 >
 > Automation paths never appear in `openapi.yaml`: that document declares
 > one server and one security scheme (the session cookie), which is false
@@ -31,11 +33,17 @@ The two planes deliberately share no credential and no socket. A request arrivin
 
 **Authentication (automation plane):** Never a session. The bearer value is either a static scoped token (`<public_id>.<secret>`, minted by `lorica automation token create`) or a GitLab OIDC ID token; the mode is chosen by the shape of the value, never by anything the caller can set separately, and both refusal paths answer the same 401 body so a caller cannot learn which mode was tried. The precise reason goes to the audit row alone.
 
-**Authorization (automation plane):** By scope, never by RBAC role. The scopes are `environments:write`, `environments:read`, `routes:read`, `certificates:read`. Each path declares the scope it requires; a path declaring none is reachable by no token at all, including one carrying every scope, so a newly added path cannot silently inherit the widest grant. A token additionally carries the hostname patterns it may claim and the backend CIDRs it may point them at.
+**Authorization (automation plane):** By scope, never by RBAC role. The vocabulary is a closed enum, `AutomationScope` in `lorica-automation-policy/src/scope.rs` (re-exported by `lorica-config`'s token model), whose `ALL` is the one list every restatement is checked against; it covers the environment resource (read and write), one read grant per family the plane exposes, the route, backend and certificate writes the MCP config tier is built on, and `settings:write` for the admin tier's one path. Each path declares the scope it requires, in `required_scope`, for its verb; a path declaring none is reachable by no token at all, including one carrying every scope, so a newly added path cannot silently inherit the widest grant. Two paths declare the third state, "any live token": `GET /automation/v1/whoami`, which reports the presented credential back to its own holder and discloses nothing the caller did not present, and `/automation/v1/mcp`, whose gate is inside the request, since an MCP message names its own tool and every tool call is authorized against the presented token's scopes in the same matrix. A token additionally carries the hostname patterns it may claim and the backend CIDRs it may point them at, when it carries a scope those grants bound.
+
+**Read surface (automation plane):** The read paths added in v1.9.0 are wrappers over the management handlers, calling the same functions and re-wrapping the rows rather than recomputing them: two surfaces that answer one question independently drift, and on a read surface the drift is a field one of them stopped stripping. Every collection there is paginated with a server-side row cap the caller cannot raise, because the consumer is a language model reading on an operator's behalf.
+
+**Write surface (automation plane):** The route, backend, certificate-binding, renewal and settings writes added in v1.9.0 run the management handler's own body (the `_as` split in `routes/crud.rs`, `backends.rs`, `acme/renewal.rs` and `settings.rs`) with the token as the actor. What the plane adds is authorization: the token's grants on what a write claims and on the row it targets, checked by a guard (`lorica-api/src/target.rs`) inside the store closure that writes; the withheld route fields; the controls that may only be strengthened; the settings allowlist with its bounds; and `?dry_run=true`, the preview (`lorica-api/src/preview.rs`), which runs the same body and stops before the store. The rules are data in `lorica-automation-policy` (the settings allowlist, the withheld fields, the one-way protections), which `lorica-mcp` reads too; the handlers and the predicates that weigh a row live in `lorica-api/src/automation/write.rs`.
 
 **Network gate (automation plane):** The listener refuses to start while `automation_allowed_cidrs` is empty. A source outside the allowlist is dropped at TCP accept, before the TLS handshake, so it never sees a 401 or a 403. Behind that sit the same pre-authentication budgets the cluster enrollment listener uses (a global handshake permit, a per-source concurrency slot, a per-source attempt window), with values sized for pipeline traffic. The allowlist is re-read on each accept, so narrowing it takes effect without a restart.
 
 **Audit:** Every automation request is recorded by the outermost layer of the automation router, whatever the outcome.
+
+**Request units (both planes, v1.9.0):** A store write commits on the blocking pool whether or not its request is still awaited, and hyper drops the request future when the client goes away, so a reload signal and an audit row awaited after the commit could be lost with the client. Each plane therefore runs a request that may write as one task the request awaits but does not own (`lorica-api/src/db.rs`): on the management plane every request that is not a read, through one router layer (`detach_mutations`) rather than a call per handler, and on the automation plane every request, its audit row included. A unit outlives its connection, so the connection budgets no longer bound it: each plane has its own semaphore, taken before the task starts, so a client that leaves while waiting for a slot starts nothing, and an abandoned unit keeps its slot until it ends. Units run on the process's task tracker, which a shutdown closes and waits on for up to 10 seconds, so a unit between its commit and its row is finished rather than cut. `lorica_detached_request_units{plane}` is the number in flight. Reads stay on their connection, where a disconnect cancelling them is the right behaviour.
 
 **Versioning:** Management API path prefix `/api/v1/`. Version bump only on breaking changes. Non-breaking additions (new fields, new endpoints) don't require version bump.
 
@@ -45,11 +53,12 @@ Everything below is the v1.0 planning subset of the **management plane**.
 The automation plane is a separate surface under `/automation/v1/`, and
 its live shape is `lorica-api/openapi-automation.yaml`:
 
-- `GET /automation/v1/whoami` (`environments:read`) - what the presented credential is. Reaches nothing else, so it is the call an automation makes to check that its credential is still live and still carries the scopes it expects.
+- `GET /automation/v1/whoami` (no scope; any live token) - what the presented credential is. Reaches nothing else, so it is the call an automation makes to check that its credential is still live and still carries the scopes it expects, and the call the MCP server makes at startup to discover its own tier.
 - `GET /automation/v1/environments` (`environments:read`) - list the environments this token owns.
 - `GET /automation/v1/environments/{name}` (`environments:read`)
 - `PUT /automation/v1/environments/{name}` (`environments:write`) - one idempotent create-or-replace covering a route, its backends, a certificate binding and a lifetime, applied in a single transaction.
 - `DELETE /automation/v1/environments/{name}` (`environments:write`) - also done by the reaper once `expires_at` has passed.
+- The read surface (`logs:read`, `waf:read`, `sla:read`, `cluster:read`, `backends:read`, `routes:read`, `certificates:read`), the write surface (`routes:write`, `backends:write`, `certificates:write`), `PUT /automation/v1/settings` (`settings:write`) and `POST /automation/v1/mcp` (any live token) - v1.9.0, listed with their scopes in `openapi-automation.yaml`.
 
 ### Authentication
 

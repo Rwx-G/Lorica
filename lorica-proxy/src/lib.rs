@@ -235,9 +235,17 @@ where
             Err(mut e) => {
                 e.as_down();
                 error!("Fail to proxy: {e}");
-                if matches!(e.etype, InvalidHTTPHeader) {
+                // Lorica: a header that did not arrive in time is answered
+                // 408 (RFC 9110 section 15.5.9) rather than dropped, so the
+                // client can tell a timeout from a broken connection.
+                let status = match e.etype {
+                    InvalidHTTPHeader => Some(400),
+                    ReadTimedout => Some(408),
+                    _ => None,
+                };
+                if let Some(status) = status {
                     downstream_session
-                        .respond_error(400)
+                        .respond_error(status)
                         .await
                         .unwrap_or_else(|e| {
                             error!("failed to send error response to downstream: {e}");
@@ -1212,6 +1220,16 @@ where
 
     fn server_options(&self) -> Option<&HttpServerOptions> {
         self.server_options.as_ref()
+    }
+
+    // Lorica: forwards the proxy's idle timeout to the server loop.
+    fn downstream_idle_timeout(&self) -> Option<std::time::Duration> {
+        self.inner.downstream_idle_timeout()
+    }
+
+    // Lorica: forwards the proxy's header timeout to the server loop.
+    fn downstream_header_timeout(&self) -> Option<std::time::Duration> {
+        self.inner.downstream_header_timeout()
     }
 
     fn h2_options(&self) -> Option<H2Options> {

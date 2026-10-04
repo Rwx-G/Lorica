@@ -43,7 +43,7 @@ pub struct PathRuleResponse {
 }
 
 /// JSON body for a single path rule on a route create or update.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct PathRuleRequest {
     /// Request-path pattern the rule tests.
     pub path: String,

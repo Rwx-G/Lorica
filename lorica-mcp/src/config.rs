@@ -1,0 +1,764 @@
+// Copyright 2026 Rwx-G (Lorica)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Configuration intake (Story 11.1 AC #1): where this server's
+//! automation endpoint and bearer token come from, and where they are
+//! refused.
+//!
+//! # Never argv
+//!
+//! AC #1 names the reason and it is not style: on Linux every local
+//! user reads `/proc/<pid>/cmdline`, so a token passed as an argument
+//! is a token published to the machine. An MCP client launches this
+//! process, and the natural thing for a client author to write is an
+//! `args` array, so the refusal has to be loud and has to name the two
+//! environment variables instead. A process started with any argument
+//! at all therefore refuses to start, rather than ignoring the argument
+//! and leaving whoever wrote it believing it took effect.
+//!
+//! # Environment or file, and which wins
+//!
+//! [`ENDPOINT_ENV`] and [`TOKEN_ENV`] are the primary intake. A client
+//! that cannot set an environment variable per server names a TOML file
+//! in [`CONFIG_ENV`] instead. The environment wins where both speak,
+//! because it is the one an operator can change without editing a file
+//! a client may rewrite.
+//!
+//! # The certificate the listener actually presents
+//!
+//! [`CA_BUNDLE_ENV`] names a PEM file of certificate authorities to
+//! trust IN ADDITION to the platform store and the built-in public
+//! roots. It exists because the automation listener's default
+//! certificate is self-signed and an operator's own is as likely as not
+//! signed by an internal CA, and because the alternative an operator
+//! reaches for otherwise is to turn verification off. There is no
+//! option here that does that: a bearer token travelling to whoever
+//! answered the connection is the failure this whole plane is arranged
+//! to prevent, and a switch that exists gets set.
+//!
+//! # Nothing here ever prints the token
+//!
+//! [`Secret`] has a [`fmt::Debug`] that redacts and no [`fmt::Display`]
+//! at all, so a token reaches a log only if somebody calls
+//! [`Secret::reveal`] and writes it out on purpose. The malformed-file
+//! error is the other half of that: a TOML parse failure carries the
+//! offending line, and the offending line of this file is as likely as
+//! not the one holding the token, so the parse detail is dropped and
+//! the path alone is reported.
+//!
+//! # A file that carries the token is its owner's alone
+//!
+//! A token in a file other local users can read is a token published
+//! to them, exactly as an argument would be. So a file that carries a
+//! `token` key and grants any permission to its group or to others is
+//! refused at startup, naming its mode and the `chmod` that fixes it,
+//! the way `ssh` refuses a private key it is not alone in reading. A
+//! file that names only the endpoint or the bundle carries nothing
+//! secret and may be shared.
+
+use core::fmt;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+/// The automation endpoint, as `https://host:port`.
+pub const ENDPOINT_ENV: &str = "LORICA_MCP_ENDPOINT";
+
+/// The automation bearer token.
+pub const TOKEN_ENV: &str = "LORICA_MCP_TOKEN";
+
+/// Path to a TOML file carrying `endpoint`, `token` and `ca_bundle`.
+pub const CONFIG_ENV: &str = "LORICA_MCP_CONFIG";
+
+/// Path to a PEM file of certificate authorities to trust as well as
+/// the platform's own.
+pub const CA_BUNDLE_ENV: &str = "LORICA_MCP_CA_BUNDLE";
+
+/// The most bytes a bearer token may weigh.
+///
+/// A Lorica automation token is a public id and a secret half, tens of
+/// bytes. The ceiling is here so a file or an environment variable that
+/// is not a token at all is refused as configuration rather than sent
+/// to the plane as an `Authorization` header.
+const MAX_TOKEN_BYTES: usize = 4096;
+
+/// A value that must not reach a log, a panic message or an error.
+///
+/// The redacting [`fmt::Debug`] is the whole type: it is what makes
+/// `tracing::debug!(?config)` safe, and what makes writing the token
+/// out require somebody to type [`Secret::reveal`] at the call site
+/// where a reviewer sees it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// The value itself, for the one place that puts it on the wire.
+    pub fn reveal(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+/// What this server needs before it can ask the plane anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerConfig {
+    /// The automation listener's origin, `https://host:port`, with no
+    /// trailing slash and no path.
+    pub endpoint: String,
+    /// The bearer token every request to that listener carries.
+    pub token: Secret,
+    /// A PEM file of extra certificate authorities to trust, or `None`
+    /// to trust the platform's own and nothing else.
+    ///
+    /// Additive, never a replacement and never a way to skip
+    /// verification: see the module documentation.
+    pub ca_bundle: Option<PathBuf>,
+}
+
+/// Why configuration was refused.
+///
+/// Every variant's message is written for the operator who will read it
+/// on stderr and has to fix it. None of them echoes the token, and the
+/// file variants name the path without quoting anything from inside the
+/// file.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigError {
+    /// The process was started with command-line arguments.
+    #[error(
+        "lorica-mcp takes no command-line arguments. The endpoint and the token are \
+         read from {ENDPOINT_ENV} and {TOKEN_ENV}, or from the TOML file named by \
+         {CONFIG_ENV}. An argument would put the token in the process table, where \
+         every local user reads it."
+    )]
+    ArgumentsRefused,
+    /// Neither the environment nor the file named an endpoint.
+    #[error(
+        "no automation endpoint: set {ENDPOINT_ENV} to the listener's origin \
+         (https://host:port), or name a TOML file in {CONFIG_ENV} carrying an \
+         `endpoint` key."
+    )]
+    MissingEndpoint,
+    /// Neither the environment nor the file named a token.
+    #[error(
+        "no automation token: set {TOKEN_ENV}, or name a TOML file in {CONFIG_ENV} \
+         carrying a `token` key."
+    )]
+    MissingToken,
+    /// The endpoint is not an `https://` origin.
+    #[error(
+        "the automation endpoint must be https://. The bearer token travels on every \
+         request, and over plaintext it travels to whoever is listening."
+    )]
+    EndpointNotHttps,
+    /// The endpoint carries a userinfo component, which would mean a
+    /// second credential in a place nothing here redacts.
+    #[error(
+        "the automation endpoint must carry no user information before the host. \
+         Lorica authenticates with the bearer token from {TOKEN_ENV} and nothing else."
+    )]
+    EndpointCarriesCredentials,
+    /// The endpoint has a path, query or fragment: this server appends
+    /// its own paths and would build nonsense from a prefix.
+    #[error(
+        "the automation endpoint is an origin (https://host:port) and nothing more. \
+         This server appends the paths it reads; a path, query or fragment here would \
+         be prepended to every one of them."
+    )]
+    EndpointIsNotAnOrigin,
+    /// The token is empty, or carries a byte that cannot travel in an
+    /// HTTP header.
+    #[error(
+        "the automation token is empty or carries a byte an HTTP header cannot. \
+         Check {TOKEN_ENV} for a trailing newline or a shell quoting mistake."
+    )]
+    TokenUnusable,
+    /// The file named by [`CONFIG_ENV`] could not be read.
+    ///
+    /// The reason is kept as text rather than as the `io::Error`
+    /// itself so the type stays comparable, which every refusal test
+    /// here relies on.
+    #[error(
+        "cannot read the configuration file named by {CONFIG_ENV} ({}): {detail}",
+        path.display()
+    )]
+    FileUnreadable {
+        /// The path that was named.
+        path: PathBuf,
+        /// The operating system's reason, which names no file content.
+        detail: String,
+    },
+    /// The file named by [`CONFIG_ENV`] is not the TOML this expects.
+    ///
+    /// Carries no parse detail on purpose: a TOML error quotes the line
+    /// it failed on, and in this file that line may be the token.
+    #[error(
+        "the configuration file named by {CONFIG_ENV} ({}) is not valid TOML with \
+         optional string keys `endpoint`, `token` and `ca_bundle`. The parse error is \
+         withheld because it would quote the line it failed on, and that line may be \
+         the token.",
+        path.display()
+    )]
+    FileMalformed {
+        /// The path that was named.
+        path: PathBuf,
+    },
+    /// The file named by [`CONFIG_ENV`] carries a token and grants a
+    /// permission to its group or to others.
+    #[error(
+        "the configuration file named by {CONFIG_ENV} ({}) carries the token and is open to \
+         other users (mode {mode:04o}): anyone it lets in holds the credential. Make it \
+         readable by its owner alone, `chmod 600 {}`, and replace the token if another user \
+         may already have read it.",
+        path.display(),
+        path.display()
+    )]
+    FileOpenToOthers {
+        /// The path that was named.
+        path: PathBuf,
+        /// The file's permission bits, as `chmod` spells them.
+        mode: u32,
+    },
+}
+
+/// The permission bits a file carrying the token may not grant: every
+/// bit of the group's and of the others', as `ssh` holds a private key.
+const OPEN_TO_OTHERS: u32 = 0o077;
+
+/// The keys the TOML file may carry, every one optional so the file
+/// can name the endpoint while the environment carries the token. The
+/// malformed-file message names them, and a test holds that message to
+/// the list serde itself reports for this struct.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    endpoint: Option<String>,
+    token: Option<String>,
+    ca_bundle: Option<String>,
+}
+
+impl ServerConfig {
+    /// Assemble a configuration from already-gathered inputs.
+    ///
+    /// Pure: `arguments` is what followed the program name, `env`
+    /// answers a variable, and `file` is the TOML text already read (or
+    /// `None` when [`CONFIG_ENV`] named nothing). Splitting the I/O out
+    /// is what lets the refusals be tested without a process or a
+    /// filesystem, which is the half of AC #1 that has to stay true.
+    ///
+    /// # Errors
+    ///
+    /// Any [`ConfigError`]; see that type for what each means.
+    pub fn assemble(
+        arguments: &[String],
+        env: impl Fn(&str) -> Option<String>,
+        file: Option<(&Path, &str)>,
+    ) -> Result<ServerConfig, ConfigError> {
+        if !arguments.is_empty() {
+            return Err(ConfigError::ArgumentsRefused);
+        }
+
+        let from_file = match file {
+            Some((path, text)) => {
+                toml::from_str::<ConfigFile>(text).map_err(|_| ConfigError::FileMalformed {
+                    path: path.to_path_buf(),
+                })?
+            }
+            None => ConfigFile::default(),
+        };
+
+        // A variable set to nothing reads as unset. An MCP client that
+        // always writes both keys into its `env` object would otherwise
+        // shadow the file with a blank string, and the operator would
+        // meet "must be https://" about a value they never typed.
+        let spoken = |name: &str| env(name).filter(|value| !value.trim().is_empty());
+        let endpoint = spoken(ENDPOINT_ENV)
+            .or(from_file.endpoint)
+            .ok_or(ConfigError::MissingEndpoint)?;
+        let token = spoken(TOKEN_ENV)
+            .or(from_file.token)
+            .ok_or(ConfigError::MissingToken)?;
+        let ca_bundle = spoken(CA_BUNDLE_ENV)
+            .or(from_file.ca_bundle)
+            .map(|named| PathBuf::from(named.trim()));
+
+        Ok(ServerConfig {
+            endpoint: checked_endpoint(endpoint.trim())?,
+            token: Secret(checked_token(token.trim())?),
+            ca_bundle,
+        })
+    }
+
+    /// Assemble from this process's own arguments, environment and, if
+    /// [`CONFIG_ENV`] names one, configuration file.
+    ///
+    /// # Errors
+    ///
+    /// Any [`ConfigError`], including [`ConfigError::FileUnreadable`],
+    /// which only this entry point can produce.
+    pub fn from_process() -> Result<ServerConfig, ConfigError> {
+        // `args_os`, not `args`: the latter panics on an argument that
+        // is not UTF-8 and prints it in the panic message, and every
+        // argument is refused anyway, so nothing here needs to read
+        // one. Lossy is enough for a value whose only use is to count.
+        let arguments: Vec<String> = std::env::args_os()
+            .skip(1)
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        // Read before `assemble` so the file's own failure is reported
+        // as itself; an unreadable path must not surface as "no
+        // endpoint", which sends an operator to the wrong variable.
+        let named = std::env::var(CONFIG_ENV).ok().map(PathBuf::from);
+        let contents = match &named {
+            Some(path) => {
+                let unreadable = |reason: std::io::Error| ConfigError::FileUnreadable {
+                    path: path.clone(),
+                    detail: reason.to_string(),
+                };
+                let text = std::fs::read_to_string(path).map_err(unreadable)?;
+                let mode = file_mode(path).map_err(unreadable)?;
+                refuse_a_token_open_to_others(path, &text, mode)?;
+                Some(text)
+            }
+            None => None,
+        };
+        let file = named.as_deref().zip(contents.as_deref());
+
+        ServerConfig::assemble(&arguments, |name| std::env::var(name).ok(), file)
+    }
+}
+
+/// The permission bits of the file at `path`, as `chmod` spells them.
+fn file_mode(path: &Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o7777)
+}
+
+/// Refuse a configuration file that carries a token and is open to
+/// other users; see the module documentation.
+///
+/// Pure, so the rule is tested without a file: `text` is what was read
+/// and `mode` its permission bits. A file that does not parse is let
+/// through to [`ServerConfig::assemble`], which refuses it as malformed
+/// without quoting it.
+fn refuse_a_token_open_to_others(path: &Path, text: &str, mode: u32) -> Result<(), ConfigError> {
+    let carries_token = toml::from_str::<ConfigFile>(text)
+        .ok()
+        .and_then(|file| file.token)
+        .is_some();
+    if carries_token && mode & OPEN_TO_OTHERS != 0 {
+        return Err(ConfigError::FileOpenToOthers {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+/// The endpoint if it is an origin this server may append paths to.
+fn checked_endpoint(endpoint: &str) -> Result<String, ConfigError> {
+    let authority = endpoint
+        .strip_prefix("https://")
+        .ok_or(ConfigError::EndpointNotHttps)?;
+    if authority.contains('@') {
+        return Err(ConfigError::EndpointCarriesCredentials);
+    }
+    if authority.is_empty() || authority.contains(['/', '?', '#']) {
+        return Err(ConfigError::EndpointIsNotAnOrigin);
+    }
+    Ok(endpoint.to_string())
+}
+
+/// The token if it can travel in an `Authorization` header.
+///
+/// Visible ASCII only, which is narrower than the header grammar allows
+/// and wider than any token this plane mints. The value is never named
+/// in the refusal: a message quoting what it rejected is a message that
+/// writes the token to stderr for every malformed one.
+fn checked_token(token: &str) -> Result<String, ConfigError> {
+    if token.is_empty()
+        || token.len() > MAX_TOKEN_BYTES
+        || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err(ConfigError::TokenUnusable);
+    }
+    Ok(token.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An environment answering exactly `pairs` and nothing else.
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    const ENDPOINT: &str = "https://lorica.internal.example.org:8443";
+    const TOKEN: &str = "lam_0123456789abcdef.s3cr3t";
+
+    #[test]
+    fn an_argument_refuses_the_start_and_says_where_the_token_goes_instead() {
+        // The failure this exists for: a client author writes an `args`
+        // array, the token lands in /proc/<pid>/cmdline, and every
+        // local user reads it. Ignoring the argument would be worse
+        // than refusing, because whoever wrote it would believe it took
+        // effect.
+        let refused = ServerConfig::assemble(
+            &["--token".to_string(), TOKEN.to_string()],
+            env_of(&[(ENDPOINT_ENV, ENDPOINT), (TOKEN_ENV, TOKEN)]),
+            None,
+        )
+        .expect_err("an argument is refused even when the environment is complete");
+        assert_eq!(refused, ConfigError::ArgumentsRefused);
+        let message = refused.to_string();
+        assert!(message.contains(TOKEN_ENV), "{message}");
+        assert!(!message.contains(TOKEN), "{message}");
+    }
+
+    #[test]
+    fn the_environment_carries_the_endpoint_and_the_token() {
+        let config = ServerConfig::assemble(
+            &[],
+            env_of(&[(ENDPOINT_ENV, ENDPOINT), (TOKEN_ENV, TOKEN)]),
+            None,
+        )
+        .expect("a complete environment is a configuration");
+        assert_eq!(config.endpoint, ENDPOINT);
+        assert_eq!(config.token.reveal(), TOKEN);
+    }
+
+    #[test]
+    fn a_file_carries_them_when_the_environment_does_not_and_loses_when_it_does() {
+        let path = Path::new("/etc/lorica/mcp.toml");
+        let text = format!("endpoint = \"{ENDPOINT}\"\ntoken = \"{TOKEN}\"\n");
+
+        let from_file = ServerConfig::assemble(&[], env_of(&[]), Some((path, &text)))
+            .expect("the file alone is a configuration");
+        assert_eq!(from_file.endpoint, ENDPOINT);
+        assert_eq!(from_file.token.reveal(), TOKEN);
+
+        // The environment wins: it is the half an operator changes
+        // without editing a file the client may rewrite.
+        let overridden = ServerConfig::assemble(
+            &[],
+            env_of(&[(TOKEN_ENV, "lam_from.environment")]),
+            Some((path, &text)),
+        )
+        .expect("the file supplies what the environment does not");
+        assert_eq!(overridden.endpoint, ENDPOINT);
+        assert_eq!(overridden.token.reveal(), "lam_from.environment");
+
+        // A variable set to nothing reads as unset. A client that
+        // always writes both keys into its `env` object would otherwise
+        // shadow the file with a blank string.
+        let blank = ServerConfig::assemble(
+            &[],
+            env_of(&[(ENDPOINT_ENV, ""), (TOKEN_ENV, "   ")]),
+            Some((path, &text)),
+        )
+        .expect("a blank variable falls through to the file");
+        assert_eq!(blank.endpoint, ENDPOINT);
+        assert_eq!(blank.token.reveal(), TOKEN);
+    }
+
+    #[test]
+    fn a_ca_bundle_is_optional_and_comes_from_either_intake() {
+        // The listener's default certificate is self-signed, so an
+        // operator needs somewhere to name what they trust. There is
+        // deliberately no companion switch that turns verification off.
+        let bare = ServerConfig::assemble(
+            &[],
+            env_of(&[(ENDPOINT_ENV, ENDPOINT), (TOKEN_ENV, TOKEN)]),
+            None,
+        )
+        .expect("a bundle is optional");
+        assert_eq!(bare.ca_bundle, None);
+
+        let from_env = ServerConfig::assemble(
+            &[],
+            env_of(&[
+                (ENDPOINT_ENV, ENDPOINT),
+                (TOKEN_ENV, TOKEN),
+                (CA_BUNDLE_ENV, "/etc/lorica/internal-ca.pem"),
+            ]),
+            None,
+        )
+        .expect("a named bundle");
+        assert_eq!(
+            from_env.ca_bundle,
+            Some(PathBuf::from("/etc/lorica/internal-ca.pem"))
+        );
+
+        let from_file = ServerConfig::assemble(
+            &[],
+            env_of(&[]),
+            Some((
+                Path::new("/etc/lorica/mcp.toml"),
+                &format!(
+                    "endpoint = \"{ENDPOINT}\"\ntoken = \"{TOKEN}\"\n\
+                     ca_bundle = \"/etc/lorica/internal-ca.pem\"\n"
+                ),
+            )),
+        )
+        .expect("the file names the bundle too");
+        assert_eq!(
+            from_file.ca_bundle,
+            Some(PathBuf::from("/etc/lorica/internal-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn a_malformed_file_names_the_path_and_quotes_nothing_from_inside_it() {
+        // A TOML parse error carries the offending line, and in this
+        // file that line is as likely as not the token.
+        let path = Path::new("/etc/lorica/mcp.toml");
+        let refused = ServerConfig::assemble(
+            &[],
+            env_of(&[]),
+            Some((path, &format!("token = {TOKEN}\n"))),
+        )
+        .expect_err("an unquoted value is not TOML");
+        assert_eq!(
+            refused,
+            ConfigError::FileMalformed {
+                path: path.to_path_buf()
+            }
+        );
+        let message = refused.to_string();
+        assert!(message.contains("mcp.toml"), "{message}");
+        assert!(!message.contains(TOKEN), "{message}");
+
+        // A key nobody declared is a mistake worth reporting, not a
+        // value to ignore: `tokne = ` would otherwise read as "no
+        // token" and send the operator to the wrong variable.
+        let refused = ServerConfig::assemble(
+            &[],
+            env_of(&[]),
+            Some((path, "endpoint = \"https://h\"\ntokne = \"x\"\n")),
+        )
+        .expect_err("an undeclared key is refused");
+        assert!(matches!(refused, ConfigError::FileMalformed { .. }));
+    }
+
+    #[test]
+    fn the_malformed_file_message_names_exactly_the_keys_the_file_may_carry() {
+        // serde names the struct's own fields when it refuses an
+        // unknown one, so the expected set is read from it rather than
+        // typed here: a field added to `ConfigFile` and not to the
+        // message, or the reverse, turns this red.
+        let backticked = |text: &str| -> std::collections::BTreeSet<String> {
+            text.split('`')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect()
+        };
+        let serde_says = toml::from_str::<ConfigFile>("not_a_key = 1\n")
+            .expect_err("an unknown key is refused")
+            .to_string();
+        let (_, expected) = serde_says
+            .split_once("expected")
+            .expect("serde lists the fields it expected");
+        let expected = backticked(expected);
+        assert!(!expected.is_empty(), "{serde_says}");
+        let message = ConfigError::FileMalformed {
+            path: Path::new("/etc/lorica/mcp.toml").to_path_buf(),
+        }
+        .to_string();
+        assert_eq!(backticked(&message), expected, "{message}");
+    }
+
+    #[test]
+    fn a_missing_half_names_the_half_that_is_missing() {
+        assert_eq!(
+            ServerConfig::assemble(&[], env_of(&[(TOKEN_ENV, TOKEN)]), None)
+                .expect_err("no endpoint"),
+            ConfigError::MissingEndpoint
+        );
+        assert_eq!(
+            ServerConfig::assemble(&[], env_of(&[(ENDPOINT_ENV, ENDPOINT)]), None)
+                .expect_err("no token"),
+            ConfigError::MissingToken
+        );
+    }
+
+    #[test]
+    fn the_endpoint_is_an_https_origin_and_nothing_else() {
+        let refuses = |endpoint: &str| {
+            ServerConfig::assemble(
+                &[],
+                env_of(&[(ENDPOINT_ENV, endpoint), (TOKEN_ENV, TOKEN)]),
+                None,
+            )
+            .expect_err(endpoint)
+        };
+
+        // Plaintext would put the bearer token on the wire in clear on
+        // every single request.
+        assert_eq!(
+            refuses("http://lorica.internal.example.org:8443"),
+            ConfigError::EndpointNotHttps
+        );
+        assert_eq!(
+            refuses("lorica.internal.example.org"),
+            ConfigError::EndpointNotHttps
+        );
+        // Userinfo is a second credential in a field nothing here
+        // redacts.
+        assert_eq!(
+            refuses("https://user01:pass@lorica.internal.example.org"),
+            ConfigError::EndpointCarriesCredentials
+        );
+        // A prefix would be prepended to every path this server builds.
+        for not_an_origin in [
+            "https://lorica.internal.example.org/automation/v1",
+            "https://lorica.internal.example.org/",
+            "https://lorica.internal.example.org?x=1",
+            "https://lorica.internal.example.org#f",
+            "https://",
+        ] {
+            assert_eq!(
+                refuses(not_an_origin),
+                ConfigError::EndpointIsNotAnOrigin,
+                "{not_an_origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_that_cannot_travel_in_a_header_is_refused_without_being_quoted() {
+        for unusable in ["has space", "has\nnewline", "has\ttab"] {
+            let refused = ServerConfig::assemble(
+                &[],
+                env_of(&[(ENDPOINT_ENV, ENDPOINT), (TOKEN_ENV, unusable)]),
+                None,
+            )
+            .expect_err("unusable token");
+            assert_eq!(refused, ConfigError::TokenUnusable, "{unusable:?}");
+            assert!(!refused.to_string().contains(unusable), "{unusable:?}");
+        }
+
+        // A variable set to nothing is unset rather than unusable, and
+        // says so: an operator who set it blank needs to be sent to the
+        // variable, not to the shape of a value they never typed.
+        for blank in ["", "   "] {
+            assert_eq!(
+                ServerConfig::assemble(
+                    &[],
+                    env_of(&[(ENDPOINT_ENV, ENDPOINT), (TOKEN_ENV, blank)]),
+                    None,
+                )
+                .expect_err("a blank token is no token"),
+                ConfigError::MissingToken,
+                "{blank:?}"
+            );
+        }
+
+        // A surrounding newline is the commonest way a token arrives
+        // from a shell and is not a mistake worth refusing.
+        let trimmed = ServerConfig::assemble(
+            &[],
+            env_of(&[
+                (ENDPOINT_ENV, ENDPOINT),
+                (TOKEN_ENV, &format!("  {TOKEN}\n")),
+            ]),
+            None,
+        )
+        .expect("a trailing newline is trimmed, not refused");
+        assert_eq!(trimmed.token.reveal(), TOKEN);
+    }
+
+    #[test]
+    fn a_file_carrying_the_token_is_refused_when_anyone_but_its_owner_may_open_it() {
+        let path = Path::new("/etc/lorica/mcp.toml");
+        let with_token = format!("endpoint = \"{ENDPOINT}\"\ntoken = \"{TOKEN}\"\n");
+
+        for owner_only in [0o600, 0o400, 0o700] {
+            refuse_a_token_open_to_others(path, &with_token, owner_only)
+                .unwrap_or_else(|refused| panic!("{owner_only:o}: {refused}"));
+        }
+        // Every bit of the group's and the others', each on its own, as
+        // `ssh` holds a private key: a group-writable file is one
+        // another user can point at their own endpoint.
+        for shift in 0..6 {
+            let mode = 0o600 | (1 << shift);
+            let refused = refuse_a_token_open_to_others(path, &with_token, mode)
+                .expect_err("a token open to others is refused");
+            assert_eq!(
+                refused,
+                ConfigError::FileOpenToOthers {
+                    path: path.to_path_buf(),
+                    mode
+                }
+            );
+            let message = refused.to_string();
+            assert!(message.contains(&format!("{mode:04o}")), "{message}");
+            assert!(
+                message.contains("chmod 600 /etc/lorica/mcp.toml"),
+                "{message}"
+            );
+            assert!(!message.contains(TOKEN), "{message}");
+        }
+
+        // A file naming only the endpoint and the bundle holds nothing
+        // secret and may be shared.
+        let no_token =
+            format!("endpoint = \"{ENDPOINT}\"\nca_bundle = \"/etc/lorica/internal-ca.pem\"\n");
+        refuse_a_token_open_to_others(path, &no_token, 0o644).expect("nothing secret in it");
+        // A file that does not parse is left to `assemble`, which refuses
+        // it as malformed without quoting it.
+        refuse_a_token_open_to_others(path, &format!("token = {TOKEN}\n"), 0o644)
+            .expect("not judged here");
+    }
+
+    #[test]
+    fn the_mode_read_from_disk_is_the_one_chmod_set() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("test setup: temp dir");
+        let path = dir.path().join("mcp.toml");
+        std::fs::write(&path, "").expect("test setup: written");
+        for mode in [0o600, 0o640, 0o644] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("test setup: chmod");
+            assert_eq!(file_mode(&path).expect("a mode"), mode);
+        }
+    }
+
+    #[test]
+    fn the_token_is_redacted_in_every_debug_rendering() {
+        // `tracing::debug!(?config)` must not be the thing that
+        // publishes the credential.
+        let config = ServerConfig::assemble(
+            &[],
+            env_of(&[(ENDPOINT_ENV, ENDPOINT), (TOKEN_ENV, TOKEN)]),
+            None,
+        )
+        .expect("a complete environment is a configuration");
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+        assert!(rendered.contains(ENDPOINT), "the endpoint is not a secret");
+    }
+}

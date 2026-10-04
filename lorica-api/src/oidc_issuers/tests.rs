@@ -75,6 +75,9 @@ async fn test_state(issuer: Arc<MockIssuer>) -> (AppState, SessionStore, RateLim
         task_tracker: tokio_util::task::TaskTracker::new(),
         cluster: crate::cluster::ClusterRuntime::Standalone,
         oidc: Arc::new(OidcVerifier::new(issuer)),
+        mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
+        renewals: Arc::new(crate::acme::RenewalLedger::new()),
+        automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
     };
     let session_store = SessionStore::new(store).await;
     (state, session_store, RateLimiter::new())

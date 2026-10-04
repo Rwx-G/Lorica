@@ -44,6 +44,17 @@
 //! the names a route hostname could collide with are `localhost` and
 //! an address literal; both are refused outright rather than compared
 //! against a bind that is not part of `AppState`.
+//!
+//! # Never weaker than the route it displaces
+//!
+//! An environment's exact hostname takes its host from any wildcard or
+//! catch-all route that serves it today, and its route is written from
+//! a fixed profile. It therefore inherits, control by control, the
+//! protections of every route it displaces (the maintainer's decision
+//! of 2026-10-04), through the same rules and the same host selection
+//! that bound a token's own route
+//! ([`super::write::inherit_displaced_protections`]), and the answer
+//! names those routes by id in `protections_inherited_from`.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -61,11 +72,12 @@ use lorica_config::models::{
     ManagedBy, PipelineIdentity, Route, WafMode, AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT,
     AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL,
 };
-use lorica_config::{ConfigError, ConfigStore, ConnectionFilterPolicy};
+use lorica_config::{parse_cidr, ConfigError, ConfigStore, ConnectionFilterPolicy};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::auth::AutomationPrincipal;
+use super::write::inherit_displaced_protections;
 use crate::audit::{AuditContext, ClientConnectInfo};
 use crate::cluster::ClusterRuntime;
 use crate::db::db_blocking;
@@ -176,6 +188,13 @@ pub struct EnvironmentWriteResponse {
     pub certificate_not_after: String,
     /// RFC 3339 instant the reaper may collect the environment.
     pub expires_at: String,
+    /// The routes that served this hostname before the environment took
+    /// it, by id, whose protections the environment's route inherited
+    /// because its own profile was weaker on at least one of them.
+    /// Empty when it displaced no protected route. The values inherited
+    /// are not answered: a Basic auth credential among them stays in
+    /// the store.
+    pub protections_inherited_from: Vec<String>,
     /// The fleet configuration generation the control plane had
     /// PUBLISHED when this response was built; 0 on a standalone node,
     /// which has no fleet to wait for.
@@ -274,6 +293,7 @@ struct WriteInput {
 struct Written {
     created: bool,
     route: Route,
+    protections_inherited_from: Vec<String>,
     backend_ids: Vec<String>,
     certificate_id: String,
     certificate_not_after: DateTime<Utc>,
@@ -415,12 +435,20 @@ fn validate_path_prefix(raw: Option<&str>) -> Result<String, ApiError> {
     Ok(value.to_string())
 }
 
-/// Parse and grant-check every backend against the credential.
+/// The backend grant, applied to one address a credential wants to
+/// point a hostname at: the parsed `ip:port`, or the refusal.
 ///
 /// The address has to be an `ip:port`: the grant is a CIDR list, and a
 /// name cannot be checked against one without a resolution the token
 /// holder would control. Outside the grant is 403, the same answer the
 /// scope gate gives: the token is real and the grant is not there.
+/// `field` names the input in the refusal so the caller knows which
+/// one it is about.
+///
+/// One function for both writers of a backend row on this plane, the
+/// environment resource and the backend write (Story 11.2), because
+/// the grant is a security rule and two copies of it would drift the
+/// day one of them is loosened.
 ///
 /// # An empty grant is deny-all here
 ///
@@ -432,6 +460,72 @@ fn validate_path_prefix(raw: Option<&str>) -> Result<String, ApiError> {
 /// metadata address. The models refuse an empty list at write time;
 /// this refuses it again at use time, for the rows written before
 /// that rule landed.
+///
+/// The same holds one step later. The connection filter skips an entry
+/// it cannot parse, so a stored list whose every entry is blank or
+/// malformed would build that same empty allow list. The models refuse
+/// such an entry at mint, but the store never re-validates a row it
+/// loads, so each entry is parsed here and a list holding one that does
+/// not parse is refused whole: the grant is either what the operator
+/// wrote or nothing.
+///
+/// # A mapped address is the IPv4 it maps to
+///
+/// `[::ffff:127.0.0.1]:80` parses as an IPv6 socket address and the
+/// upstream connect reaches IPv4 loopback. Weighed as IPv6, a grant
+/// over a v6 range covering the mapped space (`::/0`, `::ffff:0:0/96`)
+/// accepted it and handed the credential every IPv4 address there is;
+/// weighed as the IPv4 it maps to, the same grant refuses it and a v4
+/// grant covering that address accepts it, which is what the address
+/// connects to either way.
+pub(super) fn ensure_backend_address_granted(
+    principal: &AutomationPrincipal,
+    field: &str,
+    raw: &str,
+) -> Result<SocketAddr, ApiError> {
+    if principal.allowed_backend_cidrs.is_empty() {
+        return Err(ApiError::Forbidden(
+            "this credential names no allowed_backend_cidrs, so its backend grant covers no \
+             address; ask an operator to name the ranges it may reach"
+                .to_string(),
+        ));
+    }
+    let granted = principal
+        .allowed_backend_cidrs
+        .iter()
+        .map(|entry| parse_cidr(entry))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|_| {
+            ApiError::Forbidden(
+                "this credential's allowed_backend_cidrs holds an entry that does not parse, so \
+                 its backend grant is refused whole rather than read as wider than written; ask \
+                 an operator to mint it again"
+                    .to_string(),
+            )
+        })?;
+    let policy = ConnectionFilterPolicy::from_nets(granted, Vec::new());
+    let raw = raw.trim();
+    let addr: SocketAddr = raw.parse().map_err(|_| {
+        ApiError::Unprocessable(format!(
+            "{field} `{raw}` must be `ip:port`; a name cannot be checked against \
+             allowed_backend_cidrs"
+        ))
+    })?;
+    if addr.port() == 0 {
+        return Err(ApiError::Unprocessable(format!(
+            "{field} `{raw}` must carry a non-zero port"
+        )));
+    }
+    if !policy.accepts(addr.ip().to_canonical()) {
+        return Err(ApiError::Forbidden(format!(
+            "{field} `{raw}` is outside this token's allowed_backend_cidrs"
+        )));
+    }
+    Ok(addr)
+}
+
+/// Parse and grant-check every backend against the credential, through
+/// [`ensure_backend_address_granted`].
 fn validate_backends(
     principal: &AutomationPrincipal,
     backends: &[EnvironmentBackendRequest],
@@ -449,34 +543,10 @@ fn validate_backends(
             backends.len()
         )));
     }
-    if principal.allowed_backend_cidrs.is_empty() {
-        return Err(ApiError::Forbidden(
-            "this credential names no allowed_backend_cidrs, so its backend grant covers no \
-             address; ask an operator to name the ranges it may reach"
-                .to_string(),
-        ));
-    }
-    let policy = ConnectionFilterPolicy::from_cidrs(&principal.allowed_backend_cidrs, &[]);
     let mut out = Vec::with_capacity(backends.len());
     for (index, backend) in backends.iter().enumerate() {
         let field = format!("backends[{index}].address");
-        let raw = backend.address.trim();
-        let addr: SocketAddr = raw.parse().map_err(|_| {
-            ApiError::Unprocessable(format!(
-                "{field} `{raw}` must be `ip:port`; a name cannot be checked against \
-                 allowed_backend_cidrs"
-            ))
-        })?;
-        if addr.port() == 0 {
-            return Err(ApiError::Unprocessable(format!(
-                "{field} `{raw}` must carry a non-zero port"
-            )));
-        }
-        if !policy.accepts(addr.ip()) {
-            return Err(ApiError::Forbidden(format!(
-                "{field} `{raw}` is outside this token's allowed_backend_cidrs"
-            )));
-        }
+        let addr = ensure_backend_address_granted(principal, &field, &backend.address)?;
         let weight = backend.weight.unwrap_or(DEFAULT_BACKEND_WEIGHT);
         if weight < 1 {
             return Err(ApiError::Unprocessable(format!(
@@ -570,7 +640,15 @@ fn parse_certificate_mode(
 /// kind, so the two never match each other. An environment is reached
 /// by its exact owner, or by anybody when its owner labelled it
 /// `shared = "true"`.
-fn caller_may_access(environment: &AutomationEnvironment, caller: &EnvironmentOwner) -> bool {
+///
+/// Shared with the write surface (Story 11.2), which holds a route or
+/// a backend an environment owns to this same rule before a token may
+/// act on it: the route's delete cascades the environment, so the
+/// route is reachable exactly when the environment would be.
+pub(super) fn caller_may_access(
+    environment: &AutomationEnvironment,
+    caller: &EnvironmentOwner,
+) -> bool {
     may_access(
         &environment.owner,
         &caller.principal,
@@ -579,10 +657,55 @@ fn caller_may_access(environment: &AutomationEnvironment, caller: &EnvironmentOw
     )
 }
 
+/// The names among `named` that `principal` may learn from a listing:
+/// the environments `GET /automation/v1/environments/{name}` answers it
+/// rather than refusing or hiding (backlog #94 d).
+///
+/// A route or a backend an environment owns carries the environment's
+/// name in its `managed_by` mark, and the route and backend listings
+/// answered it to every reader, so a neighbour on a shared node read
+/// off a listing the names the environment endpoint answers it 404 for.
+/// This is that endpoint's rule, applied by name: the environment
+/// exists, the caller may access it by its owner and labels, and a
+/// credential bound to `environment_protected` is asking about the one
+/// environment its job deploys. A mark whose environment row is gone
+/// is not visible either, since the endpoint answers that name 404.
+///
+/// # Errors
+///
+/// The store's error.
+pub(super) async fn environments_visible_to(
+    state: &AppState,
+    principal: &AutomationPrincipal,
+    named: std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeSet<String>, ApiError> {
+    let caller = principal.as_owner();
+    let principal = principal.clone();
+    db_blocking(&state.store, move |store| {
+        let mut visible = std::collections::BTreeSet::new();
+        for name in named {
+            if ensure_environment_binding(&name, &principal).is_err() {
+                continue;
+            }
+            let Some(environment) = store.get_automation_environment(&name)? else {
+                continue;
+            };
+            if caller_may_access(&environment, &caller) {
+                visible.insert(name);
+            }
+        }
+        Ok::<_, ConfigError>(visible)
+    })
+    .await
+}
+
 /// AC #3: a credential bound to `environment_protected = true` may only
 /// write the environment its job runs for, named by the GitLab slug of
 /// the job's `environment` claim.
-fn ensure_environment_binding(name: &str, principal: &AutomationPrincipal) -> Result<(), ApiError> {
+pub(super) fn ensure_environment_binding(
+    name: &str,
+    principal: &AutomationPrincipal,
+) -> Result<(), ApiError> {
     let Some(slug) = principal.required_environment_slug.as_deref() else {
         return Ok(());
     };
@@ -774,11 +897,11 @@ fn is_owned_by(backend: &Backend, environment: &str) -> bool {
 /// The body of a `PUT`, run inside the caller's transaction.
 ///
 /// In order: ownership and `If-Match`, the hostname collision, the
-/// certificate, the route, the backend set, the environment row. The
-/// first four write nothing, so every refusal a caller can provoke
-/// rolls back an empty transaction; the last three are where a
-/// database error would strand a partial environment, and that is
-/// what the transaction is for.
+/// certificate, the protections the route inherits, the route, the
+/// backend set, the environment row. The first four write nothing, so
+/// every refusal a caller can provoke rolls back an empty transaction;
+/// the last three are where a database error would strand a partial
+/// environment, and that is what the transaction is for.
 fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutcome, ApiError> {
     let existing = store.get_automation_environment(&input.name)?;
     let current_etag = existing.as_ref().map(etag_for);
@@ -883,7 +1006,8 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
         }
         None => (uuid::Uuid::new_v4().to_string(), input.now),
     };
-    let route = environment_route(input, route_id.clone(), &certificate.id, route_created_at);
+    let mut route = environment_route(input, route_id.clone(), &certificate.id, route_created_at);
+    let protections_inherited_from = inherit_displaced_protections(store, &mut route)?;
     if existing.is_some() {
         store.update_route(&route)?;
     } else {
@@ -943,6 +1067,7 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
     Ok(PutOutcome::Written(Box::new(Written {
         created: existing.is_none(),
         route,
+        protections_inherited_from,
         backend_ids,
         certificate_id: certificate.id.clone(),
         certificate_not_after: certificate.not_after,
@@ -1191,7 +1316,13 @@ fn view_for(
 
 /// The audit identity of an automation principal, the same shape the
 /// request-level audit layer stamps so the two rows join on it.
-fn audit_context(
+///
+/// Shared with the write surface (Story 11.2), whose management-side
+/// rows (`route.create`, `backend.update`, ...) name the token exactly
+/// as the environment rows do: `<name> (<public_id>)` under the role
+/// `automation`, so one filter on the audit page finds every
+/// machine-driven change whichever resource it touched.
+pub(super) fn audit_context(
     principal: &AutomationPrincipal,
     connect_info: &ClientConnectInfo,
     headers: &HeaderMap,
@@ -1203,9 +1334,13 @@ fn audit_context(
             .as_ref()
             .map(|ci| ci.0.ip().to_string())
             .unwrap_or_default(),
+        // Bounded as the request row bounds it: the header is the
+        // caller's own text, and every management-side row an
+        // automation write records carries it.
         user_agent: headers
             .get(header::USER_AGENT)
             .and_then(|value| value.to_str().ok())
+            .map(|agent| super::audit::bounded(agent, super::audit::USER_AGENT_MAX_BYTES))
             .unwrap_or_default()
             .to_string(),
     }
@@ -1374,6 +1509,7 @@ async fn put_environment_inner(
         certificate_id: written.certificate_id.clone(),
         certificate_not_after: written.certificate_not_after.to_rfc3339(),
         expires_at: written.environment.expires_at.to_rfc3339(),
+        protections_inherited_from: written.protections_inherited_from.clone(),
         applied_generation: applied_generation(state),
     };
     let action = if written.created {

@@ -460,6 +460,50 @@ pub async fn record(
     record_with_store(state.log_store.clone(), ctx, action, target, before, after).await;
 }
 
+/// [`record`] for a caller that cannot await, with no payload: the
+/// automation plane's row for a write an accepted credential sent,
+/// which keeps the mutation reserve of the queue.
+pub fn record_now(state: &AppState, ctx: &AuditContext, action: &str, target: (&str, &str)) {
+    offer(
+        state.log_store.clone(),
+        ctx,
+        action,
+        target,
+        (None, None),
+        Shedding::Last,
+    );
+}
+
+/// [`record`] for a row the queue may shed before a mutation's: the
+/// automation plane's per-request row for a read, or for a request no
+/// credential got through.
+///
+/// Such a row costs its sender nothing to cause, so a flood of them
+/// must not be what sheds the row of a write committing beside it: it
+/// is refused once only
+/// [`crate::log_store::AUDIT_QUEUE_RESERVED_FOR_MUTATIONS`] slots are
+/// left, and a drop is counted exactly as a full queue's.
+pub fn record_request(state: &AppState, ctx: &AuditContext, action: &str, target: (&str, &str)) {
+    offer(
+        state.log_store.clone(),
+        ctx,
+        action,
+        target,
+        (None, None),
+        Shedding::First,
+    );
+}
+
+/// Which rows of the audit queue a row gives way to.
+#[derive(Clone, Copy)]
+enum Shedding {
+    /// A mutation's row: shed only when the whole queue is full.
+    Last,
+    /// A per-request row: shed while the mutation reserve is all that
+    /// is left.
+    First,
+}
+
 /// [`record`] for callers that hold the log store but no `AppState`:
 /// the cluster plane's lifecycle hooks (enrollment, renewal, leave,
 /// identity refusals), which run in the binary before and beside the
@@ -477,6 +521,26 @@ pub async fn record_with_store(
     before: Option<&serde_json::Value>,
     after: Option<&serde_json::Value>,
 ) {
+    offer(
+        log_store,
+        ctx,
+        action,
+        target,
+        (before, after),
+        Shedding::Last,
+    );
+}
+
+/// Build the row and offer it to the queue under `shedding`.
+fn offer(
+    log_store: Option<std::sync::Arc<crate::log_store::LogStore>>,
+    ctx: &AuditContext,
+    action: &str,
+    target: (&str, &str),
+    payloads: (Option<&serde_json::Value>, Option<&serde_json::Value>),
+    shedding: Shedding,
+) {
+    let (before, after) = payloads;
     let (target_type, target_id) = target;
     // One timestamp shared by the persisted row and the sink copy, so
     // the SIEM-side and DB-side records agree exactly (QA finding:
@@ -507,7 +571,11 @@ pub async fn record_with_store(
     // order, and a single consumer writes in receive order, so rows
     // chain in the order `record` was called across both planes.
     // Nothing may await between building the entry and offering it.
-    if let Err(dropped) = log_store.enqueue_audit(entry) {
+    let offered = match shedding {
+        Shedding::Last => log_store.enqueue_audit(entry),
+        Shedding::First => log_store.enqueue_audit_sheddable(entry),
+    };
+    if let Err(dropped) = offered {
         // A full queue sheds the row rather than the request. Waiting
         // here would turn a slow disk into a management plane that
         // stops answering, which is the outage the log-writer stance
@@ -1002,6 +1070,89 @@ mod tests {
         assert!(
             dropped >= (SURPLUS - 1) as u64,
             "a full queue sheds every row it cannot hold: {dropped} dropped of {overflow} offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_request_rows_never_takes_the_slots_a_mutation_row_needs() {
+        // The flood's rows are free to cause; the mutation's row is the
+        // one the trail exists for. With the writer stalled, a flood
+        // larger than the whole queue is offered as request rows, then
+        // mutation rows are offered: every one of them lands.
+        let dir = tempfile::tempdir().expect("test setup: temp dir");
+        let log_store = std::sync::Arc::new(
+            crate::log_store::LogStore::open(dir.path()).expect("test setup: log store"),
+        );
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (stalled, is_stalled) = std::sync::mpsc::channel::<()>();
+        let stalling_store = std::sync::Arc::clone(&log_store);
+        let staller = std::thread::spawn(move || {
+            let _connection = stalling_store.block_audit_writer_for_test();
+            let _ = stalled.send(());
+            let _ = released.recv();
+        });
+        is_stalled
+            .recv()
+            .expect("the stalling thread takes the connection");
+
+        let flood = probe_ctx("-", "automation");
+        let flood_rows = crate::log_store::AUDIT_QUEUE_CAPACITY + 64;
+        for row in 0..flood_rows {
+            let target_id = format!("flood-{row}");
+            offer(
+                Some(std::sync::Arc::clone(&log_store)),
+                &flood,
+                "automation.request.unauthenticated:malformed",
+                ("queue_flood_probe", &target_id),
+                (None, None),
+                Shedding::First,
+            );
+        }
+        let writer = probe_ctx("pipeline", "automation");
+        // The reserve, less the one row the stalled writer may already
+        // hold and the one a racing flood row may have crossed with.
+        let mutations = crate::log_store::AUDIT_QUEUE_RESERVED_FOR_MUTATIONS - 2;
+        for row in 0..mutations {
+            let target_id = format!("mutation-{row}");
+            record_with_store(
+                Some(std::sync::Arc::clone(&log_store)),
+                &writer,
+                "route.update",
+                ("queue_mutation_probe", &target_id),
+                None,
+                None,
+            )
+            .await;
+        }
+        let _ = release.send(());
+        staller.join().expect("the stalling thread finishes");
+        log_store.flush_audit().await.expect("the writer drains");
+
+        let (stored, _) = log_store
+            .query_audit(&AuditQuery {
+                limit: 2 * crate::log_store::AUDIT_QUEUE_CAPACITY,
+                ..AuditQuery::default()
+            })
+            .expect("the audit query runs");
+        let stored_under = |target_type: &str| {
+            stored
+                .iter()
+                .filter(|row| row.target_type == target_type)
+                .count()
+        };
+        // Counted on disk rather than on the drop counter, which every
+        // test of the process shares.
+        assert_eq!(
+            stored_under("queue_mutation_probe"),
+            mutations,
+            "a mutation row was shed behind a flood"
+        );
+        assert!(
+            stored_under("queue_flood_probe")
+                <= crate::log_store::AUDIT_QUEUE_CAPACITY
+                    - crate::log_store::AUDIT_QUEUE_RESERVED_FOR_MUTATIONS
+                    + 1,
+            "the flood took slots of the reserve"
         );
     }
 }

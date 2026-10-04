@@ -42,13 +42,28 @@ jobs:
 
       # Same four gates as the local Docker recipe (see CONTRIBUTING.md).
       - name: Clippy (product crates)
-        run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings
+        run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-automation-policy -- -D warnings
 
-      - name: Clippy (tests and benches of the API and cluster crates)
-        run: cargo clippy -p lorica-api -p lorica-cluster --all-targets -- -D warnings
+      - name: Clippy (tests and benches of the API, cluster, MCP and policy crates)
+        run: cargo clippy -p lorica-api -p lorica-cluster -p lorica-mcp -p lorica-automation-policy --all-targets -- -D warnings
 
       - name: Clippy (binary crate with the otel feature)
         run: cargo clippy -p lorica --all-targets --features otel -- -D warnings
+
+      # lorica-mcp is a subprocess an operator's MCP client launches and
+      # reads no database. The one first-party crate it may link is
+      # lorica-automation-policy, pure data with serde as its only
+      # dependency; any other lorica-* crate (lorica-config and its
+      # bundled SQLite, lorica-api) or SQLite itself fails this step.
+      - name: lorica-mcp links neither the management crates nor SQLite
+        run: |
+          linked=$(cargo tree -p lorica-mcp -e normal --prefix none | awk '{print $1}' | sort -u \
+            | grep -xE 'rusqlite|libsqlite3-sys|lorica-.*' \
+            | grep -vxE 'lorica-mcp|lorica-automation-policy' || true)
+          if [ -n "$linked" ]; then
+            echo "FAIL: lorica-mcp links: $linked"
+            exit 1
+          fi
 
       - name: Cargo audit
         run: |
@@ -201,7 +216,15 @@ jobs:
           npm run build
 
       - name: Run Rust unit tests (product crates)
-        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-tls -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem
+        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-tls -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-mcp -p lorica-automation-policy
+        env:
+          SKIP_FRONTEND_BUILD: ""
+
+      # The binary crate, in its own step because the feature applies to it
+      # alone. Clippy compiled these tests for releases before 1.9.0 and
+      # nothing ran them.
+      - name: Run Rust unit tests (binary crate with the otel feature)
+        run: cargo test -p lorica --features otel
         env:
           SKIP_FRONTEND_BUILD: ""
 
@@ -253,6 +276,7 @@ jobs:
             -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify \
             -p lorica-bench -p lorica-command -p lorica-metrics -p lorica-acme \
             -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker \
+            -p lorica-mcp -p lorica-automation-policy -p lorica \
             -p lorica-cluster -p lorica-tls \
             -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \
             -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
@@ -314,33 +338,54 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build release binary
-        run: cargo build --release -p lorica
+      # `-p lorica` alone links lorica-mcp as a library and never builds
+      # its binary, which both packages ship (Story 11.4).
+      - name: Build release binaries
+        run: cargo build --release -p lorica -p lorica-mcp
 
-      - name: Verify binary
+      - name: Verify binaries
         run: |
-          file target/release/lorica
+          file target/release/lorica target/release/lorica-mcp
           target/release/lorica --version
+          # lorica-mcp has no --version. With no configuration it must
+          # refuse with EX_CONFIG (78), which proves it links and runs.
+          rc=0
+          target/release/lorica-mcp < /dev/null || rc=$?
+          if [ "$rc" -ne 78 ]; then
+            echo "FAIL: lorica-mcp exited $rc, expected 78"
+            exit 1
+          fi
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:
           name: lorica-linux-x86_64
-          path: target/release/lorica
+          path: |
+            target/release/lorica
+            target/release/lorica-mcp
           retention-days: 30
 
       # Package .deb (same job, no artifact download needed)
       - name: Build .deb package
         run: |
-          chmod +x target/release/lorica
-          bash dist/build-deb.sh ./target/release/lorica
+          chmod +x target/release/lorica target/release/lorica-mcp
+          bash dist/build-deb.sh ./target/release/lorica ./target/release/lorica-mcp
 
       - name: Verify .deb package
         run: |
+          # Every entry must be root/root. This job runs as the unprivileged
+          # runner user, and every .deb before 1.9.0 recorded that account
+          # as the owner, which dpkg applied on install.
           for deb in dist/*.deb; do
             echo "--- $deb ---"
             dpkg-deb --info "$deb"
             dpkg-deb --contents "$deb"
+            not_root=$(dpkg-deb --contents "$deb" | awk '$2 != "root/root"')
+            if [ -n "$not_root" ]; then
+              echo "FAIL: entries not owned by root/root in $deb:"
+              echo "$not_root"
+              exit 1
+            fi
           done
 
       - name: Upload .deb artifact
@@ -356,15 +401,22 @@ jobs:
 
       - name: Build .rpm package
         run: |
-          chmod +x target/release/lorica
-          bash dist/build-rpm.sh ./target/release/lorica
+          chmod +x target/release/lorica target/release/lorica-mcp
+          bash dist/build-rpm.sh ./target/release/lorica ./target/release/lorica-mcp
 
       - name: Verify .rpm package
         run: |
           for rpm in dist/*.rpm; do
             echo "--- $rpm ---"
             rpm -qpi "$rpm"
-            rpm -qpl "$rpm"
+            rpm -qplv "$rpm"
+            # Everything but the data directory belongs to root.
+            not_root=$(rpm -qplv "$rpm" | awk '$3"/"$4 != "root/root" && $9 !~ /^\/var\/lib\/lorica(\/|$)/')
+            if [ -n "$not_root" ]; then
+              echo "FAIL: entries not owned by root/root in $rpm:"
+              echo "$not_root"
+              exit 1
+            fi
           done
 
       - name: Import GPG key
@@ -405,17 +457,37 @@ jobs:
     needs: build-and-package
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: lorica-deb
-          path: dist/
-      - name: Install and verify
+          path: pkg/
+      # The runner boots systemd, so the service really starts: active,
+      # enabled and recording the certificate it serves, with no repair
+      # warning on a host that never had lorica.
+      - name: Install on a clean host
+        run: sudo bash dist/tests/deb-upgrade.sh clean pkg/*.deb
+      - name: Verify the installed files
         run: |
-          sudo apt-get update
-          sudo dpkg -i dist/*.deb || sudo apt-get install -f -y
           test -x /usr/bin/lorica
+          test -x /usr/bin/lorica-mcp
           test -f /lib/systemd/system/lorica.service
+          for path in /usr/bin/lorica /usr/bin/lorica-mcp \
+                      /lib/systemd/system/lorica.service /usr/share/doc/lorica; do
+            owner=$(stat -c %u:%g "$path")
+            if [ "$owner" != "0:0" ]; then
+              echo "FAIL: $path is owned by $owner, expected 0:0"
+              exit 1
+            fi
+          done
           lorica --version
+          # Installed, never started: the unit must not launch the MCP
+          # server (Story 11.4). `if`, not `!`: bash -e ignores a negated
+          # command, so `! grep` could never fail the step.
+          if grep -q '^Exec.*lorica-mcp' /lib/systemd/system/lorica.service; then
+            echo "FAIL: the shipped unit starts lorica-mcp"
+            exit 1
+          fi
           echo ".deb installation verified OK"
       - name: systemd unit - hardening lint
         run: |
@@ -454,6 +526,86 @@ jobs:
           fi
           echo "OK: chown fails soft under the shipped filter (no SIGSYS)"
 
+  # The ownership repair in the postinst only acts on a host upgraded from
+  # a package built before 1.9.0, so it is tested on one: the released
+  # 1.8.0, installed on this runner, whose `runner` account (uid 1001) is
+  # the one those packages recorded as owner. 1.8.0 is pinned because it
+  # is the last affected release; a later one would not exercise the
+  # repair, and the script fails if the precondition does not hold.
+  test-deb-upgrade:
+    name: Test .deb upgrade from 1.8.0
+    needs: build-and-package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: lorica-deb
+          path: pkg/
+      - name: Download the released 1.8.0 .deb
+        run: |
+          curl -fsSL --retry 3 -o lorica_1.8.0_amd64.deb \
+            https://github.com/Rwx-G/Lorica/releases/download/v1.8.0/lorica_1.8.0_amd64.deb
+      - name: Upgrade 1.8.0 on a host with the uid-1001 account
+        run: sudo bash dist/tests/deb-upgrade.sh upgrade lorica_1.8.0_amd64.deb pkg/*.deb
+
+  # 1.8.0's preun stops and disables the service on every upgrade, so the
+  # new package must start it from posttrans. That needs systemd, which a
+  # `container:` job does not boot: Fedora runs here under its own init,
+  # in a privileged container on the runner.
+  test-rpm-upgrade:
+    name: Test .rpm upgrade from 1.8.0
+    needs: build-and-package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: lorica-rpm
+          path: pkg/
+      - name: Download the released 1.8.0 .rpm
+        run: |
+          curl -fsSL --retry 3 -o pkg/lorica-1.8.0-1.x86_64.rpm \
+            https://github.com/Rwx-G/Lorica/releases/download/v1.8.0/lorica-1.8.0-1.x86_64.rpm
+      - name: Boot Fedora under systemd
+        run: |
+          printf '%s\n' \
+            'FROM fedora:latest' \
+            'RUN dnf -y -q install systemd procps-ng openssl ca-certificates && dnf clean all' \
+            'STOPSIGNAL SIGRTMIN+3' \
+            'CMD ["/sbin/init"]' > Dockerfile.systemd
+          docker build -q -t fedora-systemd -f Dockerfile.systemd .
+          docker run -d --name fedora --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
+            -v "$PWD:/w:ro" fedora-systemd
+          for _ in $(seq 1 30); do
+            case "$(docker exec fedora systemctl is-system-running 2>/dev/null)" in
+              running|degraded) exit 0 ;;
+            esac
+            sleep 1
+          done
+          echo "FAIL: systemd did not come up in the container"
+          exit 1
+      - name: Upgrade 1.8.0, then reinstall over itself
+        run: |
+          new=$(ls pkg/lorica-*.rpm | grep -v 'lorica-1\.8\.0-')
+          docker exec fedora bash /w/dist/tests/rpm-upgrade.sh upgrade \
+            /w/pkg/lorica-1.8.0-1.x86_64.rpm "/w/$new"
+      - name: Install on a clean host
+        run: |
+          new=$(ls pkg/lorica-*.rpm | grep -v 'lorica-1\.8\.0-')
+          docker rm -f fedora
+          docker run -d --name fedora --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
+            -v "$PWD:/w:ro" fedora-systemd
+          for _ in $(seq 1 30); do
+            case "$(docker exec fedora systemctl is-system-running 2>/dev/null)" in
+              running|degraded) break ;;
+            esac
+            sleep 1
+          done
+          docker exec fedora bash /w/dist/tests/rpm-upgrade.sh clean "/w/$new"
+
   test-rpm-install:
     name: Test .rpm install
     needs: build-and-package
@@ -468,14 +620,27 @@ jobs:
         run: |
           rpm -ivh dist/*.rpm
           test -x /usr/bin/lorica
+          test -x /usr/bin/lorica-mcp
           test -f /usr/lib/systemd/system/lorica.service
+          for path in /usr/bin/lorica /usr/bin/lorica-mcp \
+                      /usr/lib/systemd/system/lorica.service; do
+            owner=$(stat -c %u:%g "$path")
+            if [ "$owner" != "0:0" ]; then
+              echo "FAIL: $path is owned by $owner, expected 0:0"
+              exit 1
+            fi
+          done
           lorica --version
+          if grep -q '^Exec.*lorica-mcp' /usr/lib/systemd/system/lorica.service; then
+            echo "FAIL: the shipped unit starts lorica-mcp"
+            exit 1
+          fi
           echo ".rpm installation verified OK"
 
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [verify-tag, test-deb-install, test-rpm-install]
+    needs: [verify-tag, test-deb-install, test-rpm-install, test-deb-upgrade, test-rpm-upgrade]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -3,7 +3,7 @@
 # Lorica bot-protection E2E smoke test (v1.4.0 story 3.9).
 #
 # Pre-requisite: docker-compose `bot` profile is up.
-# `lorica-bot` runs the default entrypoint (no pre-seeding — the
+# `lorica-bot` runs the default entrypoint (no pre-seeding - the
 # test exercises the hot-reload path for trusted_proxies and uses
 # the API to configure everything).
 #
@@ -20,7 +20,7 @@
 #      test runner extracts the stash nonce AND fetches the image.
 #      Since solving a real image captcha from a shell is not
 #      feasible, we read the expected text out of the stash by a
-#      side channel — in v1.4.0 no such channel exists, so the
+#      side channel - in v1.4.0 no such channel exists, so the
 #      captcha mode test asserts the rendering only (page served,
 #      image URL returns 200 image/png, form present). Full solve
 #      round-trip is deferred to a follow-up.
@@ -318,7 +318,7 @@ else
 fi
 rm -f "$POST_HEAD"
 
-# Replay with the reconstructed cookie — must reach the backend
+# Replay with the reconstructed cookie - must reach the backend
 # (strict: X-Backend-Id is only emitted by the backend fixture).
 POW_REPLAY_HDRS=$(mktemp)
 curl -s -o /dev/null -D "$POW_REPLAY_HDRS" \
@@ -415,7 +415,7 @@ else
 fi
 
 # --- Bypass matrix: IP CIDR ----------------------------------------------
-log "=== bot smoke: bypass matrix — IP CIDR ==="
+log "=== bot smoke: bypass matrix - IP CIDR ==="
 UP=$(api_put "/api/v1/routes/${ROUTE_ID}" "{
     \"hostname\": \"bot-test.local\",
     \"path_prefix\": \"/\",
@@ -461,7 +461,7 @@ fi
 rm -f "$RESP"
 
 # --- Bypass matrix: ASN --------------------------------------------------
-log "=== bot smoke: bypass matrix — ASN ==="
+log "=== bot smoke: bypass matrix - ASN ==="
 UP=$(api_put "/api/v1/routes/${ROUTE_ID}" "{
     \"hostname\": \"bot-test.local\",
     \"path_prefix\": \"/\",
@@ -505,7 +505,7 @@ fi
 rm -f "$RESP"
 
 # --- Bypass matrix: country ----------------------------------------------
-log "=== bot smoke: bypass matrix — country ==="
+log "=== bot smoke: bypass matrix - country ==="
 UP=$(api_put "/api/v1/routes/${ROUTE_ID}" "{
     \"hostname\": \"bot-test.local\",
     \"path_prefix\": \"/\",
@@ -534,7 +534,7 @@ fi
 rm -f "$RESP"
 
 # --- Bypass matrix: User-Agent regex -------------------------------------
-log "=== bot smoke: bypass matrix — User-Agent regex ==="
+log "=== bot smoke: bypass matrix - User-Agent regex ==="
 UP=$(api_put "/api/v1/routes/${ROUTE_ID}" "{
     \"hostname\": \"bot-test.local\",
     \"path_prefix\": \"/\",
@@ -596,7 +596,7 @@ rm -f "$RESP"
 
 # --- Metrics assertions --------------------------------------------------
 # Worker-mode Lorica currently scopes `lorica_bot_challenge_total`
-# per worker (same story as `lorica_geoip_block_total`) — the
+# per worker (same story as `lorica_geoip_block_total`) - the
 # supervisor's `/metrics` does not aggregate those counters. The
 # functional path across workers is already proven green above
 # (PoW solve round-trips across workers thanks to the SQLite stash).

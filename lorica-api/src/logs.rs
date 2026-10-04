@@ -17,6 +17,18 @@ use crate::error::{json_data, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
 
+/// The deepest one access-log read reaches, whatever `?limit=` asks
+/// for.
+///
+/// Both log paths clamp to it: the SQLite `LIMIT` in
+/// [`crate::log_store::LogStore::query`] and the in-memory tail below.
+/// A surface that pages over this source cannot reach a row past it, so
+/// the constant is public: [`crate::automation::read`] refuses an offset
+/// beyond it with a 400 naming the depth rather than answering an empty
+/// page, which is the one failure an operator reads as "there was
+/// nothing".
+pub const LOGS_QUERY_MAX_ROWS: usize = 10_000;
+
 /// A single access log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -182,6 +194,10 @@ pub struct LogsQuery {
     pub limit: Option<usize>,
     /// Return entries after this ID (for pagination).
     pub after_id: Option<u64>,
+    /// Return entries before this ID: the keyset cursor for walking
+    /// back in time, which reads only the rows of the page it answers
+    /// however deep it is.
+    pub before_id: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -203,15 +219,47 @@ pub async fn get_logs(
         let (entries, total) = log_db_blocking(store, move |s| s.query(&params)).await?;
         return Ok(json_data(LogsResponse { entries, total }));
     }
+    let (entries, total) = buffered_entries(&state, &params);
+    Ok(json_data(LogsResponse { entries, total }))
+}
 
+/// The rows [`get_logs`] answers under `entries`, oldest first, without
+/// the match count it answers beside them: the automation plane's
+/// `/logs` pages with `has_more` and reports no total, and on the
+/// persistent store the count is a second pass over every matching row
+/// under the connection mutex.
+///
+/// # Errors
+///
+/// The store's error text.
+pub(crate) async fn log_rows(
+    state: &AppState,
+    params: LogsQuery,
+) -> Result<Vec<LogEntry>, ApiError> {
+    if let Some(ref store) = state.log_store {
+        return log_db_blocking(store, move |s| s.query_rows(&params)).await;
+    }
+    Ok(buffered_entries(state, &params).0)
+}
+
+/// The in-memory fallback of [`get_logs`]: the newest `limit` buffered
+/// rows the filters match, oldest first, and how many matched.
+fn buffered_entries(state: &AppState, params: &LogsQuery) -> (Vec<LogEntry>, usize) {
     let all_entries = state.log_buffer.snapshot();
-    let limit = params.limit.unwrap_or(200).min(10_000);
+    let limit = params.limit.unwrap_or(200).min(LOGS_QUERY_MAX_ROWS);
+    // Lowered once, not once per buffered row.
+    let search = params.search.as_ref().map(|needle| needle.to_lowercase());
 
     let filtered: Vec<LogEntry> = all_entries
         .into_iter()
         .filter(|e| {
             if let Some(after_id) = params.after_id {
                 if e.id <= after_id {
+                    return false;
+                }
+            }
+            if let Some(before_id) = params.before_id {
+                if e.id >= before_id {
                     return false;
                 }
             }
@@ -250,15 +298,14 @@ pub async fn get_logs(
                     return false;
                 }
             }
-            if let Some(ref search) = params.search {
-                let s = search.to_lowercase();
-                let matches = e.method.to_lowercase().contains(&s)
-                    || e.path.to_lowercase().contains(&s)
-                    || e.host.to_lowercase().contains(&s)
-                    || e.backend.to_lowercase().contains(&s)
+            if let Some(ref s) = search {
+                let matches = e.method.to_lowercase().contains(s)
+                    || e.path.to_lowercase().contains(s)
+                    || e.host.to_lowercase().contains(s)
+                    || e.backend.to_lowercase().contains(s)
                     || e.error
                         .as_ref()
-                        .is_some_and(|err| err.to_lowercase().contains(&s));
+                        .is_some_and(|err| err.to_lowercase().contains(s));
                 if !matches {
                     return false;
                 }
@@ -274,8 +321,7 @@ pub async fn get_logs(
     } else {
         filtered
     };
-
-    Ok(json_data(LogsResponse { entries, total }))
+    (entries, total)
 }
 
 /// Query parameters for the log export endpoint.
@@ -315,6 +361,7 @@ impl LogExportQuery {
             search: self.search.clone(),
             limit: None,
             after_id: None,
+            before_id: None,
         }
     }
 }
@@ -756,6 +803,7 @@ mod tests {
         assert_eq!(lq.time_to.as_deref(), Some("2026-01-02T00:00:00Z"));
         assert!(lq.limit.is_none());
         assert!(lq.after_id.is_none());
+        assert!(lq.before_id.is_none());
     }
 
     #[tokio::test]

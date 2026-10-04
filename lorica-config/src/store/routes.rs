@@ -7,22 +7,42 @@ use super::{serialize_field, serialize_optional_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::*;
 
+/// A name a route would answer to that another route already holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostnameClaim {
+    /// The name, as the route being written spells it.
+    pub hostname: String,
+    /// The route that holds it.
+    pub route_id: String,
+    /// Whether that route holds it as an alias rather than as its
+    /// hostname.
+    pub as_alias: bool,
+}
+
 impl ConfigStore {
-    /// Check that no other route uses any of the given hostnames (primary or alias).
-    /// Returns an error naming the conflicting hostname and route if found.
-    fn validate_hostname_uniqueness(
+    /// The first of `hostname` and `aliases` another route than
+    /// `route_id` already answers to, as its hostname or an alias: the
+    /// rule [`ConfigStore::create_route`] and
+    /// [`ConfigStore::update_route`] refuse a write on.
+    ///
+    /// Public so a caller that must not learn the other route's id (the
+    /// automation plane, which answers a token that may not see it) can
+    /// weigh the same rule before the write and word its own refusal.
+    ///
+    /// # Errors
+    ///
+    /// A database read failure.
+    pub fn hostname_claimed_elsewhere(
         &self,
         route_id: &str,
         hostname: &str,
         aliases: &[String],
-    ) -> Result<()> {
-        // Collect all hostnames to check
+    ) -> Result<Option<HostnameClaim>> {
         let mut check: Vec<&str> = vec![hostname];
         for a in aliases {
             check.push(a.as_str());
         }
 
-        // Check against all existing routes
         let mut stmt = self
             .conn
             .prepare("SELECT id, hostname, hostname_aliases FROM routes WHERE id != ?1")?;
@@ -40,19 +60,48 @@ impl ConfigStore {
                 serde_json::from_str(&aliases_json).unwrap_or_default();
 
             for h in &check {
-                if *h == other_host {
-                    return Err(ConfigError::Validation(format!(
-                        "hostname '{h}' already used by route {other_id}"
-                    )));
-                }
-                if other_aliases.iter().any(|a| a == *h) {
-                    return Err(ConfigError::Validation(format!(
-                        "hostname '{h}' already used as alias on route {other_id}"
-                    )));
-                }
+                let as_alias = if *h == other_host {
+                    false
+                } else if other_aliases.iter().any(|a| a == *h) {
+                    true
+                } else {
+                    continue;
+                };
+                return Ok(Some(HostnameClaim {
+                    hostname: (*h).to_string(),
+                    route_id: other_id,
+                    as_alias,
+                }));
             }
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// Check that no other route uses any of the given hostnames (primary or alias).
+    /// Returns an error naming the conflicting hostname and route if found.
+    fn validate_hostname_uniqueness(
+        &self,
+        route_id: &str,
+        hostname: &str,
+        aliases: &[String],
+    ) -> Result<()> {
+        match self.hostname_claimed_elsewhere(route_id, hostname, aliases)? {
+            None => Ok(()),
+            Some(HostnameClaim {
+                hostname,
+                route_id,
+                as_alias: false,
+            }) => Err(ConfigError::Validation(format!(
+                "hostname '{hostname}' already used by route {route_id}"
+            ))),
+            Some(HostnameClaim {
+                hostname,
+                route_id,
+                as_alias: true,
+            }) => Err(ConfigError::Validation(format!(
+                "hostname '{hostname}' already used as alias on route {route_id}"
+            ))),
+        }
     }
 
     /// Insert a new route into the database.

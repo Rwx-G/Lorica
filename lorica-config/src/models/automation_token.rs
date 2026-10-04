@@ -42,6 +42,13 @@ use serde::{Deserialize, Serialize};
 use super::hostname_pattern::matches_one_label;
 use crate::connection_filter::validate_cidr;
 
+/// The scope vocabulary and the `settings:write` lifetime ceiling are
+/// the automation policy's, declared in `lorica-automation-policy` so
+/// that `lorica-mcp`, which must not link this crate's SQLite, reads the
+/// same statement. Re-exported here so the token model's path to them
+/// is unchanged.
+pub use lorica_automation_policy::{AutomationScope, AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS};
+
 /// Bytes in the public (lookup) half of an automation token.
 pub const AUTOMATION_TOKEN_PUBLIC_ID_LEN: usize = 12;
 
@@ -67,6 +74,9 @@ pub const AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP: u32 = 30 * 24 * 60 * 60;
 /// its mandatory [`AutomationToken::expires_at`].
 pub const AUTOMATION_TOKEN_DEFAULT_LIFETIME_DAYS: i64 = 365;
 
+/// How every refusal about an automation token names its subject.
+pub const AUTOMATION_TOKEN_SUBJECT: &str = "automation token";
+
 /// Longest hostname pattern accepted, matching the DNS name limit.
 const HOSTNAME_PATTERN_MAX_LEN: usize = 253;
 
@@ -77,49 +87,72 @@ fn default_max_ttl_seconds() -> u32 {
     AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS
 }
 
-/// What an automation token is allowed to do.
+/// The hostname and backend grants of a credential carrying `scopes`,
+/// held to typed absence (maintainer decision, 2026-09-30).
 ///
-/// The enum is closed and these four variants are the whole surface for
-/// 1.8.0. The absence of `routes:write`, `certificates:write` and
-/// `settings:*` is deliberate: the automation surface is the
-/// environment resource, not the management API behind a different
-/// door. An automation that needs to reshape routing or issue a
-/// certificate is asking for an operator's credential, and it should
-/// have to say so rather than find the capability already attached to
-/// the token it uses for ephemeral environments.
+/// Required, non-empty and well-formed, when any scope is
+/// [`AutomationScope::is_grant_bounded`]. Refused, both empty, when none
+/// is: a grant on a credential whose every path ignores it is a blast
+/// radius the operator reads and the node never applies. An empty list
+/// means "nothing" everywhere it is read (`allows_hostname` matches no
+/// pattern; the backend check refuses before it builds a filter), so a
+/// credential that carries a bounded scope and an empty grant could do
+/// nothing, silently, which is why it is refused here rather than
+/// discovered at the first call.
 ///
-/// An unknown scope string fails to deserialise rather than being
-/// dropped, so a token minted against a newer Lorica is refused here
-/// instead of silently losing the grant an operator wrote down.
+/// Shared by the static token and the OIDC issuer entry, which grant
+/// the same two things. `subject` names the credential in the message.
 ///
-/// ```
-/// use lorica_config::models::AutomationScope;
-/// let scope: AutomationScope =
-///     serde_json::from_str("\"environments:write\"").expect("known scope");
-/// assert_eq!(scope, AutomationScope::EnvironmentsWrite);
-/// assert!(serde_json::from_str::<AutomationScope>("\"settings:write\"").is_err());
-/// ```
-// The wire spelling below lives in three places and a rename has to
-// touch all three: these renames, `scope_str` in
-// `lorica-api/src/automation/scope.rs` (the string an operator reads in
-// a 403), and
-// `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.fixture.ts`
-// (what the mint form offers). Two of the three agreeing is a token
-// minted with a scope the gate never matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AutomationScope {
-    /// Create, update and tear down environments.
-    #[serde(rename = "environments:write")]
-    EnvironmentsWrite,
-    /// Read environments and their state.
-    #[serde(rename = "environments:read")]
-    EnvironmentsRead,
-    /// Read the routes an environment resolves to.
-    #[serde(rename = "routes:read")]
-    RoutesRead,
-    /// Read certificate metadata (never private key material).
-    #[serde(rename = "certificates:read")]
-    CertificatesRead,
+/// # Errors
+///
+/// A message naming the field and the rule, for a `422` body.
+pub fn validate_automation_grants(
+    subject: &str,
+    scopes: &[AutomationScope],
+    allowed_hostnames: &[String],
+    allowed_backend_cidrs: &[String],
+) -> Result<(), String> {
+    if !scopes.iter().any(|scope| scope.is_grant_bounded()) {
+        for (field, grant) in [
+            ("allowed_hostnames", allowed_hostnames),
+            ("allowed_backend_cidrs", allowed_backend_cidrs),
+        ] {
+            if !grant.is_empty() {
+                let bounded: Vec<&str> = AutomationScope::ALL
+                    .iter()
+                    .filter(|scope| scope.is_grant_bounded())
+                    .map(|scope| scope.as_str())
+                    .collect();
+                return Err(format!(
+                    "{subject} carries no scope a hostname or backend grant bounds ({}), so \
+                     {field} must be empty: here it would bound nothing and still read as the \
+                     {subject}'s blast radius",
+                    bounded.join(", ")
+                ));
+            }
+        }
+        return Ok(());
+    }
+    if allowed_hostnames.is_empty() {
+        return Err(format!(
+            "{subject} carries a scope the hostname grant bounds, so it must allow at least one \
+             hostname; one that matches no hostname can do nothing, and does so silently"
+        ));
+    }
+    for pattern in allowed_hostnames {
+        validate_hostname_pattern(pattern)?;
+    }
+    if allowed_backend_cidrs.is_empty() {
+        return Err(format!(
+            "{subject} carries a scope the backend grant bounds, so it must allow at least one \
+             backend CIDR in allowed_backend_cidrs; an empty list admits no address, and there \
+             is no node-wide default backend policy to fall back on"
+        ));
+    }
+    for cidr in allowed_backend_cidrs {
+        validate_cidr(cidr, "allowed_backend_cidrs")?;
+    }
+    Ok(())
 }
 
 /// One scoped automation credential.
@@ -147,13 +180,17 @@ pub struct AutomationToken {
     pub scopes: Vec<AutomationScope>,
     /// Hostname patterns this token may claim: an exact hostname
     /// (`api.example.com`) or a wildcard (`*.preview.example.com`).
-    /// At least one.
+    /// At least one when the token carries a grant-bounded scope
+    /// ([`AutomationScope::is_grant_bounded`]), none otherwise: an
+    /// empty list is the typed absence of a grant, and it admits no
+    /// host.
+    #[serde(default)]
     pub allowed_hostnames: Vec<String>,
     /// CIDRs (or bare addresses) this token may point a hostname at.
-    /// At least one: there is no node-wide default backend policy to
-    /// fall back on, and the filter reads an empty allow list as
-    /// allow-every-address, which would let a token aim a public
-    /// hostname at loopback or at a cloud metadata service.
+    /// Same rule as [`Self::allowed_hostnames`]. An empty list admits
+    /// no address: the backend check refuses on it before it builds
+    /// the connection filter, whose own empty allow list would read as
+    /// every address.
     #[serde(default)]
     pub allowed_backend_cidrs: Vec<String>,
     /// Ceiling on the lifetime any environment this token creates may
@@ -223,11 +260,15 @@ impl AutomationToken {
     /// # Errors
     ///
     /// Returns `Err` when the name is blank, when the token grants no
-    /// scope, when it matches no hostname, when it names no backend
-    /// CIDR, when a hostname pattern or a backend CIDR is malformed,
+    /// scope, when it carries a grant-bounded scope and matches no
+    /// hostname or names no backend CIDR, when it carries none and
+    /// names either grant anyway, when a hostname pattern or a backend
+    /// CIDR is malformed,
     /// when `max_ttl_seconds` is zero or over
-    /// [`AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP`], or when `expires_at`
-    /// is not after `created_at`.
+    /// [`AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP`], when `expires_at`
+    /// is not after `created_at`, or when a token carrying
+    /// `settings:write` would live longer than
+    /// [`AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS`].
     ///
     /// ```
     /// use lorica_config::models::AutomationToken;
@@ -240,30 +281,19 @@ impl AutomationToken {
     /// ```
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
-            return Err("automation token must have a name".to_string());
+            return Err(format!("{AUTOMATION_TOKEN_SUBJECT} must have a name"));
         }
         if self.scopes.is_empty() {
-            return Err("automation token must grant at least one scope".to_string());
+            return Err(format!(
+                "{AUTOMATION_TOKEN_SUBJECT} must grant at least one scope"
+            ));
         }
-        if self.allowed_hostnames.is_empty() {
-            return Err(
-                "automation token must allow at least one hostname; a token that matches no \
-                 hostname can do nothing, and does so silently"
-                    .to_string(),
-            );
-        }
-        for pattern in &self.allowed_hostnames {
-            validate_hostname_pattern(pattern)?;
-        }
-        if self.allowed_backend_cidrs.is_empty() {
-            return Err(
-                "automation token must allow at least one backend CIDR; an empty                  allowed_backend_cidrs is read as every address, which would let this token                  point a public hostname at loopback or at a metadata service"
-                    .to_string(),
-            );
-        }
-        for cidr in &self.allowed_backend_cidrs {
-            validate_cidr(cidr, "allowed_backend_cidrs")?;
-        }
+        validate_automation_grants(
+            AUTOMATION_TOKEN_SUBJECT,
+            &self.scopes,
+            &self.allowed_hostnames,
+            &self.allowed_backend_cidrs,
+        )?;
         if self.max_ttl_seconds == 0 {
             return Err("max_ttl_seconds must be greater than zero".to_string());
         }
@@ -274,6 +304,19 @@ impl AutomationToken {
         }
         if self.expires_at <= self.created_at {
             return Err("expires_at must be after created_at".to_string());
+        }
+        let ceiling = chrono::Duration::days(AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS);
+        if self.has_scope(AutomationScope::SettingsWrite)
+            && self.expires_at - self.created_at > ceiling
+        {
+            return Err(format!(
+                "{AUTOMATION_TOKEN_SUBJECT} carrying {} lives at most \
+                 {AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS} days: it changes operational \
+                 settings and is minted for the task that needs them; pass lifetime_days \
+                 {AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS} or less, or an expires_at inside \
+                 that window",
+                AutomationScope::SettingsWrite.as_str()
+            ));
         }
         Ok(())
     }
@@ -287,10 +330,10 @@ impl AutomationToken {
 /// node serves is describing an operator credential, not an automation
 /// one.
 ///
-/// Shared with the OIDC issuer entry (Story 10.5), which grants the
-/// same kind of authority over a name and must read a pattern the same
-/// way.
-pub(super) fn validate_hostname_pattern(pattern: &str) -> Result<(), String> {
+/// Shared with the OIDC issuer entry (Story 10.5) through
+/// [`validate_automation_grants`]: it grants the same kind of authority over a
+/// name and must read a pattern the same way.
+fn validate_hostname_pattern(pattern: &str) -> Result<(), String> {
     let invalid = |why: &str| format!("`{pattern}` is not a valid hostname pattern: {why}");
     if pattern == "*" {
         return Err(invalid(
@@ -512,43 +555,6 @@ mod tests {
         }
     }
 
-    // ---- The scope enum ----
-
-    #[test]
-    fn every_scope_round_trips_through_its_exact_wire_string() {
-        for (scope, wire) in [
-            (AutomationScope::EnvironmentsWrite, "environments:write"),
-            (AutomationScope::EnvironmentsRead, "environments:read"),
-            (AutomationScope::RoutesRead, "routes:read"),
-            (AutomationScope::CertificatesRead, "certificates:read"),
-        ] {
-            let json = serde_json::to_string(&scope).expect("test setup: scope serialises");
-            assert_eq!(json, format!("\"{wire}\""));
-            let back: AutomationScope =
-                serde_json::from_str(&json).expect("test setup: scope deserialises");
-            assert_eq!(back, scope);
-        }
-    }
-
-    #[test]
-    fn an_unknown_scope_string_fails_to_deserialise_rather_than_being_ignored() {
-        // The enum is the whole grant surface for 1.8.0. Dropping an
-        // unknown entry would mint a token narrower than the operator
-        // wrote, and they would find out at the first call.
-        for unknown in [
-            "\"settings:write\"",
-            "\"routes:write\"",
-            "\"certificates:write\"",
-            "\"environments\"",
-            "\"\"",
-        ] {
-            assert!(
-                serde_json::from_str::<AutomationScope>(unknown).is_err(),
-                "{unknown} must be refused"
-            );
-        }
-    }
-
     #[test]
     fn a_token_with_no_backend_cidr_is_refused() {
         // An empty allow list is default-allow in the connection
@@ -560,6 +566,93 @@ mod tests {
             .validate()
             .expect_err("an empty backend grant is refused");
         assert!(err.contains("allowed_backend_cidrs"), "{err}");
+    }
+
+    #[test]
+    fn a_token_carrying_no_bounded_scope_carries_no_grant() {
+        // Typed absence (2026-09-30). A read or a settings token carries
+        // grants that no path it reaches consults, and a grant that
+        // bounds nothing still reads as a blast radius in the listing.
+        for scope in AutomationScope::ALL
+            .iter()
+            .copied()
+            .filter(|scope| !scope.is_grant_bounded())
+        {
+            let mut token = valid_token();
+            token.scopes = vec![scope];
+            // Inside every scope's lifetime ceiling, so the only thing
+            // wrong with the token is the grant under test.
+            token.expires_at = token.created_at + chrono::Duration::days(1);
+            let refused = token
+                .validate()
+                .expect_err("grants on a token they cannot bound");
+            assert!(
+                refused.contains("allowed_hostnames"),
+                "{scope:?}: {refused}"
+            );
+            token.allowed_hostnames.clear();
+            let refused = token
+                .validate()
+                .expect_err("the CIDR grant bounds nothing either");
+            assert!(
+                refused.contains("allowed_backend_cidrs"),
+                "{scope:?}: {refused}"
+            );
+            token.allowed_backend_cidrs.clear();
+            assert_eq!(token.validate(), Ok(()), "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn a_token_carrying_one_bounded_scope_needs_both_grants_whatever_else_it_carries() {
+        for scope in AutomationScope::ALL
+            .iter()
+            .copied()
+            .filter(|scope| scope.is_grant_bounded())
+        {
+            let mut token = valid_token();
+            token.scopes = vec![AutomationScope::LogsRead, scope];
+            assert_eq!(token.validate(), Ok(()), "{scope:?}");
+            let mut no_host = token.clone();
+            no_host.allowed_hostnames.clear();
+            assert!(no_host.validate().is_err(), "{scope:?}");
+            let mut no_cidr = token;
+            no_cidr.allowed_backend_cidrs.clear();
+            assert!(no_cidr.validate().is_err(), "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_hostname_grant_admits_no_host() {
+        // Empty means nothing, never everything: a row stored before
+        // typed absence, or a read token, can claim no name.
+        let mut token = valid_token();
+        token.allowed_hostnames.clear();
+        for host in [
+            "pr-42.preview.example.com",
+            "preview.example.com",
+            "localhost",
+            "*",
+            "",
+        ] {
+            assert!(!token.allows_hostname(host), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn no_refusal_carries_a_run_of_spaces_from_a_broken_line_continuation() {
+        // The backend CIDR message once lost its trailing backslash and
+        // carried two runs of source indentation to every operator.
+        let mut no_cidr = valid_token();
+        no_cidr.allowed_backend_cidrs.clear();
+        let mut no_host = valid_token();
+        no_host.allowed_hostnames.clear();
+        let mut unbounded = valid_token();
+        unbounded.scopes = vec![AutomationScope::LogsRead];
+        for token in [no_cidr, no_host, unbounded] {
+            let refused = token.validate().expect_err("refused");
+            assert!(!refused.contains("  "), "{refused}");
+        }
     }
 
     // ---- Liveness ----
@@ -711,6 +804,47 @@ mod tests {
         token.max_ttl_seconds = AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP + 1;
         let err = token.validate().expect_err("over the cap");
         assert!(err.contains("max_ttl_seconds"), "{err}");
+    }
+
+    #[test]
+    fn a_settings_write_token_lives_at_most_the_ceiling_and_no_other_scope_is_held_to_it() {
+        let ceiling = chrono::Duration::days(AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS);
+        let mut admin = valid_token();
+        admin.scopes = vec![AutomationScope::SettingsWrite];
+        admin.allowed_hostnames.clear();
+        admin.allowed_backend_cidrs.clear();
+
+        admin.expires_at = admin.created_at + ceiling;
+        admin.validate().expect("exactly the ceiling is allowed");
+
+        admin.expires_at = admin.created_at + ceiling + chrono::Duration::seconds(1);
+        let err = admin.validate().expect_err("past the ceiling is refused");
+        assert!(
+            err.contains(&format!(
+                "{AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS} days"
+            )),
+            "the refusal names the ceiling: {err}"
+        );
+        assert!(err.contains("settings:write"), "{err}");
+        assert!(!err.contains("  "), "a line continuation was lost: {err}");
+
+        // The node's own default lifetime is past the ceiling, so a
+        // settings:write mint that names no lifetime is refused rather
+        // than silently shortened.
+        admin.expires_at =
+            admin.created_at + chrono::Duration::days(AUTOMATION_TOKEN_DEFAULT_LIFETIME_DAYS);
+        assert!(admin.validate().is_err());
+
+        // Beside other scopes the rule still holds: it follows the
+        // scope, not the scope set.
+        let mut mixed = valid_token();
+        mixed.scopes.push(AutomationScope::SettingsWrite);
+        assert!(mixed.validate().is_err());
+
+        // Without settings:write, the default lifetime stands.
+        valid_token()
+            .validate()
+            .expect("a token without settings:write keeps the default lifetime");
     }
 
     #[test]

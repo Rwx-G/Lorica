@@ -151,8 +151,10 @@ fn lenient_loader_returns_good_rows_no_skips() {
 
 #[test]
 fn rebuild_from_store_swaps_global_handle() {
-    // This is the only test that writes the process-wide handle, so it
-    // does not race other tests in the binary.
+    // The handle is process-wide and a reload commit elsewhere in this
+    // binary rebuilds it too, so the rebuild and the read below happen
+    // under the lock every writer holds.
+    let _writers = ai_bot_merged::TEST_HANDLE_WRITERS.blocking_lock();
     let store = ConfigStore::open_in_memory().expect("in-memory store opens");
     store
         .create_custom_crawler(&custom(

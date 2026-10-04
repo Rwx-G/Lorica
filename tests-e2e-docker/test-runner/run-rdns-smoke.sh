@@ -16,7 +16,7 @@
 #   3. After a brief settle, the cache is populated with the
 #      forward-confirmed match; the SECOND request from 203.0.113.42
 #      must bypass the challenge and hit the backend.
-#   4. Requests from 203.0.113.77 fail forward-confirm — the cache
+#   4. Requests from 203.0.113.77 fail forward-confirm - the cache
 #      entry stores None and the challenge continues to render even
 #      after settle (regression guard for the forward-confirm step,
 #      which is the ONLY thing keeping a hostile resolver from
@@ -51,12 +51,12 @@ log "Lorica API ready"
 # Sanity-check: dnsmasq is reachable AND the zone resolves from the
 # test-runner's own resolver. If this fails, the lorica-rdns
 # entrypoint has overridden resolv.conf correctly on its side but
-# our sanity probe would fail silently — so we query the dnsmasq
+# our sanity probe would fail silently - so we query the dnsmasq
 # sidecar directly.
 #
 # Use `getent` which is available in Debian-slim by default. We ask
 # for a forward lookup of `crawler.bot-e2e.local` through the test-
-# runner's default resolver — this will miss unless we explicitly
+# runner's default resolver - this will miss unless we explicitly
 # point at dnsmasq. We skip the sanity in that case (the lorica
 # side is what matters for the test).
 log "rdns fixtures sanity (informational):"
@@ -174,7 +174,7 @@ probe() {
 log "=== rdns smoke: trusted client (PTR + forward confirm) ==="
 # First hit: cache MISS. The populate is async (tokio::spawn in the
 # request_filter) so this request typically renders the challenge.
-# We do not assert on this one — the important check is "the NEXT
+# We do not assert on this one - the important check is "the NEXT
 # request from the same IP bypasses".
 read -r CODE1 POW1 < <(probe "$IP_TRUSTED")
 log "trusted client first request: HTTP $CODE1, PoW markers=$POW1 (cache miss expected)"
@@ -194,7 +194,7 @@ for attempt in 1 2 3 4 5; do
         break
     fi
     # Give the populate one more second in case the runner machine
-    # is slow — CI sometimes takes > 2 s to fire the background task.
+    # is slow - CI sometimes takes > 2 s to fire the background task.
     sleep 1
 done
 if [ "$BYPASS_PASSED" = "1" ]; then
@@ -225,7 +225,7 @@ done
 if [ "$SPOOF_BLOCKED" = "1" ]; then
     ok "spoofed client: forward-confirm rejects PTR, challenge still fires (threat model intact)"
 else
-    fail "spoofed client: forward-confirm FAILED — spoofed PTR bypassed the challenge (security regression)"
+    fail "spoofed client: forward-confirm FAILED - spoofed PTR bypassed the challenge (security regression)"
 fi
 
 # --- Summary ---

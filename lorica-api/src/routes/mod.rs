@@ -44,7 +44,7 @@ pub mod traffic_splits;
 // external code can still name `lorica_api::routes::RouteResponse` etc.
 pub use crud::{
     create_route, delete_route, get_route, list_routes, update_route, CreateRouteRequest,
-    RouteResponse, UpdateRouteRequest,
+    ListRoutesQuery, RouteResponse, UpdateRouteRequest,
 };
 pub use forward_auth::{
     validate_forward_auth, ForwardAuthConfigRequest, ValidateForwardAuthRequest,

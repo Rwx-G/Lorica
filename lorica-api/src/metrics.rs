@@ -1827,6 +1827,26 @@ static AUDIT_ROWS_DROPPED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     )
 });
 
+/// Request units each plane runs detached from their connections and
+/// has not finished (`crate::db::DetachedUnits`). Labels: plane
+/// (`management | automation`). A value that stays at the plane's
+/// bound means requests are waiting for a slot; one that climbs while
+/// the live connections do not means units outlive their clients.
+static DETACHED_REQUEST_UNITS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge_vec(
+        "detached_request_units",
+        "Request units running detached from their connections, per plane",
+        &["plane"],
+    )
+});
+
+/// Move the in-flight count of `plane`'s detached request units.
+pub fn adjust_detached_request_units(plane: &str, delta: i64) {
+    DETACHED_REQUEST_UNITS
+        .with_label_values(&[plane])
+        .add(delta);
+}
+
 /// Bump the dropped-audit-row counter.
 pub fn inc_audit_rows_dropped() {
     AUDIT_ROWS_DROPPED_TOTAL.inc();
@@ -2331,6 +2351,32 @@ static AUTOMATION_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 pub fn inc_automation_request(outcome: &str) {
     AUTOMATION_REQUESTS_TOTAL
         .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Requests on the automation listener by path and outcome. Labels:
+/// path, outcome.
+///
+/// Separate from the counter above rather than a label added to it: the
+/// plane-wide rate is what an operator alerts on and what a dashboard
+/// shows without a sum, and a whole read surface made "which one" a
+/// second question rather than a refinement of the first.
+static AUTOMATION_REQUESTS_BY_PATH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "automation_requests_by_path_total",
+        "Automation API requests by declared path template and outcome",
+        &["path", "outcome"],
+    )
+});
+
+/// Record one automation request against its path template.
+///
+/// `path` MUST be a template the scope matrix declares, or the fixed
+/// word for an undeclared one. Anything carrying a caller-chosen
+/// segment is a new time series per value a caller sends.
+pub fn inc_automation_request_by_path(path: &str, outcome: &str) {
+    AUTOMATION_REQUESTS_BY_PATH_TOTAL
+        .with_label_values(&[path, outcome])
         .inc();
 }
 

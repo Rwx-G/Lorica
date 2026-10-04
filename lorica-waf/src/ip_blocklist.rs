@@ -319,16 +319,32 @@ invalid-line
         let count = bl.load_from_text(&text);
         assert!(count > 90_000);
 
-        // Lookup should be fast (O(1))
-        let start = std::time::Instant::now();
-        for _ in 0..10_000 {
-            bl.is_blocked_str("50.128.2.1");
-        }
-        let elapsed = start.elapsed();
-        let per_lookup_ns = elapsed.as_nanos() / 10_000;
+        // The claim is that a lookup does not grow with the list. An
+        // absolute bound measured the machine instead: a loaded CI runner
+        // in a debug build crossed 1000 ns on a correct implementation.
+        // So the large list is timed against a one-entry list, side by
+        // side on the same machine, and only a lookup that scales with
+        // the list (a linear scan is ~100 000 times slower) fails.
+        let small = IpBlocklist::new();
+        small.load_from_text("50.128.2.1\n");
+        let per_lookup = |list: &IpBlocklist| {
+            (0..5)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    for _ in 0..10_000 {
+                        std::hint::black_box(list.is_blocked_str("50.128.2.1"));
+                    }
+                    start.elapsed().as_nanos() / 10_000
+                })
+                .min()
+                .expect("five rounds")
+                .max(1)
+        };
+        let small_ns = per_lookup(&small);
+        let large_ns = per_lookup(&bl);
         assert!(
-            per_lookup_ns < 1000,
-            "Lookup too slow: {per_lookup_ns}ns per lookup"
+            large_ns < small_ns * 50,
+            "lookup scales with the list: {large_ns}ns on 100k entries against {small_ns}ns on one"
         );
     }
 }

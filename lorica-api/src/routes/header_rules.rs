@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ApiError;
 
 /// Header-based routing rule (matches a header value, picks a backend pool).
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct HeaderRuleRequest {
     /// HTTP header name the rule tests.
     pub header_name: String,

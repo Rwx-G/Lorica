@@ -382,6 +382,24 @@ pub fn hash_password(password: &str) -> Result<String, ApiError> {
     Ok(hash.to_string())
 }
 
+/// [`hash_password`] on the blocking pool, for a caller on an async
+/// worker.
+///
+/// One Argon2id hash is tens of milliseconds of CPU and 19 MiB of
+/// memory by design, and on a worker thread it stalls every other task
+/// scheduled there for that long. A caller already inside a store
+/// closure is on the blocking pool and calls [`hash_password`].
+///
+/// # Errors
+///
+/// Whatever [`hash_password`] answers, or `Internal` when the blocking
+/// task could not be joined.
+pub async fn hash_password_off_worker(password: String) -> Result<String, ApiError> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| ApiError::Internal(format!("password hashing task join failed: {e}")))?
+}
+
 /// Fixed Argon2id hash used only to equalize the cost of a
 /// user-not-found login with the real verify path, closing the username
 /// enumeration timing oracle. A dummy verify against this hash always
@@ -447,4 +465,38 @@ pub fn ensure_admin_user(store: &lorica_config::ConfigStore) -> Result<Option<St
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Some(password))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hash_off_the_worker_leaves_the_worker_free_and_verifies() {
+        // One worker thread: a hash computed on it would stop the ticker
+        // for the whole hash, and the count would still be zero.
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let hash = hash_password_off_worker("correct horse".to_string())
+            .await
+            .expect("the hash is computed");
+        ticker.abort();
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "the worker ran other tasks while the hash was computed"
+        );
+        verify_password("correct horse", &hash).expect("the hash verifies its password");
+        verify_password("wrong horse", &hash).expect_err("and no other");
+    }
 }

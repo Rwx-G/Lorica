@@ -57,10 +57,10 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::automation_token::{validate_hostname_pattern, AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP};
+use super::automation_token::{validate_automation_grants, AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP};
 use super::hostname_pattern::matches_one_label;
 use super::AutomationScope;
-use crate::connection_filter::validate_cidr;
+use lorica_automation_policy::Tier;
 
 /// The closed set of claims an entry may bind. Anything else is refused
 /// at validation: a claim GitLab does not put in the token can never
@@ -146,14 +146,14 @@ pub struct OidcIssuer {
     /// [`OIDC_BOUND_CLAIM_WITH_GLOB`] only. A `BTreeMap` so the row
     /// serialises the same way every time.
     pub bound_claims: BTreeMap<String, String>,
-    /// Hostname patterns a token from this entry may claim. At least
-    /// one, the same rule as a static token.
+    /// Hostname patterns a token from this entry may claim, under the
+    /// static token's rule: at least one when the entry grants a
+    /// grant-bounded scope, none otherwise, and an empty list admits
+    /// no host.
+    #[serde(default)]
     pub allowed_hostnames: Vec<String>,
-    /// CIDRs a token from this entry may point a hostname at. At
-    /// least one: there is no node-wide default backend policy to fall
-    /// back on, and the filter reads an empty allow list as
-    /// allow-every-address, which would let a job aim a public
-    /// hostname at loopback or at a cloud metadata service.
+    /// CIDRs a token from this entry may point a hostname at, under the
+    /// same rule. An empty list admits no address.
     #[serde(default)]
     pub allowed_backend_cidrs: Vec<String>,
     /// Ceiling on the lifetime any environment a token from this entry
@@ -243,8 +243,10 @@ impl OidcIssuer {
     /// [`OIDC_BOUND_CLAIM_WITH_GLOB`], is not anchored on a namespace
     /// segment, or is not `true`/`false` for a boolean claim, when the
     /// entry binds none of [`OIDC_OWNERSHIP_BOUND_CLAIMS`], when the
-    /// entry grants no scope, matches no hostname or names no backend
-    /// CIDR, when a hostname pattern or a CIDR is malformed, or when
+    /// entry grants no scope or grants `settings:write`, when it grants
+    /// a grant-bounded scope and matches no hostname or names no
+    /// backend CIDR, when it grants none and names either grant anyway,
+    /// when a hostname pattern or a CIDR is malformed, or when
     /// `max_ttl_seconds` is zero or over the static-token cap.
     ///
     /// ```
@@ -280,32 +282,37 @@ impl OidcIssuer {
             .any(|name| OIDC_OWNERSHIP_BOUND_CLAIMS.contains(&name.as_str()))
         {
             return Err(format!(
-                "oidc issuer entry must bind one of {}; the audience is not a secret, so an                  entry that binds neither accepts a token from every project on the instance",
+                "oidc issuer entry must bind one of {}; the audience is not a secret, so an \
+                 entry that binds neither accepts a token from every project on the instance",
                 OIDC_OWNERSHIP_BOUND_CLAIMS.join(" or ")
             ));
         }
         if self.scopes.is_empty() {
             return Err("oidc issuer entry must grant at least one scope".to_string());
         }
-        if self.allowed_hostnames.is_empty() {
-            return Err(
-                "oidc issuer entry must allow at least one hostname; an entry that matches no \
-                 hostname can do nothing, and does so silently"
-                    .to_string(),
-            );
+        // The admin tier is minted for one task and revoked after it.
+        // An issuer entry is the opposite, a standing grant to every
+        // pipeline job whose claims match, so one poisoned merge
+        // request would hold node-wide settings for as long as the
+        // entry stands, with no token to revoke. Read off the tier
+        // table, so a scope joining the admin tier is refused here the
+        // day it joins.
+        if let Some(admin) = self
+            .scopes
+            .iter()
+            .find(|scope| Tier::requiring(**scope) == Some(Tier::Admin))
+        {
+            return Err(format!(
+                "oidc issuer entry may not grant {admin}; the admin tier is a static token \
+                 minted for one task with a short lifetime and revoked after it"
+            ));
         }
-        for pattern in &self.allowed_hostnames {
-            validate_hostname_pattern(pattern)?;
-        }
-        if self.allowed_backend_cidrs.is_empty() {
-            return Err(
-                "oidc issuer entry must allow at least one backend CIDR; an empty                  allowed_backend_cidrs is read as every address, which would let a job point a                  public hostname at loopback or at a metadata service"
-                    .to_string(),
-            );
-        }
-        for cidr in &self.allowed_backend_cidrs {
-            validate_cidr(cidr, "allowed_backend_cidrs")?;
-        }
+        validate_automation_grants(
+            "oidc issuer entry",
+            &self.scopes,
+            &self.allowed_hostnames,
+            &self.allowed_backend_cidrs,
+        )?;
         if self.max_ttl_seconds == 0 {
             return Err("max_ttl_seconds must be greater than zero".to_string());
         }
@@ -503,6 +510,93 @@ mod tests {
     #[test]
     fn a_well_formed_entry_validates() {
         assert_eq!(valid_issuer().validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_entry_granting_the_admin_tier_is_refused_and_every_other_scope_is_not() {
+        // Story 11.3: the admin tier is a short-lived static token, never
+        // a standing grant to every matching pipeline job.
+        let admin = Tier::Admin.requires();
+        assert!(!admin.is_empty());
+        for scope in admin {
+            let mut issuer = valid_issuer();
+            issuer.scopes.push(*scope);
+            let refused = issuer
+                .validate()
+                .expect_err("an admin-tier scope on an issuer");
+            assert!(refused.contains(scope.as_str()), "{refused}");
+            assert!(refused.contains("static token"), "{refused}");
+            assert!(
+                !refused.contains("  "),
+                "a line continuation was lost: {refused}"
+            );
+        }
+        for scope in AutomationScope::ALL {
+            if admin.contains(scope) {
+                continue;
+            }
+            // The config tier's write scopes stay open to an entry on
+            // purpose (2026-09-30): a keyless, short-lived CI credential
+            // is what OIDC is for, and it is safer than a static token.
+            let mut issuer = valid_issuer();
+            issuer.scopes = vec![*scope];
+            if !scope.is_grant_bounded() {
+                issuer.allowed_hostnames.clear();
+                issuer.allowed_backend_cidrs.clear();
+            }
+            assert_eq!(issuer.validate(), Ok(()), "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn an_entry_granting_no_bounded_scope_carries_no_grant_and_one_granting_one_carries_both() {
+        // Typed absence, the static token's rule on the other credential
+        // that grants the same two things.
+        let mut reader = valid_issuer();
+        reader.scopes = vec![AutomationScope::EnvironmentsRead];
+        let refused = reader.validate().expect_err("a grant that bounds nothing");
+        assert!(refused.contains("allowed_hostnames"), "{refused}");
+        assert!(!refused.contains("  "), "{refused}");
+        reader.allowed_hostnames.clear();
+        let refused = reader
+            .validate()
+            .expect_err("the CIDR grant bounds nothing either");
+        assert!(refused.contains("allowed_backend_cidrs"), "{refused}");
+        reader.allowed_backend_cidrs.clear();
+        assert_eq!(reader.validate(), Ok(()));
+
+        let mut writer = valid_issuer();
+        writer.allowed_hostnames.clear();
+        writer.allowed_backend_cidrs.clear();
+        assert!(writer.validate().is_err());
+    }
+
+    #[test]
+    fn an_entry_with_no_hostname_admits_no_host() {
+        let mut issuer = valid_issuer();
+        issuer.allowed_hostnames.clear();
+        for host in [
+            "preview.example.com",
+            "a.preview.example.com",
+            "localhost",
+            "",
+        ] {
+            assert!(!issuer.allows_hostname(host), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn no_refusal_carries_a_run_of_spaces_from_a_broken_line_continuation() {
+        let mut unbound = valid_issuer();
+        unbound.bound_claims = claims(&[("ref_protected", "true")]);
+        let mut no_cidr = valid_issuer();
+        no_cidr.allowed_backend_cidrs.clear();
+        let mut no_host = valid_issuer();
+        no_host.allowed_hostnames.clear();
+        for issuer in [unbound, no_cidr, no_host] {
+            let refused = issuer.validate().expect_err("refused");
+            assert!(!refused.contains("  "), "{refused}");
+        }
     }
 
     #[test]

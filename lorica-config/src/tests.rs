@@ -1308,14 +1308,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 61 is the current head of the tracked MIGRATIONS table (every
+        // 62 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            61
+            62
         );
     }
 
@@ -1333,7 +1333,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                61
+                62
             );
         }
     }
@@ -2051,6 +2051,59 @@ backend_id = "also-nonexistent"
             .expect("test setup: certificate fetch")
             .expect("test setup: value present");
         assert_eq!(fetched.key_pem, updated.key_pem);
+    }
+
+    #[test]
+    fn the_listing_without_private_keys_is_the_listing_less_its_keys_and_decrypts_none() {
+        use crate::crypto::EncryptionKey;
+
+        let key = EncryptionKey::generate().expect("test setup: key generates");
+        let store = ConfigStore::open_in_memory_with_key(key)
+            .expect("test setup: in-memory store opens with key");
+        let mut second = make_certificate();
+        second.domain = "a.example.com".into();
+        second.is_acme = true;
+        second.acme_method = Some("http01".into());
+        for cert in [make_certificate(), second] {
+            store
+                .create_certificate(&cert)
+                .expect("test setup: certificate inserts");
+        }
+
+        let with_keys = store
+            .list_certificates()
+            .expect("test setup: certificates listed");
+        let without = store
+            .list_certificates_without_private_keys()
+            .expect("the listing without keys");
+        assert!(without.iter().all(|cert| cert.key_pem.is_empty()));
+        let blanked: Vec<serde_json::Value> = with_keys
+            .into_iter()
+            .map(|mut cert| {
+                cert.key_pem = String::new();
+                serde_json::to_value(cert).expect("a certificate serialises")
+            })
+            .collect();
+        let listed: Vec<serde_json::Value> = without
+            .into_iter()
+            .map(|cert| serde_json::to_value(cert).expect("a certificate serialises"))
+            .collect();
+        assert_eq!(listed, blanked, "same rows, same order, same fields");
+
+        // A key blob that no longer decrypts fails the full listing and
+        // not this one, which is what shows it never decrypts a key.
+        store
+            .conn
+            .execute("UPDATE certificates SET key_pem = X'00'", [])
+            .expect("test setup: key blobs overwritten");
+        assert!(store.list_certificates().is_err());
+        assert_eq!(
+            store
+                .list_certificates_without_private_keys()
+                .expect("the listing without keys reads no key")
+                .len(),
+            2
+        );
     }
 
     // ---- ConfigDiff tests ----

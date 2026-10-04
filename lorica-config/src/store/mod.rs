@@ -49,6 +49,7 @@ mod probes;
 mod replica;
 pub use replica::{ReplicaError, ReplicaOutcome};
 mod routes;
+pub use routes::HostnameClaim;
 mod row_helpers;
 mod sessions;
 mod settings;
@@ -185,6 +186,7 @@ const MIGRATIONS: &[Migration] = &[
     (59, migrate_oidc_issuers),
     (60, migrate_oidc_issuer_ca_pem),
     (61, migrate_route_waf_body_scan_cap),
+    (62, migrate_downstream_idle_timeout),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1151,6 +1153,17 @@ fn migrate_route_waf_body_scan_cap(conn: &Connection) -> rusqlite::Result<()> {
         "waf_body_scan_max_bytes",
         "INTEGER DEFAULT NULL",
     )
+}
+
+fn migrate_downstream_idle_timeout(_conn: &Connection) -> rusqlite::Result<()> {
+    // Backlog #82. Deliberately no DDL and no row: the settings table is
+    // key/value and reads an absent `downstream_idle_timeout_s` as its
+    // default. What this version is for is the schema number itself.
+    // The setting joined the replicated settings blob, and a follower
+    // whose schema is behind the control plane's is refused at the
+    // handshake instead of being handed a blob carrying a field it
+    // cannot decode (`docs/cluster.md`, "Running a Mixed-Version Fleet").
+    Ok(())
 }
 
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {

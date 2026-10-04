@@ -40,7 +40,7 @@ use lorica_config::models::ClusterIdentity;
 use lorica_config::store::ConfigStore;
 use tokio::io::AsyncReadExt;
 
-use crate::cli_client::{fail, management_client, management_data, management_login};
+use crate::cli_client::{fail, management_data, management_session};
 
 /// Bound on one enrollment exchange.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -377,9 +377,9 @@ pub(crate) fn run_cluster_leave(
         // Authorised by a SuperAdmin credential: the running instance
         // tells the control plane, wipes and audits.
         rt.block_on(async {
-            let client = management_client();
-            management_login(&client, management_port, &user, &password).await;
-            let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/leave");
+            let client =
+                management_session(Path::new(data_dir), management_port, &user, &password).await;
+            let url = crate::cli_client::management_url(management_port, "/api/v1/cluster/leave");
             let response = client
                 .post(&url)
                 .send()
@@ -558,9 +558,8 @@ pub(crate) fn run_cluster_status(
         return;
     };
     runtime().block_on(async {
-        let client = management_client();
-        management_login(&client, management_port, &user, &password).await;
-        let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/status");
+        let client = management_session(&data_dir, management_port, &user, &password).await;
+        let url = crate::cli_client::management_url(management_port, "/api/v1/cluster/status");
         let response = client
             .get(&url)
             .send()
@@ -577,6 +576,7 @@ pub(crate) fn run_cluster_status(
 
 /// `lorica cluster break-glass` (Story 9.4 AC #11).
 pub(crate) fn run_cluster_break_glass(
+    data_dir: &str,
     management_port: u16,
     duration_s: u64,
     close: bool,
@@ -584,9 +584,9 @@ pub(crate) fn run_cluster_break_glass(
     password: String,
 ) {
     runtime().block_on(async {
-        let client = management_client();
-        management_login(&client, management_port, &user, &password).await;
-        let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/break-glass");
+        let client =
+            management_session(Path::new(data_dir), management_port, &user, &password).await;
+        let url = crate::cli_client::management_url(management_port, "/api/v1/cluster/break-glass");
         let request = if close {
             client.delete(&url)
         } else {
@@ -623,6 +623,7 @@ pub(crate) fn run_cluster_break_glass(
 
 /// `lorica cluster token`.
 pub(crate) fn run_cluster_token(
+    data_dir: &str,
     management_port: u16,
     ttl_seconds: Option<u64>,
     node_name: String,
@@ -631,9 +632,9 @@ pub(crate) fn run_cluster_token(
     password: String,
 ) {
     runtime().block_on(async {
-        let client = management_client();
-        management_login(&client, management_port, &user, &password).await;
-        let url = format!("https://127.0.0.1:{management_port}/api/v1/cluster/tokens");
+        let client =
+            management_session(Path::new(data_dir), management_port, &user, &password).await;
+        let url = crate::cli_client::management_url(management_port, "/api/v1/cluster/tokens");
         let response = client
             .post(&url)
             .json(&serde_json::json!({

@@ -304,11 +304,18 @@ where
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
-        // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
+        // retry, send buffer if it exists.
+        // Lorica: also when a request filter already read the whole body
+        // before the upstream leg, so request_body_filter still gets the
+        // end-of-body call through which it hands that body over. An empty
+        // body already ended the stream in proxy_to_h2_upstream.
+        let buffer = session.as_mut().get_retry_buffer();
+        let body_read_before_upstream =
+            downstream_state.is_done() && !session.as_mut().is_body_empty();
+        if buffer.is_some() || body_read_before_upstream {
             self.send_body_to2(
                 session,
-                Some(buffer),
+                buffer,
                 downstream_state.is_done(),
                 client_body,
                 ctx,

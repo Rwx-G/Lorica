@@ -1,6 +1,8 @@
 target/
 .git/
 docs/
+# Read by tests through include_str!; see Dockerfile.dev.
+!docs/*.md
 dist/
 *.md
 !README.md

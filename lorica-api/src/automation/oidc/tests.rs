@@ -342,6 +342,35 @@ async fn each_claim_failure_is_refused_with_its_own_reason() {
     assert!(reasons.contains(&"bound_claim_mismatch:project_path".to_string()));
 }
 
+#[tokio::test]
+async fn a_key_published_for_another_use_or_algorithm_verifies_nothing() {
+    // A key the issuer marks for encryption, or for another algorithm,
+    // shares the RSA family and could carry the `kid` a token names.
+    // Taken at its word, it is not a signing key for RS256.
+    let key = TestKey::generate("k1");
+    for (member, value) in [("use", "enc"), ("alg", "RS384")] {
+        let mut jwk = key.jwk();
+        jwk[member] = serde_json::json!(value);
+        let verifier = OidcVerifier::new(MockIssuer::serving_jwks(vec![jwk]));
+        assert_eq!(
+            verify(&verifier, &key.sign(&claims()), &[entry()], now())
+                .await
+                .err(),
+            Some(RefusalReason::UnknownKid),
+            "{member}: {value}"
+        );
+    }
+    // Neither member is required: a key stating neither is admitted.
+    let mut bare = key.jwk();
+    let object = bare.as_object_mut().expect("a JWK is an object");
+    object.remove("use");
+    object.remove("alg");
+    let verifier = OidcVerifier::new(MockIssuer::serving_jwks(vec![bare]));
+    assert!(verify(&verifier, &key.sign(&claims()), &[entry()], now())
+        .await
+        .is_ok());
+}
+
 // ---- Replay (AC #4) ----
 
 #[tokio::test]
@@ -367,6 +396,33 @@ async fn a_replayed_jti_is_refused_and_a_mismatch_does_not_consume_it() {
         Some(RefusalReason::Replayed)
     );
     assert_eq!(verifier.replay_set().len(), 1);
+}
+
+#[tokio::test]
+async fn a_token_past_its_exp_but_inside_the_skew_is_accepted_once_and_never_twice() {
+    // The library accepts `exp` up to the skew in the past. An entry
+    // purged at the bare `exp` was gone again at the next call, so
+    // every presentation inside that minute read as the first.
+    let key = TestKey::generate("k1");
+    let issuer = MockIssuer::serving(&[&key]);
+    let verifier = OidcVerifier::new(issuer.clone());
+    let real_now = Utc::now().timestamp();
+    let mut late = claims();
+    late["iat"] = serde_json::json!(real_now - 300);
+    late["nbf"] = serde_json::json!(real_now - 300);
+    late["exp"] = serde_json::json!(real_now - 30);
+    let token = key.sign(&late);
+
+    assert!(
+        verify(&verifier, &token, &[entry()], now()).await.is_ok(),
+        "inside the skew"
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            verify(&verifier, &token, &[entry()], now()).await.err(),
+            Some(RefusalReason::Replayed)
+        );
+    }
 }
 
 #[tokio::test]
@@ -397,11 +453,16 @@ async fn a_full_replay_set_evicts_the_earliest_expiry_and_counts_it() {
             - before,
         1
     );
-    // The evicted id is replayable again: that is the window the
-    // counter reports, and why a silent eviction is not acceptable.
-    assert!(verify(&verifier, &soonest_token, &[entry()], now())
-        .await
-        .is_ok());
+    // The evicted id expires before every id the full set holds, so
+    // remembering it again would evict it at once: it is refused
+    // rather than admitted with its replay open. An evicted id that
+    // outlives the earliest one left is the window the counter reports.
+    assert_eq!(
+        verify(&verifier, &soonest_token, &[entry()], now())
+            .await
+            .err(),
+        Some(RefusalReason::ReplaySetFull)
+    );
 }
 
 // ---- The two refresh triggers (IV5, IV2) ----

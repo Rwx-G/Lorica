@@ -9,22 +9,22 @@
 > banner ; it was refreshed during the v1.8.0 cycle.
 >
 > **What is true today.** The configuration database holds 34 tables
-> and its schema version is 61. Captured traffic is not one of them: a
+> and its schema version is 62. Captured traffic is not one of them: a
 > capture rule is a row, the captured bodies are files on disk.
 >
 > ## Where the migrations actually live
 >
 > The authoritative list is the `MIGRATIONS` constant in
 > `lorica-config/src/store/mod.rs`: a slice of `(version, fn)` pairs,
-> 1 through 60 in ascending order, applied by
+> 1 through 62 in ascending order, applied by
 > `ConfigStore::run_migrations`. Start there. It is the only place that
 > enumerates the whole history.
 >
 > **`lorica-config/src/migrations/` is not that list.** The directory
 > holds 18 `.sql` batch files and they cover schema versions 1-16, 19
-> and 21 only. Every other version (17, 18, 20, and 22 through 60) is a
+> and 21 only. Every other version (17, 18, 20, and 22 through 62) is a
 > Rust function in `store/mod.rs` carrying its DDL inline. A reader who
-> follows the directory alone sees 18 of the 60 migrations and misses
+> follows the directory alone sees 18 of the 62 migrations and misses
 > every table added since v1.6.0. The filenames also drift from the
 > version numbers past 16: `017_acme_method.sql` is version 19 and
 > `019_sessions.sql` is version 21, and no `018_*.sql` exists.
@@ -71,11 +71,17 @@
 >   `cluster_state`, `cluster_ca`, `cluster_nodes`,
 >   `cluster_join_tokens`, `cluster_revoked_serials`,
 >   `cluster_identity`, `cluster_secrets`, `cluster_replica`.
-> - v1.8.0 (migrations 56-60, capture and CI automation):
+> - v1.8.0 (migrations 56-61, capture and CI automation):
 >   `capture_rules`, `api_tokens`, `automation_environments`,
 >   `oidc_issuers` (plus its `ca_pem` column at 60). Routes and
->   backends gained `managed_by`, and `CANONICAL_FORMAT_VERSION`
->   became 2.
+>   backends gained `managed_by`, routes `waf_body_scan_max_bytes`
+>   (61), and `CANONICAL_FORMAT_VERSION` became 2.
+> - v1.9.0 (migration 62): no table, no column, no row. It exists for
+>   the schema version alone: `downstream_idle_timeout_s` joined the
+>   replicated settings blob,
+>   and a follower behind on schema is refused at the handshake rather
+>   than handed a field it cannot decode. `CANONICAL_FORMAT_VERSION`
+>   stays 2 (the reason is on `CANONICAL_SHAPE_DIGEST`).
 >
 > The `Route` table grew from 9 columns to 30+ (basic-auth,
 > stale-while-revalidate, rate-limit struct, geoip, mTLS, forward-auth,

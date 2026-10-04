@@ -577,6 +577,249 @@ fn generate_request_id() -> String {
     format!("{hi:016x}{lo:016x}")
 }
 
+/// What `request_body_filter` returns once it has answered a request
+/// itself, so the upstream leg is dropped mid-body instead of ended.
+///
+/// A streamed body is forwarded as it arrives, so the upstream already
+/// holds part of it when a refusal is decided: the chunked
+/// `max_request_body_bytes` 413 on a body the WAF does not hold (see
+/// [`WafBodyHold`]). Setting the body to `None` would end it: on a
+/// chunked upstream the proxy then writes the terminating chunk, and
+/// the origin receives the bytes forwarded so far as a complete,
+/// well-formed request. An error instead abandons the upstream
+/// connection without that chunk, and an origin discards a request
+/// whose body never completes.
+///
+/// A held body is refused before the upstream is dialled, inside
+/// `request_filter`, which turns this error back into "answered" (see
+/// [`LoricaProxy::hold_body_until_verdict`]).
+///
+/// The source is `Downstream` because the client's request caused the
+/// refusal: it must not count against the backend in the circuit
+/// breaker. `fail_to_proxy` keeps the response already written.
+fn refused_mid_body(status: u16) -> Box<Error> {
+    Error::explain(
+        ErrorType::HTTPStatus(status),
+        "request refused while its body was being forwarded",
+    )
+    .into_down()
+}
+
+/// Where a request body stands between the client and the upstream
+/// while the WAF has not ruled on it.
+///
+/// In Blocking mode a body the engine can parse is read in full inside
+/// `request_filter`, before the upstream is dialled, and handed over
+/// only once the scan has passed. A refused body therefore reaches no
+/// backend at all, not even as an incomplete request. The memory this
+/// takes is the scan buffer itself, which already holds every byte of
+/// such a body: the scan window caps it (past it, 413) and the
+/// node-wide scan budget accounts for it. Detection mode, a body the
+/// engine cannot parse, and a route without the WAF stream as before.
+pub enum WafBodyHold {
+    /// The body is forwarded to the upstream as it arrives.
+    Streaming,
+    /// `request_filter` is reading the body ahead of the upstream leg.
+    Reading,
+    /// The read is over and the upstream is owed `owed` ahead of
+    /// anything the proxy reads from the client itself: the whole body
+    /// once the scan passed, or, when the node-wide scan budget refused
+    /// the body mid-read, the bytes read until then, after which the
+    /// rest streams unscanned as it does on every other fail-open path.
+    ///
+    /// Kept for the whole request because each upstream attempt sends
+    /// it again: `upstream_request_filter` raises `replay_due` once per
+    /// attempt and the first `request_body_filter` call of that attempt
+    /// lowers it.
+    Released {
+        owed: bytes::Bytes,
+        replay_due: bool,
+    },
+}
+
+/// Whether this request's body is held until the WAF has ruled on it:
+/// Blocking mode, a body the engine will scan, and a body to read.
+/// An upgrade request is left alone, its body is a tunnel.
+fn body_hold_applies(session: &mut Session, ctx: &RequestCtx) -> bool {
+    ctx.waf_body_inspect
+        && ctx
+            .route_snapshot
+            .as_ref()
+            .is_some_and(|r| matches!(r.waf_mode, WafMode::Blocking))
+        && !session.as_mut().is_body_empty()
+        && !session.is_upgrade_req()
+}
+
+/// How long a held body may take to arrive: each read waits at most the
+/// first value, the whole body at most the second.
+///
+/// The gap is `downstream_idle_timeout_s`: a client that sends nothing for
+/// that long is idle, whether between requests or inside one. The total is
+/// the route's upstream `read_timeout_s`, which is the time a body that
+/// streams has to arrive: the proxy reads the backend's response while it
+/// forwards the body, a backend sends nothing before the body is complete,
+/// and that read gives up after `read_timeout_s`. Holding the body
+/// therefore leaves a client the same time it had when the body streamed,
+/// and an operator who raises the route's timeout for a slow backend
+/// raises both together. A zero or negative stored value reads as one
+/// second, so no value leaves the hold unbounded.
+fn body_hold_bounds(downstream_idle_timeout_s: u32, read_timeout_s: i32) -> (Duration, Duration) {
+    let gap = Duration::from_secs(u64::from(downstream_idle_timeout_s.max(1)));
+    let total = Duration::from_secs(u64::try_from(read_timeout_s).unwrap_or(0).max(1));
+    (gap, total)
+}
+
+/// `owed` followed by whatever `body` carries.
+fn prepend_owed(body: &mut Option<bytes::Bytes>, owed: bytes::Bytes) {
+    if owed.is_empty() {
+        return;
+    }
+    *body = Some(match body.take() {
+        Some(rest) if !rest.is_empty() => {
+            let mut joined = bytes::BytesMut::with_capacity(owed.len() + rest.len());
+            joined.extend_from_slice(&owed);
+            joined.extend_from_slice(&rest);
+            joined.freeze()
+        }
+        _ => owed,
+    });
+}
+
+impl LoricaProxy {
+    /// Reads a Blocking-mode inspectable body in full before the
+    /// upstream is dialled, through `request_body_filter`, so every
+    /// limit, the scan and every refusal apply exactly as they do to a
+    /// streamed body. Returns `Ok(true)` when a refusal answered the
+    /// request, `Ok(false)` to proxy it. See [`WafBodyHold`].
+    ///
+    /// A client that sent `Expect: 100-continue` waits for a go-ahead
+    /// before sending the body, and the upstream that would normally
+    /// give it is not contacted yet, so the proxy answers `100
+    /// Continue` itself and `upstream_request_filter` strips the
+    /// header from the upstream request.
+    ///
+    /// The read is bounded (see [`body_hold_bounds`]): a body that stops
+    /// arriving, or arrives too slowly, is answered `408` and its
+    /// connection closed, with no upstream contacted.
+    async fn hold_body_until_verdict(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+    ) -> Result<bool> {
+        if !body_hold_applies(session, ctx) {
+            return Ok(false);
+        }
+        if lorica_core::protocols::http::v1::common::is_expect_continue_req(session.req_header()) {
+            let go_ahead = ResponseHeader::build(100, None)?;
+            session
+                .write_response_header(Box::new(go_ahead), false)
+                .await?;
+        }
+        let (gap, total) = body_hold_bounds(
+            self.config.load().downstream_idle_timeout_s,
+            ctx.route_snapshot
+                .as_ref()
+                .map_or(0, |route| route.read_timeout_s),
+        );
+        let deadline = Instant::now() + total;
+        ctx.waf_body_hold = WafBodyHold::Reading;
+        loop {
+            let wait = gap.min(deadline.saturating_duration_since(Instant::now()));
+            let read =
+                tokio::time::timeout(wait, session.downstream_session.read_request_body()).await;
+            let mut chunk = match read {
+                Ok(Ok(chunk)) => chunk,
+                // The session's own read timeout (HTTP/1.1) is the same
+                // stall seen from below.
+                Ok(Err(e)) if matches!(e.etype(), ErrorType::ReadTimedout) => {
+                    return self.refuse_stalled_body(session, ctx, gap, total).await;
+                }
+                Ok(Err(e)) => return Err(e.into_down()),
+                Err(_) => return self.refuse_stalled_body(session, ctx, gap, total).await,
+            };
+            let end_of_stream = chunk.is_none() || session.is_body_done();
+            session
+                .downstream_modules_ctx
+                .request_body_filter(&mut chunk, end_of_stream)
+                .await?;
+            if let Err(e) = self
+                .request_body_filter(session, &mut chunk, end_of_stream, ctx)
+                .await
+            {
+                // A refusal has written a final response: the request
+                // is answered and no upstream was dialled for it.
+                let answered = session
+                    .response_written()
+                    .is_some_and(|r| !r.status.is_informational());
+                return if answered { Ok(true) } else { Err(e) };
+            }
+            if matches!(ctx.waf_body_hold, WafBodyHold::Reading) {
+                if !end_of_stream {
+                    continue;
+                }
+                let owed = ctx
+                    .waf_body_buffer
+                    .take()
+                    .map(bytes::Bytes::from)
+                    .unwrap_or_default();
+                ctx.waf_body_hold = WafBodyHold::Released {
+                    owed,
+                    replay_due: false,
+                };
+                return Ok(false);
+            }
+            // The scan budget refused this chunk: the filter released
+            // the prefix it held, this chunk follows it, and the rest of
+            // the body streams.
+            if let (WafBodyHold::Released { owed, .. }, Some(chunk)) =
+                (&mut ctx.waf_body_hold, chunk)
+            {
+                let mut joined = Some(chunk);
+                prepend_owed(&mut joined, std::mem::take(owed));
+                *owed = joined.unwrap_or_default();
+            }
+            return Ok(false);
+        }
+    }
+
+    /// Answers a held body that did not arrive in time with `408` and
+    /// closes the connection (RFC 9110 section 15.5.9): the rest of the
+    /// body was never read, so the connection cannot carry another request.
+    async fn refuse_stalled_body(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        gap: Duration,
+        total: Duration,
+    ) -> Result<bool> {
+        warn!(
+            route_id = ctx.route_snapshot.as_ref().map_or("-", |r| r.id.as_str()),
+            request_id = %ctx.request_id,
+            body_bytes_received = ctx.body_bytes_received,
+            gap_s = gap.as_secs(),
+            total_s = total.as_secs(),
+            "request body held for the WAF did not arrive in time (408)"
+        );
+        ctx.block_reason = Some("request body timeout".to_string());
+        ctx.waf_body_buffer = None;
+        ctx.waf_body_reservation = None;
+        session.set_keepalive(None);
+        let error_page_html = ctx
+            .route_snapshot
+            .as_ref()
+            .and_then(|r| r.error_page_html.clone());
+        self.write_error_response(
+            session,
+            408,
+            &ctx.request_id,
+            error_page_html.as_deref(),
+            "Request body took too long",
+            &[],
+        )
+        .await
+    }
+}
+
 /// Escape HTML special characters to prevent XSS when injecting dynamic values
 /// into HTML templates (e.g. error pages).
 fn escape_html(s: &str) -> String {
@@ -600,6 +843,27 @@ impl ProxyHttp for LoricaProxy {
         // gRPC-Web bridge: transparently converts HTTP/1.1 gRPC-web requests
         // (application/grpc-web) to HTTP/2 gRPC for the upstream backend.
         modules.add_module(Box::new(lorica_core::modules::http::grpc_web::GrpcWeb));
+    }
+
+    /// Backlog #82. Read from the live snapshot, so a settings change
+    /// reaches the next connection and the next HTTP/1.1 reuse after a
+    /// reload, in every worker the snapshot reaches.
+    fn downstream_idle_timeout(&self) -> Option<Duration> {
+        match self.config.load().downstream_idle_timeout_s {
+            0 => None,
+            seconds => Some(Duration::from_secs(u64::from(seconds))),
+        }
+    }
+
+    /// Story 8.10 AC #1, enforced while the header is read: the global
+    /// `header_timeout_s` bounds every HTTP/1.x request header, first byte
+    /// to end of headers, on every route. Read from the live snapshot
+    /// before every request, like the idle timeout. `0` disables it.
+    fn downstream_header_timeout(&self) -> Option<Duration> {
+        match self.config.load().header_timeout_s {
+            0 => None,
+            seconds => Some(Duration::from_secs(u64::from(seconds))),
+        }
     }
 
     fn new_ctx(&self) -> Self::CTX {
@@ -634,6 +898,7 @@ impl ProxyHttp for LoricaProxy {
             waf_body_reservation: None,
             waf_body_scan_skipped_budget: false,
             waf_body_truncated: false,
+            waf_body_hold: WafBodyHold::Streaming,
             sticky_backend_id: None,
             forward_auth_inject: Vec::new(),
             ai_bot_inject: Vec::new(),
@@ -1001,22 +1266,33 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(handled);
             }
 
-            // Per-route max connections enforcement
-            if let Some(handled) = self
-                .check_route_connection_limit(session, ctx, entry)
-                .await?
-            {
-                return Ok(handled);
-            }
-
             // Request body size limit + WAF body-scan cap (advertised CL)
             if let Some(handled) = self.check_body_limits(session, ctx, entry).await? {
                 return Ok(handled);
             }
 
-            // WAF evaluation over path / query / headers (terminal stage)
-            self.evaluate_waf_request(session, ctx, entry, check_ip.as_deref(), is_whitelisted)
-                .await
+            // WAF evaluation over path / query / headers
+            if self
+                .evaluate_waf_request(session, ctx, entry, check_ip.as_deref(), is_whitelisted)
+                .await?
+            {
+                return Ok(true);
+            }
+
+            // Blocking-mode body hold: the body is read and scanned before
+            // the upstream is dialled
+            if self.hold_body_until_verdict(session, ctx).await? {
+                return Ok(true);
+            }
+
+            // Per-route max connections enforcement (terminal stage). Last,
+            // so the slot is taken only by a request about to be proxied:
+            // a client holding a body back, or refused on any stage above,
+            // never occupies one.
+            Ok(self
+                .check_route_connection_limit(session, ctx, entry)
+                .await?
+                .unwrap_or(false))
         }
         .instrument(span)
         .await
@@ -1043,6 +1319,15 @@ impl ProxyHttp for LoricaProxy {
     /// Steps 2 and 3 are skipped entirely for a body the engine
     /// cannot parse: no buffer, no cap, no scan, and the route's
     /// `max_request_body_bytes` in step 1 is the only ceiling left.
+    ///
+    /// Every refusal here writes its response and then returns
+    /// [`refused_mid_body`], never `Ok` with the body cleared: the
+    /// upstream must see the request cut off, not completed.
+    ///
+    /// A Blocking-mode body the engine scans runs through here inside
+    /// `request_filter`, before the upstream is dialled
+    /// ([`WafBodyHold`]); the proxy's own first call of each upstream
+    /// attempt then hands over the bytes owed, ahead of its own chunk.
     async fn request_body_filter(
         &self,
         session: &mut Session,
@@ -1053,6 +1338,14 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
+        let owed = match &mut ctx.waf_body_hold {
+            WafBodyHold::Released { owed, replay_due } if *replay_due => {
+                *replay_due = false;
+                Some(owed.clone())
+            }
+            _ => None,
+        };
+
         if let Some(ref chunk) = body {
             ctx.body_bytes_received += chunk.len() as u64;
 
@@ -1074,8 +1367,7 @@ impl ProxyHttp for LoricaProxy {
                     session
                         .write_response_header(Box::new(header), true)
                         .await?;
-                    *body = None;
-                    return Ok(());
+                    return Err(refused_mid_body(413));
                 }
             }
 
@@ -1120,8 +1412,7 @@ impl ProxyHttp for LoricaProxy {
                         session
                             .write_response_header(Box::new(header), true)
                             .await?;
-                        *body = None;
-                        return Ok(());
+                        return Err(refused_mid_body(413));
                     }
                     WafMode::Detection => {
                         let observed = ctx.body_bytes_received;
@@ -1178,10 +1469,20 @@ impl ProxyHttp for LoricaProxy {
                         // Nothing further is buffered, measured or
                         // scanned for this request, in either WAF
                         // mode. Dropping the reservation returns the
-                        // prefix it had already taken.
+                        // prefix it had already taken, unless that
+                        // prefix was held back from the upstream: the
+                        // upstream is still owed it, and the bytes
+                        // stay reserved for as long as they are held.
                         ctx.waf_body_inspect = false;
-                        ctx.waf_body_buffer = None;
-                        ctx.waf_body_reservation = None;
+                        let prefix = ctx.waf_body_buffer.take();
+                        if matches!(ctx.waf_body_hold, WafBodyHold::Reading) {
+                            ctx.waf_body_hold = WafBodyHold::Released {
+                                owed: prefix.map(bytes::Bytes::from).unwrap_or_default(),
+                                replay_due: false,
+                            };
+                        } else {
+                            ctx.waf_body_reservation = None;
+                        }
                     }
                 }
             }
@@ -1219,47 +1520,6 @@ impl ProxyHttp for LoricaProxy {
                         MirrorBodyState::Overflowed => {
                             ctx.mirror_body_state = Some(MirrorBodyState::Overflowed);
                         }
-                    }
-                }
-            }
-        }
-
-        // End of stream: fire the mirror sub-request with the buffered
-        // body (or skip it on overflow). Must happen regardless of
-        // WAF status - WAF may allow the request while the mirror has
-        // overflowed, or vice versa.
-        if end_of_stream {
-            if let (Some(pending), Some(body_state)) =
-                (ctx.mirror_pending.take(), ctx.mirror_body_state.take())
-            {
-                match body_state {
-                    MirrorBodyState::Active(buf) => {
-                        let mirror_caps = {
-                            let cfg = self.config.load();
-                            (
-                                cfg.mirror_max_concurrent_per_route,
-                                cfg.mirror_max_concurrent_global,
-                            )
-                        };
-                        spawn_mirrors(
-                            &pending.cfg,
-                            &pending.backends,
-                            pending.method,
-                            pending.path_and_query,
-                            pending.headers,
-                            Some(buf),
-                            pending.request_id,
-                            pending.route_id,
-                            mirror_caps,
-                        );
-                    }
-                    MirrorBodyState::Overflowed => {
-                        // Buffer exceeded max_body_bytes: skip silently.
-                        // Already logged at overflow time.
-                        lorica_api::metrics::inc_mirror_outcome(
-                            &pending.route_id,
-                            "dropped_oversize_body",
-                        );
                     }
                 }
             }
@@ -1319,8 +1579,7 @@ impl ProxyHttp for LoricaProxy {
                                 &[],
                             )
                             .await?;
-                            *body = None;
-                            return Ok(());
+                            return Err(refused_mid_body(403));
                         }
                         lorica_waf::WafVerdict::Detected(ref mut events) => {
                             for ev in events.iter_mut() {
@@ -1345,6 +1604,52 @@ impl ProxyHttp for LoricaProxy {
                     }
                 }
             }
+        }
+
+        // End of stream: fire the mirror sub-request with the buffered
+        // body (or skip it on overflow). After the WAF verdict, so a
+        // body the WAF refused never reaches the shadow backend either;
+        // otherwise regardless of WAF status - WAF may allow the request
+        // while the mirror has overflowed, or vice versa.
+        if end_of_stream {
+            if let (Some(pending), Some(body_state)) =
+                (ctx.mirror_pending.take(), ctx.mirror_body_state.take())
+            {
+                match body_state {
+                    MirrorBodyState::Active(buf) => {
+                        let mirror_caps = {
+                            let cfg = self.config.load();
+                            (
+                                cfg.mirror_max_concurrent_per_route,
+                                cfg.mirror_max_concurrent_global,
+                            )
+                        };
+                        spawn_mirrors(
+                            &pending.cfg,
+                            &pending.backends,
+                            pending.method,
+                            pending.path_and_query,
+                            pending.headers,
+                            Some(buf),
+                            pending.request_id,
+                            pending.route_id,
+                            mirror_caps,
+                        );
+                    }
+                    MirrorBodyState::Overflowed => {
+                        // Buffer exceeded max_body_bytes: skip silently.
+                        // Already logged at overflow time.
+                        lorica_api::metrics::inc_mirror_outcome(
+                            &pending.route_id,
+                            "dropped_oversize_body",
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(owed) = owed {
+            prepend_owed(body, owed);
         }
 
         Ok(())
@@ -1584,6 +1889,17 @@ impl ProxyHttp for LoricaProxy {
         allowed
     }
 
+    /// Keeps a refusal decided in `request_body_filter` out of the
+    /// error-level "Fail to proxy" line. The refusal is the proxy doing
+    /// its job, it is already logged at its decision site and in the
+    /// access log, and an error line per refused request would let any
+    /// client write to the error log at will. The match is the shape
+    /// `refused_mid_body` builds: an `HTTPStatus` error sourced downstream.
+    fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, error: &Error) -> bool {
+        matches!(error.etype(), ErrorType::HTTPStatus(_))
+            && error.esource() == &ErrorSource::Downstream
+    }
+
     /// Serve custom error pages when the upstream fails.
     ///
     /// If the route has an `error_page_html` configured, render it with the
@@ -1605,6 +1921,22 @@ impl ProxyHttp for LoricaProxy {
         e: &Error,
         ctx: &mut Self::CTX,
     ) -> FailToProxy {
+        // A filter that answered the request itself and then aborted the
+        // upstream leg (`refused_mid_body`) lands here with its response
+        // already on the wire. A second header is refused by the session,
+        // but the error page body after it would be appended to the
+        // finished response and corrupt the stream. An informational
+        // header other than 101 is not a final response, so an error page
+        // still follows one, as `write_error_response` in lorica-core rules.
+        if let Some(written) = session.response_written() {
+            if !written.status.is_informational() || written.status == 101 {
+                return FailToProxy {
+                    error_code: written.status.as_u16(),
+                    can_reuse_downstream: false,
+                };
+            }
+        }
+
         let code = match e.etype() {
             ErrorType::HTTPStatus(code) => *code,
             _ => match e.esource() {
@@ -1921,6 +2253,15 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // A body read ahead of the upstream leg is owed to every
+        // attempt, a retry included. The client's `Expect:
+        // 100-continue` was answered by the proxy and the body is in
+        // hand, so the upstream is not asked for a go-ahead of its own.
+        if let WafBodyHold::Released { replay_due, .. } = &mut ctx.waf_body_hold {
+            *replay_due = true;
+            upstream_request.remove_header(&http::header::EXPECT);
+        }
+
         let route = match ctx.route_snapshot {
             Some(ref r) => r,
             None => return Ok(()),
