@@ -2,7 +2,7 @@
 
 **Author:** Romain G.
 **Target version:** 1.8.0
-**Status:** Draft (2026-09-08, written after a prior-art study of Envoy, Caddy, HAProxy, Kong, APISIX, nginx, Traefik and the GitLab Review Apps pattern, and after a code walk of the seams each story reuses)
+**Status:** Shipped in v1.8.0 (2026-09-18). Drafted 2026-09-08, after a prior-art study of Envoy, Caddy, HAProxy, Kong, APISIX, nginx, Traefik and the GitLab Review Apps pattern, and after a code walk of the seams each story reuses; all seven stories Done, QA record in `docs/qa/epic-10-report.md`, release notes in the `[1.8.0]` section of `CHANGELOG.md`.
 
 **Epic Goal:** Two operator needs that today require either a packet sniffer on the box or a human in the dashboard. First, **conditional request capture**: an operator declares "on this route, for this source range, when the response is a 5xx, keep the full request and response for the logs", and Lorica does it with bounded memory, a time limit, and secrets redacted. Second, a **CI automation API**: a GitLab pipeline that has just deployed a review environment creates or updates a Lorica route, its backend and its certificate binding in one authenticated call, gets a public URL back, and tears it down from its `on_stop` job, with Lorica reaping whatever the pipeline forgot.
 

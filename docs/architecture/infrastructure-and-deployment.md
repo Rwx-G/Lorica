@@ -17,6 +17,7 @@
 - systemd service file (`lorica.service`) with security hardening directives
 - Data directory: `/var/lib/lorica/` (SQLite database, runtime state)
 - Log output: stdout captured by systemd journal
+- Second binary (v1.9.0): `lorica-mcp`, the management MCP server, installed at `/usr/bin/lorica-mcp` by the `.deb` and the `.rpm`, carried by the production Docker image and published as a standalone release binary. No systemd unit starts it: an operator's MCP client launches it per session over stdio, and CI fails a package that lacks it or a unit that starts it. Its remote transport needs no deployment of its own, being a path on the automation listener (`--automation-listen`, off by default). See `docs/mcp.md`
 
 **Pipeline Integration:**
 - GitHub Actions for CI (cargo test, cargo clippy, cargo fmt --check)

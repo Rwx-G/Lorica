@@ -214,7 +214,7 @@ belongs to the maintainer.
 
 | AC | Result |
 |---|---|
-| #1 short list by exclusion | Met. Nine keys: the access-log, WAF-event and SLA retentions (raise-only, never 0, under a ceiling of ten times the default), the two certificate alert thresholds, the WAF auto-ban threshold and duration (at most a day), the health-check interval (5 to 60 s) and probe budget |
+| #1 short list by exclusion | Met. Nine keys: the access-log and WAF-event retentions (raise-only, never 0, under a ceiling of ten times the default, 1,000,000 rows) and the SLA retention (raise-only, at most 3650 days), the two certificate alert thresholds, the WAF auto-ban threshold and duration (at most a day), the health-check interval (5 to 60 s) and probe budget |
 | #2 cluster mutations out | Met. Users, roles, tokens, OIDC issuers, nodes, enrolment, fleet bans, `leave` and break-glass are declared for no token on any verb, by a test derived from the management route table |
 | #3 reversible from the dashboard | Met. Every key is an editable field of the settings form, which a test reads |
 | #4 audit, docs, hardening guide | Met. The audit row records `key:old->new` |

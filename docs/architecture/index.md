@@ -33,3 +33,7 @@ This document supplements the Pingora framework architecture by defining how new
 - [Worker Shared State](./worker-shared-state.md)
 - [Bot Protection](./bot-protection.md)
 - [Certificate Resolver](./cert-resolver.md)
+
+### Planes added after the v1.0 blueprint
+
+- Cluster plane (v1.7.0), automation plane (v1.8.0) and the management MCP server on top of it (v1.9.0): placed in [Component Architecture](./component-architecture.md) and [API Design and Integration](./api-design-and-integration.md), with their security controls summarised in [Security Integration](./security-integration.md). The user-facing references are `docs/cluster.md`, `docs/automation.md` and `docs/mcp.md`.
