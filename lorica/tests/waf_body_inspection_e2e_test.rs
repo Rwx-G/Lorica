@@ -61,6 +61,7 @@ use lorica_config::models::*;
 use lorica_core::server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 const SCAN_WINDOW: usize = 1_048_576;
 const ROUTE_BODY_LIMIT: u64 = 8 * 1_048_576;
@@ -69,9 +70,25 @@ const ROUTE_BODY_LIMIT: u64 = 8 * 1_048_576;
 // Origin that counts the body bytes it receives, de-chunking when needed.
 // ---------------------------------------------------------------------------
 
-async fn spawn_body_counting_origin() -> (SocketAddr, Arc<AtomicU64>) {
+/// What one upstream connection carried, reported once the origin has
+/// stopped reading it.
+#[derive(Debug)]
+struct UpstreamRequest {
+    payload_bytes: u64,
+    /// The body ended on its own framing: the terminating chunk, or the
+    /// last byte of the advertised `Content-Length`. An origin only acts
+    /// on a request that completes; one cut off mid-body is discarded.
+    complete: bool,
+}
+
+async fn spawn_body_counting_origin() -> (
+    SocketAddr,
+    Arc<AtomicU64>,
+    mpsc::UnboundedReceiver<UpstreamRequest>,
+) {
     let received = Arc::new(AtomicU64::new(0));
     let received_c = Arc::clone(&received);
+    let (requests_tx, requests_rx) = mpsc::unbounded_channel();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -81,6 +98,7 @@ async fn spawn_body_counting_origin() -> (SocketAddr, Arc<AtomicU64>) {
                 Err(_) => return,
             };
             let received = Arc::clone(&received_c);
+            let requests_tx = requests_tx.clone();
             tokio::spawn(async move {
                 let mut buf: Vec<u8> = Vec::new();
                 let mut scratch = [0u8; 16384];
@@ -98,7 +116,7 @@ async fn spawn_body_counting_origin() -> (SocketAddr, Arc<AtomicU64>) {
                 let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
                 let body_so_far = buf.split_off(header_end);
 
-                let counted = if headers.contains("transfer-encoding: chunked") {
+                let request = if headers.contains("transfer-encoding: chunked") {
                     read_chunked_body(&mut stream, body_so_far).await
                 } else {
                     let want = headers
@@ -110,21 +128,26 @@ async fn spawn_body_counting_origin() -> (SocketAddr, Arc<AtomicU64>) {
                     read_sized_body(&mut stream, body_so_far, want).await
                 };
 
-                received.fetch_add(counted as u64, Ordering::SeqCst);
+                received.fetch_add(request.payload_bytes, Ordering::SeqCst);
+                let complete = request.complete;
+                let _ = requests_tx.send(request);
+                if !complete {
+                    return;
+                }
                 let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                 let _ = stream.write_all(resp.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
         }
     });
-    (addr, received)
+    (addr, received, requests_rx)
 }
 
 async fn read_sized_body(
     stream: &mut tokio::net::TcpStream,
     already: Vec<u8>,
     want: usize,
-) -> usize {
+) -> UpstreamRequest {
     let mut have = already.len();
     let mut scratch = [0u8; 16384];
     while have < want {
@@ -133,16 +156,28 @@ async fn read_sized_body(
             Ok(n) => have += n,
         }
     }
-    have
+    UpstreamRequest {
+        payload_bytes: have as u64,
+        complete: have >= want,
+    }
 }
 
 /// Counts payload bytes only, so the assertion compares like for like
-/// with what the client sent whichever framing the proxy chose.
-async fn read_chunked_body(stream: &mut tokio::net::TcpStream, already: Vec<u8>) -> usize {
+/// with what the client sent whichever framing the proxy chose. Only
+/// whole chunks count, so a body cut off mid-chunk reports the bytes
+/// that actually arrived rather than the size its last header promised.
+async fn read_chunked_body(
+    stream: &mut tokio::net::TcpStream,
+    already: Vec<u8>,
+) -> UpstreamRequest {
     let mut buf = already;
     let mut scratch = [0u8; 16384];
-    let mut payload = 0usize;
+    let mut payload = 0u64;
     let mut cursor = 0usize;
+    let cut_off = |payload_bytes| UpstreamRequest {
+        payload_bytes,
+        complete: false,
+    };
     loop {
         // One chunk header per iteration: `<hex size>\r\n`.
         let line_end = loop {
@@ -150,7 +185,7 @@ async fn read_chunked_body(stream: &mut tokio::net::TcpStream, already: Vec<u8>)
                 break cursor + pos;
             }
             match stream.read(&mut scratch).await {
-                Ok(0) | Err(_) => return payload,
+                Ok(0) | Err(_) => return cut_off(payload),
                 Ok(n) => buf.extend_from_slice(&scratch[..n]),
             }
         };
@@ -158,19 +193,38 @@ async fn read_chunked_body(stream: &mut tokio::net::TcpStream, already: Vec<u8>)
         let size = usize::from_str_radix(size_hex.trim().split(';').next().unwrap_or("0"), 16)
             .unwrap_or(0);
         if size == 0 {
-            return payload;
+            return UpstreamRequest {
+                payload_bytes: payload,
+                complete: true,
+            };
         }
-        payload += size;
         // Skip the chunk body and its trailing CRLF.
         let chunk_end = line_end + 2 + size + 2;
         while buf.len() < chunk_end {
             match stream.read(&mut scratch).await {
-                Ok(0) | Err(_) => return payload,
+                Ok(0) | Err(_) => return cut_off(payload),
                 Ok(n) => buf.extend_from_slice(&scratch[..n]),
             }
         }
+        payload += size as u64;
         cursor = chunk_end;
     }
+}
+
+/// The next request the origin finished reading, however it ended.
+///
+/// This is the synchronisation point the byte counter cannot give: the
+/// origin reports a request only once it has stopped reading it, so an
+/// assertion made after this returns no longer races the proxy's
+/// upstream leg. The timeout bounds a hang, it is not a wait for a
+/// condition to settle.
+async fn next_upstream_request(
+    requests: &mut mpsc::UnboundedReceiver<UpstreamRequest>,
+) -> UpstreamRequest {
+    tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the origin never finished reading an upstream request")
+        .expect("the origin stopped accepting connections")
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +479,18 @@ fn test_backend(id: &str, addr: SocketAddr) -> Backend {
 }
 
 async fn harness(mode: WafMode) -> (ProxyHarness, Arc<AtomicU64>) {
-    let (origin, received) = spawn_body_counting_origin().await;
+    let (harness, received, _requests) = harness_observing_upstream(mode).await;
+    (harness, received)
+}
+
+async fn harness_observing_upstream(
+    mode: WafMode,
+) -> (
+    ProxyHarness,
+    Arc<AtomicU64>,
+    mpsc::UnboundedReceiver<UpstreamRequest>,
+) {
+    let (origin, received, requests) = spawn_body_counting_origin().await;
     let route = waf_route(mode);
     let backends = vec![test_backend("b-primary", origin)];
     let links = vec![("r-waf-body".into(), "b-primary".into())];
@@ -437,7 +502,7 @@ async fn harness(mode: WafMode) -> (ProxyHarness, Arc<AtomicU64>) {
         ProxyConfigGlobals::default(),
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
-    (harness, received)
+    (harness, received, requests)
 }
 
 /// Bytes the widened route admits, well past what its scan cap does, so
@@ -476,7 +541,18 @@ fn wide_scan_route(mode: WafMode) -> Route {
 }
 
 async fn harness_with_wide_route(mode: WafMode) -> (ProxyHarness, Arc<AtomicU64>) {
-    let (origin, received) = spawn_body_counting_origin().await;
+    let (harness, received, _requests) = harness_with_wide_route_observing_upstream(mode).await;
+    (harness, received)
+}
+
+async fn harness_with_wide_route_observing_upstream(
+    mode: WafMode,
+) -> (
+    ProxyHarness,
+    Arc<AtomicU64>,
+    mpsc::UnboundedReceiver<UpstreamRequest>,
+) {
+    let (origin, received, requests) = spawn_body_counting_origin().await;
     let backends = vec![test_backend("b-primary", origin)];
     let links = vec![
         ("r-waf-body".into(), "b-primary".into()),
@@ -490,7 +566,7 @@ async fn harness_with_wide_route(mode: WafMode) -> (ProxyHarness, Arc<AtomicU64>
         ProxyConfigGlobals::default(),
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
-    (harness, received)
+    (harness, received, requests)
 }
 
 fn sized_request_to(port: u16, path: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
@@ -598,7 +674,10 @@ async fn json_past_the_scan_window_is_still_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_payload_in_an_inspectable_body_is_still_blocked() {
-    let (harness, received) = harness(WafMode::Blocking).await;
+    // The scan runs on the body, so the upstream leg is already open
+    // when the verdict is taken. What a block guarantees is that the
+    // origin never holds the request complete.
+    let (harness, _received, mut upstream) = harness_observing_upstream(WafMode::Blocking).await;
 
     let status = send_request(
         harness.port,
@@ -611,10 +690,10 @@ async fn a_payload_in_an_inspectable_body_is_still_blocked() {
     .await;
 
     assert_eq!(status, 403, "the body scan must still fire");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
+    let seen = next_upstream_request(&mut upstream).await;
+    assert!(
+        !seen.complete,
+        "a blocked body must never complete upstream: {seen:?}"
     );
 }
 
@@ -683,7 +762,14 @@ async fn chunked_binary_upload_past_the_scan_window_reaches_the_upstream_whole()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chunked_json_past_the_scan_window_is_still_rejected() {
-    let (harness, received) = harness(WafMode::Blocking).await;
+    // A chunked body is forwarded as it arrives, so the bytes ahead of
+    // the window have left for the upstream by the time the window is
+    // crossed, and "nothing reaches upstream" is not a claim this path
+    // can make. What it must guarantee is that the upstream never holds
+    // a COMPLETE request: the rejection aborts the upstream leg instead
+    // of closing the body with a terminating chunk, which would hand the
+    // origin the unscanned prefix as a well-formed request to act on.
+    let (harness, _received, mut upstream) = harness_observing_upstream(WafMode::Blocking).await;
     let body = vec![b'a'; SCAN_WINDOW + 4096];
 
     let status = send_request(
@@ -693,10 +779,37 @@ async fn chunked_json_past_the_scan_window_is_still_rejected() {
     .await;
 
     assert_eq!(status, 413, "chunked inspectable body keeps the window");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
+    let seen = next_upstream_request(&mut upstream).await;
+    assert!(
+        !seen.complete,
+        "the upstream must see the request cut off, not a truncated body framed as complete: {seen:?}"
+    );
+    assert!(
+        seen.payload_bytes <= SCAN_WINDOW as u64,
+        "nothing past the window follows the rejection: {seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_payload_in_a_chunked_body_never_completes_upstream() {
+    // The end-of-stream half of the same contract. The payload chunk is
+    // forwarded before the terminating chunk tells the proxy the body is
+    // over and the scan can run; a 403 that then closed the upstream
+    // body normally would deliver the payload as a complete request
+    // while the client is told it was blocked.
+    let (harness, _received, mut upstream) = harness_observing_upstream(WafMode::Blocking).await;
+
+    let status = send_request(
+        harness.port,
+        chunked_request(harness.port, "application/json", &sqli_json()),
+    )
+    .await;
+
+    assert_eq!(status, 403, "the body scan must fire on a chunked body");
+    let seen = next_upstream_request(&mut upstream).await;
+    assert!(
+        !seen.complete,
+        "a blocked chunked body must never complete upstream: {seen:?}"
     );
 }
 
@@ -756,7 +869,10 @@ async fn a_raised_scan_window_catches_a_payload_the_default_would_have_missed() 
     // the 1 MiB default this body is rejected without ever being
     // scanned; under the route's 2 MiB window the scan runs the whole
     // way and the payload is found, which is the point of the setting.
-    let (harness, received) = harness_with_wide_route(WafMode::Blocking).await;
+    // The body streams upstream while it is buffered for the scan, so
+    // the claim is that the origin never holds the request complete.
+    let (harness, _received, mut upstream) =
+        harness_with_wide_route_observing_upstream(WafMode::Blocking).await;
     let body = padded_json(OVER_DEFAULT_UNDER_WIDE, PAYLOAD_OFFSET);
 
     let status = send_request(
@@ -766,10 +882,10 @@ async fn a_raised_scan_window_catches_a_payload_the_default_would_have_missed() 
     .await;
 
     assert_eq!(status, 403, "the widened window must scan to the payload");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
+    let seen = next_upstream_request(&mut upstream).await;
+    assert!(
+        !seen.complete,
+        "a blocked body must never complete upstream: {seen:?}"
     );
 }
 
@@ -824,8 +940,10 @@ async fn the_padding_bypass_stays_closed_at_the_raised_window() {
     // on a route whose window is 2 MiB. The padding no longer pushes
     // the body out of the window, so the answer is a scan that finds
     // the payload rather than a 413 that never looked. Either way the
-    // request does not reach the upstream, which is what H-2 requires.
-    let (harness, received) = harness_with_wide_route(WafMode::Blocking).await;
+    // upstream never holds the request complete, which is what H-2
+    // requires.
+    let (harness, _received, mut upstream) =
+        harness_with_wide_route_observing_upstream(WafMode::Blocking).await;
     let body = padded_json(SCAN_WINDOW + sqli_json().len(), SCAN_WINDOW);
 
     let status = send_request(
@@ -835,10 +953,10 @@ async fn the_padding_bypass_stays_closed_at_the_raised_window() {
     .await;
 
     assert_eq!(status, 403, "padding inside the window is scanned through");
-    assert_eq!(
-        received.load(Ordering::SeqCst),
-        0,
-        "nothing reaches upstream"
+    let seen = next_upstream_request(&mut upstream).await;
+    assert!(
+        !seen.complete,
+        "a blocked body must never complete upstream: {seen:?}"
     );
 }
 
@@ -852,20 +970,20 @@ async fn chunked_parity_for_the_raised_window() {
     //
     // The scanned-and-blocked half of the pair is asserted on the
     // Content-Length path instead
-    // (`a_raised_scan_window_catches_a_payload_the_default_would_have_missed`):
-    // a 403 decided at end of stream races the upstream's own response
-    // for the downstream socket, because a chunked body is forwarded
-    // as it arrives. The window check here is the part that is
-    // specific to the streaming path, and it is decided mid-body.
+    // (`a_raised_scan_window_catches_a_payload_the_default_would_have_missed`);
+    // the chunked 403 contract is `a_payload_in_a_chunked_body_never_completes_upstream`.
+    // The window check here is the part that is specific to the
+    // streaming path, and it is decided mid-body.
     //
-    // There is no byte assertion here, and it is worth saying why
-    // rather than leaving the next reader to wonder: a chunked body is
-    // forwarded as it arrives, so the bytes ahead of the window have
-    // already left for the upstream when the window is crossed. What
-    // the 413 guarantees is that the rest does not follow, which is
-    // the audit H-2 stance. The byte-level claim belongs to the
-    // Content-Length cases, where nothing is forwarded at all.
-    let (harness, _origin_bytes) = harness_with_wide_route(WafMode::Blocking).await;
+    // A chunked body is forwarded as it arrives, so the bytes ahead of
+    // the window have already left for the upstream when the window is
+    // crossed, and "nothing reaches upstream" belongs to the
+    // Content-Length 413s, which are decided on the advertised header
+    // before the upstream is dialled. What the 413 guarantees is that the
+    // rest does not follow and that the upstream never sees the request
+    // complete, which is the audit H-2 stance.
+    let (harness, _received, mut upstream) =
+        harness_with_wide_route_observing_upstream(WafMode::Blocking).await;
 
     let oversize = send_request(
         harness.port,
@@ -879,4 +997,13 @@ async fn chunked_parity_for_the_raised_window() {
     .await;
 
     assert_eq!(oversize, 413, "chunked body past the raised window");
+    let seen = next_upstream_request(&mut upstream).await;
+    assert!(
+        !seen.complete,
+        "the upstream must see the request cut off: {seen:?}"
+    );
+    assert!(
+        seen.payload_bytes <= WIDE_SCAN_WINDOW,
+        "nothing past the raised window follows the rejection: {seen:?}"
+    );
 }

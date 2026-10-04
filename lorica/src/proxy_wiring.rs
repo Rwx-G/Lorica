@@ -577,6 +577,29 @@ fn generate_request_id() -> String {
     format!("{hi:016x}{lo:016x}")
 }
 
+/// What `request_body_filter` returns once it has answered a request
+/// itself, so the upstream leg is dropped mid-body instead of ended.
+///
+/// A body is forwarded as it arrives, so the upstream already holds
+/// part of it when a Blocking-mode verdict is taken. Setting the body
+/// to `None` would end it: on a chunked upstream the proxy then writes
+/// the terminating chunk, and the origin receives the bytes forwarded
+/// so far as a complete, well-formed request (the scan window's prefix,
+/// or a whole payload whose 403 was decided at end of stream). An error
+/// instead abandons the upstream connection without that chunk, and an
+/// origin discards a request whose body never completes.
+///
+/// The source is `Downstream` because the client's request caused the
+/// refusal: it must not count against the backend in the circuit
+/// breaker. `fail_to_proxy` keeps the response already written.
+fn refused_mid_body(status: u16) -> Box<Error> {
+    Error::explain(
+        ErrorType::HTTPStatus(status),
+        "request refused while its body was being forwarded",
+    )
+    .into_down()
+}
+
 /// Escape HTML special characters to prevent XSS when injecting dynamic values
 /// into HTML templates (e.g. error pages).
 fn escape_html(s: &str) -> String {
@@ -1043,6 +1066,10 @@ impl ProxyHttp for LoricaProxy {
     /// Steps 2 and 3 are skipped entirely for a body the engine
     /// cannot parse: no buffer, no cap, no scan, and the route's
     /// `max_request_body_bytes` in step 1 is the only ceiling left.
+    ///
+    /// Every refusal here writes its response and then returns
+    /// [`refused_mid_body`], never `Ok` with the body cleared: the
+    /// upstream must see the request cut off, not completed.
     async fn request_body_filter(
         &self,
         session: &mut Session,
@@ -1074,8 +1101,7 @@ impl ProxyHttp for LoricaProxy {
                     session
                         .write_response_header(Box::new(header), true)
                         .await?;
-                    *body = None;
-                    return Ok(());
+                    return Err(refused_mid_body(413));
                 }
             }
 
@@ -1120,8 +1146,7 @@ impl ProxyHttp for LoricaProxy {
                         session
                             .write_response_header(Box::new(header), true)
                             .await?;
-                        *body = None;
-                        return Ok(());
+                        return Err(refused_mid_body(413));
                     }
                     WafMode::Detection => {
                         let observed = ctx.body_bytes_received;
@@ -1319,8 +1344,7 @@ impl ProxyHttp for LoricaProxy {
                                 &[],
                             )
                             .await?;
-                            *body = None;
-                            return Ok(());
+                            return Err(refused_mid_body(403));
                         }
                         lorica_waf::WafVerdict::Detected(ref mut events) => {
                             for ev in events.iter_mut() {
@@ -1584,6 +1608,17 @@ impl ProxyHttp for LoricaProxy {
         allowed
     }
 
+    /// Keeps a refusal decided in `request_body_filter` out of the
+    /// error-level "Fail to proxy" line. The refusal is the proxy doing
+    /// its job, it is already logged at its decision site and in the
+    /// access log, and an error line per refused request would let any
+    /// client write to the error log at will. The match is the shape
+    /// `refused_mid_body` builds: an `HTTPStatus` error sourced downstream.
+    fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, error: &Error) -> bool {
+        matches!(error.etype(), ErrorType::HTTPStatus(_))
+            && error.esource() == &ErrorSource::Downstream
+    }
+
     /// Serve custom error pages when the upstream fails.
     ///
     /// If the route has an `error_page_html` configured, render it with the
@@ -1605,6 +1640,22 @@ impl ProxyHttp for LoricaProxy {
         e: &Error,
         ctx: &mut Self::CTX,
     ) -> FailToProxy {
+        // A filter that answered the request itself and then aborted the
+        // upstream leg (`refused_mid_body`) lands here with its response
+        // already on the wire. A second header is refused by the session,
+        // but the error page body after it would be appended to the
+        // finished response and corrupt the stream. An informational
+        // header other than 101 is not a final response, so an error page
+        // still follows one, as `write_error_response` in lorica-core rules.
+        if let Some(written) = session.response_written() {
+            if !written.status.is_informational() || written.status == 101 {
+                return FailToProxy {
+                    error_code: written.status.as_u16(),
+                    can_reuse_downstream: false,
+                };
+            }
+        }
+
         let code = match e.etype() {
             ErrorType::HTTPStatus(code) => *code,
             _ => match e.esource() {
