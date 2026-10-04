@@ -17,10 +17,11 @@
 //!
 //! The automation plane (Story 10.3) is a second socket with a second
 //! credential, so it has a second document, `openapi-automation.yaml`,
-//! and a second gate below. It reuses every extractor here: the router
-//! is an axum router and the document is an OpenAPI document, so the
-//! two sides are the same shape as the management pair. What it adds
-//! is a scope check, because on that plane the scope a path requires
+//! and a second gate below. Its router side is not scanned: it reads
+//! [`lorica_api::automation::route_table`], the declared table both
+//! automation routers are built from, so the gate does not depend on
+//! how `src/automation/router.rs` is formatted. Its document side reuses
+//! the extractors here. What it adds is a scope check, because on that plane the scope a path requires
 //! is part of the contract an automation reads, and a scope that
 //! drifts from [`lorica_api::automation::required_scope`] is a 403
 //! nobody predicted.
@@ -121,25 +122,18 @@ fn openapi_spec_matches_routes() {
 
 #[test]
 fn automation_openapi_matches_automation_routes() {
-    let router_src: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/automation/router.rs"
-    ));
     let spec_src: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/openapi-automation.yaml"
     ));
 
-    let routes: BTreeSet<(String, String)> = extract_routes(router_src);
+    let routes: BTreeSet<(String, String)> = automation_routes();
     let spec: BTreeSet<(String, String)> = extract_spec_paths(spec_src);
 
     // Same extraction sanity as the management gate: two empty sets
     // compare equal, and a silently broken parser must not read as a
     // clean contract.
-    assert!(
-        !routes.is_empty(),
-        "route extraction looks broken: no (method, path) pair found in src/automation/router.rs"
-    );
+    assert!(!routes.is_empty(), "the automation route table is empty");
     assert!(
         !spec.is_empty(),
         "spec extraction looks broken: no (method, path) pair found in openapi-automation.yaml"
@@ -333,7 +327,7 @@ fn automation_openapi_documents_the_query_vocabulary_the_handlers_reuse() {
 /// handler deserialises (Story 11.2).
 ///
 /// The read side pins what each answer carries
-/// (`AUTOMATION_READ_FIELD_NAMES` in `src/tests.rs`); this is the
+/// (`AUTOMATION_READ_FIELD_NAMES` in `src/automation/read/plane_tests.rs`); this is the
 /// request side of the same contract. Every write on this plane takes
 /// the management model's own body, so a field added to
 /// `CreateRouteRequest` for the dashboard becomes, with no other
@@ -737,57 +731,31 @@ fn nested_field_names(
     }
 }
 
-/// Every non-`GET` `(METHOD, normalised path, handler)` the automation
-/// router mounts, read off the `.route(` calls the way
-/// [`extract_routes`] reads the paths: the handler is the last segment
-/// of the token after each method combinator.
-fn extract_write_routes(src: &str) -> Vec<(String, String, String)> {
-    let mut out = Vec::new();
-    let marker = ".route(";
-    let mut from = 0usize;
-    while let Some(rel) = src[from..].find(marker) {
-        let open_paren = from + rel + marker.len() - 1;
-        let (span, after) = balanced_span(src, open_paren);
-        from = after;
-        let Some(path) = first_string_literal(&span) else {
-            continue;
-        };
-        let normalized = normalize_path(&path);
-        for method in ["post", "put", "delete", "patch"] {
-            for handler in handlers_after_combinator(&span, method) {
-                let name = handler.rsplit("::").next().unwrap_or_default().to_string();
-                out.push((method.to_uppercase(), normalized.clone(), name));
-            }
-        }
-    }
-    out
+/// Every `(METHOD, normalised path)` the automation router mounts,
+/// read off the route table both automation routers are built from.
+fn automation_routes() -> BTreeSet<(String, String)> {
+    lorica_api::automation::route_table()
+        .iter()
+        .map(|route| (route.method.to_string(), normalize_path(route.path)))
+        .collect()
 }
 
-/// The handler tokens a route span applies `method(` to, on a word
-/// boundary, the way [`method_combinators`] finds the method itself.
-fn handlers_after_combinator(span: &str, method: &str) -> Vec<String> {
-    let bytes = span.as_bytes();
-    let mut found = Vec::new();
-    let mut search = 0usize;
-    while let Some(rel) = span[search..].find(method) {
-        let idx = search + rel;
-        let after = idx + method.len();
-        search = after;
-        let boundary_before = idx == 0 || !is_ident_byte(bytes[idx - 1]);
-        let boundary_after = after >= bytes.len() || !is_ident_byte(bytes[after]);
-        if !boundary_before || !boundary_after {
-            continue;
-        }
-        let mut j = after;
-        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
-        if j < bytes.len() && bytes[j] == b'(' {
-            let (inner, _) = balanced_span(span, j);
-            found.push(inner.trim().to_string());
-        }
-    }
-    found
+/// Every non-`GET` `(METHOD, normalised path, handler)` the automation
+/// router mounts, read off the same table: the handler is the last
+/// segment of the Rust path the table records for the function mounted.
+fn automation_write_routes() -> Vec<(String, String, String)> {
+    lorica_api::automation::route_table()
+        .iter()
+        .filter(|route| route.method != http::Method::GET)
+        .map(|route| {
+            let name = route.handler.rsplit("::").next().unwrap_or_default();
+            (
+                route.method.to_string(),
+                normalize_path(route.path),
+                name.to_string(),
+            )
+        })
+        .collect()
 }
 
 /// The type a handler's `Json<...>` extractor deserialises, or `None`
@@ -852,15 +820,10 @@ fn declaring_struct(body_type: &str) -> &str {
 
 #[test]
 fn every_automation_write_accepts_exactly_the_field_names_this_surface_committed_to() {
-    let router_src: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/automation/router.rs"
-    ));
-    let writes = extract_write_routes(router_src);
+    let writes = automation_write_routes();
     assert!(
         writes.len() >= 8,
-        "write-route extraction looks broken: only {} non-GET routes found in \
-         src/automation/router.rs",
+        "only {} non-GET routes in the automation route table",
         writes.len()
     );
 
@@ -1103,10 +1066,6 @@ fn extract_schema_properties(yaml: &str, name: &str) -> BTreeSet<String> {
 #[test]
 fn no_automation_write_accepts_key_material() {
     // Story 11.2 AC #6, asserted three ways rather than promised.
-    let router_src: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/automation/router.rs"
-    ));
     let spec_src: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/openapi-automation.yaml"
@@ -1115,7 +1074,7 @@ fn no_automation_write_accepts_key_material() {
     // 1. The management paths that take a PEM body are mounted on this
     //    listener under no verb, and the matrix declares nothing for
     //    them, so two things refuse them.
-    let mounted = extract_routes(router_src);
+    let mounted = automation_routes();
     for (method, path) in [
         ("POST", "/automation/v1/certificates"),
         ("PUT", "/automation/v1/certificates/{}"),
@@ -1135,7 +1094,7 @@ fn no_automation_write_accepts_key_material() {
 
     // 2. No request struct an automation write deserialises has a
     //    top-level field that could carry key material.
-    let writes = extract_write_routes(router_src);
+    let writes = automation_write_routes();
     let mut structs_checked = 0usize;
     for (method, path, handler) in &writes {
         if path == AUTOMATION_MCP_PATH {
@@ -1395,11 +1354,7 @@ fn every_mcp_write_tool_declares_exactly_the_fields_its_handler_accepts_less_the
     // side moves: a field added to `CreateRouteRequest` for the
     // dashboard is offered to a model by a decision, and a field the
     // tool declares that the handler dropped is a promise nothing keeps.
-    let router_src: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/automation/router.rs"
-    ));
-    let writes = extract_write_routes(router_src);
+    let writes = automation_write_routes();
     let targets = mcp_write_targets();
     assert!(
         targets.len() >= 8,
@@ -1556,11 +1511,7 @@ fn no_mcp_tool_body_field_takes_key_material_at_any_depth_of_its_request_struct(
     // request struct the handler deserialises instead, from each field
     // the tool offers into every struct it nests, so the next nested
     // credential-shaped field turns red whatever its schema says.
-    let router_src: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/automation/router.rs"
-    ));
-    let writes = extract_write_routes(router_src);
+    let writes = automation_write_routes();
     let mut nested_reached = 0usize;
     let mut withheld_material: Vec<String> = Vec::new();
     for (spec, (method, path)) in mcp_write_targets() {
@@ -1650,11 +1601,7 @@ fn every_mcp_write_tool_declares_its_nested_vocabularies_against_the_nested_stru
     // the struct behind the field, both ways, checks that a list is
     // declared as one exactly when the field is a `Vec`, and refuses a
     // field that is a struct with no vocabulary declared for it.
-    let router_src: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/automation/router.rs"
-    ));
-    let writes = extract_write_routes(router_src);
+    let writes = automation_write_routes();
     let mut drift = String::new();
     let mut nested_pinned = 0usize;
     for (spec, (method, path)) in mcp_write_targets() {

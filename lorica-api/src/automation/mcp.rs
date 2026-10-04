@@ -759,6 +759,9 @@ impl InProcessPlane {
 }
 
 #[cfg(test)]
+mod plane_tests;
+
+#[cfg(test)]
 mod tests {
     use serde_json::json;
 
@@ -1272,7 +1275,7 @@ mod tests {
         // Asserted against this file's own source: both constants exist
         // to be named as ignored, so neither may reach a `get` or a
         // `contains_key`. That an answer never echoes a session id is
-        // asserted through the whole stack in `crate::tests`.
+        // asserted through the whole stack in `plane_tests`.
         let source = include_str!("mcp.rs");
         let body = source.split("#[cfg(test)]").next().unwrap_or(source);
         for ignored in ["SESSION_ID_HEADER", "LAST_EVENT_ID_HEADER"] {
@@ -1590,13 +1593,17 @@ mod tests {
 
     #[test]
     fn the_router_mounts_the_path_this_module_declares() {
-        // The OpenAPI gate reads `router.rs` for string literals, so the
-        // route is spelled there rather than referenced. This is what
-        // keeps that literal and this constant one path.
-        let router = include_str!("router.rs");
-        assert!(
-            router.contains(&format!("\"{MCP_PATH}\"")),
-            "{MCP_PATH} is not mounted in router.rs"
+        // The listener mounts this constant for `POST` and no other
+        // verb, the shape the revision gives the endpoint.
+        let verbs: Vec<http::Method> = crate::automation::route_table()
+            .into_iter()
+            .filter(|route| route.path == MCP_PATH)
+            .map(|route| route.method)
+            .collect();
+        assert_eq!(
+            verbs,
+            vec![http::Method::POST],
+            "{MCP_PATH} mounts {verbs:?}"
         );
     }
 }

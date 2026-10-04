@@ -46,7 +46,7 @@ const HOSTNAME: &str = "pr-42.review.example.com";
 /// the failed-resolution tests aim at.
 const GRANTED_HOSTNAMES: &[&str] = &["*.review.example.com", "*.uncovered.example.com"];
 
-/// [`crate::tests::mint_automation`] with the backend grant spelled
+/// [`crate::automation::test_support::mint_automation`] with the backend grant spelled
 /// out, for the tests that care what it covers. The crate-wide helper
 /// fixes that grant, and these need it empty or narrow.
 async fn mint_with_cidrs(
@@ -82,7 +82,7 @@ async fn mint_with_cidrs(
 
 /// A token that can read and write environments.
 async fn writer(state: &AppState, name: &str) -> String {
-    crate::tests::mint_automation(
+    crate::automation::test_support::mint_automation(
         state,
         name,
         vec![
@@ -739,7 +739,7 @@ async fn an_explicit_certificate_needs_certificates_read_and_must_exist() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(error_message(response).await.contains("certificates:read"));
 
-    let with = crate::tests::mint_automation(
+    let with = crate::automation::test_support::mint_automation(
         &state,
         "acme-deploy",
         vec![
@@ -874,7 +874,7 @@ async fn an_explicit_certificate_must_cover_the_hostname() {
         "2027-01-01T00:00:00Z",
     )
     .await;
-    let token = crate::tests::mint_automation(
+    let token = crate::automation::test_support::mint_automation(
         &state,
         "acme-ci",
         vec![
@@ -1465,7 +1465,7 @@ async fn the_reaper_deletes_an_expired_environment_and_audits_and_skips_an_unexp
 async fn a_read_only_token_cannot_write_and_a_missing_scope_is_403() {
     let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
-    let reader = crate::tests::mint_automation(
+    let reader = crate::automation::test_support::mint_automation(
         &state,
         "acme-ci",
         vec![AutomationScope::EnvironmentsRead],
@@ -1527,7 +1527,7 @@ async fn stored_certificate_id(state: &AppState, environment: &str) -> Option<St
 async fn an_auto_environment_follows_a_new_certificate_and_an_explicit_one_does_not() {
     let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
-    let token = crate::tests::mint_automation(
+    let token = crate::automation::test_support::mint_automation(
         &state,
         "acme-ci",
         vec![
@@ -1770,7 +1770,7 @@ async fn the_reaper_counts_its_runs_and_expiries_and_publishes_the_gauge() {
 #[tokio::test]
 async fn every_automation_request_is_counted_by_its_outcome() {
     let state = crate::tests::test_state().await.0;
-    let reader = crate::tests::mint_automation(
+    let reader = crate::automation::test_support::mint_automation(
         &state,
         "acme-ci",
         vec![AutomationScope::EnvironmentsRead],

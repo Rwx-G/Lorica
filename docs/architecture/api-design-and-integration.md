@@ -3,14 +3,16 @@
 > **Baseline note.** The endpoint list below is the v1.0 planning subset
 > and predates the RBAC, ACME, AI-crawler, audit-log, hot-upgrade,
 > cluster, and automation routes. There are now **two** authoritative,
-> always-current contracts, and both are enforced against the live axum
+> always-current contracts, and both are enforced against the axum
 > route tables by `lorica-api/tests/openapi_contract.rs`:
 >
 > - `lorica-api/openapi.yaml` - the management plane, scanned against
 >   `src/server.rs`.
-> - `lorica-api/openapi-automation.yaml` - the automation plane, scanned
->   against `src/automation/router.rs`. The test additionally checks that
->   the scope each operation documents is the scope the gate applies.
+> - `lorica-api/openapi-automation.yaml` - the automation plane, held
+>   against `route_table()` in `src/automation/router.rs`, the declared
+>   table both automation routers are built from. The test additionally
+>   checks that the scope each operation documents is the scope the gate
+>   applies.
 >
 > Automation paths never appear in `openapi.yaml`: that document declares
 > one server and one security scheme (the session cookie), which is false

@@ -43,12 +43,6 @@ use lorica_mcp::Tier;
 /// The management route table, read as source.
 const MANAGEMENT_ROUTES: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs"));
 
-/// The automation plane's route table, read as source.
-const AUTOMATION_ROUTES: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/src/automation/router.rs"
-));
-
 /// The families of management operations no automation token may reach
 /// through any tier (Story 11.3 AC #1 and AC #2, Story 9.9): identity
 /// (users, the session and password operations), the credentials that
@@ -119,16 +113,13 @@ fn management_paths() -> BTreeSet<String> {
     paths
 }
 
-/// Every `/automation/v1/...` string literal in the automation route
-/// table.
+/// Every path the automation plane mounts, read off the declared route
+/// table both automation routers are built from.
 fn automation_paths() -> BTreeSet<String> {
-    let paths = path_literals(AUTOMATION_ROUTES, "/automation/v1/");
-    assert!(
-        paths.len() >= 10,
-        "only {} automation paths read off src/automation/router.rs",
-        paths.len()
-    );
-    paths
+    lorica_api::automation::route_table()
+        .iter()
+        .map(|route| route.path.to_string())
+        .collect()
 }
 
 /// `path` with each `{parameter}` given a concrete one-segment value.

@@ -304,14 +304,14 @@ fn one_segment_under(path: &str, collection: &str) -> bool {
 }
 
 /// The identity path, the only one any live token reaches.
-const WHOAMI_PATH: &str = "/automation/v1/whoami";
+pub(super) const WHOAMI_PATH: &str = "/automation/v1/whoami";
 
 /// The environment collection path; single environments hang under it.
-const ENVIRONMENTS_PATH: &str = "/automation/v1/environments";
+pub(super) const ENVIRONMENTS_PATH: &str = "/automation/v1/environments";
 
 /// How `openapi-automation.yaml` spells one environment, and how the
 /// metric labels it.
-const ENVIRONMENT_TEMPLATE: &str = "/automation/v1/environments/{name}";
+pub(super) const ENVIRONMENT_TEMPLATE: &str = "/automation/v1/environments/{name}";
 
 /// The access log.
 pub(super) const LOGS_PATH: &str = "/automation/v1/logs";
@@ -330,7 +330,7 @@ pub(super) const SLA_ROUTES_PATH: &str = "/automation/v1/sla/routes";
 
 /// How `openapi-automation.yaml` spells one route's SLA, and how the
 /// metric labels it.
-const SLA_ROUTE_TEMPLATE: &str = "/automation/v1/sla/routes/{id}";
+pub(super) const SLA_ROUTE_TEMPLATE: &str = "/automation/v1/sla/routes/{id}";
 
 /// This node's cluster role and applied configuration.
 ///
@@ -349,25 +349,25 @@ pub(super) const BACKENDS_PATH: &str = "/automation/v1/backends";
 
 /// How `openapi-automation.yaml` spells one backend, and how the
 /// metric labels it.
-const BACKEND_TEMPLATE: &str = "/automation/v1/backends/{id}";
+pub(super) const BACKEND_TEMPLATE: &str = "/automation/v1/backends/{id}";
 
 /// The route listing, and the route create.
 pub(super) const ROUTES_PATH: &str = "/automation/v1/routes";
 
 /// How `openapi-automation.yaml` spells one route, and how the metric
 /// labels it.
-const ROUTE_TEMPLATE: &str = "/automation/v1/routes/{id}";
+pub(super) const ROUTE_TEMPLATE: &str = "/automation/v1/routes/{id}";
 
 /// How `openapi-automation.yaml` spells one route's certificate
 /// binding, and how the metric labels it.
-const ROUTE_CERTIFICATE_TEMPLATE: &str = "/automation/v1/routes/{id}/certificate";
+pub(super) const ROUTE_CERTIFICATE_TEMPLATE: &str = "/automation/v1/routes/{id}/certificate";
 
 /// Certificate metadata; never a PEM body and never key material.
 pub(super) const CERTIFICATES_PATH: &str = "/automation/v1/certificates";
 
 /// How `openapi-automation.yaml` spells one certificate's renewal, and
 /// how the metric labels it.
-const CERTIFICATE_RENEW_TEMPLATE: &str = "/automation/v1/certificates/{id}/renew";
+pub(super) const CERTIFICATE_RENEW_TEMPLATE: &str = "/automation/v1/certificates/{id}/renew";
 
 /// The global settings document, the admin tier's one path (Story
 /// 11.3). Written, never read: the answer to a write is the allowlisted
@@ -440,9 +440,9 @@ pub(super) fn scope_str(scope: AutomationScope) -> &'static str {
 /// with that code whatever it says, and each entry is a request with a
 /// concrete id, which a template is not. It is walked by this module's
 /// matrix tests and by the AC #5 secret sweep and the field-name pin in
-/// `crate::tests`. What keeps it complete is not this comment:
+/// `super::read::plane_tests`. What keeps it complete is not this comment:
 /// `every_read_the_plane_mounts_is_on_the_read_surface` walks every
-/// path the router mounts (every path literal `router.rs` holds), asks the
+/// path the router mounts (every path of `router::route_table`), asks the
 /// matrix what each declares for `GET`, and fails naming any path
 /// declared behind a read scope that this list does not carry, so a
 /// read added to the router and the matrix cannot reach a model
@@ -472,7 +472,7 @@ pub(crate) const READ_SURFACE: &[(&str, AutomationScope)] = &[
 /// The same statement [`READ_SURFACE`] makes for the reads, for the
 /// same reason: spelled out rather than read back from
 /// [`write_declaration`], walked by this module's matrix tests and by
-/// the write-surface tests in `crate::tests` alike, so a write path
+/// the write-surface tests in `super::write::plane_tests` alike, so a write path
 /// added to the matrix and forgotten in either place fails in the
 /// other. The verb is a `&str` and not an `http::Method` so the list
 /// can be a `const` without a question about drop glue.
@@ -908,20 +908,14 @@ mod tests {
         );
     }
 
-    /// Every path literal `router.rs` mounts, read off its source: the
-    /// one place both surface tests enumerate the plane from, rather
-    /// than a list typed beside it. The OpenAPI contract gate reads the
-    /// same `.route(` calls and pins them to the document, so a path
-    /// mounted any other way fails there first.
+    /// Every path the router mounts, read off the route table both
+    /// routers are built from: the one place both surface tests
+    /// enumerate the plane from, rather than a list typed beside it.
+    /// The OpenAPI contract gate pins the same table to the document.
     fn mounted_paths() -> std::collections::BTreeSet<&'static str> {
-        let router = include_str!("router.rs");
-        let opening = "\"/automation/v1/";
-        router
-            .match_indices(opening)
-            .map(|(at, _)| {
-                let literal = &router[at + 1..];
-                &literal[..literal.find('"').expect("a terminated literal")]
-            })
+        super::super::router::route_table()
+            .iter()
+            .map(|route| route.path)
             .collect()
     }
 
@@ -1021,7 +1015,7 @@ mod tests {
                 );
             }
         }
-        assert!(mounted >= 10, "only {mounted} paths read off router.rs");
+        assert!(mounted >= 10, "only {mounted} paths in the route table");
         assert!(writes >= WRITE_SURFACE.len(), "only {writes} writes found");
     }
 

@@ -75,9 +75,10 @@
 //! [`required_scope`] enforces.
 //!
 //! Each document has its own drift gate in `tests/openapi_contract.rs`:
-//! the management one scans `src/server.rs`, the automation one scans
-//! [`router`] and additionally checks that every documented scope is
-//! the scope the gate actually applies.
+//! the management one scans `src/server.rs`, the automation one reads
+//! [`route_table`], the table both automation routers are built from,
+//! and additionally checks that every documented scope is the scope the
+//! gate actually applies.
 
 pub mod audit;
 pub mod auth;
@@ -89,6 +90,10 @@ pub mod read;
 pub mod redact;
 pub mod router;
 pub mod scope;
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
+mod tests;
 pub mod write;
 
 pub use auth::{
@@ -107,5 +112,5 @@ pub use oidc::{OidcVerifier, RefusalReason, OIDC_REPLAY_SET_CAP};
 pub use read::{
     AUTOMATION_READ_DEFAULT_ROWS, AUTOMATION_READ_MAX_ANSWER_BYTES, AUTOMATION_READ_MAX_ROWS,
 };
-pub use router::{build_automation_router, AUTOMATION_BODY_CAP};
+pub use router::{build_automation_router, route_table, AutomationRoute, AUTOMATION_BODY_CAP};
 pub use scope::{path_template, required_scope, ScopeRequirement};

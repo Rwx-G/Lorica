@@ -43,6 +43,10 @@ DATA_DIR=/var/lib/lorica
 LOGFILE=/shared/cp.log
 : > "$LOGFILE"
 
+# A marker left by an earlier start on the same volume would tell a
+# follower the API answers before this start has bound it.
+rm -f /shared/cp_ready
+
 say() { echo "$*" | tee -a "$LOGFILE"; }
 
 # `--data-dir` is a GLOBAL flag: it belongs before the subcommand, not
@@ -127,8 +131,29 @@ if [ ! -f /shared/cp_admin_password ]; then
     exit 1
 fi
 
+# The password file is not a readiness signal on its own: lorica writes
+# it right after opening the store, and binds the management API only
+# at the end of startup. A follower that saw the marker in that window
+# reached socat with nothing listening behind it, failed its login and
+# exited, so the fleet never formed until compose restarted it. Wait
+# for the API to answer through the socat port the followers dial: any
+# HTTP status counts, a 401 included, as in the runners' wait_for_api.
+for i in $(seq 1 60); do
+    code=$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:9443/api/v1/status" 2>/dev/null || true)
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+        break
+    fi
+    code=""
+    sleep 1
+done
+
+if [ -z "$code" ]; then
+    say "the control plane's management API never answered"
+    exit 1
+fi
+
 # The marker the followers wait on: written last, so its presence means
-# the password file is already readable.
+# the password file is already readable and the management API answers.
 echo ready > /shared/cp_ready
 say "control plane ready"
 

@@ -95,7 +95,7 @@
 //! view, and a route's Basic-auth hash never leaves [`crate::routes`]'s.
 //! What those views do carry for the dashboard's sake, a route's
 //! `proxy_headers` values above all, [`super::redact`] withholds. None
-//! of it is a promise, so `lorica-api/src/tests.rs` walks every path
+//! of it is a promise, so `read/plane_tests.rs` walks every path
 //! [`super::scope`] declares - the list it walks is derived from that
 //! matrix, not retyped beside it - for the field names that must never
 //! appear (Story 11.1 AC #5), and pins the whole set of key names each
@@ -384,7 +384,7 @@ fn texts<'a>(row: &'a Value, field: &str) -> impl Iterator<Item = &'a str> {
 ///
 /// A row missing the field its predicate reads is outside: a management
 /// view that renamed a field fails closed here, and the field-set pin in
-/// `lorica-api/src/tests.rs` is what reports the rename.
+/// `read/plane_tests.rs` is what reports the rename.
 fn within_the_grant(
     principal: &AutomationPrincipal,
     rows: Vec<Value>,
@@ -741,6 +741,9 @@ pub async fn list_certificates(
     });
     page.of(rows)
 }
+
+#[cfg(test)]
+mod plane_tests;
 
 #[cfg(test)]
 mod tests {

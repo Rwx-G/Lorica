@@ -238,7 +238,7 @@ mod tests {
     fn a_key_that_is_not_dry_run_is_refused_rather_than_read_as_the_write() {
         // The whole-stack case, through the handlers' `Query` extractor,
         // is `a_mistyped_dry_run_is_refused_and_never_an_apply` in
-        // `crate::tests`; this pins the attribute itself, which serde
+        // `crate::automation::write::plane_tests`; this pins the attribute itself, which serde
         // applies the same way whatever the format.
         for query in [
             r#"{"dryrun": true}"#,

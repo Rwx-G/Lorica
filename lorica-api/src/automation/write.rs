@@ -1427,6 +1427,11 @@ pub async fn update_settings(
 }
 
 #[cfg(test)]
+mod admin_tier_tests;
+#[cfg(test)]
+mod plane_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use lorica_automation_policy::{BACKEND_PROTECTION_RULES, ROUTE_PROTECTION_RULES};
@@ -1480,7 +1485,7 @@ mod tests {
         .expect("every alias inside the grant");
         // A patch that names no host claims nothing here; the route it
         // names is held to the grant by the guard, inside the store
-        // closure, which the whole-stack tests in `crate::tests` drive.
+        // closure, which the whole-stack tests in `plane_tests` drive.
         ensure_hostnames_granted(&granted, None, None).expect("nothing claimed");
 
         for (hostname, aliases) in [

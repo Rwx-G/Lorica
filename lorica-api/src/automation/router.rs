@@ -25,9 +25,11 @@
 //! [`super::environments`], the read paths (Story 11.1) in
 //! [`super::read`] and the write paths (Story 11.2) in
 //! [`super::write`]; the MCP endpoint (Story 11.1 AC #9) is in
-//! [`super::mcp`]. They are mounted here, and only here, so
-//! the OpenAPI drift gate in `tests/openapi_contract.rs` sees every
-//! automation route in one file.
+//! [`super::mcp`]. They are mounted here, and only here, from one
+//! declared table, [`route_table`]: both routers are built from it, and
+//! the OpenAPI drift gate in `tests/openapi_contract.rs`, the scope
+//! matrix's surface tests and the admin tier's sweeps read it, so no
+//! test depends on how this file is formatted.
 //!
 //! # Two routers from one route table
 //!
@@ -47,8 +49,9 @@
 
 use std::sync::OnceLock;
 
+use axum::handler::Handler;
 use axum::response::Response;
-use axum::routing::{get, post, put};
+use axum::routing::MethodRouter;
 use axum::Router;
 use lorica_config::models::{AutomationScope, OwnerKind, PipelineIdentity};
 use serde::Serialize;
@@ -57,6 +60,12 @@ use tracing::Instrument;
 use super::auth::AutomationPrincipal;
 use super::environments::{
     delete_environment, get_environment, list_environments, put_environment,
+};
+use super::scope::{
+    required_scope, ScopeRequirement, BACKENDS_PATH, BACKEND_TEMPLATE, CERTIFICATES_PATH,
+    CERTIFICATE_RENEW_TEMPLATE, CLUSTER_STATUS_PATH, ENVIRONMENTS_PATH, ENVIRONMENT_TEMPLATE,
+    LOGS_PATH, ROUTES_PATH, ROUTE_CERTIFICATE_TEMPLATE, ROUTE_TEMPLATE, SETTINGS_PATH,
+    SLA_OVERVIEW_PATH, SLA_ROUTE_TEMPLATE, WAF_EVENTS_PATH, WAF_STATS_PATH, WHOAMI_PATH,
 };
 use crate::error::json_data;
 use crate::server::AppState;
@@ -181,87 +190,169 @@ async fn hardened_response(req: axum::extract::Request, next: axum::middleware::
     response
 }
 
-/// The route table of the plane, before any layer and without the MCP
-/// endpoint: what both routers are built from.
+/// One `(verb, path)` the automation plane mounts, and the handler
+/// that answers it.
 ///
-/// The MCP endpoint is mounted by [`build_automation_router`] alone,
-/// so a tool cannot reach the endpoint that is running it.
-fn plane_routes() -> Router {
-    Router::new()
-        .route("/automation/v1/whoami", get(whoami))
-        .route("/automation/v1/environments", get(list_environments))
-        .route(
-            "/automation/v1/environments/{name}",
-            get(get_environment)
-                .put(put_environment)
-                .delete(delete_environment),
-        )
+/// Only [`route_table`] builds one, so every entry a test reads is one
+/// the routers are folded from.
+pub struct AutomationRoute {
+    /// The verb this entry mounts, and the only one it answers.
+    pub method: http::Method,
+    /// The path as the router matches it, which is also how
+    /// `openapi-automation.yaml` spells it and how the request metric
+    /// labels it: the path constants of [`super::scope`].
+    pub path: &'static str,
+    /// The handler's Rust path, as [`std::any::type_name`] reports it
+    /// for the function mounted, so a test can find the handler's
+    /// source without a second spelling of its name.
+    pub handler: &'static str,
+    method_router: MethodRouter,
+}
+
+impl AutomationRoute {
+    fn get<H, T>(path: &'static str, handler: H) -> Self
+    where
+        H: Handler<T, ()>,
+        T: 'static,
+    {
+        Self {
+            method: http::Method::GET,
+            path,
+            handler: std::any::type_name::<H>(),
+            method_router: axum::routing::get(handler),
+        }
+    }
+
+    fn post<H, T>(path: &'static str, handler: H) -> Self
+    where
+        H: Handler<T, ()>,
+        T: 'static,
+    {
+        Self {
+            method: http::Method::POST,
+            path,
+            handler: std::any::type_name::<H>(),
+            method_router: axum::routing::post(handler),
+        }
+    }
+
+    fn put<H, T>(path: &'static str, handler: H) -> Self
+    where
+        H: Handler<T, ()>,
+        T: 'static,
+    {
+        Self {
+            method: http::Method::PUT,
+            path,
+            handler: std::any::type_name::<H>(),
+            method_router: axum::routing::put(handler),
+        }
+    }
+
+    fn delete<H, T>(path: &'static str, handler: H) -> Self
+    where
+        H: Handler<T, ()>,
+        T: 'static,
+    {
+        Self {
+            method: http::Method::DELETE,
+            path,
+            handler: std::any::type_name::<H>(),
+            method_router: axum::routing::delete(handler),
+        }
+    }
+
+    /// What the scope matrix demands of a credential on this entry,
+    /// asked of [`required_scope`] with the path's template, which the
+    /// matrix answers the way it answers a concrete id. `None` would be
+    /// a mounted route no token reaches, and a test refuses it.
+    pub fn requirement(&self) -> Option<ScopeRequirement> {
+        required_scope(&self.method, self.path)
+    }
+}
+
+/// Every route the automation plane mounts, the MCP endpoint included:
+/// the one statement both routers are built from and every test that
+/// enumerates the plane reads.
+///
+/// The scope each entry sits behind is declared in
+/// [`super::scope::required_scope`] and not here; the matrix stays the
+/// one fail-closed function that decides, and
+/// [`AutomationRoute::requirement`] reads it.
+///
+/// ```
+/// let table = lorica_api::automation::route_table();
+/// assert!(table
+///     .iter()
+///     .any(|route| route.method == http::Method::GET && route.path == "/automation/v1/whoami"));
+/// assert!(table.iter().all(|route| route.requirement().is_some()));
+/// ```
+pub fn route_table() -> Vec<AutomationRoute> {
+    vec![
+        AutomationRoute::get(WHOAMI_PATH, whoami),
+        AutomationRoute::get(ENVIRONMENTS_PATH, list_environments),
+        AutomationRoute::get(ENVIRONMENT_TEMPLATE, get_environment),
+        AutomationRoute::put(ENVIRONMENT_TEMPLATE, put_environment),
+        AutomationRoute::delete(ENVIRONMENT_TEMPLATE, delete_environment),
         // The read surface (Story 11.1). Every one of these is a
-        // wrapper over the management handler that already answers it;
-        // the scope each sits behind is declared in
-        // [`super::scope::required_scope`], without which it would be
-        // reachable by no token at all.
-        .route("/automation/v1/logs", get(super::read::list_logs))
-        .route(
-            "/automation/v1/waf/events",
-            get(super::read::list_waf_events),
-        )
-        .route("/automation/v1/waf/stats", get(super::read::waf_stats))
-        .route(
-            "/automation/v1/sla/overview",
-            get(super::read::sla_overview),
-        )
-        .route(
-            "/automation/v1/sla/routes/{id}",
-            get(super::read::route_sla),
-        )
-        .route(
-            "/automation/v1/cluster/status",
-            get(super::read::cluster_status),
-        )
-        .route("/automation/v1/backends", get(super::read::list_backends))
-        .route("/automation/v1/routes", get(super::read::list_routes))
-        .route(
-            "/automation/v1/certificates",
-            get(super::read::list_certificates),
-        )
+        // wrapper over the management handler that already answers it.
+        AutomationRoute::get(LOGS_PATH, super::read::list_logs),
+        AutomationRoute::get(WAF_EVENTS_PATH, super::read::list_waf_events),
+        AutomationRoute::get(WAF_STATS_PATH, super::read::waf_stats),
+        AutomationRoute::get(SLA_OVERVIEW_PATH, super::read::sla_overview),
+        AutomationRoute::get(SLA_ROUTE_TEMPLATE, super::read::route_sla),
+        AutomationRoute::get(CLUSTER_STATUS_PATH, super::read::cluster_status),
+        AutomationRoute::get(BACKENDS_PATH, super::read::list_backends),
+        AutomationRoute::get(ROUTES_PATH, super::read::list_routes),
+        AutomationRoute::get(CERTIFICATES_PATH, super::read::list_certificates),
         // The write surface (Story 11.2). Every one of these runs the
-        // management handler's own body with the token as the actor;
-        // the scope each sits behind is declared in
-        // [`super::scope::required_scope`] for its verb alone. There is
-        // no route that takes a PEM body: the certificate create, the
-        // self-signed generate and the single-certificate update are
-        // deliberately absent, and the matrix declares nothing for them.
-        .route("/automation/v1/routes", post(super::write::create_route))
-        .route(
-            "/automation/v1/routes/{id}",
-            put(super::write::update_route).delete(super::write::delete_route),
-        )
-        .route(
-            "/automation/v1/routes/{id}/certificate",
-            put(super::write::bind_certificate),
-        )
-        .route(
-            "/automation/v1/backends",
-            post(super::write::create_backend),
-        )
-        .route(
-            "/automation/v1/backends/{id}",
-            put(super::write::update_backend).delete(super::write::delete_backend),
-        )
-        .route(
-            "/automation/v1/certificates/{id}/renew",
-            post(super::write::renew_certificate),
-        )
+        // management handler's own body with the token as the actor.
+        // There is no route that takes a PEM body: the certificate
+        // create, the self-signed generate and the single-certificate
+        // update are deliberately absent, and the matrix declares
+        // nothing for them.
+        AutomationRoute::post(ROUTES_PATH, super::write::create_route),
+        AutomationRoute::put(ROUTE_TEMPLATE, super::write::update_route),
+        AutomationRoute::delete(ROUTE_TEMPLATE, super::write::delete_route),
+        AutomationRoute::put(ROUTE_CERTIFICATE_TEMPLATE, super::write::bind_certificate),
+        AutomationRoute::post(BACKENDS_PATH, super::write::create_backend),
+        AutomationRoute::put(BACKEND_TEMPLATE, super::write::update_backend),
+        AutomationRoute::delete(BACKEND_TEMPLATE, super::write::delete_backend),
+        AutomationRoute::post(CERTIFICATE_RENEW_TEMPLATE, super::write::renew_certificate),
         // The admin tier (Story 11.3): one verb on the settings
         // document, bounded by `super::write::SETTINGS_ALLOWLIST`. No
         // `GET`: the document is not readable on this plane, and no
         // path under users, tokens or the cluster's membership is
         // mounted here for any verb.
-        .route(
-            "/automation/v1/settings",
-            put(super::write::update_settings),
-        )
+        AutomationRoute::put(SETTINGS_PATH, super::write::update_settings),
+        // The MCP endpoint (Story 11.1 AC #9). `POST` and nothing
+        // else: revision 2026-07-28 removed the standalone GET stream
+        // and the session DELETE, so both answer the 405 this mounting
+        // produces rather than a handler that explains they are gone.
+        // `plane_routes` leaves it out, so a tool cannot reach the
+        // endpoint that is running it.
+        AutomationRoute::post(super::mcp::MCP_PATH, super::mcp::mcp_endpoint),
+    ]
+}
+
+/// A router mounting `routes` and nothing else, before any layer.
+///
+/// Two entries on one path merge into one method router, which is how
+/// a collection answers both its listing and its create.
+fn mounted(routes: impl IntoIterator<Item = AutomationRoute>) -> Router {
+    routes.into_iter().fold(Router::new(), |router, route| {
+        router.route(route.path, route.method_router)
+    })
+}
+
+/// The route table of the plane, before any layer and without the MCP
+/// endpoint: what [`in_process_router`] is built from.
+fn plane_routes() -> Router {
+    mounted(
+        route_table()
+            .into_iter()
+            .filter(|route| route.path != super::mcp::MCP_PATH),
+    )
 }
 
 /// The per-credential budget of every write on this plane, one window
@@ -380,21 +471,165 @@ pub(super) fn in_process_router() -> Router {
 /// cheapest way to keep that true is for this router to have no way to
 /// read one.
 pub fn build_automation_router(state: AppState) -> Router {
-    let routed = authorized(
-        plane_routes()
-            // The MCP endpoint (Story 11.1 AC #9). `post` and nothing
-            // else: revision 2026-07-28 removed the standalone GET
-            // stream and the session DELETE, so both answer the 405
-            // this mounting produces rather than a handler that
-            // explains they are gone.
-            .route("/automation/v1/mcp", post(super::mcp::mcp_endpoint)),
-    )
-    .layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        super::auth::require_automation_auth,
-    ))
-    .layer(axum::middleware::from_fn(hardened_response))
-    .layer(axum::extract::DefaultBodyLimit::max(AUTOMATION_BODY_CAP))
-    .layer(axum::Extension(state.clone()));
+    let routed = authorized(mounted(route_table()))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::auth::require_automation_auth,
+        ))
+        .layer(axum::middleware::from_fn(hardened_response))
+        .layer(axum::extract::DefaultBodyLimit::max(AUTOMATION_BODY_CAP))
+        .layer(axum::Extension(state.clone()));
     with_audit_and_panic_net(routed, state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    const EVERY_VERB: [http::Method; 5] = [
+        http::Method::GET,
+        http::Method::POST,
+        http::Method::PUT,
+        http::Method::DELETE,
+        http::Method::PATCH,
+    ];
+
+    /// `path` with each `{parameter}` given a concrete one-segment value.
+    fn concrete(path: &str) -> String {
+        path.split('/')
+            .map(|segment| {
+                if segment.starts_with('{') {
+                    "x-1"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<&str>>()
+            .join("/")
+    }
+
+    /// What `router` answers to a bodiless `method` on `path`. No
+    /// extension is installed, so a routed request fails in its
+    /// handler's extractors with anything but 404 or 405, which are the
+    /// two statuses only the routing itself produces here.
+    async fn answered(router: &Router, method: &http::Method, path: &str) -> http::StatusCode {
+        let request = http::Request::builder()
+            .method(method.clone())
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .expect("test setup");
+        router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("infallible")
+            .status()
+    }
+
+    fn routed(status: http::StatusCode) -> bool {
+        status != http::StatusCode::NOT_FOUND && status != http::StatusCode::METHOD_NOT_ALLOWED
+    }
+
+    /// Assert that `router` answers exactly `table`'s `(verb, path)`
+    /// pairs: each one routed, every other verb on a path of the table a
+    /// 405, and a path outside the table a 404.
+    async fn mounts_exactly(router: Router, table: &[(http::Method, &'static str)]) {
+        let paths: std::collections::BTreeSet<&str> = table.iter().map(|(_, path)| *path).collect();
+        for path in &paths {
+            for method in &EVERY_VERB {
+                let status = answered(&router, method, &concrete(path)).await;
+                if table.iter().any(|(m, p)| m == method && p == path) {
+                    assert!(
+                        routed(status),
+                        "{method} {path} is in the table and answered {status}"
+                    );
+                } else {
+                    assert_eq!(
+                        status,
+                        http::StatusCode::METHOD_NOT_ALLOWED,
+                        "{method} {path} is not in the table"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            answered(
+                &router,
+                &http::Method::GET,
+                "/automation/v1/not-in-the-table"
+            )
+            .await,
+            http::StatusCode::NOT_FOUND
+        );
+    }
+
+    fn pairs(table: &[AutomationRoute]) -> Vec<(http::Method, &'static str)> {
+        table
+            .iter()
+            .map(|route| (route.method.clone(), route.path))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_listener_router_mounts_exactly_the_table() {
+        let table = pairs(&route_table());
+        mounts_exactly(mounted(route_table()), &table).await;
+    }
+
+    #[tokio::test]
+    async fn the_in_process_router_mounts_the_table_without_the_mcp_endpoint() {
+        let table: Vec<(http::Method, &'static str)> = pairs(&route_table())
+            .into_iter()
+            .filter(|(_, path)| *path != super::super::mcp::MCP_PATH)
+            .collect();
+        mounts_exactly(plane_routes(), &table).await;
+        assert_eq!(
+            answered(
+                &plane_routes(),
+                &http::Method::POST,
+                super::super::mcp::MCP_PATH
+            )
+            .await,
+            http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn every_route_in_the_table_is_declared_in_the_scope_matrix() {
+        // A mounted route the matrix declares nothing for is refused for
+        // every token: a dead route, or a declaration somebody forgot.
+        let table = route_table();
+        assert!(!table.is_empty());
+        for route in &table {
+            assert!(
+                route.requirement().is_some(),
+                "{} {} is mounted and declared for no token",
+                route.method,
+                route.path
+            );
+        }
+    }
+
+    #[test]
+    fn each_entry_names_the_function_it_mounts() {
+        let table = route_table();
+        let whoami_entry = table
+            .iter()
+            .find(|route| route.path == WHOAMI_PATH)
+            .expect("whoami is mounted");
+        assert_eq!(
+            whoami_entry.handler,
+            "lorica_api::automation::router::whoami"
+        );
+        for route in &table {
+            assert!(
+                route.handler.starts_with("lorica_api::automation::"),
+                "{} {} is handled by {}",
+                route.method,
+                route.path,
+                route.handler
+            );
+        }
+    }
 }
