@@ -6552,7 +6552,7 @@ async fn test_settings_schema_endpoint_shape() {
 
     // Ranged integer field: min + max + default.
     assert_eq!(schema["header_timeout_s"]["type"], "integer");
-    assert_eq!(schema["header_timeout_s"]["min"], 0);
+    assert_eq!(schema["header_timeout_s"]["min"], 1);
     assert_eq!(schema["header_timeout_s"]["max"], 3600);
     assert_eq!(schema["header_timeout_s"]["default"], 10);
 
@@ -6637,6 +6637,36 @@ async fn test_settings_schema_bounds_match_validator() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn test_header_timeout_has_no_off_value() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        "/api/v1/settings",
+        &admin,
+        Some(serde_json::json!({ "header_timeout_s": 0 })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/settings",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(parse_data(resp).await["header_timeout_s"], 10);
 }
 
 // ---- Story 9.3: cluster registry endpoints ----

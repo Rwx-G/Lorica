@@ -924,8 +924,10 @@ export interface GlobalSettingsResponse {
   flood_threshold_rps: number;
   // Per-IP admission rate in flood mode; 0 = auto (half the threshold).
   flood_strict_rps: number;
-  // Global header-phase read timeout (s); 0 = off.
+  // Global header-phase read timeout (s), 1 to 3600; never 0.
   header_timeout_s: number;
+  // Downstream idle timeout (s), HTTP/1.1 keepalive and HTTP/2. Default 75; never 0.
+  downstream_idle_timeout_s: number;
   waf_ban_threshold: number;
   waf_ban_duration_s: number;
   // Process-wide ceiling on the bytes the WAF holds in body-scan
@@ -1012,6 +1014,7 @@ export interface UpdateSettingsRequest {
   flood_threshold_rps?: number;
   flood_strict_rps?: number;
   header_timeout_s?: number;
+  downstream_idle_timeout_s?: number;
   waf_ban_threshold?: number;
   waf_ban_duration_s?: number;
   waf_body_scan_max_inflight_bytes?: number;

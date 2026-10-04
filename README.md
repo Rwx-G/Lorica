@@ -9,8 +9,8 @@
   <img src="https://img.shields.io/badge/version-1.9.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3073-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-766-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3095-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-779-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -55,7 +55,8 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Auto-ban** - IPs that repeatedly exceed rate limits (or trip the WAF) are banned automatically (configurable threshold and duration). Under `--workers N`, the WAF auto-ban counter lives in an anonymous `memfd` shared by all workers (no UDS round-trip per block), and the supervisor is the sole ban issuer, broadcasting `BanIp` on threshold crossing
 - **Trusted proxies** - CIDR list for X-Forwarded-For validation, prevents IP spoofing via header injection
 - **DDoS protection** - per-route max connections, global flood rate tracking
-- **Slowloris detection** - rejects slow-header attacks with configurable threshold
+- **Slowloris protection** - a client trickling its request header is answered 408 and disconnected once `header_timeout_s` (default 10 s, counted from the header's first byte) elapses, enforced while the header is read; a per-route `slowloris_threshold_ms` refuses with 408 a request whose header took longer, before it reaches the backend
+- **Idle connection timeout** (v1.9.0) - closes a client connection idle longer than `downstream_idle_timeout_s` (default 75 s, as nginx): an HTTP/1.1 keep-alive connection between requests, an HTTP/2 connection with no stream in flight. Streaming responses and WebSockets are not idle. Applies on reload, no restart
 - **Security headers** - presets (strict/moderate/none) with HSTS, CSP, X-Frame-Options, X-Content-Type-Options
 - **HTTP Basic Auth** - per-route username/password authentication (Argon2id-hashed) with cached verification
 - **IP allowlist/denylist** and **CORS configuration** per route
@@ -348,7 +349,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 - **Capture** (v1.8.0) - the rule list with live counters, remaining budget and time to expiry, Disable for Operators, Create / Edit / Delete for SuperAdmins (the form refuses a rule that would record every request on a route unless the operator says so, and shows the expiry the TTL produces as they type), and a "Recent captures" panel over the last 50 records this process emitted, with a whole-record download
 - **Cluster** (v1.7.0) - the fleet roster with live sessions, applied configuration generation, resource gauges, per-node certificate entitlement and recent WAF events, join-token dialog with the ready-to-paste `cluster join` command, activation and revocation (which names the keys to re-issue); on a follower, the read-only banner with break-glass and leave
 - **System** - worker table with PID, health, heartbeat latency; CPU/memory/disk gauges
-- **Settings** - notification channels, security header presets, DNS providers (Cloudflare / Route53 / OVH), ban rules, network allow / deny lists and the automation listener's allowed CIDRs, OpenTelemetry exporter, log export (syslog and OTLP logs, one switch per event kind on each sink, per-sink test), GeoIP / ASN databases, AI crawler policy, team (users and roles), automation tokens (scopes, lifetimes, and hostname patterns and backend CIDRs asked for only once a scope they bound is ticked; the form names the MCP tier a scope set makes and warns when it spans two; the token is shown once, revocation keeps the row), global configuration (since v1.9.0 also the active-probe cap, the load-test ceilings, the strict flood rate and the header timeout), binary upgrade, certificate filesystem export zone + ACL editor, config export / import with diff preview
+- **Settings** - notification channels, security header presets, DNS providers (Cloudflare / Route53 / OVH), ban rules, network allow / deny lists and the automation listener's allowed CIDRs, OpenTelemetry exporter, log export (syslog and OTLP logs, one switch per event kind on each sink, per-sink test), GeoIP / ASN databases, AI crawler policy, team (users and roles), automation tokens (scopes, lifetimes, and hostname patterns and backend CIDRs asked for only once a scope they bound is ticked; the form names the MCP tier a scope set makes and warns when it spans two; the token is shown once, revocation keeps the row), global configuration (since v1.9.0 also the active-probe cap, the load-test ceilings, the strict flood rate, the header timeout and the idle connection timeout), binary upgrade, certificate filesystem export zone + ACL editor, config export / import with diff preview
 - **Theme** - light/dark mode toggle
 
 ## Architecture
@@ -718,7 +719,7 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (3073 tests, Lorica-native)
+# Product crates only (3095 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-shmem \
@@ -727,7 +728,7 @@ cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-mcp -p lorica-automation-policy \
            --features otel
 
-# Pingora-forked crates (766 tests)
+# Pingora-forked crates (779 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-error -p lorica-tls -p lorica-cache \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
@@ -739,16 +740,16 @@ cargo test -p lorica-core -p lorica-proxy -p lorica-http \
 # wire corpus (every message's encoding, pinned)
 cargo test -p lorica-cluster --tests
 
-# Frontend (522 Vitest cases across 26 files) and its gates
+# Frontend (524 Vitest cases across 26 files) and its gates
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 
-The `lorica` binary crate carries 21 end-to-end binaries under
+The `lorica` binary crate carries 22 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends
 (mTLS, response rewriting, mirroring, forward auth, stale-while-revalidate,
 the connection pre-filter, canary and header routing, config reload, rate
-limits and their cross-worker sync, the circuit breaker and the RPC
-plane). They run as part of `cargo test -p lorica`.
+limits and their cross-worker sync, the circuit breaker, the downstream
+idle timeout and the RPC plane). They run as part of `cargo test -p lorica`.
 
 #### Docker end-to-end suites
 

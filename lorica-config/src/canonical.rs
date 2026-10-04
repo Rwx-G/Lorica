@@ -102,6 +102,10 @@ use crate::store::ConfigStore;
 /// decision has to be taken deliberately.
 pub const CANONICAL_FORMAT_VERSION: u32 = 2;
 
+fn default_downstream_idle_timeout_s() -> u32 {
+    crate::models::DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S
+}
+
 /// One WAF custom rule in canonical form. The store keeps these as
 /// bare tuples; the blob needs a named, strict shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -258,6 +262,19 @@ pub struct CanonicalGlobalSettings {
     pub flood_strict_rps: u32,
     /// Global slowloris header-read floor (s).
     pub header_timeout_s: u32,
+    /// Downstream idle timeout (s), HTTP/1.1 keepalive and HTTP/2.
+    ///
+    /// The one field of this struct with a serde default, and on
+    /// purpose: it joined the blob in 1.9.0 under format version 2,
+    /// which 1.8.0 already shipped. Followers are upgraded first, so a
+    /// 1.9.0 follower decodes a 1.8.0 control plane's blob, which lacks
+    /// the field, and takes the shipped default. The other direction, a
+    /// 1.8.0 follower handed this blob, is refused at the handshake by
+    /// schema version (migration 62) before any blob is sent. Bumping
+    /// the format version instead would have made the 1.9.0 follower
+    /// refuse the 1.8.0 blob, which is the order the upgrade runs in.
+    #[serde(default = "default_downstream_idle_timeout_s")]
+    pub downstream_idle_timeout_s: u32,
     /// WAF auto-ban threshold.
     pub waf_ban_threshold: i32,
     /// WAF auto-ban duration (s).
@@ -320,6 +337,7 @@ impl From<&GlobalSettings> for CanonicalGlobalSettings {
             flood_threshold_rps: s.flood_threshold_rps,
             flood_strict_rps: s.flood_strict_rps,
             header_timeout_s: s.header_timeout_s,
+            downstream_idle_timeout_s: s.downstream_idle_timeout_s,
             waf_ban_threshold: s.waf_ban_threshold,
             waf_ban_duration_s: s.waf_ban_duration_s,
             custom_security_presets: s.custom_security_presets.clone(),
@@ -371,6 +389,7 @@ impl CanonicalGlobalSettings {
         settings.flood_threshold_rps = self.flood_threshold_rps;
         settings.flood_strict_rps = self.flood_strict_rps;
         settings.header_timeout_s = self.header_timeout_s;
+        settings.downstream_idle_timeout_s = self.downstream_idle_timeout_s;
         settings.waf_ban_threshold = self.waf_ban_threshold;
         settings.waf_ban_duration_s = self.waf_ban_duration_s;
         settings.custom_security_presets = self.custom_security_presets.clone();
@@ -1316,6 +1335,30 @@ mod tests {
     }
 
     #[test]
+    fn a_1_8_0_blob_without_the_idle_timeout_decodes_to_the_default() {
+        let mut cfg = fleet_config();
+        cfg.global.downstream_idle_timeout_s = 30;
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        let removed = root["global"]
+            .as_object_mut()
+            .expect("test setup: global is an object")
+            .remove("downstream_idle_timeout_s");
+        assert_eq!(
+            removed,
+            Some(serde_json::json!(30)),
+            "the field is on the wire"
+        );
+        let older = serde_json::to_vec(&root).expect("test setup: re-encode");
+        let decoded = decode_canonical(&older).expect("a 1.8.0-shaped blob still decodes");
+        assert_eq!(
+            decoded.global.downstream_idle_timeout_s,
+            crate::models::DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S
+        );
+    }
+
+    #[test]
     fn the_canonical_format_version_is_two() {
         let bytes = encode_canonical(&fleet_config()).expect("test setup: encode");
         let peek: serde_json::Value =
@@ -1337,8 +1380,19 @@ mod tests {
     /// project bumps the format version once per release, not once per
     /// field, and no peer anywhere holds a version 2 blob of the older
     /// shape, so a second bump would protect nothing.
+    ///
+    /// Backlog #82 (1.9.0) moved it again, and this time version 2 HAS
+    /// shipped: `CanonicalGlobalSettings.downstream_idle_timeout_s`
+    /// joined the blob. The version still stays at 2. The new field
+    /// carries a serde default, so a 1.9.0 follower accepts the 1.8.0
+    /// blob it is handed while its control plane waits to be upgraded
+    /// last; a 1.8.0 follower never decodes the new shape, because
+    /// migration 62 puts it behind on schema and the handshake refuses
+    /// it first. A version bump would break the first case and protect
+    /// nothing in the second. Pinned by
+    /// `a_1_8_0_blob_without_the_idle_timeout_decodes_to_the_default`.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "6e20386dd9a665ad7f29274780f99a39c10f6441eda917dbf902884222149482";
+        "5b850d870f04320d6636d3655f48f1a05258e5934a34c7b90c02d5599b00c8fc";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -1997,6 +2051,7 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             flood_threshold_rps: _,
             flood_strict_rps: _,
             header_timeout_s: _,
+            downstream_idle_timeout_s: _,
             waf_ban_threshold: _,
             waf_ban_duration_s: _,
             custom_security_presets: _,

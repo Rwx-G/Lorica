@@ -107,7 +107,16 @@ impl ConfigStore {
                     settings.flood_strict_rps = value.parse().unwrap_or(0);
                 }
                 "header_timeout_s" => {
-                    settings.header_timeout_s = value.parse().unwrap_or(10);
+                    settings.header_timeout_s = value
+                        .parse()
+                        .unwrap_or(crate::models::DEFAULT_HEADER_TIMEOUT_S);
+                }
+                "downstream_idle_timeout_s" => {
+                    settings.downstream_idle_timeout_s = value.parse().map_err(|e| {
+                        ConfigError::Corrupt(format!(
+                            "stored downstream_idle_timeout_s {value:?} is not a number: {e}"
+                        ))
+                    })?;
                 }
                 "waf_ban_threshold" => {
                     settings.waf_ban_threshold = value.parse().map_err(|e| {
@@ -444,6 +453,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('header_timeout_s', ?1)",
             params![settings.header_timeout_s.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('downstream_idle_timeout_s', ?1)",
+            params![settings.downstream_idle_timeout_s.to_string()],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_ban_threshold', ?1)",

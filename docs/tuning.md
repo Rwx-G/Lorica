@@ -85,8 +85,11 @@ Each worker runs an independent proxy engine. SO_REUSEPORT is enabled automatica
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `max_global_connections` | 0 (unlimited) | Total proxy connections cap. 503 when exceeded. |
+| `max_global_connections` | 0 (unlimited) | Cap on requests being proxied to a backend at once, across the node's routes. 503 when exceeded. It counts requests, not client sockets: a connection waiting for a request, reading a header or holding a body back is not counted. |
+| `connection_limits_per_ip` | None (off) | Cap on live client connections from one source IP, enforced at accept. **Counted per worker**: the effective ceiling is this value times `--workers`. It is the only bound on how many sockets one client holds (the timeouts below bound how long each lives), so set it on internet-facing nodes. Size it above what one legitimate source opens, divided by the worker count: a browser opens about six HTTP/1.1 connections per host, and a NAT gateway or corporate proxy carries many users behind one address. |
 | `flood_threshold_rps` | 0 (disabled) | When global RPS exceeds this, per-IP rate limits are halved. |
+| `header_timeout_s` | 10 | Time an HTTP/1.1 client has to send its whole request header, from its first byte, before it is answered 408 and disconnected, on every route. Enforced while the header is read, so a client trickling header bytes is cut at this bound however short its gaps; the wait before the first byte belongs to `downstream_idle_timeout_s`. Applies to the next request after a save, no restart. 1 to 3600, no "off" value: per-route thresholds are judged only once a header is complete and cannot cut one still arriving. Before 1.9.0 it was measured after the header had been read and cut nothing. |
+| `downstream_idle_timeout_s` | 75 | How long a client connection may sit idle before it is closed: an HTTP/1.1 keep-alive connection waiting for its next (or first) request, an HTTP/2 connection with no stream in flight. 1 to 3600, no "no limit" value. A response in progress (long poll, SSE) and a WebSocket are not idle. Bounds the sockets idle clients can hold against the file-descriptor limit above; lower it on nodes that face many idle clients, raise it only for clients that pause long between requests on purpose. Applies after a save to every connection and keep-alive wait that starts afterwards, no restart. It also bounds the wait for an HTTP/2 client's connection preface after TLS, and each read of a request body held for Blocking-mode WAF inspection. The TLS handshake itself has its own fixed 60 s bound. |
 
 ### Per-Route Settings
 
@@ -95,11 +98,12 @@ Each worker runs an independent proxy engine. SO_REUSEPORT is enabled automatica
 | `rate_limit_rps` | None | Per-client-IP request rate. Set to avoid a single client saturating a route. |
 | `rate_limit_burst` | None | Extra requests allowed above RPS before throttling. |
 | `max_connections` | None | Per-route connection cap. 503 when exceeded. |
+| `slowloris_threshold_ms` | 5000 | A request whose header took longer than this, from its first byte, is answered 408 and never reaches the backend. Judged once the header is complete (the route is only known then); a header that never completes is cut by the global `header_timeout_s`. HTTP/1.1 only. 0 = off. Before 1.9.0 it was measured after the header had been read and refused nothing. |
 | `cache_enabled` | false | Enables in-memory response cache. Reduces backend load for cacheable content. |
 | `cache_ttl_s` | 300 | Cache lifetime in seconds. |
 | `compression_enabled` | false | Gzip response compression. Saves bandwidth at CPU cost. |
 | `connect_timeout_s` | 5 | Backend connection timeout. Lower values fail-fast on dead backends. |
-| `read_timeout_s` | 60 | Backend response timeout. |
+| `read_timeout_s` | 60 | Backend response timeout. Also the total time a request body held for Blocking-mode WAF inspection may take to arrive (408 past it): the same time a streamed body has, since the backend answers only once the body is complete. |
 
 ### Per-Backend Settings
 

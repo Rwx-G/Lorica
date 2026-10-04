@@ -57,6 +57,30 @@ pub trait ProxyHttp {
         modules.add_module(ResponseCompressionBuilder::enable(0));
     }
 
+    /// How long a downstream connection may sit idle between requests
+    /// (HTTP/1.x keepalive) or with no stream in flight (HTTP/2).
+    ///
+    /// Asked for every new connection and before every HTTP/1.x reuse,
+    /// so an implementation may read it from configuration that changes
+    /// at runtime. `None` keeps the server's built-in behaviour. See
+    /// [`lorica_core::apps::HttpServerApp::downstream_idle_timeout`] for
+    /// what the bound does and does not cover.
+    fn downstream_idle_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// How long an HTTP/1.x client may take to send a whole request
+    /// header, from its first byte to the end of the header block. A
+    /// client past it is answered `408` and the connection is closed.
+    ///
+    /// Asked before every HTTP/1.x request, so an implementation may read
+    /// it from configuration that changes at runtime. `None` keeps the
+    /// server's built-in behaviour. See
+    /// [`lorica_core::apps::HttpServerApp::downstream_header_timeout`].
+    fn downstream_header_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Handle the incoming request.
     ///
     /// In this phase, users can parse, validate, rate limit, perform access control and/or

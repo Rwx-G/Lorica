@@ -14,6 +14,7 @@
     flood_threshold_rps: number;
     flood_strict_rps: number;
     header_timeout_s: number;
+    downstream_idle_timeout_s: number;
     waf_ban_threshold: number;
     waf_ban_duration_s: number;
     waf_body_scan_max_inflight_bytes: number;
@@ -69,7 +70,8 @@
     maxGlobal: bound('max_global_connections', 0, 1_000_000),
     flood: bound('flood_threshold_rps', 0, 1_000_000),
     floodStrict: bound('flood_strict_rps', 0, 10_000_000),
-    headerTimeout: bound('header_timeout_s', 0, 3600),
+    headerTimeout: bound('header_timeout_s', 1, 3600),
+    idleTimeout: bound('downstream_idle_timeout_s', 1, 3600),
     wafBanThreshold: bound('waf_ban_threshold', 0, 1000),
     wafBanDur: bound('waf_ban_duration_s', 0, 2_592_000),
     wafScanBudget: bound('waf_body_scan_max_inflight_bytes', 1_048_576, 17_179_869_184),
@@ -90,6 +92,7 @@
   let floodErr = $state<string | null>(null);
   let floodStrictErr = $state<string | null>(null);
   let headerTimeoutErr = $state<string | null>(null);
+  let idleTimeoutErr = $state<string | null>(null);
   let wafBanThresholdErr = $state<string | null>(null);
   let wafBanDurErr = $state<string | null>(null);
   let wafScanBudgetErr = $state<string | null>(null);
@@ -123,6 +126,7 @@
         : null);
   }
   function checkHeaderTimeout() { headerTimeoutErr = integerInRange(settingsForm.header_timeout_s, c.headerTimeout); }
+  function checkIdleTimeout() { idleTimeoutErr = integerInRange(settingsForm.downstream_idle_timeout_s, c.idleTimeout); }
   function checkWafBanThreshold() { wafBanThresholdErr = integerInRange(settingsForm.waf_ban_threshold, c.wafBanThreshold); }
   function checkWafBanDur() { wafBanDurErr = integerInRange(settingsForm.waf_ban_duration_s, c.wafBanDur); }
   function checkWafScanBudget() { wafScanBudgetErr = integerInRange(settingsForm.waf_body_scan_max_inflight_bytes, c.wafScanBudget); }
@@ -199,7 +203,13 @@
         <label for="header-timeout">Header Timeout (seconds)</label>
         <input id="header-timeout" type="number" bind:value={settingsForm.header_timeout_s} min={c.headerTimeout.min} max={c.headerTimeout.max} onblur={checkHeaderTimeout} oninput={checkHeaderTimeout} />
         {#if headerTimeoutErr}<span class="field-error" role="alert">{headerTimeoutErr}</span>{/if}
-        <span class="hint">Time a client has to finish sending its request headers before it is answered 408, on every route (a slowloris floor). 0 = off; per-route thresholds still apply.</span>
+        <span class="hint">Time a client has to send its whole request header, from its first byte, before it is answered 408 and disconnected, on every route (a slowloris floor). There is no "off" value: per-route thresholds are judged only once the header is complete and cannot cut one still arriving.</span>
+      </div>
+      <div class="settings-form-row">
+        <label for="idle-timeout">Idle Connection Timeout (seconds)</label>
+        <input id="idle-timeout" type="number" bind:value={settingsForm.downstream_idle_timeout_s} min={c.idleTimeout.min} max={c.idleTimeout.max} onblur={checkIdleTimeout} oninput={checkIdleTimeout} />
+        {#if idleTimeoutErr}<span class="field-error" role="alert">{idleTimeoutErr}</span>{/if}
+        <span class="hint">How long a client connection may sit idle before the proxy closes it: an HTTP/1.1 keep-alive connection between requests, an HTTP/2 connection with no request in flight (default 75, as nginx). A response still streaming and a WebSocket are not idle. There is no "no limit" value. Applies to connections and keep-alive waits that start after the save.</span>
       </div>
       <div class="settings-form-row">
         <label for="waf-ban-threshold">WAF Auto-ban Threshold</label>

@@ -512,9 +512,23 @@ paths:
                 header_timeout_s:
                   type: integer
                   description: >-
-                    Seconds a client has to finish sending its request headers
-                    before it is answered 408, on every route (Story 8.10).
-                    `0` turns the global floor off. Bounds:
+                    Seconds an HTTP/1.1 client has to send its whole request
+                    header, from its first byte, before it is answered 408
+                    and disconnected, on every route (Story 8.10). Default
+                    10; there is no `0`, because a route's slowloris
+                    threshold is judged only once the header is complete
+                    and cannot cut one still arriving. Bounds:
+                    `GET /api/v1/settings/schema`.
+                downstream_idle_timeout_s:
+                  type: integer
+                  description: >-
+                    Seconds a downstream connection may sit idle before it is
+                    closed: an HTTP/1.1 keepalive connection waiting for its
+                    next request, an HTTP/2 connection with no stream in
+                    flight. A response in progress and an upgraded
+                    (WebSocket) connection are not idle. Default 75; there is
+                    no `0`. Applies to connections and keepalive waits that
+                    start after the save. Bounds:
                     `GET /api/v1/settings/schema`.
                 max_active_probes:
                   type: integer

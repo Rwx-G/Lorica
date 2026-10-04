@@ -650,6 +650,25 @@ fn body_hold_applies(session: &mut Session, ctx: &RequestCtx) -> bool {
         && !session.is_upgrade_req()
 }
 
+/// How long a held body may take to arrive: each read waits at most the
+/// first value, the whole body at most the second.
+///
+/// The gap is `downstream_idle_timeout_s`: a client that sends nothing for
+/// that long is idle, whether between requests or inside one. The total is
+/// the route's upstream `read_timeout_s`, which is the time a body that
+/// streams has to arrive: the proxy reads the backend's response while it
+/// forwards the body, a backend sends nothing before the body is complete,
+/// and that read gives up after `read_timeout_s`. Holding the body
+/// therefore leaves a client the same time it had when the body streamed,
+/// and an operator who raises the route's timeout for a slow backend
+/// raises both together. A zero or negative stored value reads as one
+/// second, so no value leaves the hold unbounded.
+fn body_hold_bounds(downstream_idle_timeout_s: u32, read_timeout_s: i32) -> (Duration, Duration) {
+    let gap = Duration::from_secs(u64::from(downstream_idle_timeout_s.max(1)));
+    let total = Duration::from_secs(u64::try_from(read_timeout_s).unwrap_or(0).max(1));
+    (gap, total)
+}
+
 /// `owed` followed by whatever `body` carries.
 fn prepend_owed(body: &mut Option<bytes::Bytes>, owed: bytes::Bytes) {
     if owed.is_empty() {
@@ -678,6 +697,10 @@ impl LoricaProxy {
     /// give it is not contacted yet, so the proxy answers `100
     /// Continue` itself and `upstream_request_filter` strips the
     /// header from the upstream request.
+    ///
+    /// The read is bounded (see [`body_hold_bounds`]): a body that stops
+    /// arriving, or arrives too slowly, is answered `408` and its
+    /// connection closed, with no upstream contacted.
     async fn hold_body_until_verdict(
         &self,
         session: &mut Session,
@@ -692,13 +715,28 @@ impl LoricaProxy {
                 .write_response_header(Box::new(go_ahead), false)
                 .await?;
         }
+        let (gap, total) = body_hold_bounds(
+            self.config.load().downstream_idle_timeout_s,
+            ctx.route_snapshot
+                .as_ref()
+                .map_or(0, |route| route.read_timeout_s),
+        );
+        let deadline = Instant::now() + total;
         ctx.waf_body_hold = WafBodyHold::Reading;
         loop {
-            let mut chunk = session
-                .downstream_session
-                .read_request_body()
-                .await
-                .map_err(|e| e.into_down())?;
+            let wait = gap.min(deadline.saturating_duration_since(Instant::now()));
+            let read =
+                tokio::time::timeout(wait, session.downstream_session.read_request_body()).await;
+            let mut chunk = match read {
+                Ok(Ok(chunk)) => chunk,
+                // The session's own read timeout (HTTP/1.1) is the same
+                // stall seen from below.
+                Ok(Err(e)) if matches!(e.etype(), ErrorType::ReadTimedout) => {
+                    return self.refuse_stalled_body(session, ctx, gap, total).await;
+                }
+                Ok(Err(e)) => return Err(e.into_down()),
+                Err(_) => return self.refuse_stalled_body(session, ctx, gap, total).await,
+            };
             let end_of_stream = chunk.is_none() || session.is_body_done();
             session
                 .downstream_modules_ctx
@@ -743,6 +781,43 @@ impl LoricaProxy {
             return Ok(false);
         }
     }
+
+    /// Answers a held body that did not arrive in time with `408` and
+    /// closes the connection (RFC 9110 section 15.5.9): the rest of the
+    /// body was never read, so the connection cannot carry another request.
+    async fn refuse_stalled_body(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        gap: Duration,
+        total: Duration,
+    ) -> Result<bool> {
+        warn!(
+            route_id = ctx.route_snapshot.as_ref().map_or("-", |r| r.id.as_str()),
+            request_id = %ctx.request_id,
+            body_bytes_received = ctx.body_bytes_received,
+            gap_s = gap.as_secs(),
+            total_s = total.as_secs(),
+            "request body held for the WAF did not arrive in time (408)"
+        );
+        ctx.block_reason = Some("request body timeout".to_string());
+        ctx.waf_body_buffer = None;
+        ctx.waf_body_reservation = None;
+        session.set_keepalive(None);
+        let error_page_html = ctx
+            .route_snapshot
+            .as_ref()
+            .and_then(|r| r.error_page_html.clone());
+        self.write_error_response(
+            session,
+            408,
+            &ctx.request_id,
+            error_page_html.as_deref(),
+            "Request body took too long",
+            &[],
+        )
+        .await
+    }
 }
 
 /// Escape HTML special characters to prevent XSS when injecting dynamic values
@@ -768,6 +843,27 @@ impl ProxyHttp for LoricaProxy {
         // gRPC-Web bridge: transparently converts HTTP/1.1 gRPC-web requests
         // (application/grpc-web) to HTTP/2 gRPC for the upstream backend.
         modules.add_module(Box::new(lorica_core::modules::http::grpc_web::GrpcWeb));
+    }
+
+    /// Backlog #82. Read from the live snapshot, so a settings change
+    /// reaches the next connection and the next HTTP/1.1 reuse after a
+    /// reload, in every worker the snapshot reaches.
+    fn downstream_idle_timeout(&self) -> Option<Duration> {
+        match self.config.load().downstream_idle_timeout_s {
+            0 => None,
+            seconds => Some(Duration::from_secs(u64::from(seconds))),
+        }
+    }
+
+    /// Story 8.10 AC #1, enforced while the header is read: the global
+    /// `header_timeout_s` bounds every HTTP/1.x request header, first byte
+    /// to end of headers, on every route. Read from the live snapshot
+    /// before every request, like the idle timeout. `0` disables it.
+    fn downstream_header_timeout(&self) -> Option<Duration> {
+        match self.config.load().header_timeout_s {
+            0 => None,
+            seconds => Some(Duration::from_secs(u64::from(seconds))),
+        }
     }
 
     fn new_ctx(&self) -> Self::CTX {
@@ -1170,14 +1266,6 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(handled);
             }
 
-            // Per-route max connections enforcement
-            if let Some(handled) = self
-                .check_route_connection_limit(session, ctx, entry)
-                .await?
-            {
-                return Ok(handled);
-            }
-
             // Request body size limit + WAF body-scan cap (advertised CL)
             if let Some(handled) = self.check_body_limits(session, ctx, entry).await? {
                 return Ok(handled);
@@ -1191,9 +1279,20 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(true);
             }
 
-            // Blocking-mode body hold (terminal stage): the body is read
-            // and scanned before the upstream is dialled
-            self.hold_body_until_verdict(session, ctx).await
+            // Blocking-mode body hold: the body is read and scanned before
+            // the upstream is dialled
+            if self.hold_body_until_verdict(session, ctx).await? {
+                return Ok(true);
+            }
+
+            // Per-route max connections enforcement (terminal stage). Last,
+            // so the slot is taken only by a request about to be proxied:
+            // a client holding a body back, or refused on any stage above,
+            // never occupies one.
+            Ok(self
+                .check_route_connection_limit(session, ctx, entry)
+                .await?
+                .unwrap_or(false))
         }
         .instrument(span)
         .await

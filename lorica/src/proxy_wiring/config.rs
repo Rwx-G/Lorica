@@ -212,8 +212,16 @@ pub struct ProxyConfig {
     /// 0.5x factor). Only consulted when `flood_threshold_rps > 0`.
     pub flood_strict_rps: u32,
     /// Story 8.10 AC #1. Global header-phase read timeout (seconds) used
-    /// as a slowloris floor across every route. `0` = disabled.
+    /// as a slowloris floor across every route, read by
+    /// `ProxyHttp::downstream_header_timeout` before every HTTP/1.x
+    /// request and enforced inside the header read. `0` = disabled.
     pub header_timeout_s: u32,
+    /// Backlog #82. Downstream idle timeout (seconds), read by
+    /// `ProxyHttp::downstream_idle_timeout` for every new connection and
+    /// every HTTP/1.1 keepalive reuse. `0` only in a snapshot no store
+    /// built (`ProxyConfig::default()`), and means the server's
+    /// built-in behaviour.
+    pub downstream_idle_timeout_s: u32,
     /// WAF auto-ban: ban IP after this many WAF blocks. 0 = disabled.
     pub waf_ban_threshold: u32,
     /// Duration of WAF-triggered bans in seconds.
@@ -260,6 +268,7 @@ pub struct ProxyConfigGlobals {
     pub flood_threshold_rps: u32,
     pub flood_strict_rps: u32,
     pub header_timeout_s: u32,
+    pub downstream_idle_timeout_s: u32,
     pub waf_ban_threshold: u32,
     pub waf_ban_duration_s: u32,
     pub trusted_proxy_cidrs: Vec<String>,
@@ -294,7 +303,9 @@ impl Default for ProxyConfigGlobals {
     /// permit via `route_mirror_semaphore`'s `.max(1)`, starving every
     /// shadow backend after the first. Keeping `default()` production-
     /// faithful stops that footgun from biting config built in tests
-    /// and fallbacks. Every other field keeps its zero/empty default.
+    /// and fallbacks. The WAF scan budget and the downstream idle timeout
+    /// seed to their production defaults for the same reason; every other
+    /// field keeps its zero/empty default.
     fn default() -> Self {
         Self {
             custom_security_presets: Vec::new(),
@@ -302,6 +313,7 @@ impl Default for ProxyConfigGlobals {
             flood_threshold_rps: 0,
             flood_strict_rps: 0,
             header_timeout_s: 0,
+            downstream_idle_timeout_s: lorica_config::models::DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S,
             waf_ban_threshold: 0,
             waf_ban_duration_s: 0,
             trusted_proxy_cidrs: Vec::new(),
@@ -342,6 +354,7 @@ impl ProxyConfig {
             flood_threshold_rps,
             flood_strict_rps,
             header_timeout_s,
+            downstream_idle_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs,
@@ -645,6 +658,7 @@ impl ProxyConfig {
             flood_threshold_rps,
             flood_strict_rps,
             header_timeout_s,
+            downstream_idle_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxies,

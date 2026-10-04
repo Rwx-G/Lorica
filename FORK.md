@@ -128,6 +128,67 @@ after any upstream sync that touches the function it lives in.
   request hangs. The WAF's Blocking-mode body hold (`WafBodyHold` in
   `lorica/src/proxy_wiring.rs`) hands the held body over through that
   call.
+- **`lorica-core` and `lorica-proxy`, the downstream idle timeout
+  (v1.9.0, backlog #82).** Sites: `lorica-core/src/apps/mod.rs`
+  (`HttpServerApp::downstream_idle_timeout`, a new defaulted method,
+  read in `ServerApp::process_new` for the HTTP/2 accept loop, the
+  wait before the first HTTP/1.x request and every HTTP/1.x keepalive
+  reuse), `lorica-proxy/src/proxy_trait.rs`
+  (`ProxyHttp::downstream_idle_timeout`, defaulted to `None`) and
+  `lorica-proxy/src/lib.rs` (`HttpProxy` forwards it). Upstream waits
+  without bound between HTTP/1.1 requests (`read_request` resets
+  keepalive to `Some(0)` on every request) unless the application sets
+  a bound per request, waits a fixed 60 s for the first one, and reads
+  the HTTP/2 idle timeout from the static `HttpServerOptions`. The new
+  method is asked per connection and per reuse, so Lorica's
+  `downstream_idle_timeout_s` setting applies on reload; with `None`
+  every site behaves as upstream does. Two more sites carry the same
+  bound on HTTP/2. `ServerApp::process_new` applies it to
+  `server::handshake`, which completes only once the client has sent its
+  connection preface: upstream waits for it without bound, so a client
+  that went silent after TLS held the connection before the accept
+  loop's idle timeout could start. And
+  `lorica-core/src/protocols/http/v2/server.rs`
+  (`accept_downstream_sessions`, `wait_for_idle_timeout`) keeps one idle
+  deadline per idle period, cleared only by an accepted session: upstream
+  restarts the idle sleep on every loop iteration, so each stream
+  rejected during acceptance (ambiguous `Content-Length`, conflicting
+  authority) started the period over, up to the malformed-stream budget.
+- **`lorica-core`, the HTTP/2 request body read timeout (v1.9.0).**
+  Sites: `lorica-core/src/protocols/http/v2/server.rs`
+  (`HttpSession::read_body_bytes`, where upstream leaves
+  `// TODO: timeout`, and the new `set_read_timeout` /
+  `get_read_timeout`) and `lorica-core/src/protocols/http/server.rs`
+  (`ServerSession::set_read_timeout` and `get_read_timeout`, which
+  upstream makes a no-op for HTTP/2). Upstream bounds an HTTP/1.x body
+  read by the session's read timeout (60 s by default) and an HTTP/2 one
+  by nothing. Lorica's HTTP/2 session takes the same per-read timeout,
+  reset on every read, failing with `ReadTimedout` past it. The default
+  stays `None`, as upstream, so only a caller that sets it is affected;
+  Lorica sets none globally, since a gRPC client stream may pause
+  between messages for as long as it likes, and its WAF body hold bounds
+  its own reads (`hold_body_until_verdict` in
+  `lorica/src/proxy_wiring.rs`).
+- **`lorica-core` and `lorica-proxy`, the request-header timeout
+  (v1.9.0, slowloris).** Sites: `lorica-core/src/protocols/http/v1/server.rs`
+  (`HttpSession::read_request` bounds the whole header from its first
+  byte when `set_header_timeout` was given a value, and records
+  `header_read_duration`), `lorica-core/src/protocols/http/server.rs`
+  (the `ServerSession` forwarders, HTTP/1.x only),
+  `lorica-core/src/apps/mod.rs` (`HttpServerApp::downstream_header_timeout`,
+  a new defaulted method, applied to the first HTTP/1.x session and to
+  every keepalive reuse in `ServerApp::process_new`),
+  `lorica-proxy/src/proxy_trait.rs` (`ProxyHttp::downstream_header_timeout`,
+  defaulted to `None`) and `lorica-proxy/src/lib.rs` (`HttpProxy` forwards
+  it, and `handle_new_request` answers a `ReadTimedout` header read with
+  `408` where upstream closes without a response). Upstream bounds each
+  read of the header separately (keepalive or read timeout), so a client
+  sending one byte per gap holds the read indefinitely, and offers no
+  measure of how long the header took. Lorica's `header_timeout_s` is
+  read per request from the live snapshot; with `None` the read loop
+  behaves as upstream does. The `408` also covers upstream's own read
+  timeout on a header (`KeepaliveStatus::Off`), which RFC 9110 15.5.9
+  describes as well as the new bound.
 
 ## Upstream sync record
 

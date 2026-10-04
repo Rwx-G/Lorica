@@ -667,10 +667,10 @@
       </li>
       <li>
         <strong>Slowloris threshold</strong>: time budget a client has
-        to finish sending the request headers. Clients that drip
-        bytes beyond this window are disconnected; a classic
-        Slowloris DoS pattern is blocked without touching the
-        backend.
+        to send the request headers, from their first byte. A request
+        whose headers took longer is refused with 408 and never reaches
+        the backend. A client that never finishes its headers is cut
+        by the global header timeout (Settings, Global configuration).
       </li>
     </ul>
     <p>

@@ -44,10 +44,16 @@
 //!    as a connection; a clean one arrives byte for byte; a client
 //!    that sent `Expect: 100-continue` is answered by the proxy.
 //!    Detection mode still streams.
+//! 9. The hold is bounded: a body that stops arriving is answered 408
+//!    after `downstream_idle_timeout_s`, one that has not arrived whole
+//!    after the route's `read_timeout_s` likewise, the connection is
+//!    closed and the origin never sees it; and a held body takes no slot
+//!    of the route's `max_connections`.
 //!
 //! "The origin never saw it" is asserted with a probe rather than a
 //! wait (`assert_origin_untouched`), so no assertion here depends on
-//! timing.
+//! timing, except the bounds of item 9, which are timeouts and are
+//! asserted with wide margins.
 //!
 //! The node-wide in-flight budget (AC #7) is exercised in
 //! `waf_body_scan_budget_e2e_test.rs`, which needs a process to itself
@@ -605,6 +611,14 @@ fn test_backend(id: &str, addr: SocketAddr) -> Backend {
 
 /// Every route given, all linked to one origin.
 async fn harness_with_routes(routes: Vec<Route>) -> (ProxyHarness, Upstream) {
+    harness_with_globals(routes, ProxyConfigGlobals::default()).await
+}
+
+/// [`harness_with_routes`] with the given global settings.
+async fn harness_with_globals(
+    routes: Vec<Route>,
+    globals: ProxyConfigGlobals,
+) -> (ProxyHarness, Upstream) {
     let (origin, upstream) = spawn_origin().await;
     let links = routes
         .iter()
@@ -615,7 +629,7 @@ async fn harness_with_routes(routes: Vec<Route>) -> (ProxyHarness, Upstream) {
         vec![test_backend("b-primary", origin)],
         vec![],
         links,
-        ProxyConfigGlobals::default(),
+        globals,
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
     (harness, upstream)
@@ -1275,6 +1289,154 @@ async fn chunked_parity_for_the_raised_window() {
 
     assert_eq!(oversize, 413, "chunked body past the raised window");
     assert_origin_untouched(harness.port, &mut upstream).await;
+}
+
+// ---------------------------------------------------------------------------
+// The bounds of the hold (item 9).
+// ---------------------------------------------------------------------------
+
+/// A Blocking route whose upstream `read_timeout_s`, the total bound of
+/// the hold, is `read_timeout_s`, behind a node whose
+/// `downstream_idle_timeout_s`, the bound of each read, is `idle_s`.
+async fn bounded_hold_harness(
+    read_timeout_s: i32,
+    idle_s: u32,
+    max_connections: Option<u32>,
+) -> (ProxyHarness, Upstream) {
+    let route = Route {
+        read_timeout_s,
+        max_connections,
+        ..waf_route(WafMode::Blocking)
+    };
+    harness_with_globals(
+        vec![route],
+        ProxyConfigGlobals {
+            downstream_idle_timeout_s: idle_s,
+            ..ProxyConfigGlobals::default()
+        },
+    )
+    .await
+}
+
+/// Reads until the proxy closes, returning everything it sent and how
+/// long after `started` the close came.
+async fn read_until_closed(rd: &mut OwnedReadHalf, started: Instant) -> (String, Duration) {
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(10), rd.read(&mut scratch))
+            .await
+            .expect("the proxy held the connection past 10 s")
+            .unwrap_or(0);
+        if n == 0 {
+            return (
+                String::from_utf8_lossy(&buf).to_lowercase(),
+                started.elapsed(),
+            );
+        }
+        buf.extend_from_slice(&scratch[..n]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_body_that_stops_arriving_is_answered_408_and_closed() {
+    // A tenth of the declared body, then nothing: only the 1 s gap bound
+    // can end the read, the route's 30 s total is far away.
+    let (harness, mut upstream) = bounded_hold_harness(30, 1, None).await;
+    let body = patterned_text(1000);
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", harness.port))
+        .await
+        .unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+    let mut opening = format!(
+        "PUT /upload HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        harness.port,
+        body.len()
+    )
+    .into_bytes();
+    opening.extend_from_slice(&body[..100]);
+    let started = Instant::now();
+    wr.write_all(&opening).await.unwrap();
+
+    let (response, closed_after) = read_until_closed(&mut rd, started).await;
+    assert!(response.starts_with("http/1.1 408"), "{response:?}");
+    assert!(
+        response.contains("\r\nconnection: close\r\n"),
+        "{response:?}"
+    );
+    assert!(
+        closed_after >= Duration::from_millis(900),
+        "cut before the gap bound: {closed_after:?}"
+    );
+    assert!(
+        closed_after < Duration::from_secs(5),
+        "cut late: {closed_after:?}"
+    );
+    drop(wr);
+    assert_origin_untouched(harness.port, &mut upstream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_body_slower_than_the_route_read_timeout_is_answered_408_and_closed() {
+    // Small chunks 200 ms apart, each far inside the 30 s gap bound, then
+    // silence well before the cut, so no write races the close: only the
+    // route's 1 s total can end the read.
+    let (harness, mut upstream) = bounded_hold_harness(1, 30, None).await;
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", harness.port))
+        .await
+        .unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+    let started = Instant::now();
+    wr.write_all(&chunked_head(harness.port, "/upload", "application/json"))
+        .await
+        .unwrap();
+    let trickle = tokio::spawn(async move {
+        for _ in 0..3 {
+            wr.write_all(&chunk_frames(b"0123456789")).await?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        std::future::pending::<()>().await;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let (response, closed_after) = read_until_closed(&mut rd, started).await;
+    trickle.abort();
+    assert!(response.starts_with("http/1.1 408"), "{response:?}");
+    assert!(
+        closed_after >= Duration::from_millis(900),
+        "cut before the total bound: {closed_after:?}"
+    );
+    assert!(
+        closed_after < Duration::from_secs(5),
+        "cut late: {closed_after:?}"
+    );
+    assert_origin_untouched(harness.port, &mut upstream).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_body_takes_no_route_connection_slot() {
+    // The route admits one request at a time. A client holding its body
+    // back must not be that request: the proxy's own `100 Continue` says
+    // the request has reached the hold, past every other stage, and a
+    // second request is still proxied while the first waits there.
+    let (harness, mut upstream) = bounded_hold_harness(30, 30, Some(1)).await;
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", harness.port))
+        .await
+        .unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+    let head = format!(
+        "PUT /upload HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        harness.port
+    );
+    wr.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    assert_eq!(read_status(&mut rd, &mut buf).await, 100);
+
+    let probe = send_request(harness.port, probe_request(harness.port)).await;
+    assert_eq!(probe, 200, "the held request took the route's only slot");
+    let seen = next_upstream_request(&mut upstream.requests).await;
+    assert!(seen.head.starts_with("get /probe "), "{seen:?}");
+    drop(wr);
 }
 
 // ---------------------------------------------------------------------------

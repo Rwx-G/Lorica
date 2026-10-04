@@ -23,7 +23,7 @@ MCP revision 2026-07-28 over stdio and over one path on the Epic 10
 automation listener, so an operator who has not enabled that listener
 has no MCP surface at all.
 
-The cycle also found and fixed six defects in versions already released,
+The cycle also found and fixed seven defects in versions already released,
 two of them serious: every `.deb` from 1.0.0 to 1.8.0 installed its
 files owned by the CI runner account, and since 1.7.2 a Blocking-mode
 WAF refusal of a chunked request body delivered that body to the backend
@@ -53,7 +53,7 @@ qualifications:
   checked by hand, and only the advisory tells them so.
 - **Three residual risks are accepted and named** (section 12): deleting
   a protected route and creating it again (#93), the bytes past the WAF
-  scan budget that stream unscanned, and the fifteen open backlog
+  scan budget that stream unscanned, and the fourteen open backlog
   entries that predate the cycle.
 
 Story status:
@@ -107,6 +107,7 @@ Top findings across the cycle, ranked by what they would have cost:
 | The CLI accepted any certificate on `127.0.0.1` and sent the password; single-process mode kept running after a failed management bind | Pre-existing in every management CLI command that logs in, up to 1.8.0 | Story 11.4 security audit (Low, pre-existing), then the pre-merge security audit for the bind | `b1a39995` pins the certificate the listener records as served; `d98b2927` makes a failed management bind fatal in both modes |
 | An RPM upgrade left the service stopped and disabled (`%preun` ran unguarded after the new `%post`) | 1.8.0 `.rpm` (pre-existing) | Pre-merge architecture audit (High) | `d98b2927` guards `%preun` and repairs the 1.8.0 hop in `%posttrans`; `352c184b` records the service state before the old scriptlets run, so an upgrade keeps it as the operator left it |
 | Six Network-tab settings (`audit_log_retention_days`, `connection_limits_per_ip`, the two bot-stash caps, the two mirror caps) had no request field, so every save dropped the edit | 1.6.0 to 1.8.0 | The backlog #89 pass | `352c184b` |
+| `header_timeout_s` and the per-route `slowloris_threshold_ms` were measured from a context created after the request header had been read, so a client trickling header bytes was never cut by either | `slowloris_threshold_ms` 0.1.2 to 1.8.0, `header_timeout_s` 1.6.0 to 1.8.0 | The backlog #82 work (the idle timeout bounds only each gap between header bytes) | `header_timeout_s` enforced inside the forked HTTP/1.1 header read, from the header's first byte (`downstream_header_timeout`); `slowloris_threshold_ms` judged on the header's measured duration; `CHANGELOG.md` Security |
 
 Two 1.8.0 defects of the environment resource, smaller in reach, were
 fixed on the way and are in `CHANGELOG.md` Security: a backend grant
@@ -522,10 +523,15 @@ IV3's replication half), #92 (the Epic 11 leftovers: the trace span, the
 dashboard tier hint, the shared e2e helper, the cheaper MCP answer), #94
 (the pre-merge findings on the automation plane, eight items), #95 (the
 policy crate). Raised during Story 11.3 and resolved on 2026-10-04: #89.
+Predating the cycle and taken into it by the maintainer on 2026-10-04:
+#82 (the downstream idle timeout, `downstream_idle_timeout_s`), and the
+slowloris defect it exposed (`header_timeout_s` and
+`slowloris_threshold_ms` bounded nothing; section 2), fixed in the same
+cycle with no backlog entry of its own.
 Raised and left open by decision: #93.
 
-The Open table holds sixteen entries: fifteen that predate the cycle
-(#14, 15, 52, 53, 64, 70, 72, 75, 79, 81, 82, 83, 84, 85, 86) and #93.
+The Open table holds fifteen entries: fourteen that predate the cycle
+(#14, 15, 52, 53, 64, 70, 72, 75, 79, 81, 83, 84, 85, 86) and #93.
 #52, the `lorica-fleet` extraction, was re-deferred at this close as at
 the last one, and its entry says so.
 
@@ -542,12 +548,11 @@ the last one, and its entry says so.
   Failing closed would let any client turn the shared budget into a 413
   for everyone else; the reasoning is in `docs/security.md` and the
   threat model.
-- **The fifteen pre-cycle backlog entries**, none of them a defect this
+- **The fourteen pre-cycle backlog entries**, none of them a defect this
   cycle introduced: upstream tracking (#14, #15, #81, #83), measurements
   owed (#64, #70, #75, #79), the fleet audit bounds and signed checkpoints
   (#72, #84), CA key protection (#85), multipart inspection (#86), the
-  downstream idle timeout (#82), the log-sink follow-ups (#53) and the
-  `lorica-fleet` extraction (#52).
+  log-sink follow-ups (#53) and the `lorica-fleet` extraction (#52).
 
 ## 13. Recommendations
 

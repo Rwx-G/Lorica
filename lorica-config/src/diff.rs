@@ -295,6 +295,13 @@ fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> Setting
             new_value: incoming.header_timeout_s.to_string(),
         });
     }
+    if current.downstream_idle_timeout_s != incoming.downstream_idle_timeout_s {
+        changes.push(SettingChange {
+            key: "downstream_idle_timeout_s".to_string(),
+            old_value: current.downstream_idle_timeout_s.to_string(),
+            new_value: incoming.downstream_idle_timeout_s.to_string(),
+        });
+    }
     SettingsDiff { changes }
 }
 

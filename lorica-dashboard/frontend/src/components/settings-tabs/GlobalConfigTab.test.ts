@@ -22,6 +22,7 @@ function form(overrides: Partial<FormShape> = {}): FormShape {
     flood_threshold_rps: 0,
     flood_strict_rps: 0,
     header_timeout_s: 10,
+    downstream_idle_timeout_s: 75,
     waf_ban_threshold: 3,
     waf_ban_duration_s: 3600,
     waf_body_scan_max_inflight_bytes: 268435456,
@@ -53,11 +54,13 @@ function props(overrides: Partial<TabProps> = {}): TabProps {
   };
 }
 
-/// Backlog #89: the settings the form could not write. Each label is
-/// paired with the key it edits, so a test can say which one failed.
+/// Backlog #89: the settings the form could not write, and backlog #82's
+/// idle timeout. Each label is paired with the key it edits, so a test
+/// can say which one failed.
 const ADDED_FIELDS: [string, keyof FormShape][] = [
   ['Flood Strict Rate (RPS per IP)', 'flood_strict_rps'],
   ['Header Timeout (seconds)', 'header_timeout_s'],
+  ['Idle Connection Timeout (seconds)', 'downstream_idle_timeout_s'],
   ['Max Active Probes', 'max_active_probes'],
   ['Load Test Concurrency Ceiling', 'loadtest_max_concurrency'],
   ['Load Test Duration Ceiling (seconds)', 'loadtest_max_duration_s'],
@@ -69,6 +72,7 @@ describe('GlobalConfigTab, the settings backlog #89 added', () => {
     const settingsForm = form({
       flood_strict_rps: 40,
       header_timeout_s: 15,
+      downstream_idle_timeout_s: 30,
       max_active_probes: 7,
       loadtest_max_concurrency: 250,
       loadtest_max_duration_s: 120,
@@ -131,6 +135,28 @@ describe('GlobalConfigTab, the settings backlog #89 added', () => {
       target: { value: '50' },
     });
     expect(row.querySelector('[role="alert"]')?.textContent).toContain('(50)');
+  });
+
+  it('refuses a header timeout of 0 before the schema loads', async () => {
+    render(GlobalConfigTab, { props: props() });
+    const field = screen.getByLabelText('Header Timeout (seconds)') as HTMLInputElement;
+    expect(field.min).toBe('1');
+    const row = field.parentElement as HTMLElement;
+    await fireEvent.input(field, { target: { value: '0' } });
+    expect(row.querySelector('[role="alert"]')).not.toBeNull();
+    await fireEvent.input(field, { target: { value: '10' } });
+    expect(row.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it('refuses an idle timeout of 0 before the schema loads', async () => {
+    render(GlobalConfigTab, { props: props() });
+    const field = screen.getByLabelText('Idle Connection Timeout (seconds)') as HTMLInputElement;
+    expect(field.min).toBe('1');
+    const row = field.parentElement as HTMLElement;
+    await fireEvent.input(field, { target: { value: '0' } });
+    expect(row.querySelector('[role="alert"]')).not.toBeNull();
+    await fireEvent.input(field, { target: { value: '75' } });
+    expect(row.querySelector('[role="alert"]')).toBeNull();
   });
 
   it('states the WAF ban ceiling the schema publishes', () => {

@@ -3448,3 +3448,17 @@ fn redirect_location_path_rule_literal_ignores_query_too() {
     let loc = build_redirect_location("https://example.com/final", "/src", Some("utm=x"), true);
     assert_eq!(loc, "https://example.com/final");
 }
+
+#[test]
+fn the_body_hold_is_bounded_per_read_and_in_total_whatever_is_stored() {
+    assert_eq!(
+        body_hold_bounds(75, 60),
+        (Duration::from_secs(75), Duration::from_secs(60))
+    );
+    // No stored value leaves either bound open.
+    assert_eq!(
+        body_hold_bounds(0, 0),
+        (Duration::from_secs(1), Duration::from_secs(1))
+    );
+    assert_eq!(body_hold_bounds(30, -5).1, Duration::from_secs(1));
+}

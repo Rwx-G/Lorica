@@ -1037,7 +1037,20 @@ async fn build_proxy_config_inner(
         .map(|s| s.flood_threshold_rps.max(0) as u32)
         .unwrap_or(0);
     let flood_strict_rps = settings.as_ref().map(|s| s.flood_strict_rps).unwrap_or(0);
-    let header_timeout_s = settings.as_ref().map(|s| s.header_timeout_s).unwrap_or(10);
+    // The API bounds it to 1..=3600; an import or a replicated blob is not
+    // checked against that bound. 0 must not reach the proxy as "no bound",
+    // and a value past the ceiling is read as the ceiling.
+    let header_timeout_s = match settings.as_ref().map(|s| s.header_timeout_s) {
+        None | Some(0) => lorica_config::models::DEFAULT_HEADER_TIMEOUT_S,
+        Some(seconds) => seconds.min(lorica_config::models::MAX_HEADER_TIMEOUT_S),
+    };
+    // The API refuses 0; an import or a replicated blob is not checked
+    // against that bound, and 0 must not reach the proxy as "no limit".
+    let downstream_idle_timeout_s = settings
+        .as_ref()
+        .map(|s| s.downstream_idle_timeout_s)
+        .filter(|s| *s > 0)
+        .unwrap_or(lorica_config::models::DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S);
     let waf_ban_threshold = settings
         .as_ref()
         .map(|s| s.waf_ban_threshold.max(0) as u32)
@@ -1105,6 +1118,7 @@ async fn build_proxy_config_inner(
             flood_threshold_rps,
             flood_strict_rps,
             header_timeout_s,
+            downstream_idle_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs: trusted_proxies,
@@ -1794,6 +1808,97 @@ mod environment_certificate_tests {
                 .iter()
                 .any(|environment| environment.contains("pr-42")),
             "a WARN must name the environment; warned: {warned:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod downstream_idle_timeout_tests {
+    //! Backlog #82 and the header timeout, through the real snapshot build.
+
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use lorica_config::models::{
+        GlobalSettings, DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S, DEFAULT_HEADER_TIMEOUT_S,
+        MAX_HEADER_TIMEOUT_S,
+    };
+    use lorica_config::ConfigStore;
+    use tokio::sync::Mutex;
+
+    use super::build_proxy_config;
+    use crate::proxy_wiring::ProxyConfig;
+
+    async fn snapshot_with(edit: impl FnOnce(&mut GlobalSettings)) -> ProxyConfig {
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        let mut settings = store.get_global_settings().expect("test setup: settings");
+        edit(&mut settings);
+        store
+            .update_global_settings(&settings)
+            .expect("test setup: settings write");
+        let store = Arc::new(Mutex::new(store));
+        let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+        build_proxy_config(&store, &proxy_config, None)
+            .await
+            .expect("the snapshot builds")
+            .config
+    }
+
+    async fn snapshot_with_stored(seconds: u32) -> u32 {
+        snapshot_with(|s| s.downstream_idle_timeout_s = seconds)
+            .await
+            .downstream_idle_timeout_s
+    }
+
+    async fn header_timeout_with_stored(seconds: u32) -> u32 {
+        snapshot_with(|s| s.header_timeout_s = seconds)
+            .await
+            .header_timeout_s
+    }
+
+    #[tokio::test]
+    async fn a_stored_header_timeout_reaches_the_snapshot() {
+        assert_eq!(header_timeout_with_stored(15).await, 15);
+    }
+
+    #[tokio::test]
+    async fn a_stored_zero_header_timeout_reads_as_the_default_and_never_as_no_bound() {
+        assert_eq!(
+            header_timeout_with_stored(0).await,
+            DEFAULT_HEADER_TIMEOUT_S
+        );
+    }
+
+    #[tokio::test]
+    async fn a_header_timeout_past_the_ceiling_reads_as_the_ceiling() {
+        assert_eq!(
+            header_timeout_with_stored(u32::MAX).await,
+            MAX_HEADER_TIMEOUT_S
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stored_timeout_reaches_the_snapshot() {
+        assert_eq!(snapshot_with_stored(30).await, 30);
+    }
+
+    #[tokio::test]
+    async fn a_stored_zero_reads_as_the_default_and_never_as_no_limit() {
+        assert_eq!(
+            snapshot_with_stored(0).await,
+            DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_store_ships_the_default() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        assert_eq!(
+            store
+                .get_global_settings()
+                .expect("settings")
+                .downstream_idle_timeout_s,
+            DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S
         );
     }
 }

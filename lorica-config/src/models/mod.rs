@@ -83,5 +83,6 @@ pub use route::{
 };
 pub use settings::{
     builtin_security_presets, resolve_security_preset, GlobalSettings, SecurityHeaderPreset,
+    DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S, DEFAULT_HEADER_TIMEOUT_S, MAX_HEADER_TIMEOUT_S,
 };
 pub use sla::{SlaBucket, SlaConfig, SlaSummary};

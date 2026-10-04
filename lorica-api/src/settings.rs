@@ -33,8 +33,17 @@ const MAX_GLOBAL_CONNECTIONS_MIN: i32 = 0;
 const FLOOD_THRESHOLD_RPS_MIN: i32 = 0;
 const FLOOD_STRICT_RPS_MIN: u32 = 0;
 const FLOOD_STRICT_RPS_MAX: u32 = 10_000_000;
-const HEADER_TIMEOUT_S_MIN: u32 = 0;
-const HEADER_TIMEOUT_S_MAX: u32 = 3600;
+// No 0, for the reason `downstream_idle_timeout_s` has none: with the
+// global bound off, a client trickling its header is cut by nothing, since
+// the per-route threshold is judged only once the header is complete.
+const HEADER_TIMEOUT_S_MIN: u32 = 1;
+const HEADER_TIMEOUT_S_MAX: u32 = lorica_config::models::MAX_HEADER_TIMEOUT_S;
+// Backlog #82. No 0: an idle connection the proxy never closes is the
+// defect the setting exists to remove, so "no limit" is not a value.
+// The ceiling matches the header timeout's: past an hour an idle
+// keepalive saves no handshake anyone notices.
+const DOWNSTREAM_IDLE_TIMEOUT_S_MIN: u32 = 1;
+const DOWNSTREAM_IDLE_TIMEOUT_S_MAX: u32 = 3600;
 const WAF_BAN_THRESHOLD_MIN: i32 = 0;
 const WAF_BAN_DURATION_S_MIN: i32 = 0;
 // Thirty days. Each ban copies the duration when it is issued, so
@@ -168,6 +177,12 @@ pub fn settings_schema() -> serde_json::Value {
             "min": HEADER_TIMEOUT_S_MIN,
             "max": HEADER_TIMEOUT_S_MAX,
             "default": d.header_timeout_s,
+        },
+        "downstream_idle_timeout_s": {
+            "type": "integer",
+            "min": DOWNSTREAM_IDLE_TIMEOUT_S_MIN,
+            "max": DOWNSTREAM_IDLE_TIMEOUT_S_MAX,
+            "default": d.downstream_idle_timeout_s,
         },
         "max_active_probes": {
             "type": "integer",
@@ -453,6 +468,9 @@ pub struct UpdateSettingsRequest {
     pub flood_strict_rps: Option<u32>,
     /// Global header-phase read timeout in seconds (Story 8.10 AC #1).
     pub header_timeout_s: Option<u32>,
+    /// Downstream idle timeout in seconds, HTTP/1.1 keepalive and
+    /// HTTP/2 (backlog #82).
+    pub downstream_idle_timeout_s: Option<u32>,
     /// Cap on concurrent synthetic probes (backlog #89).
     pub max_active_probes: Option<i32>,
     /// Load-test concurrency above which a run asks for confirmation
@@ -808,12 +826,18 @@ pub(crate) async fn update_settings_as(
             FLOOD_STRICT_RPS_MIN..=FLOOD_STRICT_RPS_MAX,
             &format!("flood_strict_rps must be in {FLOOD_STRICT_RPS_MIN}..={FLOOD_STRICT_RPS_MAX}"),
         )?;
-        // Story 8.10 AC #1. `0` disables the global header-phase floor.
+        // Story 8.10 AC #1.
         apply_ranged_u32(
             body.header_timeout_s,
             &mut settings.header_timeout_s,
             HEADER_TIMEOUT_S_MIN..=HEADER_TIMEOUT_S_MAX,
             &format!("header_timeout_s must be in {HEADER_TIMEOUT_S_MIN}..={HEADER_TIMEOUT_S_MAX}"),
+        )?;
+        apply_ranged(
+            body.downstream_idle_timeout_s,
+            &mut settings.downstream_idle_timeout_s,
+            DOWNSTREAM_IDLE_TIMEOUT_S_MIN..=DOWNSTREAM_IDLE_TIMEOUT_S_MAX,
+            "downstream_idle_timeout_s",
         )?;
         apply_ranged(
             body.max_active_probes,
@@ -2367,8 +2391,9 @@ mod tests {
     use crate::tests::{parse_data, send, setup_admin_and_login, test_state};
 
     /// The settings the dashboard's form writes since backlog #89 and
-    /// the Story 8.9 bounds its Network tab showed and never sent.
-    const FORM_WRITTEN_SINCE_1_9: [&str; 10] = [
+    /// the Story 8.9 bounds its Network tab showed and never sent, plus
+    /// the downstream idle timeout (backlog #82), new in 1.9.0.
+    const FORM_WRITTEN_SINCE_1_9: [&str; 11] = [
         "max_active_probes",
         "loadtest_max_concurrency",
         "loadtest_max_duration_s",
@@ -2379,6 +2404,7 @@ mod tests {
         "bot_stash_per_prefix_max",
         "mirror_max_concurrent_per_route",
         "mirror_max_concurrent_global",
+        "downstream_idle_timeout_s",
     ];
 
     #[tokio::test]

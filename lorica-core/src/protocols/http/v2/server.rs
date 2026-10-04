@@ -28,7 +28,7 @@ use lorica_timeout::timeout;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::ready;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use crate::protocols::http::authority::validate_request_authority_fields;
@@ -146,6 +146,10 @@ pub(crate) async fn accept_downstream_sessions<F>(
     let mut malformed_streams = 0usize;
     // In-flight sessions, decremented by the `StreamGuard` given to `on_session`.
     let active = Arc::new(ActiveSessions::new());
+    // Lorica: when the current idle period ends. Set once the connection has
+    // nothing in flight and cleared only by an accepted session, so a stream
+    // rejected during acceptance does not start the period over.
+    let mut idle_deadline: Option<Instant> = None;
     loop {
         let h2_stream = if shutdown_initiated {
             HttpSession::from_h2_conn_with_malformed_budget(
@@ -173,7 +177,7 @@ pub(crate) async fn accept_downstream_sessions<F>(
                 // Any accepted stream cancels this future. The next iteration
                 // waits for all active streams to finish before starting a fresh
                 // idle period.
-                _ = wait_for_idle_timeout(&active, idle_timeout.unwrap_or_default()), if idle_timeout.is_some() => {
+                _ = wait_for_idle_timeout(&active, idle_timeout.unwrap_or_default(), &mut idle_deadline), if idle_timeout.is_some() => {
                     // Idle with nothing in flight: drop `conn` to close the
                     // socket now (no graceful GOAWAY wait that could hang on
                     // a dead peer).
@@ -194,6 +198,7 @@ pub(crate) async fn accept_downstream_sessions<F>(
             // connection alive and continue accepting sibling streams.
             Ok(Some(H2Accept::Rejected)) => continue,
             Ok(Some(H2Accept::Session(session))) => {
+                idle_deadline = None;
                 on_session(*session, active.start_session());
             }
         }
@@ -240,10 +245,15 @@ impl ActiveSessions {
     }
 }
 
-async fn wait_for_idle_timeout(active: &ActiveSessions, idle_timeout: Duration) {
+async fn wait_for_idle_timeout(
+    active: &ActiveSessions,
+    idle_timeout: Duration,
+    idle_deadline: &mut Option<Instant>,
+) {
     active.wait_until_idle().await;
     if !idle_timeout.is_zero() {
-        lorica_timeout::sleep(idle_timeout).await;
+        let deadline = *idle_deadline.get_or_insert_with(|| Instant::now() + idle_timeout);
+        lorica_timeout::sleep(deadline.saturating_duration_since(Instant::now())).await;
     }
 }
 
@@ -293,6 +303,9 @@ pub struct HttpSession {
     pub write_timeout: Option<Duration>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
+    // Lorica: how long each request body read may wait, reset on every read.
+    // `None`, the default, waits as upstream does: without bound.
+    read_timeout: Option<Duration>,
 }
 
 /// The outcome of accepting the next event on an HTTP/2 downstream connection.
@@ -488,6 +501,7 @@ impl HttpSession {
             digest,
             write_timeout: None,
             total_drain_timeout: None,
+            read_timeout: None,
         }))))
     }
 
@@ -508,9 +522,23 @@ impl HttpSession {
     }
 
     /// Read request body bytes. `None` when there is no more body to read.
+    ///
+    /// Waits at most the read timeout, when one is set
+    /// ([`Self::set_read_timeout`]), and fails with `ReadTimedout` past it.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        // TODO: timeout
-        let data = self.request_body_reader.data().await.transpose().or_err(
+        let data = match self.read_timeout {
+            Some(t) => match timeout(t, self.request_body_reader.data()).await {
+                Ok(data) => data,
+                Err(_) => {
+                    return Error::e_explain(
+                        ErrorType::ReadTimedout,
+                        format!("reading body, timeout: {t:?}"),
+                    )
+                }
+            },
+            None => self.request_body_reader.data().await,
+        };
+        let data = data.transpose().or_err(
             ErrorType::ReadError,
             "while reading downstream request body",
         )?;
@@ -574,6 +602,18 @@ impl HttpSession {
             },
             None => self.do_drain_request_body().await,
         }
+    }
+
+    /// Sets the downstream read timeout: how long each request body read
+    /// may wait for data. It is reset on every read and does not bound the
+    /// body as a whole. `None`, the default, waits without bound.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    /// Get the read timeout.
+    pub fn get_read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 
     /// Sets the downstream write timeout. This will trigger if we're unable
@@ -1309,7 +1349,7 @@ mod test {
         let guard = active.start_session();
         let timeout_active = active.clone();
         let timeout = tokio::spawn(async move {
-            wait_for_idle_timeout(&timeout_active, Duration::ZERO).await;
+            wait_for_idle_timeout(&timeout_active, Duration::ZERO, &mut None).await;
         });
 
         tokio::task::yield_now().await;
@@ -1323,6 +1363,132 @@ mod test {
             .await
             .expect("zero timeout did not expire after the session finished")
             .expect("timeout task panicked");
+    }
+
+    #[tokio::test]
+    async fn test_read_timeout_bounds_an_h2_body_read_through_the_server_session() {
+        let (client, server) = duplex(65536);
+        let (client_done, wait_client_done) = oneshot::channel::<()>();
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            // HEADERS without END_STREAM and no DATA: a body that never comes.
+            let (_response, _body) = h2.send_request(request, false).unwrap();
+            let _ = wait_client_done.await;
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let Some(H2Accept::Session(session)) =
+            HttpSession::from_h2_conn(&mut connection, digest.clone())
+                .await
+                .unwrap()
+        else {
+            panic!("the request did not reach the application");
+        };
+        let driver = tokio::spawn(async move {
+            while let Ok(Some(_)) = HttpSession::from_h2_conn(&mut connection, digest.clone()).await
+            {
+            }
+        });
+        let mut session = crate::protocols::http::ServerSession::new_http2(*session);
+
+        assert_eq!(session.get_read_timeout(), None, "the default is unchanged");
+        assert!(
+            timeout(Duration::from_millis(300), session.read_request_body())
+                .await
+                .is_err(),
+            "without a read timeout an h2 body read waits"
+        );
+
+        session.set_read_timeout(Some(Duration::from_millis(200)));
+        assert_eq!(session.get_read_timeout(), Some(Duration::from_millis(200)));
+        let err = timeout(Duration::from_secs(5), session.read_request_body())
+            .await
+            .expect("the read timeout did not bound the h2 body read")
+            .expect_err("no body was sent");
+        assert_eq!(err.etype(), &ErrorType::ReadTimedout);
+
+        drop(session);
+        let _ = client_done.send(());
+        client.await.unwrap();
+        driver.abort();
+    }
+
+    #[tokio::test]
+    async fn test_rejected_streams_do_not_restart_the_idle_period() {
+        let (client, server) = duplex(65536);
+        let (client_done, wait_client_done) = oneshot::channel::<()>();
+
+        // One malformed stream every 100 ms for 2 s, under the malformed
+        // budget: each is rejected during acceptance and none starts a
+        // session, so none may extend the 400 ms idle period.
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2;
+            for _ in 0..20 {
+                let Ok(ready) = h2.ready().await else { break };
+                h2 = ready;
+                let request = Request::builder()
+                    .method(Method::GET)
+                    .uri("https://www.example.com/")
+                    .header("content-length", "5")
+                    .header("content-length", "6")
+                    .body(())
+                    .unwrap();
+                // A body matching the first value, so the h2 codec accepts
+                // the stream and the fork's own framing check rejects it.
+                let Ok((_response, mut body)) = h2.send_request(request, false) else {
+                    break;
+                };
+                body.reserve_capacity(5);
+                if body.send_data("abcde".into(), true).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let _ = wait_client_done.await;
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let started = std::time::Instant::now();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_in_loop = accepted.clone();
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        timeout(
+            Duration::from_millis(1500),
+            accept_downstream_sessions(
+                connection,
+                Arc::new(Digest::default()),
+                shutdown,
+                Some(Duration::from_millis(400)),
+                move |_, _| {
+                    accepted_in_loop.fetch_add(1, Ordering::Relaxed);
+                },
+            ),
+        )
+        .await
+        .expect("rejected streams kept restarting the idle period");
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "closed before the idle timeout"
+        );
+        assert_eq!(accepted.load(Ordering::Relaxed), 0, "no stream was valid");
+
+        let _ = client_done.send(());
+        client.await.unwrap();
     }
 
     #[tokio::test]
