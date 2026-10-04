@@ -1827,6 +1827,26 @@ static AUDIT_ROWS_DROPPED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     )
 });
 
+/// Request units each plane runs detached from their connections and
+/// has not finished (`crate::db::DetachedUnits`). Labels: plane
+/// (`management | automation`). A value that stays at the plane's
+/// bound means requests are waiting for a slot; one that climbs while
+/// the live connections do not means units outlive their clients.
+static DETACHED_REQUEST_UNITS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge_vec(
+        "detached_request_units",
+        "Request units running detached from their connections, per plane",
+        &["plane"],
+    )
+});
+
+/// Move the in-flight count of `plane`'s detached request units.
+pub fn adjust_detached_request_units(plane: &str, delta: i64) {
+    DETACHED_REQUEST_UNITS
+        .with_label_values(&[plane])
+        .add(delta);
+}
+
 /// Bump the dropped-audit-row counter.
 pub fn inc_audit_rows_dropped() {
     AUDIT_ROWS_DROPPED_TOTAL.inc();

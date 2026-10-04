@@ -53,6 +53,11 @@ COPY lorica-shmem/ lorica-shmem/
 COPY lorica-mcp/ lorica-mcp/
 COPY lorica-automation-policy/ lorica-automation-policy/
 COPY tinyufo/ tinyufo/
+# Test-only: tests in lorica-api and lorica-automation-policy compile
+# the top-level docs/*.md pages in with include_str!, which is why
+# .dockerignore lets those pages through. The release Dockerfile and the
+# e2e image build no tests and copy no docs.
+COPY docs/ docs/
 
 # Copy pre-built frontend
 COPY --from=frontend /app/lorica-dashboard/frontend/dist/ lorica-dashboard/frontend/dist/

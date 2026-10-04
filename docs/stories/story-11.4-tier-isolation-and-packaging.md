@@ -754,3 +754,8 @@ ownership is kept outside the repository for the maintainer to publish.
   `[Unreleased]` rewritten as the release's final state. Deferred items
   are backlog #91 to #95. The CLI, packaging and CI findings were fixed
   in a separate pass.
+- 2026-10-04: The deferred items named above, backlog #91 to #95, are
+  all resolved in the 1.9.0 cycle; `docs/backlog.md` "Resolved in the
+  v1.9.0 cycle" records each. The `TIERS` this story's Dev Notes place
+  in `lorica-mcp/src/tier.rs` moved to `lorica-automation-policy` with
+  #95; the notes are kept as written.

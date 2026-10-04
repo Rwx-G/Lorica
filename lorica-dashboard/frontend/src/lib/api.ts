@@ -922,6 +922,10 @@ export interface GlobalSettingsResponse {
   cert_critical_days: number;
   max_global_connections: number;
   flood_threshold_rps: number;
+  // Per-IP admission rate in flood mode; 0 = auto (half the threshold).
+  flood_strict_rps: number;
+  // Global header-phase read timeout (s); 0 = off.
+  header_timeout_s: number;
   waf_ban_threshold: number;
   waf_ban_duration_s: number;
   // Process-wide ceiling on the bytes the WAF holds in body-scan
@@ -932,6 +936,12 @@ export interface GlobalSettingsResponse {
   sla_purge_enabled: boolean;
   sla_purge_retention_days: number;
   sla_purge_schedule: string;
+  // Synthetic probe cap and the load-test ceilings above which a run
+  // asks for confirmation (backlog #89).
+  max_active_probes: number;
+  loadtest_max_concurrency: number;
+  loadtest_max_duration_s: number;
+  loadtest_max_rps: number;
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies: string[];
   waf_whitelist_ips: string[];
@@ -1000,6 +1010,8 @@ export interface UpdateSettingsRequest {
   cert_critical_days?: number;
   max_global_connections?: number;
   flood_threshold_rps?: number;
+  flood_strict_rps?: number;
+  header_timeout_s?: number;
   waf_ban_threshold?: number;
   waf_ban_duration_s?: number;
   waf_body_scan_max_inflight_bytes?: number;
@@ -1008,6 +1020,10 @@ export interface UpdateSettingsRequest {
   sla_purge_enabled?: boolean;
   sla_purge_retention_days?: number;
   sla_purge_schedule?: string;
+  max_active_probes?: number;
+  loadtest_max_concurrency?: number;
+  loadtest_max_duration_s?: number;
+  loadtest_max_rps?: number;
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies?: string[];
   waf_whitelist_ips?: string[];
@@ -1028,9 +1044,10 @@ export interface UpdateSettingsRequest {
   cert_export_group_gid?: number | null;
   cert_export_file_mode?: number;
   cert_export_dir_mode?: number;
-  // Defense-in-depth data-plane bounds (Story 8.9).
+  // Defense-in-depth data-plane bounds (Story 8.9). The per-IP cap is
+  // lifted by 0; a null leaves it as stored.
   audit_log_retention_days?: number;
-  connection_limits_per_ip?: number | null;
+  connection_limits_per_ip?: number;
   bot_stash_max_entries?: number;
   bot_stash_per_prefix_max?: number;
   mirror_max_concurrent_per_route?: number;

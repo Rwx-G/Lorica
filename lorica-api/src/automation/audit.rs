@@ -134,7 +134,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -146,6 +146,7 @@ use super::auth::AutomationPrincipal;
 use super::mcp::{McpCallRecord, MCP_PATH, NAME_HEADER};
 use super::scope::{scope_str, ScopeRequirement};
 use crate::audit::AuditContext;
+use crate::preview::DryRunQuery;
 use crate::server::AppState;
 
 /// `operator_role` stamped on every automation row.
@@ -265,6 +266,7 @@ pub const AUTOMATION_AUDIT_REASONS: &[&str] = &[
     "missing_claim",
     "bound_claim_mismatch",
     "replayed",
+    "replay_set_full",
     // The scope gate: the path that declares no scope. The grant a
     // token did not carry is the scope's own spelling, derived.
     NO_DECLARED_SCOPE,
@@ -610,19 +612,26 @@ pub async fn audit_automation_request(
         .unwrap_or_default()
         .to_string();
 
+    let previews: bool = Query::<DryRunQuery>::try_from_uri(req.uri())
+        .is_ok_and(|Query(query)| query.mode().previews());
+
     let slot = PrincipalSlot::default();
     req.extensions_mut().insert(slot.clone());
 
     // The handler, this row, the counters, and whatever the handler
     // does after its store commit (the reload signal, the management
-    // row) run as one task this request awaits but does not own. hyper
-    // drops the request future when the peer goes away, and a store
-    // closure on the blocking pool commits whether or not anyone still
-    // awaits it: on the request future, a committed write whose client
-    // hung up landed with no row, no reload and no count. A task runs
-    // to its end whoever stopped listening, so a request either never
-    // reached the store or lands the whole unit.
-    let unit = tokio::spawn(async move {
+    // row) run as one unit this request awaits but does not own
+    // (`crate::db::DetachedUnits`). hyper drops the request future when
+    // the peer goes away, and a store closure on the blocking pool
+    // commits whether or not anyone still awaits it: on the request
+    // future, a committed write whose client hung up landed with no
+    // row, no reload and no count. A unit runs to its end whoever
+    // stopped listening, so a request either never reached the store
+    // or lands the whole unit; and since it outlives the connection,
+    // the units in flight are bounded by [`automation_units`] rather
+    // than by the listener's connection caps.
+    let tracker = state.task_tracker.clone();
+    let unit = async move {
         let response = next.run(req).await;
         record_request_row(
             &state,
@@ -630,6 +639,7 @@ pub async fn audit_automation_request(
                 method,
                 path,
                 is_mcp,
+                previews,
                 filters,
                 claimed,
                 ip,
@@ -639,15 +649,28 @@ pub async fn audit_automation_request(
             &response,
         );
         response
-    });
-    match unit.await {
-        Ok(response) => response,
-        // The panic net inside this layer turns a handler's unwind into
-        // a 500, so a panic here is this layer's own and keeps its
-        // meaning; a cancelled task is the runtime shutting down.
-        Err(failed) if failed.is_panic() => std::panic::resume_unwind(failed.into_panic()),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+    };
+    // The panic net inside this layer turns a handler's unwind into a
+    // 500, so a panic resumed here is this layer's own and keeps its
+    // meaning; a unit that never answered is the runtime shutting down.
+    automation_units()
+        .run(&tracker, unit)
+        .await
+        .unwrap_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())
+}
+
+/// The automation plane's request units: as many at once as the
+/// listener admits connections at once, so an abandoned unit holds the
+/// place a live connection would and a flood of resets builds no queue
+/// of work behind the store mutex the dashboard shares.
+pub fn automation_units() -> &'static crate::db::DetachedUnits {
+    static UNITS: OnceLock<crate::db::DetachedUnits> = OnceLock::new();
+    UNITS.get_or_init(|| {
+        crate::db::DetachedUnits::new(
+            "automation",
+            super::listener::AUTOMATION_MAX_CONCURRENT_HANDSHAKES,
+        )
+    })
 }
 
 /// What the layer read off a request on the way down, for the row it
@@ -656,6 +679,9 @@ struct RequestSeen {
     method: Method,
     path: String,
     is_mcp: bool,
+    /// The query asks for a preview (`?dry_run=true`), which writes
+    /// nothing.
+    previews: bool,
     filters: String,
     claimed: String,
     ip: String,
@@ -669,6 +695,7 @@ fn record_request_row(state: &AppState, seen: RequestSeen, response: &Response) 
         method,
         path,
         is_mcp,
+        previews,
         filters,
         claimed,
         ip,
@@ -741,17 +768,69 @@ fn record_request_row(state: &AppState, seen: RequestSeen, response: &Response) 
     // words was never a secret, and a column an operator cannot read
     // is not worth the row it sits in.
     //
-    // A read, or a request no credential got through, costs its sender
-    // nothing, so its row is the one shed first on a full queue: a
-    // flood of them must not shed the row of a write beside it. A
-    // write an accepted credential sent keeps the mutation reserve.
+    // Only a write that happened keeps the mutation reserve of the
+    // queue; every other row is shed first on a full queue. A read, a
+    // refusal, a preview or a read-tier MCP call costs its sender no
+    // write budget, so a flood of them must not shed the row of a write
+    // beside it, and must not be able to fill the reserve itself.
     let action = action_for(outcome_word, reason.as_deref());
     let target = (AUTOMATION_TARGET_TYPE, target.as_str());
     let accepted = matches!(decision, Some(AuthOutcome::Accepted { .. }));
-    if accepted && method != Method::GET && method != Method::HEAD {
+    let wrote = WriteEvidence {
+        accepted,
+        method: &method,
+        is_mcp,
+        previews,
+        status: response.status(),
+        mcp: mcp.as_ref(),
+    };
+    if wrote.keeps_mutation_reserve() {
         crate::audit::record_now(state, &ctx, &action, target);
     } else {
         crate::audit::record_request(state, &ctx, &action, target);
+    }
+}
+
+/// What a request's row knows about whether the request wrote.
+struct WriteEvidence<'a> {
+    /// The bearer gate accepted the credential.
+    accepted: bool,
+    method: &'a Method,
+    /// The request reached the MCP endpoint.
+    is_mcp: bool,
+    /// The query asked for a preview.
+    previews: bool,
+    status: StatusCode,
+    /// What the MCP handler established, when it ran.
+    mcp: Option<&'a McpCallRecord>,
+}
+
+impl WriteEvidence<'_> {
+    /// Whether the row is a mutation's, which the audit queue sheds
+    /// last: an accepted credential's write that the plane answered
+    /// with a success, outside a preview, or an MCP call of an apply
+    /// tool that succeeded. A refusal by any gate or handler, a 404, a
+    /// preview, a read, and an MCP call of a read or preview tool are
+    /// not, whatever their verb.
+    fn keeps_mutation_reserve(&self) -> bool {
+        if !self.accepted {
+            return false;
+        }
+        if self.is_mcp {
+            return self.mcp.is_some_and(|record| {
+                record.outcome == Outcome::Ok
+                    && record
+                        .tool
+                        .as_deref()
+                        .and_then(tools::find)
+                        .and_then(|spec| spec.write())
+                        .is_some_and(|write| !write.previews)
+            });
+        }
+        *self.method != Method::GET
+            && *self.method != Method::HEAD
+            && !self.previews
+            && self.status.is_success()
     }
 }
 
@@ -786,6 +865,116 @@ mod tests {
         // The node's own fault reads as its own word.
         assert_eq!(outcome(StatusCode::INTERNAL_SERVER_ERROR), "error");
         assert_eq!(outcome(StatusCode::SERVICE_UNAVAILABLE), "error");
+    }
+
+    #[test]
+    fn only_a_write_that_happened_keeps_the_mutation_reserve() {
+        // Security audit M2: the reserve went to every accepted non-GET,
+        // so a read-tier token filled it with refused PUTs and MCP read
+        // calls, which cost no write budget, and shed real mutations.
+        let apply_tool = tools::catalogue()
+            .iter()
+            .find(|spec| spec.write().is_some_and(|write| !write.previews))
+            .expect("the catalogue has an apply tool");
+        let preview_tool = tools::catalogue()
+            .iter()
+            .find(|spec| spec.write().is_some_and(|write| write.previews))
+            .expect("the catalogue has a preview tool");
+        let read_tool = tools::catalogue()
+            .iter()
+            .find(|spec| spec.write().is_none())
+            .expect("the catalogue has a read tool");
+        let call = |tool: &str, outcome: Outcome| McpCallRecord {
+            tool: Some(tool.to_string()),
+            argument_names: Vec::new(),
+            outcome,
+        };
+        let keeps = |accepted: bool,
+                     method: Method,
+                     previews: bool,
+                     status: StatusCode,
+                     mcp: Option<&McpCallRecord>| {
+            WriteEvidence {
+                accepted,
+                method: &method,
+                is_mcp: mcp.is_some(),
+                previews,
+                status,
+                mcp,
+            }
+            .keeps_mutation_reserve()
+        };
+
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            assert!(keeps(true, method.clone(), false, StatusCode::OK, None));
+            assert!(keeps(
+                true,
+                method.clone(),
+                false,
+                StatusCode::CREATED,
+                None
+            ));
+            for refused in [
+                StatusCode::FORBIDDEN,
+                StatusCode::NOT_FOUND,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::CONFLICT,
+            ] {
+                assert!(
+                    !keeps(true, method.clone(), false, refused, None),
+                    "{method} {refused}"
+                );
+            }
+            assert!(
+                !keeps(true, method.clone(), true, StatusCode::OK, None),
+                "a preview"
+            );
+            assert!(
+                !keeps(false, method.clone(), false, StatusCode::OK, None),
+                "no credential"
+            );
+        }
+        assert!(
+            !keeps(true, Method::GET, false, StatusCode::OK, None),
+            "a read"
+        );
+
+        let applied = call(apply_tool.name, Outcome::Ok);
+        assert!(keeps(
+            true,
+            Method::POST,
+            false,
+            StatusCode::OK,
+            Some(&applied)
+        ));
+        for no_write in [
+            call(apply_tool.name, Outcome::Refused(403)),
+            call(apply_tool.name, Outcome::RateLimited),
+            call(apply_tool.name, Outcome::InvalidParams),
+            call(preview_tool.name, Outcome::Ok),
+            call(read_tool.name, Outcome::Ok),
+            McpCallRecord {
+                tool: None,
+                argument_names: Vec::new(),
+                outcome: Outcome::Ok,
+            },
+        ] {
+            assert!(
+                !keeps(true, Method::POST, false, StatusCode::OK, Some(&no_write)),
+                "{no_write:?}"
+            );
+        }
+        // An MCP POST a gate refused carries no record at all.
+        let refused_at_the_gate = WriteEvidence {
+            accepted: true,
+            method: &Method::POST,
+            is_mcp: true,
+            previews: false,
+            status: StatusCode::FORBIDDEN,
+            mcp: None,
+        };
+        assert!(!refused_at_the_gate.keeps_mutation_reserve());
     }
 
     #[test]
@@ -859,6 +1048,7 @@ mod tests {
             RefusalReason::MissingClaim("jti".to_string()),
             RefusalReason::BoundClaimMismatch("environment_protected".to_string()),
             RefusalReason::Replayed,
+            RefusalReason::ReplaySetFull,
         ];
         for variant in &every_variant {
             // Exhaustive on purpose: a new variant stops compiling
@@ -877,7 +1067,8 @@ mod tests {
                 | RefusalReason::WrongIss
                 | RefusalReason::MissingClaim(_)
                 | RefusalReason::BoundClaimMismatch(_)
-                | RefusalReason::Replayed => {}
+                | RefusalReason::Replayed
+                | RefusalReason::ReplaySetFull => {}
             }
             let reason = variant.audit_reason();
             assert!(

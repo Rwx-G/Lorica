@@ -319,18 +319,28 @@ goes; the header name, match type and backends stay), the userinfo and
 query values of a route's `forward_auth` address, the query values of a
 backend's `health_check_path`, and the query values and fragment of an
 access-log row's `path`. It does so wherever it answers such a row: the
-listings, every write answer and every preview, including a preview's
-list of changed fields. The dashboard and the log sinks are unchanged.
+listings, every write answer and every preview. A preview's list of
+changed fields is computed on the masked views, so a change confined to
+a withheld value reads as no change, and the list cannot confirm a
+guess at one. The dashboard and the log sinks are unchanged.
 A config-tier model that edits one header rule sends the whole list
 back, and a rule returned with the `[redacted]` value it was read with
 keeps the value stored for the rule at the same position with the same
 header name and match type; a marker the node cannot place that way, on
 a rule added, moved, renamed or retyped, is refused and names the rule
-by position, and the marker is never stored. The environment a route or
+by position, and the marker is never stored. A backend's
+`health_check_path` read back with its `[redacted]` query values and
+sent unchanged keeps the stored path; one whose masked form differs
+from the stored path's is refused, and a create carrying the marker is
+refused, so a read-modify-write cannot replace a probe credential with
+the marker. The environment a route or
 backend belongs to (its `managed_by` mark) is named only to a token the
 environment endpoint would answer for that environment; every other
 token reads the mark with the name `[redacted]`, so the row still says
-it is managed without saying whose. The
+it is managed without saying whose, and the fields that carry the
+same name, a row's `group_name` (`automation:<name>`) and a backend's
+`name` (`<name>-<index>`), are withheld from that token the same way.
+The
 function and the reasoning are `lorica-api/src/automation/redact.rs`,
 and a test walks a route carrying an upstream credential through the
 listing, an apply, two previews and the MCP tool, asserting the value
@@ -482,17 +492,37 @@ the constant and asserts it is here:
 | `bot_protection`, `bot_protection_disable` | added where none is set; never changed or removed once set |
 | `waf_enabled` | switched on, never off |
 | `waf_mode` | moved to blocking, never back to detection |
-| `rate_limit` | added, or tightened with its capacity and refill never raised and its scope unchanged; never removed |
-| `rate_limit_rps`, `rate_limit_burst` | added, or lowered; never raised or cleared |
+| `rate_limit`, `rate_limit_rps`, `rate_limit_burst` | the bucket the proxy enforces, `rate_limit` when set and the legacy pair otherwise, is added, or tightened with its capacity and refill never raised and its scope unchanged; never removed |
 | `auto_ban_threshold` | added, or lowered; never raised or cleared |
 | `tls_skip_verify` | switched off, never on |
 | `tls_upstream` | switched on, never off |
 | `tls_sni` | left unchanged while the upstream certificate is verified |
 
-A create weighs nothing it does not set against the row it would have
-had: every route control above is at its weakest on the row the
-management create stores when the body names none of them, so a route
-create is not bounded by the table, and a backend create is weighed
+A route row is also weighed against the route it would take requests
+from. A create, or an update that adds a name, moves the path prefix or
+switches the route on, whose exact name would take a host that a
+wildcard route or the catch-all `_` serves today, is held to the table
+against that route, through the proxy's own route selection
+(`lorica-config/src/route_selection.rs`), exactly as an update is held
+against the row it replaces. Without it, `app1.review.example.com`
+created under an operator's `*.review.example.com` took that host's
+traffic to a row with none of the wildcard's protections, and the token
+never had to reach the protected route. The refusal names the control
+and the displaced route's id. One consequence to plan for: a catch-all
+carrying Basic auth refuses every token route create on a host it
+serves, since a token never sends the password a new route would need.
+The environment resource (`environments:write`, no MCP tool) writes its
+exact-host route from a fixed profile rather than a body a model
+shapes, so it is not refused there: by the maintainer's decision of
+2026-10-04 its route inherits the displaced route's controls through
+the same rules, the Basic-auth credential copied server side, and its
+answer names the displaced routes by id (`docs/automation.md`, the
+environment resource).
+
+Otherwise a create weighs nothing it does not set against the row it
+would have had: every route control above is at its weakest on the row
+the management create stores when the body names none of them, and a
+backend create is weighed
 against the create's own default, which verifies the upstream
 certificate whenever TLS is on, so a create asking for
 `tls_skip_verify` is refused. The Basic-auth username is not offered
@@ -778,11 +808,15 @@ the story that built the tier names every field:
 - **`audit_log_retention_days`**, although it reads as retention:
   shortening it destroys the trail that tells a model's actions from a
   person's.
-- **The settings the dashboard's form cannot write**: `max_active_probes`
-  and the load-test ceilings, the flood strict rate and the header
-  timeout. A value set here could not be undone there, which fails the
-  rule above. They can join the tier the day the dashboard gains a
-  field for them, and not before.
+- **`max_active_probes` and the load-test ceilings, the flood strict
+  rate and the header timeout.** They were left out because the
+  dashboard's form could not write them, so a value set here could not
+  have been undone there. The form writes all six since 1.9.0, which
+  removes that obstacle and decides nothing else: a field on the form
+  is what the rule above requires of an entry, not a reason to add one.
+  Admitting any of them is its own decision, with its reason, its bound
+  and its safe direction, and none has been taken. The flood strict
+  rate may have no safe direction at all.
 
 **Where it stops.** The paths listed in [What it is not](#what-it-is-not)
 are declared for nobody in the scope matrix, so they answer 403 to the
@@ -1212,8 +1246,12 @@ A write the node committed lands both rows and signals the reload even
 when the client hung up before the answer: the request runs as a task
 the connection does not own, so a store commit, its rows and its reload
 are one unit a disconnect cannot split. A mutation's rows also keep a
-reserved share of the audit queue that the rows of reads and of refused
-requests cannot take, so a flood of those does not shed them.
+reserved share of the audit queue, and only a write that happened takes
+it: a write the plane answered with success, outside a preview, or an
+MCP call to an apply tool that succeeded. Reads, previews, read-tool
+calls and refused requests, from a live credential or not, queue as
+sheddable rows, so a flood of them sheds its own rows before any
+mutation's.
 
 Over **Streamable HTTP**, both are established. The node routed the
 request to `/automation/v1/mcp` itself, so the path in the row is the
@@ -1248,8 +1286,10 @@ its call, the word that HTTP status already has on every other row of
 this plane: `forbidden` for a hostname outside the token's grant,
 `refused` for a validator's 400 or a row an environment owns. The
 request metrics count the same word. The whole vocabulary is
-`AUTOMATION_AUDIT_REASONS` in `lorica-api/src/automation/audit.rs`,
-and [automation.md](automation.md#reading-a-refusal) explains each.
+`AUTOMATION_AUDIT_REASONS` in `lorica-api/src/automation/audit.rs`
+plus every scope spelling, which `is_published_reason` reads from
+`AutomationScope` itself, and
+[automation.md](automation.md#reading-a-refusal) explains each.
 
 Anyone holding a live token can send any header they like, so every
 asserted value is bounded in length and character set before it reaches

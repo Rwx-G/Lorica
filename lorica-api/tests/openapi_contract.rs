@@ -213,6 +213,64 @@ fn automation_openapi_declares_the_scope_the_gate_enforces() {
     }
 }
 
+/// The values `components.schemas.AutomationScope.enum` lists in an
+/// OpenAPI document, in their order.
+///
+/// Read by indentation: the schema is the four-space key, its body the
+/// lines indented deeper, and the enum the `- ` items after its `enum:`
+/// key up to the first line that is not one.
+fn documented_scope_enum(document: &str) -> Vec<String> {
+    let schema: Vec<&str> = document
+        .lines()
+        .skip_while(|line| line.trim_end() != "    AutomationScope:")
+        .skip(1)
+        .take_while(|line| line.trim().is_empty() || line.starts_with("     "))
+        .collect();
+    schema
+        .iter()
+        .skip_while(|line| line.trim() != "enum:")
+        .skip(1)
+        .map_while(|line| line.trim().strip_prefix("- "))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn both_documents_enumerate_every_automation_scope_and_nothing_else() {
+    // The scope a token may carry is a published contract on both
+    // planes: the management document describes the mint body and the
+    // automation document the grants a caller holds. Each restates the
+    // enum, so each is held to `AutomationScope::ALL`, both ways and in
+    // its order, and a scope added there alone turns this red.
+    let expected: Vec<String> = lorica_automation_policy::AutomationScope::ALL
+        .iter()
+        .map(|scope| scope.as_str().to_string())
+        .collect();
+    for (name, document) in [
+        (
+            "openapi.yaml",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml")),
+        ),
+        (
+            "openapi-automation.yaml",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/openapi-automation.yaml"
+            )),
+        ),
+    ] {
+        let documented = documented_scope_enum(document);
+        assert!(
+            !documented.is_empty(),
+            "{name}: no AutomationScope enum was read; the parse went blind"
+        );
+        assert_eq!(
+            documented, expected,
+            "{name}'s AutomationScope enum and AutomationScope::ALL disagree"
+        );
+    }
+}
+
 /// The automation reads whose query vocabulary is the management
 /// plane's, and the struct each one takes it from.
 ///
@@ -560,9 +618,10 @@ const AUTOMATION_MCP_PATH: &str = "/automation/v1/mcp";
 const KEY_MATERIAL_MARKERS: &[&str] = &["pem", "private_key", "csr"];
 
 /// The automation module declaring `pub async fn <handler>(`, among
-/// the two that mount a write: the router names some handlers through
-/// `super::<module>::` and imports others by name, so the module is
-/// found from the handler rather than read off the route.
+/// the two that mount a write. The route table carries each handler's
+/// path as `std::any::type_name` spells it, which is best-effort and
+/// not a file path, so the module is found by the declaration it
+/// holds rather than mapped from that spelling.
 fn automation_handler_source(handler: &str) -> Option<(&'static str, &'static str)> {
     let opening = format!("pub async fn {handler}(");
     [
@@ -1811,12 +1870,13 @@ fn the_settings_patch_publishes_each_allowlisted_bound() {
 
 #[test]
 fn the_settings_patch_is_documented_and_offered_as_exactly_the_allowlist() {
-    // Story 11.3: the allowlist binds at the plane, and two surfaces
-    // restate it, the documented schema a caller reads and the MCP
-    // tool's body vocabulary a model is offered. Both are diffed against
-    // the constant here, both ways, so a key added to one surface alone
-    // is a red gate rather than a key one surface offers and the plane
-    // refuses, or one the plane accepts and nothing documents.
+    // Story 11.3: the allowlist binds at the plane, and one surface
+    // restates it, the documented schema a caller reads. It is diffed
+    // against the constant here, both ways, so a key added to one side
+    // alone is a red gate rather than a key the document offers and the
+    // plane refuses, or one the plane accepts and nothing documents. The
+    // MCP tool's body vocabulary is the constant's own names
+    // (`SETTINGS_ALLOWLIST_NAMES`), so it is not a second surface.
     let spec_src: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/openapi-automation.yaml"
@@ -1830,19 +1890,6 @@ fn the_settings_patch_is_documented_and_offered_as_exactly_the_allowlist() {
         .expect("PUT /automation/v1/settings documents a request body by $ref");
     assert_eq!(documented_ref, ALLOWLISTED_BODY.0);
     let documented = extract_schema_properties(spec_src, ALLOWLISTED_BODY.0);
-
-    let tools: Vec<&lorica_mcp::tools::ToolSpec> = lorica_mcp::tools::catalogue()
-        .iter()
-        .filter(|spec| {
-            spec.body()
-                .is_some_and(|body| body.schema == ALLOWLISTED_BODY.0)
-        })
-        .collect();
-    assert!(
-        !tools.is_empty(),
-        "no MCP tool carries a {} body",
-        ALLOWLISTED_BODY.0
-    );
 
     let mut drift = String::new();
     let mut compare = |surface: &str, offered: &BTreeSet<String>| {
@@ -1862,16 +1909,9 @@ fn the_settings_patch_is_documented_and_offered_as_exactly_the_allowlist() {
         ),
         &documented,
     );
-    for spec in &tools {
-        let offered: BTreeSet<String> = spec
-            .body()
-            .map(|body| body.fields.iter().map(|f| (*f).to_string()).collect())
-            .unwrap_or_default();
-        compare(&format!("the MCP tool {}", spec.name), &offered);
-    }
     assert!(
         drift.is_empty(),
-        "\nThe admin tier's settings allowlist and a surface restating it disagree.\n{drift}\n\
+        "\nThe admin tier's settings allowlist and the document restating it disagree.\n{drift}\n\
          SETTINGS_ALLOWLIST in lorica-automation-policy/src/settings.rs is the control, each entry with \
          its reason. Change it there first, by a decision, then the SettingsPatch schema in \
          openapi-automation.yaml; the MCP tool is built from the constant.\n"

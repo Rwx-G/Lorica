@@ -84,7 +84,10 @@ pub struct AdminSetting {
     pub name: &'static str,
     /// Why a model driving the admin tier may change it: what makes it
     /// operational, and why a value inside its bound is undone from the
-    /// dashboard without having taken anything down.
+    /// dashboard without having taken anything down. Read by no surface
+    /// a model or an operator sees: it is the reason an entry arrives
+    /// with, required non-empty by a test so the allowlist grows only by
+    /// a stated decision.
     pub why: &'static str,
     /// The lowest value this tier may set, inclusive. The dashboard's
     /// own validator still runs after this one and may be narrower.
@@ -185,20 +188,28 @@ pub const RETENTION_TIER_CEILING_ROWS: i64 = 1_000_000;
 /// and not harmless; the telemetry and log-sink destinations, since a
 /// redirect is not visibly wrong; `audit_log_retention_days`, because
 /// retention protecting the audit of this tier is not this tier's to
-/// shorten; and the probe and load-test budgets the dashboard has no
-/// write path for, so a value set here could not be undone there
-/// (AC #3), which `docs/backlog.md` records.
+/// shorten; and the probe and load-test budgets (`max_active_probes`
+/// and the three load-test ceilings).
 ///
 /// Taken out on 2026-09-28, each for a reason the first list missed:
 /// `flood_threshold_rps`, because either direction harms (lowered it
 /// makes every per-IP bucket answer 429, at 0 it switches the flood
-/// defence off); `flood_strict_rps` and `header_timeout_s`, because the
-/// dashboard has no field for them, so a value set here could not be
-/// undone there (`docs/backlog.md` #89); `sla_purge_enabled`, because
-/// off means unbounded growth; `sla_purge_schedule`, because the only
-/// direction it moves is purges more often; and `log_level`, because it
-/// has no safe direction: raised it floods the disk and writes request
-/// detail into the logs, lowered it blinds the investigation.
+/// defence off); `flood_strict_rps` and `header_timeout_s`, for the
+/// reason the next paragraph gives;
+/// `sla_purge_enabled`, because off means unbounded growth;
+/// `sla_purge_schedule`, because the only direction it moves is purges
+/// more often; and `log_level`, because it has no safe direction:
+/// raised it floods the disk and writes request detail into the logs,
+/// lowered it blinds the investigation.
+///
+/// The probe and load-test budgets, `flood_strict_rps` and
+/// `header_timeout_s` first stayed out because the dashboard had no
+/// write path for them, so a value set here could not have been undone
+/// there (AC #3). Since `docs/backlog.md` #89 (2026-10-04) the dashboard
+/// writes all six, and they stay out all the same: a dashboard field is
+/// what an entry requires, not a reason to add one, and none of the six
+/// has been admitted by a decision with its reason, its bound and its
+/// safe direction.
 ///
 /// Every later request to add an entry will be reasonable on its own
 /// terms. An entry arrives with its reason and its bound or not at all.

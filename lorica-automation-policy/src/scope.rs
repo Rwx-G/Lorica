@@ -79,9 +79,10 @@ pub const AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS: i64 = 7;
 // maintained from memory: `AutomationScope::as_str` below (the string
 // an operator reads in a 403 and in an audit row) is asserted against
 // these renames by a test that walks `ALL`; `lorica-api`'s
-// `AUTOMATION_AUDIT_REASONS` publishes them as refusal reasons under
-// the same walk; the two OpenAPI documents restate the enum and are
-// read by `lorica-api/tests/openapi_contract.rs`; and
+// `is_published_reason` publishes them as refusal reasons from `ALL`,
+// beside the `AUTOMATION_AUDIT_REASONS` list that carries none of them;
+// the two OpenAPI documents restate the enum and
+// `lorica-api/tests/openapi_contract.rs` holds each to `ALL`; and
 // `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.generated.ts`,
 // what the mint form offers, is diffed against `ALL` by
 // `lorica-api/tests/automation_scope_fixture.rs`. Add a variant here

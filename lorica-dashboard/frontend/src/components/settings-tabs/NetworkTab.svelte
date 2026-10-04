@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { validateCidr } from '../../lib/validators';
+  import { integerInRange, settingsBound, validateCidr } from '../../lib/validators';
   import { isSuperAdmin } from '../../lib/auth';
+  import type { SettingsSchemaResponse } from '../../lib/api';
 
   function cidrListErr(text: string): string | null {
     const raw = text.trim();
@@ -24,7 +25,8 @@
     asn_auto_update_enabled: boolean;
     // Defense-in-depth data-plane bounds (Story 8.9).
     // connection_limits_per_ip is a free-form text field so an
-    // empty input means "no cap" (mapped to null on save).
+    // empty input means "no cap" (sent as 0, which the server stores
+    // as no cap).
     audit_log_retention_days: number;
     connection_limits_per_ip: string;
     bot_stash_max_entries: number;
@@ -35,6 +37,12 @@
 
   interface Props {
     settingsForm: NetworkFormShape;
+    /**
+     * Server-authoritative field bounds (Story 8.10 AC #7). Empty
+     * before the schema loads, so every input falls back to its UI
+     * default via `settingsBound()`.
+     */
+    schema: SettingsSchemaResponse;
     expanded: boolean;
     toggleSection: () => void;
     onSave: () => void | Promise<void>;
@@ -45,6 +53,7 @@
 
   let {
     settingsForm = $bindable(),
+    schema,
     expanded,
     toggleSection,
     onSave,
@@ -63,29 +72,29 @@
   function checkAutomationCidrs() { automationCidrsErr = cidrListErr(settingsForm.automation_allowed_cidrs); }
 
   // Defense-in-depth numeric bounds (Story 8.9). Empty is treated
-  // as "unset"; the connection limit additionally accepts 0 as
-  // "no cap".
-  function numErr(raw: number | string, min: number, max: number): string | null {
-    const str = String(raw).trim();
-    if (str === '') return null;
-    const n = Number(str);
-    if (!Number.isInteger(n) || n < min || n > max) {
-      return `value must be an integer in ${min}..${max}`;
-    }
-    return null;
-  }
+  // as "unset"; the connection limit and the audit retention accept 0
+  // as "no cap" and "keep forever". The fallbacks are used before the
+  // schema loads.
+  const c = $derived({
+    auditRetention: settingsBound(schema, 'audit_log_retention_days', 0, 3650),
+    connLimit: settingsBound(schema, 'connection_limits_per_ip', 0, 1_000_000),
+    botStashMax: settingsBound(schema, 'bot_stash_max_entries', 1, 10_000_000),
+    botStashPrefix: settingsBound(schema, 'bot_stash_per_prefix_max', 1, 1_000_000),
+    mirrorRoute: settingsBound(schema, 'mirror_max_concurrent_per_route', 1, 1_000_000),
+    mirrorGlobal: settingsBound(schema, 'mirror_max_concurrent_global', 1, 1_000_000),
+  });
   let auditRetentionErr = $state<string | null>(null);
   let connLimitErr = $state<string | null>(null);
   let botStashMaxErr = $state<string | null>(null);
   let botStashPrefixErr = $state<string | null>(null);
   let mirrorRouteErr = $state<string | null>(null);
   let mirrorGlobalErr = $state<string | null>(null);
-  function checkAuditRetention() { auditRetentionErr = numErr(settingsForm.audit_log_retention_days, 1, 3650); }
-  function checkConnLimit() { connLimitErr = numErr(settingsForm.connection_limits_per_ip, 0, 1_000_000); }
-  function checkBotStashMax() { botStashMaxErr = numErr(settingsForm.bot_stash_max_entries, 1, 10_000_000); }
-  function checkBotStashPrefix() { botStashPrefixErr = numErr(settingsForm.bot_stash_per_prefix_max, 1, 1_000_000); }
-  function checkMirrorRoute() { mirrorRouteErr = numErr(settingsForm.mirror_max_concurrent_per_route, 1, 1_000_000); }
-  function checkMirrorGlobal() { mirrorGlobalErr = numErr(settingsForm.mirror_max_concurrent_global, 1, 1_000_000); }
+  function checkAuditRetention() { auditRetentionErr = integerInRange(settingsForm.audit_log_retention_days, c.auditRetention); }
+  function checkConnLimit() { connLimitErr = integerInRange(settingsForm.connection_limits_per_ip, c.connLimit); }
+  function checkBotStashMax() { botStashMaxErr = integerInRange(settingsForm.bot_stash_max_entries, c.botStashMax); }
+  function checkBotStashPrefix() { botStashPrefixErr = integerInRange(settingsForm.bot_stash_per_prefix_max, c.botStashPrefix); }
+  function checkMirrorRoute() { mirrorRouteErr = integerInRange(settingsForm.mirror_max_concurrent_per_route, c.mirrorRoute); }
+  function checkMirrorGlobal() { mirrorGlobalErr = integerInRange(settingsForm.mirror_max_concurrent_global, c.mirrorGlobal); }
 </script>
 
 <section class="settings-section">
@@ -257,13 +266,13 @@
         <input
           id="audit-retention"
           type="number"
-          min="1"
-          max="3650"
+          min={c.auditRetention.min}
+          max={c.auditRetention.max}
           bind:value={settingsForm.audit_log_retention_days}
           onblur={checkAuditRetention} oninput={checkAuditRetention}
         />
         {#if auditRetentionErr}<span class="field-error" role="alert">{auditRetentionErr}</span>{/if}
-        <span class="hint">Operator audit records older than this are purged. Default 90.</span>
+        <span class="hint">Operator audit records older than this are purged. 0 = kept forever. Default 90.</span>
       </div>
 
       <div class="settings-form-row">
@@ -289,8 +298,8 @@
         <input
           id="bot-stash-max"
           type="number"
-          min="1"
-          max="10000000"
+          min={c.botStashMax.min}
+          max={c.botStashMax.max}
           bind:value={settingsForm.bot_stash_max_entries}
           onblur={checkBotStashMax} oninput={checkBotStashMax}
         />
@@ -303,8 +312,8 @@
         <input
           id="bot-stash-prefix"
           type="number"
-          min="1"
-          max="1000000"
+          min={c.botStashPrefix.min}
+          max={c.botStashPrefix.max}
           bind:value={settingsForm.bot_stash_per_prefix_max}
           onblur={checkBotStashPrefix} oninput={checkBotStashPrefix}
         />
@@ -317,8 +326,8 @@
         <input
           id="mirror-per-route"
           type="number"
-          min="1"
-          max="1000000"
+          min={c.mirrorRoute.min}
+          max={c.mirrorRoute.max}
           bind:value={settingsForm.mirror_max_concurrent_per_route}
           onblur={checkMirrorRoute} oninput={checkMirrorRoute}
         />
@@ -331,8 +340,8 @@
         <input
           id="mirror-global"
           type="number"
-          min="1"
-          max="1000000"
+          min={c.mirrorGlobal.min}
+          max={c.mirrorGlobal.max}
           bind:value={settingsForm.mirror_max_concurrent_global}
           onblur={checkMirrorGlobal} oninput={checkMirrorGlobal}
         />

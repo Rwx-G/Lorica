@@ -132,18 +132,20 @@ A handful of user-visible numbers live in code AND in marketing-style docs, and 
 
 ```bash
 # Test counts quoted in README.md ("Product crates only (N tests)",
-# "Pingora-forked crates (N tests)", the Vitest figure) and in
-# CONTRIBUTING.md. They drift every cycle that adds a test and nothing
-# recomputes them. Sum the per-binary results rather than trusting the
-# last edit.
+# "Pingora-forked crates (N tests)", the Vitest figure). CONTRIBUTING.md
+# deliberately quotes none. They drift every cycle that adds a test and
+# nothing recomputes them. Sum the per-binary results rather than
+# trusting the last edit.
 #
-# README.md carries the product-crate figure TWICE: once in the shell
-# comment around line 714 and once in the `Lorica%20Tests-N` shields
-# badge at the top. The badge is the one that gets missed; it was left
-# behind three separate times during the v1.9.0 cycle alone. Grep for
-# the OLD number after editing, not for the new one, and expect zero
-# hits:
-#   grep -n '<old count>' README.md CONTRIBUTING.md
+# README.md carries the product-crate figure TWICE, in the shell
+# comment under "Running tests" and in the `Lorica%20Tests-N` shields
+# badge at the top, and the forked figure twice too, in its comment and
+# in the `Pingora%20Tests-N` badge. The badges are the ones that get
+# missed: the product badge was left behind three separate times during
+# the v1.9.0 cycle, and the forked badge and comment disagreed at its
+# end. Grep for the OLD numbers after editing, not for the new ones,
+# and expect zero hits:
+#   grep -n '<old count>' README.md
 cargo test <the README product-crate list> 2>&1 \
   | grep -oE 'test result: ok\. [0-9]+ passed' | grep -oE '[0-9]+' \
   | python3 -c 'import sys; print(sum(int(x) for x in sys.stdin))'

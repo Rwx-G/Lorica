@@ -44,6 +44,17 @@
 //! the names a route hostname could collide with are `localhost` and
 //! an address literal; both are refused outright rather than compared
 //! against a bind that is not part of `AppState`.
+//!
+//! # Never weaker than the route it displaces
+//!
+//! An environment's exact hostname takes its host from any wildcard or
+//! catch-all route that serves it today, and its route is written from
+//! a fixed profile. It therefore inherits, control by control, the
+//! protections of every route it displaces (the maintainer's decision
+//! of 2026-10-04), through the same rules and the same host selection
+//! that bound a token's own route
+//! ([`super::write::inherit_displaced_protections`]), and the answer
+//! names those routes by id in `protections_inherited_from`.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -66,6 +77,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::auth::AutomationPrincipal;
+use super::write::inherit_displaced_protections;
 use crate::audit::{AuditContext, ClientConnectInfo};
 use crate::cluster::ClusterRuntime;
 use crate::db::db_blocking;
@@ -176,6 +188,13 @@ pub struct EnvironmentWriteResponse {
     pub certificate_not_after: String,
     /// RFC 3339 instant the reaper may collect the environment.
     pub expires_at: String,
+    /// The routes that served this hostname before the environment took
+    /// it, by id, whose protections the environment's route inherited
+    /// because its own profile was weaker on at least one of them.
+    /// Empty when it displaced no protected route. The values inherited
+    /// are not answered: a Basic auth credential among them stays in
+    /// the store.
+    pub protections_inherited_from: Vec<String>,
     /// The fleet configuration generation the control plane had
     /// PUBLISHED when this response was built; 0 on a standalone node,
     /// which has no fleet to wait for.
@@ -274,6 +293,7 @@ struct WriteInput {
 struct Written {
     created: bool,
     route: Route,
+    protections_inherited_from: Vec<String>,
     backend_ids: Vec<String>,
     certificate_id: String,
     certificate_not_after: DateTime<Utc>,
@@ -877,11 +897,11 @@ fn is_owned_by(backend: &Backend, environment: &str) -> bool {
 /// The body of a `PUT`, run inside the caller's transaction.
 ///
 /// In order: ownership and `If-Match`, the hostname collision, the
-/// certificate, the route, the backend set, the environment row. The
-/// first four write nothing, so every refusal a caller can provoke
-/// rolls back an empty transaction; the last three are where a
-/// database error would strand a partial environment, and that is
-/// what the transaction is for.
+/// certificate, the protections the route inherits, the route, the
+/// backend set, the environment row. The first four write nothing, so
+/// every refusal a caller can provoke rolls back an empty transaction;
+/// the last three are where a database error would strand a partial
+/// environment, and that is what the transaction is for.
 fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutcome, ApiError> {
     let existing = store.get_automation_environment(&input.name)?;
     let current_etag = existing.as_ref().map(etag_for);
@@ -986,7 +1006,8 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
         }
         None => (uuid::Uuid::new_v4().to_string(), input.now),
     };
-    let route = environment_route(input, route_id.clone(), &certificate.id, route_created_at);
+    let mut route = environment_route(input, route_id.clone(), &certificate.id, route_created_at);
+    let protections_inherited_from = inherit_displaced_protections(store, &mut route)?;
     if existing.is_some() {
         store.update_route(&route)?;
     } else {
@@ -1046,6 +1067,7 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
     Ok(PutOutcome::Written(Box::new(Written {
         created: existing.is_none(),
         route,
+        protections_inherited_from,
         backend_ids,
         certificate_id: certificate.id.clone(),
         certificate_not_after: certificate.not_after,
@@ -1487,6 +1509,7 @@ async fn put_environment_inner(
         certificate_id: written.certificate_id.clone(),
         certificate_not_after: written.certificate_not_after.to_rfc3339(),
         expires_at: written.environment.expires_at.to_rfc3339(),
+        protections_inherited_from: written.protections_inherited_from.clone(),
         applied_generation: applied_generation(state),
     };
     let action = if written.created {

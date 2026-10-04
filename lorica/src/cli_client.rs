@@ -39,13 +39,27 @@
 //! age serves, chosen the way it chose it: the operator's
 //! `management_cert_pem_path` when the stored settings name both it and
 //! the key, the self-signed `management/cert.pem` otherwise. That is
-//! still one certificate compared byte for byte, read from a file the
-//! port squatter can neither read nor replace, never "whatever
+//! still one certificate compared byte for byte, never "whatever
 //! answers". If that certificate cannot be read either, the command is
 //! refused as before. A 1.9.0 node writes the record on its first
 //! start, after which this path is never taken for it again.
+//!
+//! The CLI usually runs as root, and everything under the data
+//! directory belongs to the node's account, which is the account a
+//! compromised proxy runs as. So nothing there is trusted to be what
+//! its name says: the settings database is read through a read-only,
+//! non-migrating connection that refuses a symbolic link and a file the
+//! data directory's owner does not own, and every certificate read
+//! from the data directory must be a regular file, never a link. An
+//! operator certificate lives wherever the operator put it, behind
+//! links of its own (an ACME client's `live/` tree is one), so it is
+//! resolved instead, and pinned only when the file it resolves to
+//! belongs to root or to the node's account and no one else may write
+//! it: a pin anyone could rewrite would let them choose who receives
+//! the password.
 
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -162,7 +176,7 @@ impl PinnedLeaf {
     /// on; the password is never sent in that case.
     fn load(data_dir: &Path) -> Result<Self, String> {
         let path: PathBuf = lorica_api::management_tls::served_certificate_path(data_dir);
-        match std::fs::read(&path) {
+        match read_regular_file(&path) {
             Ok(pem) => Self::from_pem(path, &pem),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let neither = |why: String| {
@@ -176,7 +190,7 @@ impl PinnedLeaf {
                     )
                 };
                 let legacy: PathBuf = pre_1_9_served_certificate_path(data_dir).map_err(neither)?;
-                let pem: Vec<u8> = std::fs::read(&legacy)
+                let pem: Vec<u8> = read_regular_file(&legacy)
                     .map_err(|e| neither(format!("cannot read {}: {e}", legacy.display())))?;
                 eprintln!(
                     "note: {} does not exist, which is what a node older than 1.9.0 looks like; \
@@ -239,25 +253,84 @@ fn unreadable_pin(path: &Path, error: &std::io::Error) -> String {
 ///
 /// Why the choice cannot be made: the settings live in `lorica.db`, and
 /// guessing without them could pin the wrong certificate. The database
-/// is opened the way the other CLI commands open it; 1.9.0 adds no
-/// migration, so opening a 1.8.0 database changes nothing in it.
+/// is read the way the module doc says, never opened for writing: an
+/// older node's schema is the one it knows, and a migration run by
+/// this binary under it would change what it reads.
 fn pre_1_9_served_certificate_path(data_dir: &Path) -> Result<PathBuf, String> {
+    let node_account: u32 = std::fs::metadata(data_dir)
+        .map_err(|e| format!("cannot read {}: {e}", data_dir.display()))?
+        .uid();
     let database: PathBuf = data_dir.join("lorica.db");
-    if !database.is_file() {
-        return Err(format!("{} does not exist", database.display()));
+    let entry = match std::fs::symlink_metadata(&database) {
+        Ok(entry) => entry,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("{} does not exist", database.display()))
+        }
+        Err(e) => return Err(format!("cannot read {}: {e}", database.display())),
+    };
+    if !entry.file_type().is_file() || entry.uid() != node_account {
+        return Err(format!(
+            "{} is not a regular file owned by the owner of {}, so it is not read",
+            database.display(),
+            data_dir.display()
+        ));
     }
-    let settings = lorica_config::ConfigStore::open(&database, None)
-        .and_then(|store| store.get_global_settings())
+    let settings = lorica_config::ConfigStore::read_global_settings_read_only(&database)
         .map_err(|e| format!("cannot read the settings in {}: {e}", database.display()))?;
-    Ok(
-        match (
-            settings.management_cert_pem_path,
-            settings.management_key_pem_path,
-        ) {
-            (Some(cert), Some(_)) => PathBuf::from(cert),
-            _ => data_dir.join("management").join("cert.pem"),
-        },
-    )
+    match (
+        settings.management_cert_pem_path,
+        settings.management_key_pem_path,
+    ) {
+        (Some(cert), Some(_)) => operator_certificate(Path::new(&cert), node_account),
+        _ => Ok(data_dir.join("management").join("cert.pem")),
+    }
+}
+
+/// The file an operator's `management_cert_pem_path` resolves to, when
+/// it may be pinned: a regular file owned by root or by `node_account`
+/// that neither its group nor anyone else may write.
+///
+/// # Errors
+///
+/// The path does not resolve, or resolves to a file someone other than
+/// root and the node's account could rewrite.
+fn operator_certificate(configured: &Path, node_account: u32) -> Result<PathBuf, String> {
+    let resolved: PathBuf = std::fs::canonicalize(configured)
+        .map_err(|e| format!("cannot read {}: {e}", configured.display()))?;
+    let file = std::fs::metadata(&resolved)
+        .map_err(|e| format!("cannot read {}: {e}", resolved.display()))?;
+    let owner_may_pin = file.uid() == 0 || file.uid() == node_account;
+    if !file.is_file() || !owner_may_pin || file.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{} (the management_cert_pem_path {}) is not a regular file owned by root or by \
+             the node's account and writable by its owner alone, so it is not pinned",
+            resolved.display(),
+            configured.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// The bytes of the regular file at `path`, refusing a symbolic link,
+/// and any other kind of entry, rather than following it. The entry
+/// opened is checked to be the entry inspected, so swapping a link in
+/// between the two is refused too.
+fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let inspected = std::fs::symlink_metadata(path)?;
+    if !inspected.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file; a symbolic link is refused rather than followed",
+        ));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if (opened.dev(), opened.ino()) != (inspected.dev(), inspected.ino()) {
+        return Err(std::io::Error::other("replaced while it was being opened"));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 impl ServerCertVerifier for PinnedLeaf {
@@ -643,9 +716,90 @@ mod tests {
         let (operator, _) = leaf();
         let dir = pre_1_9_data_dir(&self_signed, Some(&operator));
         let pin = PinnedLeaf::load(dir.path()).expect("pin");
-        assert_eq!(pin.path, dir.path().join("operator-cert.pem"));
+        assert_eq!(
+            pin.path,
+            std::fs::canonicalize(dir.path().join("operator-cert.pem")).expect("resolve")
+        );
         let expected = CertificateDer::from_pem_slice(operator.as_bytes()).expect("cert");
         assert_eq!(pin.leaf.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn the_fallback_reads_the_nodes_database_without_writing_it() {
+        let (self_signed, _) = leaf();
+        let dir = pre_1_9_data_dir(&self_signed, None);
+        let database = dir.path().join("lorica.db");
+        let before = std::fs::read(&database).expect("read");
+        PinnedLeaf::load(dir.path()).expect("pin");
+        assert_eq!(std::fs::read(&database).expect("read"), before);
+    }
+
+    #[test]
+    fn a_settings_database_behind_a_symbolic_link_is_not_read() {
+        // The data directory belongs to the node's account: a process
+        // running as it can replace `lorica.db` with a link to any file
+        // root may write.
+        let (self_signed, _) = leaf();
+        let dir = pre_1_9_data_dir(&self_signed, None);
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let target = elsewhere.path().join("lorica.db");
+        std::fs::rename(dir.path().join("lorica.db"), &target).expect("move");
+        std::os::unix::fs::symlink(&target, dir.path().join("lorica.db")).expect("symlink");
+        let before = std::fs::read(&target).expect("read");
+
+        let refused = PinnedLeaf::load(dir.path()).expect_err("a link is not read");
+        assert!(refused.contains("not a regular file owned"), "{refused}");
+        assert!(refused.contains("password was not sent"), "{refused}");
+        assert_eq!(std::fs::read(&target).expect("read"), before);
+    }
+
+    #[test]
+    fn a_certificate_in_the_data_directory_behind_a_symbolic_link_is_not_pinned() {
+        let (self_signed, _) = leaf();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let target = elsewhere.path().join("cert.pem");
+        std::fs::write(&target, &self_signed).expect("write");
+
+        // The pre-1.9 self-signed certificate.
+        let dir = pre_1_9_data_dir(&self_signed, None);
+        let cert = dir.path().join("management").join("cert.pem");
+        std::fs::remove_file(&cert).expect("remove");
+        std::os::unix::fs::symlink(&target, &cert).expect("symlink");
+        let refused = PinnedLeaf::load(dir.path()).expect_err("a link is not pinned");
+        assert!(refused.contains("symbolic link"), "{refused}");
+
+        // The served-certificate record itself.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = lorica_api::management_tls::served_certificate_path(dir.path());
+        std::fs::create_dir_all(record.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&target, &record).expect("symlink");
+        let refused = PinnedLeaf::load(dir.path()).expect_err("a link is not pinned");
+        assert!(refused.contains("symbolic link"), "{refused}");
+        assert!(refused.contains("password was not sent"), "{refused}");
+    }
+
+    #[test]
+    fn an_operator_certificate_others_may_rewrite_is_not_pinned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (self_signed, _) = leaf();
+        let (operator, _) = leaf();
+        let dir = pre_1_9_data_dir(&self_signed, Some(&operator));
+        let cert = dir.path().join("operator-cert.pem");
+        for mode in [0o664, 0o646] {
+            std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            let refused = PinnedLeaf::load(dir.path()).expect_err("writable by others");
+            assert!(refused.contains("is not pinned"), "{mode:o}: {refused}");
+        }
+
+        // Reached through a link, as an ACME client's `live/` tree is,
+        // the file it resolves to is what is weighed and pinned.
+        std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let resolved = dir.path().join("archive-cert.pem");
+        std::fs::rename(&cert, &resolved).expect("move");
+        std::os::unix::fs::symlink(&resolved, &cert).expect("symlink");
+        let pin = PinnedLeaf::load(dir.path()).expect("pin");
+        assert_eq!(pin.path, std::fs::canonicalize(&resolved).expect("resolve"));
     }
 
     #[test]

@@ -93,6 +93,24 @@ Homepage: https://github.com/Rwx-G/Lorica
 Depends: ca-certificates
 EOF
 
+# /run/lorica-package.state carries the service state across a
+# transaction: written by the old package's prerm on an upgrade, or by
+# preinst on an install, and consumed by postinst. /run belongs to root,
+# so the service account cannot plant a record, and it is cleared at
+# boot, so a record an aborted transaction left behind dies with it.
+
+# Pre-install script. `install` is a first install, or a reinstall after
+# `dpkg -r` (whose prerm disabled the service): both get first-install
+# behaviour. An upgrade keeps what the old prerm recorded.
+cat > "$PKG_DIR/DEBIAN/preinst" << 'EOF'
+#!/bin/sh
+set -e
+if [ "$1" = "install" ]; then
+    printf 'install\n' > /run/lorica-package.state 2>/dev/null || true
+fi
+EOF
+chmod 755 "$PKG_DIR/DEBIAN/preinst"
+
 # Post-install script
 cat > "$PKG_DIR/DEBIAN/postinst" << 'EOF'
 #!/bin/sh
@@ -101,6 +119,16 @@ set -e
 # Create system user
 if ! id -u lorica >/dev/null 2>&1; then
     useradd -r -s /bin/false -d /var/lib/lorica lorica
+fi
+
+# What the service was doing before this transaction: `install` (first
+# install), `active` or `inactive` (an upgrade from a package whose
+# prerm recorded it), or nothing (an upgrade from 1.8.0 or earlier,
+# whose prerm stopped and disabled the service and recorded nothing).
+previous_state=$(cat /run/lorica-package.state 2>/dev/null || true)
+rm -f /run/lorica-package.state
+if [ -z "${2:-}" ]; then
+    previous_state=install
 fi
 
 # Repair hosts that installed a package built before 1.9.0. Those recorded
@@ -135,8 +163,13 @@ repaired=$(printf '%s\n' "$package_paths" | while IFS= read -r path; do
     printf '%s\n' "$path"
 done)
 
-# Set permissions
-chown -R lorica:lorica /var/lib/lorica
+# Set permissions. Not recursive: everything below the data directory is
+# the service account's, and root walking a tree that account controls
+# follows whatever it planted there (a hard link to a root-owned file
+# would change hands). The node creates what it writes with its own
+# owner, and a recursive pass also reset, on every upgrade, the owner
+# an operator gave exported certificates.
+chown lorica:lorica /var/lib/lorica
 chmod 750 /var/lib/lorica
 
 # Pre-create the default cert-export zone (v1.4.1) with the
@@ -184,13 +217,46 @@ if [ -n "$repaired" ]; then
     exit 0
 fi
 
-# Enable and (re)start service
-systemctl daemon-reload
-systemctl enable lorica.service
-systemctl restart lorica.service 2>/dev/null || systemctl start lorica.service
+# Enable and start on a first install. On an upgrade, the operator's
+# choice stands: the enablement is never touched (this version's prerm
+# does not disable on upgrade), and the service is restarted only if it
+# was running. /run/systemd/system exists only while systemd runs;
+# without it (an image build, a container) nothing is started.
+systemd_running=no
+if [ -d /run/systemd/system ]; then
+    systemd_running=yes
+    systemctl daemon-reload
+fi
+left_stopped=""
+case "$previous_state" in
+    install)
+        systemctl enable lorica.service
+        if [ "$systemd_running" = yes ]; then
+            systemctl restart lorica.service
+        fi
+        ;;
+    active)
+        if [ "$systemd_running" = yes ]; then
+            systemctl restart lorica.service
+        fi
+        ;;
+    inactive)
+        left_stopped="it was not running before the upgrade"
+        ;;
+    *)
+        left_stopped="the package it replaced stopped and disabled it, and recorded nothing that tells a deliberate disable from that one"
+        ;;
+esac
 
 echo ""
 echo "  ================================================"
+if [ -n "$left_stopped" ]; then
+    echo "  NOTE: lorica.service was left stopped:"
+    echo "    $left_stopped."
+    echo "  To run it:            sudo systemctl start lorica.service"
+    echo "  To run it at boot:    sudo systemctl enable lorica.service"
+    echo "  "
+fi
 echo "  Lorica installed successfully!"
 echo "  "
 echo "  Dashboard: https://127.0.0.1:9443"
@@ -241,10 +307,18 @@ chmod 755 "$PKG_DIR/DEBIAN/postinst"
 
 # Pre-removal script. Stopped on every path out of this version, disabled
 # only when the package is removed: an upgrade leaves the operator's
-# enablement to the next version's postinst.
+# enablement alone, and records whether the service was running so the
+# next version's postinst restarts it only then.
 cat > "$PKG_DIR/DEBIAN/prerm" << 'EOF'
 #!/bin/sh
 set -e
+if [ "$1" = "upgrade" ]; then
+    if [ "$(systemctl is-active lorica.service 2>/dev/null || true)" = active ]; then
+        printf 'active\n' > /run/lorica-package.state 2>/dev/null || true
+    else
+        printf 'inactive\n' > /run/lorica-package.state 2>/dev/null || true
+    fi
+fi
 systemctl stop lorica.service 2>/dev/null || true
 if [ "$1" = "remove" ]; then
     systemctl disable lorica.service 2>/dev/null || true
@@ -252,7 +326,9 @@ fi
 EOF
 chmod 755 "$PKG_DIR/DEBIAN/prerm"
 
-# Post-removal (purge) script
+# Post-removal script. The daemon reload belongs to a removal: on an
+# upgrade the new postinst reloads, after its ownership repair has run,
+# and not at all on a host that repair left stopped.
 cat > "$PKG_DIR/DEBIAN/postrm" << 'EOF'
 #!/bin/sh
 set -e
@@ -260,7 +336,9 @@ if [ "$1" = "purge" ]; then
     rm -rf /var/lib/lorica
     userdel lorica 2>/dev/null || true
 fi
-systemctl daemon-reload
+if { [ "$1" = "remove" ] || [ "$1" = "purge" ]; } && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+fi
 EOF
 chmod 755 "$PKG_DIR/DEBIAN/postrm"
 

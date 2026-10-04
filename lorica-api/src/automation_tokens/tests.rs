@@ -261,6 +261,76 @@ async fn mint(
     )
 }
 
+// ---- A mint lands whole or not at all ----
+
+#[tokio::test]
+async fn a_mint_whose_client_hangs_up_still_lands_its_token_and_its_audit_row() {
+    // Architecture audit: cancellation safety covered the four handler
+    // families someone wrapped by hand, and a token mint committed on
+    // the blocking pool while its audit row waited on the request
+    // future hyper drops. The management router now runs every
+    // mutation as one detached unit.
+    let (mut state, sessions, limiter) = test_state().await;
+    let logs = tempfile::tempdir().expect("test setup: temp dir");
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(logs.path()).expect("test setup: log store"),
+    ));
+    let admin = super_admin(&state, &sessions, &limiter).await;
+
+    let held = Arc::clone(&state.store).lock_owned().await;
+    let router = build_router(state.clone(), sessions.clone(), limiter.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(TOKENS_PATH)
+        .header("Cookie", &admin)
+        .header("Content-Type", "application/json")
+        .body(Body::from(create_body().to_string()))
+        .expect("test setup: request builds");
+    let mut in_flight = Box::pin(router.oneshot(request));
+    // Polled until its unit exists on the state's tracker, and no
+    // further: the store is held, so the unit waits inside.
+    while state.task_tracker.is_empty() {
+        tokio::select! {
+            biased;
+            _ = &mut in_flight => panic!("the mint answered while the store was held"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+    // The client hangs up, then the store comes free.
+    drop(in_flight);
+    drop(held);
+    state.task_tracker.close();
+    state.task_tracker.wait().await;
+
+    let stored = {
+        let store = state.store.lock().await;
+        store
+            .list_automation_tokens()
+            .expect("test setup: tokens list")
+    };
+    assert_eq!(
+        stored.len(),
+        1,
+        "the mint committed once the client had gone"
+    );
+    let log_store = state.log_store.clone().expect("test setup: log store");
+    log_store
+        .flush_audit()
+        .await
+        .expect("the audit writer drains");
+    let (rows, _) = log_store
+        .query_audit(&crate::audit::AuditQuery {
+            action_prefix: Some("automation.token.create".to_string()),
+            limit: 10,
+            ..crate::audit::AuditQuery::default()
+        })
+        .expect("the audit query runs");
+    assert!(
+        rows.iter().any(|row| row.target_id == stored[0].public_id),
+        "no audit row for a token that is stored: {rows:?}"
+    );
+}
+
 // ---- Mint and verify agree ----
 
 #[tokio::test]

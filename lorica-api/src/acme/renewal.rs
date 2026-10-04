@@ -486,17 +486,14 @@ pub async fn renew_certificate(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::db::run_detached(async move {
-        renew_certificate_as(
-            &state,
-            &audit_ctx,
-            id,
-            crate::preview::WriteMode::Apply,
-            crate::target::CertificateGuard::unbounded(),
-            RenewalBudget::Unbounded,
-        )
-        .await
-    })
+    renew_certificate_as(
+        &state,
+        &audit_ctx,
+        id,
+        crate::preview::WriteMode::Apply,
+        crate::target::CertificateGuard::unbounded(),
+        RenewalBudget::Unbounded,
+    )
     .await
 }
 

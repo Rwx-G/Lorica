@@ -34,6 +34,14 @@
 //! another: anything between the two, a rename, a re-mark, a delete
 //! and re-create under the same id, is a window. Here there is none.
 //!
+//! # A guard also restores what its caller was shown masked
+//!
+//! The automation plane answers some values masked, and a caller that
+//! writes back what it read sends the mask. A guard can carry a
+//! restore, run on the row about to be written before the check weighs
+//! it and under the same lock, that puts the stored value back or
+//! refuses a mask it cannot place, so the marker is never stored.
+//!
 //! # Who builds one
 //!
 //! The management wrappers pass an unbounded guard: the session's role
@@ -84,6 +92,10 @@ type RouteCheck = Arc<dyn Fn(&ConfigStore, RouteTarget<'_>) -> Result<(), ApiErr
 type RouteRestore = fn(Option<&Route>, &mut Route) -> Result<(), ApiError>;
 type BackendCheck =
     Arc<dyn Fn(&ConfigStore, BackendTarget<'_>) -> Result<(), ApiError> + Send + Sync>;
+/// Puts back, in the backend about to be written, the stored values a
+/// caller was shown masked and sent back unchanged; see
+/// [`BackendGuard::restoring_withheld`].
+type BackendRestore = fn(Option<&Backend>, &mut Backend) -> Result<(), ApiError>;
 type CertificateCheck = Arc<dyn Fn(&Certificate) -> Result<(), ApiError> + Send + Sync>;
 
 /// Who may act on a route row, and what a caller shown masked values
@@ -166,21 +178,57 @@ impl std::fmt::Debug for RouteGuard {
     }
 }
 
-/// Who may act on a backend row.
+/// Who may act on a backend row, and what a caller shown masked values
+/// means by sending them back.
 #[derive(Clone)]
-pub struct BackendGuard(Option<BackendCheck>);
+pub struct BackendGuard {
+    check: Option<BackendCheck>,
+    restore: Option<BackendRestore>,
+}
 
 impl BackendGuard {
     /// Every row is reachable.
     pub fn unbounded() -> Self {
-        Self(None)
+        Self {
+            check: None,
+            restore: None,
+        }
     }
 
     /// Only the rows `check` accepts are reachable.
     pub fn bounded(
         check: impl Fn(&ConfigStore, BackendTarget<'_>) -> Result<(), ApiError> + Send + Sync + 'static,
     ) -> Self {
-        Self(Some(Arc::new(check)))
+        Self {
+            check: Some(Arc::new(check)),
+            restore: None,
+        }
+    }
+
+    /// This guard, with `restore` run on the backend about to be
+    /// written before the check weighs it, under the lock that writes
+    /// it; the same contract as [`RouteGuard::restoring_withheld`].
+    pub fn restoring_withheld(self, restore: BackendRestore) -> Self {
+        Self {
+            restore: Some(restore),
+            ..self
+        }
+    }
+
+    /// Run the restore, if this guard has one.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the restore refuses with.
+    pub fn restore_withheld(
+        &self,
+        before: Option<&Backend>,
+        after: &mut Backend,
+    ) -> Result<(), ApiError> {
+        match self.restore {
+            Some(restore) => restore(before, after),
+            None => Ok(()),
+        }
     }
 
     /// Run the check on the rows a write reads and would write, inside
@@ -190,7 +238,7 @@ impl BackendGuard {
     ///
     /// Whatever the check refuses with, a `Forbidden` for a grant.
     pub fn check(&self, store: &ConfigStore, target: BackendTarget<'_>) -> Result<(), ApiError> {
-        match &self.0 {
+        match &self.check {
             Some(check) => check(store, target),
             None => Ok(()),
         }
@@ -199,7 +247,7 @@ impl BackendGuard {
 
 impl std::fmt::Debug for BackendGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() {
+        f.write_str(if self.check.is_some() {
             "BackendGuard::bounded"
         } else {
             "BackendGuard::unbounded"

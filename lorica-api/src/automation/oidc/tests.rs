@@ -453,11 +453,16 @@ async fn a_full_replay_set_evicts_the_earliest_expiry_and_counts_it() {
             - before,
         1
     );
-    // The evicted id is replayable again: that is the window the
-    // counter reports, and why a silent eviction is not acceptable.
-    assert!(verify(&verifier, &soonest_token, &[entry()], now())
-        .await
-        .is_ok());
+    // The evicted id expires before every id the full set holds, so
+    // remembering it again would evict it at once: it is refused
+    // rather than admitted with its replay open. An evicted id that
+    // outlives the earliest one left is the window the counter reports.
+    assert_eq!(
+        verify(&verifier, &soonest_token, &[entry()], now())
+            .await
+            .err(),
+        Some(RefusalReason::ReplaySetFull)
+    );
 }
 
 // ---- The two refresh triggers (IV5, IV2) ----

@@ -2023,7 +2023,7 @@ components:
 
     EnvironmentWriteResponse:
       type: object
-      required: [name, url, route_id, backend_ids, certificate_id, certificate_not_after, expires_at, applied_generation]
+      required: [name, url, route_id, backend_ids, certificate_id, certificate_not_after, expires_at, protections_inherited_from, applied_generation]
       properties:
         name:
           type: string
@@ -2046,6 +2046,17 @@ components:
         expires_at:
           type: string
           format: date-time
+        protections_inherited_from:
+          type: array
+          items:
+            type: string
+          description: >-
+            The ids of the routes that served this hostname before the
+            environment took it (a wildcard or the catch-all) whose
+            protections the environment's route inherited, because its
+            own profile was weaker on at least one of them. Empty when
+            it displaced no protected route. The inherited values are
+            not answered.
         applied_generation:
           type: integer
           format: int64

@@ -19,7 +19,13 @@ sudo dpkg -i lorica_<version>_amd64.deb
 sudo rpm -i lorica-<version>-1.x86_64.rpm
 ```
 
-The post-install hook enables and starts the service. Lorica listens on
+On a first install the post-install hook enables and starts the service.
+An upgrade keeps the state you left it in: it never enables the
+service, and restarts it only if it was running. The one hop it cannot
+read is from a `.deb` of 1.8.0 or earlier, whose removal script
+stopped and disabled the service without recording anything: that
+upgrade leaves it stopped and says so, and `sudo systemctl enable --now
+lorica.service` brings it back. Lorica listens on
 8080 (HTTP proxy), 8443 (HTTPS proxy), and 9443 (dashboard, localhost
 only). The initial admin password is written to
 `/var/lib/lorica/initial-admin-password` (mode 0600).

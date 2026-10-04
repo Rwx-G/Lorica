@@ -228,7 +228,7 @@ graph TB
     API -->|trigger reload| PROXY
     PROXY -->|access logs| NOTIFY
     PROXY -->|metrics| API
-    AUTOAPI -->|environments CRUD| CONFIG
+    AUTOAPI -->|environments, routes, backends, cert binding, settings| CONFIG
     CLUSTER -->|replicated config| CONFIG
     API -->|access, WAF, audit, capture| SINKS[log_sinks<br>syslog RFC 5424 + OTLP]
 ```

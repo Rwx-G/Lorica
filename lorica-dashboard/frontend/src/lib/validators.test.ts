@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
+  integerInRange,
   parseOctalMode,
+  settingsBound,
   validateAbsolutePath,
   validateCertExportPattern,
   validateExtraSd,
@@ -267,5 +269,32 @@ describe('validateExtraSd', () => {
 
   it('rejects only commas and whitespace', () => {
     expect(validateExtraSd(' , , ')).toMatch(/key=value/);
+  });
+});
+
+describe('settingsBound', () => {
+  it('reads both bounds from the schema', () => {
+    expect(settingsBound({ f: { min: 3, max: 8 } }, 'f', 0, 100)).toEqual({ min: 3, max: 8 });
+  });
+
+  it('falls back for what the schema does not state', () => {
+    expect(settingsBound({}, 'f', 0, 100)).toEqual({ min: 0, max: 100 });
+    expect(settingsBound({ f: { min: 1 } }, 'f', 0, 100)).toEqual({ min: 1, max: 100 });
+  });
+});
+
+describe('integerInRange', () => {
+  const bound = { min: 1, max: 10 };
+
+  it('accepts an empty input and every integer in the range, ends included', () => {
+    expect(integerInRange('', bound)).toBeNull();
+    expect(integerInRange(1, bound)).toBeNull();
+    expect(integerInRange('10', bound)).toBeNull();
+  });
+
+  it('refuses a value outside the range or not an integer, naming the range', () => {
+    for (const raw of [0, 11, '2.5', 'abc']) {
+      expect(integerInRange(raw, bound)).toBe('value must be an integer in 1..10');
+    }
   });
 });

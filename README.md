@@ -9,8 +9,8 @@
   <img src="https://img.shields.io/badge/version-1.8.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3028-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-748-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3073-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-766-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -713,7 +713,7 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (3028 tests, Lorica-native)
+# Product crates only (3073 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-shmem \
@@ -734,11 +734,11 @@ cargo test -p lorica-core -p lorica-proxy -p lorica-http \
 # wire corpus (every message's encoding, pinned)
 cargo test -p lorica-cluster --tests
 
-# Frontend (510 Vitest cases across 25 files) and its gates
+# Frontend (522 Vitest cases across 26 files) and its gates
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 
-The `lorica` binary crate carries 19 end-to-end binaries under
+The `lorica` binary crate carries 21 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends
 (mTLS, response rewriting, mirroring, forward auth, stale-while-revalidate,
 the connection pre-filter, canary and header routing, config reload, rate
@@ -764,9 +764,11 @@ runs them all in sequence; each `--skip-<profile>` flag drops one.
 | acme | 15 | HTTP-01 and manual DNS-01 issuance against the Pebble fixture |
 | capture | 163 | two-phase matching from two source addresses, a 10 MiB body truncated at the cap while the upstream still receives all of it, credential headers and named query parameters redacted on every sink, a binary body round-tripping through base64, the per-rule budget and the TTL each self-disabling their rule, the recent-captures ring, and an `output.dir` that is read-only and then writable |
 | capture-workers | 160 + 50 | the same profile under `--workers 2`, sharing the 163 assertions above behind a flag rather than forking them (three become ranges, because a budget is spent per worker), plus what only worker mode can show: the per-rule budget overshooting its total by at most the worker count, the recent-captures ring answering 503 rather than an empty 200, all four sinks fed from inside a worker, and the counters aggregating across workers on `/metrics` |
-| cluster | 64 | a control plane and two followers (one in workers mode): enrollment, activation, replication, an HTTP-01 order validated through the selected follower, need-to-know key distribution, telemetry and audit fan-in, a load phase at 300 rps per follower, per-node SLA reads, break-glass, revocation |
+| cluster | 66 | a control plane and two followers (one in workers mode): enrollment, activation, replication, an HTTP-01 order validated through the selected follower, need-to-know key distribution, telemetry and audit fan-in, a load phase at 300 rps per follower, per-node SLA reads, break-glass, revocation |
 | automation | 104 | on the same fleet fixture, since the listener belongs to the control plane: the source allowlist refusing a foreign address before the TLS handshake, bearer-only authentication and the scope gate, the idempotent environment `PUT` with `If-Match`, hostname and backend-CIDR grants, the TTL reaper, the management API refusing to edit a managed row, GitLab ID tokens against a local issuer fixture with a replayed `jti` refused, and a follower refusing to open the listener at all |
+| cluster mcp phase | 13 | on the same fleet: a config-tier token minted by `lorica mcp token create --tier config` drives a route create and a route update through `lorica-mcp` on the control plane, each lands its audit row, and both followers converge on the route and on the changed WAF flag |
 | cluster restart + revocation | 22 | the same fleet across a process boundary: a follower re-opens its session unaided and keeps its generation, SLA history and served certificate; a restarted control plane reports its policy-state reset, takes its followers back and clears the flag after a round; then revocation, last because it is terminal for a node |
+| mcp | 53 | `lorica-mcp` spawned over stdio for each tier, with tokens minted by the real `lorica mcp token create --tier`: the tool list of each tier, one mutation and one refusal per mutating tier with their audit rows, a revocation mid-session, a token spanning two tiers refused at start (exit 78), and the audit chain verified at the end |
 | bot, bot-workers, geoip, rdns, otel, otel-workers | 29, 29, 16, 7, 16, 16 | bot challenges, country policy, rDNS bypass, OTLP traces; run individually with `docker compose --profile <name> run --rm <name>-smoke` |
 
 The two intentional gaps in the Docker harness are:
@@ -795,7 +797,7 @@ The `.deb` and `.rpm` packages install a hardened systemd unit with:
 - `MemoryDenyWriteExecute=yes`, `SystemCallFilter=@system-service`
 - `RestrictNamespaces=yes`, `RestrictSUIDSGID=yes`
 - Runs as dedicated `lorica` user with `CAP_NET_BIND_SERVICE`
-- Service auto-starts on install and auto-restarts on upgrade
+- Service enabled and started on a first install; an upgrade keeps the state the operator left it in (restarted only if it was running, never enabled)
 - Data directory (`/var/lib/lorica`) preserved across upgrades
 
 Customize the service (e.g. enable workers) via drop-in override:

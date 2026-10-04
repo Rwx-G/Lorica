@@ -522,3 +522,10 @@ a test. The plane is the control; the schema is the affordance.
   because a dead backend keeps its traffic for three probes of the
   interval. Docker e2e suite green on the result, zero failures. Status
   to Done.
+- 2026-10-04: Backlog #89 resolved in the 1.9.0 cycle: the dashboard's
+  Global Configuration form now writes the six settings this story left
+  out because it could not (`max_active_probes`, the three load-test
+  ceilings, `flood_strict_rps`, `header_timeout_s`). By maintainer
+  decision the allowlist does not change: none of them joined the tier,
+  and the exclusion reasons above stay as they were written. The record
+  is the closing note of #89 in `docs/backlog.md`.

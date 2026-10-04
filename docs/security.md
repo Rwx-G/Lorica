@@ -259,6 +259,19 @@ not valid UTF-8, so it was already passing uninspected before this
 change. Decompressing before inspection needs a decompression-bomb
 budget of its own and is backlog, not shipped.
 
+**What the backend sees (v1.9.0).** In Blocking mode an inspectable
+body is held: Lorica reads it to its end, at most the scan window,
+scans it, and only then opens the backend connection and sends it. A
+refused body costs the backend nothing, not a byte and not a
+connection, and its mirror copy is not sent either; a clean body
+arrives byte for byte. A client sending `Expect: 100-continue` gets its
+`100 Continue` from Lorica, and the upstream request carries no
+`Expect`. The cost is latency: the backend connect and the body write
+no longer overlap with the client's upload. Detection mode and bodies
+the WAF does not inspect stream as before. If the node-wide scan budget
+refuses a body mid-read, the bytes read so far are forwarded and the
+rest streams unscanned, the fail-open path the budget always had.
+
 **The caps and how they interact.** Two ceilings apply to a request
 body, and only one of them moved:
 

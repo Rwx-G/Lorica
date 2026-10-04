@@ -426,6 +426,334 @@ async fn create_returns_201_and_an_identical_put_returns_200_with_the_same_route
     assert_eq!(counts.environments, 1);
 }
 
+// ---- Inheritance from the route an environment displaces ----
+
+/// The Basic auth hash a protected route carries here, a value no
+/// answer, audit row or view may echo.
+const INHERITED_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$inherited-hash-sentinel";
+
+/// The username beside it.
+const INHERITED_USER: &str = "ops-sentinel";
+
+/// [`seed_manual_route`] on `path_prefix`, then edited by `protect`.
+async fn seed_protected_route(
+    state: &AppState,
+    id: &str,
+    hostname: &str,
+    path_prefix: &str,
+    protect: impl FnOnce(&mut Route),
+) {
+    seed_manual_route(state, id, hostname, &[]).await;
+    let store = state.store.lock().await;
+    let mut route = store
+        .get_route(id)
+        .expect("route read")
+        .expect("test setup: the route was just stored");
+    route.path_prefix = path_prefix.to_string();
+    protect(&mut route);
+    store
+        .update_route(&route)
+        .expect("test setup: protections stored");
+}
+
+/// Every control `ROUTE_PROTECTIONS` weighs, set the way an operator
+/// would protect a preview estate.
+fn fortify(route: &mut Route) {
+    route.basic_auth_username = Some(INHERITED_USER.to_string());
+    route.basic_auth_password_hash = Some(INHERITED_HASH.to_string());
+    route.ip_allowlist = vec!["192.0.2.0/24".to_string()];
+    route.ip_denylist = vec!["192.0.2.66".to_string()];
+    route.geoip = Some(lorica_config::models::GeoIpConfig {
+        mode: lorica_config::models::GeoIpMode::Allowlist,
+        countries: vec!["FR".to_string()],
+    });
+    route.bot_protection = serde_json::from_value(serde_json::json!({ "mode": "cookie" }))
+        .expect("test setup: a bot-protection config");
+    route.waf_enabled = true;
+    route.waf_mode = WafMode::Blocking;
+    route.rate_limit = Some(lorica_config::models::RateLimit {
+        capacity: 20,
+        refill_per_sec: 5,
+        scope: lorica_config::models::RateLimitScope::PerIp,
+    });
+    route.auto_ban_threshold = Some(5);
+}
+
+/// The route a written environment owns, as stored.
+async fn environment_route_of(state: &AppState, data: &serde_json::Value) -> Route {
+    let route_id = data["route_id"].as_str().expect("route id");
+    state
+        .store
+        .lock()
+        .await
+        .get_route(route_id)
+        .expect("route read")
+        .expect("the environment's route exists")
+}
+
+/// Every protected control of `route` equals `expected`'s.
+fn assert_protections_equal(route: &Route, expected: &Route) {
+    assert_eq!(route.basic_auth_username, expected.basic_auth_username);
+    assert_eq!(
+        route.basic_auth_password_hash, expected.basic_auth_password_hash,
+        "the stored hash is copied server side"
+    );
+    assert_eq!(route.ip_allowlist, expected.ip_allowlist);
+    assert_eq!(route.ip_denylist, expected.ip_denylist);
+    assert_eq!(route.geoip, expected.geoip);
+    assert_eq!(route.bot_protection, expected.bot_protection);
+    assert_eq!(route.waf_enabled, expected.waf_enabled);
+    assert_eq!(route.waf_mode, expected.waf_mode);
+    let bucket = |route: &Route| {
+        route
+            .effective_rate_limit()
+            .map(|limit| (limit.capacity, limit.refill_per_sec, limit.scope))
+    };
+    assert_eq!(bucket(route), bucket(expected));
+    assert_eq!(route.auto_ban_threshold, expected.auto_ban_threshold);
+}
+
+/// No inherited secret anywhere in `text`.
+fn assert_no_inherited_secret(text: &str, what: &str) {
+    for secret in [
+        INHERITED_HASH,
+        "inherited-hash-sentinel",
+        "argon2",
+        INHERITED_USER,
+    ] {
+        assert!(!text.contains(secret), "{what} carries `{secret}`: {text}");
+    }
+}
+
+#[tokio::test]
+async fn an_environment_under_a_protected_wildcard_inherits_every_protection() {
+    let (mut state, _, _) = crate::tests::test_state().await;
+    let data_dir = tempfile::tempdir().expect("test setup: tempdir");
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(data_dir.path()).expect("test setup: log store"),
+    ));
+    seed_wildcard(&state).await;
+    seed_protected_route(&state, "wild-route", "*.review.example.com", "/", fortify).await;
+    let token = writer(&state, "acme-ci").await;
+
+    let response = put(&state, &token, "pr-42", env_body()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let answer = body_json(response).await;
+    let data = answer["data"].clone();
+    assert_eq!(
+        data["protections_inherited_from"],
+        serde_json::json!(["wild-route"]),
+        "the answer names the displaced route by id"
+    );
+    assert_no_inherited_secret(&answer.to_string(), "the PUT answer");
+
+    let wildcard = state
+        .store
+        .lock()
+        .await
+        .get_route("wild-route")
+        .expect("route read")
+        .expect("the wildcard is untouched");
+    let route = environment_route_of(&state, &data).await;
+    assert_protections_equal(&route, &wildcard);
+    assert_eq!(
+        route.managed_by,
+        Some(ManagedBy::Automation {
+            environment: "pr-42".to_string()
+        }),
+        "the route is still the environment's"
+    );
+
+    // The audit row's payload is the answer, which carries the ids and
+    // no secret: its hash is the answer's hash.
+    let rows =
+        crate::automation::test_support::audit_rows_under(&state, "automation.environment.create")
+            .await;
+    assert_eq!(rows.len(), 1, "one environment row");
+    assert_eq!(
+        rows[0].after_payload_hash,
+        crate::audit::hash_payload(Some(&data)),
+        "the audit payload is the answer"
+    );
+    let row_text = serde_json::to_string(&rows[0]).expect("the row serialises");
+    assert_no_inherited_secret(&row_text, "the audit row");
+
+    let view = automation(
+        &state,
+        "GET",
+        &format!("{COLLECTION}/pr-42"),
+        &token,
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(view.status(), StatusCode::OK);
+    assert_no_inherited_secret(&body_json(view).await.to_string(), "the GET view");
+}
+
+#[tokio::test]
+async fn an_environment_under_a_protected_catch_all_inherits_its_protections() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    seed_protected_route(&state, "catch-all", "_", "/", |route| {
+        route.basic_auth_username = Some(INHERITED_USER.to_string());
+        route.basic_auth_password_hash = Some(INHERITED_HASH.to_string());
+        route.ip_allowlist = vec!["198.51.100.0/24".to_string()];
+    })
+    .await;
+    let token = writer(&state, "acme-ci").await;
+
+    let response = put(&state, &token, "pr-42", env_body()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let answer = body_json(response).await;
+    assert_no_inherited_secret(&answer.to_string(), "the PUT answer");
+    let data = answer["data"].clone();
+    assert_eq!(
+        data["protections_inherited_from"],
+        serde_json::json!(["catch-all"])
+    );
+    let route = environment_route_of(&state, &data).await;
+    assert_eq!(route.basic_auth_username.as_deref(), Some(INHERITED_USER));
+    assert_eq!(
+        route.basic_auth_password_hash.as_deref(),
+        Some(INHERITED_HASH)
+    );
+    assert_eq!(route.ip_allowlist, vec!["198.51.100.0/24".to_string()]);
+}
+
+#[tokio::test]
+async fn a_control_the_environment_profile_holds_more_strongly_is_kept() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    seed_protected_route(&state, "wild-route", "*.review.example.com", "/", |route| {
+        route.ip_allowlist = vec!["192.0.2.0/24".to_string()];
+        route.waf_enabled = false;
+    })
+    .await;
+    let token = writer(&state, "acme-ci").await;
+    let mut body = env_body();
+    body["waf_enabled"] = serde_json::json!(true);
+
+    let response = put(&state, &token, "pr-42", body).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let data = body_json(response).await["data"].clone();
+    assert_eq!(
+        data["protections_inherited_from"],
+        serde_json::json!(["wild-route"])
+    );
+    let route = environment_route_of(&state, &data).await;
+    assert!(
+        route.waf_enabled,
+        "the WAF the pipeline switched on stays on over a wildcard without one"
+    );
+    assert_eq!(route.ip_allowlist, vec!["192.0.2.0/24".to_string()]);
+}
+
+#[tokio::test]
+async fn an_environment_under_an_unprotected_wildcard_keeps_its_profile() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    seed_protected_route(&state, "wild-route", "*.review.example.com", "/", |_| {}).await;
+    let token = writer(&state, "acme-ci").await;
+
+    let response = put(&state, &token, "pr-42", env_body()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let data = body_json(response).await["data"].clone();
+    assert_eq!(
+        data["protections_inherited_from"],
+        serde_json::json!([]),
+        "nothing was raised, so nothing is named"
+    );
+    let route = environment_route_of(&state, &data).await;
+    let unprotected = state
+        .store
+        .lock()
+        .await
+        .get_route("wild-route")
+        .expect("route read")
+        .expect("the wildcard exists");
+    assert_protections_equal(&route, &unprotected);
+    assert!(!route.waf_enabled);
+    assert!(route.basic_auth_password_hash.is_none());
+}
+
+#[tokio::test]
+async fn an_update_inherits_a_protection_added_underneath_it_since() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    seed_protected_route(&state, "wild-route", "*.review.example.com", "/", |_| {}).await;
+    let token = writer(&state, "acme-ci").await;
+    let response = put(&state, &token, "pr-42", env_body()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    {
+        let store = state.store.lock().await;
+        let mut wildcard = store
+            .get_route("wild-route")
+            .expect("route read")
+            .expect("the wildcard exists");
+        wildcard.ip_allowlist = vec!["192.0.2.0/24".to_string()];
+        store
+            .update_route(&wildcard)
+            .expect("test setup: the operator protects the wildcard");
+    }
+
+    let response = put(&state, &token, "pr-42", env_body()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let data = body_json(response).await["data"].clone();
+    assert_eq!(
+        data["protections_inherited_from"],
+        serde_json::json!(["wild-route"]),
+        "the environment's own route is not what it weighs against"
+    );
+    let route = environment_route_of(&state, &data).await;
+    assert_eq!(route.ip_allowlist, vec!["192.0.2.0/24".to_string()]);
+}
+
+#[tokio::test]
+async fn two_displaced_routes_no_one_credential_satisfies_are_a_403_that_writes_nothing() {
+    // The environment's `/` takes `/admin` from the wildcard and every
+    // other path from the catch-all, each with its own Basic auth
+    // credential: no single credential is at least as strong as both.
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    seed_protected_route(&state, "catch-all", "_", "/", |route| {
+        route.basic_auth_username = Some(INHERITED_USER.to_string());
+        route.basic_auth_password_hash = Some(INHERITED_HASH.to_string());
+    })
+    .await;
+    seed_protected_route(
+        &state,
+        "wild-admin",
+        "*.review.example.com",
+        "/admin",
+        |route| {
+            route.basic_auth_username = Some("admin-sentinel".to_string());
+            route.basic_auth_password_hash = Some("$argon2id$other-hash-sentinel".to_string());
+        },
+    )
+    .await;
+    let token = writer(&state, "acme-ci").await;
+
+    let response = put(&state, &token, "pr-42", env_body()).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let message = error_message(response).await;
+    assert!(message.contains("basic_auth_username: route"), "{message}");
+    assert!(
+        message.contains("catch-all") || message.contains("wild-admin"),
+        "the refusal names the displaced route: {message}"
+    );
+    assert_no_inherited_secret(&message, "the refusal");
+    assert!(!message.contains("other-hash-sentinel"), "{message}");
+    assert!(!message.contains("admin-sentinel"), "{message}");
+
+    let counts = row_counts(&state).await;
+    assert_eq!(counts.routes, 2, "only the two operator routes");
+    assert_eq!(counts.backends, 0);
+    assert_eq!(counts.joins, 0);
+    assert_eq!(counts.environments, 0);
+}
+
 // ---- The refusals, each with the field named ----
 
 #[tokio::test]

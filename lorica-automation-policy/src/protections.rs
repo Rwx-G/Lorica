@@ -95,17 +95,13 @@ pub mod route {
 
     /// The token bucket.
     pub const RATE_LIMIT: ProtectionRule = ProtectionRule {
-        fields: &["rate_limit"],
-        rule: "added, or tightened with its capacity and refill never raised and its scope \
-               unchanged; never removed",
-        why: "the token bucket is the route's defence against a flood",
-    };
-
-    /// The legacy per-client rate pair.
-    pub const LEGACY_RATE_LIMIT: ProtectionRule = ProtectionRule {
-        fields: &["rate_limit_rps", "rate_limit_burst"],
-        rule: "added, or lowered; never raised or cleared",
-        why: "the per-client rate is the route's defence against a flood",
+        fields: &["rate_limit", "rate_limit_rps", "rate_limit_burst"],
+        rule: "the bucket the proxy enforces, `rate_limit` when set and the legacy pair \
+               otherwise, is added, or tightened with its capacity and refill never raised and \
+               its scope unchanged; never removed",
+        why: "the token bucket is the route's defence against a flood, and the structured \
+              bucket replaces the legacy one outright, so the two are weighed as the one the \
+              proxy builds",
     };
 
     /// The automatic-ban threshold.
@@ -149,9 +145,11 @@ pub mod backend {
 /// Every route control an automation token may only strengthen, in the
 /// order a refusal weighs them.
 ///
-/// A route create is not weighed: each of these is at its weakest on
-/// the row the management create stores when the body names none of
-/// them, so nothing a create sets weakens anything. What is NOT here,
+/// A route create is weighed against the route that serves its host
+/// today, when one does (a wildcard or the catch-all the new exact name
+/// would take the host from), and against nothing otherwise: each of
+/// these is at its weakest on the row the management create stores
+/// when the body names none of them. What is NOT here,
 /// and why, is recorded next to the rule in `docs/mcp.md`: the capacity
 /// limits (they price a request, they do not decide whether it is
 /// admitted), the browser-facing hardening (`force_https`,
@@ -169,7 +167,6 @@ pub const ROUTE_PROTECTION_RULES: &[ProtectionRule] = &[
     route::WAF_ENABLED,
     route::WAF_MODE,
     route::RATE_LIMIT,
-    route::LEGACY_RATE_LIMIT,
     route::AUTO_BAN_THRESHOLD,
 ];
 

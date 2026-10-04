@@ -96,7 +96,7 @@ fn the_dashboard_fixture_carries_exactly_the_scopes_the_enum_declares() {
         }
         msg.push_str(&format!(
             "\nEdit {FIXTURE_PATH} by hand so its list is exactly the serde renames on \
-             `AutomationScope` in lorica-config, sorted. Nothing generates it. A scope \
+             `AutomationScope` in lorica-automation-policy/src/scope.rs, sorted. Nothing generates it. A scope \
              the fixture does not carry is a scope the dashboard's mint form cannot \
              offer, and an operator finds that out with no error anywhere.\n"
         ));

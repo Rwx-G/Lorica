@@ -1020,7 +1020,8 @@ pub const READS: &[ToolSpec] = &[
         name: "lorica_backends",
         title: "Backends",
         summary: "Read every configured backend with its health, its open connection count \
-                  and its live EWMA score.",
+                  and its live EWMA score. Every query value of a `health_check_path` reads \
+                  as `[redacted]`.",
         scope: AutomationScope::BackendsRead,
         path: "/automation/v1/backends",
         resource: None,
@@ -1524,11 +1525,14 @@ pub const MUTATIONS: &[Mutation] = &[
         title: "Update one backend",
         summary: "Patch one backend by id: only the fields sent change. The backend named, on \
                   its stored address, and any address the patch gives it must be inside the \
-                  token's allowed_backend_cidrs. A backend an environment owns is refused. Upstream TLS moves one way only: \
-                  `tls_upstream` on, never off; `tls_skip_verify` off, never on, a create \
-                  included; `tls_sni` left unchanged while the upstream certificate is \
-                  verified. A write in the other direction is refused, preview included; it is \
-                  made in the dashboard.",
+                  token's allowed_backend_cidrs. A backend an environment owns is refused. \
+                  Upstream TLS moves one way only: `tls_upstream` on, never off; \
+                  `tls_skip_verify` off, never on, a create included; `tls_sni` left unchanged \
+                  while the upstream certificate is verified. A write in the other direction is \
+                  refused, preview included; it is made in the dashboard. A \
+                  `health_check_path` sent back exactly as read, its `[redacted]` values \
+                  included, keeps the stored path; any other path carrying `[redacted]` is \
+                  refused.",
         scope: AutomationScope::BackendsWrite,
         verb: Verb::Put,
         path: "/automation/v1/backends",

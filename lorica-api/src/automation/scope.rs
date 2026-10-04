@@ -303,7 +303,8 @@ fn one_segment_under(path: &str, collection: &str) -> bool {
         .is_some_and(|last| !last.is_empty() && !last.contains('/'))
 }
 
-/// The identity path, the only one any live token reaches.
+/// The identity path: with the MCP endpoint, one of the two paths any
+/// live token reaches.
 pub(super) const WHOAMI_PATH: &str = "/automation/v1/whoami";
 
 /// The environment collection path; single environments hang under it.
@@ -1109,16 +1110,5 @@ mod tests {
             through_the_layer(logs_only, "/automation/v1/waf/events").await,
             http::StatusCode::FORBIDDEN
         );
-    }
-
-    #[test]
-    fn every_scope_spells_itself_the_way_the_wire_does() {
-        for scope in AutomationScope::ALL {
-            assert_eq!(
-                serde_json::to_string(scope).expect("scope serialises"),
-                format!("\"{}\"", scope_str(*scope)),
-                "{scope:?}"
-            );
-        }
     }
 }

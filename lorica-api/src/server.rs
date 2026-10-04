@@ -1353,9 +1353,16 @@ pub fn build_router(
         // anything larger than this global default and without a per-
         // route override is rejected with 413 Payload Too Large.
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MiB
-        .layer(axum::Extension(state))
+        .layer(axum::Extension(state.clone()))
         .layer(axum::Extension(session_store))
         .layer(axum::Extension(rate_limiter))
+        // Every request that is not a read runs, from the session check
+        // to its audit row, as one unit a client hanging up cannot cut
+        // (`crate::db::detach_mutations`), inside the request span.
+        .layer(middleware::from_fn_with_state(
+            state,
+            crate::db::detach_mutations,
+        ))
         // Outermost: every API request runs inside an `api_request`
         // tracing span so `lorica::audit` events correlate with the
         // request in OTel (Story 8.9 AC #4).

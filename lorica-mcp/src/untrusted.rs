@@ -339,11 +339,12 @@ mod tests {
     }
 
     #[test]
-    fn a_body_seeded_with_every_depth_costs_one_pass_and_not_one_per_depth() {
+    fn a_body_seeded_with_every_depth_is_fenced_past_the_deepest_seed() {
         // The input the rescanning shape paid for: markers at depths
-        // 0..N, each of which sent it back over the whole body. Under
-        // the one-pass shape this is a single walk; under the old one
-        // it was N walks of a body that is itself N markers long.
+        // 0..N, each of which sent it back over the whole body. This
+        // pins what the fence comes to on it, the smallest free depth
+        // past every seeded one; that it costs one walk and not N is
+        // the shape of `fence`, which this assertion cannot see.
         const DEPTHS: usize = 2_000;
         let mut body = String::new();
         for depth in 0..DEPTHS {

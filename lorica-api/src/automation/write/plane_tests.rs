@@ -823,6 +823,340 @@ async fn a_token_strengthens_a_protection_through_the_plane_and_never_weakens_on
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+/// An operator route on `hostname` through the management API, with
+/// `protections` merged into its body; its id.
+async fn an_operator_route(
+    f: &WriteFixture,
+    hostname: &str,
+    protections: serde_json::Value,
+) -> String {
+    let mut body = serde_json::json!({ "hostname": hostname });
+    if let (Some(body), Some(protections)) = (body.as_object_mut(), protections.as_object()) {
+        body.extend(protections.clone());
+    }
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &f.admin,
+        Some(body),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED, "{hostname}");
+    parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string()
+}
+
+/// A token route write refused for taking a host over weaker: a 403
+/// naming `field` and the displaced route's id, echoing none of the
+/// displaced route's values, and nothing written.
+async fn assert_displacement_refused(
+    f: &WriteFixture,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+    field: &str,
+    displaced: &str,
+    withheld: &str,
+) {
+    let before = lorica_config::canonical::encode_canonical(&canonical_now(&f.state).await)
+        .expect("encodes");
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            method,
+            &format!("{path}{suffix}"),
+            &f.bearer,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{body}{suffix}");
+        let refusal = body_json(response).await;
+        let message = refusal["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&format!("{field}: route `{displaced}` serves")),
+            "{body}{suffix}: {refusal}"
+        );
+        assert!(!message.contains(withheld), "{body}{suffix}: {refusal}");
+    }
+    let after = lorica_config::canonical::encode_canonical(&canonical_now(&f.state).await)
+        .expect("encodes");
+    assert_eq!(before, after, "a refused takeover changed the store");
+}
+
+#[tokio::test]
+async fn an_exact_host_under_a_protected_wildcard_takes_it_over_only_as_strong() {
+    // Security audit M1: hostnames are unique by exact string, and the
+    // proxy picks an exact name before any wildcard, so a token's route
+    // on `app.write.example.com` took that host from an operator's
+    // `*.write.example.com` and every protection set there with it.
+    let f = a_node_with_something_to_write().await;
+    let wildcard = an_operator_route(
+        &f,
+        "*.write.example.com",
+        serde_json::json!({ "ip_allowlist": ["10.0.0.0/8"], "waf_enabled": true }),
+    )
+    .await;
+
+    assert_displacement_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        serde_json::json!({ "hostname": "app.write.example.com" }),
+        "ip_allowlist",
+        &wildcard,
+        "10.0.0.0",
+    )
+    .await;
+    assert_displacement_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        serde_json::json!({
+            "hostname": "app.write.example.com",
+            "ip_allowlist": ["10.1.0.0/16"],
+        }),
+        "waf_enabled",
+        &wildcard,
+        "10.0.0.0",
+    )
+    .await;
+
+    // As strong, and stronger, it lands.
+    for (hostname, allowlist) in [
+        ("same.write.example.com", "10.0.0.0/8"),
+        ("narrower.write.example.com", "10.1.0.0/16"),
+    ] {
+        let created = automation_call(
+            &f.state,
+            "POST",
+            "/automation/v1/routes",
+            &f.bearer,
+            Some(serde_json::json!({
+                "hostname": hostname,
+                "ip_allowlist": [allowlist],
+                "waf_enabled": true,
+            })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED, "{hostname}");
+    }
+}
+
+#[tokio::test]
+async fn a_name_another_route_holds_is_refused_without_that_routes_id() {
+    // The store's uniqueness message names the holding route by id; a
+    // token whose name collides with an alias on a route outside its
+    // grant learns that the name is taken, and nothing of which row.
+    let f = a_node_with_something_to_write().await;
+    let foreign = an_operator_route(
+        &f,
+        "app.prod.example.com",
+        serde_json::json!({ "hostname_aliases": ["taken.write.example.com"] }),
+    )
+    .await;
+    for (body, suffix) in [
+        (
+            serde_json::json!({ "hostname": "taken.write.example.com" }),
+            "",
+        ),
+        (
+            serde_json::json!({
+                "hostname": "free.write.example.com",
+                "hostname_aliases": ["taken.write.example.com"],
+            }),
+            "?dry_run=true",
+        ),
+    ] {
+        let response = automation_call(
+            &f.state,
+            "POST",
+            &format!("/automation/v1/routes{suffix}"),
+            &f.bearer,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}{suffix}"
+        );
+        let message = body_json(response).await["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            message.contains("'taken.write.example.com' already used by another route"),
+            "{message}"
+        );
+        assert!(!message.contains(&foreign), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn a_route_displaces_only_the_paths_the_protected_route_serves_today() {
+    let f = a_node_with_something_to_write().await;
+    let admin_only = an_operator_route(
+        &f,
+        "*.write.example.com",
+        serde_json::json!({ "path_prefix": "/admin", "waf_enabled": true }),
+    )
+    .await;
+    // `/public` on that host reaches no route today: nothing displaced.
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "app.write.example.com",
+            "path_prefix": "/public",
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    // A root prefix would take `/admin` from the wildcard: refused.
+    assert_displacement_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        serde_json::json!({ "hostname": "root.write.example.com" }),
+        "waf_enabled",
+        &admin_only,
+        "*.write.example.com",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_update_that_moves_a_route_under_a_protected_route_is_weighed_against_it() {
+    let f = a_node_with_something_to_write().await;
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({ "hostname": "mine.write.example.com" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    let route_path = format!("/automation/v1/routes/{route_id}");
+    // The operator protects the namespace after the token's route
+    // landed; the host the route already serves is its own.
+    let wildcard = an_operator_route(
+        &f,
+        "*.write.example.com",
+        serde_json::json!({ "waf_enabled": true }),
+    )
+    .await;
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &route_path,
+        &f.bearer,
+        Some(serde_json::json!({ "connect_timeout_s": 7 })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "its own host");
+
+    for body in [
+        serde_json::json!({ "hostname_aliases": ["alias.write.example.com"] }),
+        serde_json::json!({ "hostname": "renamed.write.example.com" }),
+    ] {
+        assert_displacement_refused(
+            &f,
+            "PUT",
+            &route_path,
+            body,
+            "waf_enabled",
+            &wildcard,
+            "*.write.example.com",
+        )
+        .await;
+    }
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &route_path,
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname_aliases": ["alias.write.example.com"],
+            "waf_enabled": true,
+        })),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "as strong as the wildcard"
+    );
+}
+
+#[tokio::test]
+async fn an_exact_host_under_a_protected_catch_all_takes_it_over_only_as_strong() {
+    let f = a_node_with_something_to_write().await;
+    let catch_all = an_operator_route(
+        &f,
+        lorica_config::route_selection::CATCH_ALL_HOSTNAME,
+        serde_json::json!({
+            "ip_denylist": ["192.0.2.0/24"],
+            "waf_enabled": true,
+            "waf_mode": "blocking",
+        }),
+    )
+    .await;
+    assert_displacement_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        serde_json::json!({ "hostname": "any.write.example.com", "waf_enabled": true }),
+        "ip_denylist",
+        &catch_all,
+        "192.0.2",
+    )
+    .await;
+    assert_displacement_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        serde_json::json!({
+            "hostname": "any.write.example.com",
+            "ip_denylist": ["192.0.2.0/24"],
+            "waf_enabled": true,
+        }),
+        "waf_mode",
+        &catch_all,
+        "192.0.2",
+    )
+    .await;
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({
+            "hostname": "any.write.example.com",
+            "ip_denylist": ["192.0.2.0/23"],
+            "waf_enabled": true,
+            "waf_mode": "blocking",
+        })),
+    )
+    .await;
+    assert_eq!(
+        created.status(),
+        StatusCode::CREATED,
+        "stronger than the catch-all"
+    );
+}
+
 #[tokio::test]
 async fn a_certificate_bound_anew_is_weighed_against_the_hostname_grant() {
     // The grant said which routes a token may reach and nothing of
@@ -2699,4 +3033,101 @@ async fn a_preview_needs_the_read_scope_of_the_row_it_answers() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_masked_health_check_path_sent_back_keeps_the_stored_probe_and_is_never_stored() {
+    // Architecture audit: the plane masks every query value of a
+    // backend's health-check path, and a model copying the listed row
+    // into an update stored the mask as the probe's credential, so the
+    // backend failed its checks and its routes lost their traffic.
+    let f = a_node_with_something_to_write().await;
+    let probe = "/health?token=s3cr3t";
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/backends/{}", f.backend_id),
+        &f.admin,
+        Some(serde_json::json!({ "health_check_path": probe })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let backend_path = format!("/automation/v1/backends/{}", f.backend_id);
+    let stored_probe = || async {
+        let store = f.state.store.lock().await;
+        store
+            .get_backend(&f.backend_id)
+            .expect("store")
+            .expect("the backend")
+            .health_check_path
+    };
+
+    // Read back as listed and sent with another field: the probe stays.
+    let listed = parse_data(
+        automation_send(&f.state, "/automation/v1/backends", Some(&f.bearer), None).await,
+    )
+    .await;
+    let as_read = listed["items"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == f.backend_id.as_str()))
+        .and_then(|row| row["health_check_path"].as_str())
+        .expect("the listing carries the backend's path")
+        .to_string();
+    assert_eq!(as_read, "/health?token=[redacted]");
+    for suffix in ["?dry_run=true", ""] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("{backend_path}{suffix}"),
+            &f.bearer,
+            Some(serde_json::json!({ "health_check_path": as_read, "weight": 50 })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{suffix}");
+        let answer = body_json(response).await;
+        assert!(!answer.to_string().contains("s3cr3t"), "{suffix}: {answer}");
+    }
+    assert_eq!(stored_probe().await.as_deref(), Some(probe));
+
+    // A marker that is not the stored path read back, and a create, are
+    // refused, and nothing is stored.
+    for (method, path, body) in [
+        (
+            "PUT",
+            backend_path.clone(),
+            serde_json::json!({ "health_check_path": "/ready?token=[redacted]" }),
+        ),
+        (
+            "POST",
+            "/automation/v1/backends".to_string(),
+            serde_json::json!({ "address": "10.0.0.12:8080", "health_check_path": as_read }),
+        ),
+    ] {
+        let response =
+            automation_call(&f.state, method, &path, &f.bearer, Some(body.clone())).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{method} {body}"
+        );
+        let refusal = body_json(response).await;
+        assert!(
+            refusal["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("health_check_path: `[redacted]`")),
+            "{refusal}"
+        );
+    }
+    assert_eq!(stored_probe().await.as_deref(), Some(probe));
+    let store = f.state.store.lock().await;
+    assert!(
+        store
+            .list_backends()
+            .expect("store")
+            .iter()
+            .all(|backend| backend.address != "10.0.0.12:8080"),
+        "a refused create stored a backend"
+    );
 }

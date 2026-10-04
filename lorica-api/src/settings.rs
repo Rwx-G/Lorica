@@ -55,6 +55,33 @@ const WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN: u64 = 1_048_576;
 const WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX: u64 = 17_179_869_184;
 const SLA_PURGE_RETENTION_DAYS_MIN: i32 = 1;
 const SLA_PURGE_RETENTION_DAYS_MAX: i32 = 3650;
+// Backlog #89. The probe cap bounds how many synthetic probes run at
+// once; below 1 every probe would silently stop. The load-test ceilings
+// are not hard limits: a run above one asks for confirmation, so the
+// bounds only keep the numbers meaningful (a day-long run, a million
+// requests a second).
+const MAX_ACTIVE_PROBES_MIN: i32 = 1;
+const MAX_ACTIVE_PROBES_MAX: i32 = 10_000;
+const LOADTEST_MAX_CONCURRENCY_MIN: i32 = 1;
+const LOADTEST_MAX_CONCURRENCY_MAX: i32 = 10_000;
+const LOADTEST_MAX_DURATION_S_MIN: i32 = 1;
+const LOADTEST_MAX_DURATION_S_MAX: i32 = 86_400;
+const LOADTEST_MAX_RPS_MIN: i32 = 1;
+const LOADTEST_MAX_RPS_MAX: i32 = 1_000_000;
+// Story 8.9's defense-in-depth bounds. The dashboard's Network tab has
+// shown them since 1.6.0 while no request field carried them, so a save
+// there changed nothing. `0` keeps the audit trail forever and lifts the
+// per-IP connection cap; the stash and mirror caps have no "off".
+const AUDIT_LOG_RETENTION_DAYS_MIN: u32 = 0;
+const AUDIT_LOG_RETENTION_DAYS_MAX: u32 = 3650;
+const CONNECTION_LIMITS_PER_IP_MIN: u32 = 0;
+const CONNECTION_LIMITS_PER_IP_MAX: u32 = 1_000_000;
+const BOT_STASH_MAX_ENTRIES_MIN: u32 = 1;
+const BOT_STASH_MAX_ENTRIES_MAX: u32 = 10_000_000;
+const BOT_STASH_PER_PREFIX_MAX_MIN: u32 = 1;
+const BOT_STASH_PER_PREFIX_MAX_MAX: u32 = 1_000_000;
+const MIRROR_MAX_CONCURRENT_MIN: u32 = 1;
+const MIRROR_MAX_CONCURRENT_MAX: u32 = 1_000_000;
 const OTLP_SAMPLING_RATIO_MIN: f64 = 0.0;
 const OTLP_SAMPLING_RATIO_MAX: f64 = 1.0;
 const CERT_EXPORT_MODE_MAX: u32 = 0o777;
@@ -141,6 +168,66 @@ pub fn settings_schema() -> serde_json::Value {
             "min": HEADER_TIMEOUT_S_MIN,
             "max": HEADER_TIMEOUT_S_MAX,
             "default": d.header_timeout_s,
+        },
+        "max_active_probes": {
+            "type": "integer",
+            "min": MAX_ACTIVE_PROBES_MIN,
+            "max": MAX_ACTIVE_PROBES_MAX,
+            "default": d.max_active_probes,
+        },
+        "loadtest_max_concurrency": {
+            "type": "integer",
+            "min": LOADTEST_MAX_CONCURRENCY_MIN,
+            "max": LOADTEST_MAX_CONCURRENCY_MAX,
+            "default": d.loadtest_max_concurrency,
+        },
+        "loadtest_max_duration_s": {
+            "type": "integer",
+            "min": LOADTEST_MAX_DURATION_S_MIN,
+            "max": LOADTEST_MAX_DURATION_S_MAX,
+            "default": d.loadtest_max_duration_s,
+        },
+        "loadtest_max_rps": {
+            "type": "integer",
+            "min": LOADTEST_MAX_RPS_MIN,
+            "max": LOADTEST_MAX_RPS_MAX,
+            "default": d.loadtest_max_rps,
+        },
+        "audit_log_retention_days": {
+            "type": "integer",
+            "min": AUDIT_LOG_RETENTION_DAYS_MIN,
+            "max": AUDIT_LOG_RETENTION_DAYS_MAX,
+            "default": d.audit_log_retention_days,
+        },
+        "connection_limits_per_ip": {
+            "type": "integer",
+            "min": CONNECTION_LIMITS_PER_IP_MIN,
+            "max": CONNECTION_LIMITS_PER_IP_MAX,
+            "default": d.connection_limits_per_ip.unwrap_or(0),
+        },
+        "bot_stash_max_entries": {
+            "type": "integer",
+            "min": BOT_STASH_MAX_ENTRIES_MIN,
+            "max": BOT_STASH_MAX_ENTRIES_MAX,
+            "default": d.bot_stash_max_entries,
+        },
+        "bot_stash_per_prefix_max": {
+            "type": "integer",
+            "min": BOT_STASH_PER_PREFIX_MAX_MIN,
+            "max": BOT_STASH_PER_PREFIX_MAX_MAX,
+            "default": d.bot_stash_per_prefix_max,
+        },
+        "mirror_max_concurrent_per_route": {
+            "type": "integer",
+            "min": MIRROR_MAX_CONCURRENT_MIN,
+            "max": MIRROR_MAX_CONCURRENT_MAX,
+            "default": d.mirror_max_concurrent_per_route,
+        },
+        "mirror_max_concurrent_global": {
+            "type": "integer",
+            "min": MIRROR_MAX_CONCURRENT_MIN,
+            "max": MIRROR_MAX_CONCURRENT_MAX,
+            "default": d.mirror_max_concurrent_global,
         },
         "waf_ban_threshold": {
             "type": "integer",
@@ -366,6 +453,31 @@ pub struct UpdateSettingsRequest {
     pub flood_strict_rps: Option<u32>,
     /// Global header-phase read timeout in seconds (Story 8.10 AC #1).
     pub header_timeout_s: Option<u32>,
+    /// Cap on concurrent synthetic probes (backlog #89).
+    pub max_active_probes: Option<i32>,
+    /// Load-test concurrency above which a run asks for confirmation
+    /// (backlog #89).
+    pub loadtest_max_concurrency: Option<i32>,
+    /// Load-test duration (s) above which a run asks for confirmation
+    /// (backlog #89).
+    pub loadtest_max_duration_s: Option<i32>,
+    /// Load-test request rate above which a run asks for confirmation
+    /// (backlog #89).
+    pub loadtest_max_rps: Option<i32>,
+    /// Days of audit-log history kept (Story 8.9 AC #9). `0` keeps it
+    /// forever.
+    pub audit_log_retention_days: Option<u32>,
+    /// Simultaneous connections allowed from one source IP, per worker
+    /// (Story 8.9 AC #5). `0` lifts the cap; absent leaves it as stored.
+    pub connection_limits_per_ip: Option<u32>,
+    /// Global cap on pending bot challenges (Story 8.9 AC #6).
+    pub bot_stash_max_entries: Option<u32>,
+    /// Per-prefix cap on pending bot challenges (Story 8.9 AC #6).
+    pub bot_stash_per_prefix_max: Option<u32>,
+    /// Per-route cap on in-flight mirror sub-requests (Story 8.9 AC #7).
+    pub mirror_max_concurrent_per_route: Option<u32>,
+    /// Global cap on in-flight mirror sub-requests (Story 8.9 AC #7).
+    pub mirror_max_concurrent_global: Option<u32>,
     /// Number of WAF blocks before auto-ban.
     pub waf_ban_threshold: Option<i32>,
     /// WAF auto-ban duration (s).
@@ -530,17 +642,17 @@ pub async fn update_settings(
     Json(body): Json<UpdateSettingsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    let change = crate::db::run_detached(async move {
-        update_settings_as(
-            &state,
-            &audit_ctx,
-            body,
-            crate::preview::WriteMode::Apply,
-            SettingsAuditTarget::ChangedKeys,
-            |_, _| Ok(()),
-        )
-        .await
-    })
+    // The management router runs this request as one unit a hung-up
+    // client cannot split (`db::detach_mutations`), so the commit, the
+    // reload signal and the audit row land together.
+    let change = update_settings_as(
+        &state,
+        &audit_ctx,
+        body,
+        crate::preview::WriteMode::Apply,
+        SettingsAuditTarget::ChangedKeys,
+        |_, _| Ok(()),
+    )
     .await?;
     let mut settings = change.after;
     mask_settings_secrets(&mut settings);
@@ -703,6 +815,70 @@ pub(crate) async fn update_settings_as(
             HEADER_TIMEOUT_S_MIN..=HEADER_TIMEOUT_S_MAX,
             &format!("header_timeout_s must be in {HEADER_TIMEOUT_S_MIN}..={HEADER_TIMEOUT_S_MAX}"),
         )?;
+        apply_ranged(
+            body.max_active_probes,
+            &mut settings.max_active_probes,
+            MAX_ACTIVE_PROBES_MIN..=MAX_ACTIVE_PROBES_MAX,
+            "max_active_probes",
+        )?;
+        apply_ranged(
+            body.loadtest_max_concurrency,
+            &mut settings.loadtest_max_concurrency,
+            LOADTEST_MAX_CONCURRENCY_MIN..=LOADTEST_MAX_CONCURRENCY_MAX,
+            "loadtest_max_concurrency",
+        )?;
+        apply_ranged(
+            body.loadtest_max_duration_s,
+            &mut settings.loadtest_max_duration_s,
+            LOADTEST_MAX_DURATION_S_MIN..=LOADTEST_MAX_DURATION_S_MAX,
+            "loadtest_max_duration_s",
+        )?;
+        apply_ranged(
+            body.loadtest_max_rps,
+            &mut settings.loadtest_max_rps,
+            LOADTEST_MAX_RPS_MIN..=LOADTEST_MAX_RPS_MAX,
+            "loadtest_max_rps",
+        )?;
+        apply_ranged(
+            body.audit_log_retention_days,
+            &mut settings.audit_log_retention_days,
+            AUDIT_LOG_RETENTION_DAYS_MIN..=AUDIT_LOG_RETENTION_DAYS_MAX,
+            "audit_log_retention_days",
+        )?;
+        // The stored form of "no cap" is `None`; the request spells it
+        // `0`, because a JSON `null` reads as an absent field.
+        let mut per_ip_limit: u32 = settings.connection_limits_per_ip.unwrap_or(0);
+        apply_ranged(
+            body.connection_limits_per_ip,
+            &mut per_ip_limit,
+            CONNECTION_LIMITS_PER_IP_MIN..=CONNECTION_LIMITS_PER_IP_MAX,
+            "connection_limits_per_ip",
+        )?;
+        settings.connection_limits_per_ip = (per_ip_limit > 0).then_some(per_ip_limit);
+        apply_ranged(
+            body.bot_stash_max_entries,
+            &mut settings.bot_stash_max_entries,
+            BOT_STASH_MAX_ENTRIES_MIN..=BOT_STASH_MAX_ENTRIES_MAX,
+            "bot_stash_max_entries",
+        )?;
+        apply_ranged(
+            body.bot_stash_per_prefix_max,
+            &mut settings.bot_stash_per_prefix_max,
+            BOT_STASH_PER_PREFIX_MAX_MIN..=BOT_STASH_PER_PREFIX_MAX_MAX,
+            "bot_stash_per_prefix_max",
+        )?;
+        apply_ranged(
+            body.mirror_max_concurrent_per_route,
+            &mut settings.mirror_max_concurrent_per_route,
+            MIRROR_MAX_CONCURRENT_MIN..=MIRROR_MAX_CONCURRENT_MAX,
+            "mirror_max_concurrent_per_route",
+        )?;
+        apply_ranged(
+            body.mirror_max_concurrent_global,
+            &mut settings.mirror_max_concurrent_global,
+            MIRROR_MAX_CONCURRENT_MIN..=MIRROR_MAX_CONCURRENT_MAX,
+            "mirror_max_concurrent_global",
+        )?;
         apply_min_i32(
             body.waf_ban_threshold,
             &mut settings.waf_ban_threshold,
@@ -734,13 +910,11 @@ pub(crate) async fn update_settings_as(
         // Story 10.6 AC #7. Not a secret and not masked: the budget is
         // a capacity figure an operator has to be able to read back to
         // reason about the `skipped_budget` scan outcome.
-        apply_ranged_u64(
+        apply_ranged(
             body.waf_body_scan_max_inflight_bytes,
             &mut settings.waf_body_scan_max_inflight_bytes,
             WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN..=WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX,
-            &format!(
-                "waf_body_scan_max_inflight_bytes must be in {WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MIN}..={WAF_BODY_SCAN_MAX_INFLIGHT_BYTES_MAX}"
-            ),
+            "waf_body_scan_max_inflight_bytes",
         )?;
         apply_plain(body.sla_purge_enabled, &mut settings.sla_purge_enabled);
         apply_ranged_i32(
@@ -1119,25 +1293,28 @@ fn apply_ranged_u32(
     Ok(())
 }
 
-/// `u64` variant of [`apply_ranged_i32`] for byte-denominated budgets
-/// (`waf_body_scan_max_inflight_bytes`), which are `u64` on
-/// `GlobalSettings` because a byte count has no business being signed.
+/// Assign a numeric field when present, refusing a value outside
+/// `range` with `422 "<label> must be in <min>..=<max>"`.
 ///
-/// It answers `422`, not the `400` its `i32` and `u32` siblings
-/// answer. The rule on [`ApiError::Unprocessable`] decides it: a cap
-/// over its documented limit is a request the server understood and
-/// refuses on its merits. The siblings predate that rule and are in
-/// the set the doc comment explicitly leaves unswept, so they are not
-/// changed here; new fields use the rule.
-fn apply_ranged_u64(
-    value: Option<u64>,
-    target: &mut u64,
-    range: std::ops::RangeInclusive<u64>,
-    error_msg: &str,
+/// It answers `422`, not the `400` [`apply_ranged_i32`] and
+/// [`apply_ranged_u32`] answer. The rule on [`ApiError::Unprocessable`]
+/// decides it: a cap over its documented limit is a request the server
+/// understood and refuses on its merits. Those two predate that rule
+/// and are in the set the doc comment explicitly leaves unswept, so
+/// they are not changed here; new fields use this one.
+fn apply_ranged<T: PartialOrd + Copy + std::fmt::Display>(
+    value: Option<T>,
+    target: &mut T,
+    range: std::ops::RangeInclusive<T>,
+    label: &str,
 ) -> Result<(), ApiError> {
     if let Some(v) = value {
         if !range.contains(&v) {
-            return Err(ApiError::Unprocessable(error_msg.to_string()));
+            return Err(ApiError::Unprocessable(format!(
+                "{label} must be in {}..={}",
+                range.start(),
+                range.end()
+            )));
         }
         *target = v;
     }
@@ -2181,4 +2358,160 @@ pub async fn delete_preference(
     Ok(json_data(
         serde_json::json!({"message": "preference deleted"}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use crate::tests::{parse_data, send, setup_admin_and_login, test_state};
+
+    /// The settings the dashboard's form writes since backlog #89 and
+    /// the Story 8.9 bounds its Network tab showed and never sent.
+    const FORM_WRITTEN_SINCE_1_9: [&str; 10] = [
+        "max_active_probes",
+        "loadtest_max_concurrency",
+        "loadtest_max_duration_s",
+        "loadtest_max_rps",
+        "audit_log_retention_days",
+        "connection_limits_per_ip",
+        "bot_stash_max_entries",
+        "bot_stash_per_prefix_max",
+        "mirror_max_concurrent_per_route",
+        "mirror_max_concurrent_global",
+    ];
+
+    #[tokio::test]
+    async fn each_setting_is_written_inside_the_bounds_the_schema_publishes_and_refused_past_them()
+    {
+        let schema = super::settings_schema();
+        for field in FORM_WRITTEN_SINCE_1_9 {
+            // A node per field: the settings writes of one session share
+            // a rate budget the whole sweep would exhaust.
+            let (state, sessions, limiter) = test_state().await;
+            let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+            let min = schema[field]["min"].as_i64().expect("a published min");
+            let max = schema[field]["max"].as_i64().expect("a published max");
+            assert!(min < max, "{field}");
+            for value in [min, max, min + 1] {
+                let body = serde_json::json!({ field: value });
+                let answer = send(
+                    &state,
+                    &sessions,
+                    &limiter,
+                    "PUT",
+                    "/api/v1/settings",
+                    &admin,
+                    Some(body),
+                )
+                .await;
+                assert_eq!(answer.status(), StatusCode::OK, "{field}={value}");
+                let stored = parse_data(answer).await[field].clone();
+                let expected = if field == "connection_limits_per_ip" && value == 0 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(value)
+                };
+                assert_eq!(stored, expected, "{field}={value}");
+            }
+            let mut refused = vec![max + 1];
+            if min > 0 {
+                refused.push(min - 1);
+            }
+            for value in refused {
+                let answer = send(
+                    &state,
+                    &sessions,
+                    &limiter,
+                    "PUT",
+                    "/api/v1/settings",
+                    &admin,
+                    Some(serde_json::json!({ field: value })),
+                )
+                .await;
+                assert_eq!(
+                    answer.status(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{field}={value}"
+                );
+                let message = String::from_utf8(
+                    axum::body::to_bytes(answer.into_body(), usize::MAX)
+                        .await
+                        .expect("body")
+                        .to_vec(),
+                )
+                .expect("utf-8");
+                assert!(message.contains(field), "{message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_per_ip_connection_cap_is_lifted_by_zero_and_left_alone_when_absent() {
+        let (state, sessions, limiter) = test_state().await;
+        let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+        let put = |body: serde_json::Value| {
+            send(
+                &state,
+                &sessions,
+                &limiter,
+                "PUT",
+                "/api/v1/settings",
+                &admin,
+                Some(body),
+            )
+        };
+        let set =
+            parse_data(put(serde_json::json!({ "connection_limits_per_ip": 25 })).await).await;
+        assert_eq!(set["connection_limits_per_ip"], 25);
+        // A save that does not name it, and one that sends `null`, keep it.
+        let other = parse_data(put(serde_json::json!({ "max_active_probes": 7 })).await).await;
+        assert_eq!(other["connection_limits_per_ip"], 25);
+        let null =
+            parse_data(put(serde_json::json!({ "connection_limits_per_ip": null })).await).await;
+        assert_eq!(null["connection_limits_per_ip"], 25);
+        let lifted =
+            parse_data(put(serde_json::json!({ "connection_limits_per_ip": 0 })).await).await;
+        assert!(lifted["connection_limits_per_ip"].is_null(), "{lifted}");
+    }
+
+    #[tokio::test]
+    async fn the_document_the_dashboard_reads_is_written_back_with_its_changes() {
+        // The dashboard sends back the whole document it read, edited.
+        // Every one of these settings must take the edit rather than be
+        // dropped as an unknown key, which is what the Network tab's
+        // fields were from 1.6.0 to 1.9.0.
+        let (state, sessions, limiter) = test_state().await;
+        let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+        let read = send(
+            &state,
+            &sessions,
+            &limiter,
+            "GET",
+            "/api/v1/settings",
+            &admin,
+            None,
+        )
+        .await;
+        let mut document = parse_data(read).await;
+        let schema = super::settings_schema();
+        for field in FORM_WRITTEN_SINCE_1_9 {
+            document[field] = schema[field]["max"].clone();
+        }
+        let written = send(
+            &state,
+            &sessions,
+            &limiter,
+            "PUT",
+            "/api/v1/settings",
+            &admin,
+            Some(document),
+        )
+        .await;
+        assert_eq!(written.status(), StatusCode::OK);
+        let stored = parse_data(written).await;
+        for field in FORM_WRITTEN_SINCE_1_9 {
+            assert_eq!(stored[field], schema[field]["max"], "{field}");
+        }
+    }
 }

@@ -43,6 +43,8 @@ The two planes deliberately share no credential and no socket. A request arrivin
 
 **Audit:** Every automation request is recorded by the outermost layer of the automation router, whatever the outcome.
 
+**Request units (both planes, v1.9.0):** A store write commits on the blocking pool whether or not its request is still awaited, and hyper drops the request future when the client goes away, so a reload signal and an audit row awaited after the commit could be lost with the client. Each plane therefore runs a request that may write as one task the request awaits but does not own (`lorica-api/src/db.rs`): on the management plane every request that is not a read, through one router layer (`detach_mutations`) rather than a call per handler, and on the automation plane every request, its audit row included. A unit outlives its connection, so the connection budgets no longer bound it: each plane has its own semaphore, taken before the task starts, so a client that leaves while waiting for a slot starts nothing, and an abandoned unit keeps its slot until it ends. Units run on the process's task tracker, which a shutdown closes and waits on for up to 10 seconds, so a unit between its commit and its row is finished rather than cut. `lorica_detached_request_units{plane}` is the number in flight. Reads stay on their connection, where a disconnect cancelling them is the right behaviour.
+
 **Versioning:** Management API path prefix `/api/v1/`. Version bump only on breaking changes. Non-breaking additions (new fields, new endpoints) don't require version bump.
 
 ## API Endpoints

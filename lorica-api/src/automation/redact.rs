@@ -42,11 +42,15 @@
 //! - an access-log row's `path`: every query value and the fragment;
 //! - a route's or a backend's `managed_by.environment`, unless the
 //!   reader may look that environment up
-//!   ([`super::environments::environments_visible_to`]).
+//!   ([`super::environments::environments_visible_to`]), and with it
+//!   every field the environment resource derives from that name
+//!   ([`ENVIRONMENT_NAMED_FIELDS`]).
 //!
 //! The mask applies wherever the automation plane or the MCP server
 //! answers such a row: the read listings, and every write answer and
-//! preview, including a preview's list of changed fields. The dashboard
+//! preview. A preview's list of changed fields is computed on the
+//! masked views, so it names no field whose only change is a withheld
+//! value. The dashboard
 //! and the log sinks are unchanged: they sit behind a session or an
 //! operator's own export, not behind a model.
 //!
@@ -66,6 +70,17 @@
 //! such stored rule, on a create, a rule added, moved or retyped, is
 //! refused and names the rule by its position, so the caller sends the
 //! value itself.
+//!
+//! # A masked health-check path may be sent back
+//!
+//! `health_check_path` is a field the config tier writes too, and a
+//! model that copies a listed backend into an update or a create sends
+//! the mask back as the probe's query. Stored, the marker replaced the
+//! probe's credential and the backend failed its health checks. So a
+//! path carrying [`REDACTED`] is read as "keep the stored path" when it
+//! is exactly the stored path as this plane answered it
+//! ([`restore_health_check_path`]), and refused otherwise, a create
+//! included, so the caller sends the path itself.
 //!
 //! # What is not masked, and why
 //!
@@ -216,24 +231,76 @@ pub fn restore_header_rule_values(
     Ok(())
 }
 
+/// `after`'s `health_check_path` put back to the path `before` stores
+/// when it carries [`REDACTED`] and is exactly the stored path as
+/// [`backend_row`] answers it. `before` is `None` on a create.
+///
+/// Run by the backend write guard under the store lock, on the row the
+/// write replaces, so the path put back is the path stored. A path that
+/// differs from the masked stored one anywhere, the parameter names
+/// included, is not a path read back, and nothing tells which value the
+/// caller meant to keep.
+///
+/// # Errors
+///
+/// `BadRequest` for a marker that is not the stored path read back;
+/// nothing the caller sent and nothing stored is echoed.
+pub fn restore_health_check_path(
+    before: Option<&lorica_config::models::Backend>,
+    after: &mut lorica_config::models::Backend,
+) -> Result<(), crate::error::ApiError> {
+    let Some(sent) = after
+        .health_check_path
+        .as_deref()
+        .filter(|sent| sent.contains(REDACTED))
+    else {
+        return Ok(());
+    };
+    let stored = before
+        .and_then(|backend| backend.health_check_path.as_deref())
+        .filter(|stored| query_values(stored) == sent);
+    let Some(stored) = stored else {
+        return Err(crate::error::ApiError::BadRequest(format!(
+            "health_check_path: `{REDACTED}` keeps the stored path only when the whole path is \
+             sent back exactly as it was read, and this one is not; send the path itself"
+        )));
+    };
+    after.health_check_path = Some(stored.to_string());
+    Ok(())
+}
+
 /// The environment `row`'s `managed_by` mark names, when it names one.
 pub fn managed_by_environment(row: &Value) -> Option<&str> {
     row.get("managed_by")?.get("environment")?.as_str()
 }
 
+/// The fields of a row an environment owns that the environment
+/// resource derives from the environment's name: the route's and the
+/// backends' `group_name` (`automation:<name>`) and each backend's
+/// `name` (`<name>-<index>`). A row an environment owns is refused any
+/// in-place edit, so these always carry the name.
+pub const ENVIRONMENT_NAMED_FIELDS: &[&str] = &["group_name", "name"];
+
 /// `row` with the environment its `managed_by` mark names withheld
 /// unless it is one of `visible`, the mark itself kept: the row still
 /// reads as owned by an environment, which is what tells a model that
 /// the management plane refuses it in place, and names none the reader
-/// could not look up.
+/// could not look up. Every field of [`ENVIRONMENT_NAMED_FIELDS`] the
+/// row carries is withheld with it, since each spells the same name.
 pub fn environment_outside(row: &mut Value, visible: &std::collections::BTreeSet<String>) {
     let foreign = managed_by_environment(row).is_some_and(|name| !visible.contains(name));
-    if foreign {
-        if let Some(name) = row
-            .get_mut("managed_by")
-            .and_then(|mark| mark.get_mut("environment"))
-        {
-            *name = Value::String(REDACTED.to_string());
+    if !foreign {
+        return;
+    }
+    if let Some(name) = row
+        .get_mut("managed_by")
+        .and_then(|mark| mark.get_mut("environment"))
+    {
+        *name = Value::String(REDACTED.to_string());
+    }
+    for field in ENVIRONMENT_NAMED_FIELDS {
+        if let Some(Value::String(text)) = row.get_mut(*field) {
+            *text = REDACTED.to_string();
         }
     }
 }
@@ -257,9 +324,12 @@ pub fn access_log_row(row: &mut Value) {
 ///
 /// An apply answers the row under `data`. A preview
 /// (`crate::preview::previewed`) answers `before` and `after` and the
-/// fields that differ as `{ from, to }`, and each side of each change is
-/// masked as the field it is, so a value withheld from `after` is not
-/// read back out of `changes`.
+/// fields that differ as `{ from, to }`; the two views are masked first
+/// and the fields that differ are computed again from the masked views,
+/// so a value withheld from `after` is not read back out of `changes`,
+/// and a change confined to a withheld value reads as no change. Diffed
+/// before the mask, the presence of a field in `changes` said whether a
+/// guessed value equalled the stored one.
 pub fn write_answer(mut answer: Json<Value>, row: fn(&mut Value)) -> Json<Value> {
     let Some(data) = answer.0.get_mut("data") else {
         return answer;
@@ -269,24 +339,18 @@ pub fn write_answer(mut answer: Json<Value>, row: fn(&mut Value)) -> Json<Value>
         return answer;
     }
     for side in ["before", "after"] {
-        if let Some(view) = data.get_mut(side) {
+        if let Some(view) = data.get_mut(side).filter(|view| !view.is_null()) {
             row(view);
         }
     }
-    if let Some(Value::Object(changes)) = data.get_mut("changes") {
-        for (field, change) in changes.iter_mut() {
-            for end in ["from", "to"] {
-                if let Some(value) = change.get_mut(end) {
-                    let mut alone =
-                        Value::Object(serde_json::Map::from_iter([(field.clone(), value.take())]));
-                    row(&mut alone);
-                    *value = alone
-                        .get_mut(field.as_str())
-                        .map(Value::take)
-                        .unwrap_or(Value::Null);
-                }
-            }
+    let changes = match (data.get("before"), data.get("after")) {
+        (Some(before), Some(after)) if !before.is_null() && !after.is_null() => {
+            crate::preview::changes_between(before, after)
         }
+        _ => Value::Null,
+    };
+    if let Some(slot) = data.get_mut("changes") {
+        *slot = changes;
     }
     answer
 }
@@ -382,11 +446,16 @@ mod tests {
     }
 
     #[test]
-    fn the_route_tools_spell_the_mask_this_module_answers_with() {
+    fn the_tools_that_read_or_write_a_masked_field_spell_the_mask_this_module_answers_with() {
         // `lorica-mcp` cannot depend on this crate, so its prose restates
         // the marker; a model told to send back a different string would
         // have every write-back refused.
-        for tool in ["lorica_routes", "lorica_route_update"] {
+        for tool in [
+            "lorica_routes",
+            "lorica_route_update",
+            "lorica_backends",
+            "lorica_backend_update",
+        ] {
             let spec = lorica_mcp::tools::find(tool).expect("the tool is in the catalogue");
             assert!(spec.summary.contains(&format!("`{REDACTED}`")), "{tool}");
         }
@@ -505,6 +574,76 @@ mod tests {
         restore_header_rule_values(None, &mut created).expect("a create with values");
     }
 
+    fn backend_probing(path: Option<&str>) -> lorica_config::models::Backend {
+        lorica_config::models::Backend {
+            id: "b-1".to_string(),
+            address: "10.0.0.10:8080".to_string(),
+            name: String::new(),
+            group_name: String::new(),
+            weight: 100,
+            health_status: lorica_config::models::HealthStatus::Unknown,
+            health_check_enabled: true,
+            health_check_interval_s: 10,
+            health_check_path: path.map(str::to_string),
+            lifecycle_state: lorica_config::models::LifecycleState::Normal,
+            active_connections: 0,
+            tls_upstream: false,
+            tls_skip_verify: false,
+            tls_sni: None,
+            h2_upstream: false,
+            managed_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_masked_health_check_path_sent_back_as_read_keeps_the_stored_one_and_nothing_else() {
+        let stored = backend_probing(Some("/health?token=s3cr3t&deep=1"));
+        let as_read = query_values("/health?token=s3cr3t&deep=1");
+
+        let mut sent_back = backend_probing(Some(&as_read));
+        restore_health_check_path(Some(&stored), &mut sent_back).expect("read back as is");
+        assert_eq!(
+            sent_back.health_check_path.as_deref(),
+            Some("/health?token=s3cr3t&deep=1")
+        );
+
+        // A path without the marker is the caller's own, set as sent.
+        let mut replaced = backend_probing(Some("/ready?token=rotated"));
+        restore_health_check_path(Some(&stored), &mut replaced).expect("a real path");
+        assert_eq!(
+            replaced.health_check_path.as_deref(),
+            Some("/ready?token=rotated")
+        );
+
+        // A marker on anything but the stored path read back is refused.
+        for (what, before, sent) in [
+            (
+                "another path",
+                Some(&stored),
+                "/ready?token=[redacted]&deep=[redacted]",
+            ),
+            (
+                "a parameter dropped",
+                Some(&stored),
+                "/health?token=[redacted]",
+            ),
+            ("a create", None, "/health?token=[redacted]&deep=[redacted]"),
+        ] {
+            let mut after = backend_probing(Some(sent));
+            let refused = restore_health_check_path(before, &mut after).expect_err(what);
+            let crate::error::ApiError::BadRequest(message) = refused else {
+                panic!("{what}: the refusal is a 400")
+            };
+            assert!(
+                message.starts_with("health_check_path:"),
+                "{what}: {message}"
+            );
+            assert!(!message.contains("s3cr3t"), "{what}: {message}");
+        }
+    }
+
     #[test]
     fn a_preview_withholds_the_value_on_both_sides_and_inside_its_changes() {
         let answer = crate::preview::previewed(
@@ -523,9 +662,56 @@ mod tests {
             masked["data"]["after"]["health_check_path"],
             "/h?token=[redacted]"
         );
+        // A change confined to a withheld value reads as no change:
+        // listed, it answered whether a guessed value was the stored one.
+        assert_eq!(masked["data"]["changes"], json!({}));
+
+        // A change the reader may see is listed, masked on each side.
+        let answer = crate::preview::previewed(
+            "update",
+            Some(json!({ "id": "b-1", "health_check_path": "/h?token=old" })),
+            Some(json!({ "id": "b-1", "health_check_path": "/ready?token=new" })),
+        );
+        let masked = write_answer(answer, backend_row).0;
         assert_eq!(
             masked["data"]["changes"]["health_check_path"],
-            json!({ "from": "/h?token=[redacted]", "to": "/h?token=[redacted]" })
+            json!({ "from": "/h?token=[redacted]", "to": "/ready?token=[redacted]" })
+        );
+
+        // A route's header rule guessed right and guessed wrong answer
+        // the same preview.
+        let stored = json!({ "id": "r-1", "header_rules": [
+            { "header_name": "X-Canary", "match_type": "exact", "value": "s3cr3t", "backend_ids": [] }
+        ] });
+        let answers: Vec<Value> = ["s3cr3t", "guess"]
+            .into_iter()
+            .map(|guess| {
+                let mut after = stored.clone();
+                after["header_rules"][0]["value"] = json!(guess);
+                write_answer(
+                    crate::preview::previewed("update", Some(stored.clone()), Some(after)),
+                    route_row,
+                )
+                .0
+            })
+            .collect();
+        assert_eq!(answers[0], answers[1]);
+        assert_eq!(answers[0]["data"]["changes"], json!({}));
+
+        // A create and a delete have no changes to compute.
+        let created = write_answer(
+            crate::preview::previewed(
+                "create",
+                None,
+                Some(json!({ "health_check_path": "/h?t=1" })),
+            ),
+            backend_row,
+        )
+        .0;
+        assert_eq!(created["data"]["changes"], Value::Null);
+        assert_eq!(
+            created["data"]["after"]["health_check_path"],
+            "/h?t=[redacted]"
         );
 
         // An apply answers the row under `data`.

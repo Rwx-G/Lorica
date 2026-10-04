@@ -28,8 +28,8 @@ The Svelte frontend is compiled automatically during `cargo build` via `build.rs
 # breakdown; a count written here would be stale by the next merge)
 cargo test
 
-# Product crate tests only
-cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-automation-policy
+# Product crate tests only: the list is in README.md, under
+# "Running tests"
 
 # Frontend tests (Vitest)
 cd lorica-dashboard/frontend && npx vitest run
@@ -55,29 +55,31 @@ We use [Conventional Commits](https://www.conventionalcommits.org/):
 
 **Types:** `feat`, `fix`, `docs`, `refactor`, `test`, `ci`, `chore`
 
-**Scopes:** `ui`, `api`, `waf`, `tls`, `proxy`, `worker`, `notify`, `acme`, `config`, `auth`, `health`, `ci`, `security`, `cluster`
+**Scopes:** `ui`, `api`, `waf`, `tls`, `proxy`, `worker`, `notify`, `acme`, `config`, `auth`, `health`, `ci`, `security`, `cluster`, `mcp`
+
+`mcp` covers the `lorica-mcp` crate and the MCP endpoint of the
+automation listener; `api` is the management API.
 
 ### Code Quality
 
-Before submitting, run the same gates as CI (`.github/workflows/ci.yml`),
-on Linux or inside the `rust:1-bookworm` image with `cmake` and
-`protobuf-compiler` installed. CI exports `RUSTFLAGS="-D warnings"`
-(set by `actions-rust-lang/setup-rust-toolchain`), so a rustc warning in
-a test target fails the Test and Coverage jobs even when clippy is clean:
-export it locally too.
+Before submitting, run the gates CI runs, on Linux or inside the
+`rust:1-bookworm` image with `cmake` and `protobuf-compiler` installed.
+The commands, crate lists included, live in `.github/workflows/ci.yml`
+and nowhere else: a copy of them here ran half of CI's test set before
+anyone noticed. Print them from the workflow and run each line:
 
 ```bash
-export RUSTFLAGS="-D warnings"
-cargo fmt --all -- --check
-cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-automation-policy -- -D warnings
-cargo clippy -p lorica-api -p lorica-cluster -p lorica-mcp -p lorica-automation-policy --all-targets -- -D warnings
-cargo clippy -p lorica --all-targets --features otel -- -D warnings
-cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-automation-policy -p lorica-command
-cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
-cargo audit
+grep -E '^\s+run: cargo (fmt|clippy|test)' .github/workflows/ci.yml
 ```
 
-and, for the dashboard, `npm run check`, `npm run lint` and `npx vitest run`
+then `cargo audit`, which the workflow's "Cargo audit" step runs after
+`cargo install cargo-audit --locked`. CI exports
+`RUSTFLAGS="-D warnings"` (set by
+`actions-rust-lang/setup-rust-toolchain`), so a rustc warning in a test
+target fails the Test and Coverage jobs even when clippy is clean:
+`export RUSTFLAGS="-D warnings"` locally too.
+
+For the dashboard, run `npm run check`, `npm run lint` and `npx vitest run`
 in `lorica-dashboard/frontend`. The Docker e2e suite
 (`tests-e2e-docker/run.sh --build`) is the release gate.
 

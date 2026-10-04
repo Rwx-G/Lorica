@@ -50,9 +50,7 @@
 
 use lorica_automation_policy::AutomationScope;
 
-pub use lorica_automation_policy::tier::{
-    resolve, Tier, TierDefinition, TierError, UnknownTier, TIERS,
-};
+pub use lorica_automation_policy::tier::{resolve, Tier, TierError, TIERS};
 
 use crate::tools::{catalogue, ToolSpec};
 

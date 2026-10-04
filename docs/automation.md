@@ -301,7 +301,8 @@ and the route, backend and certificate writes, which check every name
 and address a body claims and the stored row it names. No read and not
 the settings write consults either grant. The scopes reaching those
 paths are the grant-bounded ones, decided in one place,
-`AutomationScope::is_grant_bounded` in `lorica-config`; today they are
+`AutomationScope::is_grant_bounded` in
+`lorica-automation-policy/src/scope.rs`; today they are
 every write scope except `settings:write`. So:
 
 - a token carrying at least one grant-bounded scope must name at least
@@ -430,12 +431,23 @@ when the ownership rule refuses a read, an update or a delete.
 A request runs as a task the connection does not own: a client that
 hangs up after its write committed still gets the request row, the
 management-side row and the reload signal, so a committed change is
-never missing from the trail or from the running configuration. A
-row about a read, or about a request no credential got through, is the
-one the audit queue sheds first when it fills: a quarter of the queue
+never missing from the trail or from the running configuration. Those
+tasks are bounded: the plane runs at most as many at once as it admits
+handshakes, a request waiting for a slot starts nothing if its client
+leaves, and a shutdown waits for the tasks in flight, up to 10 seconds,
+rather than cutting one between its commit and its row
+(`lorica_detached_request_units{plane="automation"}` counts them).
+
+Only a write that happened keeps a reserved place in the audit queue: a
+write the plane answered with success, outside a preview, or an MCP
+call of an apply tool that succeeded. Every other row, a read, a
+preview, a read-tool call, a request refused by any gate or handler, a
+404, from a live credential or not, is the one the queue sheds first
+when it fills. A quarter of the queue
 (`AUDIT_QUEUE_RESERVED_FOR_MUTATIONS`) is kept for the rows of writes
-and of the management plane, so a flood of cheap requests cannot push
-out the row of a change. A queue full of those still sheds, counted in
+and of the management plane, so a flood of cheap requests, an
+authenticated one included, cannot push out the row of a change. A
+queue full of those still sheds, counted in
 `lorica_audit_rows_dropped_total`.
 
 ## The environment resource
@@ -495,6 +507,36 @@ like any other, and so does the environment row, under the format
 version Story 10.1 set, so a follower serving the route knows it
 belongs to an environment.
 
+**Never weaker than the route it displaces (decided 2026-10-04).** An
+environment's hostname is exact, and the proxy picks an exact name
+before any wildcard, so the environment takes its host from a wildcard
+route or the catch-all `_` that serves it today. Its route is written
+from the fixed profile above, so it does not stop there: it inherits,
+control by control, the protections of every route it displaces, found
+by the proxy's own route selection (`lorica-config/src/route_selection.rs`)
+over the stored rows, for the environment's path prefix and every
+stored prefix below it. The controls are the ones a token's own route
+may only strengthen (`ROUTE_PROTECTIONS`, listed in `docs/mcp.md`):
+the Basic-auth credential, `ip_allowlist`, `ip_denylist` (merged, so no
+address either list refused is admitted), `geoip`, `bot_protection`,
+the WAF switch and mode, the rate-limit bucket the proxy enforces and
+`auto_ban_threshold`. Each is raised only where the profile is weaker,
+so a WAF the request switched on stays on over a wildcard without one.
+The Basic-auth credential is copied as the stored username and password
+hash, server side; neither ever appears in the answer, the audit row or
+a log. Every `PUT` inherits again from what serves the host underneath
+the environment's own route, so an update picks up a protection the
+operator added to the wildcard since, and an environment under an
+unprotected wildcard keeps its profile unchanged. The answer names the
+routes it inherited from, by id, in `protections_inherited_from`, and
+the environment's audit row records that answer. When two displaced
+routes ask for what no one value meets (two different Basic-auth
+credentials, two allowlists neither of which covers the other), the
+`PUT` is a 403 naming the control and a displaced route's id, and
+writes nothing; an operator reconciles the routes in the dashboard. A
+protection the operator adds to the wildcard after the environment's
+last `PUT` binds the environment from its next `PUT`, not before.
+
 **The hostname rules.** Beyond the shape rules in the table, the
 hostname must not be held by another route: any route's `hostname` or
 `hostname_aliases` entry equal to it, case-insensitively, other than
@@ -546,8 +588,9 @@ a certificate change it had no part in.
 **The response.** 201 on create, 200 on update, an `ETag` header
 either way, and a body of `name`, `url`
 (`https://<hostname><path_prefix>`), `route_id`, `backend_ids[]` in
-request order, `certificate_id`, `certificate_not_after`, `expires_at`
-and `applied_generation`.
+request order, `certificate_id`, `certificate_not_after`, `expires_at`,
+`protections_inherited_from` (the routes whose protections the route
+inherited, above; empty when none) and `applied_generation`.
 
 `applied_generation` is a FLOOR, not a target. It is the fleet
 configuration generation the control plane had PUBLISHED when the
@@ -843,7 +886,10 @@ route's `forward_auth` address, the query values of a backend's
 `health_check_path`, and the query values and fragment of an access-log
 row's `path` (the proxy records the path without its query string, so
 that last one is a guard for rows from any other producer). The same
-holds on every write answer and preview (`lorica-api/src/automation/redact.rs`).
+holds on every write answer and preview (`lorica-api/src/automation/redact.rs`),
+and a preview's list of changed fields is computed on the masked views,
+so a change confined to a withheld value reads as no change rather than
+confirming or refuting a guess at it.
 A route or a backend an environment owns carries `managed_by`, and the
 environment's name in it is answered only to a credential that `GET
 /automation/v1/environments/{name}` would answer for that name (it
@@ -851,10 +897,12 @@ owns the environment, or its labels share it, and a credential bound to
 `environment_protected` asks about the one its job deploys); anyone
 else reads `{"kind": "automation", "environment": "[redacted]"}`, so a
 neighbour on a shared node learns that the row is managed and not which
-pipeline's it is. The
+pipeline's it is. The fields the environment resource derives from the
+name, a row's `group_name` (`automation:<name>`) and a backend's `name`
+(`<name>-<index>`), are withheld from that reader the same way. The
 single-certificate endpoint, which does return the public certificate
 PEM, is deliberately not mounted on this listener. Two tests in
-`lorica-api/src/tests.rs` hold that, and they walk the paths the scope
+`lorica-api/src/automation/read/plane_tests.rs` hold that, and they walk the paths the scope
 matrix declares rather than a list typed beside it. The first walks
 every field name and every string value of every answer for credential
 spellings and for PEM private-key blocks. The second pins the whole SET
@@ -1073,8 +1121,12 @@ test one header; the match type is in the identity because the value is
 validated against it. A marker no stored rule answers to (a create, a
 rule added, moved, renamed or retyped) is a `400` naming the rule by
 its position, and nothing is written: send the value itself. A real
-value is stored as sent. The dashboard reads the values and is not
-subject to any of this.
+value is stored as sent. A backend's `health_check_path` follows the
+same rule: sent back exactly as it was read, with `[redacted]` query
+values, it keeps the stored path; a marker in any other path, or on a
+create, is a `400`, so a probe credential is never replaced by the
+marker. The dashboard reads the values and is not subject to any of
+this.
 
 **Access control and upstream trust move one way.** The controls of
 `ROUTE_PROTECTION_RULES` and `BACKEND_PROTECTION_RULES`, beside the withheld list,
@@ -1467,7 +1519,10 @@ For every presented ID token, in this order:
    at all means several hundred accepted tokens per second sustained,
    which is not a CI pipeline. When the set is full the entries expiring
    soonest are evicted, a WARN is logged, and
-   `lorica_automation_oidc_replay_evictions_total` counts them. A value
+   `lorica_automation_oidc_replay_evictions_total` counts them. A token
+   that would itself be the entry evicted, because its expiry is the
+   earliest of a full set, is refused instead (`replay_set_full`):
+   admitted, it would be forgotten the moment it was remembered. A value
    that moves is worth an alert: every evicted id was still valid, and
    the window until its expiry is a replay window. A silent eviction
    would have turned a full set into exactly that.
@@ -1541,6 +1596,7 @@ refuses any reason the gates can emit that is not published.
 | `bound_claim_mismatch:<claim>` | The named bound claim does not hold; the first one, in name order. |
 | `missing_claim:<claim>` | A claim the verifier needs (`jti`, `iat`, `exp`, `iss`, `project_path`) is absent. |
 | `replayed` | The `jti` was already accepted and has not expired. |
+| `replay_set_full` | The replay set is full and this token expires before every id in it, so it could not be remembered; retry once older tokens expire. |
 | `store_error` | The issuer entries could not be read; the node's problem, not the caller's. |
 
 When several entries were tried, the row carries the reason of the last
@@ -1783,6 +1839,10 @@ reaper all run in the supervisor.
 - **`lorica_automation_oidc_replay_evictions_total`** (counter): `jti`
   entries evicted before their expiry because the replay set was full.
   Alert on any movement.
+- **`lorica_detached_request_units{plane}`** (gauge): requests running
+  as tasks their connection does not own, `automation` for this
+  listener and `management` for the dashboard's writes. A value that
+  stays at its plane's bound means requests are queueing for a slot.
 
 ## Troubleshooting
 

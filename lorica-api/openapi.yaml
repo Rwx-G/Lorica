@@ -502,6 +502,75 @@ paths:
                   type: boolean
                   default: true
                   description: Ship traffic capture records on the OTLP logs lane.
+                flood_strict_rps:
+                  type: integer
+                  description: >-
+                    Per-IP admission rate while the proxy is in flood mode
+                    (Story 8.10). `0` = auto, half of `flood_threshold_rps`.
+                    While both are set it must be below the threshold. Bounds:
+                    `GET /api/v1/settings/schema`.
+                header_timeout_s:
+                  type: integer
+                  description: >-
+                    Seconds a client has to finish sending its request headers
+                    before it is answered 408, on every route (Story 8.10).
+                    `0` turns the global floor off. Bounds:
+                    `GET /api/v1/settings/schema`.
+                max_active_probes:
+                  type: integer
+                  description: >-
+                    Synthetic probes that run at once; enabled probes past it do
+                    not run (backlog #89). Bounds: `GET /api/v1/settings/schema`.
+                loadtest_max_concurrency:
+                  type: integer
+                  description: >-
+                    Load-test concurrency above which a run asks for
+                    confirmation (backlog #89). Bounds:
+                    `GET /api/v1/settings/schema`.
+                loadtest_max_duration_s:
+                  type: integer
+                  description: >-
+                    Load-test duration, in seconds, above which a run asks for
+                    confirmation (backlog #89). Bounds:
+                    `GET /api/v1/settings/schema`.
+                loadtest_max_rps:
+                  type: integer
+                  description: >-
+                    Load-test request rate above which a run asks for
+                    confirmation (backlog #89). Bounds:
+                    `GET /api/v1/settings/schema`.
+                audit_log_retention_days:
+                  type: integer
+                  description: >-
+                    Days of audit-log history kept (Story 8.9). `0` keeps it
+                    forever. Bounds: `GET /api/v1/settings/schema`.
+                connection_limits_per_ip:
+                  type: integer
+                  description: >-
+                    Simultaneous connections allowed from one source IP, per
+                    worker process (Story 8.9). `0` lifts the cap; `null` or an
+                    absent field leaves it as stored. Bounds:
+                    `GET /api/v1/settings/schema`.
+                bot_stash_max_entries:
+                  type: integer
+                  description: >-
+                    Global cap on pending bot challenges (Story 8.9). Bounds:
+                    `GET /api/v1/settings/schema`.
+                bot_stash_per_prefix_max:
+                  type: integer
+                  description: >-
+                    Per source-prefix cap on pending bot challenges (Story 8.9).
+                    Bounds: `GET /api/v1/settings/schema`.
+                mirror_max_concurrent_per_route:
+                  type: integer
+                  description: >-
+                    Cap on in-flight mirror sub-requests per route (Story 8.9).
+                    Bounds: `GET /api/v1/settings/schema`.
+                mirror_max_concurrent_global:
+                  type: integer
+                  description: >-
+                    Cap on in-flight mirror sub-requests across every route
+                    (Story 8.9). Bounds: `GET /api/v1/settings/schema`.
                 waf_body_scan_max_inflight_bytes:
                   type: integer
                   format: int64

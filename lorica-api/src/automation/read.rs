@@ -776,7 +776,10 @@ mod tests {
     }
 
     /// The bytes the envelope used to be: every item serialised again
-    /// inside the `json_data` value the handler answered.
+    /// inside the `json_data` value the handler answered. Built from the
+    /// new envelope's own rows and page, so it pins the serialisation
+    /// (key order, escapes, the splice), not which rows a window selects;
+    /// the paging tests hold the selection.
     fn as_json_data_wrote_it(page: Page, rows: Vec<Value>) -> String {
         let parsed = page.answer(rows).0;
         let items = parsed["data"]["items"].clone();

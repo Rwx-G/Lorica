@@ -257,16 +257,13 @@ pub async fn create_backend(
     Json(body): Json<CreateBackendRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::db::run_detached(async move {
-        create_backend_as(
-            &state,
-            &audit_ctx,
-            body,
-            crate::preview::WriteMode::Apply,
-            crate::target::BackendGuard::unbounded(),
-        )
-        .await
-    })
+    create_backend_as(
+        &state,
+        &audit_ctx,
+        body,
+        crate::preview::WriteMode::Apply,
+        crate::target::BackendGuard::unbounded(),
+    )
     .await
 }
 
@@ -323,6 +320,8 @@ pub(crate) async fn create_backend_as(
     };
 
     let backend = db_blocking(&state.store, move |store| {
+        let mut backend = backend;
+        guard.restore_withheld(None, &mut backend)?;
         guard.check(
             store,
             crate::target::BackendTarget {
@@ -389,17 +388,14 @@ pub async fn update_backend(
     Json(body): Json<UpdateBackendRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::db::run_detached(async move {
-        update_backend_as(
-            &state,
-            &audit_ctx,
-            id,
-            body,
-            crate::preview::WriteMode::Apply,
-            crate::target::BackendGuard::unbounded(),
-        )
-        .await
-    })
+    update_backend_as(
+        &state,
+        &audit_ctx,
+        id,
+        body,
+        crate::preview::WriteMode::Apply,
+        crate::target::BackendGuard::unbounded(),
+    )
     .await
 }
 
@@ -481,6 +477,7 @@ pub(crate) async fn update_backend_as(
             backend.h2_upstream = h2;
         }
         backend.updated_at = Utc::now();
+        guard.restore_withheld(Some(&before_backend), &mut backend)?;
         guard.check(
             store,
             crate::target::BackendTarget {
@@ -536,16 +533,13 @@ pub async fn delete_backend(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::db::run_detached(async move {
-        delete_backend_as(
-            &state,
-            &audit_ctx,
-            id,
-            crate::preview::WriteMode::Apply,
-            crate::target::BackendGuard::unbounded(),
-        )
-        .await
-    })
+    delete_backend_as(
+        &state,
+        &audit_ctx,
+        id,
+        crate::preview::WriteMode::Apply,
+        crate::target::BackendGuard::unbounded(),
+    )
     .await
 }
 

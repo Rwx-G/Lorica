@@ -607,3 +607,42 @@ export function validateExtraSd(value: string): string | null {
   }
   return null;
 }
+
+/** An inclusive integer range a settings field accepts. */
+export interface SettingsBound {
+  min: number;
+  max: number;
+}
+
+/**
+ * The bounds of a global-settings field, read from the server's
+ * `GET /settings/schema` answer (Story 8.10 AC #7) and falling back to
+ * the supplied UI defaults for whatever the schema does not state:
+ * before it loads, or for a field whose validator sets no ceiling.
+ */
+export function settingsBound(
+  schema: Record<string, { min?: number; max?: number } | undefined>,
+  field: string,
+  fallbackMin: number,
+  fallbackMax: number,
+): SettingsBound {
+  const f = schema[field];
+  return {
+    min: typeof f?.min === 'number' ? f.min : fallbackMin,
+    max: typeof f?.max === 'number' ? f.max : fallbackMax,
+  };
+}
+
+/**
+ * Validate an integer settings input against `bound`. Empty => null
+ * (the field is left as it is).
+ */
+export function integerInRange(raw: number | string, bound: SettingsBound): string | null {
+  const str = String(raw).trim();
+  if (str === '') return null;
+  const n = Number(str);
+  if (!Number.isInteger(n) || n < bound.min || n > bound.max) {
+    return `value must be an integer in ${bound.min}..${bound.max}`;
+  }
+  return null;
+}

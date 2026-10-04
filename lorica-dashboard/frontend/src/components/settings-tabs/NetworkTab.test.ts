@@ -36,6 +36,7 @@ function form(overrides: Partial<FormShape> = {}): FormShape {
 function props(overrides: Partial<TabProps> = {}): TabProps {
   return {
     settingsForm: form(),
+    schema: {},
     expanded: true,
     toggleSection: vi.fn(),
     onSave: vi.fn(),
@@ -100,5 +101,29 @@ describe('NetworkTab automation allowlist', () => {
     expect(screen.queryAllByRole('alert')).not.toHaveLength(0);
     await fireEvent.input(field, { target: { value: '192.0.2.0/24' } });
     expect(screen.queryAllByRole('alert')).toHaveLength(0);
+  });
+});
+
+describe('NetworkTab defense-in-depth bounds', () => {
+  it('takes its bounds from the server schema', async () => {
+    // The server publishes what its validator enforces; the tab must
+    // refuse what the server would, not a number of its own.
+    const schema = { bot_stash_max_entries: { type: 'integer' as const, min: 5, max: 50 } };
+    render(NetworkTab, { props: props({ schema }) });
+    const field = screen.getByLabelText('Bot challenge stash - max entries') as HTMLInputElement;
+    expect(field.min).toBe('5');
+    expect(field.max).toBe('50');
+    await fireEvent.input(field, { target: { value: '51' } });
+    expect(screen.getByRole('alert').textContent).toContain('5..50');
+    await fireEvent.input(field, { target: { value: '50' } });
+    expect(screen.queryAllByRole('alert')).toHaveLength(0);
+  });
+
+  it('accepts 0 as an audit retention, which keeps the trail forever', async () => {
+    render(NetworkTab, { props: props() });
+    const field = screen.getByLabelText('Audit log retention (days)');
+    await fireEvent.input(field, { target: { value: '0' } });
+    expect(screen.queryAllByRole('alert')).toHaveLength(0);
+    expect(field.parentElement?.textContent).toContain('0 = kept forever');
   });
 });

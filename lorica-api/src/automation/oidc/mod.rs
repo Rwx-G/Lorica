@@ -109,6 +109,10 @@ pub enum RefusalReason {
     BoundClaimMismatch(String),
     /// The `jti` was already accepted and has not expired.
     Replayed,
+    /// The replay set is full and this token expires before every id
+    /// it holds, so it could not be remembered; refused rather than
+    /// admitted with its replay open.
+    ReplaySetFull,
 }
 
 impl RefusalReason {
@@ -138,6 +142,7 @@ impl RefusalReason {
             Self::MissingClaim(claim) => format!("missing_claim:{claim}"),
             Self::BoundClaimMismatch(claim) => format!("bound_claim_mismatch:{claim}"),
             Self::Replayed => "replayed".to_string(),
+            Self::ReplaySetFull => "replay_set_full".to_string(),
         }
     }
 }
@@ -233,7 +238,7 @@ impl OidcVerifier {
     ///
     /// The entries are tried in order; the first whose issuer signed
     /// the token and whose bound claims all hold accepts it. The
-    /// `jti` is then remembered until `exp`.
+    /// `jti` is then remembered until `exp` plus the clock skew.
     ///
     /// # Errors
     ///
@@ -312,11 +317,13 @@ impl OidcVerifier {
                 // entry purged at `exp` read every presentation inside
                 // that window as the first.
                 let replay_key = format!("{}|{}", claims.issuer, claims.jti);
-                if !self
+                match self
                     .replay
                     .remember(&replay_key, claims.expires_at + skew(), now)
                 {
-                    return Err(RefusalReason::Replayed);
+                    replay::Remembered::Fresh => {}
+                    replay::Remembered::Replay => return Err(RefusalReason::Replayed),
+                    replay::Remembered::NoRoom => return Err(RefusalReason::ReplaySetFull),
                 }
                 return Ok(VerifiedIdToken {
                     issuer: entry.clone(),

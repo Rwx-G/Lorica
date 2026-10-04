@@ -1382,3 +1382,105 @@ async fn an_access_log_row_answers_its_query_values_withheld_on_the_automation_p
         .to_string()
         .contains("reset-secret-91"));
 }
+
+#[tokio::test]
+async fn the_fields_an_environment_names_are_withheld_with_its_mark() {
+    // Adversarial review: the mark's name was withheld while the
+    // route's and the backend's `group_name` and the backend's `name`,
+    // which the environment resource derives from that name, still
+    // spelled it one field away, and `?group=` told a guess apart.
+    use crate::automation::redact::REDACTED;
+    let f = a_node_with_something_to_write().await;
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &f.admin,
+        Some(serde_json::json!({
+            "hostname": "pr-12.write.example.com",
+            "backend_ids": [f.backend_id],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let route_id = parse_data(created).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    an_environment_owning(&f.state, "pr-12", &route_id, "other-pipeline").await;
+    {
+        let mark = Some(lorica_config::models::ManagedBy::Automation {
+            environment: "pr-12".to_string(),
+        });
+        let store = f.state.store.lock().await;
+        let mut route = store.get_route(&route_id).expect("store").expect("route");
+        route.group_name = "automation:pr-12".to_string();
+        route.managed_by = mark.clone();
+        store
+            .update_route(&route)
+            .expect("the route as the resource writes it");
+        let mut backend = store
+            .get_backend(&f.backend_id)
+            .expect("store")
+            .expect("backend");
+        backend.group_name = "automation:pr-12".to_string();
+        backend.name = "pr-12-0".to_string();
+        backend.managed_by = mark;
+        store
+            .update_backend(&backend)
+            .expect("the backend as the resource writes it");
+    }
+
+    let look = |bearer: String| {
+        let state = f.state.clone();
+        let route_id = route_id.clone();
+        let backend_id = f.backend_id.clone();
+        async move {
+            let routes = body_json(
+                automation_call(&state, "GET", "/automation/v1/routes", &bearer, None).await,
+            )
+            .await;
+            let backends = body_json(
+                automation_call(&state, "GET", "/automation/v1/backends", &bearer, None).await,
+            )
+            .await;
+            // No filter can select by the derived group: the route API
+            // refuses an `automation:` group outright, so a guess is
+            // never told apart from a miss.
+            let selected = automation_call(
+                &state,
+                "GET",
+                "/automation/v1/routes?group=automation:pr-12",
+                &bearer,
+                None,
+            )
+            .await
+            .status();
+            (
+                listed_row(&routes, &route_id),
+                listed_row(&backends, &backend_id),
+                selected,
+            )
+        }
+    };
+
+    let (route, backend, selected) = look(f.bearer.clone()).await;
+    assert_eq!(route["group_name"], REDACTED);
+    assert_eq!(backend["group_name"], REDACTED);
+    assert_eq!(backend["name"], REDACTED);
+    for row in [&route, &backend] {
+        assert!(!row.to_string().contains("pr-12\""), "{row}");
+        assert!(!row.to_string().contains("automation:pr-12"), "{row}");
+    }
+    assert_eq!(selected, StatusCode::BAD_REQUEST);
+
+    // Its owner reads every one of them.
+    an_environment_owning(&f.state, "pr-12", &route_id, WRITE_TOKEN_NAME).await;
+    let (route, backend, selected) = look(f.bearer.clone()).await;
+    assert_eq!(route["group_name"], "automation:pr-12");
+    assert_eq!(backend["group_name"], "automation:pr-12");
+    assert_eq!(backend["name"], "pr-12-0");
+    assert_eq!(selected, StatusCode::BAD_REQUEST);
+}

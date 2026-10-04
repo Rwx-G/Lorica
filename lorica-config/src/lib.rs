@@ -30,6 +30,9 @@ pub mod export;
 pub mod import;
 /// Serialisable model types (routes, backends, certs, settings, ...).
 pub mod models;
+/// Which route serves a request's host and path: the proxy's selection,
+/// shared with the automation plane's write guard.
+pub mod route_selection;
 /// SQLite-backed `ConfigStore` and its per-table helper modules.
 pub mod store;
 
@@ -46,4 +49,4 @@ pub use connection_filter::{
 pub use crypto::EncryptionKey;
 pub use error::{ConfigError, Result};
 pub use store::bot_stash::{BotStashEntry, BotStashInsertOutcome};
-pub use store::{ConfigStore, ReplicaError, ReplicaOutcome, TelemetryCursor};
+pub use store::{ConfigStore, HostnameClaim, ReplicaError, ReplicaOutcome, TelemetryCursor};

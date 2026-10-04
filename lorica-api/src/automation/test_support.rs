@@ -33,7 +33,7 @@ use tower::ServiceExt;
 //
 // The chain under test is source filter -> TLS -> bearer -> scope ->
 // audit. Everything above TLS is exercised here through the router
-// directly, the way every other test in this file drives the
+// directly, the way the management tests in `crate::tests` drive the
 // management router: starting a real TLS listener would test
 // `tokio-rustls` and `hyper-util`, not this crate's gates, and would
 // put a bind and a handshake in the path of every assertion. The
@@ -65,8 +65,9 @@ pub(crate) async fn mint_automation(
         secret_hmac: minted.secret_hmac.clone(),
         scopes,
         allowed_hostnames: allowed_hostnames.iter().map(|h| (*h).to_string()).collect(),
-        // `AutomationToken::validate` refuses an empty grant: the
-        // connection filter reads one as allow-every-address.
+        // Written to the store directly, so `AutomationToken::validate`
+        // does not run: the CIDR grant is spelled out because the
+        // backend writes under test are weighed against it.
         allowed_backend_cidrs: vec!["10.0.0.0/8".to_string()],
         max_ttl_seconds: lorica_config::models::AUTOMATION_TOKEN_DEFAULT_MAX_TTL_SECONDS,
         created_by: "admin".to_string(),

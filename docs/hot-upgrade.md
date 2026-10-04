@@ -69,6 +69,15 @@ nothing; there is deliberately no fallback that skips the pin, which
 would reopen the path by which a local user holding the port received
 the password.
 
+The CLI opens that older node's `lorica.db` read-only and runs no
+migration in it, whatever version the CLI is: the schema stays the one
+the running node knows. It refuses a `lorica.db` or a certificate under
+the data directory that is a symbolic link, and a `lorica.db` the data
+directory's owner does not own. An operator certificate may sit behind
+links (an ACME client's `live/` tree); it is resolved, and pinned only
+if the file it resolves to belongs to root or to `lorica` and its group
+and others cannot write it.
+
 ## Signature model
 
 - **Algorithm:** Ed25519, detached signature over the raw binary bytes.
@@ -114,6 +123,15 @@ forked, the upgrade rolls back with zero impact:
 
 A drain that overruns its window (stragglers force-killed) records the
 `drain_timeout` outcome but is still a completed upgrade, not a rollback.
+
+After a rollback from 1.9.0 to an older binary, or a package downgrade,
+`<data-dir>/management/served-cert.pem` stays behind, and the older
+node never updates it. If that node then serves another certificate (a
+rotation, or a 1.9.0 start that regenerated the self-signed pair before
+it was rolled back), the CLI refuses it as it refuses a stranger on the
+port: the failure is closed, and the message blames another process.
+Delete `served-cert.pem` in that case; the CLI then pins what the older
+node serves, as above. A token minted by 1.9.0 is unreadable by 1.8.0.
 
 ## Metrics to watch
 

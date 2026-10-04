@@ -49,6 +49,7 @@ mod probes;
 mod replica;
 pub use replica::{ReplicaError, ReplicaOutcome};
 mod routes;
+pub use routes::HostnameClaim;
 mod row_helpers;
 mod sessions;
 mod settings;

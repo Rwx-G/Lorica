@@ -3689,16 +3689,13 @@ pub async fn create_route(
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::db::run_detached(async move {
-        create_route_as(
-            &state,
-            &audit_ctx,
-            body,
-            crate::preview::WriteMode::Apply,
-            crate::target::RouteGuard::unbounded(),
-        )
-        .await
-    })
+    create_route_as(
+        &state,
+        &audit_ctx,
+        body,
+        crate::preview::WriteMode::Apply,
+        crate::target::RouteGuard::unbounded(),
+    )
     .await
 }
 
@@ -4137,17 +4134,14 @@ pub async fn update_route(
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::db::run_detached(async move {
-        update_route_as(
-            &state,
-            &audit_ctx,
-            id,
-            body,
-            crate::preview::WriteMode::Apply,
-            crate::target::RouteGuard::unbounded(),
-        )
-        .await
-    })
+    update_route_as(
+        &state,
+        &audit_ctx,
+        id,
+        body,
+        crate::preview::WriteMode::Apply,
+        crate::target::RouteGuard::unbounded(),
+    )
     .await
 }
 
@@ -4767,16 +4761,13 @@ pub async fn delete_route(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::db::run_detached(async move {
-        delete_route_as(
-            &state,
-            &audit_ctx,
-            id,
-            crate::preview::WriteMode::Apply,
-            crate::target::RouteGuard::unbounded(),
-        )
-        .await
-    })
+    delete_route_as(
+        &state,
+        &audit_ctx,
+        id,
+        crate::preview::WriteMode::Apply,
+        crate::target::RouteGuard::unbounded(),
+    )
     .await
 }
 

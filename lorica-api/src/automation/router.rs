@@ -38,7 +38,8 @@
 //! cap, the response hardening, the panic net and the audit layer.
 //! [`in_process_router`] is the one the MCP binding runs a tool's call
 //! through, in process (Story 11.2): the same route table without the
-//! MCP endpoint, under the scope gate alone. It has no bearer gate
+//! MCP endpoint, under the scope gate and the write budget alone
+//! ([`authorized`]). It has no bearer gate
 //! because the principal is already established and travels as a
 //! request extension, no audit layer because the MCP POST that drove
 //! the call is the request being audited, and no body cap because the
@@ -464,7 +465,7 @@ pub(super) fn in_process_router() -> Router {
 ///    carry the headers too.
 /// 5. [`super::auth::require_automation_auth`] - the bearer check.
 /// 6. [`authorized`] - every authorization-class layer, the scope
-///    floor today, shared with [`in_process_router`].
+///    gate and the write budget, shared with [`in_process_router`].
 ///
 /// There is deliberately NO cookie layer, NO CSRF layer and NO session
 /// store here. The two management planes share no credential, and the
@@ -571,10 +572,83 @@ mod tests {
             .collect()
     }
 
+    /// Who answered a request through the listener's router.
+    #[derive(Debug, PartialEq, Eq)]
+    enum AnsweredBy {
+        /// axum's own 404 or 405, which carry no body.
+        Routing,
+        /// The scope gate's refusal of a pair the matrix declares for
+        /// no token.
+        UndeclaredRefusal,
+        /// Anything past both: a handler ran.
+        Handler,
+    }
+
     #[tokio::test]
-    async fn the_listener_router_mounts_exactly_the_table() {
+    async fn the_listener_router_reaches_a_handler_for_exactly_the_tables_pairs() {
+        // Through `build_automation_router` itself, with a token holding
+        // every scope, so the bearer gate and the scope gate let a
+        // declared pair through to whatever the listener mounts. The
+        // gates answer for every request, routed or not, so a pair is
+        // mounted exactly when a handler answers it.
+        let f = crate::automation::test_support::a_node_with_something_to_write().await;
+        let router = build_automation_router(f.state.clone());
+        let answered_by = |method: http::Method, path: String| {
+            let router = router.clone();
+            let bearer = f.bearer.clone();
+            async move {
+                let response = router
+                    .oneshot(
+                        http::Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .header(http::header::AUTHORIZATION, bearer)
+                            .body(axum::body::Body::empty())
+                            .expect("test setup"),
+                    )
+                    .await
+                    .expect("infallible");
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("the body reads");
+                if (status == http::StatusCode::NOT_FOUND
+                    || status == http::StatusCode::METHOD_NOT_ALLOWED)
+                    && body.is_empty()
+                {
+                    AnsweredBy::Routing
+                } else if status == http::StatusCode::FORBIDDEN
+                    && String::from_utf8_lossy(&body).contains("declares no automation scope")
+                {
+                    AnsweredBy::UndeclaredRefusal
+                } else {
+                    AnsweredBy::Handler
+                }
+            }
+        };
+
         let table = pairs(&route_table());
-        mounts_exactly(mounted(route_table()), &table).await;
+        let paths: std::collections::BTreeSet<&str> = table.iter().map(|(_, path)| *path).collect();
+        for path in paths {
+            for method in EVERY_VERB {
+                let by = answered_by(method.clone(), concrete(path)).await;
+                if table.iter().any(|(m, p)| *m == method && *p == path) {
+                    assert_eq!(by, AnsweredBy::Handler, "{method} {path} is in the table");
+                } else {
+                    assert_ne!(
+                        by,
+                        AnsweredBy::Handler,
+                        "{method} {path} is not in the table"
+                    );
+                }
+            }
+        }
+        let outside = answered_by(
+            http::Method::GET,
+            "/automation/v1/not-in-the-table".to_string(),
+        )
+        .await;
+        assert_ne!(outside, AnsweredBy::Handler);
     }
 
     #[tokio::test]

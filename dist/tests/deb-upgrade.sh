@@ -11,8 +11,12 @@
 # reset every shipped path to root, leave the service stopped and say
 # which paths it repaired; started by hand, the node must record the
 # certificate it serves; reinstalled on the now healthy host, it must be
-# restarted as usual; removed, stopped. On the way, the new CLI must pin
-# the certificate the running 1.8.0 node serves, which writes no
+# restarted as usual. Reinstalled again from each other state an operator
+# can leave the service in, that state must survive: stopped and
+# disabled, stopped and enabled, running and disabled. No reinstall may
+# change the owner of what the node's account owns below its data
+# directory. Removed, stopped. On the way, the new CLI must pin the
+# certificate the running 1.8.0 node serves, which writes no
 # served-certificate record.
 #
 # `clean` installs the new package on a host that never had lorica: no
@@ -50,6 +54,43 @@ not_root_owned() {
         owner=$(stat -c %u:%g "$path")
         [ "$owner" = "0:0" ] || echo "$path $owner"
     done
+}
+
+# Put the service in the given enablement and activity, reinstall `new`
+# over it, and require both unchanged. A probe file the node's account
+# does not own, below the data directory, must keep its owner: the
+# package chowns the directories it ships, not the tree under them.
+keeps_state() {
+    local enablement="$1" activity="$2" new="$3"
+    local probe=/var/lib/lorica/exported-certs/owner-probe
+    case "$enablement" in
+        enabled) systemctl enable lorica.service > /dev/null 2>&1 ;;
+        disabled) systemctl disable lorica.service > /dev/null 2>&1 ;;
+    esac
+    if [ "$activity" = active ]; then
+        systemctl start lorica.service
+        wait_active || fail "did not start before the reinstall"
+    else
+        systemctl stop lorica.service
+    fi
+    touch "$probe"
+    chown 0:0 "$probe"
+    dpkg -i "$new" > /tmp/lorica-state.out 2>&1 || { cat /tmp/lorica-state.out; fail "reinstall"; }
+    if [ "$activity" = active ]; then
+        wait_active || fail "$enablement and $activity: not running after the reinstall"
+    else
+        sleep 2
+        [ "$(systemctl is-active lorica.service)" != active ] \
+            || fail "$enablement and $activity: started by the reinstall"
+        grep -q "left stopped" /tmp/lorica-state.out \
+            || { cat /tmp/lorica-state.out; fail "$enablement and $activity: no note that it was left stopped"; }
+    fi
+    [ "$(systemctl is-enabled lorica.service)" = "$enablement" ] \
+        || fail "$enablement and $activity: now $(systemctl is-enabled lorica.service)"
+    [ "$(stat -c %u:%g "$probe")" = "0:0" ] \
+        || fail "the reinstall changed the owner of $probe to $(stat -c %u:%g "$probe")"
+    rm -f "$probe"
+    echo "$enablement and $activity: kept"
 }
 
 upgrade() {
@@ -113,6 +154,11 @@ upgrade() {
     [ "$pid_before" != "$pid_after" ] || fail "not restarted"
     [ "$(systemctl is-enabled lorica.service)" = enabled ] || fail "not enabled"
     echo "restarted ($pid_before -> $pid_after) and enabled"
+
+    echo "=== an upgrade keeps the state the operator left"
+    keeps_state disabled inactive "$new"
+    keeps_state enabled inactive "$new"
+    keeps_state disabled active "$new"
 
     echo "=== remove"
     dpkg -r lorica > /dev/null 2>&1 || fail "remove"
