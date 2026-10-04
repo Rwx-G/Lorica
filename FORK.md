@@ -109,6 +109,26 @@ When comparing files across repositories, apply these substitutions:
 3. **New TLS features** in `pingora-rustls` (Lorica's TLS is based on this)
 4. **Breaking API changes** that affect `lorica-proxy` integration points
 
+## Lorica divergences in forked crates
+
+Behaviour changes Lorica made inside a forked crate, beyond the renaming.
+Each is marked `Lorica:` in a comment at its site. Re-apply every one
+after any upstream sync that touches the function it lives in.
+
+- **`lorica-proxy`, the initial body send of the upstream leg (v1.9.0).**
+  Sites: `proxy_h1.rs` `proxy_handle_downstream`, `proxy_h2.rs`
+  `bidirection_down_to_up`, `proxy_custom.rs`
+  `custom_bidirection_down_to_up`. Upstream runs the initial body send
+  only for a retry buffer (and, on HTTP/1, an empty body). Lorica also
+  runs it when the downstream body was already read in full before the
+  upstream leg (`downstream_state.is_done()`), except an empty body on
+  HTTP/2 and the custom protocol, whose stream was already ended with
+  the request header. Without it, a body a request filter consumed never
+  gets an end-of-body `request_body_filter` call and the upstream
+  request hangs. The WAF's Blocking-mode body hold (`WafBodyHold` in
+  `lorica/src/proxy_wiring.rs`) hands the held body over through that
+  call.
+
 ## Upstream sync record
 
 Each release cycle that pulls upstream commits into the forked crates is
