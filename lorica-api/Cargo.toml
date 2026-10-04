@@ -1,6 +1,6 @@
 [package]
 name = "lorica-api"
-version = "1.8.0"
+version = "1.9.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -8,26 +8,26 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
-lorica-acme = { version = "1.8.0", path = "../lorica-acme" }
+lorica-acme = { version = "1.9.0", path = "../lorica-acme" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-config = { version = "1.8.0", path = "../lorica-config" }
+lorica-config = { version = "1.9.0", path = "../lorica-config" }
 # The settings allowlist and the route and backend protection rules
 # the automation plane enforces, declared where `lorica-mcp` reads
 # them too.
-lorica-automation-policy = { version = "1.8.0", path = "../lorica-automation-policy" }
-lorica-dashboard = { version = "1.8.0", path = "../lorica-dashboard" }
-lorica-metrics = { version = "1.8.0", path = "../lorica-metrics" }
-lorica-waf = { version = "1.8.0", path = "../lorica-waf" }
-lorica-notify = { version = "1.8.0", path = "../lorica-notify" }
-lorica-bench = { version = "1.8.0", path = "../lorica-bench" }
-lorica-cluster = { version = "1.8.0", path = "../lorica-cluster" }
+lorica-automation-policy = { version = "1.9.0", path = "../lorica-automation-policy" }
+lorica-dashboard = { version = "1.9.0", path = "../lorica-dashboard" }
+lorica-metrics = { version = "1.9.0", path = "../lorica-metrics" }
+lorica-waf = { version = "1.9.0", path = "../lorica-waf" }
+lorica-notify = { version = "1.9.0", path = "../lorica-notify" }
+lorica-bench = { version = "1.9.0", path = "../lorica-bench" }
+lorica-cluster = { version = "1.9.0", path = "../lorica-cluster" }
 # The shared MCP core (Story 11.1 AC #9 and AC #10). The Streamable
 # HTTP binding is a path on the automation listener rather than a
 # second process, so the adapter runs here and reaches the protocol
 # core through this edge. The inversion is deliberate: `lorica-mcp`
 # must not depend on `lorica-api`, or the stdio subprocess would carry
 # the whole management crate.
-lorica-mcp = { version = "1.8.0", path = "../lorica-mcp" }
+lorica-mcp = { version = "1.9.0", path = "../lorica-mcp" }
 # Used in `certificates.rs::validate_certificate_bundle` to gate
 # every cert upload (POST /certificates, PUT /certificates/{id},
 # POST /config/import) with the exact loader the worker uses :

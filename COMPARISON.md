@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-09-18 | Lorica v1.8.0
+> Last updated: 2026-10-04 | Lorica v1.9.0
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin/Module (not built-in)
 >
@@ -312,6 +312,7 @@ These features are either unique to Lorica or extremely rare among competitors:
 | Conditional request AND response capture as structured records | Lorica only |
 | Scoped automation API on a listener of its own | Lorica only (BunkerWeb scopes tokens on the same API) |
 | OIDC workload identity for the management plane | Lorica only |
+| Built-in MCP server in three tiers (read, config, admin), one tier per process, each call audited | Lorica |
 | Syslog RFC 5424 over TCP/TLS and OTLP log records | Lorica only (HAProxy syslog only, Traefik OTLP only) |
 | AI / LLM crawler deny-list with per-vendor verification | Lorica, HAProxy Enterprise |
 
@@ -319,12 +320,12 @@ These features are either unique to Lorica or extremely rare among competitors:
 
 ## Summary: Remaining Gaps
 
-All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.8.0 are shipped: v1.6.0 added the hot binary upgrade, multi-user RBAC and the AI/LLM crawler deny-list; v1.7.0 added the multi-node cluster and the syslog / OTLP log export; v1.8.0 added conditional request capture and the CI automation API with GitLab OIDC. Remaining gaps are by design or planned for future versions.
+All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.9.0 are shipped: v1.6.0 added the hot binary upgrade, multi-user RBAC and the AI/LLM crawler deny-list; v1.7.0 added the multi-node cluster and the syslog / OTLP log export; v1.8.0 added conditional request capture and the CI automation API with GitLab OIDC; v1.9.0 added the management MCP server in three tiers. Remaining gaps are by design or planned for future versions.
 
 | Gap | Plan |
 |---|---|
 | HTTP/3 (QUIC) | Planned for v2.0.0. Blocked on [Pingora PR #524](https://github.com/cloudflare/pingora/pull/524) (tokio-quiche integration) |
-| TCP/L4 proxying | Planned for v2.0.0. Enables database, MQTT, SSH stream proxying |
+| TCP/L4 proxying | Planned for v1.10.0 ([Epic 12](docs/prd/epic-12-v1.10.0.md)): TCP and UDP stream proxying at parity with nginx `stream {}`, then beyond parity in v1.11.0 |
 | Service discovery (Docker labels, K8s Ingress) | Out of scope by design. Lorica targets standalone edge / bastion, not in-cluster deployment |
 | Config providers (etcd, Consul) | Out of scope by design. Same rationale as service discovery |
 | ACME TLS-ALPN-01 | Low priority. HTTP-01 and DNS-01 cover all real-world scenarios |

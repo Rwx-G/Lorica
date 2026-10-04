@@ -1,6 +1,6 @@
 [package]
 name = "lorica-config"
-version = "1.8.0"
+version = "1.9.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -10,7 +10,7 @@ description = "Configuration state and persistence for Lorica reverse proxy"
 [dependencies]
 # The automation scope vocabulary and the MCP tier table the token
 # model and the OIDC issuer entry validate against.
-lorica-automation-policy = { version = "1.8.0", path = "../lorica-automation-policy" }
+lorica-automation-policy = { version = "1.9.0", path = "../lorica-automation-policy" }
 base64 = "0.23"
 ipnet = "2"
 ring = "0.17"
