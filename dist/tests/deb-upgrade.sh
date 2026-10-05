@@ -3,21 +3,38 @@
 # the CI runner, or a privileged container running /sbin/init.
 #
 #   deb-upgrade.sh upgrade <released-1.8.0.deb> <new.deb>
+#   deb-upgrade.sh upgrade-held <released-1.8.0.deb> <new.deb>
 #   deb-upgrade.sh clean <new.deb>
 #
-# `upgrade` reproduces a host affected by the ownership defect fixed in
-# 1.9.0: a 1.8.0 package, built by CI as the `runner` account (uid 1001),
-# installed on a host where that account exists. The new package must
-# reset every shipped path to root, leave the service stopped and say
-# which paths it repaired; started by hand, the node must record the
-# certificate it serves; reinstalled on the now healthy host, it must be
-# restarted as usual. Reinstalled again from each other state an operator
-# can leave the service in, that state must survive: stopped and
+# Every package up to 1.8.0 was built by CI as the `runner` account (uid
+# 1001) and recorded it as the owner of every entry, and its prerm
+# stopped and disabled the service on every upgrade. Both upgrade
+# scenarios install the released 1.8.0 and upgrade it to the new
+# package, which must reset every shipped path to root either way.
+#
+# `upgrade` runs where no account has uid 1001 or the name `runner`, as
+# on most hosts upgraded from an official .deb: nobody could have
+# written those paths, so the new package must repair them without a
+# word and enable and start the service, as 1.8.0's own postinst did.
+# The script refuses to run where such an account exists: on the CI
+# runner, which has one, it runs in a container.
+#
+# `upgrade-held` runs where an account has uid 1001 (one is created when
+# none exists): that account could have changed the paths, so the new
+# package must leave the service stopped and name the paths it repaired
+# and the account that could write them; started by hand, the node must
+# record the certificate it serves.
+#
+# Both then reinstall the new package on the now healthy host, which
+# must restart it as usual, and reinstall it again from each other state
+# an operator can leave the service in, which must survive: stopped and
 # disabled, stopped and enabled, running and disabled. No reinstall may
 # change the owner of what the node's account owns below its data
 # directory. Removed, stopped. On the way, the new CLI must pin the
 # certificate the running 1.8.0 node serves, which writes no
-# served-certificate record.
+# served-certificate record. `upgrade` last installs 1.8.0 again, stops
+# and disables it, and upgrades again: enabled and started, as every
+# upgrade from 1.8.0 did, whatever a stale state record says.
 #
 # `clean` installs the new package on a host that never had lorica: no
 # warning, the service active and enabled, every shipped path root's.
@@ -93,10 +110,10 @@ keeps_state() {
     echo "$enablement and $activity: kept"
 }
 
-upgrade() {
+# Install the released 1.8.0, check it left the defect the new package
+# repairs, and point the new CLI at the running node.
+install_old() {
     local old="$1" new="$2"
-    getent passwd 1001 > /dev/null || useradd -u 1001 -m runner
-
     echo "=== install the released 1.8.0"
     dpkg -i "$old" > /tmp/lorica-old.out 2>&1 || { cat /tmp/lorica-old.out; fail "1.8.0 install"; }
     wait_active without-record || fail "1.8.0 did not start"
@@ -121,29 +138,12 @@ upgrade() {
     if grep -qE "did not present the certificate|Cannot connect|Login failed" /tmp/lorica-cli.out; then
         fail "the CLI did not log in to the 1.8.0 node"
     fi
+}
 
-    echo "=== upgrade to the new package"
-    dpkg -i "$new" > /tmp/lorica-new.out 2>&1
-    rc=$?
-    cat /tmp/lorica-new.out
-    [ "$rc" = 0 ] || fail "dpkg -i exited $rc"
-    grep -q "WARNING: lorica was NOT started" /tmp/lorica-new.out || fail "no warning on a repaired host"
-    grep -qx "    /usr/share/doc/lorica" /tmp/lorica-new.out || fail "the repaired path is not listed"
-    if grep -q "installed successfully" /tmp/lorica-new.out; then
-        fail "the success banner on a repaired host"
-    fi
-    [ "$(systemctl is-active lorica.service)" != active ] || fail "the service was started on a repaired host"
-    bad=$(not_root_owned)
-    [ -z "$bad" ] || fail "not owned by root: $bad"
-    echo "stopped, and every shipped path is 0:0"
-    echo "dpkg --verify lorica: $(dpkg --verify lorica)"
-
-    echo "=== the operator starts it"
-    systemctl daemon-reload
-    systemctl enable --now lorica.service
-    wait_active || fail "the new version did not start, or recorded no served certificate"
-    echo "active, $SERVED_CERT written"
-
+# The new package on a host it has already repaired: a reinstall restarts
+# a running service, every other state survives, and a removal stops it.
+healthy_host() {
+    local new="$1"
     echo "=== reinstall on the now healthy host"
     pid_before=$(systemctl show -p MainPID --value lorica.service)
     dpkg -i "$new" > /tmp/lorica-again.out 2>&1 || { cat /tmp/lorica-again.out; fail "reinstall"; }
@@ -166,6 +166,84 @@ upgrade() {
     echo "stopped"
 }
 
+# The upgrade from 1.8.0 where nobody could have written the shipped
+# paths: repaired silently, enabled and started.
+upgrade_from_old_unheld() {
+    local new="$1" label="$2"
+    dpkg -i "$new" > /tmp/lorica-new.out 2>&1
+    rc=$?
+    cat /tmp/lorica-new.out
+    [ "$rc" = 0 ] || fail "$label: dpkg -i exited $rc"
+    if grep -q "WARNING" /tmp/lorica-new.out; then fail "$label: a warning where no account could write the paths"; fi
+    if grep -q "left stopped" /tmp/lorica-new.out; then fail "$label: left stopped"; fi
+    grep -q "installed successfully" /tmp/lorica-new.out || fail "$label: no banner"
+    wait_active || fail "$label: not active, or recorded no served certificate"
+    [ "$(systemctl is-enabled lorica.service)" = enabled ] || fail "$label: not enabled"
+    bad=$(not_root_owned)
+    [ -z "$bad" ] || fail "$label: not owned by root: $bad"
+    echo "$label: active, enabled, $SERVED_CERT written, every shipped path 0:0"
+    echo "dpkg --verify lorica: $(dpkg --verify lorica)"
+}
+
+upgrade() {
+    local old="$1" new="$2"
+    if getent passwd 1001 > /dev/null || getent passwd runner > /dev/null; then
+        fail "this host has a uid-1001 or runner account; run \`upgrade\` where neither exists"
+    fi
+    install_old "$old" "$new"
+
+    echo "=== upgrade to the new package, no account could write the shipped paths"
+    upgrade_from_old_unheld "$new" "upgrade from 1.8.0"
+
+    healthy_host "$new"
+
+    echo "=== a 1.8.0 node stopped and disabled by the operator, upgraded"
+    dpkg -i "$old" > /tmp/lorica-old.out 2>&1 || { cat /tmp/lorica-old.out; fail "1.8.0 reinstall"; }
+    wait_active without-record || fail "1.8.0 did not start"
+    systemctl disable --now lorica.service > /dev/null 2>&1
+    # No 1.8.0 script writes or reads this record, so one found by the
+    # upgrade is stale, left by a 1.9.x transaction that never reached its
+    # postinst. Plant one saying the service was stopped: it must be
+    # ignored.
+    printf 'inactive\n' > /run/lorica-package.state
+    upgrade_from_old_unheld "$new" "upgrade from a disabled 1.8.0"
+    dpkg -r lorica > /dev/null 2>&1 || fail "remove"
+}
+
+upgrade_held() {
+    local old="$1" new="$2"
+    getent passwd 1001 > /dev/null || useradd -u 1001 -m runner
+    local account
+    account=$(getent passwd 1001 | cut -d: -f1)
+    install_old "$old" "$new"
+
+    echo "=== upgrade to the new package, $account (uid 1001) could write the shipped paths"
+    dpkg -i "$new" > /tmp/lorica-new.out 2>&1
+    rc=$?
+    cat /tmp/lorica-new.out
+    [ "$rc" = 0 ] || fail "dpkg -i exited $rc"
+    grep -q "WARNING: lorica was NOT started" /tmp/lorica-new.out || fail "no warning on a repaired host"
+    grep -qx "    /usr/share/doc/lorica" /tmp/lorica-new.out || fail "the repaired path is not listed"
+    grep -qx "    the account $account (uid 1001)" /tmp/lorica-new.out \
+        || fail "the account that could write the paths is not named"
+    if grep -q "installed successfully" /tmp/lorica-new.out; then
+        fail "the success banner on a repaired host"
+    fi
+    [ "$(systemctl is-active lorica.service)" != active ] || fail "the service was started on a repaired host"
+    bad=$(not_root_owned)
+    [ -z "$bad" ] || fail "not owned by root: $bad"
+    echo "stopped, and every shipped path is 0:0"
+    echo "dpkg --verify lorica: $(dpkg --verify lorica)"
+
+    echo "=== the operator starts it"
+    systemctl daemon-reload
+    systemctl enable --now lorica.service
+    wait_active || fail "the new version did not start, or recorded no served certificate"
+    echo "active, $SERVED_CERT written"
+
+    healthy_host "$new"
+}
+
 clean() {
     local new="$1"
     echo "=== install on a host that never had lorica"
@@ -180,9 +258,11 @@ clean() {
     echo "active, enabled, $SERVED_CERT written, every shipped path 0:0"
 }
 
+usage="usage: $0 upgrade|upgrade-held <old.deb> <new.deb> | clean <new.deb>"
 case "${1:-}" in
-    upgrade) [ $# -eq 3 ] || fail "usage: $0 upgrade <old.deb> <new.deb>"; upgrade "$2" "$3" ;;
-    clean) [ $# -eq 2 ] || fail "usage: $0 clean <new.deb>"; clean "$2" ;;
-    *) fail "usage: $0 upgrade <old.deb> <new.deb> | clean <new.deb>" ;;
+    upgrade) [ $# -eq 3 ] || fail "$usage"; upgrade "$2" "$3" ;;
+    upgrade-held) [ $# -eq 3 ] || fail "$usage"; upgrade_held "$2" "$3" ;;
+    clean) [ $# -eq 2 ] || fail "$usage"; clean "$2" ;;
+    *) fail "$usage" ;;
 esac
 echo "PASS: $1"

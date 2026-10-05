@@ -19,3 +19,6 @@ Dockerfile* text eol=lf
 # every vendor degrades to an empty range set (v1.6.0 Story 8.2).
 lorica/src/ai_bot/vendor_ips/*.json text eol=lf
 lorica/src/ai_bot/vendor_ips/*.sha256 text eol=lf
+# Byte-compared against its Rust source by lorica-api/tests/automation_scope_fixture.rs;
+# a CRLF checkout on Windows fails that comparison locally.
+lorica-dashboard/frontend/src/**/*.generated.ts text eol=lf
