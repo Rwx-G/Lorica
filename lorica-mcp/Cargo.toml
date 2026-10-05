@@ -1,6 +1,6 @@
 [package]
 name = "lorica-mcp"
-version = "1.9.0"
+version = "1.9.1"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -31,7 +31,7 @@ path = "src/main.rs"
 # with `serde` as its only dependency: `lorica-config` and `lorica-api`
 # stay out of this graph, which is what keeps bundled SQLite out of a
 # stdio subprocess that reads no database, and CI checks it.
-lorica-automation-policy = { version = "1.9.0", path = "../lorica-automation-policy" }
+lorica-automation-policy = { version = "1.9.1", path = "../lorica-automation-policy" }
 # The JSON-RPC envelope, the tool schemas and every answer that crosses
 # the seam are JSON. `serde` derive is here for the config file alone.
 serde = { version = "1.0", features = ["derive"] }
