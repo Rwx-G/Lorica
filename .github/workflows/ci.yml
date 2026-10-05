@@ -528,10 +528,13 @@ jobs:
 
   # The ownership repair in the postinst only acts on a host upgraded from
   # a package built before 1.9.0, so it is tested on one: the released
-  # 1.8.0, installed on this runner, whose `runner` account (uid 1001) is
-  # the one those packages recorded as owner. 1.8.0 is pinned because it
-  # is the last affected release; a later one would not exercise the
-  # repair, and the script fails if the precondition does not hold.
+  # 1.8.0. 1.8.0 is pinned because it is the last affected release; a
+  # later one would not exercise the repair, and the script fails if the
+  # precondition does not hold. Whether the upgrade holds the service
+  # depends on whether an account has the uid those packages recorded as
+  # owner, so both cases run: on this runner, whose `runner` account is
+  # uid 1001, and in an Ubuntu container booted under systemd, which has
+  # no such account, as most upgraded hosts do not.
   test-deb-upgrade:
     name: Test .deb upgrade from 1.8.0
     needs: build-and-package
@@ -544,10 +547,36 @@ jobs:
           path: pkg/
       - name: Download the released 1.8.0 .deb
         run: |
-          curl -fsSL --retry 3 -o lorica_1.8.0_amd64.deb \
+          curl -fsSL --retry 3 -o pkg/lorica_1.8.0_amd64.deb \
             https://github.com/Rwx-G/Lorica/releases/download/v1.8.0/lorica_1.8.0_amd64.deb
-      - name: Upgrade 1.8.0 on a host with the uid-1001 account
-        run: sudo bash dist/tests/deb-upgrade.sh upgrade lorica_1.8.0_amd64.deb pkg/*.deb
+      - name: Upgrade 1.8.0 on a host with the uid-1001 account (held)
+        run: |
+          new=$(ls pkg/lorica_*_amd64.deb | grep -v 'lorica_1\.8\.0_')
+          sudo bash dist/tests/deb-upgrade.sh upgrade-held pkg/lorica_1.8.0_amd64.deb "$new"
+      - name: Boot Ubuntu under systemd, without a uid-1001 account
+        run: |
+          printf '%s\n' \
+            'FROM ubuntu:24.04' \
+            'RUN apt-get update -qq && apt-get install -y -qq systemd systemd-sysv ca-certificates openssl procps > /dev/null && rm -rf /var/lib/apt/lists/*' \
+            'STOPSIGNAL SIGRTMIN+3' \
+            'CMD ["/sbin/init"]' > Dockerfile.systemd
+          docker build -q -t ubuntu-systemd -f Dockerfile.systemd .
+          docker run -d --name ubuntu --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
+            -v "$PWD:/w:ro" ubuntu-systemd
+          for _ in $(seq 1 30); do
+            case "$(docker exec ubuntu systemctl is-system-running 2>/dev/null)" in
+              running|degraded) exit 0 ;;
+            esac
+            sleep 1
+          done
+          echo "FAIL: systemd did not come up in the container"
+          exit 1
+      - name: Upgrade 1.8.0 on a host without it (not held)
+        run: |
+          new=$(ls pkg/lorica_*_amd64.deb | grep -v 'lorica_1\.8\.0_')
+          docker exec ubuntu bash /w/dist/tests/deb-upgrade.sh upgrade \
+            /w/pkg/lorica_1.8.0_amd64.deb "/w/$new"
 
   # 1.8.0's preun stops and disables the service on every upgrade, so the
   # new package must start it from posttrans. That needs systemd, which a

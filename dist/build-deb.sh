@@ -123,12 +123,18 @@ fi
 
 # What the service was doing before this transaction: `install` (first
 # install), `active` or `inactive` (an upgrade from a package whose
-# prerm recorded it), or nothing (an upgrade from 1.8.0 or earlier,
-# whose prerm stopped and disabled the service and recorded nothing).
+# prerm recorded it), or `legacy` (an upgrade from 1.8.0 or earlier).
+# The prerm of every release up to 1.8.0 stopped and disabled the
+# service on any upgrade and recorded nothing, and its postinst enabled
+# and restarted it whatever the operator had chosen; the state from
+# before such an upgrade is gone, so it is treated as theirs was. Any
+# record found then is stale: those prerms write none.
 previous_state=$(cat /run/lorica-package.state 2>/dev/null || true)
 rm -f /run/lorica-package.state
 if [ -z "${2:-}" ]; then
     previous_state=install
+elif dpkg --compare-versions "$2" lt 1.9.0; then
+    previous_state=legacy
 fi
 
 # Repair hosts that installed a package built before 1.9.0. Those recorded
@@ -138,8 +144,8 @@ fi
 # (/usr/share/doc/lorica, and /lib/systemd/system on a host where lorica
 # created it). Every path this package ships outside its data directory
 # belongs to root, so any other owner found here is that defect. Only the
-# offending entries are touched, which keeps this a no-op on a clean host,
-# and each one is printed below.
+# offending entries are touched, which keeps this a no-op on a clean host.
+# Each one is recorded as `uid gid mode path`, as it was before the reset.
 #
 # The file list is read first and on its own: /bin/sh has no pipefail, so
 # a failing dpkg-query piped into the loop would read as nothing to repair.
@@ -153,15 +159,48 @@ repaired=$(printf '%s\n' "$package_paths" | while IFS= read -r path; do
         /var/lib/lorica|/var/lib/lorica/*) continue ;;
     esac
     [ -e "$path" ] || [ -L "$path" ] || continue
-    [ "$(stat -c %u:%g "$path")" = "0:0" ] && continue
+    previous_owner=$(stat -c '%u %g %a' "$path")
+    case "$previous_owner" in
+        "0 0 "*) continue ;;
+    esac
     chown -h root:root "$path"
     if [ -d "$path" ] && [ ! -L "$path" ]; then
         chmod 755 "$path"
     elif [ -f "$path" ] && [ ! -L "$path" ]; then
         chmod go-w "$path"
     fi
-    printf '%s\n' "$path"
+    printf '%s %s\n' "$previous_owner" "$path"
 done)
+
+# Who could have written the repaired paths before the reset. dpkg gives
+# an extracted entry the uid of the local account carrying the owner name
+# the package recorded (`runner` for every release up to 1.8.0) and, when
+# no account carries it, the uid recorded beside it (1001). So the paths
+# could be written by their owner only if that uid is an account here,
+# which covers a `runner` account of any uid created before the install;
+# by their group only through a group-write bit on a gid that is a group
+# here; by anyone through an other-write bit. No release shipped either
+# bit, and only the owner could have added one later. Where none of this
+# holds, nobody could have changed those paths, and the repair is silent.
+writers=$(printf '%s\n' "$repaired" | while read -r uid gid mode path; do
+    [ -n "$path" ] || continue
+    if account=$(getent passwd "$uid"); then
+        printf 'the account %s (uid %s)\n' "${account%%:*}" "$uid"
+    fi
+    other_bits=${mode#"${mode%?}"}
+    group_bits=${mode%?}
+    group_bits=${group_bits#"${group_bits%?}"}
+    case "$group_bits" in
+        2|3|6|7)
+            if group=$(getent group "$gid"); then
+                printf 'the members of the group %s (gid %s)\n' "${group%%:*}" "$gid"
+            fi
+            ;;
+    esac
+    case "$other_bits" in
+        2|3|6|7) printf 'every local account (%s was world-writable)\n' "$path" ;;
+    esac
+done | sort -u)
 
 # Set permissions. Not recursive: everything below the data directory is
 # the service account's, and root walking a tree that account controls
@@ -185,13 +224,15 @@ fi
 chown lorica:lorica /var/lib/lorica/exported-certs
 chmod 750 /var/lib/lorica/exported-certs
 
-# A repaired host is left stopped. While those paths belonged to another
-# account, that account could change them or plant entries beside them
+# A host where someone could have written the repaired paths is left
+# stopped. They could change those paths or plant entries beside them
 # that no package lists: a unit, a lorica.service.d drop-in, a generator.
-# A daemon-reload or a restart here would load and run them as root before
-# the operator could look. The previous package's prerm already stopped
-# the service, so it stays stopped until the operator starts it.
-if [ -n "$repaired" ]; then
+# A restart here would run them as root before the operator could look.
+# (The postrm of 1.8.0 and earlier has already run a daemon-reload by
+# now, which nothing in this package can prevent; not adding one is what
+# is left.) The previous package's prerm already stopped the service, so
+# it stays stopped until the operator starts it.
+if [ -n "$writers" ]; then
     echo ""
     echo "  ================================================"
     echo "  WARNING: lorica was NOT started."
@@ -199,11 +240,13 @@ if [ -n "$repaired" ]; then
     echo "  This upgrade reset to root the owner of these paths,"
     echo "  which a package built before 1.9.0 had left owned by"
     echo "  the account that built it:"
-    printf '%s\n' "$repaired" | sed 's/^/    /'
+    printf '%s\n' "$repaired" | cut -d ' ' -f 4- | sed 's/^/    /'
     echo "  "
-    echo "  Until now that account could change them, and add"
-    echo "  files beside them that no package lists. Before"
-    echo "  starting the service:"
+    echo "  On this host, until now, they could be changed, and"
+    echo "  files no package lists added beside them, by:"
+    printf '%s\n' "$writers" | sed 's/^/    /'
+    echo "  "
+    echo "  Before starting the service:"
     echo "    1. sudo dpkg --verify lorica"
     echo "       (no output: the packaged files are as shipped)"
     echo "    2. look in the directories above, and in"
@@ -217,11 +260,13 @@ if [ -n "$repaired" ]; then
     exit 0
 fi
 
-# Enable and start on a first install. On an upgrade, the operator's
-# choice stands: the enablement is never touched (this version's prerm
-# does not disable on upgrade), and the service is restarted only if it
-# was running. /run/systemd/system exists only while systemd runs;
-# without it (an image build, a container) nothing is started.
+# Enable and start on a first install, and on an upgrade from 1.8.0 or
+# earlier, as that release's own postinst would have. On an upgrade from
+# 1.9.0 or later, the operator's choice stands: the enablement is never
+# touched (those prerms do not disable on upgrade), and the service is
+# restarted only if it was running. /run/systemd/system exists only while
+# systemd runs; without it (an image build, a container) nothing is
+# started.
 systemd_running=no
 if [ -d /run/systemd/system ]; then
     systemd_running=yes
@@ -229,7 +274,7 @@ if [ -d /run/systemd/system ]; then
 fi
 left_stopped=""
 case "$previous_state" in
-    install)
+    install|legacy)
         systemctl enable lorica.service
         if [ "$systemd_running" = yes ]; then
             systemctl restart lorica.service
@@ -244,7 +289,7 @@ case "$previous_state" in
         left_stopped="it was not running before the upgrade"
         ;;
     *)
-        left_stopped="the package it replaced stopped and disabled it, and recorded nothing that tells a deliberate disable from that one"
+        left_stopped="the package it replaced recorded no state for it"
         ;;
 esac
 

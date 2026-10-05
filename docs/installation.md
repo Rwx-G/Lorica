@@ -23,9 +23,11 @@ On a first install the post-install hook enables and starts the service.
 An upgrade keeps the state you left it in: it never enables the
 service, and restarts it only if it was running. The one hop it cannot
 read is from a `.deb` of 1.8.0 or earlier, whose removal script
-stopped and disabled the service without recording anything: that
-upgrade leaves it stopped and says so, and `sudo systemctl enable --now
-lorica.service` brings it back. Lorica listens on
+stopped and disabled the service without recording anything: since
+1.9.1 that upgrade enables and starts it, as every upgrade between
+those releases did, unless the ownership repair below holds it. (The
+`.rpm` reads the state before the old package's scripts run, so an
+upgrade from any `.rpm` keeps it.) Lorica listens on
 8080 (HTTP proxy), 8443 (HTTPS proxy), and 9443 (dashboard, localhost
 only). The initial admin password is written to
 `/var/lib/lorica/initial-admin-password` (mode 0600).
@@ -77,13 +79,30 @@ takes precedence over both and is never replaced.
 
 ## Upgrading a .deb from 1.8.0 or earlier
 
-Every .deb up to 1.8.0 recorded the CI build account as the owner of
-its files. Upgrading on a host where that left files owned by another
-account resets them to root and leaves Lorica stopped, listing what
-it repaired. Run `dpkg --verify lorica`, inspect the listed
-directories and `/etc/systemd/system`, then
-`systemctl daemon-reload && systemctl enable --now lorica`. On a host
-where nothing needed repairing the upgrade restarts Lorica as usual.
+Every .deb up to 1.8.0 recorded the CI build account (`runner`, uid
+1001) as the owner of its files, so on every host upgraded from one of
+them some shipped paths, at least `/usr/share/doc/lorica`, are left
+owned by that uid. The upgrade resets them to root. What it does next
+depends on whether anyone could have written them:
+
+- No local account has their previous owner's uid (the usual case: no
+  `runner` account and nothing at uid 1001). Nobody could have changed
+  them; the repair is silent, and the service is enabled and started.
+- A local account has that uid, such as a `runner` account on a
+  self-hosted CI machine. That account could have changed them or
+  planted units, drop-ins or generators beside them, so Lorica is left
+  stopped and the upgrade names the paths it repaired and the account.
+  Run `dpkg --verify lorica`, inspect the listed directories and
+  `/etc/systemd/system`, then
+  `systemctl daemon-reload && systemctl enable --now lorica`.
+
+The 1.9.0 package held the service in both cases, so every host
+upgraded from 1.8.0 or earlier straight to 1.9.0 was left stopped and
+disabled. On such a host, run `sudo dpkg --verify lorica` (no output:
+the files are as shipped), then
+`sudo systemctl daemon-reload && sudo systemctl enable --now lorica`.
+Upgrading it to 1.9.1 first does not start it: 1.9.0 recorded the
+service as stopped, and an upgrade from 1.9.0 keeps that state.
 
 ## systemd unit
 

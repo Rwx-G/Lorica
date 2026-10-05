@@ -19,6 +19,12 @@ Author: Rwx-G
 
 ### Security
 
+## [1.9.1] - 2026-10-05
+
+### Fixed
+
+- **Upgrading a .deb from 1.8.0 or earlier no longer leaves Lorica stopped and disabled on a host where nobody could have tampered with its files.** Every .deb from 1.0.0 through 1.8.0 recorded the CI build account (`runner`, uid 1001) as the owner of its entries, so on every host upgraded from an official .deb at least `/usr/share/doc/lorica` was still owned by uid 1001, and the 1.9.0 ownership repair found something to repair everywhere. When it did, the 1.9.0 postinst neither reloaded systemd nor started the service, and the prerm of 1.8.0 and earlier had already stopped and disabled it on the way out, so every such upgrade to 1.9.0 left Lorica `inactive (dead)` and `disabled`, an outage until an operator noticed, including on hosts with no account that could ever have written those paths. Affected: every host that upgraded an official .deb of 1.8.0 or earlier to 1.9.0. The .rpm was not affected. The postinst still resets every such path to `root:root`, and now records the owner each one had: it holds the service, with the warning naming the paths and the account, only when that owner's uid is a local account (a `runner` account created before the install got the files under its own uid, so it is caught too), or when a path was group-writable by an existing group or world-writable, which no release shipped. Otherwise the repair is silent, and an upgrade from 1.8.0 or earlier enables and starts the service, as each of those releases' own postinst did: their prerm disabled it and recorded nothing, so the state from before the upgrade cannot be recovered. An upgrade from 1.9.0 or later keeps the state the operator left, as in 1.9.0. CI now runs the upgrade from the released 1.8.0 both on the runner, whose `runner` account is uid 1001 (held), and in an Ubuntu container under systemd without such an account (enabled and started, no warning). **To recover a host on 1.9.0:** check the files with `sudo dpkg --verify lorica` (no output: they are as shipped), then `sudo systemctl daemon-reload && sudo systemctl enable --now lorica`. Upgrading such a host to 1.9.1 does not start it, since 1.9.0 recorded the service as stopped and that state is kept. See `docs/installation.md`.
+
 ## [1.9.0] - 2026-10-04
 
 ### Added
