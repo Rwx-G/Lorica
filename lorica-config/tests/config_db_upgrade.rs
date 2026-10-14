@@ -169,3 +169,72 @@ fn a_migration_that_fails_midway_leaves_no_partial_schema() {
         .expect("version");
     assert_eq!(version, 11);
 }
+
+/// Channels as 1.9.1 saved them: one with an explicit list, one with an
+/// empty list (every type), one with the wildcard, one that already
+/// ticked one of the log-store types.
+const RELEASED_CHANNELS: &str = r#"
+    INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+    VALUES ('explicit', 'webhook', 1, '{"url":"https://hooks.example.com/a"}',
+            '["backend_down","waf_alert"]');
+    INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+    VALUES ('everything', 'webhook', 1, '{"url":"https://hooks.example.com/b"}', '[]');
+    INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+    VALUES ('wildcard', 'slack', 1, '{"url":"https://hooks.example.com/c"}', '["*"]');
+    INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+    VALUES ('partial', 'webhook', 0, '{"url":"https://hooks.example.com/d"}',
+            '["log_store_recovered"]');
+"#;
+
+fn alert_types_of(store: &ConfigStore, id: &str) -> Vec<String> {
+    store
+        .get_notification_config(id)
+        .expect("channel reads")
+        .expect("channel kept")
+        .alert_types
+}
+
+/// A channel saved before 1.9.2 with an explicit alert-type list had no
+/// box to tick for the log-store alerts; the upgrade subscribes it, and
+/// leaves alone the channels that already receive every type.
+#[test]
+fn an_upgrade_subscribes_explicit_channels_to_the_log_store_alerts() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    write_released_file(&path, LORICA_DB_V1_5_13);
+    Connection::open(&path)
+        .expect("test setup: raw open")
+        .execute_batch(RELEASED_CHANNELS)
+        .expect("test setup: released channels");
+
+    let store = ConfigStore::open(&path, None).expect("a released lorica.db must open");
+    assert_eq!(
+        alert_types_of(&store, "explicit"),
+        [
+            "backend_down",
+            "waf_alert",
+            "log_store_unavailable",
+            "log_store_recovered"
+        ]
+    );
+    assert!(alert_types_of(&store, "everything").is_empty());
+    assert_eq!(alert_types_of(&store, "wildcard"), ["*"]);
+    assert_eq!(
+        alert_types_of(&store, "partial"),
+        ["log_store_recovered", "log_store_unavailable"],
+        "a type already ticked is not added twice"
+    );
+
+    // An operator who unticks them afterwards is not overridden.
+    let mut explicit = store
+        .get_notification_config("explicit")
+        .expect("channel reads")
+        .expect("channel kept");
+    explicit.alert_types = vec!["backend_down".to_string()];
+    store
+        .update_notification_config(&explicit)
+        .expect("operator edit");
+    drop(store);
+    let reopened = ConfigStore::open(&path, None).expect("an upgraded file reopens");
+    assert_eq!(alert_types_of(&reopened, "explicit"), ["backend_down"]);
+}
