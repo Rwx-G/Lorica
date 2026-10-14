@@ -22,3 +22,6 @@ lorica/src/ai_bot/vendor_ips/*.sha256 text eol=lf
 # Byte-compared against its Rust source by lorica-api/tests/automation_scope_fixture.rs;
 # a CRLF checkout on Windows fails that comparison locally.
 lorica-dashboard/frontend/src/**/*.generated.ts text eol=lf
+# Parsed line by line by lorica-api/tests/openapi_contract.rs, which looks
+# for "\n    <Schema>:\n"; a CRLF checkout on Windows fails it locally.
+lorica-api/openapi*.yaml text eol=lf
