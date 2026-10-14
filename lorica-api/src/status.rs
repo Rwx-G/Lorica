@@ -3,10 +3,12 @@
 
 use axum::extract::Extension;
 use axum::Json;
+use lorica_config::models::Role;
 use serde::Serialize;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// Snapshot returned by `GET /api/v1/status` summarizing the proxy fleet.
@@ -32,13 +34,18 @@ pub struct StatusResponse {
 }
 
 /// The node's access-log store, as `GET /api/v1/status` reports it.
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct LogStoreStatus {
     /// `false` while this process, or any worker, has no open store.
     pub persisting: bool,
-    /// Why not, while `persisting` is `false`.
+    /// Why not, while `persisting` is `false`. The open error itself
+    /// only for Operator and above; see [`log_store_status`].
     pub cause: Option<String>,
 }
+
+/// What a Viewer reads in place of this process's open error.
+const WITHHELD_CAUSE: &str =
+    "this node could not open access-log.db (the cause is in its journal, and shown to Operators)";
 
 /// Why this node is not persisting to its access-log store, or `None`
 /// when every process holds one.
@@ -49,9 +56,37 @@ pub struct LogStoreStatus {
 /// three cannot disagree on whether the node is degraded.
 pub fn log_store_failure() -> Option<String> {
     describe_log_store_failure(
-        crate::server::process_log_store().and_then(crate::server::LogStoreSlot::failure),
+        own_log_store_failure(),
         &crate::metrics::workers_without_log_store(),
     )
+}
+
+fn own_log_store_failure() -> Option<String> {
+    crate::server::process_log_store().and_then(crate::server::LogStoreSlot::failure)
+}
+
+/// The log-store part of the status, as `role` may read it.
+///
+/// The open error is SQLite's text, which names the data directory and
+/// can name tables and columns: system internals, which the API withholds
+/// from a Viewer elsewhere too (`GET /settings` blanks the log pipeline's
+/// topology below Operator). A Viewer still learns that the node is not
+/// persisting and which process failed, which is what the banner is for.
+pub fn log_store_status(
+    role: Role,
+    own_failure: Option<String>,
+    failed_workers: &[u32],
+) -> LogStoreStatus {
+    let own_failure = if role < Role::Operator {
+        own_failure.map(|_| WITHHELD_CAUSE.to_string())
+    } else {
+        own_failure
+    };
+    let cause = describe_log_store_failure(own_failure, failed_workers);
+    LogStoreStatus {
+        persisting: cause.is_none(),
+        cause,
+    }
 }
 
 /// Combine this process's failure and the failed workers into one cause.
@@ -76,6 +111,7 @@ pub fn describe_log_store_failure(own: Option<String>, failed_workers: &[u32]) -
 /// GET /api/v1/status - return aggregate counts of routes, backends (by health), and certificates.
 pub async fn get_status(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (routes, backends, certs) = db_blocking(&state.store, move |store| {
         let routes = store.list_routes()?;
@@ -108,13 +144,11 @@ pub async fn get_status(
             .iter()
             .filter(|c| c.not_after < expiry_threshold)
             .count(),
-        log_store: {
-            let cause = log_store_failure();
-            LogStoreStatus {
-                persisting: cause.is_none(),
-                cause,
-            }
-        },
+        log_store: log_store_status(
+            session.role,
+            own_log_store_failure(),
+            &crate::metrics::workers_without_log_store(),
+        ),
     };
 
     Ok(json_data(response))
@@ -143,18 +177,75 @@ mod tests {
         );
     }
 
+    /// The text rusqlite gives for a file it cannot open, path included.
+    const OPEN_ERROR: &str = "failed to open access log database: unable to open database \
+                              file: /var/lib/lorica/access-log.db";
+
+    const ROLES: [Role; 3] = [Role::Viewer, Role::Operator, Role::SuperAdmin];
+
+    #[test]
+    fn a_viewer_learns_the_node_is_down_but_not_the_open_error() {
+        let viewer = log_store_status(Role::Viewer, Some(OPEN_ERROR.to_string()), &[]);
+        assert!(!viewer.persisting);
+        let cause = viewer.cause.expect("the banner still has something to say");
+        assert!(!cause.contains("/var/lib"), "{cause}");
+        assert!(!cause.contains("unable to open"), "{cause}");
+        assert!(cause.contains("access-log.db"), "{cause}");
+    }
+
+    #[test]
+    fn operators_and_above_read_the_open_error() {
+        for role in ROLES.into_iter().filter(|role| *role >= Role::Operator) {
+            let status = log_store_status(role, Some(OPEN_ERROR.to_string()), &[]);
+            assert!(!status.persisting, "{role:?}");
+            assert_eq!(status.cause.as_deref(), Some(OPEN_ERROR), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn every_role_reads_which_workers_failed() {
+        for role in ROLES {
+            let status = log_store_status(role, None, &[2]);
+            assert!(!status.persisting, "{role:?}");
+            assert_eq!(
+                status.cause,
+                describe_log_store_failure(None, &[2]),
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_healthy_node_reports_persisting_to_every_role() {
+        for role in ROLES {
+            assert_eq!(
+                log_store_status(role, None, &[]),
+                LogStoreStatus {
+                    persisting: true,
+                    cause: None
+                },
+                "{role:?}"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn the_status_reports_the_log_store() {
+    async fn the_status_endpoint_answers_with_the_log_store() {
         let (state, _, _) = crate::tests::test_state().await;
-        let Json(body) = get_status(Extension(state)).await.expect("status answers");
-        let log_store = &body["data"]["log_store"];
-        // The worker states are process globals other tests move, so
-        // the assertion is on the contract, not on one value: a cause
-        // exactly when not persisting.
-        let persisting = log_store["persisting"]
+        let now = chrono::Utc::now();
+        let session = Session {
+            user_id: "user01".into(),
+            username: "user01".into(),
+            role: Role::Viewer,
+            created_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+        };
+        let Json(body) = get_status(Extension(state), Extension(session))
+            .await
+            .expect("status answers");
+        let persisting = body["data"]["log_store"]["persisting"]
             .as_bool()
             .expect("`persisting` is a boolean");
-        assert_eq!(log_store["cause"].is_string(), !persisting);
-        assert!(log_store["cause"].is_string() || log_store["cause"].is_null());
+        assert_eq!(body["data"]["log_store"]["cause"].is_string(), !persisting);
     }
 }
